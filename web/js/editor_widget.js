@@ -13,6 +13,8 @@ const TRACK_HEIGHT = 32;
 const SCENE_BAR_HEIGHT = 36;
 const TRACK_NAMES = ["Video", "Audio", "Guides", "Prompt"];
 const TRACK_COLLAPSED_HEIGHT = 8; // Height when a track is collapsed
+const LABEL_WIDTH = 55; // px reserved for track labels (node mode)
+const LABEL_WIDTH_FS = 70; // px reserved for track labels (fullscreen)
 const COLORS = {
     bg: "#1a1a1a",
     ruler: "#2a2a2a",
@@ -341,6 +343,19 @@ export class EditorWidget {
             this._toggleTimecodeMode();
         });
 
+        // Undo/Redo buttons
+        const undoBtn = this._makeBtn("↩", "Undo (Ctrl+Z)");
+        undoBtn.style.fontSize = "13px";
+        undoBtn.addEventListener("click", () => this._undo());
+
+        const redoBtn = this._makeBtn("↪", "Redo (Ctrl+Y)");
+        redoBtn.style.fontSize = "13px";
+        redoBtn.addEventListener("click", () => this._redo());
+
+        // Separator 3
+        const sep3 = document.createElement("span");
+        sep3.style.cssText = `width: 1px; height: 16px; background: #444; margin: 0 4px;`;
+
         // Spacer
         const spacer = document.createElement("span");
         spacer.style.flex = "1";
@@ -348,9 +363,9 @@ export class EditorWidget {
         // Shortcut hints
         const hints = document.createElement("span");
         hints.style.cssText = `color: #666; font-size: 9px; white-space: nowrap;`;
-        hints.textContent = "←→ Navigate | I/O In/Out | Space Play | Del Remove";
+        hints.textContent = "←→ Nav | I/O In/Out | Space Play | Del Remove | T TC | F Fit | S Snap | C Cut";
 
-        this._toolbar.append(this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, sep2, fitBtn, this._toolBtnTimecode, spacer, hints);
+        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, sep2, fitBtn, this._toolBtnTimecode, spacer, hints);
         this.container.appendChild(this._toolbar);
         this._updateToolbar();
     }
@@ -404,19 +419,11 @@ export class EditorWidget {
         zoomIn.style.fontSize = "13px";
         zoomIn.addEventListener("click", () => this._zoom(1));
 
-        const undoBtn = this._makeBtn("↩", "Undo (Ctrl+Z)");
-        undoBtn.style.fontSize = "13px";
-        undoBtn.addEventListener("click", () => this._undo());
-
-        const redoBtn = this._makeBtn("↪", "Redo (Ctrl+Y)");
-        redoBtn.style.fontSize = "13px";
-        redoBtn.addEventListener("click", () => this._redo());
-
         this._fullscreenBtn = this._makeBtn("⛶", "Toggle fullscreen");
         this._fullscreenBtn.style.fontSize = "14px";
         this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
 
-        zoomContainer.append(undoBtn, redoBtn, this._fullscreenBtn, zoomOut, zoomIn);
+        zoomContainer.append(this._fullscreenBtn, zoomOut, zoomIn);
         bar.append(this.infoLabel, zoomContainer);
         this.container.appendChild(bar);
     }
@@ -603,7 +610,11 @@ export class EditorWidget {
             this._fsTitle.textContent = `Editor — ${scene.name || "No Scene"}`;
         }
 
-        this._renderTimeline();
+        if (!isSameScene) {
+            this._autoFitTimeline();
+        } else {
+            this._renderTimeline();
+        }
         this._renderViewportFrame();
     }
 
@@ -991,16 +1002,16 @@ export class EditorWidget {
         }
         maxFrame = Math.max(maxFrame, this.totalFrames);
 
-        // Calculate ppf to fit all content with 10% margin
+        // Calculate ppf to fit all content with margin (label width already handled by _frameToX)
         const canvas = this.timelineCanvas;
         const rect = canvas.parentElement?.getBoundingClientRect();
         const width = rect ? Math.floor(rect.width) : 400;
-        const margin = width * 0.05; // 5% margin on each side
-        const availableWidth = width - margin * 2;
+        const margin = width * 0.03; // 3% margin on right side
+        const availableWidth = width - this._labelW - margin;
 
         if (maxFrame > 0 && availableWidth > 0) {
             this.pixelsPerFrame = Math.max(0.2, Math.min(40, availableWidth / maxFrame));
-            this.scrollX = -(margin / this.pixelsPerFrame);
+            this.scrollX = 0; // Frame 0 starts at label edge
         }
         this._renderTimeline();
     }
@@ -1031,12 +1042,14 @@ export class EditorWidget {
         this._updateInfoLabel();
     }
 
+    get _labelW() { return this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH; }
+
     _frameToX(frame) {
-        return (frame - this.scrollX) * this.pixelsPerFrame;
+        return this._labelW + (frame - this.scrollX) * this.pixelsPerFrame;
     }
 
     _xToFrame(x) {
-        return Math.round(x / this.pixelsPerFrame + this.scrollX);
+        return Math.round((x - this._labelW) / this.pixelsPerFrame + this.scrollX);
     }
 
     _drawRuler(ctx, width) {
@@ -1065,7 +1078,7 @@ export class EditorWidget {
         }
 
         const startFrame = Math.max(0, Math.floor(this.scrollX));
-        const endFrame = Math.min(this.totalFrames, Math.ceil(this.scrollX + width / this.pixelsPerFrame));
+        const endFrame = Math.min(this.totalFrames, Math.ceil(this.scrollX + (width - this._labelW) / this.pixelsPerFrame));
 
         for (let f = startFrame; f <= endFrame; f++) {
             const x = this._frameToX(f);
@@ -1218,6 +1231,24 @@ export class EditorWidget {
                     ctx.strokeRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
                 }
                 ctx.globalAlpha = 1.0;
+
+                // Opacity visual: diagonal hash lines when opacity < 100%
+                if (opacity < 1.0) {
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
+                    ctx.clip();
+                    ctx.strokeStyle = "rgba(0,0,0,0.4)";
+                    ctx.lineWidth = 1;
+                    const step = 6;
+                    for (let lx = x1 - videoH; lx < x2; lx += step) {
+                        ctx.beginPath();
+                        ctx.moveTo(lx, videoY + videoH - 2);
+                        ctx.lineTo(lx + videoH, videoY + 2);
+                        ctx.stroke();
+                    }
+                    ctx.restore();
+                }
 
                 // Clip label
                 ctx.fillStyle = COLORS.text;
@@ -2166,6 +2197,7 @@ export class EditorWidget {
         editor.append(label, input, createBtn, cancelBtn);
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
+        this._refreshTimelineLayout();
 
         setTimeout(() => input.focus(), 50);
     }
@@ -2244,6 +2276,7 @@ export class EditorWidget {
         // Insert after timeline canvas
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
+        this._refreshTimelineLayout();
 
         // Focus input
         setTimeout(() => input.focus(), 50);
@@ -2253,6 +2286,7 @@ export class EditorWidget {
         if (this._promptEditorEl) {
             this._promptEditorEl.remove();
             this._promptEditorEl = null;
+            this._refreshTimelineLayout();
         }
     }
 
@@ -2345,6 +2379,7 @@ export class EditorWidget {
                     this._renderTimeline();
                 });
                 opInput.addEventListener("change", () => {
+                    this._pushUndo("change opacity");
                     this._updateItemProperty(type, id, { opacity: parseInt(opInput.value) / 100 });
                 });
                 editor.append(opLabel, opInput, opVal);
@@ -2366,12 +2401,14 @@ export class EditorWidget {
                     this._renderTimeline();
                 });
                 volInput.addEventListener("change", () => {
+                    this._pushUndo("change volume");
                     this._updateItemProperty(type, id, { volume: parseInt(volInput.value) / 100 });
                 });
 
                 // Mute toggle
                 const muteBtn = this._makeBtn(data.muted ? "🔇" : "🔊", "Toggle mute");
                 muteBtn.addEventListener("click", () => {
+                    this._pushUndo("toggle mute");
                     data.muted = !data.muted;
                     muteBtn.textContent = data.muted ? "🔇" : "🔊";
                     this._updateItemProperty(type, id, { muted: data.muted });
@@ -2454,13 +2491,22 @@ export class EditorWidget {
         // Insert after timeline canvas
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._itemEditorEl = editor;
+        this._refreshTimelineLayout();
     }
 
     _hideItemEditor() {
         if (this._itemEditorEl) {
             this._itemEditorEl.remove();
             this._itemEditorEl = null;
+            this._refreshTimelineLayout();
         }
+    }
+
+    _refreshTimelineLayout() {
+        if (this.isFullscreen) {
+            this._recalcFullscreenHeights();
+        }
+        this._renderTimeline();
     }
 
     _makeEditorLabel(text) {
@@ -3635,6 +3681,7 @@ export class EditorWidget {
         // Video clip rendering
         const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
         const sourceTime = sourceFrame / this.fps;
+        this._viewportClipOpacity = clip.opacity ?? 1.0;
 
         const video = this._getOrCreateVideo(clip.source_path);
         if (!video) return;
@@ -3801,11 +3848,14 @@ export class EditorWidget {
 
         ctx.fillStyle = "#000";
         ctx.fillRect(0, 0, cw, ch);
+        const opacity = this._viewportClipOpacity ?? 1.0;
+        if (opacity < 1.0) ctx.globalAlpha = opacity;
         try {
             ctx.drawImage(video, dx, dy, dw, dh);
         } catch (e) {
             // Video may not be ready yet
         }
+        if (opacity < 1.0) ctx.globalAlpha = 1.0;
     }
 
     _updateTransportUI() {
