@@ -126,6 +126,13 @@ export class EditorWidget {
         this._redoStack = [];
         this._maxUndoSteps = 50;
 
+        // Thumbnail strip cache: { assetId: { img: Image, frameWidth, numFrames, loaded } }
+        this._thumbStripCache = {};
+        // Waveform cache: { assetId: { peaks: [[min,max],...], numBuckets, loaded } }
+        this._waveformCache = {};
+        // Asset path→assetId reverse lookup (rebuilt on asset fetch)
+        this._pathToAsset = {};
+
         // Fullscreen state
         this.isFullscreen = false;
         this._timelineHeight = TIMELINE_HEIGHT;
@@ -432,7 +439,7 @@ export class EditorWidget {
         const gallery = document.createElement("div");
         gallery.style.cssText = `
             background: ${COLORS.galleryBg}; border-top: 1px solid #333;
-            min-height: ${this._galleryHeight}px;
+            min-height: ${this._galleryHeight}px; overflow: hidden;
         `;
 
         // Tab bar
@@ -611,7 +618,9 @@ export class EditorWidget {
         }
 
         if (!isSameScene) {
-            this._autoFitTimeline();
+            // Defer auto-fit to next frame so browser reflows after editor hide
+            this._renderTimeline(); // Immediate render with new scene data
+            requestAnimationFrame(() => this._autoFitTimeline());
         } else {
             this._renderTimeline();
         }
@@ -747,10 +756,12 @@ export class EditorWidget {
             if (resp.ok) {
                 const data = await resp.json();
                 this.assets = { video: [], image: [], audio: [] };
+                this._pathToAsset = {};
                 for (const asset of (data.assets || [])) {
                     if (this.assets[asset.asset_type]) {
                         this.assets[asset.asset_type].push(asset);
                     }
+                    if (asset.path) this._pathToAsset[asset.path] = asset;
                 }
                 this._renderAssetGrid();
             }
@@ -1223,8 +1234,50 @@ export class EditorWidget {
                 const isSelectedClip = this._isSelected("clip", clip.clip_id);
                 const opacity = clip.opacity ?? 1.0;
                 ctx.globalAlpha = opacity < 1.0 ? Math.max(0.3, opacity) : 1.0;
+
+                // Draw base fill
                 ctx.fillStyle = isSelectedClip ? COLORS.clipSelected : COLORS.clip;
                 ctx.fillRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
+
+                // Thumbnail strip filmstrip (tiled at natural aspect ratio)
+                const clipAsset = this._pathToAsset[clip.source_path];
+                if (clipAsset && (x2 - x1) > 10) {
+                    const strip = this._getOrLoadThumbStrip(clipAsset.asset_id);
+                    if (strip && strip.loaded && strip.img.naturalWidth > 0) {
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.rect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
+                        ctx.clip();
+
+                        const destH = videoH - 4;
+                        // Scale each strip frame to fill track height, preserving aspect ratio
+                        const tileW = Math.max(1, Math.round(strip.frameWidth * destH / strip.img.naturalHeight));
+                        const totalSourceFrames = clipAsset.frame_count || 1;
+                        const srcIn = clip.source_in_frame || 0;
+                        const srcOut = clip.source_out_frame || totalSourceFrames;
+                        // Tile frames across the clip width
+                        const clipPixelW = x2 - x1 - 2;
+                        for (let px = 0; px < clipPixelW; px += tileW) {
+                            // Map this pixel position to a source frame, then to a strip column
+                            const frac = px / clipPixelW;
+                            const sourceFrame = srcIn + frac * (srcOut - srcIn);
+                            const col = Math.floor(sourceFrame / totalSourceFrames * strip.numFrames);
+                            const clampedCol = Math.min(col, strip.numFrames - 1);
+                            const sx = clampedCol * strip.frameWidth;
+                            const drawW = Math.min(tileW, clipPixelW - px);
+                            const srcDrawW = drawW / tileW * strip.frameWidth;
+                            ctx.drawImage(strip.img, sx, 0, srcDrawW, strip.img.naturalHeight,
+                                          x1 + 1 + px, videoY + 2, drawW, destH);
+                        }
+
+                        // Tint overlay to maintain clip color
+                        const tint = isSelectedClip ? "rgba(58,124,165,0.35)" : "rgba(58,124,165,0.2)";
+                        ctx.fillStyle = tint;
+                        ctx.fillRect(x1 + 1, videoY + 2, destW, destH);
+                        ctx.restore();
+                    }
+                }
+
                 if (isSelectedClip) {
                     ctx.strokeStyle = COLORS.clipSelected;
                     ctx.lineWidth = 1;
@@ -1301,6 +1354,48 @@ export class EditorWidget {
                 const vol = track.volume ?? 1.0;
                 ctx.fillStyle = track.muted ? "#555" : (isSelectedAudio ? COLORS.audioClipSelected : COLORS.audioClip);
                 ctx.fillRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
+
+                // Waveform visualization
+                const audioAsset = this._pathToAsset[track.source_path];
+                if (audioAsset && (x2 - x1) > 6) {
+                    const waveform = this._getOrLoadWaveform(audioAsset.asset_id);
+                    if (waveform && waveform.loaded && waveform.peaks.length > 0) {
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.rect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
+                        ctx.clip();
+
+                        const clipW = x2 - x1 - 2;
+                        const centerY = audioY + audioH / 2;
+                        const halfH = (audioH - 8) / 2;
+
+                        // Map visible source frames to waveform buckets
+                        const totalDurFrames = audioAsset.duration_sec * (this.fps || 24);
+                        const srcIn = track.source_in_frame || 0;
+                        const visibleFrames = track.timeline_end_frame - track.timeline_start_frame;
+                        const startFrac = totalDurFrames > 0 ? srcIn / totalDurFrames : 0;
+                        const endFrac = totalDurFrames > 0 ? (srcIn + visibleFrames) / totalDurFrames : 1;
+                        const startBucket = Math.floor(startFrac * waveform.numBuckets);
+                        const endBucket = Math.ceil(endFrac * waveform.numBuckets);
+                        const bucketSpan = Math.max(1, endBucket - startBucket);
+
+                        ctx.strokeStyle = track.muted ? "rgba(180,180,180,0.5)" : "rgba(220,255,220,0.9)";
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        for (let px = 0; px < clipW; px++) {
+                            const bi = startBucket + Math.floor(px / clipW * bucketSpan);
+                            const peak = waveform.peaks[Math.min(bi, waveform.peaks.length - 1)];
+                            if (!peak) continue;
+                            const y1 = centerY - peak[1] * halfH;
+                            const y2 = centerY - peak[0] * halfH;
+                            ctx.moveTo(x1 + 1 + px, y1);
+                            ctx.lineTo(x1 + 1 + px, y2);
+                        }
+                        ctx.stroke();
+                        ctx.restore();
+                    }
+                }
+
                 if (isSelectedAudio) {
                     ctx.strokeStyle = COLORS.audioClipSelected;
                     ctx.lineWidth = 1;
@@ -2098,14 +2193,16 @@ export class EditorWidget {
                 }
                 console.log("[LTX Editor] Guide frame created at frame", frame);
             } else if (asset.asset_type === "video") {
-                // Drop video = create clip on Video track
+                // Drop video = create clip on Video track (+ audio track if video has audio)
+                const clipBody = {
+                    asset_id: asset.asset_id,
+                    timeline_start_frame: frame,
+                    dual_drop: true,  // Always attempt — server handles gracefully
+                };
                 resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        asset_id: asset.asset_id,
-                        timeline_start_frame: frame,
-                    }),
+                    body: JSON.stringify(clipBody),
                 });
                 if (!resp.ok) {
                     console.warn("[LTX Editor] Clip creation failed:", resp.status, await resp.text());
@@ -2379,7 +2476,6 @@ export class EditorWidget {
                     this._renderTimeline();
                 });
                 opInput.addEventListener("change", () => {
-                    this._pushUndo("change opacity");
                     this._updateItemProperty(type, id, { opacity: parseInt(opInput.value) / 100 });
                 });
                 editor.append(opLabel, opInput, opVal);
@@ -2401,7 +2497,6 @@ export class EditorWidget {
                     this._renderTimeline();
                 });
                 volInput.addEventListener("change", () => {
-                    this._pushUndo("change volume");
                     this._updateItemProperty(type, id, { volume: parseInt(volInput.value) / 100 });
                 });
 
@@ -3098,8 +3193,12 @@ export class EditorWidget {
         this.galleryEl.style.flex = "1";
         this.galleryEl.style.minHeight = "0";
         this.galleryEl.style.overflow = "hidden";
+        this.galleryEl.style.display = "flex";
+        this.galleryEl.style.flexDirection = "column";
         this.assetGrid.style.maxHeight = "none";
         this.assetGrid.style.flex = "1";
+        this.assetGrid.style.overflowY = "auto";
+        this.assetGrid.style.minHeight = "0";
         this.assetGrid.style.gridTemplateColumns = "repeat(auto-fill, minmax(70px, 1fr))";
 
         // Move timeline container (without gallery) to bottom row
@@ -3165,8 +3264,12 @@ export class EditorWidget {
             this.galleryEl.style.flex = "";
             this.galleryEl.style.minHeight = GALLERY_HEIGHT + "px";
             this.galleryEl.style.overflow = "";
+            this.galleryEl.style.display = "";
+            this.galleryEl.style.flexDirection = "";
             this.assetGrid.style.maxHeight = (GALLERY_HEIGHT - 30) + "px";
             this.assetGrid.style.flex = "";
+            this.assetGrid.style.overflowY = "auto";
+            this.assetGrid.style.minHeight = "60px";
             this.assetGrid.style.gridTemplateColumns = "";
             this.container.insertBefore(this.galleryEl, this._galleryNextSibling || null);
         }
@@ -3211,9 +3314,10 @@ export class EditorWidget {
     // ── Keyboard Events ──────────────────────────────────────────────
     _setupKeyboardEvents() {
         this._keyHandler = (e) => {
-            // Guard: don't fire when typing in inputs
+            // Guard: don't fire when typing in inputs (except Ctrl+Z/Y for undo/redo)
             const tag = document.activeElement?.tagName;
-            if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+            const isUndo = (e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z" || e.key === "y" || e.key === "Y");
+            if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && !isUndo) return;
 
             // Guard: only handle keys when our editor is visible/active
             // (either in fullscreen, or container is in DOM)
@@ -3364,6 +3468,59 @@ export class EditorWidget {
     }
 
     // ── Undo / Redo ───────────────────────────────────────────────────
+
+    // ── Thumbnail Strip & Waveform Caches ───────────────────────────────
+
+    _getOrLoadThumbStrip(assetId) {
+        const entry = this._thumbStripCache[assetId];
+        if (entry) return entry.loaded ? entry : null;
+
+        // Start loading
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const cache = { img: new Image(), frameWidth: 0, numFrames: 0, loaded: false };
+        this._thumbStripCache[assetId] = cache;
+
+        // Fetch info first
+        fetch(api.apiURL(`/ltx-editor/project/${dirName}/thumbnail_strip/${assetId}?info=1`))
+            .then(r => r.ok ? r.json() : null)
+            .then(info => {
+                if (!info) return;
+                cache.frameWidth = info.frame_width;
+                cache.numFrames = info.num_frames;
+                cache.img.onload = () => {
+                    cache.loaded = true;
+                    this._renderTimeline();
+                };
+                cache.img.src = api.apiURL(`/ltx-editor/project/${dirName}/thumbnail_strip/${assetId}`);
+            })
+            .catch(() => {});
+
+        return null;
+    }
+
+    _getOrLoadWaveform(assetId) {
+        const entry = this._waveformCache[assetId];
+        if (entry) return entry.loaded ? entry : null;
+
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const cache = { peaks: [], numBuckets: 0, loaded: false };
+        this._waveformCache[assetId] = cache;
+
+        fetch(api.apiURL(`/ltx-editor/project/${dirName}/waveform/${assetId}`))
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+                if (!data) return;
+                cache.peaks = data.peaks;
+                cache.numBuckets = data.num_buckets;
+                cache.loaded = true;
+                this._renderTimeline();
+            })
+            .catch(() => {});
+
+        return null;
+    }
+
+    // ── Undo / Redo ──────────────────────────────────────────────────────
 
     /** Capture a snapshot of the active scene BEFORE a mutation. */
     _pushUndo(label = "edit") {

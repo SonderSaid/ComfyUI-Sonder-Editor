@@ -11,7 +11,7 @@ from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
     ClipReference,
 )
-from .thumbnail_service import ensure_thumbnail
+from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 
 logger = logging.getLogger("ltx_editor")
 
@@ -102,6 +102,183 @@ def _get_audio_duration(filepath: str) -> float:
     return 0.0
 
 
+def _video_has_audio(filepath: str) -> bool:
+    """Check if a video file contains an audio stream."""
+    # Method 1: ffprobe
+    try:
+        import subprocess
+        ffprobe = _find_ffprobe()
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", filepath],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and "audio" in result.stdout:
+            return True
+    except Exception as e:
+        logger.debug("ffprobe audio check failed for %s: %s", filepath, e)
+
+    # Method 2: mutagen (reads container metadata for audio streams)
+    try:
+        from mutagen import File as MutagenFile
+        mf = MutagenFile(filepath)
+        if mf is not None and mf.info:
+            # MP4/M4V containers: check for audio bitrate
+            if hasattr(mf.info, 'bitrate') and hasattr(mf.info, 'codec'):
+                return True
+            # Most video containers with audio will have sample_rate
+            if hasattr(mf.info, 'sample_rate') and mf.info.sample_rate > 0:
+                return True
+    except Exception as e:
+        logger.debug("mutagen audio check failed for %s: %s", filepath, e)
+
+    # Method 3: cv2 — check if video has more frames than expected for pure video
+    # This is a heuristic; cv2 can't directly detect audio streams
+    # but we can try loading audio with torchaudio as a last resort
+    try:
+        import torchaudio
+        info = torchaudio.info(filepath)
+        if info.num_frames > 0:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _find_ffmpeg() -> str:
+    """Find ffmpeg executable, checking PATH, Python packages, and common locations."""
+    import shutil
+    path = shutil.which("ffmpeg")
+    if path:
+        logger.info("Found ffmpeg on PATH: %s", path)
+        return path
+
+    # Method 1: imageio-ffmpeg (bundled ffmpeg in Python package)
+    try:
+        import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        if path and os.path.isfile(path):
+            logger.info("Found ffmpeg via imageio-ffmpeg: %s", path)
+            return path
+    except ImportError:
+        # Try to install imageio-ffmpeg (it bundles a static ffmpeg binary)
+        logger.info("imageio-ffmpeg not found, attempting to install...")
+        try:
+            import subprocess, sys
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
+            import imageio_ffmpeg
+            path = imageio_ffmpeg.get_ffmpeg_exe()
+            if path and os.path.isfile(path):
+                logger.info("Installed imageio-ffmpeg, ffmpeg at: %s", path)
+                return path
+        except Exception as e:
+            logger.warning("Failed to install imageio-ffmpeg: %s", e)
+    except Exception:
+        pass
+
+    # Method 2: Search common locations
+    import sys
+    candidates = []
+    python_dir = os.path.dirname(sys.executable)
+    candidates.append(os.path.join(python_dir, "ffmpeg.exe"))
+    candidates.append(os.path.join(python_dir, "Scripts", "ffmpeg.exe"))
+    candidates.append(os.path.join(python_dir, "..", "ffmpeg.exe"))
+    # Stability Matrix common paths
+    try:
+        import folder_paths
+        comfy_base = folder_paths.base_path
+        candidates.append(os.path.join(comfy_base, "ffmpeg.exe"))
+        candidates.append(os.path.join(comfy_base, "ffmpeg", "ffmpeg.exe"))
+        # Go up from ComfyUI to Stability Data
+        sm_data = os.path.dirname(os.path.dirname(comfy_base))
+        candidates.append(os.path.join(sm_data, "Assets", "ffmpeg", "ffmpeg.exe"))
+        candidates.append(os.path.join(sm_data, "Assets", "ffmpeg", "bin", "ffmpeg.exe"))
+    except Exception:
+        pass
+    # Search imageio_ffmpeg package directory directly
+    site_packages = os.path.join(python_dir, "Lib", "site-packages", "imageio_ffmpeg", "binaries")
+    if os.path.isdir(site_packages):
+        for f in os.listdir(site_packages):
+            if "ffmpeg" in f.lower() and not "probe" in f.lower():
+                candidates.append(os.path.join(site_packages, f))
+    # Common system locations
+    candidates.append(r"C:\ffmpeg\bin\ffmpeg.exe")
+    candidates.append(os.path.expanduser(r"~\ffmpeg\bin\ffmpeg.exe"))
+
+    for c in candidates:
+        if os.path.isfile(c):
+            logger.info("Found ffmpeg at: %s", c)
+            return c
+
+    logger.warning("ffmpeg not found anywhere. Audio extraction from video will not work.")
+    return "ffmpeg"  # fallback to PATH (will fail)
+
+
+_ffmpeg_path = None
+
+def _get_ffmpeg() -> str:
+    global _ffmpeg_path
+    if _ffmpeg_path is None:
+        _ffmpeg_path = _find_ffmpeg()
+    return _ffmpeg_path
+
+
+def _find_ffprobe() -> str:
+    """Find ffprobe executable."""
+    import shutil
+    path = shutil.which("ffprobe")
+    if path:
+        return path
+    # Try same directory as ffmpeg
+    ffmpeg = _get_ffmpeg()
+    if ffmpeg and ffmpeg != "ffmpeg":
+        probe = os.path.join(os.path.dirname(ffmpeg), "ffprobe" + (".exe" if os.name == "nt" else ""))
+        if os.path.isfile(probe):
+            return probe
+    return "ffprobe"
+
+
+def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
+    """Extract audio track from video file as WAV."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Method 1: ffmpeg
+    try:
+        import subprocess
+        ffmpeg = _get_ffmpeg()
+        result = subprocess.run(
+            [ffmpeg, "-y", "-i", video_path, "-vn",
+             "-acodec", "pcm_s16le", "-ar", "44100", output_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0 and os.path.isfile(output_path):
+            logger.info("Extracted audio from video via ffmpeg: %s", os.path.basename(video_path))
+            return True
+        else:
+            logger.warning("ffmpeg returned %d for %s: %s", result.returncode,
+                           os.path.basename(video_path), result.stderr[:200] if result.stderr else "")
+    except Exception as e:
+        logger.warning("ffmpeg audio extraction failed for %s: %s", video_path, e)
+
+    # Method 2: torchaudio (can read audio from video containers)
+    try:
+        import torchaudio
+        waveform, sr = torchaudio.load(video_path)
+        torchaudio.save(output_path, waveform, sr, format="wav")
+        if os.path.isfile(output_path):
+            logger.info("Extracted audio from video via torchaudio: %s", os.path.basename(video_path))
+            return True
+    except Exception as e:
+        logger.debug("torchaudio audio extraction failed for %s: %s", video_path, e)
+
+    return False
+
+
 def _sync_media_folder(project: TimelineProject) -> None:
     """Scan media/ folder for files not yet in the asset registry and add them."""
     media_dir = os.path.join(project.project_dir, "media")
@@ -157,6 +334,10 @@ def _sync_media_folder(project: TimelineProject) -> None:
         elif asset_type == "audio":
             duration_sec = _get_audio_duration(filepath)
 
+        has_audio = False
+        if asset_type == "video":
+            has_audio = _video_has_audio(filepath)
+
         asset = Asset(
             name=filename,
             asset_type=asset_type,
@@ -167,6 +348,7 @@ def _sync_media_folder(project: TimelineProject) -> None:
             fps=fps,
             duration_sec=duration_sec,
             sample_rate=sample_rate,
+            has_audio=has_audio,
         )
         project.add_asset(asset)
 
@@ -179,6 +361,15 @@ def _sync_media_folder(project: TimelineProject) -> None:
 
         changed = True
         logger.info("Auto-registered asset: %s (%s)", filename, asset_type)
+
+    # Repair video assets missing has_audio detection
+    for asset in project.assets:
+        if asset.asset_type == "video" and not asset.has_audio:
+            filepath = os.path.join(project.project_dir, asset.path)
+            if os.path.isfile(filepath) and _video_has_audio(filepath):
+                asset.has_audio = True
+                changed = True
+                logger.info("Detected audio in video: %s", asset.name)
 
     # Repair existing audio assets with missing duration
     repaired_assets = {}
@@ -437,6 +628,11 @@ if routes is not None:
         elif asset_type == "audio":
             duration_sec = _get_audio_duration(dest_path)
 
+        # Check for audio in video files
+        has_audio = False
+        if asset_type == "video":
+            has_audio = _video_has_audio(dest_path)
+
         # Create asset entry
         asset = Asset(
             name=basename,
@@ -448,6 +644,7 @@ if routes is not None:
             fps=fps,
             duration_sec=duration_sec,
             sample_rate=sample_rate,
+            has_audio=has_audio,
             prompt=body.get("prompt", ""),
             generation_params=body.get("generation_params", {}),
         )
@@ -486,6 +683,71 @@ if routes is not None:
             return _json_error("Failed to generate thumbnail", 500)
 
         return web.FileResponse(thumb_path)
+
+    @routes.get("/ltx-editor/project/{project_id}/thumbnail_strip/{asset_id}")
+    async def api_get_thumbnail_strip(request: web.Request) -> web.Response:
+        """Serve a filmstrip thumbnail for a video asset (tiled frames)."""
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_id = request.match_info["asset_id"]
+        asset = project.get_asset(asset_id)
+        if not asset or asset.asset_type != "video":
+            return _json_error(f"Video asset not found: {asset_id}", 404)
+
+        strip_path = os.path.join(
+            project.project_dir, "cache", "thumbnails",
+            f"{asset_id}_strip.jpg"
+        )
+        info_path = strip_path + ".json"
+
+        # Generate if not cached
+        if not os.path.isfile(strip_path):
+            source_path = os.path.join(project.project_dir, asset.path)
+            info = generate_thumbnail_strip(source_path, strip_path)
+            if info:
+                import json as _json
+                with open(info_path, "w") as f:
+                    _json.dump(info, f)
+            else:
+                return _json_error("Failed to generate thumbnail strip", 500)
+
+        # Return info JSON or image
+        if request.query.get("info"):
+            if os.path.isfile(info_path):
+                return web.FileResponse(info_path, headers={"Content-Type": "application/json"})
+            return _json_error("Strip info not found", 404)
+
+        return web.FileResponse(strip_path)
+
+    @routes.get("/ltx-editor/project/{project_id}/waveform/{asset_id}")
+    async def api_get_waveform(request: web.Request) -> web.Response:
+        """Serve waveform peaks data for an audio asset."""
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_id = request.match_info["asset_id"]
+        asset = project.get_asset(asset_id)
+        if not asset or asset.asset_type != "audio":
+            return _json_error(f"Audio asset not found: {asset_id}", 404)
+
+        waveform_path = os.path.join(
+            project.project_dir, "cache", "waveforms",
+            f"{asset_id}.json"
+        )
+
+        # Generate if not cached
+        if not os.path.isfile(waveform_path):
+            source_path = os.path.join(project.project_dir, asset.path)
+            data = generate_waveform_data(source_path, waveform_path)
+            if not data:
+                return _json_error("Failed to generate waveform data", 500)
+
+        return web.FileResponse(waveform_path, headers={"Content-Type": "application/json"})
 
     # -----------------------------------------------------------------------
     # Scene CRUD
@@ -734,9 +996,61 @@ if routes is not None:
             track_index=int(body.get("track_index", 0)),
         )
         scene.clips.append(clip)
+
+        # Dual drop: also create audio track if video has audio
+        # Wrapped in try/except so audio extraction failure doesn't prevent clip creation
+        audio_track_dict = None
+        if body.get("dual_drop") and asset.asset_type == "video":
+            try:
+                video_path = os.path.join(project.project_dir, asset.path)
+                audio_filename = f"{asset.asset_id}_audio.wav"
+                audio_rel_path = os.path.join("media", audio_filename)
+                audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
+
+                # Extract audio if not already done
+                if not os.path.isfile(audio_abs_path):
+                    _extract_audio_from_video(video_path, audio_abs_path)
+
+                if os.path.isfile(audio_abs_path):
+                    # Find or create audio asset
+                    audio_asset = next(
+                        (a for a in project.assets if a.path == audio_rel_path), None
+                    )
+                    if not audio_asset:
+                        audio_dur = _get_audio_duration(audio_abs_path)
+                        audio_asset = Asset(
+                            name=f"{asset.name} (audio)",
+                            asset_type="audio",
+                            path=audio_rel_path,
+                            duration_sec=audio_dur,
+                        )
+                        project.add_asset(audio_asset)
+                        # Generate waveform thumbnail
+                        thumb_path = os.path.join(
+                            project.project_dir, "cache", "thumbnails",
+                            f"{audio_asset.asset_id}.png"
+                        )
+                        ensure_thumbnail("audio", audio_abs_path, thumb_path)
+
+                    fps = project.fps or 24.0
+                    audio_frames = int(audio_asset.duration_sec * fps) if audio_asset.duration_sec > 0 else frame_count
+                    audio_track = AudioTrack(
+                        source_path=audio_asset.path,
+                        timeline_start_frame=start_frame,
+                        timeline_end_frame=start_frame + audio_frames,
+                        total_source_frames=audio_frames,
+                    )
+                    scene.audio_tracks.append(audio_track)
+                    audio_track_dict = audio_track.to_dict()
+            except Exception as e:
+                logger.warning("Dual drop audio extraction failed: %s", e)
+
         save_project(project)
 
-        return web.json_response(clip.to_dict(), status=201)
+        result = clip.to_dict()
+        if audio_track_dict:
+            result["audio_track"] = audio_track_dict
+        return web.json_response(result, status=201)
 
     @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
     async def api_delete_clip(request: web.Request) -> web.Response:

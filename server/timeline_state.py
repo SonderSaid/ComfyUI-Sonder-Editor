@@ -25,6 +25,7 @@ class Asset:
     fps: float = 0.0                        # 0 for images/audio
     duration_sec: float = 0.0
     sample_rate: int = 0                    # audio only
+    has_audio: bool = False                  # video files: True if video contains audio stream
     imported_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def to_dict(self) -> dict:
@@ -41,6 +42,7 @@ class Asset:
             "fps": self.fps,
             "duration_sec": self.duration_sec,
             "sample_rate": self.sample_rate,
+            "has_audio": self.has_audio,
             "imported_at": self.imported_at,
         }
 
@@ -59,6 +61,7 @@ class Asset:
             fps=data.get("fps", 0.0),
             duration_sec=data.get("duration_sec", 0.0),
             sample_rate=data.get("sample_rate", 0),
+            has_audio=data.get("has_audio", False),
             imported_at=data.get("imported_at", datetime.now().isoformat()),
         )
 
