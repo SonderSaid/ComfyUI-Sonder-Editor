@@ -220,4 +220,92 @@ app.registerExtension({
             };
         }
     },
+
+    setup() {
+        // ── Global drop interceptor: asset gallery → ComfyUI graph ───────
+        // HTML5 drag can't carry File objects, so we intercept drops with our
+        // custom MIME type, fetch the actual asset, upload it to ComfyUI's
+        // input dir, and create the appropriate loader node.
+        document.addEventListener("drop", async (e) => {
+            const assetData = e.dataTransfer.getData("application/ltx-asset");
+            if (!assetData) return; // Not our drag
+
+            // Don't intercept drops on our own editor elements
+            if (e.target.closest?.("[data-ltx-editor]")) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            try {
+                const asset = JSON.parse(assetData);
+                const dirName = asset._projectDir;
+                if (!dirName) return;
+
+                const fn = asset.path.split(/[/\\]/).pop();
+                const sf = `ltx_projects/${dirName}/${asset.path.split(/[/\\]/).slice(0, -1).join("/")}`;
+                const viewUrl = api.apiURL(
+                    `/view?filename=${encodeURIComponent(fn)}&subfolder=${encodeURIComponent(sf)}&type=output`
+                );
+
+                // Fetch the actual asset file
+                const resp = await fetch(viewUrl);
+                if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
+                const blob = await resp.blob();
+                const file = new File([blob], fn, { type: blob.type });
+
+                // Upload to ComfyUI input directory
+                const formData = new FormData();
+                formData.append("image", file);
+                formData.append("subfolder", "ltx_assets");
+                const uploadResp = await api.fetchApi("/upload/image", {
+                    method: "POST",
+                    body: formData,
+                });
+                if (!uploadResp.ok) throw new Error(`Upload failed: ${uploadResp.status}`);
+                const uploadResult = await uploadResp.json();
+                const uploadedName = uploadResult.subfolder
+                    ? `${uploadResult.subfolder}/${uploadResult.name}`
+                    : uploadResult.name;
+
+                // Pick node type based on asset type
+                const regTypes = LiteGraph.registered_node_types || {};
+                let nodeType, widgetName;
+                if (asset.asset_type === "image") {
+                    nodeType = "LoadImage";
+                    widgetName = "image";
+                } else if (asset.asset_type === "video") {
+                    nodeType = regTypes["VHS_LoadVideo"] ? "VHS_LoadVideo" : "LoadImage";
+                    widgetName = nodeType === "VHS_LoadVideo" ? "video" : "image";
+                } else if (asset.asset_type === "audio") {
+                    nodeType = regTypes["LoadAudio"] ? "LoadAudio" : null;
+                    widgetName = "audio";
+                }
+
+                if (!nodeType) {
+                    console.warn("[LTX Editor] No suitable node type for:", asset.asset_type);
+                    return;
+                }
+
+                // Create node at drop position on the graph
+                const graphCanvas = app.canvas;
+                const pos = graphCanvas.convertEventToCanvasOffset(e);
+                const node = LiteGraph.createNode(nodeType);
+                if (!node) {
+                    console.warn("[LTX Editor] Could not create node:", nodeType);
+                    return;
+                }
+                node.pos = [pos[0], pos[1]];
+                app.graph.add(node);
+
+                // Set the file widget value
+                const widget = node.widgets?.find(w => w.name === widgetName);
+                if (widget) {
+                    widget.value = uploadedName;
+                    widget.callback?.(uploadedName);
+                }
+            } catch (err) {
+                console.warn("[LTX Editor] ComfyUI graph drop failed:", err);
+            }
+        }, false); // bubble phase — timeline canvas stopPropagation prevents this from firing for timeline drops
+    },
 });

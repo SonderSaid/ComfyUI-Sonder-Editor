@@ -133,6 +133,9 @@ export class EditorWidget {
         // Asset path→assetId reverse lookup (rebuilt on asset fetch)
         this._pathToAsset = {};
 
+        // Editor focus state — true when user last clicked inside the editor
+        this._editorFocused = false;
+
         // Fullscreen state
         this.isFullscreen = false;
         this._timelineHeight = TIMELINE_HEIGHT;
@@ -163,6 +166,7 @@ export class EditorWidget {
     _buildDOM() {
         // Main container
         this.container = document.createElement("div");
+        this.container.dataset.ltxEditor = "1"; // marker for global drop interceptor
         this.container.style.cssText = `
             width: 100%; display: flex; flex-direction: column;
             padding: 4px 8px;
@@ -817,6 +821,7 @@ export class EditorWidget {
                 const img = document.createElement("img");
                 img.src = api.apiURL(`/ltx-editor/project/${dirName}/thumbnail/${asset.asset_id}`);
                 img.style.cssText = "width: 100%; height: 100%; object-fit: cover;";
+                img.draggable = false; // Prevent browser from dragging thumbnail URL
                 thumb.appendChild(img);
             } else {
                 const icon = document.createElement("span");
@@ -856,7 +861,9 @@ export class EditorWidget {
             // Drag support
             item.draggable = true;
             item.addEventListener("dragstart", (e) => {
-                e.dataTransfer.setData("application/ltx-asset", JSON.stringify(asset));
+                // Stash projectDir so the global ComfyUI drop handler can build URLs
+                const enrichedAsset = { ...asset, _projectDir: this.projectDir.split(/[/\\]/).pop() };
+                e.dataTransfer.setData("application/ltx-asset", JSON.stringify(enrichedAsset));
                 e.dataTransfer.effectAllowed = "copy";
             });
 
@@ -2051,11 +2058,13 @@ export class EditorWidget {
         // Drop assets onto timeline
         canvas.addEventListener("dragover", (e) => {
             e.preventDefault();
+            e.stopPropagation(); // Prevent ComfyUI from showing its own drop indicator
             e.dataTransfer.dropEffect = "copy";
         });
 
         canvas.addEventListener("drop", (e) => {
             e.preventDefault();
+            e.stopPropagation(); // Prevent ComfyUI from also handling this drop
             const assetData = e.dataTransfer.getData("application/ltx-asset");
             if (!assetData) return;
 
@@ -3319,9 +3328,9 @@ export class EditorWidget {
             const isUndo = (e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z" || e.key === "y" || e.key === "Y");
             if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && !isUndo) return;
 
-            // Guard: only handle keys when our editor is visible/active
-            // (either in fullscreen, or container is in DOM)
-            if (!this.isFullscreen && !this.container?.isConnected) return;
+            // Guard: only handle keys when our editor is focused
+            // (fullscreen always focused, node mode only when user clicked inside)
+            if (!this.isFullscreen && !this._editorFocused) return;
 
             const ctrl = e.ctrlKey || e.metaKey;
             const shift = e.shiftKey;
@@ -3449,6 +3458,18 @@ export class EditorWidget {
         };
         // Use capture phase to intercept BEFORE ComfyUI's handlers
         document.addEventListener("keydown", this._keyHandler, true);
+
+        // Track editor focus: set when clicking inside editor, clear when clicking outside
+        this._focusHandler = (e) => {
+            if (this.isFullscreen) {
+                // In fullscreen, editor always has focus
+                this._editorFocused = true;
+            } else {
+                // In node mode, check if click is inside our container
+                this._editorFocused = !!(this.container?.contains(e.target));
+            }
+        };
+        document.addEventListener("mousedown", this._focusHandler, true);
     }
 
     /** Called whenever the playhead changes position (arrow keys, etc.). */
