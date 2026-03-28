@@ -9,7 +9,7 @@ from aiohttp import web
 from .project_manager import create_project, load_project, save_project, list_projects
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
-    ClipReference,
+    ClipReference, LaneConfig,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 
@@ -829,6 +829,23 @@ if routes is not None:
             ]
         if "generation_params" in body:
             scene.generation_params = body["generation_params"]
+        if "video_lane_count" in body:
+            scene.video_lane_count = max(1, int(body["video_lane_count"]))
+        if "audio_lane_count" in body:
+            scene.audio_lane_count = max(1, int(body["audio_lane_count"]))
+        if "video_lane_configs" in body:
+            scene.video_lane_configs = [
+                LaneConfig.from_dict(c) for c in body["video_lane_configs"]
+            ]
+        if "audio_lane_configs" in body:
+            scene.audio_lane_configs = [
+                LaneConfig.from_dict(c) for c in body["audio_lane_configs"]
+            ]
+        # Auto-pad configs to match lane counts
+        while len(scene.video_lane_configs) < scene.video_lane_count:
+            scene.video_lane_configs.append(LaneConfig())
+        while len(scene.audio_lane_configs) < scene.audio_lane_count:
+            scene.audio_lane_configs.append(LaneConfig())
 
         save_project(project)
         return web.json_response(scene.to_dict())
@@ -890,6 +907,22 @@ if routes is not None:
             scene.audio_tracks = [
                 AudioTrack.from_dict(a) for a in body["audio_tracks"]
             ]
+        if "video_lane_count" in body:
+            scene.video_lane_count = max(1, int(body["video_lane_count"]))
+        if "audio_lane_count" in body:
+            scene.audio_lane_count = max(1, int(body["audio_lane_count"]))
+        if "video_lane_configs" in body:
+            scene.video_lane_configs = [
+                LaneConfig.from_dict(c) for c in body["video_lane_configs"]
+            ]
+        if "audio_lane_configs" in body:
+            scene.audio_lane_configs = [
+                LaneConfig.from_dict(c) for c in body["audio_lane_configs"]
+            ]
+        while len(scene.video_lane_configs) < scene.video_lane_count:
+            scene.video_lane_configs.append(LaneConfig())
+        while len(scene.audio_lane_configs) < scene.audio_lane_count:
+            scene.audio_lane_configs.append(LaneConfig())
 
         save_project(project)
         return web.json_response(scene.to_dict())
@@ -1034,11 +1067,13 @@ if routes is not None:
 
                     fps = project.fps or 24.0
                     audio_frames = int(audio_asset.duration_sec * fps) if audio_asset.duration_sec > 0 else frame_count
+                    audio_lane_idx = int(body.get("audio_lane_index", 0))
                     audio_track = AudioTrack(
                         source_path=audio_asset.path,
                         timeline_start_frame=start_frame,
                         timeline_end_frame=start_frame + audio_frames,
                         total_source_frames=audio_frames,
+                        lane_index=audio_lane_idx,
                     )
                     scene.audio_tracks.append(audio_track)
                     audio_track_dict = audio_track.to_dict()
@@ -1114,6 +1149,8 @@ if routes is not None:
             clip.source_out_frame = int(body["source_out_frame"])
         if "opacity" in body:
             clip.opacity = float(body["opacity"])
+        if "track_index" in body:
+            clip.track_index = int(body["track_index"])
 
         save_project(project)
         return web.json_response(clip.to_dict())
@@ -1216,6 +1253,7 @@ if routes is not None:
             timeline_start_frame=start_frame,
             timeline_end_frame=end_frame,
             total_source_frames=duration_frames,
+            lane_index=int(body.get("lane_index", 0)),
         )
         scene.audio_tracks.append(track)
         save_project(project)
@@ -1287,6 +1325,8 @@ if routes is not None:
 
         if "volume" in body:
             track.volume = float(body["volume"])
+        if "lane_index" in body:
+            track.lane_index = int(body["lane_index"])
 
         save_project(project)
         return web.json_response(track.to_dict())
@@ -1338,6 +1378,7 @@ if routes is not None:
             source_origin_frame=source_split,     # origin = source_in at split
             volume=track.volume,
             muted=track.muted,
+            lane_index=track.lane_index,          # preserve lane on split
         )
 
         # Trim first track (left half)

@@ -199,6 +199,31 @@ class BatchConfig:
 
 
 # ---------------------------------------------------------------------------
+# Lane config — per-lane metadata (name, color, lock, hide/mute)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LaneConfig:
+    """Per-lane display/behavior settings."""
+    name: str = ""          # Custom name (empty = use default "V0", "A1" etc.)
+    color: str = ""         # Hex color (empty = use palette default)
+    locked: bool = False    # Prevent edits
+    hidden: bool = False    # Hidden from viewport (video) / muted (audio)
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "color": self.color, "locked": self.locked, "hidden": self.hidden}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "LaneConfig":
+        return cls(
+            name=data.get("name", ""),
+            color=data.get("color", ""),
+            locked=data.get("locked", False),
+            hidden=data.get("hidden", False),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Scene — a composition segment (e.g., "dog eating", "bridge shot")
 # ---------------------------------------------------------------------------
 
@@ -241,6 +266,10 @@ class Scene:
     audio_tracks: list = field(default_factory=list)     # list[AudioTrack]
     asset_ids: list = field(default_factory=list)        # references to project-level Assets used
     is_bridge: bool = False                 # True if this is an auto-generated bridge between scenes
+    video_lane_count: int = 1               # number of video lanes (multi-layer)
+    audio_lane_count: int = 1               # number of audio lanes (multi-layer)
+    video_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
+    audio_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
 
     @property
     def duration_seconds(self) -> float:
@@ -290,6 +319,10 @@ class Scene:
             "audio_tracks": [a.to_dict() for a in self.audio_tracks],
             "asset_ids": list(self.asset_ids),
             "is_bridge": self.is_bridge,
+            "video_lane_count": self.video_lane_count,
+            "audio_lane_count": self.audio_lane_count,
+            "video_lane_configs": [c.to_dict() for c in self.video_lane_configs],
+            "audio_lane_configs": [c.to_dict() for c in self.audio_lane_configs],
         }
 
     @classmethod
@@ -304,6 +337,8 @@ class Scene:
             batch_config=BatchConfig.from_dict(data.get("batch_config", {})),
             asset_ids=data.get("asset_ids", []),
             is_bridge=data.get("is_bridge", False),
+            video_lane_count=data.get("video_lane_count", 1),
+            audio_lane_count=data.get("audio_lane_count", 1),
         )
         scene.prompt_sections = [
             PromptSection.from_dict(p) for p in data.get("prompt_sections", [])
@@ -317,6 +352,17 @@ class Scene:
         scene.audio_tracks = [
             AudioTrack.from_dict(a) for a in data.get("audio_tracks", [])
         ]
+        # Lane configs — deserialize + auto-pad to match lane counts
+        scene.video_lane_configs = [
+            LaneConfig.from_dict(c) for c in data.get("video_lane_configs", [])
+        ]
+        while len(scene.video_lane_configs) < scene.video_lane_count:
+            scene.video_lane_configs.append(LaneConfig())
+        scene.audio_lane_configs = [
+            LaneConfig.from_dict(c) for c in data.get("audio_lane_configs", [])
+        ]
+        while len(scene.audio_lane_configs) < scene.audio_lane_count:
+            scene.audio_lane_configs.append(LaneConfig())
         return scene
 
 
@@ -405,6 +451,7 @@ class AudioTrack:
     source_origin_frame: int = 0  # source_in at creation/split (for trim ghost calc)
     volume: float = 1.0
     muted: bool = False
+    lane_index: int = 0                 # audio lane (0-based, for multi-layer)
 
     def to_dict(self) -> dict:
         return {
@@ -417,6 +464,7 @@ class AudioTrack:
             "source_origin_frame": self.source_origin_frame,
             "volume": self.volume,
             "muted": self.muted,
+            "lane_index": self.lane_index,
         }
 
     @classmethod
@@ -431,6 +479,7 @@ class AudioTrack:
             source_origin_frame=data.get("source_origin_frame", 0),
             volume=data.get("volume", 1.0),
             muted=data.get("muted", False),
+            lane_index=data.get("lane_index", 0),
         )
 
 

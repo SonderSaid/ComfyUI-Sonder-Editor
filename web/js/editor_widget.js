@@ -11,10 +11,18 @@ const GALLERY_HEIGHT = 160;
 const RULER_HEIGHT = 24;
 const TRACK_HEIGHT = 32;
 const SCENE_BAR_HEIGHT = 36;
-const TRACK_NAMES = ["Video", "Audio", "Guides", "Prompt"];
+const TRACK_TYPE = { VIDEO: "video", AUDIO: "audio", GUIDES: "guides", PROMPT: "prompt" };
 const TRACK_COLLAPSED_HEIGHT = 8; // Height when a track is collapsed
 const LABEL_WIDTH = 55; // px reserved for track labels (node mode)
 const LABEL_WIDTH_FS = 70; // px reserved for track labels (fullscreen)
+const LANE_PALETTE = [
+    "#3a6ea5",  // Blue
+    "#6a8e3e",  // Green
+    "#a05a2c",  // Orange
+    "#7e4a8a",  // Purple
+    "#8a6b3e",  // Gold
+    "#3a8a7a",  // Teal
+];
 const COLORS = {
     bg: "#1a1a1a",
     ruler: "#2a2a2a",
@@ -115,8 +123,9 @@ export class EditorWidget {
         this._snapThreshold = 5; // frames
         this._snapIndicator = null; // frame number of active snap line, or null
 
-        // Track collapse state: { 0: false, 1: false, 2: false, 3: false }
-        this._collapsedTracks = { 0: false, 1: false, 2: false, 3: false };
+        // Track layout: dynamically built array of { type, label, laneIndex, collapsed }
+        this._trackLayout = [];
+        this._buildTrackLayout();
 
         // Timecode display mode: "frames" or "timecode" (HH:MM:SS:FF)
         this._timecodeMode = "frames";
@@ -609,6 +618,7 @@ export class EditorWidget {
 
         this.activeScene = scene;
         this.activeSceneId = scene.scene_id;
+        this._buildTrackLayout();
         this.totalFrames = scene.duration_frames || 200;
         this.durationInput.value = this.totalFrames;
         this.sceneLabel.textContent = scene.name || "Untitled Scene";
@@ -976,25 +986,122 @@ export class EditorWidget {
         this._updateTransportUI();
     }
 
-    /** Get y offset of a track index accounting for collapsed tracks */
-    _trackY(trackIdx) {
+    /** Build the track layout array from scene lane counts */
+    _buildTrackLayout() {
+        const layout = [];
+        const scene = this.activeScene;
+        const videoLanes = scene?.video_lane_count || 1;
+        const audioLanes = scene?.audio_lane_count || 1;
+        const vConfigs = scene?.video_lane_configs || [];
+        const aConfigs = scene?.audio_lane_configs || [];
+
+        // Preserve collapsed state across rebuilds
+        const oldCollapsed = {};
+        for (const entry of this._trackLayout) {
+            oldCollapsed[entry.type + ":" + entry.laneIndex] = entry.collapsed;
+        }
+
+        // Video lanes: highest index at top (foreground on top)
+        for (let i = videoLanes - 1; i >= 0; i--) {
+            const key = TRACK_TYPE.VIDEO + ":" + i;
+            const cfg = vConfigs[i] || {};
+            layout.push({
+                type: TRACK_TYPE.VIDEO,
+                label: cfg.name || (videoLanes > 1 ? `V${i + 1}` : "Video"),
+                customName: cfg.name || "",
+                laneIndex: i,
+                collapsed: oldCollapsed[key] ?? false,
+                color: cfg.color || LANE_PALETTE[i % LANE_PALETTE.length],
+                locked: cfg.locked || false,
+                hidden: cfg.hidden || false,
+            });
+        }
+
+        // Audio lanes: lowest index at top
+        for (let i = 0; i < audioLanes; i++) {
+            const key = TRACK_TYPE.AUDIO + ":" + i;
+            const cfg = aConfigs[i] || {};
+            layout.push({
+                type: TRACK_TYPE.AUDIO,
+                label: cfg.name || (audioLanes > 1 ? `A${i + 1}` : "Audio"),
+                customName: cfg.name || "",
+                laneIndex: i,
+                collapsed: oldCollapsed[key] ?? false,
+                color: cfg.color || LANE_PALETTE[i % LANE_PALETTE.length],
+                locked: cfg.locked || false,
+                hidden: cfg.hidden || false,
+            });
+        }
+
+        // Fixed rows (no lock/hide/color)
+        layout.push({
+            type: TRACK_TYPE.GUIDES,
+            label: "Guides",
+            customName: "",
+            laneIndex: 0,
+            collapsed: oldCollapsed[TRACK_TYPE.GUIDES + ":0"] ?? false,
+            color: "",
+            locked: false,
+            hidden: false,
+        });
+        layout.push({
+            type: TRACK_TYPE.PROMPT,
+            label: "Prompt",
+            customName: "",
+            laneIndex: 0,
+            collapsed: oldCollapsed[TRACK_TYPE.PROMPT + ":0"] ?? false,
+            color: "",
+            locked: false,
+            hidden: false,
+        });
+
+        this._trackLayout = layout;
+    }
+
+    /** Find layout index for a video lane */
+    _videoLaneLayoutIdx(laneIndex) {
+        return this._trackLayout.findIndex(
+            e => e.type === TRACK_TYPE.VIDEO && e.laneIndex === laneIndex
+        );
+    }
+
+    /** Find layout index for an audio lane */
+    _audioLaneLayoutIdx(laneIndex) {
+        return this._trackLayout.findIndex(
+            e => e.type === TRACK_TYPE.AUDIO && e.laneIndex === laneIndex
+        );
+    }
+
+    /** Find layout index for guides */
+    _guidesLayoutIdx() {
+        return this._trackLayout.findIndex(e => e.type === TRACK_TYPE.GUIDES);
+    }
+
+    /** Find layout index for prompt */
+    _promptLayoutIdx() {
+        return this._trackLayout.findIndex(e => e.type === TRACK_TYPE.PROMPT);
+    }
+
+    /** Get y offset of a layout index accounting for collapsed tracks */
+    _trackY(layoutIdx) {
         let y = RULER_HEIGHT;
-        for (let i = 0; i < trackIdx; i++) {
-            y += this._collapsedTracks[i] ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
+        for (let i = 0; i < layoutIdx; i++) {
+            y += this._trackLayout[i]?.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
         }
         return y;
     }
 
-    /** Get height of a track accounting for collapsed state */
-    _trackH(trackIdx) {
-        return this._collapsedTracks[trackIdx] ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
+    /** Get height of a layout index accounting for collapsed state */
+    _trackH(layoutIdx) {
+        const entry = this._trackLayout[layoutIdx];
+        return entry?.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
     }
 
     /** Total height of all tracks */
     _totalTracksHeight() {
         let h = 0;
-        for (let i = 0; i < 4; i++) {
-            h += this._collapsedTracks[i] ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
+        for (const entry of this._trackLayout) {
+            h += entry.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
         }
         return h;
     }
@@ -1118,24 +1225,81 @@ export class EditorWidget {
     }
 
     _drawTracks(ctx, width) {
-        for (let i = 0; i < TRACK_NAMES.length; i++) {
+        const headerW = this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH;
+        const fs = this.isFullscreen;
+        for (let i = 0; i < this._trackLayout.length; i++) {
+            const entry = this._trackLayout[i];
             const y = this._trackY(i);
             const h = this._trackH(i);
-            const collapsed = this._collapsedTracks[i];
+            const collapsed = entry.collapsed;
+            const isLane = entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO;
+
+            // Track background
             ctx.fillStyle = i % 2 === 0 ? COLORS.track : COLORS.bg;
             ctx.fillRect(0, y, width, h);
 
-            // Track label
-            ctx.fillStyle = collapsed ? "#555" : COLORS.textDim;
-            ctx.font = this.isFullscreen ? "11px sans-serif" : "9px sans-serif";
-            ctx.textAlign = "left";
-            const labelX = this.isFullscreen ? 8 : 4;
-            const arrow = collapsed ? "▸" : "▾";
-            if (!collapsed) {
-                ctx.fillText(`${arrow} ${TRACK_NAMES[i]}`, labelX, y + h / 2 + 3);
-            } else {
+            if (collapsed) {
+                // Collapsed: just arrow + short label
+                ctx.fillStyle = "#555";
                 ctx.font = "7px sans-serif";
-                ctx.fillText(`${arrow} ${TRACK_NAMES[i]}`, labelX, y + h / 2 + 2);
+                ctx.textAlign = "left";
+                ctx.fillText(`▸ ${entry.label}`, fs ? 6 : 3, y + h / 2 + 2);
+            } else {
+                // --- Header layout (left to right) ---
+                // Positions scale with fullscreen
+                const arrowX = fs ? 6 : 3;
+                const iconSize = fs ? 14 : 11;
+                let curX = arrowX;
+
+                // 1. Collapse arrow
+                ctx.fillStyle = COLORS.textDim;
+                ctx.font = `${iconSize}px sans-serif`;
+                ctx.textAlign = "left";
+                ctx.fillText("▾", curX, y + h / 2 + (fs ? 5 : 4));
+                curX += iconSize + 2;
+
+                if (isLane) {
+                    // 2. Lock icon — bright red-orange when locked, dim when unlocked
+                    if (entry.locked) {
+                        // Draw bright background indicator for locked state
+                        ctx.fillStyle = "rgba(255, 80, 60, 0.3)";
+                        ctx.fillRect(curX - 1, y + 2, iconSize + 1, h - 4);
+                    }
+                    ctx.fillStyle = entry.locked ? "#ff5544" : "#666";
+                    ctx.font = `${iconSize - 2}px sans-serif`;
+                    ctx.fillText(entry.locked ? "🔒" : "🔓", curX, y + h / 2 + (fs ? 4 : 3));
+                    curX += iconSize + 1;
+
+                    // 3. Hide/Mute icon
+                    if (entry.type === TRACK_TYPE.VIDEO) {
+                        ctx.fillStyle = entry.hidden ? "#e05050" : "#555";
+                        ctx.fillText(entry.hidden ? "🚫" : "👁", curX, y + h / 2 + (fs ? 4 : 3));
+                    } else {
+                        ctx.fillStyle = entry.hidden ? "#e05050" : "#555";
+                        ctx.fillText(entry.hidden ? "🔇" : "🔊", curX, y + h / 2 + (fs ? 4 : 3));
+                    }
+                    curX += iconSize + 1;
+
+                    // 4. Color bar
+                    if (entry.color) {
+                        ctx.fillStyle = entry.color;
+                        ctx.fillRect(curX, y + 2, 4, h - 4);
+                    }
+                    curX += 7;
+                }
+
+                // 5. Label
+                ctx.fillStyle = isLane && entry.hidden ? "#666" : COLORS.textDim;
+                ctx.font = fs ? "10px sans-serif" : "8px sans-serif";
+                ctx.textAlign = "left";
+                const labelText = entry.label;
+                const maxLabelW = headerW - curX - 2;
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(curX, y, maxLabelW, h);
+                ctx.clip();
+                ctx.fillText(labelText, curX, y + h / 2 + (fs ? 3 : 3));
+                ctx.restore();
             }
 
             // Border
@@ -1172,11 +1336,12 @@ export class EditorWidget {
 
     _drawGuideMarkers(ctx, width) {
         if (!this.activeScene) return;
-        if (this._collapsedTracks[2]) return; // Guides track collapsed
+        const gi = this._guidesLayoutIdx();
+        if (gi < 0 || this._trackLayout[gi].collapsed) return;
 
         const guides = this.activeScene.guide_frames || [];
-        const y = this._trackY(2);
-        const h = this._trackH(2);
+        const y = this._trackY(gi);
+        const h = this._trackH(gi);
 
         for (const guide of guides) {
             let idx = guide._previewFrameIndex ?? guide.frame_index;
@@ -1228,11 +1393,15 @@ export class EditorWidget {
             ctx.globalAlpha = 1.0;
         };
 
-        // Video clips (track 0)
-        if (!this._collapsedTracks[0]) {
-            const clips = this.activeScene.clips || [];
-            const videoY = this._trackY(0);
-            const videoH = this._trackH(0);
+        // Video clips (all video lanes)
+        const allClips = this.activeScene.clips || [];
+        for (let _vli = 0; _vli < this._trackLayout.length; _vli++) {
+            const _vlEntry = this._trackLayout[_vli];
+            if (_vlEntry.type !== TRACK_TYPE.VIDEO || _vlEntry.collapsed) continue;
+            const videoY = this._trackY(_vli);
+            const videoH = this._trackH(_vli);
+            const laneHidden = _vlEntry.hidden;
+            const clips = allClips.filter(c => (c.track_index || 0) === _vlEntry.laneIndex);
             for (const clip of clips) {
                 const x1 = this._frameToX(clip.timeline_start_frame);
                 const x2 = this._frameToX(clip.timeline_end_frame);
@@ -1240,7 +1409,8 @@ export class EditorWidget {
 
                 const isSelectedClip = this._isSelected("clip", clip.clip_id);
                 const opacity = clip.opacity ?? 1.0;
-                ctx.globalAlpha = opacity < 1.0 ? Math.max(0.3, opacity) : 1.0;
+                const baseAlpha = laneHidden ? 0.3 : (opacity < 1.0 ? Math.max(0.3, opacity) : 1.0);
+                ctx.globalAlpha = baseAlpha;
 
                 // Draw base fill
                 ctx.fillStyle = isSelectedClip ? COLORS.clipSelected : COLORS.clip;
@@ -1277,12 +1447,23 @@ export class EditorWidget {
                                           x1 + 1 + px, videoY + 2, drawW, destH);
                         }
 
-                        // Tint overlay to maintain clip color
-                        const tint = isSelectedClip ? "rgba(58,124,165,0.35)" : "rgba(58,124,165,0.2)";
-                        ctx.fillStyle = tint;
-                        ctx.fillRect(x1 + 1, videoY + 2, destW, destH);
+                        // Tint overlay — use lane color if available, fallback to default blue
+                        const lc = _vlEntry.color || "#3a7ca5";
+                        const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
+                        const tintAlpha = isSelectedClip ? 0.4 : 0.25;
+                        ctx.fillStyle = `rgba(${r},${g},${b},${tintAlpha})`;
+                        ctx.fillRect(x1 + 1, videoY + 2, clipPixelW, destH);
                         ctx.restore();
                     }
+                } else if (_vlEntry.color) {
+                    // No thumbnail — apply lane color tint directly on base fill
+                    const lc = _vlEntry.color;
+                    const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
+                    const prevAlpha = ctx.globalAlpha;
+                    ctx.globalAlpha = prevAlpha * 0.25;
+                    ctx.fillStyle = `rgb(${r},${g},${b})`;
+                    ctx.fillRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
+                    ctx.globalAlpha = prevAlpha;
                 }
 
                 if (isSelectedClip) {
@@ -1290,7 +1471,7 @@ export class EditorWidget {
                     ctx.lineWidth = 1;
                     ctx.strokeRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
                 }
-                ctx.globalAlpha = 1.0;
+                ctx.globalAlpha = baseAlpha;
 
                 // Opacity visual: diagonal hash lines when opacity < 100%
                 if (opacity < 1.0) {
@@ -1345,13 +1526,18 @@ export class EditorWidget {
                 // Active trim drag ghost (during edge-drag)
                 if (this.dragType === "trimEdge") drawTrimGhost(clip, videoY, videoH, COLORS.clip);
             }
+            ctx.globalAlpha = 1.0;
         }
 
-        // Audio tracks (track 1)
-        if (!this._collapsedTracks[1]) {
-            const audioTracks = this.activeScene.audio_tracks || [];
-            const audioY = this._trackY(1);
-            const audioH = this._trackH(1);
+        // Audio tracks (all audio lanes)
+        const allAudioTracks = this.activeScene.audio_tracks || [];
+        for (let _ali = 0; _ali < this._trackLayout.length; _ali++) {
+            const _alEntry = this._trackLayout[_ali];
+            if (_alEntry.type !== TRACK_TYPE.AUDIO || _alEntry.collapsed) continue;
+            const audioY = this._trackY(_ali);
+            const audioH = this._trackH(_ali);
+            const audioLaneHidden = _alEntry.hidden;
+            const audioTracks = allAudioTracks.filter(a => (a.lane_index || 0) === _alEntry.laneIndex);
             for (const track of audioTracks) {
                 const x1 = this._frameToX(track.timeline_start_frame);
                 const x2 = this._frameToX(track.timeline_end_frame);
@@ -1359,7 +1545,8 @@ export class EditorWidget {
 
                 const isSelectedAudio = this._isSelected("audio", track.track_id);
                 const vol = track.volume ?? 1.0;
-                ctx.fillStyle = track.muted ? "#555" : (isSelectedAudio ? COLORS.audioClipSelected : COLORS.audioClip);
+                ctx.globalAlpha = audioLaneHidden ? 0.3 : 1.0;
+                ctx.fillStyle = (track.muted || audioLaneHidden) ? "#555" : (isSelectedAudio ? COLORS.audioClipSelected : COLORS.audioClip);
                 ctx.fillRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
 
                 // Waveform visualization
@@ -1401,6 +1588,17 @@ export class EditorWidget {
                         ctx.stroke();
                         ctx.restore();
                     }
+                }
+
+                // Lane color tint (over waveform)
+                if (_alEntry.color) {
+                    const lc = _alEntry.color;
+                    const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
+                    const prevAlpha = ctx.globalAlpha;
+                    ctx.globalAlpha = prevAlpha * 0.2;
+                    ctx.fillStyle = `rgb(${r},${g},${b})`;
+                    ctx.fillRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
+                    ctx.globalAlpha = prevAlpha;
                 }
 
                 if (isSelectedAudio) {
@@ -1452,13 +1650,15 @@ export class EditorWidget {
                 // Active trim drag ghost
                 if (this.dragType === "trimEdge") drawTrimGhost(track, audioY, audioH, COLORS.audioClip);
             }
+            ctx.globalAlpha = 1.0;
         }
 
-        // Prompt sections (track 3)
-        if (!this._collapsedTracks[3]) {
+        // Prompt sections
+        const pi = this._promptLayoutIdx();
+        if (pi >= 0 && !this._trackLayout[pi].collapsed) {
             const sections = this.activeScene.prompt_sections || [];
-            const promptY = this._trackY(3);
-            const promptH = this._trackH(3);
+            const promptY = this._trackY(pi);
+            const promptH = this._trackH(pi);
             for (let si = 0; si < sections.length; si++) {
                 const section = sections[si];
                 const x1 = this._frameToX(section.start_frame);
@@ -1548,57 +1748,90 @@ export class EditorWidget {
     }
 
     // ── Hit Testing ──────────────────────────────────────────────────
-    /** Hit-test track header area for collapse toggle (left 40px of each track) */
+    /** Hit-test track header area — returns { layoutIdx, zone } or null */
     _hitTestTrackHeader(x, y) {
-        const headerWidth = this.isFullscreen ? 50 : 35;
-        if (x > headerWidth) return -1;
-        for (let i = 0; i < 4; i++) {
+        const headerWidth = this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH;
+        if (x > headerWidth) return null;
+        const fs = this.isFullscreen;
+        const iconSize = fs ? 14 : 11;
+        for (let i = 0; i < this._trackLayout.length; i++) {
             const ty = this._trackY(i);
             const th = this._trackH(i);
-            if (y >= ty && y < ty + th) return i;
+            if (y >= ty && y < ty + th) {
+                const entry = this._trackLayout[i];
+                const isLane = entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO;
+                if (entry.collapsed || !isLane) {
+                    return { layoutIdx: i, zone: "collapse" };
+                }
+                // Zone detection (left to right) matching _drawTracks layout
+                const arrowX = fs ? 6 : 3;
+                let zoneEnd = arrowX + iconSize + 2;
+                if (x < zoneEnd) return { layoutIdx: i, zone: "collapse" };
+                zoneEnd += iconSize + 1;
+                if (x < zoneEnd) return { layoutIdx: i, zone: "lock" };
+                zoneEnd += iconSize + 1;
+                if (x < zoneEnd) return { layoutIdx: i, zone: "hide" };
+                return { layoutIdx: i, zone: "label" };
+            }
         }
-        return -1;
+        return null;
     }
 
     _hitTestClip(x, y) {
-        if (!this.activeScene || this._collapsedTracks[0]) return null;
+        if (!this.activeScene) return null;
         const clips = this.activeScene.clips || [];
-        const trackY = this._trackY(0);
-        const trackH = this._trackH(0);
-        if (y < trackY || y > trackY + trackH) return null;
 
-        for (const clip of clips) {
-            const x1 = this._frameToX(clip.timeline_start_frame);
-            const x2 = this._frameToX(clip.timeline_end_frame);
-            if (x >= x1 && x <= x2) {
-                return { type: "clip", id: clip.clip_id, data: clip };
+        for (let li = 0; li < this._trackLayout.length; li++) {
+            const entry = this._trackLayout[li];
+            if (entry.type !== TRACK_TYPE.VIDEO || entry.collapsed) continue;
+
+            const trackY = this._trackY(li);
+            const trackH = this._trackH(li);
+            if (y < trackY || y > trackY + trackH) continue;
+
+            for (const clip of clips) {
+                if ((clip.track_index || 0) !== entry.laneIndex) continue;
+                const x1 = this._frameToX(clip.timeline_start_frame);
+                const x2 = this._frameToX(clip.timeline_end_frame);
+                if (x >= x1 && x <= x2) {
+                    return { type: "clip", id: clip.clip_id, data: clip };
+                }
             }
         }
         return null;
     }
 
     _hitTestAudio(x, y) {
-        if (!this.activeScene || this._collapsedTracks[1]) return null;
+        if (!this.activeScene) return null;
         const tracks = this.activeScene.audio_tracks || [];
-        const trackY = this._trackY(1);
-        const trackH = this._trackH(1);
-        if (y < trackY || y > trackY + trackH) return null;
 
-        for (const track of tracks) {
-            const x1 = this._frameToX(track.timeline_start_frame);
-            const x2 = this._frameToX(track.timeline_end_frame);
-            if (x >= x1 && x <= x2) {
-                return { type: "audio", id: track.track_id, data: track };
+        for (let li = 0; li < this._trackLayout.length; li++) {
+            const entry = this._trackLayout[li];
+            if (entry.type !== TRACK_TYPE.AUDIO || entry.collapsed) continue;
+
+            const trackY = this._trackY(li);
+            const trackH = this._trackH(li);
+            if (y < trackY || y > trackY + trackH) continue;
+
+            for (const track of tracks) {
+                if ((track.lane_index || 0) !== entry.laneIndex) continue;
+                const x1 = this._frameToX(track.timeline_start_frame);
+                const x2 = this._frameToX(track.timeline_end_frame);
+                if (x >= x1 && x <= x2) {
+                    return { type: "audio", id: track.track_id, data: track };
+                }
             }
         }
         return null;
     }
 
     _hitTestGuide(x, y) {
-        if (!this.activeScene || this._collapsedTracks[2]) return null;
+        if (!this.activeScene) return null;
+        const gi = this._guidesLayoutIdx();
+        if (gi < 0 || this._trackLayout[gi].collapsed) return null;
         const guides = this.activeScene.guide_frames || [];
-        const trackY = this._trackY(2);
-        const trackH = this._trackH(2);
+        const trackY = this._trackY(gi);
+        const trackH = this._trackH(gi);
         if (y < trackY || y > trackY + trackH) return null;
 
         for (const guide of guides) {
@@ -1613,10 +1846,12 @@ export class EditorWidget {
     }
 
     _hitTestPrompt(x, y) {
-        if (!this.activeScene || this._collapsedTracks[3]) return null;
+        if (!this.activeScene) return null;
+        const pli = this._promptLayoutIdx();
+        if (pli < 0 || this._trackLayout[pli].collapsed) return null;
         const sections = this.activeScene.prompt_sections || [];
-        const trackY = this._trackY(3);
-        const trackH = this._trackH(3);
+        const trackY = this._trackY(pli);
+        const trackH = this._trackH(pli);
         if (y < trackY || y > trackY + trackH) return null;
 
         for (let i = 0; i < sections.length; i++) {
@@ -1640,12 +1875,15 @@ export class EditorWidget {
         const edgePx = 6;
         if (!this.activeScene) return null;
 
-        // Check clips (track 0)
-        if (!this._collapsedTracks[0]) {
-            const clipTrackY = this._trackY(0);
-            const clipTrackH = this._trackH(0);
+        // Check clips (all video lanes)
+        for (let li = 0; li < this._trackLayout.length; li++) {
+            const entry = this._trackLayout[li];
+            if (entry.type !== TRACK_TYPE.VIDEO || entry.collapsed) continue;
+            const clipTrackY = this._trackY(li);
+            const clipTrackH = this._trackH(li);
             if (y >= clipTrackY && y <= clipTrackY + clipTrackH) {
                 for (const clip of (this.activeScene.clips || [])) {
+                    if ((clip.track_index || 0) !== entry.laneIndex) continue;
                     const x1 = this._frameToX(clip.timeline_start_frame);
                     const x2 = this._frameToX(clip.timeline_end_frame);
                     if (Math.abs(x - x1) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "left" };
@@ -1654,12 +1892,15 @@ export class EditorWidget {
             }
         }
 
-        // Check audio tracks (track 1)
-        if (!this._collapsedTracks[1]) {
-            const audioTrackY = this._trackY(1);
-            const audioTrackH = this._trackH(1);
+        // Check audio tracks (all audio lanes)
+        for (let li = 0; li < this._trackLayout.length; li++) {
+            const entry = this._trackLayout[li];
+            if (entry.type !== TRACK_TYPE.AUDIO || entry.collapsed) continue;
+            const audioTrackY = this._trackY(li);
+            const audioTrackH = this._trackH(li);
             if (y >= audioTrackY && y <= audioTrackY + audioTrackH) {
                 for (const track of (this.activeScene.audio_tracks || [])) {
+                    if ((track.lane_index || 0) !== entry.laneIndex) continue;
                     const x1 = this._frameToX(track.timeline_start_frame);
                     const x2 = this._frameToX(track.timeline_end_frame);
                     if (Math.abs(x - x1) < edgePx) return { type: "audio", id: track.track_id, data: track, edge: "left" };
@@ -1668,10 +1909,11 @@ export class EditorWidget {
             }
         }
 
-        // Check prompt sections (track 3)
-        if (!this._collapsedTracks[3]) {
-            const promptTrackY = this._trackY(3);
-            const promptTrackH = this._trackH(3);
+        // Check prompt sections
+        const pli = this._promptLayoutIdx();
+        if (pli >= 0 && !this._trackLayout[pli].collapsed) {
+            const promptTrackY = this._trackY(pli);
+            const promptTrackH = this._trackH(pli);
             if (y >= promptTrackY && y <= promptTrackY + promptTrackH) {
                 const sections = this.activeScene.prompt_sections || [];
                 for (let i = 0; i < sections.length; i++) {
@@ -1809,11 +2051,24 @@ export class EditorWidget {
                 this.dragType = "playhead";
                 if (this.isPlaying) this._stopPlayback();
                 this._renderViewportFrame();
-            } else if (this._hitTestTrackHeader(x, y) >= 0) {
-                // Click on track header = toggle collapse
-                const trackIdx = this._hitTestTrackHeader(x, y);
-                this._collapsedTracks[trackIdx] = !this._collapsedTracks[trackIdx];
+            } else if (this._hitTestTrackHeader(x, y)) {
+                const headerHit = this._hitTestTrackHeader(x, y);
+                const entry = this._trackLayout[headerHit.layoutIdx];
+                switch (headerHit.zone) {
+                    case "collapse":
+                        entry.collapsed = !entry.collapsed;
+                        break;
+                    case "lock":
+                        entry.locked = !entry.locked;
+                        this._saveLaneConfig();
+                        break;
+                    case "hide":
+                        entry.hidden = !entry.hidden;
+                        this._saveLaneConfig();
+                        break;
+                }
                 this._renderTimeline();
+                this._renderViewportFrame();
             } else {
                 // Selection is set only via I/O shortcuts — no mouse selection drag
                 if (this._razorMode) {
@@ -1827,6 +2082,9 @@ export class EditorWidget {
                     // Check if near clip/audio/prompt edges for trimming
                     const edgeHit = this._hitTestEdge(x, y);
                     if (edgeHit) {
+                        // Block trim on locked lanes
+                        if (edgeHit.type === "clip" && this._isLaneLocked(TRACK_TYPE.VIDEO, edgeHit.data.track_index || 0)) return;
+                        if (edgeHit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, edgeHit.data.lane_index || 0)) return;
                         this._pushUndo("trim");
                         const isPrompt = edgeHit.type === "prompt";
                         this._trimItem = {
@@ -1861,6 +2119,13 @@ export class EditorWidget {
                             this.selectedItem = hit;
                         }
                         this._hideItemEditor(); // Will show on mouseup if no drag
+                        // Block drag if any selected item is on a locked lane
+                        const anyLocked = this.selectedItems.some(s => {
+                            if (s.type === "clip") return this._isLaneLocked(TRACK_TYPE.VIDEO, s.data.track_index || 0);
+                            if (s.type === "audio") return this._isLaneLocked(TRACK_TYPE.AUDIO, s.data.lane_index || 0);
+                            return false;
+                        });
+                        if (anyLocked) return;
                         this._pushUndo("move items"); // Capture BEFORE drag modifies data
                         this.isDragging = true;
                         this.dragType = "moveItem";
@@ -1868,12 +2133,23 @@ export class EditorWidget {
                         this._lastSnappedDelta = 0; // Track snapped delta for commit
                         this._dragItemOrigStart = hit.data.timeline_start_frame ?? hit.data.start_frame ?? hit.data.frame_index ?? 0;
                         this._dragItemOrigEnd = hit.data.timeline_end_frame ?? hit.data.end_frame ?? this._dragItemOrigStart;
-                        // Store original positions for all selected items (group move)
+                        // Store original positions + lane info for all selected items (group move)
                         this._dragItemsOrig = this.selectedItems.map(s => ({
                             type: s.type, id: s.id, data: s.data,
                             origStart: s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0,
                             origEnd: s.data.timeline_end_frame ?? s.data.end_frame ?? (s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0),
+                            origLane: s.type === "clip" ? (s.data.track_index || 0) : (s.type === "audio" ? (s.data.lane_index || 0) : 0),
                         }));
+                        this._dragLaneChanged = false;
+                        // Snapshot ALL clip/audio lanes for swap preview
+                        this._origAllClipLanes = {};
+                        for (const c of (this.activeScene?.clips || [])) {
+                            this._origAllClipLanes[c.clip_id] = c.track_index || 0;
+                        }
+                        this._origAllAudioLanes = {};
+                        for (const a of (this.activeScene?.audio_tracks || [])) {
+                            this._origAllAudioLanes[a.track_id] = a.lane_index || 0;
+                        }
                     } else {
                         // Click on empty space — deselect all
                         this._clearSelection();
@@ -1965,13 +2241,67 @@ export class EditorWidget {
                         }
                     }
                 }
-                // Move all selected items by the same delta
+                // Detect lane from Y position for cross-lane drag
+                let hoverLaneType = null;
+                let hoverLaneIndex = -1;
+                for (let li = 0; li < this._trackLayout.length; li++) {
+                    const entry = this._trackLayout[li];
+                    const ty = this._trackY(li);
+                    const th = this._trackH(li);
+                    if (y >= ty && y < ty + th) {
+                        hoverLaneType = entry.type;
+                        hoverLaneIndex = entry.laneIndex;
+                        break;
+                    }
+                }
+
+                // Step 1: Restore ALL clips/audio to their original lanes
+                for (const c of (this.activeScene?.clips || [])) {
+                    if (this._origAllClipLanes && this._origAllClipLanes[c.clip_id] !== undefined) {
+                        c.track_index = this._origAllClipLanes[c.clip_id];
+                    }
+                }
+                for (const a of (this.activeScene?.audio_tracks || [])) {
+                    if (this._origAllAudioLanes && this._origAllAudioLanes[a.track_id] !== undefined) {
+                        a.lane_index = this._origAllAudioLanes[a.track_id];
+                    }
+                }
+
+                // Step 2: Determine dragged items' target lane
+                const draggedClipIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "clip").map(o => o.id));
+                const draggedAudioIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "audio").map(o => o.id));
+                this._dragLaneChanged = false;
+
+                // Step 3: Move all selected items + apply swap preview
                 for (const orig of (this._dragItemsOrig || [])) {
                     if (orig.type === "clip" || orig.type === "audio") {
                         const duration = orig.origEnd - orig.origStart;
                         const newStart = Math.max(0, orig.origStart + frameDelta);
                         orig.data.timeline_start_frame = newStart;
                         orig.data.timeline_end_frame = newStart + duration;
+                        // Lane swap preview
+                        if (orig.type === "clip" && hoverLaneType === TRACK_TYPE.VIDEO && hoverLaneIndex >= 0) {
+                            if (hoverLaneIndex !== orig.origLane) {
+                                orig.data.track_index = hoverLaneIndex;
+                                this._dragLaneChanged = true;
+                                // Swap: move all non-dragged clips on target lane to source lane
+                                for (const c of (this.activeScene?.clips || [])) {
+                                    if (!draggedClipIds.has(c.clip_id) && c.track_index === hoverLaneIndex) {
+                                        c.track_index = orig.origLane;
+                                    }
+                                }
+                            }
+                        } else if (orig.type === "audio" && hoverLaneType === TRACK_TYPE.AUDIO && hoverLaneIndex >= 0) {
+                            if (hoverLaneIndex !== orig.origLane) {
+                                orig.data.lane_index = hoverLaneIndex;
+                                this._dragLaneChanged = true;
+                                for (const a of (this.activeScene?.audio_tracks || [])) {
+                                    if (!draggedAudioIds.has(a.track_id) && a.lane_index === hoverLaneIndex) {
+                                        a.lane_index = orig.origLane;
+                                    }
+                                }
+                            }
+                        }
                     } else if (orig.type === "guide") {
                         const newIdx = Math.max(0, Math.min(this.totalFrames - 1, orig.origStart + frameDelta));
                         orig.data._previewFrameIndex = newIdx;
@@ -2003,7 +2333,7 @@ export class EditorWidget {
                 // Use the snapped delta (stored during mousemove), not raw mouse position
                 const frameDelta = this._lastSnappedDelta || 0;
 
-                if (frameDelta !== 0) {
+                if (frameDelta !== 0 || this._dragLaneChanged) {
                     this._commitItemMove(frameDelta);
                 } else {
                     // Click without drag = show properties editor (single item only)
@@ -2086,11 +2416,13 @@ export class EditorWidget {
             const rect = canvas.getBoundingClientRect();
             const x = e.clientX - rect.left;
             const y = e.clientY - rect.top;
-            const promptTrackY = this._trackY(3);
-
-            if (y >= promptTrackY && y <= promptTrackY + this._trackH(3)) {
-                const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
-                this._createPromptSection(frame);
+            const _pli = this._promptLayoutIdx();
+            if (_pli >= 0) {
+                const promptTrackY = this._trackY(_pli);
+                if (y >= promptTrackY && y <= promptTrackY + this._trackH(_pli)) {
+                    const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
+                    this._createPromptSection(frame);
+                }
             }
         });
 
@@ -2103,11 +2435,14 @@ export class EditorWidget {
             const y = e.clientY - rect.top;
 
             if (this._selectedPromptIdx !== null) {
-                const promptTrackY = this._trackY(3);
-                if (y < promptTrackY || y > promptTrackY + this._trackH(3)) {
-                    this._selectedPromptIdx = null;
-                    this._hidePromptEditor();
-                    this._renderTimeline();
+                const _pli2 = this._promptLayoutIdx();
+                if (_pli2 >= 0) {
+                    const promptTrackY = this._trackY(_pli2);
+                    if (y < promptTrackY || y > promptTrackY + this._trackH(_pli2)) {
+                        this._selectedPromptIdx = null;
+                        this._hidePromptEditor();
+                        this._renderTimeline();
+                    }
                 }
             }
         });
@@ -2123,6 +2458,37 @@ export class EditorWidget {
 
             const menuItems = [];
 
+            // Check for track header right-click (lane management)
+            const headerHit = this._hitTestTrackHeader(x, y);
+            if (headerHit) {
+                const entry = this._trackLayout[headerHit.layoutIdx];
+                if (entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO) {
+                    const isVideo = entry.type === TRACK_TYPE.VIDEO;
+                    const laneCount = isVideo
+                        ? (this.activeScene?.video_lane_count || 1)
+                        : (this.activeScene?.audio_lane_count || 1);
+                    const label = isVideo ? "Video" : "Audio";
+
+                    menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(headerHit.layoutIdx) });
+                    menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
+                    if (laneCount > 1) {
+                        // Only allow removing if lane is empty
+                        const hasItems = isVideo
+                            ? (this.activeScene?.clips || []).some(c => (c.track_index || 0) === entry.laneIndex)
+                            : (this.activeScene?.audio_tracks || []).some(a => (a.lane_index || 0) === entry.laneIndex);
+                        if (hasItems) {
+                            menuItems.push({ label: `Remove ${label} Lane (has items)`, action: () => {}, disabled: true });
+                        } else {
+                            menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
+                        }
+                    }
+                }
+                if (menuItems.length > 0) {
+                    this._showContextMenu(e.clientX, e.clientY, menuItems);
+                }
+                return;
+            }
+
             // Check for timeline item hits
             const hit = this._hitTestItem(x, y);
             if (hit) {
@@ -2132,20 +2498,25 @@ export class EditorWidget {
                 this._renderTimeline();
 
                 const count = this.selectedItems.length;
+                const itemLocked = (hit.type === "clip" && this._isLaneLocked(TRACK_TYPE.VIDEO, hit.data.track_index || 0))
+                    || (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0));
                 if (count > 1) {
-                    menuItems.push({ label: `Delete ${count} items`, action: () => this._deleteSelectedItems(), danger: true });
+                    menuItems.push({ label: `Delete ${count} items`, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "clip") {
-                    menuItems.push({ label: "Delete Clip", action: () => this._deleteSelectedItems(), danger: true });
+                    menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+                    menuItems.push({ label: itemLocked ? "Delete Clip (locked)" : "Delete Clip", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "audio") {
-                    menuItems.push({ label: "Delete Audio Track", action: () => this._deleteSelectedItems(), danger: true });
+                    menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+                    menuItems.push({ label: itemLocked ? "Delete Audio (locked)" : "Delete Audio Track", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "guide") {
                     menuItems.push({ label: "Delete Guide", action: () => this._deleteSelectedItems(), danger: true });
                 }
             }
 
             // Check prompt track
-            const promptTrackY = this._trackY(3);
-            if (y >= promptTrackY && y <= promptTrackY + this._trackH(3)) {
+            const _pli3 = this._promptLayoutIdx();
+            const promptTrackY = _pli3 >= 0 ? this._trackY(_pli3) : -1;
+            if (_pli3 >= 0 && y >= promptTrackY && y <= promptTrackY + this._trackH(_pli3)) {
                 const sections = this.activeScene?.prompt_sections || [];
                 const idx = sections.findIndex(s => frame >= s.start_frame && frame <= s.end_frame);
                 if (idx >= 0) {
@@ -2171,14 +2542,94 @@ export class EditorWidget {
         this._pushUndo("add asset");
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
-        // Determine drop target based on Y position AND asset type
-        // Track layout: Video (0), Audio (1), Guides (2), Prompt (3)
-        let trackIndex = -1;
+        // Determine drop target lane from Y position
+        let targetVideoLane = 0;
+        let targetAudioLane = 0;
         if (trackY !== undefined) {
-            for (let i = 0; i < 4; i++) {
+            for (let i = 0; i < this._trackLayout.length; i++) {
+                const entry = this._trackLayout[i];
                 const ty = this._trackY(i);
                 const th = this._trackH(i);
-                if (trackY >= ty && trackY < ty + th) { trackIndex = i; break; }
+                if (trackY >= ty && trackY < ty + th) {
+                    if (entry.type === TRACK_TYPE.VIDEO) targetVideoLane = entry.laneIndex;
+                    if (entry.type === TRACK_TYPE.AUDIO) targetAudioLane = entry.laneIndex;
+                    break;
+                }
+            }
+        }
+
+        // Block drop on locked lanes
+        if (this._isLaneLocked(TRACK_TYPE.VIDEO, targetVideoLane) || this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
+
+        // Auto-add lane if target lane has overlapping items at the drop frame
+        const _findAsset = (id) => {
+            for (const type of ["video", "image", "audio"]) {
+                const found = (this.assets[type] || []).find(a => a.asset_id === id);
+                if (found) return found;
+            }
+            return null;
+        };
+        if (asset.asset_type === "video") {
+            const assetObj = _findAsset(asset.asset_id);
+            const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
+            const dropEnd = frame + dropDuration;
+            const hasOverlap = (this.activeScene.clips || []).some(c =>
+                (c.track_index || 0) === targetVideoLane &&
+                c.timeline_start_frame < dropEnd && c.timeline_end_frame > frame
+            );
+            if (hasOverlap) {
+                // Auto-add a new video lane and place clip there
+                const newCount = (this.activeScene.video_lane_count || 1) + 1;
+                targetVideoLane = newCount - 1; // highest lane = top
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ video_lane_count: newCount }),
+                });
+                this.activeScene.video_lane_count = newCount;
+                this._buildTrackLayout();
+            }
+            // Also check audio overlap for dual video+audio drops (always check —
+            // server attempts dual_drop regardless, and has_audio may not be set yet)
+            {
+                const fps = this.fps || 24;
+                const audioDuration = dropDuration; // video duration = audio duration
+                const audioDropEnd = frame + audioDuration;
+                const hasAudioOverlap = (this.activeScene.audio_tracks || []).some(a =>
+                    (a.lane_index || 0) === targetAudioLane &&
+                    a.timeline_start_frame < audioDropEnd && a.timeline_end_frame > frame
+                );
+                if (hasAudioOverlap) {
+                    const newAudioCount = (this.activeScene.audio_lane_count || 1) + 1;
+                    targetAudioLane = newAudioCount - 1;
+                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                        method: "PUT",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ audio_lane_count: newAudioCount }),
+                    });
+                    this.activeScene.audio_lane_count = newAudioCount;
+                    this._buildTrackLayout();
+                }
+            }
+        } else if (asset.asset_type === "audio") {
+            const fps = this.fps || 24;
+            const assetObj = _findAsset(asset.asset_id);
+            const dropDuration = assetObj ? Math.max(1, Math.round((assetObj.duration_sec || 1) * fps)) : 30;
+            const dropEnd = frame + dropDuration;
+            const hasOverlap = (this.activeScene.audio_tracks || []).some(a =>
+                (a.lane_index || 0) === targetAudioLane &&
+                a.timeline_start_frame < dropEnd && a.timeline_end_frame > frame
+            );
+            if (hasOverlap) {
+                const newCount = (this.activeScene.audio_lane_count || 1) + 1;
+                targetAudioLane = newCount - 1;
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ audio_lane_count: newCount }),
+                });
+                this.activeScene.audio_lane_count = newCount;
+                this._buildTrackLayout();
             }
         }
 
@@ -2202,10 +2653,12 @@ export class EditorWidget {
                 }
                 console.log("[LTX Editor] Guide frame created at frame", frame);
             } else if (asset.asset_type === "video") {
-                // Drop video = create clip on Video track (+ audio track if video has audio)
+                // Drop video = create clip on target video lane (+ audio track if video has audio)
                 const clipBody = {
                     asset_id: asset.asset_id,
                     timeline_start_frame: frame,
+                    track_index: targetVideoLane,
+                    audio_lane_index: targetAudioLane,
                     dual_drop: true,  // Always attempt — server handles gracefully
                 };
                 resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
@@ -2218,13 +2671,14 @@ export class EditorWidget {
                     return;
                 }
             } else if (asset.asset_type === "audio") {
-                // Drop audio = create audio track
+                // Drop audio = create audio track on target audio lane
                 resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         asset_id: asset.asset_id,
                         timeline_start_frame: frame,
+                        lane_index: targetAudioLane,
                     }),
                 });
                 if (!resp.ok) {
@@ -2238,6 +2692,230 @@ export class EditorWidget {
             this._renderTimeline();
         } catch (e) {
             console.warn("[LTX Editor] Failed to drop asset:", e);
+        }
+    }
+
+    // ── Lane Management ────────────────────────────────────────────────
+    async _moveItemToNewLane(hit) {
+        if (!this.activeScene || !this.projectDir) return;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const sceneId = this.activeSceneId;
+        this._pushUndo("move to new lane");
+
+        try {
+            if (hit.type === "clip") {
+                // Add a new video lane and move clip there
+                const newCount = (this.activeScene.video_lane_count || 1) + 1;
+                const newLane = newCount - 1;
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ video_lane_count: newCount }),
+                });
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${hit.id}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ track_index: newLane }),
+                });
+            } else if (hit.type === "audio") {
+                const newCount = (this.activeScene.audio_lane_count || 1) + 1;
+                const newLane = newCount - 1;
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ audio_lane_count: newCount }),
+                });
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${hit.id}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ lane_index: newLane }),
+                });
+            }
+            await this._fetchScenes();
+            this._buildTrackLayout();
+            this._renderTimeline();
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to move item to new lane:", e);
+        }
+    }
+
+    /** Check if a lane is locked */
+    _isLaneLocked(type, laneIndex) {
+        const idx = type === TRACK_TYPE.VIDEO
+            ? this._videoLaneLayoutIdx(laneIndex)
+            : this._audioLaneLayoutIdx(laneIndex);
+        return idx >= 0 && this._trackLayout[idx]?.locked;
+    }
+
+    /** Check if a lane is hidden */
+    _isLaneHidden(type, laneIndex) {
+        const idx = type === TRACK_TYPE.VIDEO
+            ? this._videoLaneLayoutIdx(laneIndex)
+            : this._audioLaneLayoutIdx(laneIndex);
+        return idx >= 0 && this._trackLayout[idx]?.hidden;
+    }
+
+    /** Start inline rename for a lane header */
+    _startLaneRename(layoutIdx) {
+        const entry = this._trackLayout[layoutIdx];
+        const canvas = this.timelineCanvas;
+        const rect = canvas.getBoundingClientRect();
+        const headerW = this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH;
+        const ty = this._trackY(layoutIdx);
+        const th = this._trackH(layoutIdx);
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = entry.customName || "";
+        input.placeholder = entry.label;
+        input.style.cssText = `
+            position: fixed;
+            left: ${rect.left + 2}px;
+            top: ${rect.top + ty + 1}px;
+            width: ${headerW - 4}px;
+            height: ${th - 2}px;
+            font-size: 10px;
+            background: #333;
+            color: #fff;
+            border: 1px solid #5af;
+            padding: 0 3px;
+            z-index: 10001;
+            outline: none;
+            box-sizing: border-box;
+        `;
+
+        const finish = (save) => {
+            if (save) {
+                const newName = input.value.trim();
+                entry.customName = newName;
+                entry.label = newName || (entry.type === TRACK_TYPE.VIDEO
+                    ? ((this.activeScene?.video_lane_count || 1) > 1 ? `V${entry.laneIndex + 1}` : "Video")
+                    : ((this.activeScene?.audio_lane_count || 1) > 1 ? `A${entry.laneIndex + 1}` : "Audio"));
+                this._saveLaneConfig();
+                this._renderTimeline();
+            }
+            input.remove();
+        };
+
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); finish(true); }
+            else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+            e.stopPropagation();
+        });
+        input.addEventListener("blur", () => finish(true));
+
+        document.body.appendChild(input);
+        input.focus();
+        input.select();
+    }
+
+    /** Persist lane configs (lock/hide/name/color) to server from current _trackLayout */
+    async _saveLaneConfig() {
+        if (!this.activeScene || !this.projectDir) return;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const videoConfigs = [];
+        const audioConfigs = [];
+        for (const e of this._trackLayout) {
+            if (e.type === TRACK_TYPE.VIDEO) {
+                videoConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
+            } else if (e.type === TRACK_TYPE.AUDIO) {
+                audioConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
+            }
+        }
+        // Fill any sparse gaps
+        for (let i = 0; i < videoConfigs.length; i++) if (!videoConfigs[i]) videoConfigs[i] = { name: "", color: "", locked: false, hidden: false };
+        for (let i = 0; i < audioConfigs.length; i++) if (!audioConfigs[i]) audioConfigs[i] = { name: "", color: "", locked: false, hidden: false };
+        try {
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ video_lane_configs: videoConfigs, audio_lane_configs: audioConfigs }),
+            });
+            // Update local scene data
+            if (this.activeScene) {
+                this.activeScene.video_lane_configs = videoConfigs;
+                this.activeScene.audio_lane_configs = audioConfigs;
+            }
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to save lane config:", e);
+        }
+    }
+
+    async _addLane(trackType) {
+        if (!this.activeScene || !this.projectDir) return;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const isVideo = trackType === TRACK_TYPE.VIDEO;
+        const body = {};
+        if (isVideo) {
+            body.video_lane_count = (this.activeScene.video_lane_count || 1) + 1;
+        } else {
+            body.audio_lane_count = (this.activeScene.audio_lane_count || 1) + 1;
+        }
+        try {
+            this._pushUndo("add lane");
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            await this._fetchScenes();
+            this._buildTrackLayout();
+            this._renderTimeline();
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to add lane:", e);
+        }
+    }
+
+    async _removeLane(trackType, laneIndex) {
+        if (!this.activeScene || !this.projectDir) return;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const isVideo = trackType === TRACK_TYPE.VIDEO;
+        const currentCount = isVideo
+            ? (this.activeScene.video_lane_count || 1)
+            : (this.activeScene.audio_lane_count || 1);
+        if (currentCount <= 1) return;
+
+        // Shift items on higher lanes down
+        const body = {};
+        if (isVideo) {
+            body.video_lane_count = currentCount - 1;
+        } else {
+            body.audio_lane_count = currentCount - 1;
+        }
+        try {
+            this._pushUndo("remove lane");
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            // Shift items on lanes above the removed one
+            if (isVideo) {
+                for (const clip of (this.activeScene.clips || [])) {
+                    if ((clip.track_index || 0) > laneIndex) {
+                        await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/clips/${clip.clip_id}`), {
+                            method: "PUT",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ track_index: clip.track_index - 1 }),
+                        });
+                    }
+                }
+            } else {
+                for (const track of (this.activeScene.audio_tracks || [])) {
+                    if ((track.lane_index || 0) > laneIndex) {
+                        await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks/${track.track_id}`), {
+                            method: "PUT",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ lane_index: track.lane_index - 1 }),
+                        });
+                    }
+                }
+            }
+            await this._fetchScenes();
+            this._buildTrackLayout();
+            this._renderTimeline();
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to remove lane:", e);
         }
     }
 
@@ -2747,21 +3425,63 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
 
         try {
+            // Lane swap: use original lane snapshots to find items that need swapping
+            const draggedClipIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "clip").map(o => o.id));
+            const draggedAudioIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "audio").map(o => o.id));
+            const origClipLanes = this._origAllClipLanes || {};
+            const origAudioLanes = this._origAllAudioLanes || {};
+
+            for (const orig of (this._dragItemsOrig || [])) {
+                if (orig.type === "clip") {
+                    const newLane = orig.data.track_index || 0;
+                    if (newLane !== orig.origLane) {
+                        // Swap: all non-dragged clips originally on targetLane → origLane
+                        for (const c of (this.activeScene.clips || [])) {
+                            if (!draggedClipIds.has(c.clip_id) && (origClipLanes[c.clip_id] ?? 0) === newLane) {
+                                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${c.clip_id}`), {
+                                    method: "PUT",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ track_index: orig.origLane }),
+                                });
+                            }
+                        }
+                    }
+                } else if (orig.type === "audio") {
+                    const newLane = orig.data.lane_index || 0;
+                    if (newLane !== orig.origLane) {
+                        for (const a of (this.activeScene.audio_tracks || [])) {
+                            if (!draggedAudioIds.has(a.track_id) && (origAudioLanes[a.track_id] ?? 0) === newLane) {
+                                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${a.track_id}`), {
+                                    method: "PUT",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ lane_index: orig.origLane }),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Now commit the dragged items themselves
             for (const orig of (this._dragItemsOrig || [])) {
                 const { type, id, data } = orig;
                 if (type === "clip") {
                     const newStart = Math.max(0, orig.origStart + frameDelta);
+                    const putBody = { timeline_start_frame: newStart };
+                    if (data.track_index !== undefined) putBody.track_index = data.track_index;
                     await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`), {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ timeline_start_frame: newStart }),
+                        body: JSON.stringify(putBody),
                     });
                 } else if (type === "audio") {
                     const newStart = Math.max(0, orig.origStart + frameDelta);
+                    const putBody = { timeline_start_frame: newStart };
+                    if (data.lane_index !== undefined) putBody.lane_index = data.lane_index;
                     await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`), {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ timeline_start_frame: newStart }),
+                        body: JSON.stringify(putBody),
                     });
                 } else if (type === "guide") {
                     const oldIdx = orig.origStart;
@@ -2857,6 +3577,9 @@ export class EditorWidget {
         if (!this.projectDir || !this.activeScene) return;
         if (hit.type !== "clip" && hit.type !== "audio") return;
         if (frame <= hit.data.timeline_start_frame || frame >= hit.data.timeline_end_frame) return;
+        // Block split on locked lanes
+        if (hit.type === "clip" && this._isLaneLocked(TRACK_TYPE.VIDEO, hit.data.track_index || 0)) return;
+        if (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0)) return;
 
         this._pushUndo(`split ${hit.type}`);
         const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -2893,16 +3616,19 @@ export class EditorWidget {
         for (const item of items) {
             const row = document.createElement("div");
             row.textContent = item.label;
+            const isDisabled = item.disabled;
             row.style.cssText = `
-                padding: 6px 14px; cursor: pointer;
-                color: ${item.danger ? "#f66" : "#ddd"};
+                padding: 6px 14px; cursor: ${isDisabled ? "default" : "pointer"};
+                color: ${isDisabled ? "#666" : (item.danger ? "#f66" : "#ddd")};
             `;
-            row.addEventListener("mouseenter", () => row.style.background = "#3a3a3a");
-            row.addEventListener("mouseleave", () => row.style.background = "transparent");
-            row.addEventListener("click", () => {
-                this._hideContextMenu();
-                item.action();
-            });
+            if (!isDisabled) {
+                row.addEventListener("mouseenter", () => row.style.background = "#3a3a3a");
+                row.addEventListener("mouseleave", () => row.style.background = "transparent");
+                row.addEventListener("click", () => {
+                    this._hideContextMenu();
+                    item.action();
+                });
+            }
             menu.appendChild(row);
         }
 
@@ -3353,7 +4079,13 @@ export class EditorWidget {
             if (key === "Delete" || key === "Backspace") {
                 consume(); // Always consume Delete/Backspace to prevent ComfyUI node deletion
                 if (this.selectedItems.length > 0) {
-                    this._deleteSelectedItems();
+                    // Filter out locked-lane items before delete
+                    this.selectedItems = this.selectedItems.filter(s => {
+                        if (s.type === "clip") return !this._isLaneLocked(TRACK_TYPE.VIDEO, s.data.track_index || 0);
+                        if (s.type === "audio") return !this._isLaneLocked(TRACK_TYPE.AUDIO, s.data.lane_index || 0);
+                        return true;
+                    });
+                    if (this.selectedItems.length > 0) this._deleteSelectedItems();
                 }
                 return;
             }
@@ -3717,12 +4449,25 @@ export class EditorWidget {
 
     _getClipAtFrame(frame) {
         if (!this.activeScene?.clips) return null;
+        let best = null;
         for (const clip of this.activeScene.clips) {
             if (frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame) {
-                return clip;
+                if (this._isLaneHidden(TRACK_TYPE.VIDEO, clip.track_index || 0)) continue;
+                if (!best || (clip.track_index || 0) > (best.track_index || 0)) {
+                    best = clip;
+                }
             }
         }
-        return null;
+        return best;
+    }
+
+    /** Get all non-hidden clips at a given frame, sorted bottom-up (lowest track_index first) */
+    _getClipsAtFrame(frame) {
+        if (!this.activeScene?.clips) return [];
+        return this.activeScene.clips
+            .filter(clip => frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame)
+            .filter(clip => !this._isLaneHidden(TRACK_TYPE.VIDEO, clip.track_index || 0))
+            .sort((a, b) => (a.track_index || 0) - (b.track_index || 0));
     }
 
     _getAudioAtFrame(frame) {
@@ -3739,6 +4484,7 @@ export class EditorWidget {
         if (!this.activeScene?.audio_tracks) return [];
         return this.activeScene.audio_tracks.filter(
             a => frame >= a.timeline_start_frame && frame < a.timeline_end_frame
+                && !this._isLaneHidden(TRACK_TYPE.AUDIO, a.lane_index || 0)
         );
     }
 
@@ -3754,9 +4500,9 @@ export class EditorWidget {
     _getOrCreateVideo(sourcePath) {
         if (this._videoCache[sourcePath]) return this._videoCache[sourcePath];
 
-        // LRU eviction: max 5 cached videos
+        // LRU eviction: max 8 cached videos (increased for multi-layer compositing)
         const keys = Object.keys(this._videoCache).filter(k => !k.startsWith("guide_"));
-        if (keys.length >= 5) {
+        if (keys.length >= 8) {
             const oldest = keys[0];
             const old = this._videoCache[oldest];
             old.pause();
@@ -3842,9 +4588,9 @@ export class EditorWidget {
             return;
         }
 
-        const clip = this._getClipAtFrame(this.playhead);
+        const clips = this._getClipsAtFrame(this.playhead);
 
-        if (!clip) {
+        if (clips.length === 0) {
             // No clip and no guide — show frame number centered
             ctx.fillStyle = "#000";
             ctx.fillRect(0, 0, w, h);
@@ -3856,40 +4602,103 @@ export class EditorWidget {
             return;
         }
 
-        // Video clip rendering
-        const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
-        const sourceTime = sourceFrame / this.fps;
-        this._viewportClipOpacity = clip.opacity ?? 1.0;
+        // Single clip: use existing fast path
+        if (clips.length === 1) {
+            const clip = clips[0];
+            const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
+            const sourceTime = sourceFrame / this.fps;
+            this._viewportClipOpacity = clip.opacity ?? 1.0;
 
-        const video = this._getOrCreateVideo(clip.source_path);
-        if (!video) return;
+            const video = this._getOrCreateVideo(clip.source_path);
+            if (!video) return;
 
-        if (video.readyState >= 2) {
-            if (this.isPlaying) {
-                // During playback — draw current video frame (no seeking)
-                this._drawVideoToCanvas(video);
+            if (video.readyState >= 2) {
+                if (this.isPlaying) {
+                    this._drawVideoToCanvas(video);
+                } else {
+                    this._seekVideoAndDraw(video, sourceTime);
+                }
             } else {
-                // Scrubbing — seek and draw
-                this._seekVideoAndDraw(video, sourceTime);
+                ctx.fillStyle = "#000";
+                ctx.fillRect(0, 0, w, h);
+                ctx.fillStyle = "rgba(255,255,255,0.3)";
+                ctx.font = "14px sans-serif";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText("Loading video...", w / 2, h / 2);
+
+                const onReady = () => {
+                    video.removeEventListener("canplay", onReady);
+                    video.removeEventListener("loadeddata", onReady);
+                    this._renderViewportFrame();
+                };
+                video.addEventListener("canplay", onReady);
+                video.addEventListener("loadeddata", onReady);
             }
-        } else {
-            // Still loading — show loading text
+            return;
+        }
+
+        // Multi-layer compositing: multiple clips at this frame
+        if (this.isPlaying) {
+            // During playback — draw all layers using current video frame positions
             ctx.fillStyle = "#000";
             ctx.fillRect(0, 0, w, h);
-            ctx.fillStyle = "rgba(255,255,255,0.3)";
-            ctx.font = "14px sans-serif";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            ctx.fillText("Loading video...", w / 2, h / 2);
+            for (const clip of clips) {
+                const video = this._getOrCreateVideo(clip.source_path);
+                if (!video || video.readyState < 2) continue;
+                const opacity = clip.opacity ?? 1.0;
+                if (opacity <= 0) continue;
+                this._drawVideoToCanvasRaw(video, ctx, w, h, opacity);
+            }
+        } else {
+            // Scrubbing — seek all videos then composite
+            this._renderViewportComposite(this.playhead, clips);
+        }
+    }
 
-            // Retry when loaded — seek to correct position
-            const onReady = () => {
-                video.removeEventListener("canplay", onReady);
-                video.removeEventListener("loadeddata", onReady);
-                this._renderViewportFrame();
-            };
-            video.addEventListener("canplay", onReady);
-            video.addEventListener("loadeddata", onReady);
+    /** Multi-layer composite rendering (scrub mode) */
+    async _renderViewportComposite(frame, clips) {
+        const ctx = this._vpCtx;
+        const w = this._vpCanvas.width;
+        const h = this._vpCanvas.height;
+
+        // Cancel any previous seek
+        if (this._seekAbort) {
+            this._seekAbort();
+            this._seekAbort = null;
+        }
+
+        let cancelled = false;
+        this._seekAbort = () => { cancelled = true; };
+
+        // Pre-seek all videos in parallel
+        const seekPromises = clips.map(clip => {
+            const video = this._getOrCreateVideo(clip.source_path);
+            if (!video || video.readyState < 2) return Promise.resolve(null);
+            const sourceFrame = frame - clip.timeline_start_frame + (clip.source_in_frame || 0);
+            const targetTime = sourceFrame / this.fps;
+            if (Math.abs(video.currentTime - targetTime) < 0.02) return Promise.resolve(video);
+            return new Promise(resolve => {
+                const handler = () => { video.removeEventListener("seeked", handler); resolve(video); };
+                video.addEventListener("seeked", handler);
+                video.currentTime = targetTime;
+            });
+        });
+
+        const videos = await Promise.all(seekPromises);
+        if (cancelled) return;
+        this._seekAbort = null;
+
+        // Clear + draw all layers
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, w, h);
+
+        for (let i = 0; i < clips.length; i++) {
+            const video = videos[i];
+            if (!video) continue;
+            const opacity = clips[i].opacity ?? 1.0;
+            if (opacity <= 0) continue;
+            this._drawVideoToCanvasRaw(video, ctx, w, h, opacity);
         }
     }
 
@@ -4036,6 +4845,25 @@ export class EditorWidget {
         if (opacity < 1.0) ctx.globalAlpha = 1.0;
     }
 
+    /** Draw video to canvas WITHOUT clearing — for multi-layer compositing */
+    _drawVideoToCanvasRaw(video, ctx, cw, ch, opacity) {
+        const vw = video.videoWidth || cw;
+        const vh = video.videoHeight || ch;
+        const vAspect = vw / vh;
+        const cAspect = cw / ch;
+
+        let dx, dy, dw, dh;
+        if (vAspect > cAspect) {
+            dw = cw; dh = cw / vAspect; dx = 0; dy = (ch - dh) / 2;
+        } else {
+            dh = ch; dw = ch * vAspect; dx = (cw - dw) / 2; dy = 0;
+        }
+
+        if (opacity < 1.0) ctx.globalAlpha = opacity;
+        try { ctx.drawImage(video, dx, dy, dw, dh); } catch (e) {}
+        if (opacity < 1.0) ctx.globalAlpha = 1.0;
+    }
+
     _updateTransportUI() {
         if (this._vpFrameCounter) {
             if (this._timecodeMode === "timecode") {
@@ -4076,48 +4904,48 @@ export class EditorWidget {
             this._seekAbort = null;
         }
 
-        // Start video element for current clip
-        const clip = this._getClipAtFrame(this.playhead);
-        if (clip) {
+        // Start video elements for all visible clips at current frame
+        const visibleClips = this._getClipsAtFrame(this.playhead);
+        this._activePlaybackVideos = [];
+        for (const clip of visibleClips) {
             const video = this._getOrCreateVideo(clip.source_path);
-            if (video) {
-                const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
-                const sourceTime = sourceFrame / this.fps;
-                video.muted = true;
+            if (!video) continue;
+            const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
+            const sourceTime = sourceFrame / this.fps;
+            video.muted = true;
 
-                const startVideoPlayback = () => {
-                    // Use seeked event to ensure we start from the right position
-                    const onSeeked = () => {
-                        video.removeEventListener("seeked", onSeeked);
-                        video.play().catch(() => {});
-                    };
-                    if (Math.abs(video.currentTime - sourceTime) > 0.01) {
-                        video.addEventListener("seeked", onSeeked);
-                        video.currentTime = sourceTime;
-                        // Also try playing after a short delay as fallback
-                        setTimeout(() => {
-                            video.removeEventListener("seeked", onSeeked);
-                            video.play().catch(() => {});
-                        }, 200);
-                    } else {
-                        video.play().catch(() => {});
-                    }
-                    this._activePlaybackVideo = video;
+            const startVideoPlayback = (v) => {
+                const onSeeked = () => {
+                    v.removeEventListener("seeked", onSeeked);
+                    v.play().catch(() => {});
                 };
-
-                if (video.readyState >= 2) {
-                    startVideoPlayback();
+                if (Math.abs(v.currentTime - sourceTime) > 0.01) {
+                    v.addEventListener("seeked", onSeeked);
+                    v.currentTime = sourceTime;
+                    setTimeout(() => {
+                        v.removeEventListener("seeked", onSeeked);
+                        v.play().catch(() => {});
+                    }, 200);
                 } else {
-                    const onReady = () => {
-                        video.removeEventListener("canplay", onReady);
-                        video.removeEventListener("loadeddata", onReady);
-                        startVideoPlayback();
-                    };
-                    video.addEventListener("canplay", onReady);
-                    video.addEventListener("loadeddata", onReady);
+                    v.play().catch(() => {});
                 }
+            };
+
+            if (video.readyState >= 2) {
+                startVideoPlayback(video);
+            } else {
+                const onReady = () => {
+                    video.removeEventListener("canplay", onReady);
+                    video.removeEventListener("loadeddata", onReady);
+                    startVideoPlayback(video);
+                };
+                video.addEventListener("canplay", onReady);
+                video.addEventListener("loadeddata", onReady);
             }
+            this._activePlaybackVideos.push(video);
         }
+        // Backward compat
+        this._activePlaybackVideo = this._activePlaybackVideos.length > 0 ? this._activePlaybackVideos[this._activePlaybackVideos.length - 1] : null;
 
         // Start audio tracks
         const audioTracks = this._getAudioTracksAtFrame(this.playhead);
@@ -4152,27 +4980,36 @@ export class EditorWidget {
         const prevFrame = this.playhead;
         this.playhead = newFrame;
 
-        // Detect clip boundary crossing
-        const prevClip = this._getClipAtFrame(prevFrame);
-        const currClip = this._getClipAtFrame(newFrame);
-        if (prevClip !== currClip) {
-            // Stop old video
-            if (this._activePlaybackVideo) {
-                this._activePlaybackVideo.pause();
-                this._activePlaybackVideo = null;
-            }
-            // Start new clip video
-            if (currClip) {
-                const video = this._getOrCreateVideo(currClip.source_path);
+        // Detect clip boundary crossing (multi-layer aware)
+        const prevClips = this._getClipsAtFrame(prevFrame);
+        const currClips = this._getClipsAtFrame(newFrame);
+        const prevPaths = new Set(prevClips.map(c => c.source_path));
+        const currPaths = new Set(currClips.map(c => c.source_path));
+
+        // Stop videos no longer visible
+        if (this._activePlaybackVideos) {
+            this._activePlaybackVideos = this._activePlaybackVideos.filter(v => {
+                const srcPath = Object.keys(this._videoCache).find(k => this._videoCache[k] === v);
+                if (srcPath && !currPaths.has(srcPath)) { v.pause(); return false; }
+                return true;
+            });
+        }
+
+        // Start newly visible clip videos
+        for (const clip of currClips) {
+            if (!prevPaths.has(clip.source_path)) {
+                const video = this._getOrCreateVideo(clip.source_path);
                 if (video && video.readyState >= 2) {
-                    const sf = newFrame - currClip.timeline_start_frame + (currClip.source_in_frame || 0);
+                    const sf = newFrame - clip.timeline_start_frame + (clip.source_in_frame || 0);
                     video.currentTime = sf / this.fps;
                     video.muted = true;
                     video.play().catch(() => {});
-                    this._activePlaybackVideo = video;
+                    if (!this._activePlaybackVideos) this._activePlaybackVideos = [];
+                    this._activePlaybackVideos.push(video);
                 }
             }
         }
+        this._activePlaybackVideo = this._activePlaybackVideos?.length > 0 ? this._activePlaybackVideos[this._activePlaybackVideos.length - 1] : null;
 
         // Draw current frame
         this._renderViewportFrame();
@@ -4189,7 +5026,11 @@ export class EditorWidget {
         this.isPlaying = false;
         if (this._vpPlayBtn) this._vpPlayBtn.textContent = "▶";
 
-        // Pause active video
+        // Pause active videos (multi-layer)
+        if (this._activePlaybackVideos) {
+            for (const v of this._activePlaybackVideos) v.pause();
+            this._activePlaybackVideos = [];
+        }
         if (this._activePlaybackVideo) {
             this._activePlaybackVideo.pause();
             this._activePlaybackVideo = null;
