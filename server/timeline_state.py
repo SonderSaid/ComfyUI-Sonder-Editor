@@ -288,6 +288,25 @@ class Scene:
             return 0
         return max(c.timeline_end_frame for c in self.clips)
 
+    def content_hash(self, selection_start: int = 0, selection_end: int = 0,
+                     resolution: tuple = (768, 512)) -> str:
+        """Deterministic hash of all state that affects rendered output."""
+        import hashlib
+        import json
+        data = {
+            "clips": [(c.source_path, c.timeline_start_frame, c.timeline_end_frame,
+                        c.source_in_frame, c.opacity, c.track_index)
+                       for c in self.clips],
+            "audio": [(a.source_path, a.timeline_start_frame, a.timeline_end_frame,
+                        a.source_in_frame, a.volume, a.muted, a.lane_index)
+                       for a in self.audio_tracks],
+            "hidden_video": [i for i, c in enumerate(self.video_lane_configs) if c.hidden],
+            "hidden_audio": [i for i, c in enumerate(self.audio_lane_configs) if c.hidden],
+            "sel": (selection_start, selection_end),
+            "res": resolution,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
     def get_prompt_at_frame(self, frame: int) -> str:
         """Return the prompt for a given frame. Falls back to scene-level prompt."""
         for section in self.prompt_sections:

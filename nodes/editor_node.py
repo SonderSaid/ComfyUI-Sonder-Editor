@@ -58,13 +58,14 @@ class LTXEditor:
     """
 
     CATEGORY = "LTX-Editor"
-    RETURN_TYPES = ("LTX_PROJECT", "IMAGE", "STRING", "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO")
+    RETURN_TYPES = ("LTX_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO")
     RETURN_NAMES = (
-        "project", "guide_images", "guide_indices", "prompt",
+        "project", "rendered_frames", "guide_images", "guide_indices", "prompt",
         "frame_count", "fps", "width", "height", "audio",
     )
     OUTPUT_TOOLTIPS = (
         "The project object. Connect to LTX Save Video.",
+        "Composited video frames from the timeline (all visible clips layered with opacity).",
         "Guide frame images as an IMAGE batch tensor. Connect to LTX guiders.",
         "Comma-separated frame indices for each guide image (e.g., '0,96').",
         "The prompt text for the selected timeline section.",
@@ -154,29 +155,40 @@ class LTXEditor:
         if scene_id:
             scene = proj.get_scene(scene_id)
 
-        # --- If no scene or no selection, return defaults ---
-        if not scene or selection_end <= selection_start:
-            # Return empty/default outputs
+        # --- If no scene, return defaults ---
+        if not scene:
             empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
             silent_audio = _make_silent_audio(1.0, 44100)
-            return (proj, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio)
+            return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio)
 
-        # --- Compute frame count ---
-        frame_count = selection_end - selection_start
+        # --- Determine render range ---
+        # If selection is set, use it; otherwise render the full scene
+        if selection_end > selection_start:
+            render_start = selection_start
+            render_end = selection_end
+        else:
+            render_start = 0
+            render_end = scene.duration_frames
+            if render_end <= 0:
+                empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+                silent_audio = _make_silent_audio(1.0, 44100)
+                return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio)
 
-        # --- Gather guide frames within selection ---
+        frame_count = render_end - render_start
+
+        # --- Render composited frames ---
+        rendered_frames = self._render_scene_frames(proj, scene, render_start, render_end)
+
+        # --- Gather guide frames within render range ---
         guide_images = []
         guide_indices = []
 
         for guide in scene.guide_frames:
             idx = guide.frame_index
-            # Resolve -1 to last frame
             if idx == -1:
                 idx = scene.duration_frames - 1
 
-            # Check if guide falls within selection
-            if selection_start <= idx < selection_end:
-                # Load the guide image from the asset
+            if render_start <= idx < render_end:
                 asset = proj.get_asset(guide.asset_id)
                 if asset:
                     asset_path = os.path.join(proj.project_dir, asset.path)
@@ -186,11 +198,9 @@ class LTXEditor:
                         )
                         if img is not None:
                             guide_images.append(img)
-                            # Remap to selection-local index
-                            local_idx = idx - selection_start
+                            local_idx = idx - render_start
                             guide_indices.append(str(local_idx))
 
-        # Build guide image tensor
         if guide_images:
             guide_tensor = torch.stack(guide_images, dim=0)
         else:
@@ -199,13 +209,141 @@ class LTXEditor:
 
         indices_str = ",".join(guide_indices)
 
-        # --- Get prompt for selection ---
-        prompt_text = scene.get_prompt_for_range(selection_start, selection_end)
+        # --- Get prompt for render range ---
+        prompt_text = scene.get_prompt_for_range(render_start, render_end)
 
-        # --- Load audio from scene's audio tracks for the selected range ---
-        audio = self._load_scene_audio(proj, scene, selection_start, selection_end)
+        # --- Load audio from scene's audio tracks for the render range ---
+        audio = self._load_scene_audio(proj, scene, render_start, render_end)
 
-        return (proj, guide_tensor, indices_str, prompt_text, frame_count, proj_fps, proj_w, proj_h, audio)
+        return (proj, rendered_frames, guide_tensor, indices_str, prompt_text, frame_count, proj_fps, proj_w, proj_h, audio)
+
+    def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
+                              render_start: int, render_end: int) -> torch.Tensor:
+        """Composite all visible video clips into frames for the given range.
+
+        Returns (N, H, W, 3) float32 RGB tensor. Uses caching to skip
+        re-rendering when the scene hasn't changed.
+        """
+        proj_w, proj_h = proj.resolution
+        num_frames = render_end - render_start
+
+        if num_frames <= 0:
+            return torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+
+        # --- Check cache ---
+        cache_dir = os.path.join(proj.project_dir, "cache", "renders")
+        content_hash = scene.content_hash(render_start, render_end, proj.resolution)
+        cache_path = os.path.join(cache_dir, f"{scene.scene_id}_{content_hash}.pt")
+
+        if os.path.isfile(cache_path):
+            try:
+                cached = torch.load(cache_path, weights_only=True)
+                logger.info("Render cache hit for scene %s (%d frames)", scene.scene_id, num_frames)
+                return cached
+            except Exception as e:
+                logger.warning("Failed to load render cache: %s", e)
+
+        # --- Collect visible clips (skip hidden video lanes) ---
+        hidden_lanes = set()
+        for i, cfg in enumerate(scene.video_lane_configs):
+            if cfg.hidden:
+                hidden_lanes.add(i)
+
+        visible_clips = [c for c in scene.clips if c.track_index not in hidden_lanes]
+
+        if not visible_clips:
+            return torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
+
+        # --- Open video captures (reuse across frames) ---
+        captures = {}  # source_path -> cv2.VideoCapture
+
+        def get_cap(source_path):
+            abs_path = source_path
+            if not os.path.isfile(abs_path):
+                abs_path = os.path.join(proj.project_dir, source_path)
+            if abs_path not in captures:
+                cap = cv2.VideoCapture(abs_path)
+                if cap.isOpened():
+                    captures[abs_path] = cap
+                else:
+                    logger.warning("Cannot open video: %s", abs_path)
+                    return None
+            return captures[abs_path]
+
+        try:
+            frames = []
+            for f in range(render_start, render_end):
+                # Black canvas
+                canvas = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
+
+                # Find active clips at this frame, sorted by track_index (lower = bottom)
+                active = [c for c in visible_clips
+                          if c.timeline_start_frame <= f < c.timeline_end_frame]
+                active.sort(key=lambda c: c.track_index)
+
+                for clip in active:
+                    source_frame = clip.source_in_frame + (f - clip.timeline_start_frame)
+                    cap = get_cap(clip.source_path)
+                    if cap is None:
+                        continue
+
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
+                    ret, frame_bgr = cap.read()
+                    if not ret:
+                        continue
+
+                    # Fit frame to canvas preserving aspect ratio
+                    placed = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
+
+                    if clip.opacity >= 1.0:
+                        # Direct composite — non-black pixels overwrite
+                        mask = np.any(placed > 0, axis=2)
+                        canvas[mask] = placed[mask]
+                    else:
+                        # Blend with opacity
+                        mask = np.any(placed > 0, axis=2)
+                        blended = canvas.copy()
+                        blended[mask] = cv2.addWeighted(
+                            canvas[mask].reshape(-1, 1, 3), 1.0 - clip.opacity,
+                            placed[mask].reshape(-1, 1, 3), clip.opacity, 0
+                        ).reshape(-1, 3)
+                        canvas = blended
+
+                # Convert BGR -> RGB
+                frames.append(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+
+            # Convert to tensor
+            arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
+            tensor = torch.from_numpy(arr)
+
+            # Save to cache
+            os.makedirs(cache_dir, exist_ok=True)
+            try:
+                torch.save(tensor, cache_path)
+                logger.info("Cached render for scene %s (%d frames)", scene.scene_id, num_frames)
+            except Exception as e:
+                logger.warning("Failed to save render cache: %s", e)
+
+            return tensor
+
+        finally:
+            for cap in captures.values():
+                cap.release()
+
+    @staticmethod
+    def _fit_frame_to_canvas(frame_bgr: np.ndarray, canvas_w: int, canvas_h: int) -> np.ndarray:
+        """Resize frame to fit canvas preserving aspect ratio (letterbox/pillarbox)."""
+        fh, fw = frame_bgr.shape[:2]
+        scale = min(canvas_w / fw, canvas_h / fh)
+        new_w = int(fw * scale)
+        new_h = int(fh * scale)
+        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        x_off = (canvas_w - new_w) // 2
+        y_off = (canvas_h - new_h) // 2
+        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        return canvas
 
     def _load_guide_image(self, path: str, asset_type: str,
                           target_w: int, target_h: int) -> torch.Tensor | None:
@@ -257,9 +395,15 @@ class LTXEditor:
             total_samples = int(duration_sec * sample_rate)
             mixed = torch.zeros(2, total_samples, dtype=torch.float32)
 
+            # Build set of hidden audio lanes
+            hidden_audio_lanes = set()
+            for i, cfg in enumerate(scene.audio_lane_configs):
+                if cfg.hidden:
+                    hidden_audio_lanes.add(i)
+
             any_loaded = False
             for track in scene.audio_tracks:
-                if track.muted:
+                if track.muted or track.lane_index in hidden_audio_lanes:
                     continue
                 # Check if track overlaps selection
                 if track.timeline_end_frame <= sel_start or track.timeline_start_frame >= sel_end:

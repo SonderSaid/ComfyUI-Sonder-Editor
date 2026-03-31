@@ -660,6 +660,30 @@ if routes is not None:
 
         return web.json_response(asset.to_dict(), status=201)
 
+    @routes.put("/ltx-editor/project/{project_id}/assets/{asset_id}")
+    async def api_update_asset(request: web.Request) -> web.Response:
+        """Update asset properties (e.g. name)."""
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_id = request.match_info["asset_id"]
+        asset = project.get_asset(asset_id)
+        if not asset:
+            return _json_error(f"Asset not found: {asset_id}", 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        if "name" in body:
+            asset.name = str(body["name"]).strip() or asset.name
+
+        save_project(project)
+        return web.json_response(asset.to_dict())
+
     @routes.get("/ltx-editor/project/{project_id}/thumbnail/{asset_id}")
     async def api_get_thumbnail(request: web.Request) -> web.Response:
         """Serve a thumbnail image for an asset."""

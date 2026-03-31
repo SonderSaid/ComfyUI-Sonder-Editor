@@ -142,6 +142,9 @@ export class EditorWidget {
         // Asset path→assetId reverse lookup (rebuilt on asset fetch)
         this._pathToAsset = {};
 
+        // UI scale factor (persisted via localStorage)
+        this._uiScale = parseFloat(localStorage.getItem("ltx-editor-ui-scale") || "1.0");
+
         // Editor focus state — true when user last clicked inside the editor
         this._editorFocused = false;
 
@@ -157,6 +160,9 @@ export class EditorWidget {
         // Build DOM
         this._buildDOM();
         this._setupKeyboardEvents();
+
+        // Apply initial UI scale (bars + canvas will be scaled on first render)
+        if (this._uiScale !== 1.0) this._applyUiScale();
 
         // Window resize handler for fullscreen
         window.addEventListener("resize", () => {
@@ -278,6 +284,7 @@ export class EditorWidget {
         });
 
         bar.append(prevBtn, this.sceneLabel, nextBtn, addBtn, durLabel, this.durationInput);
+        this._sceneBar = bar;
         this.container.appendChild(bar);
     }
 
@@ -380,12 +387,17 @@ export class EditorWidget {
         const spacer = document.createElement("span");
         spacer.style.flex = "1";
 
-        // Shortcut hints
-        const hints = document.createElement("span");
-        hints.style.cssText = `color: #666; font-size: 9px; white-space: nowrap;`;
-        hints.textContent = "←→ Nav | I/O In/Out | Space Play | Del Remove | T TC | F Fit | S Snap | C Cut";
+        // Shortcut help button
+        const helpBtn = document.createElement("button");
+        helpBtn.textContent = "?";
+        helpBtn.title = "Keyboard Shortcuts";
+        helpBtn.style.cssText = `
+            background: #333; border: 1px solid #555; color: #aaa; cursor: pointer;
+            padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: bold;
+        `;
+        helpBtn.addEventListener("click", () => this._showShortcutOverlay());
 
-        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, sep2, fitBtn, this._toolBtnTimecode, spacer, hints);
+        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, sep2, fitBtn, this._toolBtnTimecode, spacer, helpBtn);
         this.container.appendChild(this._toolbar);
         this._updateToolbar();
     }
@@ -443,8 +455,23 @@ export class EditorWidget {
         this._fullscreenBtn.style.fontSize = "14px";
         this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
 
-        zoomContainer.append(this._fullscreenBtn, zoomOut, zoomIn);
+        // UI Scale controls
+        const scaleContainer = document.createElement("span");
+        scaleContainer.style.cssText = "display:flex; gap:2px; align-items:center; margin-right:8px;";
+        const scaleDn = this._makeBtn("A−", "Decrease UI scale");
+        scaleDn.style.fontSize = "9px";
+        scaleDn.addEventListener("click", () => this._setUiScale(this._uiScale - 0.1));
+        this._scaleLabel = document.createElement("span");
+        this._scaleLabel.style.cssText = "font-size:9px; color:#888; min-width:28px; text-align:center;";
+        this._scaleLabel.textContent = `${Math.round(this._uiScale * 100)}%`;
+        const scaleUp = this._makeBtn("A+", "Increase UI scale");
+        scaleUp.style.fontSize = "9px";
+        scaleUp.addEventListener("click", () => this._setUiScale(this._uiScale + 0.1));
+        scaleContainer.append(scaleDn, this._scaleLabel, scaleUp);
+
+        zoomContainer.append(this._fullscreenBtn, scaleContainer, zoomOut, zoomIn);
         bar.append(this.infoLabel, zoomContainer);
+        this._infoBar = bar;
         this.container.appendChild(bar);
     }
 
@@ -634,7 +661,7 @@ export class EditorWidget {
         if (!isSameScene) {
             // Defer auto-fit to next frame so browser reflows after editor hide
             this._renderTimeline(); // Immediate render with new scene data
-            requestAnimationFrame(() => this._autoFitTimeline());
+            requestAnimationFrame(() => this._fitToView());
         } else {
             this._renderTimeline();
         }
@@ -868,6 +895,15 @@ export class EditorWidget {
             // Click to preview
             item.addEventListener("click", () => this._previewAsset(asset));
 
+            // Right-click context menu
+            item.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this._showContextMenu(e.clientX, e.clientY, [
+                    { label: "Rename", action: () => this._startAssetRename(asset, label) },
+                ]);
+            });
+
             // Drag support
             item.draggable = true;
             item.addEventListener("dragstart", (e) => {
@@ -964,6 +1000,51 @@ export class EditorWidget {
         // Insert preview above the asset grid
         this.assetGrid.parentElement.insertBefore(preview, this.assetGrid);
         this._previewEl = preview;
+    }
+
+    // ── Asset Rename ─────────────────────────────────────────────────
+    _startAssetRename(asset, labelEl) {
+        const original = asset.name || "Untitled";
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = original;
+        input.style.cssText = `
+            font-size: 9px; width: 100%; text-align: center;
+            background: #333; color: #ddd; border: 1px solid #666;
+            outline: none; padding: 1px 4px; box-sizing: border-box;
+        `;
+        labelEl.textContent = "";
+        labelEl.appendChild(input);
+        input.select();
+        input.focus();
+
+        const commit = () => {
+            const newName = input.value.trim();
+            labelEl.textContent = newName || original;
+            if (newName && newName !== original) {
+                this._renameAsset(asset, newName);
+            }
+        };
+        input.addEventListener("blur", commit);
+        input.addEventListener("keydown", (e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") { input.removeEventListener("blur", commit); commit(); input.blur(); }
+            if (e.key === "Escape") { input.removeEventListener("blur", commit); labelEl.textContent = original; input.blur(); }
+        });
+    }
+
+    async _renameAsset(asset, newName) {
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        try {
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${asset.asset_id}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: newName }),
+            });
+            await this._fetchAssets();
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to rename asset:", e);
+        }
     }
 
     // ── Timecode Helpers ──────────────────────────────────────────────
@@ -1147,15 +1228,23 @@ export class EditorWidget {
         const rect = canvas.parentElement?.getBoundingClientRect();
         const width = rect ? Math.floor(rect.width) : 400;
         const totalH = RULER_HEIGHT + this._totalTracksHeight();
-        canvas.width = width;
-        canvas.height = Math.max(totalH, this._timelineHeight);
+        const canvasH = Math.max(totalH, this._timelineHeight);
+        const s = this._uiScale;
+
+        // Set canvas pixel buffer to scaled size, CSS size reflects visual size
+        canvas.width = Math.floor(width * s);
+        canvas.height = Math.floor(canvasH * s);
+        canvas.style.width = width + "px";
+        canvas.style.height = (canvasH * s) + "px";
 
         const ctx = canvas.getContext("2d");
-        ctx.clearRect(0, 0, width, canvas.height);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        ctx.scale(s, s);
 
-        // Background
+        // Background (logical dimensions)
         ctx.fillStyle = COLORS.bg;
-        ctx.fillRect(0, 0, width, canvas.height);
+        ctx.fillRect(0, 0, width, canvasH);
 
         this._drawRuler(ctx, width);
         this._drawTracks(ctx, width);
@@ -1164,6 +1253,7 @@ export class EditorWidget {
         this._drawClips(ctx, width);
         this._drawPlayhead(ctx, width);
         this._drawSnapIndicator(ctx, width);
+        ctx.restore();
         this._updateInfoLabel();
     }
 
@@ -1175,6 +1265,14 @@ export class EditorWidget {
 
     _xToFrame(x) {
         return Math.round((x - this._labelW) / this.pixelsPerFrame + this.scrollX);
+    }
+
+    _clampScrollX() {
+        const rect = this.timelineCanvas?.parentElement?.getBoundingClientRect();
+        const width = rect ? Math.floor(rect.width) : 400;
+        const visibleFrames = (width - this._labelW) / this.pixelsPerFrame;
+        const maxScroll = Math.max(0, this.totalFrames - visibleFrames + 5);
+        this.scrollX = Math.max(0, Math.min(maxScroll, this.scrollX));
     }
 
     _drawRuler(ctx, width) {
@@ -2039,9 +2137,7 @@ export class EditorWidget {
             // Close context menu on any click
             this._hideContextMenu();
 
-            const rect = canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
+            const { x, y } = this._canvasMouseCoords(e);
             const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
 
             if (y < RULER_HEIGHT) {
@@ -2161,9 +2257,7 @@ export class EditorWidget {
         });
 
         canvas.addEventListener("mousemove", (e) => {
-            const rect = canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
+            const { x, y } = this._canvasMouseCoords(e);
 
             if (!this.isDragging) {
                 // Update cursor based on position
@@ -2380,7 +2474,7 @@ export class EditorWidget {
             } else {
                 // Pan
                 this.scrollX += e.deltaY / this.pixelsPerFrame * 3;
-                this.scrollX = Math.max(0, Math.min(this.totalFrames - 10, this.scrollX));
+                this._clampScrollX();
                 this._renderTimeline();
             }
         });
@@ -2400,9 +2494,7 @@ export class EditorWidget {
 
             try {
                 const asset = JSON.parse(assetData);
-                const rect = canvas.getBoundingClientRect();
-                const x = e.clientX - rect.left;
-                const y = e.clientY - rect.top;
+                const { x, y } = this._canvasMouseCoords(e);
                 const frame = Math.max(0, this._xToFrame(x));
 
                 this._handleAssetDrop(asset, frame, y);
@@ -2413,9 +2505,7 @@ export class EditorWidget {
 
         // Double-click on Prompt track = create prompt section
         canvas.addEventListener("dblclick", (e) => {
-            const rect = canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
+            const { x, y } = this._canvasMouseCoords(e);
             const _pli = this._promptLayoutIdx();
             if (_pli >= 0) {
                 const promptTrackY = this._trackY(_pli);
@@ -2430,9 +2520,7 @@ export class EditorWidget {
         canvas.addEventListener("click", (e) => {
             // Prompt deselection is handled by the unified mousedown/mouseup system
             // When clicking empty space, deselect prompt editor too
-            const rect = canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
+            const { x, y } = this._canvasMouseCoords(e);
 
             if (this._selectedPromptIdx !== null) {
                 const _pli2 = this._promptLayoutIdx();
@@ -2451,9 +2539,7 @@ export class EditorWidget {
         canvas.addEventListener("contextmenu", (e) => {
             e.preventDefault();
 
-            const rect = canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
+            const { x, y } = this._canvasMouseCoords(e);
             const frame = Math.max(0, this._xToFrame(x));
 
             const menuItems = [];
@@ -2477,7 +2563,7 @@ export class EditorWidget {
                             ? (this.activeScene?.clips || []).some(c => (c.track_index || 0) === entry.laneIndex)
                             : (this.activeScene?.audio_tracks || []).some(a => (a.lane_index || 0) === entry.laneIndex);
                         if (hasItems) {
-                            menuItems.push({ label: `Remove ${label} Lane (has items)`, action: () => {}, disabled: true });
+                            menuItems.push({ label: `Remove ${label} Lane (move items)`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
                         } else {
                             menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
                         }
@@ -2760,6 +2846,7 @@ export class EditorWidget {
         const entry = this._trackLayout[layoutIdx];
         const canvas = this.timelineCanvas;
         const rect = canvas.getBoundingClientRect();
+        const s = this._uiScale;
         const headerW = this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH;
         const ty = this._trackY(layoutIdx);
         const th = this._trackH(layoutIdx);
@@ -2770,11 +2857,11 @@ export class EditorWidget {
         input.placeholder = entry.label;
         input.style.cssText = `
             position: fixed;
-            left: ${rect.left + 2}px;
-            top: ${rect.top + ty + 1}px;
-            width: ${headerW - 4}px;
-            height: ${th - 2}px;
-            font-size: 10px;
+            left: ${rect.left + 2 * s}px;
+            top: ${rect.top + ty * s + 1}px;
+            width: ${(headerW - 4) * s}px;
+            height: ${(th - 2) * s}px;
+            font-size: ${10 * s}px;
             background: #333;
             color: #fff;
             border: 1px solid #5af;
@@ -2863,6 +2950,54 @@ export class EditorWidget {
             this._renderTimeline();
         } catch (e) {
             console.warn("[LTX Editor] Failed to add lane:", e);
+        }
+    }
+
+    async _removeLaneWithItems(trackType, laneIndex) {
+        const isVideo = trackType === TRACK_TYPE.VIDEO;
+        const label = isVideo ? "video" : "audio";
+        const items = isVideo
+            ? (this.activeScene?.clips || []).filter(c => (c.track_index || 0) === laneIndex)
+            : (this.activeScene?.audio_tracks || []).filter(a => (a.lane_index || 0) === laneIndex);
+        const targetLane = laneIndex > 0 ? laneIndex - 1 : 1;
+        const currentCount = isVideo
+            ? (this.activeScene?.video_lane_count || 1)
+            : (this.activeScene?.audio_lane_count || 1);
+
+        // If target lane would be the same (only 1 lane) or no valid target, delete items instead
+        const willMove = currentCount > 1 && targetLane !== laneIndex;
+        const msg = willMove
+            ? `This ${label} lane has ${items.length} item(s). Move them to lane ${targetLane} and remove this lane?`
+            : `This ${label} lane has ${items.length} item(s). Delete them and remove this lane?`;
+        if (!confirm(msg)) return;
+
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        try {
+            if (willMove) {
+                // Move items to adjacent lane
+                for (const item of items) {
+                    const id = isVideo ? item.clip_id : item.track_id;
+                    const endpoint = isVideo ? "clips" : "audio_tracks";
+                    const field = isVideo ? "track_index" : "lane_index";
+                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
+                        method: "PUT",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ [field]: targetLane }),
+                    });
+                }
+            } else {
+                // Delete items on this lane
+                for (const item of items) {
+                    const id = isVideo ? item.clip_id : item.track_id;
+                    const endpoint = isVideo ? "clips" : "audio_tracks";
+                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
+                        method: "DELETE",
+                    });
+                }
+            }
+            await this._removeLane(trackType, laneIndex);
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to remove lane with items:", e);
         }
     }
 
@@ -3664,6 +3799,71 @@ export class EditorWidget {
         }
     }
 
+    // ── Keyboard Shortcut Overlay ────────────────────────────────────
+    _showShortcutOverlay() {
+        if (this._shortcutOverlayEl) return;
+        const backdrop = document.createElement("div");
+        backdrop.style.cssText = `position:fixed;inset:0;z-index:10001;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;`;
+        const panel = document.createElement("div");
+        panel.style.cssText = `background:#1e1e1e;border:1px solid #555;border-radius:8px;padding:20px 28px;max-width:520px;width:90%;max-height:80vh;overflow-y:auto;color:#ddd;font-family:monospace;font-size:12px;`;
+        panel.innerHTML = `<h3 style="margin:0 0 12px;color:#fff;font-size:14px;">Keyboard Shortcuts</h3>` +
+            this._shortcutSection("Playback", [
+                ["Space", "Play / Pause (fullscreen)"],
+                ["\u2190 / \u2192", "Frame back / forward"],
+                ["Shift+\u2190 / \u2192", "10 frames back / forward"],
+                ["Home / End", "Go to first / last frame"],
+            ]) +
+            this._shortcutSection("Selection", [
+                ["I", "Set in-point"],
+                ["O", "Set out-point"],
+                ["X", "Clear selection"],
+            ]) +
+            this._shortcutSection("Tools", [
+                ["C", "Toggle razor / cut mode"],
+                ["S", "Toggle snapping"],
+                ["T", "Toggle timecode display"],
+                ["F", "Fit timeline to view"],
+                ["Shift+F", "Zoom to selection"],
+            ]) +
+            this._shortcutSection("Edit", [
+                ["Del / Backspace", "Delete selected items"],
+                ["Ctrl+Z", "Undo"],
+                ["Ctrl+Y", "Redo"],
+            ]) +
+            this._shortcutSection("View", [
+                ["+ / -", "Zoom in / out"],
+                ["Esc", "Exit fullscreen"],
+                ["?", "Show this overlay"],
+            ]);
+
+        backdrop.appendChild(panel);
+        document.body.appendChild(backdrop);
+        this._shortcutOverlayEl = backdrop;
+
+        backdrop.addEventListener("click", (e) => { if (e.target === backdrop) this._hideShortcutOverlay(); });
+        this._shortcutOverlayEscHandler = (e) => { if (e.key === "Escape") { e.stopImmediatePropagation(); this._hideShortcutOverlay(); } };
+        document.addEventListener("keydown", this._shortcutOverlayEscHandler, true);
+    }
+
+    _shortcutSection(title, shortcuts) {
+        let html = `<div style="margin-bottom:10px;"><div style="color:#aaa;font-size:11px;margin-bottom:4px;text-transform:uppercase;">${title}</div>`;
+        for (const [key, desc] of shortcuts) {
+            html += `<div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#6cf;min-width:120px;">${key}</span><span>${desc}</span></div>`;
+        }
+        return html + `</div>`;
+    }
+
+    _hideShortcutOverlay() {
+        if (this._shortcutOverlayEl) {
+            this._shortcutOverlayEl.remove();
+            this._shortcutOverlayEl = null;
+        }
+        if (this._shortcutOverlayEscHandler) {
+            document.removeEventListener("keydown", this._shortcutOverlayEscHandler, true);
+            this._shortcutOverlayEscHandler = null;
+        }
+    }
+
     // ── Fullscreen Mode ──────────────────────────────────────────────
     _createFullscreenOverlay() {
         if (this._fullscreenOverlay) return;
@@ -3894,12 +4094,14 @@ export class EditorWidget {
     _recalcFullscreenHeights() {
         // In three-panel layout, timeline height is based on the bottom row height
         const bottomH = this._fsBottomRow ? parseInt(getComputedStyle(this._fsBottomRow).height) || 280 : 280;
-        const sceneBarH = SCENE_BAR_HEIGHT;
-        const infoBarH = 24;
-        const editorsH = (this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0);
+        const s = this._uiScale;
+        const sceneBarH = SCENE_BAR_HEIGHT * s;
+        const toolbarH = 24 * s;
+        const infoBarH = 24 * s;
+        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * s;
 
-        // Timeline fills the bottom row minus scene bar and info bar
-        this._timelineHeight = Math.max(100, bottomH - sceneBarH - infoBarH - editorsH);
+        // Timeline logical height (canvas will multiply by s when rendering)
+        this._timelineHeight = Math.max(100, (bottomH - sceneBarH - toolbarH - infoBarH - editorsH) / s);
         // Gallery is in the sidebar now, doesn't need height calc
         this._galleryHeight = GALLERY_HEIGHT; // Not used in fullscreen layout
     }
@@ -4181,8 +4383,29 @@ export class EditorWidget {
             // ── T = toggle timecode ──
             if (key === "t" || key === "T") { consume(); this._toggleTimecodeMode(); this._updateToolbar(); return; }
 
-            // ── F = fit to view ──
-            if (key === "f" || key === "F") { consume(); this._fitToView(); return; }
+            // ── F = fit to view, Shift+F = zoom to selection ──
+            if (key === "f" || key === "F") {
+                consume();
+                if (e.shiftKey && this.selectionStart < this.selectionEnd) {
+                    const canvas = this.timelineCanvas;
+                    const rect = canvas.parentElement?.getBoundingClientRect();
+                    const width = rect ? Math.floor(rect.width) : 400;
+                    const margin = width * 0.03;
+                    const availableWidth = width - this._labelW - margin;
+                    const range = this.selectionEnd - this.selectionStart;
+                    if (range > 0 && availableWidth > 0) {
+                        this.pixelsPerFrame = Math.max(0.2, Math.min(40, availableWidth / range));
+                        this.scrollX = this.selectionStart;
+                    }
+                    this._renderTimeline();
+                } else {
+                    this._fitToView();
+                }
+                return;
+            }
+
+            // ── ? = shortcut overlay ──
+            if (key === "?") { consume(); this._showShortcutOverlay(); return; }
 
             // ── Zoom: +/- ──
             if (key === "=" || key === "+") { consume(); this._zoom(1); return; }
@@ -4218,6 +4441,37 @@ export class EditorWidget {
         if (this.pixelsPerFrame !== oldPPF) {
             this._renderTimeline();
         }
+    }
+
+    // ── UI Scale ──────────────────────────────────────────────────────
+    _setUiScale(value) {
+        this._uiScale = Math.round(Math.max(0.7, Math.min(2.0, value)) * 10) / 10;
+        localStorage.setItem("ltx-editor-ui-scale", this._uiScale.toString());
+        if (this._scaleLabel) this._scaleLabel.textContent = `${Math.round(this._uiScale * 100)}%`;
+        this._applyUiScale();
+    }
+
+    _applyUiScale() {
+        const s = this._uiScale;
+        // Scale HTML bars via CSS transform
+        for (const el of [this._sceneBar, this._toolbar, this._infoBar]) {
+            if (!el) continue;
+            el.style.transform = s !== 1.0 ? `scale(${s})` : "";
+            el.style.transformOrigin = "top left";
+            el.style.width = s !== 1.0 ? `${100 / s}%` : "";
+        }
+        this._renderTimeline();
+        // Notify ComfyUI that our size changed
+        if (this.node) this.node.setDirtyCanvas?.(true, true);
+    }
+
+    _canvasMouseCoords(e) {
+        const rect = this.timelineCanvas.getBoundingClientRect();
+        const s = this._uiScale;
+        return {
+            x: (e.clientX - rect.left) / s,
+            y: (e.clientY - rect.top) / s
+        };
     }
 
     // ── Undo / Redo ───────────────────────────────────────────────────
@@ -5049,7 +5303,11 @@ export class EditorWidget {
 
     getHeight() {
         if (this.isFullscreen) return 60;
-        return SCENE_BAR_HEIGHT + this._timelineHeight + 24 + this._galleryHeight + (this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0);
+        const s = this._uiScale;
+        const barsH = (SCENE_BAR_HEIGHT + 24 + 24) * s; // scene bar + toolbar + info bar
+        const timelineH = this._timelineHeight * s;
+        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * s;
+        return barsH + timelineH + this._galleryHeight + editorsH;
     }
 
     // ── File Import (drag-and-drop files from OS onto node) ────────────
