@@ -26,6 +26,13 @@ def create_project(
         raise ValueError("base_dir must be specified")
 
     project_dir = os.path.join(base_dir, _safe_dirname(name))
+
+    # BUG-1 fix: check if project already exists — load instead of overwriting
+    project_file = os.path.join(project_dir, "project.json")
+    if os.path.isfile(project_file):
+        logger.info("Project '%s' already exists at %s — loading existing", name, project_dir)
+        return load_project(project_dir)
+
     os.makedirs(project_dir, exist_ok=True)
 
     for subdir in PROJECT_SUBDIRS:

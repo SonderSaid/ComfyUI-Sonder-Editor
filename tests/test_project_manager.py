@@ -86,6 +86,33 @@ def test_load_project_missing():
             load_project(os.path.join(base_dir, "no_such_project"))
 
 
+def test_create_project_idempotent():
+    """BUG-1 regression test: re-creating a project with the same name must NOT
+    overwrite existing data — it should load the existing project."""
+    with tempfile.TemporaryDirectory() as base_dir:
+        # Create project and add a scene with clips
+        project = create_project("Test", base_dir=base_dir)
+        original_id = project.project_id
+        scene = Scene(name="My Scene")
+        clip = ClipReference(
+            clip_id="important_clip",
+            source_path="/fake/video.mp4",
+            timeline_start_frame=0,
+            timeline_end_frame=100,
+        )
+        scene.clips.append(clip)
+        project.scenes.append(scene)
+        save_project(project)
+
+        # Re-create with same name — should load existing, not overwrite
+        project2 = create_project("Test", base_dir=base_dir)
+
+        assert project2.project_id == original_id
+        assert len(project2.scenes) == 1
+        assert len(project2.scenes[0].clips) == 1
+        assert project2.scenes[0].clips[0].clip_id == "important_clip"
+
+
 def test_safe_dirname_special_chars():
     from server.project_manager import _safe_dirname
 
