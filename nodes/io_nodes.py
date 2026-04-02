@@ -12,7 +12,7 @@ import folder_paths
 
 from PIL import Image
 
-from ..server.timeline_state import ClipReference, AudioTrack, Asset
+from ..server.timeline_state import ClipReference, AudioTrack, Asset, LaneConfig
 from ..server.project_manager import save_project
 
 logger = logging.getLogger("ltx_editor")
@@ -318,6 +318,7 @@ class LTXSaveVideo:
                 "frames": ("IMAGE", {"tooltip": "Batch of frames to encode as video."}),
                 "filename_prefix": ("STRING", {"default": "output", "tooltip": "Prefix for the output filename."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001, "tooltip": "Output video frame rate."}),
+                "mode": (["Video", "Take"], {"default": "Video", "tooltip": "Video: normal save. Take: saves and auto-places result on timeline as a new lane."}),
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "Audio to mux into the video."}),
@@ -327,7 +328,7 @@ class LTXSaveVideo:
         }
 
     def save_video(self, project, frames, filename_prefix="output", fps=24.0,
-                   audio=None, codec="libx264", quality=23):
+                   mode="Video", audio=None, codec="libx264", quality=23):
         # Save to media/ so it appears in the project's asset gallery
         media_dir = os.path.join(project.project_dir, "media")
         os.makedirs(media_dir, exist_ok=True)
@@ -401,6 +402,54 @@ class LTXSaveVideo:
         )
         ensure_thumbnail("video", output_path, thumb_path)
 
+        # --- Take mode: auto-place on timeline ---
+        if mode == "Take" and hasattr(project, '_execution_context') and project._execution_context:
+            ctx = project._execution_context
+            scene = project.get_scene(ctx.get("scene_id", ""))
+            if scene:
+                # Organize asset into Takes folder
+                asset.folder = f"Takes/{ctx.get('scene_name', scene.name)}"
+                asset.generation_params = dict(ctx)
+
+                # Find next available video lane
+                existing_lanes = [c.track_index for c in scene.clips] if scene.clips else [-1]
+                new_lane = max(existing_lanes) + 1
+
+                # Ensure scene has enough lanes
+                if scene.video_lane_count <= new_lane:
+                    scene.video_lane_count = new_lane + 1
+                while len(scene.video_lane_configs) < scene.video_lane_count:
+                    scene.video_lane_configs.append(LaneConfig())
+
+                # Determine clip placement — at original selection, not context-expanded range
+                sel_start = ctx.get("selection_start", 0)
+                sel_end = ctx.get("selection_end", sel_start + total_frames)
+                pre_ctx = ctx.get("pre_context_frames", ctx.get("context_frames", 0))
+                post_ctx = ctx.get("post_context_frames", ctx.get("context_frames", 0))
+
+                # Source trim: if context frames exist, the video has pre+generation+post
+                # The clip should show only the generated portion
+                source_in = pre_ctx if pre_ctx > 0 else 0
+                source_out = total_frames - post_ctx if post_ctx > 0 else total_frames
+
+                clip = ClipReference(
+                    source_path=os.path.join("media", output_filename),
+                    timeline_start_frame=sel_start,
+                    timeline_end_frame=sel_end,
+                    source_in_frame=source_in,
+                    source_out_frame=source_out,
+                    total_source_frames=total_frames,
+                    source_origin_frame=source_in,
+                    track_index=new_lane,
+                    is_generated=True,
+                    generation_params=dict(ctx),
+                    take_metadata=dict(ctx),
+                )
+                scene.clips.append(clip)
+                logger.info("Take auto-placed on lane %d at frames %d-%d", new_lane, sel_start, sel_end)
+            else:
+                logger.warning("Take mode: scene_id '%s' not found, skipping auto-placement", ctx.get("scene_id", ""))
+
         save_project(project)
 
         # Generate preview thumbnail for ComfyUI node display
@@ -429,12 +478,9 @@ class LTXPreviewVideo:
                 "frames": ("IMAGE", {"tooltip": "Batch of frames to preview."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001, "tooltip": "Playback frame rate for the preview."}),
             },
-            "optional": {
-                "audio": ("AUDIO", {"tooltip": "Audio to include in the preview."}),
-            },
         }
 
-    def preview(self, frames, fps=24.0, audio=None):
+    def preview(self, frames, fps=24.0):
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
 
