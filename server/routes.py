@@ -9,7 +9,7 @@ from aiohttp import web
 from .project_manager import create_project, load_project, save_project, list_projects
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
-    ClipReference, LaneConfig,
+    ClipReference, LaneConfig, GenerationJob,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 
@@ -26,6 +26,13 @@ except Exception:
 
 def _json_error(msg: str, status: int = 400) -> web.Response:
     return web.json_response({"error": msg}, status=status)
+
+
+def _coerce_nonnegative_int(value, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
@@ -228,6 +235,62 @@ def _get_ffmpeg() -> str:
     return _ffmpeg_path
 
 
+def _read_image_size(image_path: str) -> tuple[int, int] | None:
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            return img.size
+    except Exception:
+        try:
+            import cv2
+            img = cv2.imread(image_path)
+            if img is None:
+                return None
+            h, w = img.shape[:2]
+            return w, h
+        except Exception:
+            return None
+
+
+def _extract_video_frame_ffmpeg(video_path: str, frame_index: int, output_path: str) -> tuple[int, int] | None:
+    try:
+        import subprocess
+
+        ffmpeg = _get_ffmpeg()
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                video_path,
+                "-vf",
+                f"select=eq(n\\,{frame_index})",
+                "-frames:v",
+                "1",
+                "-pix_fmt",
+                "rgb24",
+                output_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0 or not os.path.isfile(output_path):
+            logger.warning(
+                "ffmpeg frame extraction failed for %s frame %s: %s",
+                os.path.basename(video_path),
+                frame_index,
+                (result.stderr or "").strip()[:200],
+            )
+            return None
+        return _read_image_size(output_path)
+    except Exception as e:
+        logger.warning("ffmpeg frame extraction failed for %s: %s", video_path, e)
+        return None
+
+
 def _find_ffprobe() -> str:
     """Find ffprobe executable."""
     import shutil
@@ -279,11 +342,14 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
     return False
 
 
-def _sync_media_folder(project: TimelineProject) -> None:
-    """Scan media/ folder for files not yet in the asset registry and add them."""
+def _sync_media_folder(project: TimelineProject) -> bool:
+    """Scan media/ folder for files not yet in the asset registry and add them.
+
+    Returns True if any changes were made (new assets discovered or repaired).
+    """
     media_dir = os.path.join(project.project_dir, "media")
     if not os.path.isdir(media_dir):
-        return
+        return False
 
     # Build set of known relative paths
     known_paths = {a.path for a in project.assets}
@@ -396,6 +462,8 @@ def _sync_media_folder(project: TimelineProject) -> None:
                     if new_duration > 1:
                         track.timeline_end_frame = track.timeline_start_frame + new_duration
                         logger.info("Repaired audio track duration: %d frames (%s)", new_duration, track.source_path)
+
+    return changed
 
 
 
@@ -535,7 +603,9 @@ if routes is not None:
             return _json_error(str(e), 404)
 
         # Auto-discover untracked files in media/ folder
-        _sync_media_folder(project)
+        # BUG-4 fix: persist newly discovered assets so IDs remain stable
+        if _sync_media_folder(project):
+            save_project(project)
 
         asset_type = request.query.get("type", "")
         if asset_type:
@@ -648,6 +718,8 @@ if routes is not None:
             prompt=body.get("prompt", ""),
             generation_params=body.get("generation_params", {}),
         )
+        if body.get("folder"):
+            asset.folder = body["folder"]
         project.add_asset(asset)
         save_project(project)
 
@@ -659,6 +731,80 @@ if routes is not None:
         ensure_thumbnail(asset_type, dest_path, thumb_path)
 
         return web.json_response(asset.to_dict(), status=201)
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/extract_frame")
+    async def api_extract_frame(request: web.Request) -> web.Response:
+        """Extract a single video frame and save as an image asset."""
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        body = await request.json()
+        source_path = body.get("source_path", "")
+        frame_index = int(body.get("frame_index", 0))
+
+        if not source_path:
+            return _json_error("source_path is required", 400)
+
+        # Resolve path relative to project dir
+        abs_path = source_path
+        if not os.path.isabs(source_path):
+            abs_path = os.path.join(project.project_dir, source_path)
+        if not os.path.isfile(abs_path):
+            return _json_error(f"Source file not found: {source_path}", 404)
+
+        try:
+            media_dir = os.path.join(project.project_dir, "media")
+            os.makedirs(media_dir, exist_ok=True)
+            out_filename = f"{uuid.uuid4().hex[:8]}_frame_{frame_index}.png"
+            out_path = os.path.join(media_dir, out_filename)
+
+            # Prefer ffmpeg for frame extraction to preserve video decode fidelity.
+            # Fall back to OpenCV if ffmpeg is unavailable or fails.
+            extracted_size = _extract_video_frame_ffmpeg(abs_path, frame_index, out_path)
+            if extracted_size is not None:
+                w, h = extracted_size
+            else:
+                import cv2
+                cap = cv2.VideoCapture(abs_path)
+                if not cap.isOpened():
+                    return _json_error("Could not open video file", 500)
+
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ret, frame_bgr = cap.read()
+                cap.release()
+
+                if not ret:
+                    return _json_error(f"Could not read frame {frame_index}", 500)
+
+                h, w = frame_bgr.shape[:2]
+                cv2.imwrite(out_path, frame_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+
+            asset = Asset(
+                name=f"Frame {frame_index}",
+                asset_type="image",
+                path=os.path.join("media", out_filename),
+                width=w,
+                height=h,
+            )
+            project.add_asset(asset)
+            save_project(project)
+
+            # Generate thumbnail
+            thumb_path = os.path.join(
+                project.project_dir, "cache", "thumbnails",
+                f"{asset.asset_id}.png"
+            )
+            ensure_thumbnail("image", out_path, thumb_path)
+
+            return web.json_response(asset.to_dict(), status=201)
+
+        except ImportError:
+            return _json_error("cv2 (OpenCV) not available", 500)
+        except Exception as e:
+            logger.warning("Failed to extract frame: %s", e)
+            return _json_error(str(e), 500)
 
     @routes.put("/ltx-editor/project/{project_id}/assets/{asset_id}")
     async def api_update_asset(request: web.Request) -> web.Response:
@@ -865,6 +1011,12 @@ if routes is not None:
             scene.audio_lane_configs = [
                 LaneConfig.from_dict(c) for c in body["audio_lane_configs"]
             ]
+        if "width" in body:
+            scene.width = int(body["width"])
+        if "height" in body:
+            scene.height = int(body["height"])
+        if "fps" in body:
+            scene.fps = float(body["fps"])
         # Auto-pad configs to match lane counts
         while len(scene.video_lane_configs) < scene.video_lane_count:
             scene.video_lane_configs.append(LaneConfig())
@@ -1504,6 +1656,208 @@ if routes is not None:
         save_project(project)
 
         return web.json_response({"status": "deleted"})
+
+    # -----------------------------------------------------------------------
+    # Saved selections
+    # -----------------------------------------------------------------------
+
+    @routes.get("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
+    async def api_list_saved_selections(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene = project.get_scene(request.match_info["scene_id"])
+        if not scene:
+            return _json_error("Scene not found", 404)
+
+        return web.json_response(scene.saved_selections)
+
+    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
+    async def api_add_saved_selection(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene = project.get_scene(request.match_info["scene_id"])
+        if not scene:
+            return _json_error("Scene not found", 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        entry = {
+            "name": body.get("name", f"Selection {len(scene.saved_selections) + 1}"),
+            "start": _coerce_nonnegative_int(body.get("start", 0)),
+            "end": _coerce_nonnegative_int(body.get("end", 0)),
+            "pre_context_frames": _coerce_nonnegative_int(body.get("pre_context_frames", 0)),
+            "post_context_frames": _coerce_nonnegative_int(body.get("post_context_frames", 0)),
+        }
+        scene.saved_selections.append(entry)
+        save_project(project)
+        return web.json_response({"index": len(scene.saved_selections) - 1, "entry": entry})
+
+    @routes.put("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
+    async def api_update_saved_selection(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene = project.get_scene(request.match_info["scene_id"])
+        if not scene:
+            return _json_error("Scene not found", 404)
+
+        idx = int(request.match_info["index"])
+        if idx < 0 or idx >= len(scene.saved_selections):
+            return _json_error("Selection index out of range", 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        if "name" in body:
+            scene.saved_selections[idx]["name"] = body["name"]
+        if "start" in body:
+            scene.saved_selections[idx]["start"] = _coerce_nonnegative_int(body["start"])
+        if "end" in body:
+            scene.saved_selections[idx]["end"] = _coerce_nonnegative_int(body["end"])
+        if "pre_context_frames" in body:
+            scene.saved_selections[idx]["pre_context_frames"] = _coerce_nonnegative_int(body["pre_context_frames"])
+        if "post_context_frames" in body:
+            scene.saved_selections[idx]["post_context_frames"] = _coerce_nonnegative_int(body["post_context_frames"])
+
+        save_project(project)
+        return web.json_response(scene.saved_selections[idx])
+
+    @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
+    async def api_delete_saved_selection(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene = project.get_scene(request.match_info["scene_id"])
+        if not scene:
+            return _json_error("Scene not found", 404)
+
+        idx = int(request.match_info["index"])
+        if idx < 0 or idx >= len(scene.saved_selections):
+            return _json_error("Selection index out of range", 404)
+
+        scene.saved_selections.pop(idx)
+        save_project(project)
+        return web.json_response({"status": "deleted"})
+
+    # -----------------------------------------------------------------------
+    # Render queue
+    # -----------------------------------------------------------------------
+
+    @routes.get("/ltx-editor/project/{project_id}/queue")
+    async def api_list_queue(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        return web.json_response([j.to_dict() for j in project.generation_queue])
+
+    @routes.post("/ltx-editor/project/{project_id}/queue")
+    async def api_add_queue_job(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        job = GenerationJob(
+            scene_id=body.get("scene_id", ""),
+            scene_name=body.get("scene_name", ""),
+            selection_start=int(body.get("selection_start", 0)),
+            selection_end=int(body.get("selection_end", 0)),
+            prompt=body.get("prompt", ""),
+            context_frames=int(body.get("context_frames", 0)),
+            params=body.get("params", {}),
+        )
+        project.generation_queue.append(job)
+        save_project(project)
+        return web.json_response(job.to_dict())
+
+    @routes.put("/ltx-editor/project/{project_id}/queue/{job_id}")
+    async def api_update_queue_job(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        job_id = request.match_info["job_id"]
+        job = next((j for j in project.generation_queue if j.job_id == job_id), None)
+        if not job:
+            return _json_error(f"Job not found: {job_id}", 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        if "status" in body:
+            job.status = body["status"]
+        if "progress" in body:
+            job.progress = float(body["progress"])
+        if "error" in body:
+            job.error = body["error"]
+        if "result_asset_id" in body:
+            job.result_asset_id = body["result_asset_id"]
+        if "completed_at" in body:
+            job.completed_at = body["completed_at"]
+
+        save_project(project)
+        return web.json_response(job.to_dict())
+
+    @routes.delete("/ltx-editor/project/{project_id}/queue/{job_id}")
+    async def api_delete_queue_job(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        job_id = request.match_info["job_id"]
+        before = len(project.generation_queue)
+        project.generation_queue = [j for j in project.generation_queue if j.job_id != job_id]
+        if len(project.generation_queue) == before:
+            return _json_error(f"Job not found: {job_id}", 404)
+
+        save_project(project)
+        return web.json_response({"status": "deleted"})
+
+    @routes.delete("/ltx-editor/project/{project_id}/queue")
+    async def api_clear_queue(request: web.Request) -> web.Response:
+        """Clear completed/failed jobs, or all if ?all=1."""
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        if request.query.get("all") == "1":
+            project.generation_queue.clear()
+        else:
+            # Default: clear completed and failed only
+            project.generation_queue = [
+                j for j in project.generation_queue
+                if j.status not in ("completed", "failed")
+            ]
+
+        save_project(project)
+        return web.json_response({"status": "cleared"})
 
     # -----------------------------------------------------------------------
     # WebSocket stub

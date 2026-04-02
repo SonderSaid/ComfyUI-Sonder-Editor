@@ -27,6 +27,7 @@ class Asset:
     sample_rate: int = 0                    # audio only
     has_audio: bool = False                  # video files: True if video contains audio stream
     imported_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    folder: str = ""                            # organizational folder (e.g., "Takes/Scene 1")
 
     def to_dict(self) -> dict:
         return {
@@ -44,6 +45,7 @@ class Asset:
             "sample_rate": self.sample_rate,
             "has_audio": self.has_audio,
             "imported_at": self.imported_at,
+            "folder": self.folder,
         }
 
     @classmethod
@@ -63,6 +65,7 @@ class Asset:
             sample_rate=data.get("sample_rate", 0),
             has_audio=data.get("has_audio", False),
             imported_at=data.get("imported_at", datetime.now().isoformat()),
+            folder=data.get("folder", ""),
         )
 
 
@@ -270,6 +273,10 @@ class Scene:
     audio_lane_count: int = 1               # number of audio lanes (multi-layer)
     video_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     audio_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
+    width: int = 0                              # 0 = inherit from project
+    height: int = 0                             # 0 = inherit from project
+    fps: float = 0.0                            # 0 = inherit from project
+    saved_selections: list = field(default_factory=list)  # list[dict] {name, start, end, pre_context_frames, post_context_frames}
 
     @property
     def duration_seconds(self) -> float:
@@ -304,6 +311,8 @@ class Scene:
             "hidden_audio": [i for i, c in enumerate(self.audio_lane_configs) if c.hidden],
             "sel": (selection_start, selection_end),
             "res": resolution,
+            "scene_res": (self.width, self.height),
+            "scene_fps": self.fps,
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -342,10 +351,20 @@ class Scene:
             "audio_lane_count": self.audio_lane_count,
             "video_lane_configs": [c.to_dict() for c in self.video_lane_configs],
             "audio_lane_configs": [c.to_dict() for c in self.audio_lane_configs],
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps,
+            "saved_selections": list(self.saved_selections),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Scene":
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
         scene = cls(
             scene_id=data.get("scene_id", uuid.uuid4().hex[:8]),
             name=data.get("name", "Untitled Scene"),
@@ -358,7 +377,22 @@ class Scene:
             is_bridge=data.get("is_bridge", False),
             video_lane_count=data.get("video_lane_count", 1),
             audio_lane_count=data.get("audio_lane_count", 1),
+            width=data.get("width", 0),
+            height=data.get("height", 0),
+            fps=data.get("fps", 0.0),
+            saved_selections=[],
         )
+        scene.saved_selections = [
+            {
+                "name": entry.get("name", f"Selection {idx + 1}"),
+                "start": _safe_int(entry.get("start", 0)),
+                "end": _safe_int(entry.get("end", 0)),
+                "pre_context_frames": _safe_int(entry.get("pre_context_frames", 0)),
+                "post_context_frames": _safe_int(entry.get("post_context_frames", 0)),
+            }
+            for idx, entry in enumerate(data.get("saved_selections", []))
+            if isinstance(entry, dict)
+        ]
         scene.prompt_sections = [
             PromptSection.from_dict(p) for p in data.get("prompt_sections", [])
         ]
@@ -406,6 +440,7 @@ class ClipReference:
     generation_params: dict = field(default_factory=dict)
     takes: list = field(default_factory=list)
     active_take: int = 0
+    take_metadata: dict = field(default_factory=dict)  # {scene_id, selection_start/end, prompt, context_frames}
 
     @property
     def duration_frames(self) -> int:
@@ -432,6 +467,7 @@ class ClipReference:
             "generation_params": self.generation_params,
             "takes": list(self.takes),
             "active_take": self.active_take,
+            "take_metadata": dict(self.take_metadata),
         }
 
     @classmethod
@@ -452,6 +488,7 @@ class ClipReference:
             generation_params=data.get("generation_params", {}),
             takes=data.get("takes", []),
             active_take=data.get("active_take", 0),
+            take_metadata=data.get("take_metadata", {}),
         )
 
 
@@ -516,6 +553,15 @@ class GenerationJob:
     params: dict = field(default_factory=dict)
     progress: float = 0.0
     error: str = ""
+    # Snapshot fields — capture state at queue time
+    selection_start: int = 0
+    selection_end: int = 0
+    prompt: str = ""
+    scene_name: str = ""
+    context_frames: int = 0
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    completed_at: str = ""
+    result_asset_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -527,6 +573,14 @@ class GenerationJob:
             "params": self.params,
             "progress": self.progress,
             "error": self.error,
+            "selection_start": self.selection_start,
+            "selection_end": self.selection_end,
+            "prompt": self.prompt,
+            "scene_name": self.scene_name,
+            "context_frames": self.context_frames,
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+            "result_asset_id": self.result_asset_id,
         }
 
     @classmethod
@@ -540,6 +594,14 @@ class GenerationJob:
             params=data.get("params", {}),
             progress=data.get("progress", 0.0),
             error=data.get("error", ""),
+            selection_start=data.get("selection_start", 0),
+            selection_end=data.get("selection_end", 0),
+            prompt=data.get("prompt", ""),
+            scene_name=data.get("scene_name", ""),
+            context_frames=data.get("context_frames", 0),
+            created_at=data.get("created_at", ""),
+            completed_at=data.get("completed_at", ""),
+            result_asset_id=data.get("result_asset_id", ""),
         )
 
 

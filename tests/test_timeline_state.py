@@ -172,6 +172,13 @@ def test_scene_roundtrip():
         GuideFrame(frame_index=-1, asset_id="img002", source="asset"),
     ]
     scene.asset_ids = ["img001", "img002", "vid001"]
+    scene.saved_selections = [{
+        "name": "Main beat",
+        "start": 48,
+        "end": 96,
+        "pre_context_frames": 8,
+        "post_context_frames": 12,
+    }]
 
     data = scene.to_dict()
     restored = Scene.from_dict(data)
@@ -185,7 +192,24 @@ def test_scene_roundtrip():
     assert restored.guide_frames[0].frame_index == 0
     assert restored.guide_frames[1].frame_index == -1
     assert restored.asset_ids == ["img001", "img002", "vid001"]
+    assert restored.saved_selections[0]["pre_context_frames"] == 8
+    assert restored.saved_selections[0]["post_context_frames"] == 12
     assert restored.is_bridge is False
+
+
+def test_scene_saved_selection_defaults_context_fields():
+    scene = Scene.from_dict({
+        "name": "Legacy Scene",
+        "saved_selections": [{"name": "Old", "start": "4", "end": "20"}],
+    })
+
+    assert scene.saved_selections == [{
+        "name": "Old",
+        "start": 4,
+        "end": 20,
+        "pre_context_frames": 0,
+        "post_context_frames": 0,
+    }]
 
 
 def test_scene_empty():

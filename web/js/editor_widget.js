@@ -80,6 +80,9 @@ export class EditorWidget {
         // Asset state
         this.assets = { video: [], image: [], audio: [] };
         this.selectedAssetType = "video";
+        this._collapsedFolders = {};
+        this._renderQueue = [];
+        this._savedSelDropdown = null;
 
         // Prompt section state
         this._selectedPromptIdx = null;
@@ -104,6 +107,14 @@ export class EditorWidget {
         this.fps = 24;
         this.sceneWidth = 768;
         this.sceneHeight = 512;
+
+        // Animatic toggle state
+        this._animaticMode = false;
+        this._preAnimaticHidden = null;
+
+        // Resolution lock state
+        this._lockAspectRatio = false;
+        this._lockedRatio = 1.0;
 
         // Viewport / playback state
         this.isPlaying = false;
@@ -142,8 +153,24 @@ export class EditorWidget {
         // Asset path→assetId reverse lookup (rebuilt on asset fetch)
         this._pathToAsset = {};
 
-        // UI scale factor (persisted via localStorage)
-        this._uiScale = parseFloat(localStorage.getItem("ltx-editor-ui-scale") || "1.0");
+        // Per-section UI scale factors (persisted via localStorage)
+        // Migrate old global scale to per-section if present
+        const _oldScale = localStorage.getItem("ltx-editor-ui-scale");
+        if (_oldScale) {
+            for (const k of ["toolbar", "trackheaders", "timeline", "gallery"]) {
+                if (!localStorage.getItem(`ltx-editor-scale-${k}`))
+                    localStorage.setItem(`ltx-editor-scale-${k}`, _oldScale);
+            }
+            localStorage.removeItem("ltx-editor-ui-scale");
+        }
+        this._scaleToolbar = parseFloat(localStorage.getItem("ltx-editor-scale-toolbar") || "1.0");
+        this._scaleTrackHeaders = parseFloat(localStorage.getItem("ltx-editor-scale-trackheaders") || "1.0");
+        this._scaleTimeline = parseFloat(localStorage.getItem("ltx-editor-scale-timeline") || "1.0");
+        this._scaleGallery = parseFloat(localStorage.getItem("ltx-editor-scale-gallery") || "1.0");
+
+        // User-adjustable track header width (persisted per mode)
+        this._labelWidthUser = parseInt(localStorage.getItem("ltx-editor-label-width") || "0"); // 0 = use default
+        this._labelWidthUserFS = parseInt(localStorage.getItem("ltx-editor-label-width-fs") || "0");
 
         // Editor focus state — true when user last clicked inside the editor
         this._editorFocused = false;
@@ -160,9 +187,10 @@ export class EditorWidget {
         // Build DOM
         this._buildDOM();
         this._setupKeyboardEvents();
+        this._refreshContextInputs();
 
-        // Apply initial UI scale (bars + canvas will be scaled on first render)
-        if (this._uiScale !== 1.0) this._applyUiScale();
+        // Apply initial UI scales (bars + canvas will be scaled on first render)
+        this._applyScales();
 
         // Window resize handler for fullscreen
         window.addEventListener("resize", () => {
@@ -201,9 +229,6 @@ export class EditorWidget {
         this.timelineCanvas.style.cssText = `width: 100%; cursor: crosshair;`;
         this.timelineCanvas.height = this._timelineHeight;
         this.container.appendChild(this.timelineCanvas);
-
-        // Timeline info bar
-        this._buildInfoBar();
 
         // Asset gallery
         this._buildAssetGallery();
@@ -262,9 +287,9 @@ export class EditorWidget {
         addBtn.addEventListener("click", () => this._createScene());
 
         // Duration input
-        const durLabel = document.createElement("span");
-        durLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 8px;`;
-        durLabel.textContent = "Frames:";
+        this._durLabel = document.createElement("span");
+        this._durLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 8px;`;
+        this._durLabel.textContent = "Frames:";
 
         this.durationInput = document.createElement("input");
         this.durationInput.type = "number";
@@ -276,14 +301,153 @@ export class EditorWidget {
             padding: 2px 4px; font-size: 11px; border-radius: 3px; text-align: center;
         `;
         this.durationInput.addEventListener("change", () => {
-            this.totalFrames = Math.max(1, parseInt(this.durationInput.value) || 200);
+            if (this._timecodeMode === "timecode") {
+                const sec = parseFloat(this.durationInput.value) || 0;
+                this.totalFrames = Math.max(1, this._secondsToFrames(sec));
+            } else {
+                this.totalFrames = Math.max(1, parseInt(this.durationInput.value) || 200);
+            }
             if (this.activeScene) {
                 this._updateSceneDuration(this.totalFrames);
             }
             this._renderTimeline();
         });
 
-        bar.append(prevBtn, this.sceneLabel, nextBtn, addBtn, durLabel, this.durationInput);
+        const ctxLabel = document.createElement("span");
+        ctxLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
+        ctxLabel.textContent = "Ctx:";
+
+        const ctxInputStyle = `
+            width: 40px; background: #333; border: 1px solid #555; color: #ddd;
+            padding: 2px 3px; font-size: 10px; border-radius: 3px; text-align: center;
+        `;
+
+        const preCtxLabel = document.createElement("span");
+        preCtxLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
+        preCtxLabel.textContent = "Pre";
+
+        this._preContextInput = document.createElement("input");
+        this._preContextInput.type = "number";
+        this._preContextInput.min = 0;
+        this._preContextInput.max = 256;
+        this._preContextInput.step = 1;
+        this._preContextInput.value = 0;
+        this._preContextInput.title = "Frames to include before the selected generation range";
+        this._preContextInput.style.cssText = ctxInputStyle;
+        this._preContextInput.addEventListener("change", () => this._updateContextFrameWidgets());
+
+        const postCtxLabel = document.createElement("span");
+        postCtxLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
+        postCtxLabel.textContent = "Post";
+
+        this._postContextInput = document.createElement("input");
+        this._postContextInput.type = "number";
+        this._postContextInput.min = 0;
+        this._postContextInput.max = 256;
+        this._postContextInput.step = 1;
+        this._postContextInput.value = 0;
+        this._postContextInput.title = "Frames to include after the selected generation range";
+        this._postContextInput.style.cssText = ctxInputStyle;
+        this._postContextInput.addEventListener("change", () => this._updateContextFrameWidgets());
+
+        // Resolution inputs
+        const resLabel = document.createElement("span");
+        resLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
+        resLabel.textContent = "Res:";
+
+        const inputStyle = `width: 48px; background: #333; border: 1px solid #555; color: #ddd;
+            padding: 2px 3px; font-size: 10px; border-radius: 3px; text-align: center;`;
+
+        this._resWInput = document.createElement("input");
+        this._resWInput.type = "number"; this._resWInput.min = 0; this._resWInput.max = 4096; this._resWInput.step = 8;
+        this._resWInput.placeholder = "W";
+        this._resWInput.style.cssText = inputStyle;
+        this._resWInput.addEventListener("change", () => this._onResolutionChange("w"));
+
+        const xLabel = document.createElement("span");
+        xLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
+        xLabel.textContent = "×";
+
+        this._resHInput = document.createElement("input");
+        this._resHInput.type = "number"; this._resHInput.min = 0; this._resHInput.max = 4096; this._resHInput.step = 8;
+        this._resHInput.placeholder = "H";
+        this._resHInput.style.cssText = inputStyle;
+        this._resHInput.addEventListener("change", () => this._onResolutionChange("h"));
+
+        // Lock aspect ratio toggle
+        this._lockBtn = document.createElement("button");
+        this._lockBtn.textContent = "🔓";
+        this._lockBtn.title = "Lock aspect ratio";
+        this._lockBtn.style.cssText = `
+            background: transparent; border: 1px solid transparent; color: #aaa;
+            cursor: pointer; font-size: 11px; padding: 1px 4px; border-radius: 4px;
+            min-width: 24px; transition: background 0.15s, border-color 0.15s, color 0.15s;
+        `;
+        this._lockBtn.addEventListener("click", () => {
+            this._lockAspectRatio = !this._lockAspectRatio;
+            if (this._lockAspectRatio) {
+                this._captureLockedRatio();
+            }
+            this._updateAspectLockButton();
+        });
+        this._updateAspectLockButton();
+
+        // Resolution preset dropdown
+        this._resPreset = document.createElement("select");
+        this._resPreset.style.cssText = `background: #333; border: 1px solid #555; color: #ddd;
+            font-size: 9px; border-radius: 3px; padding: 1px;`;
+        // Inferred from official LTX spatial constraints:
+        // keep common aspect ratios while using dimensions divisible by 32.
+        const presets = [
+            ["Default", 0, 0],
+            ["LTX Wide 1216×704", 1216, 704],
+            ["HD 1280×720", 1280, 720],
+            ["Square 1024×1024", 1024, 1024],
+            ["Photo 1152×768", 1152, 768],
+            ["Portrait 768×1152", 768, 1152],
+            ["4:3 1088×832", 1088, 832],
+            ["3:4 832×1088", 832, 1088],
+            ["Vertical 704×1216", 704, 1216],
+            ["Cinema 1280×640", 1280, 640],
+        ];
+        for (const [label, w, h] of presets) {
+            const opt = document.createElement("option");
+            opt.value = `${w},${h}`;
+            opt.textContent = label;
+            this._resPreset.appendChild(opt);
+        }
+        this._resPreset.addEventListener("change", () => {
+            const [w, h] = this._resPreset.value.split(",").map(Number);
+            this._resWInput.value = w || "";
+            this._resHInput.value = h || "";
+            if (w > 0 && h > 0 && this._lockAspectRatio) {
+                this._lockedRatio = w / h;
+            }
+            this._updateSceneResolution(w, h);
+        });
+
+        // FPS input
+        const fpsLabel = document.createElement("span");
+        fpsLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
+        fpsLabel.textContent = "FPS:";
+
+        this._fpsInput = document.createElement("input");
+        this._fpsInput.type = "number"; this._fpsInput.min = 0; this._fpsInput.max = 120; this._fpsInput.step = 0.001;
+        this._fpsInput.placeholder = String(this.fps);
+        this._fpsInput.style.cssText = `width: 42px; background: #333; border: 1px solid #555; color: #ddd;
+            padding: 2px 3px; font-size: 10px; border-radius: 3px; text-align: center;`;
+        this._fpsInput.addEventListener("change", () => {
+            const val = parseFloat(this._fpsInput.value) || 0;
+            if (this.activeScene) {
+                this._updateSceneFps(val);
+            }
+        });
+
+        bar.append(prevBtn, this.sceneLabel, nextBtn, addBtn,
+            this._durLabel, this.durationInput,
+            ctxLabel, preCtxLabel, this._preContextInput, postCtxLabel, this._postContextInput,
+            resLabel, this._resWInput, xLabel, this._resHInput, this._lockBtn, this._resPreset,
+            fpsLabel, this._fpsInput);
         this._sceneBar = bar;
         this.container.appendChild(bar);
     }
@@ -350,7 +514,7 @@ export class EditorWidget {
             this._setWidgetValue("selection_start", 0);
             this._setWidgetValue("selection_end", 0);
             this._renderTimeline();
-            this._updateInfoLabel();
+            this._updateToolbar();
             this._updateToolbar();
         });
         clearSelBtn.style.padding = "2px 4px";
@@ -397,7 +561,55 @@ export class EditorWidget {
         `;
         helpBtn.addEventListener("click", () => this._showShortcutOverlay());
 
-        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, sep2, fitBtn, this._toolBtnTimecode, spacer, helpBtn);
+        // Settings gear button
+        const settingsBtn = document.createElement("button");
+        settingsBtn.textContent = "⚙";
+        settingsBtn.title = "Editor Settings";
+        settingsBtn.style.cssText = `
+            background: #333; border: 1px solid #555; color: #aaa; cursor: pointer;
+            padding: 1px 7px; border-radius: 10px; font-size: 12px; margin-left: 4px;
+        `;
+        settingsBtn.addEventListener("click", () => this._showSettingsPanel());
+
+        // Saved selections bookmark button
+        this._bookmarkBtn = document.createElement("button");
+        this._bookmarkBtn.textContent = "🔖";
+        this._bookmarkBtn.title = "Saved Selections";
+        this._bookmarkBtn.style.cssText = `
+            background: #333; border: 1px solid #555; color: #ccc; cursor: pointer;
+            padding: 1px 6px; border-radius: 3px; font-size: 11px; position: relative;
+        `;
+        this._bookmarkBtn.addEventListener("click", (e) => this._toggleSavedSelectionsDropdown(e));
+
+        // + Queue button
+        this._queueBtn = document.createElement("button");
+        this._queueBtn.textContent = "+ Queue";
+        this._queueBtn.title = "Add current selection to render queue";
+        this._queueBtn.style.cssText = `
+            background: #333; border: 1px solid #555; color: #ccc; cursor: pointer;
+            padding: 2px 8px; font-size: 10px; border-radius: 3px; white-space: nowrap;
+        `;
+        this._queueBtn.addEventListener("click", () => this._addToRenderQueue());
+
+        // Animatic toggle button
+        this._toolBtnAnimatic = makeToolBtn("👁 Anim", "A", "Toggle animatic mode (hide all video)", () => this._animaticMode, () => {
+            this._toggleAnimatic();
+        });
+
+        // Zoom controls + fullscreen (migrated from info bar)
+        const zoomOut = this._makeBtn("−", "Zoom out [-]");
+        zoomOut.style.fontSize = "13px";
+        zoomOut.addEventListener("click", () => this._zoom(-1));
+
+        const zoomIn = this._makeBtn("+", "Zoom in [+]");
+        zoomIn.style.fontSize = "13px";
+        zoomIn.addEventListener("click", () => this._zoom(1));
+
+        this._fullscreenBtn = this._makeBtn("⛶", "Toggle fullscreen");
+        this._fullscreenBtn.style.fontSize = "14px";
+        this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
+
+        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
         this.container.appendChild(this._toolbar);
         this._updateToolbar();
     }
@@ -416,65 +628,28 @@ export class EditorWidget {
 
         // Update selection display
         if (this._selectionLabel) {
+            const preCtx = this._contextFrameValue("pre_context_frames");
+            const postCtx = this._contextFrameValue("post_context_frames");
+            const ctxSuffix = (preCtx > 0 || postCtx > 0) ? ` | Ctx: -${preCtx}/+${postCtx}` : "";
             if (this.selectionStart < this.selectionEnd) {
                 const dur = this.selectionEnd - this.selectionStart;
-                this._selectionLabel.textContent = `In: ${this._frameToTimecode(this.selectionStart)} Out: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(dur)})`;
+                this._selectionLabel.textContent = `In: ${this._frameToTimecode(this.selectionStart)} Out: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(dur)})${ctxSuffix}`;
                 this._selectionLabel.style.color = "#8cf";
             } else {
-                this._selectionLabel.textContent = "In/Out: —";
+                this._selectionLabel.textContent = `Playhead: ${this._frameToTimecode(this.playhead)} | Total: ${this._frameToTimecode(this.totalFrames)}${ctxSuffix}`;
                 this._selectionLabel.style.color = "#999";
             }
         }
+
+        // Animatic toggle state
+        if (this._toolBtnAnimatic) {
+            this._toolBtnAnimatic.style.background = this._animaticMode ? "#5a3a5a" : "#333";
+            this._toolBtnAnimatic.style.color = this._animaticMode ? "#f8f" : "#ccc";
+        }
     }
 
-    _buildInfoBar() {
-        const bar = document.createElement("div");
-        bar.style.cssText = `
-            display: flex; align-items: center; justify-content: space-between;
-            padding: 3px 6px; background: ${COLORS.sceneBar};
-            border-top: 1px solid #333; font-size: 10px; color: ${COLORS.textDim};
-        `;
-
-        this.infoLabel = document.createElement("span");
-        this.infoLabel.textContent = "Selection: none";
-
-        const zoomContainer = document.createElement("span");
-        zoomContainer.style.display = "flex";
-        zoomContainer.style.gap = "4px";
-        zoomContainer.style.alignItems = "center";
-
-        const zoomOut = this._makeBtn("−", "Zoom out");
-        zoomOut.style.fontSize = "13px";
-        zoomOut.addEventListener("click", () => this._zoom(-1));
-
-        const zoomIn = this._makeBtn("+", "Zoom in");
-        zoomIn.style.fontSize = "13px";
-        zoomIn.addEventListener("click", () => this._zoom(1));
-
-        this._fullscreenBtn = this._makeBtn("⛶", "Toggle fullscreen");
-        this._fullscreenBtn.style.fontSize = "14px";
-        this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
-
-        // UI Scale controls
-        const scaleContainer = document.createElement("span");
-        scaleContainer.style.cssText = "display:flex; gap:2px; align-items:center; margin-right:8px;";
-        const scaleDn = this._makeBtn("A−", "Decrease UI scale");
-        scaleDn.style.fontSize = "9px";
-        scaleDn.addEventListener("click", () => this._setUiScale(this._uiScale - 0.1));
-        this._scaleLabel = document.createElement("span");
-        this._scaleLabel.style.cssText = "font-size:9px; color:#888; min-width:28px; text-align:center;";
-        this._scaleLabel.textContent = `${Math.round(this._uiScale * 100)}%`;
-        const scaleUp = this._makeBtn("A+", "Increase UI scale");
-        scaleUp.style.fontSize = "9px";
-        scaleUp.addEventListener("click", () => this._setUiScale(this._uiScale + 0.1));
-        scaleContainer.append(scaleDn, this._scaleLabel, scaleUp);
-
-        zoomContainer.append(this._fullscreenBtn, scaleContainer, zoomOut, zoomIn);
-        bar.append(this.infoLabel, zoomContainer);
-        this._infoBar = bar;
-        this.container.appendChild(bar);
-    }
-
+    // Info bar removed — zoom/fullscreen controls moved to toolbar.
+    // _updateInfoLabel calls replaced with _updateToolbar.
     _buildAssetGallery() {
         const gallery = document.createElement("div");
         gallery.style.cssText = `
@@ -519,6 +694,7 @@ export class EditorWidget {
         this.assetGrid = document.createElement("div");
         this.assetGrid.style.cssText = `
             display: flex; flex-wrap: wrap; gap: 6px; padding: 6px;
+            align-content: start;
             overflow-y: auto; max-height: ${this._galleryHeight - 30}px;
             min-height: 60px;
         `;
@@ -532,7 +708,32 @@ export class EditorWidget {
         this.emptyMsg.textContent = "No assets yet. Import media into your project.";
         this.assetGrid.appendChild(this.emptyMsg);
 
-        gallery.append(tabs, this.assetGrid);
+        // Render Queue section (collapsible)
+        const queueSection = document.createElement("div");
+        queueSection.style.cssText = `border-top: 1px solid #444;`;
+
+        const queueHeader = document.createElement("div");
+        queueHeader.style.cssText = `
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 3px 8px; background: #252525; cursor: pointer; font-size: 10px; color: #999;
+        `;
+        queueHeader.innerHTML = `<span>▸ Render Queue</span>`;
+        this._queueContainer = document.createElement("div");
+        this._queueContainer.style.cssText = `max-height: 0; overflow: hidden; transition: max-height 0.2s;`;
+        this._queueContainer.innerHTML = `<div style="padding: 8px; color: #666; font-style: italic; font-size: 10px;">Queue empty — use + Queue to add jobs</div>`;
+
+        let queueExpanded = false;
+        queueHeader.addEventListener("click", () => {
+            queueExpanded = !queueExpanded;
+            this._queueContainer.style.maxHeight = queueExpanded ? "200px" : "0";
+            this._queueContainer.style.overflowY = queueExpanded ? "auto" : "hidden";
+            queueHeader.querySelector("span").textContent = `${queueExpanded ? "▾" : "▸"} Render Queue (${(this._renderQueue || []).length})`;
+            if (queueExpanded) this._fetchRenderQueue();
+        });
+
+        queueSection.append(queueHeader, this._queueContainer);
+
+        gallery.append(tabs, this.assetGrid, queueSection);
         this.container.appendChild(gallery);
         this.galleryEl = gallery;
 
@@ -549,14 +750,36 @@ export class EditorWidget {
         gallery.addEventListener("dragleave", () => {
             gallery.style.outline = "none";
         });
-        gallery.addEventListener("drop", (e) => {
+        gallery.addEventListener("drop", async (e) => {
             gallery.style.outline = "none";
-            if (e.dataTransfer.files?.length > 0) {
-                e.preventDefault();
-                e.stopPropagation();
-                for (const file of e.dataTransfer.files) {
-                    this._importFile(file);
+            if (!e.dataTransfer?.types?.includes("Files")) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            const items = Array.from(e.dataTransfer.items || []);
+            let handledEntries = false;
+
+            for (const item of items) {
+                const entry = typeof item.webkitGetAsEntry === "function"
+                    ? item.webkitGetAsEntry()
+                    : null;
+                if (entry?.isDirectory) {
+                    handledEntries = true;
+                    await this._importDroppedDirectory(entry);
+                } else if (entry?.isFile) {
+                    const file = item.getAsFile?.();
+                    if (file) {
+                        handledEntries = true;
+                        await this._importFile(file);
+                    }
                 }
+            }
+
+            if (handledEntries) return;
+
+            for (const file of Array.from(e.dataTransfer.files || [])) {
+                await this._importFile(file);
             }
         });
 
@@ -611,7 +834,7 @@ export class EditorWidget {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     name: `Scene ${this.scenes.length + 1}`,
-                    duration_frames: parseInt(this.durationInput.value) || 200,
+                    duration_frames: Math.max(1, this.totalFrames || 200),
                 }),
             });
             if (resp.ok) {
@@ -628,6 +851,11 @@ export class EditorWidget {
         const isSameScene = this.activeSceneId === scene.scene_id;
 
         if (!isSameScene) {
+            if (this._animaticMode && this._restoreAnimaticState()) {
+                this._saveLaneConfig();
+            }
+            this._animaticMode = false;
+            this._preAnimaticHidden = null;
             this._stopPlayback();
             // Clear undo/redo on scene switch (snapshots are scene-specific)
             this._undoStack = [];
@@ -647,8 +875,20 @@ export class EditorWidget {
         this.activeSceneId = scene.scene_id;
         this._buildTrackLayout();
         this.totalFrames = scene.duration_frames || 200;
-        this.durationInput.value = this.totalFrames;
+        this._refreshDurationInput();
         this.sceneLabel.textContent = scene.name || "Untitled Scene";
+
+        // Load scene resolution/fps into inputs
+        this._syncSceneResolutionControls();
+        if (this._fpsInput) {
+            this._fpsInput.value = scene.fps || "";
+            this._fpsInput.placeholder = String(this.fps);
+        }
+        this._updateViewportHeader();
+        this._updateAspectLockButton();
+        if (this._lockAspectRatio) {
+            this._captureLockedRatio();
+        }
 
         // Update hidden widgets
         this._setWidgetValue("scene_id", scene.scene_id);
@@ -665,7 +905,117 @@ export class EditorWidget {
         } else {
             this._renderTimeline();
         }
+        this._resizeViewportCanvas();
         this._renderViewportFrame();
+        this._updateToolbar();
+    }
+
+    _refreshDurationInput() {
+        if (!this.durationInput) return;
+        if (this._timecodeMode === "timecode") {
+            this.durationInput.type = "text";
+            this.durationInput.inputMode = "decimal";
+            this.durationInput.value = this._framesToSeconds(this.totalFrames).toFixed(2);
+            this._durLabel.textContent = "Duration:";
+        } else {
+            this.durationInput.type = "number";
+            this.durationInput.inputMode = "numeric";
+            this.durationInput.value = this.totalFrames;
+            this._durLabel.textContent = "Frames:";
+        }
+    }
+
+    _clampTimelineStateToDuration() {
+        const maxFrame = Math.max(0, this.totalFrames);
+        this.playhead = Math.min(this.playhead, maxFrame);
+        this.selectionStart = Math.min(this.selectionStart, maxFrame);
+        this.selectionEnd = Math.min(this.selectionEnd, maxFrame);
+        this._setWidgetValue("selection_start", this.selectionStart);
+        this._setWidgetValue("selection_end", this.selectionEnd);
+    }
+
+    _onResolutionChange(axis) {
+        let w = parseInt(this._resWInput.value) || 0;
+        let h = parseInt(this._resHInput.value) || 0;
+        if (this._lockAspectRatio && this._lockedRatio > 0) {
+            if (axis === "w" && w > 0) {
+                h = Math.round(w / this._lockedRatio / 8) * 8;
+                this._resHInput.value = h || "";
+            } else if (axis === "h" && h > 0) {
+                w = Math.round(h * this._lockedRatio / 8) * 8;
+                this._resWInput.value = w || "";
+            }
+        }
+        this._updateSceneResolution(w, h);
+    }
+
+    async _updateSceneResolution(w, h) {
+        if (!this.activeScene || !this.projectDir) return;
+        w = Math.max(0, parseInt(w, 10) || 0);
+        h = Math.max(0, parseInt(h, 10) || 0);
+        const dirName = this._projectDirName();
+        const sceneRef = this.activeScene;
+        const sceneId = this.activeSceneId;
+        const prevWidth = sceneRef.width || 0;
+        const prevHeight = sceneRef.height || 0;
+        sceneRef.width = w;
+        sceneRef.height = h;
+        if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
+            this._syncSceneResolutionControls();
+            if (w > 0 && h > 0 && this._lockAspectRatio) {
+                this._lockedRatio = w / h;
+            }
+            this._updateViewportHeader();
+            this._resizeViewportCanvas();
+            this._renderViewportFrame();
+        }
+        try {
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ width: w, height: h }),
+            });
+        } catch (e) {
+            sceneRef.width = prevWidth;
+            sceneRef.height = prevHeight;
+            if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
+                this._syncSceneResolutionControls();
+                this._updateViewportHeader();
+                this._resizeViewportCanvas();
+                this._renderViewportFrame();
+            }
+            console.warn("[LTX Editor] Failed to update scene resolution:", e);
+        }
+    }
+
+    async _updateSceneFps(fps) {
+        if (!this.activeScene || !this.projectDir) return;
+        const dirName = this._projectDirName();
+        const sceneRef = this.activeScene;
+        const sceneId = this.activeSceneId;
+        try {
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ fps }),
+            });
+            sceneRef.fps = fps;
+            if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
+                this._updateViewportHeader();
+                if (this._timecodeMode === "timecode") {
+                    this._refreshDurationInput();
+                    if (this._itemEditorEl && this.selectedItem) {
+                        this._showItemEditor();
+                    }
+                }
+                this._renderTimeline();
+                this._renderViewportFrame();
+                this._updateToolbar();
+                this._updateTransportUI();
+            }
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to update scene FPS:", e);
+        }
     }
 
     _cycleScene(dir) {
@@ -699,16 +1049,39 @@ export class EditorWidget {
 
     async _updateSceneDuration(frames) {
         if (!this.activeScene || !this.projectDir) return;
+        frames = Math.max(1, parseInt(frames, 10) || 1);
         this._pushUndo("change duration");
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const dirName = this._projectDirName();
+        const sceneRef = this.activeScene;
+        const sceneId = this.activeSceneId;
+        const prevDuration = sceneRef.duration_frames || this.totalFrames;
+        sceneRef.duration_frames = frames;
+        if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
+            this.totalFrames = frames;
+            this._clampTimelineStateToDuration();
+            this._refreshDurationInput();
+            this._renderTimeline();
+            this._renderViewportFrame();
+            this._updateToolbar();
+            this._updateTransportUI();
+        }
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ duration_frames: frames }),
             });
-            this.activeScene.duration_frames = frames;
         } catch (e) {
+            sceneRef.duration_frames = prevDuration;
+            if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
+                this.totalFrames = prevDuration;
+                this._clampTimelineStateToDuration();
+                this._refreshDurationInput();
+                this._renderTimeline();
+                this._renderViewportFrame();
+                this._updateToolbar();
+                this._updateTransportUI();
+            }
             console.warn("[LTX Editor] Failed to update scene duration:", e);
         }
     }
@@ -834,7 +1207,52 @@ export class EditorWidget {
             return;
         }
 
+        // Group by folder
+        const rootItems = [];
+        const folders = {};
         for (const asset of items) {
+            const folder = asset.folder || "";
+            if (folder) {
+                if (!folders[folder]) folders[folder] = [];
+                folders[folder].push(asset);
+            } else {
+                rootItems.push(asset);
+            }
+        }
+
+        // Render root items first
+        for (const asset of rootItems) {
+            this.assetGrid.appendChild(this._buildAssetItem(asset));
+        }
+
+        // Render folder groups
+        const sortedFolders = Object.keys(folders).sort();
+        for (const folderName of sortedFolders) {
+            const folderHeader = document.createElement("div");
+            folderHeader.style.cssText = `
+                width: 100%; padding: 4px 8px; background: #1a1a2e;
+                border-radius: 3px; cursor: pointer; font-size: 10px; color: #8cf;
+                display: flex; align-items: center; gap: 4px; margin-top: 4px;
+            `;
+            const collapsed = this._collapsedFolders?.[folderName] ?? false;
+            folderHeader.innerHTML = `<span>${collapsed ? "▸" : "▾"}</span> 📁 ${folderName} (${folders[folderName].length})`;
+            folderHeader.addEventListener("click", () => {
+                if (!this._collapsedFolders) this._collapsedFolders = {};
+                this._collapsedFolders[folderName] = !this._collapsedFolders[folderName];
+                this._renderAssetGrid();
+            });
+            this.assetGrid.appendChild(folderHeader);
+
+            if (!collapsed) {
+                for (const asset of folders[folderName]) {
+                    this.assetGrid.appendChild(this._buildAssetItem(asset));
+                }
+            }
+        }
+    }
+
+    _buildAssetItem(asset) {
+        {
             const item = document.createElement("div");
             item.style.cssText = `
                 width: 80px; background: ${COLORS.galleryItem};
@@ -914,7 +1332,7 @@ export class EditorWidget {
             });
 
             item.append(thumb, label, meta);
-            this.assetGrid.appendChild(item);
+            return item;
         }
     }
 
@@ -1047,10 +1465,111 @@ export class EditorWidget {
         }
     }
 
-    // ── Timecode Helpers ──────────────────────────────────────────────
+    // ── FPS & Timecode Helpers ───────────────────────────────────────
+    get _effectiveFps() {
+        const sceneFps = this.activeScene?.fps || 0;
+        return sceneFps > 0 ? sceneFps : (this.fps || 24);
+    }
+
+    get _effectiveSceneWidth() {
+        const sceneWidth = this.activeScene?.width || 0;
+        return sceneWidth > 0 ? sceneWidth : (this.sceneWidth || 768);
+    }
+
+    get _effectiveSceneHeight() {
+        const sceneHeight = this.activeScene?.height || 0;
+        return sceneHeight > 0 ? sceneHeight : (this.sceneHeight || 512);
+    }
+
+    _framesToSeconds(frames) { return frames / this._effectiveFps; }
+    _secondsToFrames(seconds) { return Math.round(seconds * this._effectiveFps); }
+    _formatPositionInput(frame) { return this._timecodeMode === "timecode" ? this._framesToSeconds(frame).toFixed(2) : String(frame); }
+    _parsePositionInput(value) {
+        if (this._timecodeMode === "timecode") {
+            const seconds = parseFloat(value);
+            return Number.isFinite(seconds) ? this._secondsToFrames(seconds) : NaN;
+        }
+        const frames = parseInt(value, 10);
+        return Number.isFinite(frames) ? frames : NaN;
+    }
+
+    _updateViewportHeader() {
+        if (!this._vpHeaderText) return;
+        this._vpHeaderText.textContent = `${this._effectiveSceneWidth}×${this._effectiveSceneHeight} @ ${this._effectiveFps}fps`;
+    }
+
+    _updateAspectLockButton() {
+        if (!this._lockBtn) return;
+        const locked = !!this._lockAspectRatio;
+        this._lockBtn.textContent = locked ? "🔒" : "🔓";
+        this._lockBtn.title = locked ? "Aspect ratio lock enabled" : "Aspect ratio lock disabled";
+        this._lockBtn.style.background = locked ? "rgba(58, 124, 165, 0.35)" : "transparent";
+        this._lockBtn.style.borderColor = locked ? "#5aacd5" : "transparent";
+        this._lockBtn.style.color = locked ? "#d7f1ff" : "#aaa";
+    }
+
+    _captureLockedRatio() {
+        const w = parseInt(this._resWInput?.value, 10) || this._effectiveSceneWidth;
+        const h = parseInt(this._resHInput?.value, 10) || this._effectiveSceneHeight;
+        if (w > 0 && h > 0) {
+            this._lockedRatio = w / h;
+        }
+    }
+
+    _syncSceneResolutionControls() {
+        if (this._resWInput) {
+            this._resWInput.value = this.activeScene?.width || "";
+            this._resWInput.placeholder = String(this.sceneWidth || 768);
+        }
+        if (this._resHInput) {
+            this._resHInput.value = this.activeScene?.height || "";
+            this._resHInput.placeholder = String(this.sceneHeight || 512);
+        }
+        if (this._resPreset) {
+            const val = `${this.activeScene?.width || 0},${this.activeScene?.height || 0}`;
+            this._resPreset.value = Array.from(this._resPreset.options).some((opt) => opt.value === val) ? val : "0,0";
+        }
+    }
+
+    _contextFrameValue(name) {
+        return Math.max(0, parseInt(this._getWidgetValue(name, 0), 10) || 0);
+    }
+
+    _refreshContextInputs() {
+        if (this._preContextInput) {
+            this._preContextInput.value = this._contextFrameValue("pre_context_frames");
+        }
+        if (this._postContextInput) {
+            this._postContextInput.value = this._contextFrameValue("post_context_frames");
+        }
+        this._updateToolbar();
+    }
+
+    _updateContextFrameWidgets() {
+        const pre = Math.max(0, parseInt(this._preContextInput?.value, 10) || 0);
+        const post = Math.max(0, parseInt(this._postContextInput?.value, 10) || 0);
+        if (this._preContextInput) this._preContextInput.value = pre;
+        if (this._postContextInput) this._postContextInput.value = post;
+        this._setWidgetValue("pre_context_frames", pre);
+        this._setWidgetValue("post_context_frames", post);
+        this._updateToolbar();
+    }
+
+    _restoreAnimaticState() {
+        if (!this._preAnimaticHidden) return false;
+        for (const entry of this._trackLayout) {
+            if (entry.type === TRACK_TYPE.VIDEO) {
+                entry.hidden = !!this._preAnimaticHidden[entry.laneIndex];
+            }
+        }
+        this._preAnimaticHidden = null;
+        this._animaticMode = false;
+        return true;
+    }
+
     _frameToTimecode(frame) {
         if (this._timecodeMode === "frames") return String(frame);
-        const fps = this.fps || 24;
+        const fps = this._effectiveFps;
         const totalSeconds = frame / fps;
         const h = Math.floor(totalSeconds / 3600);
         const m = Math.floor((totalSeconds % 3600) / 60);
@@ -1062,9 +1581,35 @@ export class EditorWidget {
 
     _toggleTimecodeMode() {
         this._timecodeMode = this._timecodeMode === "frames" ? "timecode" : "frames";
+        this._refreshDurationInput();
+        if (this._itemEditorEl && this.selectedItem) {
+            this._showItemEditor();
+        }
         this._renderTimeline();
-        this._updateInfoLabel();
+        this._updateToolbar();
         this._updateTransportUI();
+    }
+
+    async _toggleAnimatic() {
+        if (!this.activeScene || !this.projectDir) return;
+
+        if (this._animaticMode) {
+            if (!this._restoreAnimaticState()) return;
+        } else {
+            const hiddenByLane = {};
+            for (const entry of this._trackLayout) {
+                if (entry.type !== TRACK_TYPE.VIDEO) continue;
+                hiddenByLane[entry.laneIndex] = !!entry.hidden;
+                entry.hidden = true;
+            }
+            this._preAnimaticHidden = hiddenByLane;
+            this._animaticMode = true;
+        }
+
+        await this._saveLaneConfig();
+        this._renderTimeline();
+        this._renderViewportFrame();
+        this._updateToolbar();
     }
 
     /** Build the track layout array from scene lane counts */
@@ -1165,9 +1710,10 @@ export class EditorWidget {
 
     /** Get y offset of a layout index accounting for collapsed tracks */
     _trackY(layoutIdx) {
-        let y = RULER_HEIGHT;
+        const ts = this._scaleTimeline;
+        let y = Math.round(RULER_HEIGHT * ts);
         for (let i = 0; i < layoutIdx; i++) {
-            y += this._trackLayout[i]?.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
+            y += Math.round((this._trackLayout[i]?.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT) * ts);
         }
         return y;
     }
@@ -1175,14 +1721,15 @@ export class EditorWidget {
     /** Get height of a layout index accounting for collapsed state */
     _trackH(layoutIdx) {
         const entry = this._trackLayout[layoutIdx];
-        return entry?.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
+        return Math.round((entry?.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT) * this._scaleTimeline);
     }
 
     /** Total height of all tracks */
     _totalTracksHeight() {
+        const ts = this._scaleTimeline;
         let h = 0;
         for (const entry of this._trackLayout) {
-            h += entry.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT;
+            h += Math.round((entry.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT) * ts);
         }
         return h;
     }
@@ -1227,22 +1774,21 @@ export class EditorWidget {
         const canvas = this.timelineCanvas;
         const rect = canvas.parentElement?.getBoundingClientRect();
         const width = rect ? Math.floor(rect.width) : 400;
-        const totalH = RULER_HEIGHT + this._totalTracksHeight();
+        const rulerH = Math.round(RULER_HEIGHT * this._scaleTimeline);
+        const totalH = rulerH + this._totalTracksHeight();
         const canvasH = Math.max(totalH, this._timelineHeight);
-        const s = this._uiScale;
 
-        // Set canvas pixel buffer to scaled size, CSS size reflects visual size
-        canvas.width = Math.floor(width * s);
-        canvas.height = Math.floor(canvasH * s);
+        // Canvas at 1:1 — per-section scales handle individual elements
+        canvas.width = width;
+        canvas.height = canvasH;
         canvas.style.width = width + "px";
-        canvas.style.height = (canvasH * s) + "px";
+        canvas.style.height = canvasH + "px";
 
         const ctx = canvas.getContext("2d");
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.save();
-        ctx.scale(s, s);
 
-        // Background (logical dimensions)
+        // Background
         ctx.fillStyle = COLORS.bg;
         ctx.fillRect(0, 0, width, canvasH);
 
@@ -1254,10 +1800,14 @@ export class EditorWidget {
         this._drawPlayhead(ctx, width);
         this._drawSnapIndicator(ctx, width);
         ctx.restore();
-        this._updateInfoLabel();
+        this._updateToolbar();
     }
 
-    get _labelW() { return this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH; }
+    get _labelW() {
+        const userW = this.isFullscreen ? this._labelWidthUserFS : this._labelWidthUser;
+        const baseW = userW > 0 ? userW : (this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH);
+        return Math.round(baseW * this._scaleTrackHeaders);
+    }
 
     _frameToX(frame) {
         return this._labelW + (frame - this.scrollX) * this.pixelsPerFrame;
@@ -1276,12 +1826,14 @@ export class EditorWidget {
     }
 
     _drawRuler(ctx, width) {
+        const ts = this._scaleTimeline;
+        const rulerH = Math.round(RULER_HEIGHT * ts);
         ctx.fillStyle = COLORS.ruler;
-        ctx.fillRect(0, 0, width, RULER_HEIGHT);
+        ctx.fillRect(0, 0, width, rulerH);
 
         ctx.strokeStyle = COLORS.rulerTick;
         ctx.fillStyle = COLORS.rulerText;
-        ctx.font = "9px monospace";
+        ctx.font = `${Math.round(9 * ts)}px monospace`;
         ctx.textAlign = "center";
 
         // Determine tick spacing based on zoom
@@ -1292,7 +1844,7 @@ export class EditorWidget {
 
         // For timecode mode, adjust major ticks to align with seconds
         if (this._timecodeMode === "timecode") {
-            const fps = this.fps || 24;
+            const fps = this._effectiveFps;
             if (this.pixelsPerFrame * fps < 80) {
                 majorEvery = fps * 5; // every 5 seconds
             } else {
@@ -1309,21 +1861,22 @@ export class EditorWidget {
 
             if (f % majorEvery === 0) {
                 ctx.beginPath();
-                ctx.moveTo(x, RULER_HEIGHT - 12);
-                ctx.lineTo(x, RULER_HEIGHT);
+                ctx.moveTo(x, rulerH - Math.round(12 * ts));
+                ctx.lineTo(x, rulerH);
                 ctx.stroke();
-                ctx.fillText(this._frameToTimecode(f), x, RULER_HEIGHT - 13);
+                ctx.fillText(this._frameToTimecode(f), x, rulerH - Math.round(13 * ts));
             } else if (f % (majorEvery / 5) === 0 && this.pixelsPerFrame > 1.5) {
                 ctx.beginPath();
-                ctx.moveTo(x, RULER_HEIGHT - 6);
-                ctx.lineTo(x, RULER_HEIGHT);
+                ctx.moveTo(x, rulerH - Math.round(6 * ts));
+                ctx.lineTo(x, rulerH);
                 ctx.stroke();
             }
         }
     }
 
     _drawTracks(ctx, width) {
-        const headerW = this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH;
+        const hs = this._scaleTrackHeaders;
+        const headerW = this._labelW; // already scaled by _scaleTrackHeaders
         const fs = this.isFullscreen;
         for (let i = 0; i < this._trackLayout.length; i++) {
             const entry = this._trackLayout[i];
@@ -1339,22 +1892,22 @@ export class EditorWidget {
             if (collapsed) {
                 // Collapsed: just arrow + short label
                 ctx.fillStyle = "#555";
-                ctx.font = "7px sans-serif";
+                ctx.font = `${Math.round(7 * hs)}px sans-serif`;
                 ctx.textAlign = "left";
-                ctx.fillText(`▸ ${entry.label}`, fs ? 6 : 3, y + h / 2 + 2);
+                ctx.fillText(`▸ ${entry.label}`, Math.round((fs ? 6 : 3) * hs), y + h / 2 + 2);
             } else {
                 // --- Header layout (left to right) ---
-                // Positions scale with fullscreen
-                const arrowX = fs ? 6 : 3;
-                const iconSize = fs ? 14 : 11;
+                // Positions scale with fullscreen AND _scaleTrackHeaders
+                const arrowX = Math.round((fs ? 6 : 3) * hs);
+                const iconSize = Math.round((fs ? 14 : 11) * hs);
                 let curX = arrowX;
 
                 // 1. Collapse arrow
                 ctx.fillStyle = COLORS.textDim;
                 ctx.font = `${iconSize}px sans-serif`;
                 ctx.textAlign = "left";
-                ctx.fillText("▾", curX, y + h / 2 + (fs ? 5 : 4));
-                curX += iconSize + 2;
+                ctx.fillText("▾", curX, y + h / 2 + Math.round((fs ? 5 : 4) * hs));
+                curX += iconSize + Math.round(2 * hs);
 
                 if (isLane) {
                     // 2. Lock icon — bright red-orange when locked, dim when unlocked
@@ -1364,31 +1917,31 @@ export class EditorWidget {
                         ctx.fillRect(curX - 1, y + 2, iconSize + 1, h - 4);
                     }
                     ctx.fillStyle = entry.locked ? "#ff5544" : "#666";
-                    ctx.font = `${iconSize - 2}px sans-serif`;
-                    ctx.fillText(entry.locked ? "🔒" : "🔓", curX, y + h / 2 + (fs ? 4 : 3));
-                    curX += iconSize + 1;
+                    ctx.font = `${iconSize - Math.round(2 * hs)}px sans-serif`;
+                    ctx.fillText(entry.locked ? "🔒" : "🔓", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
+                    curX += iconSize + Math.round(1 * hs);
 
                     // 3. Hide/Mute icon
                     if (entry.type === TRACK_TYPE.VIDEO) {
                         ctx.fillStyle = entry.hidden ? "#e05050" : "#555";
-                        ctx.fillText(entry.hidden ? "🚫" : "👁", curX, y + h / 2 + (fs ? 4 : 3));
+                        ctx.fillText(entry.hidden ? "🚫" : "👁", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
                     } else {
                         ctx.fillStyle = entry.hidden ? "#e05050" : "#555";
-                        ctx.fillText(entry.hidden ? "🔇" : "🔊", curX, y + h / 2 + (fs ? 4 : 3));
+                        ctx.fillText(entry.hidden ? "🔇" : "🔊", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
                     }
-                    curX += iconSize + 1;
+                    curX += iconSize + Math.round(1 * hs);
 
                     // 4. Color bar
                     if (entry.color) {
                         ctx.fillStyle = entry.color;
-                        ctx.fillRect(curX, y + 2, 4, h - 4);
+                        ctx.fillRect(curX, y + 2, Math.round(4 * hs), h - 4);
                     }
-                    curX += 7;
+                    curX += Math.round(7 * hs);
                 }
 
                 // 5. Label
                 ctx.fillStyle = isLane && entry.hidden ? "#666" : COLORS.textDim;
-                ctx.font = fs ? "10px sans-serif" : "8px sans-serif";
+                ctx.font = `${Math.round((fs ? 10 : 8) * hs)}px sans-serif`;
                 ctx.textAlign = "left";
                 const labelText = entry.label;
                 const maxLabelW = headerW - curX - 2;
@@ -1396,7 +1949,7 @@ export class EditorWidget {
                 ctx.beginPath();
                 ctx.rect(curX, y, maxLabelW, h);
                 ctx.clip();
-                ctx.fillText(labelText, curX, y + h / 2 + (fs ? 3 : 3));
+                ctx.fillText(labelText, curX, y + h / 2 + Math.round(3 * hs));
                 ctx.restore();
             }
 
@@ -1407,6 +1960,15 @@ export class EditorWidget {
             ctx.lineTo(width, y + h);
             ctx.stroke();
         }
+
+        // Header/timeline boundary separator (draggable)
+        const bx = this._labelW;
+        ctx.strokeStyle = "#555";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(bx, 0);
+        ctx.lineTo(bx, this._trackY(this._trackLayout.length - 1) + this._trackH(this._trackLayout.length - 1));
+        ctx.stroke();
     }
 
     _drawSelection(ctx, width) {
@@ -1414,7 +1976,7 @@ export class EditorWidget {
 
         const x1 = this._frameToX(this.selectionStart);
         const x2 = this._frameToX(this.selectionEnd);
-        const y = RULER_HEIGHT;
+        const y = Math.round(RULER_HEIGHT * this._scaleTimeline);
         const h = this._totalTracksHeight();
 
         // Fill
@@ -1461,9 +2023,9 @@ export class EditorWidget {
 
             // Label
             ctx.fillStyle = COLORS.text;
-            ctx.font = "8px monospace";
+            ctx.font = `${Math.round(8 * this._scaleTimeline)}px monospace`;
             ctx.textAlign = "center";
-            ctx.fillText(`f${idx}`, x, y + h + 10);
+            ctx.fillText(`f${idx}`, x, y + h + Math.round(10 * this._scaleTimeline));
         }
     }
 
@@ -1591,12 +2153,12 @@ export class EditorWidget {
 
                 // Clip label
                 ctx.fillStyle = COLORS.text;
-                ctx.font = "9px sans-serif";
+                ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
                 ctx.textAlign = "left";
                 const dur = clip.timeline_end_frame - clip.timeline_start_frame;
                 let label = this._timecodeMode === "timecode" ? this._frameToTimecode(dur) : `${dur}f`;
                 if (opacity < 1.0) label += ` ${Math.round(opacity * 100)}%`;
-                ctx.fillText(label, x1 + 4, videoY + videoH / 2 + 3);
+                ctx.fillText(label, x1 + 4, videoY + videoH / 2 + Math.round(3 * this._scaleTimeline));
 
                 // Permanent trim ghost
                 const clipOrigin = clip.source_origin_frame || 0;
@@ -1662,7 +2224,7 @@ export class EditorWidget {
                         const halfH = (audioH - 8) / 2;
 
                         // Map visible source frames to waveform buckets
-                        const totalDurFrames = audioAsset.duration_sec * (this.fps || 24);
+                        const totalDurFrames = audioAsset.duration_sec * this._effectiveFps;
                         const srcIn = track.source_in_frame || 0;
                         const visibleFrames = track.timeline_end_frame - track.timeline_start_frame;
                         const startFrac = totalDurFrames > 0 ? srcIn / totalDurFrames : 0;
@@ -1715,11 +2277,11 @@ export class EditorWidget {
                 // Audio label
                 if ((x2 - x1) > 30) {
                     ctx.fillStyle = COLORS.text;
-                    ctx.font = "8px sans-serif";
+                    ctx.font = `${Math.round(8 * this._scaleTimeline)}px sans-serif`;
                     ctx.textAlign = "left";
                     let aLabel = track.muted ? "M" : "";
                     if (vol < 1.0 && !track.muted) aLabel += `${Math.round(vol * 100)}%`;
-                    if (aLabel) ctx.fillText(aLabel, x1 + 4, audioY + audioH / 2 + 3);
+                    if (aLabel) ctx.fillText(aLabel, x1 + 4, audioY + audioH / 2 + Math.round(3 * this._scaleTimeline));
                 }
 
                 // Permanent trim ghost for audio
@@ -1778,13 +2340,13 @@ export class EditorWidget {
                 // Prompt text label (truncated)
                 if (section.prompt && (x2 - x1) > 20) {
                     ctx.fillStyle = COLORS.text;
-                    ctx.font = "9px sans-serif";
+                    ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
                     ctx.textAlign = "left";
                     ctx.save();
                     ctx.beginPath();
                     ctx.rect(x1 + 3, promptY + 2, x2 - x1 - 6, promptH - 4);
                     ctx.clip();
-                    ctx.fillText(section.prompt, x1 + 4, promptY + promptH / 2 + 3);
+                    ctx.fillText(section.prompt, x1 + 4, promptY + promptH / 2 + Math.round(3 * this._scaleTimeline));
                     ctx.restore();
                 }
 
@@ -1798,7 +2360,7 @@ export class EditorWidget {
         const x = this._frameToX(this.playhead);
         if (x < 0 || x > width) return;
 
-        const totalH = RULER_HEIGHT + this._totalTracksHeight();
+        const totalH = Math.round(RULER_HEIGHT * this._scaleTimeline) + this._totalTracksHeight();
         ctx.strokeStyle = COLORS.playhead;
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -1821,7 +2383,7 @@ export class EditorWidget {
         const x = this._frameToX(this._snapIndicator);
         if (x < 0 || x > width) return;
 
-        const totalH = RULER_HEIGHT + this._totalTracksHeight();
+        const totalH = Math.round(RULER_HEIGHT * this._scaleTimeline) + this._totalTracksHeight();
         ctx.strokeStyle = "#ffff00";
         ctx.lineWidth = 1;
         ctx.setLineDash([4, 4]);
@@ -1832,26 +2394,16 @@ export class EditorWidget {
         ctx.setLineDash([]);
     }
 
-    _updateInfoLabel() {
-        const parts = [];
-        if (this.selectionStart < this.selectionEnd) {
-            const count = this.selectionEnd - this.selectionStart;
-            parts.push(`Selection: ${this._frameToTimecode(this.selectionStart)}-${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(count)})`);
-        } else {
-            parts.push("Click & drag to select frames");
-        }
-        parts.push(`Playhead: ${this._frameToTimecode(this.playhead)}`);
-        parts.push(`Total: ${this._frameToTimecode(this.totalFrames)}`);
-        this.infoLabel.textContent = parts.join("  |  ");
-    }
+    // _updateInfoLabel removed — merged into _updateToolbar()
 
     // ── Hit Testing ──────────────────────────────────────────────────
     /** Hit-test track header area — returns { layoutIdx, zone } or null */
     _hitTestTrackHeader(x, y) {
-        const headerWidth = this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH;
+        const headerWidth = this._labelW; // already scaled by _scaleTrackHeaders
         if (x > headerWidth) return null;
         const fs = this.isFullscreen;
-        const iconSize = fs ? 14 : 11;
+        const hs = this._scaleTrackHeaders;
+        const iconSize = Math.round((fs ? 14 : 11) * hs);
         for (let i = 0; i < this._trackLayout.length; i++) {
             const ty = this._trackY(i);
             const th = this._trackH(i);
@@ -1862,17 +2414,23 @@ export class EditorWidget {
                     return { layoutIdx: i, zone: "collapse" };
                 }
                 // Zone detection (left to right) matching _drawTracks layout
-                const arrowX = fs ? 6 : 3;
-                let zoneEnd = arrowX + iconSize + 2;
+                const arrowX = Math.round((fs ? 6 : 3) * hs);
+                let zoneEnd = arrowX + iconSize + Math.round(2 * hs);
                 if (x < zoneEnd) return { layoutIdx: i, zone: "collapse" };
-                zoneEnd += iconSize + 1;
+                zoneEnd += iconSize + Math.round(1 * hs);
                 if (x < zoneEnd) return { layoutIdx: i, zone: "lock" };
-                zoneEnd += iconSize + 1;
+                zoneEnd += iconSize + Math.round(1 * hs);
                 if (x < zoneEnd) return { layoutIdx: i, zone: "hide" };
                 return { layoutIdx: i, zone: "label" };
             }
         }
         return null;
+    }
+
+    /** Hit-test the header/timeline boundary for drag resize */
+    _hitTestHeaderEdge(x, y) {
+        const headerW = this._labelW;
+        return Math.abs(x - headerW) <= 4 && y >= 0;
     }
 
     _hitTestClip(x, y) {
@@ -2138,9 +2696,21 @@ export class EditorWidget {
             this._hideContextMenu();
 
             const { x, y } = this._canvasMouseCoords(e);
+
+            // Header edge resize drag
+            if (this._hitTestHeaderEdge(x, y)) {
+                this.isDragging = true;
+                this.dragType = "headerResize";
+                this._headerResizeStartX = x;
+                this._headerResizeStartW = this._labelW;
+                canvas.style.cursor = "col-resize";
+                e.preventDefault();
+                return;
+            }
+
             const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
 
-            if (y < RULER_HEIGHT) {
+            if (y < Math.round(RULER_HEIGHT * this._scaleTimeline)) {
                 // Click on ruler = move playhead
                 this.playhead = frame;
                 this.isDragging = true;
@@ -2261,7 +2831,9 @@ export class EditorWidget {
 
             if (!this.isDragging) {
                 // Update cursor based on position
-                if (this._razorMode) {
+                if (this._hitTestHeaderEdge(x, y)) {
+                    canvas.style.cursor = "col-resize";
+                } else if (this._razorMode) {
                     canvas.style.cursor = "crosshair";
                 } else if (this._hitTestEdge(x, y)) {
                     canvas.style.cursor = "ew-resize";
@@ -2270,6 +2842,22 @@ export class EditorWidget {
                 } else {
                     canvas.style.cursor = "crosshair";
                 }
+                return;
+            }
+
+            // Header resize drag
+            if (this.dragType === "headerResize") {
+                canvas.style.cursor = "col-resize";
+                const delta = x - this._headerResizeStartX;
+                const newW = Math.max(30, this._headerResizeStartW + delta);
+                const hs = this._scaleTrackHeaders;
+                const baseW = Math.round(newW / hs); // store unscaled base width
+                if (this.isFullscreen) {
+                    this._labelWidthUserFS = baseW;
+                } else {
+                    this._labelWidthUser = baseW;
+                }
+                this._renderTimeline();
                 return;
             }
 
@@ -2418,7 +3006,14 @@ export class EditorWidget {
             this.dragType = null;
             this._snapIndicator = null;
 
-            if (wasDragType === "trimEdge" && this._trimItem) {
+            if (wasDragType === "headerResize") {
+                // Persist header width to localStorage
+                localStorage.setItem("ltx-editor-label-width", this._labelWidthUser.toString());
+                localStorage.setItem("ltx-editor-label-width-fs", this._labelWidthUserFS.toString());
+                canvas.style.cursor = "crosshair";
+                this._renderTimeline();
+                return;
+            } else if (wasDragType === "trimEdge" && this._trimItem) {
                 // Commit trim to server
                 this._commitTrim(this._trimItem);
                 this._trimItem = null;
@@ -2590,9 +3185,22 @@ export class EditorWidget {
                     menuItems.push({ label: `Delete ${count} items`, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "clip") {
                     menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+                    menuItems.push({ label: "Add Frame to Guides", action: () => this._addClipFrameToGuides(hit.data) });
+                    // Extend scene to clip end
+                    const clipEnd = hit.data.timeline_end_frame || 0;
+                    const sceneDur = this.activeScene?.duration_frames || 0;
+                    if (clipEnd > sceneDur) {
+                        menuItems.push({ label: "Extend Scene to Clip End", action: () => this._updateSceneDuration(clipEnd) });
+                    }
                     menuItems.push({ label: itemLocked ? "Delete Clip (locked)" : "Delete Clip", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "audio") {
                     menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+                    // Extend scene to audio end
+                    const audioEnd = hit.data.timeline_end_frame || 0;
+                    const audioSceneDur = this.activeScene?.duration_frames || 0;
+                    if (audioEnd > audioSceneDur) {
+                        menuItems.push({ label: "Extend Scene to Audio End", action: () => this._updateSceneDuration(audioEnd) });
+                    }
                     menuItems.push({ label: itemLocked ? "Delete Audio (locked)" : "Delete Audio Track", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "guide") {
                     menuItems.push({ label: "Delete Guide", action: () => this._deleteSelectedItems(), danger: true });
@@ -2625,6 +3233,12 @@ export class EditorWidget {
 
     async _handleAssetDrop(asset, frame, trackY) {
         if (!this.activeScene || !this.projectDir) return;
+
+        // Take-aware drop: if asset has take_metadata, auto-place at original position
+        if (asset.generation_params?.selection_start !== undefined && asset.generation_params?.scene_id === this.activeScene.scene_id) {
+            frame = asset.generation_params.selection_start;
+        }
+
         this._pushUndo("add asset");
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
@@ -2678,7 +3292,7 @@ export class EditorWidget {
             // Also check audio overlap for dual video+audio drops (always check —
             // server attempts dual_drop regardless, and has_audio may not be set yet)
             {
-                const fps = this.fps || 24;
+                const fps = this._effectiveFps;
                 const audioDuration = dropDuration; // video duration = audio duration
                 const audioDropEnd = frame + audioDuration;
                 const hasAudioOverlap = (this.activeScene.audio_tracks || []).some(a =>
@@ -2698,7 +3312,7 @@ export class EditorWidget {
                 }
             }
         } else if (asset.asset_type === "audio") {
-            const fps = this.fps || 24;
+            const fps = this._effectiveFps;
             const assetObj = _findAsset(asset.asset_id);
             const dropDuration = assetObj ? Math.max(1, Math.round((assetObj.duration_sec || 1) * fps)) : 30;
             const dropEnd = frame + dropDuration;
@@ -2846,8 +3460,7 @@ export class EditorWidget {
         const entry = this._trackLayout[layoutIdx];
         const canvas = this.timelineCanvas;
         const rect = canvas.getBoundingClientRect();
-        const s = this._uiScale;
-        const headerW = this.isFullscreen ? LABEL_WIDTH_FS : LABEL_WIDTH;
+        const headerW = this._labelW; // already scaled by _scaleTrackHeaders
         const ty = this._trackY(layoutIdx);
         const th = this._trackH(layoutIdx);
 
@@ -2857,11 +3470,11 @@ export class EditorWidget {
         input.placeholder = entry.label;
         input.style.cssText = `
             position: fixed;
-            left: ${rect.left + 2 * s}px;
-            top: ${rect.top + ty * s + 1}px;
-            width: ${(headerW - 4) * s}px;
-            height: ${(th - 2) * s}px;
-            font-size: ${10 * s}px;
+            left: ${rect.left + 2}px;
+            top: ${rect.top + ty + 1}px;
+            width: ${headerW - 4}px;
+            height: ${th - 2}px;
+            font-size: ${Math.round(10 * this._scaleTrackHeaders)}px;
             background: #333;
             color: #fff;
             border: 1px solid #5af;
@@ -2900,6 +3513,8 @@ export class EditorWidget {
     async _saveLaneConfig() {
         if (!this.activeScene || !this.projectDir) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        const sceneId = this.activeSceneId;
+        const sceneRef = this.activeScene;
         const videoConfigs = [];
         const audioConfigs = [];
         for (const e of this._trackLayout) {
@@ -2913,15 +3528,15 @@ export class EditorWidget {
         for (let i = 0; i < videoConfigs.length; i++) if (!videoConfigs[i]) videoConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         for (let i = 0; i < audioConfigs.length; i++) if (!audioConfigs[i]) audioConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ video_lane_configs: videoConfigs, audio_lane_configs: audioConfigs }),
             });
             // Update local scene data
-            if (this.activeScene) {
-                this.activeScene.video_lane_configs = videoConfigs;
-                this.activeScene.audio_lane_configs = audioConfigs;
+            if (sceneRef) {
+                sceneRef.video_lane_configs = videoConfigs;
+                sceneRef.audio_lane_configs = audioConfigs;
             }
         } catch (e) {
             console.warn("[LTX Editor] Failed to save lane config:", e);
@@ -3271,8 +3886,13 @@ export class EditorWidget {
             const duration = endFrame - startFrame;
 
             // Start frame input
-            const startLabel = this._makeEditorLabel("Start:");
+            const startLabel = this._makeEditorLabel(this._timecodeMode === "timecode" ? "Start (s):" : "Start:");
             const startInput = this._makeEditorInput(startFrame, 0, this.totalFrames);
+            if (this._timecodeMode === "timecode") {
+                startInput.type = "text";
+                startInput.inputMode = "decimal";
+                startInput.value = this._formatPositionInput(startFrame);
+            }
             editor.append(startLabel, startInput);
 
             // Duration display
@@ -3337,7 +3957,7 @@ export class EditorWidget {
             // Apply button
             const applyBtn = this._makeBtn("Apply", "Apply position change");
             applyBtn.addEventListener("click", () => {
-                const newStart = parseInt(startInput.value, 10);
+                const newStart = this._parsePositionInput(startInput.value);
                 if (!isNaN(newStart) && newStart >= 0) {
                     this._moveItemToFrame(type, id, data, newStart);
                 }
@@ -3347,7 +3967,7 @@ export class EditorWidget {
             // Enter key in input
             startInput.addEventListener("keydown", (e) => {
                 if (e.key === "Enter") {
-                    const newStart = parseInt(startInput.value, 10);
+                    const newStart = this._parsePositionInput(startInput.value);
                     if (!isNaN(newStart) && newStart >= 0) {
                         this._moveItemToFrame(type, id, data, newStart);
                     }
@@ -3364,8 +3984,13 @@ export class EditorWidget {
             if (idx === -1) idx = this.totalFrames - 1;
 
             // Frame index input
-            const frameLabel = this._makeEditorLabel("Frame:");
+            const frameLabel = this._makeEditorLabel(this._timecodeMode === "timecode" ? "Frame (s):" : "Frame:");
             const frameInput = this._makeEditorInput(idx, 0, this.totalFrames - 1);
+            if (this._timecodeMode === "timecode") {
+                frameInput.type = "text";
+                frameInput.inputMode = "decimal";
+                frameInput.value = this._formatPositionInput(idx);
+            }
             editor.append(frameLabel, frameInput);
 
             // Strength display
@@ -3376,7 +4001,7 @@ export class EditorWidget {
             // Apply button
             const applyBtn = this._makeBtn("Apply", "Apply position change");
             applyBtn.addEventListener("click", () => {
-                const newIdx = parseInt(frameInput.value, 10);
+                const newIdx = this._parsePositionInput(frameInput.value);
                 if (!isNaN(newIdx) && newIdx >= 0 && newIdx !== data.frame_index) {
                     this._moveGuideToFrame(data, newIdx);
                 }
@@ -3386,7 +4011,7 @@ export class EditorWidget {
             // Enter key in input
             frameInput.addEventListener("keydown", (e) => {
                 if (e.key === "Enter") {
-                    const newIdx = parseInt(frameInput.value, 10);
+                    const newIdx = this._parsePositionInput(frameInput.value);
                     if (!isNaN(newIdx) && newIdx >= 0 && newIdx !== data.frame_index) {
                         this._moveGuideToFrame(data, newIdx);
                     }
@@ -3522,6 +4147,47 @@ export class EditorWidget {
     }
 
     // ── Item Delete / Move ──────────────────────────────────────────────
+    async _addClipFrameToGuides(clip) {
+        if (!this.activeScene || !this.projectDir || !clip) return;
+        const dirName = this._projectDirName();
+        const sourceFrame = Math.max(0, this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0));
+
+        try {
+            const extractResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/extract_frame`), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    source_path: clip.source_path,
+                    frame_index: sourceFrame,
+                }),
+            });
+            if (!extractResp.ok) {
+                console.warn("[LTX Editor] Extract frame failed:", await extractResp.text());
+                return;
+            }
+
+            const asset = await extractResp.json();
+            const guideResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    frame_index: this.playhead,
+                    asset_id: asset.asset_id,
+                    source: "asset",
+                    strength: 1.0,
+                }),
+            });
+            if (!guideResp.ok) {
+                console.warn("[LTX Editor] Add guide failed:", await guideResp.text());
+                return;
+            }
+
+            await Promise.all([this._fetchAssets(), this._fetchScenes()]);
+        } catch (e) {
+            console.warn("[LTX Editor] Add frame to guides failed:", e);
+        }
+    }
+
     async _deleteSelectedItems() {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
         this._pushUndo("delete items");
@@ -3834,6 +4500,7 @@ export class EditorWidget {
                 ["+ / -", "Zoom in / out"],
                 ["Esc", "Exit fullscreen"],
                 ["?", "Show this overlay"],
+                ["⚙", "Editor Settings (toolbar gear)"],
             ]);
 
         backdrop.appendChild(panel);
@@ -3951,7 +4618,7 @@ export class EditorWidget {
             display: flex; justify-content: space-between; align-items: center;
         `;
         this._vpHeaderText = document.createElement("span");
-        this._vpHeaderText.textContent = `${this.sceneWidth}×${this.sceneHeight} @ ${this.fps}fps`;
+        this._updateViewportHeader();
         vpHeader.appendChild(this._vpHeaderText);
 
         // Viewport content area — canvas for video preview
@@ -4094,14 +4761,13 @@ export class EditorWidget {
     _recalcFullscreenHeights() {
         // In three-panel layout, timeline height is based on the bottom row height
         const bottomH = this._fsBottomRow ? parseInt(getComputedStyle(this._fsBottomRow).height) || 280 : 280;
-        const s = this._uiScale;
-        const sceneBarH = SCENE_BAR_HEIGHT * s;
-        const toolbarH = 24 * s;
-        const infoBarH = 24 * s;
-        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * s;
+        const st = this._scaleToolbar;
+        const sceneBarH = SCENE_BAR_HEIGHT * st;
+        const toolbarH = 24 * st;
+        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * st;
 
-        // Timeline logical height (canvas will multiply by s when rendering)
-        this._timelineHeight = Math.max(100, (bottomH - sceneBarH - toolbarH - infoBarH - editorsH) / s);
+        // Timeline height — canvas renders at 1:1 now (individual elements scale themselves)
+        this._timelineHeight = Math.max(100, bottomH - sceneBarH - toolbarH - editorsH);
         // Gallery is in the sidebar now, doesn't need height calc
         this._galleryHeight = GALLERY_HEIGHT; // Not used in fullscreen layout
     }
@@ -4125,8 +4791,10 @@ export class EditorWidget {
         const dirName = this.projectDir ? this.projectDir.split(/[/\\]/).pop() : "Assets";
         if (this._fsSidebarHeader) this._fsSidebarHeader.textContent = dirName;
 
-        // Move gallery to sidebar
+        // Move gallery to sidebar (keep gallery zoom for scale)
         this._fsSidebar.appendChild(this.galleryEl);
+        const sg = this._scaleGallery;
+        this.galleryEl.style.zoom = sg !== 1.0 ? sg : "";
         this.galleryEl.style.flex = "1";
         this.galleryEl.style.minHeight = "0";
         this.galleryEl.style.overflow = "hidden";
@@ -4229,7 +4897,8 @@ export class EditorWidget {
         this._fullscreenBtn.textContent = "⛶";
         this._fullscreenBtn.title = "Toggle fullscreen";
 
-        this._renderTimeline();
+        // Reapply per-section scales (gallery transform, etc.)
+        this._applyScales();
 
         // Restore node size to what it was before fullscreen
         if (this._savedNodeSize) {
@@ -4336,7 +5005,7 @@ export class EditorWidget {
                 if (this.selectionEnd < this.selectionStart) this.selectionEnd = this.selectionStart;
                 this._setWidgetValue("selection_start", this.selectionStart);
                 this._renderTimeline();
-                this._updateInfoLabel();
+                this._updateToolbar();
                 this._updateToolbar();
                 return;
             }
@@ -4346,7 +5015,7 @@ export class EditorWidget {
                 if (this.selectionStart > this.selectionEnd) this.selectionStart = this.selectionEnd;
                 this._setWidgetValue("selection_end", this.selectionEnd);
                 this._renderTimeline();
-                this._updateInfoLabel();
+                this._updateToolbar();
                 this._updateToolbar();
                 return;
             }
@@ -4359,7 +5028,7 @@ export class EditorWidget {
                 this._setWidgetValue("selection_start", 0);
                 this._setWidgetValue("selection_end", 0);
                 this._renderTimeline();
-                this._updateInfoLabel();
+                this._updateToolbar();
                 this._updateToolbar();
                 return;
             }
@@ -4382,6 +5051,7 @@ export class EditorWidget {
 
             // ── T = toggle timecode ──
             if (key === "t" || key === "T") { consume(); this._toggleTimecodeMode(); this._updateToolbar(); return; }
+            if (key === "a" || key === "A") { consume(); this._toggleAnimatic(); return; }
 
             // ── F = fit to view, Shift+F = zoom to selection ──
             if (key === "f" || key === "F") {
@@ -4431,7 +5101,7 @@ export class EditorWidget {
     _onPlayheadChange() {
         this._renderTimeline();
         if (this.isFullscreen) this._renderViewportFrame();
-        this._updateInfoLabel();
+        this._updateToolbar();
     }
 
     // ── Zoom ───────────────────────────────────────────────────────────
@@ -4443,22 +5113,31 @@ export class EditorWidget {
         }
     }
 
-    // ── UI Scale ──────────────────────────────────────────────────────
-    _setUiScale(value) {
-        this._uiScale = Math.round(Math.max(0.7, Math.min(2.0, value)) * 10) / 10;
-        localStorage.setItem("ltx-editor-ui-scale", this._uiScale.toString());
-        if (this._scaleLabel) this._scaleLabel.textContent = `${Math.round(this._uiScale * 100)}%`;
-        this._applyUiScale();
+    // ── UI Scale (per-section) ───────────────────────────────────────
+    _setScale(key, value) {
+        const clamped = Math.round(Math.max(0.7, Math.min(2.0, value)) * 10) / 10;
+        this[`_scale${key}`] = clamped;
+        localStorage.setItem(`ltx-editor-scale-${key.toLowerCase()}`, clamped.toString());
+        // Update settings panel label if open
+        if (this._settingsLabels && this._settingsLabels[key]) {
+            this._settingsLabels[key].textContent = `${Math.round(clamped * 100)}%`;
+        }
+        this._applyScales();
     }
 
-    _applyUiScale() {
-        const s = this._uiScale;
-        // Scale HTML bars via CSS transform
+    _applyScales() {
+        // A. Toolbar & Bars — CSS transform
+        const st = this._scaleToolbar;
         for (const el of [this._sceneBar, this._toolbar, this._infoBar]) {
             if (!el) continue;
-            el.style.transform = s !== 1.0 ? `scale(${s})` : "";
+            el.style.transform = st !== 1.0 ? `scale(${st})` : "";
             el.style.transformOrigin = "top left";
-            el.style.width = s !== 1.0 ? `${100 / s}%` : "";
+            el.style.width = st !== 1.0 ? `${100 / st}%` : "";
+        }
+        // D. Asset Gallery — CSS zoom (not transform, because transform doesn't affect layout/scroll)
+        if (this.galleryEl) {
+            const sg = this._scaleGallery;
+            this.galleryEl.style.zoom = sg !== 1.0 ? sg : "";
         }
         this._renderTimeline();
         // Notify ComfyUI that our size changed
@@ -4467,11 +5146,370 @@ export class EditorWidget {
 
     _canvasMouseCoords(e) {
         const rect = this.timelineCanvas.getBoundingClientRect();
-        const s = this._uiScale;
         return {
-            x: (e.clientX - rect.left) / s,
-            y: (e.clientY - rect.top) / s
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top
         };
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────
+    _projectDirName() {
+        if (!this.projectDir) return "";
+        return this.projectDir.split(/[/\\]/).pop();
+    }
+
+    // ── Saved Selections ──────────────────────────────────────────────
+    _toggleSavedSelectionsDropdown(e) {
+        // Close if already open
+        if (this._savedSelDropdown) {
+            this._savedSelDropdown.remove();
+            this._savedSelDropdown = null;
+            return;
+        }
+
+        const rect = this._bookmarkBtn.getBoundingClientRect();
+        const dd = document.createElement("div");
+        dd.style.cssText = `
+            position: fixed; left: ${rect.left}px; top: ${rect.bottom + 2}px;
+            background: #2a2a2a; border: 1px solid #555; border-radius: 4px;
+            min-width: 200px; max-height: 300px; overflow-y: auto;
+            z-index: 10002; font-size: 11px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+        `;
+
+        // Save current selection option
+        const saveItem = document.createElement("div");
+        const hasSel = this.selectionStart < this.selectionEnd;
+        saveItem.style.cssText = `
+            padding: 6px 10px; cursor: ${hasSel ? "pointer" : "default"};
+            color: ${hasSel ? "#8cf" : "#666"}; border-bottom: 1px solid #444;
+        `;
+        saveItem.textContent = hasSel ? `💾 Save Selection (${this._frameToTimecode(this.selectionStart)}–${this._frameToTimecode(this.selectionEnd)})` : "💾 Save Selection (no selection)";
+        if (hasSel) {
+            saveItem.addEventListener("mouseenter", () => { saveItem.style.background = "#333"; });
+            saveItem.addEventListener("mouseleave", () => { saveItem.style.background = ""; });
+            saveItem.addEventListener("click", () => {
+                this._saveCurrentSelection();
+                dd.remove();
+                this._savedSelDropdown = null;
+            });
+        }
+        dd.appendChild(saveItem);
+
+        // List saved selections
+        const selections = this.activeScene?.saved_selections || [];
+        if (selections.length === 0) {
+            const empty = document.createElement("div");
+            empty.style.cssText = `padding: 8px 10px; color: #666; font-style: italic;`;
+            empty.textContent = "No saved selections";
+            dd.appendChild(empty);
+        } else {
+            selections.forEach((sel, idx) => {
+                const item = document.createElement("div");
+                item.style.cssText = `padding: 5px 10px; cursor: pointer; color: #ccc; display: flex; justify-content: space-between; align-items: center;`;
+                item.addEventListener("mouseenter", () => { item.style.background = "#383838"; });
+                item.addEventListener("mouseleave", () => { item.style.background = ""; });
+
+                const label = document.createElement("span");
+                const preCtx = Math.max(0, parseInt(sel.pre_context_frames, 10) || 0);
+                const postCtx = Math.max(0, parseInt(sel.post_context_frames, 10) || 0);
+                const ctxSuffix = (preCtx > 0 || postCtx > 0) ? ` | Ctx -${preCtx}/+${postCtx}` : "";
+                label.textContent = `${sel.name} (${this._frameToTimecode(sel.start)}–${this._frameToTimecode(sel.end)}${ctxSuffix})`;
+                item.appendChild(label);
+
+                const delBtn = document.createElement("span");
+                delBtn.textContent = "✕";
+                delBtn.style.cssText = `color: #888; cursor: pointer; padding: 0 4px; font-size: 10px;`;
+                delBtn.title = "Delete saved selection";
+                delBtn.addEventListener("click", (ev) => {
+                    ev.stopPropagation();
+                    this._deleteSavedSelection(idx);
+                    dd.remove();
+                    this._savedSelDropdown = null;
+                });
+                item.appendChild(delBtn);
+
+                item.addEventListener("click", () => {
+                    this._recallSavedSelection(sel);
+                    dd.remove();
+                    this._savedSelDropdown = null;
+                });
+
+                // Right-click to rename
+                item.addEventListener("contextmenu", (ev) => {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    const newName = prompt("Rename selection:", sel.name);
+                    if (newName && newName.trim()) {
+                        this._renameSavedSelection(idx, newName.trim());
+                        dd.remove();
+                        this._savedSelDropdown = null;
+                    }
+                });
+
+                dd.appendChild(item);
+            });
+        }
+
+        // Close on outside click
+        const closeHandler = (ev) => {
+            if (!dd.contains(ev.target) && ev.target !== this._bookmarkBtn) {
+                dd.remove();
+                this._savedSelDropdown = null;
+                document.removeEventListener("mousedown", closeHandler, true);
+            }
+        };
+        setTimeout(() => document.addEventListener("mousedown", closeHandler, true), 0);
+
+        document.body.appendChild(dd);
+        this._savedSelDropdown = dd;
+    }
+
+    async _saveCurrentSelection() {
+        if (this.selectionStart >= this.selectionEnd || !this.activeScene) return;
+        const name = prompt("Selection name:", `Sel ${(this.activeScene.saved_selections?.length || 0) + 1}`);
+        if (!name || !name.trim()) return;
+
+        try {
+            const dirName = encodeURIComponent(this._projectDirName());
+            const sceneId = this.activeScene.scene_id;
+            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/saved_selections`), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    name: name.trim(),
+                    start: this.selectionStart,
+                    end: this.selectionEnd,
+                    pre_context_frames: this._contextFrameValue("pre_context_frames"),
+                    post_context_frames: this._contextFrameValue("post_context_frames"),
+                }),
+            });
+            if (resp.ok) {
+                await this._fetchScenes();
+            }
+        } catch (e) { console.error("Save selection failed:", e); }
+    }
+
+    _recallSavedSelection(sel) {
+        this.selectionStart = sel.start;
+        this.selectionEnd = sel.end;
+        this._setWidgetValue("selection_start", sel.start);
+        this._setWidgetValue("selection_end", sel.end);
+        this._setWidgetValue("pre_context_frames", Math.max(0, parseInt(sel.pre_context_frames, 10) || 0));
+        this._setWidgetValue("post_context_frames", Math.max(0, parseInt(sel.post_context_frames, 10) || 0));
+        this._refreshContextInputs();
+        this._renderTimeline();
+        this._updateToolbar();
+        this._updateToolbar();
+    }
+
+    async _deleteSavedSelection(idx) {
+        if (!this.activeScene) return;
+        try {
+            const dirName = encodeURIComponent(this._projectDirName());
+            const sceneId = this.activeScene.scene_id;
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), { method: "DELETE" });
+            await this._fetchScenes();
+        } catch (e) { console.error("Delete saved selection failed:", e); }
+    }
+
+    async _renameSavedSelection(idx, newName) {
+        if (!this.activeScene) return;
+        try {
+            const dirName = encodeURIComponent(this._projectDirName());
+            const sceneId = this.activeScene.scene_id;
+            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: newName }),
+            });
+            await this._fetchScenes();
+        } catch (e) { console.error("Rename saved selection failed:", e); }
+    }
+
+    // ── Render Queue ─────────────────────────────────────────────────
+    async _addToRenderQueue() {
+        if (!this.activeScene) return;
+        const sceneId = this.activeScene.scene_id;
+        const sceneName = this.activeScene.name;
+        const selStart = this.selectionStart < this.selectionEnd ? this.selectionStart : 0;
+        const selEnd = this.selectionStart < this.selectionEnd ? this.selectionEnd : this.activeScene.duration_frames;
+        // Get prompt from prompt sections for the range, or fall back to scene prompt
+        let prompt = this.activeScene.prompt || "";
+        const sections = this.activeScene.prompt_sections || [];
+        for (const s of sections) {
+            if (s.start_frame <= selStart && s.end_frame >= selEnd) { prompt = s.prompt; break; }
+            if (s.start_frame < selEnd && s.end_frame > selStart) { prompt = s.prompt; break; }
+        }
+
+        try {
+            const dirName = encodeURIComponent(this._projectDirName());
+            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    scene_id: sceneId,
+                    scene_name: sceneName,
+                    selection_start: selStart,
+                    selection_end: selEnd,
+                    prompt: prompt,
+                    context_frames: 0,
+                }),
+            });
+            if (resp.ok) {
+                this._queueBtn.style.background = "#3a7ca5";
+                this._queueBtn.style.color = "#fff";
+                setTimeout(() => {
+                    this._queueBtn.style.background = "#333";
+                    this._queueBtn.style.color = "#ccc";
+                }, 500);
+                this._fetchRenderQueue();
+            }
+        } catch (e) { console.error("Add to queue failed:", e); }
+    }
+
+    async _fetchRenderQueue() {
+        if (!this._projectDirName()) return;
+        try {
+            const dirName = encodeURIComponent(this._projectDirName());
+            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`));
+            if (resp.ok) {
+                this._renderQueue = await resp.json();
+                this._renderQueuePanel();
+            }
+        } catch (e) { console.error("Fetch queue failed:", e); }
+    }
+
+    _renderQueuePanel() {
+        if (!this._queueContainer) return;
+        this._queueContainer.innerHTML = "";
+
+        const queue = this._renderQueue || [];
+        if (queue.length === 0) {
+            this._queueContainer.innerHTML = `<div style="padding: 8px; color: #666; font-style: italic; font-size: 10px;">Queue empty — use + Queue to add jobs</div>`;
+            return;
+        }
+
+        queue.forEach(job => {
+            const item = document.createElement("div");
+            item.style.cssText = `
+                padding: 4px 8px; border-bottom: 1px solid #333; display: flex;
+                align-items: center; gap: 6px; font-size: 10px; color: #ccc;
+            `;
+
+            // Status badge
+            const badge = document.createElement("span");
+            const colors = { pending: "#888", running: "#4a9eff", completed: "#4a4", failed: "#c44" };
+            badge.style.cssText = `
+                width: 8px; height: 8px; border-radius: 50%;
+                background: ${colors[job.status] || "#888"}; flex-shrink: 0;
+            `;
+            badge.title = job.status;
+            item.appendChild(badge);
+
+            // Job info
+            const info = document.createElement("span");
+            info.style.cssText = `flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;`;
+            info.textContent = `${job.scene_name || "Scene"} ${this._frameToTimecode(job.selection_start)}–${this._frameToTimecode(job.selection_end)}`;
+            if (job.prompt) info.title = job.prompt;
+            item.appendChild(info);
+
+            // Delete button
+            const delBtn = document.createElement("span");
+            delBtn.textContent = "✕";
+            delBtn.style.cssText = `color: #888; cursor: pointer; padding: 0 2px; font-size: 9px;`;
+            delBtn.addEventListener("click", async () => {
+                try {
+                    const dirName = encodeURIComponent(this._projectDirName());
+                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
+                    this._fetchRenderQueue();
+                } catch (e) { console.error("Delete queue job failed:", e); }
+            });
+            item.appendChild(delBtn);
+
+            this._queueContainer.appendChild(item);
+        });
+    }
+
+    // ── Settings Panel ────────────────────────────────────────────────
+    _showSettingsPanel() {
+        if (this._settingsPanelEl) return;
+        const backdrop = document.createElement("div");
+        backdrop.style.cssText = `position:fixed;inset:0;z-index:10001;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;`;
+        const panel = document.createElement("div");
+        panel.style.cssText = `background:#1e1e1e;border:1px solid #555;border-radius:8px;padding:20px 28px;max-width:400px;width:90%;color:#ddd;font-family:sans-serif;font-size:12px;`;
+
+        panel.innerHTML = `<h3 style="margin:0 0 16px;color:#fff;font-size:14px;">Editor Settings</h3>
+            <div style="color:#aaa;font-size:11px;margin-bottom:8px;text-transform:uppercase;">UI Scale</div>`;
+
+        this._settingsLabels = {};
+        const sections = [
+            { key: "Toolbar", label: "Toolbar & Bars", desc: "Scene bar and toolbar controls" },
+            { key: "TrackHeaders", label: "Track Headers", desc: "Icons, labels, header width" },
+            { key: "Timeline", label: "Timeline", desc: "Track heights, clip text, ruler" },
+            { key: "Gallery", label: "Asset Gallery", desc: "Thumbnails, tabs, item text" },
+        ];
+
+        for (const { key, label, desc } of sections) {
+            const row = document.createElement("div");
+            row.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #333;";
+
+            const labelDiv = document.createElement("div");
+            labelDiv.innerHTML = `<div style="color:#ccc;font-size:12px;">${label}</div><div style="color:#666;font-size:9px;">${desc}</div>`;
+
+            const controls = document.createElement("div");
+            controls.style.cssText = "display:flex;align-items:center;gap:6px;";
+
+            const btnDn = document.createElement("button");
+            btnDn.textContent = "−";
+            btnDn.style.cssText = "background:#333;border:1px solid #555;color:#aaa;cursor:pointer;padding:2px 8px;border-radius:4px;font-size:14px;line-height:1;";
+            btnDn.addEventListener("click", () => this._setScale(key, this[`_scale${key}`] - 0.1));
+
+            const pctLabel = document.createElement("span");
+            pctLabel.style.cssText = "font-size:11px;color:#aaa;min-width:36px;text-align:center;";
+            pctLabel.textContent = `${Math.round(this[`_scale${key}`] * 100)}%`;
+            this._settingsLabels[key] = pctLabel;
+
+            const btnUp = document.createElement("button");
+            btnUp.textContent = "+";
+            btnUp.style.cssText = "background:#333;border:1px solid #555;color:#aaa;cursor:pointer;padding:2px 8px;border-radius:4px;font-size:14px;line-height:1;";
+            btnUp.addEventListener("click", () => this._setScale(key, this[`_scale${key}`] + 0.1));
+
+            controls.append(btnDn, pctLabel, btnUp);
+            row.append(labelDiv, controls);
+            panel.appendChild(row);
+        }
+
+        // Reset All button
+        const resetRow = document.createElement("div");
+        resetRow.style.cssText = "margin-top:14px;text-align:center;";
+        const resetBtn = document.createElement("button");
+        resetBtn.textContent = "Reset All to 100%";
+        resetBtn.style.cssText = "background:#333;border:1px solid #555;color:#aaa;cursor:pointer;padding:4px 16px;border-radius:4px;font-size:11px;";
+        resetBtn.addEventListener("click", () => {
+            for (const { key } of sections) this._setScale(key, 1.0);
+        });
+        resetRow.appendChild(resetBtn);
+        panel.appendChild(resetRow);
+
+        backdrop.appendChild(panel);
+        document.body.appendChild(backdrop);
+        this._settingsPanelEl = backdrop;
+
+        backdrop.addEventListener("click", (e) => { if (e.target === backdrop) this._hideSettingsPanel(); });
+        this._settingsPanelEscHandler = (e) => { if (e.key === "Escape") { e.stopImmediatePropagation(); this._hideSettingsPanel(); } };
+        document.addEventListener("keydown", this._settingsPanelEscHandler, true);
+    }
+
+    _hideSettingsPanel() {
+        if (this._settingsPanelEl) {
+            this._settingsPanelEl.remove();
+            this._settingsPanelEl = null;
+            this._settingsLabels = null;
+        }
+        if (this._settingsPanelEscHandler) {
+            document.removeEventListener("keydown", this._settingsPanelEscHandler, true);
+            this._settingsPanelEscHandler = null;
+        }
     }
 
     // ── Undo / Redo ───────────────────────────────────────────────────
@@ -4611,6 +5649,11 @@ export class EditorWidget {
         }
     }
 
+    _getWidgetValue(name, defaultValue = 0) {
+        const widget = this.node.widgets?.find(w => w.name === name);
+        return widget ? widget.value : defaultValue;
+    }
+
     // ── Public API ─────────────────────────────────────────────────────
     updateProject(projectDir) {
         if (projectDir === this.projectDir) return;
@@ -4644,10 +5687,9 @@ export class EditorWidget {
                     this.sceneWidth = data.resolution[0] || 768;
                     this.sceneHeight = data.resolution[1] || 512;
                 }
-                // Update viewport header if it exists
-                if (this._vpHeaderText) {
-                    this._vpHeaderText.textContent = `${this.sceneWidth}×${this.sceneHeight} @ ${this.fps}fps`;
-                }
+                this._syncSceneResolutionControls();
+                this._updateViewportHeader();
+                this._resizeViewportCanvas();
             }
         } catch (e) {
             console.warn("[LTX Editor] Failed to fetch project settings:", e);
@@ -4681,7 +5723,11 @@ export class EditorWidget {
         const containerH = rect.height;
         if (containerW <= 0 || containerH <= 0) return;
 
-        const aspect = this.sceneWidth / this.sceneHeight;
+        const sceneWidth = this._effectiveSceneWidth;
+        const sceneHeight = this._effectiveSceneHeight;
+        if (sceneWidth <= 0 || sceneHeight <= 0) return;
+
+        const aspect = sceneWidth / sceneHeight;
         let canvasW, canvasH;
         if (containerW / containerH > aspect) {
             // Container is wider than scene aspect — fit to height
@@ -4830,21 +5876,11 @@ export class EditorWidget {
         // Update transport UI
         this._updateTransportUI();
 
-        // Guide images have absolute priority over video
+        // Animatic: guides render BENEATH video (as holdframe reference)
         const guide = this._getGuideAtFrame(this.playhead);
-        if (guide) {
-            // Cancel any pending video seek
-            if (this._seekAbort) {
-                this._seekAbort();
-                this._seekAbort = null;
-            }
-            this._drawGuideToViewport(guide);
-            return;
-        }
-
         const clips = this._getClipsAtFrame(this.playhead);
 
-        if (clips.length === 0) {
+        if (clips.length === 0 && !guide) {
             // No clip and no guide — show frame number centered
             ctx.fillStyle = "#000";
             ctx.fillRect(0, 0, w, h);
@@ -4856,11 +5892,23 @@ export class EditorWidget {
             return;
         }
 
+        if (clips.length === 0 && guide) {
+            // Guide only — show as animatic reference (no video to cover it)
+            if (this._seekAbort) {
+                this._seekAbort();
+                this._seekAbort = null;
+            }
+            this._drawGuideToViewport(guide);
+            return;
+        }
+
+        // Video clips exist — they take visual priority over guides
+
         // Single clip: use existing fast path
         if (clips.length === 1) {
             const clip = clips[0];
             const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
-            const sourceTime = sourceFrame / this.fps;
+            const sourceTime = sourceFrame / this._effectiveFps;
             this._viewportClipOpacity = clip.opacity ?? 1.0;
 
             const video = this._getOrCreateVideo(clip.source_path);
@@ -4930,7 +5978,7 @@ export class EditorWidget {
             const video = this._getOrCreateVideo(clip.source_path);
             if (!video || video.readyState < 2) return Promise.resolve(null);
             const sourceFrame = frame - clip.timeline_start_frame + (clip.source_in_frame || 0);
-            const targetTime = sourceFrame / this.fps;
+            const targetTime = sourceFrame / this._effectiveFps;
             if (Math.abs(video.currentTime - targetTime) < 0.02) return Promise.resolve(video);
             return new Promise(resolve => {
                 const handler = () => { video.removeEventListener("seeked", handler); resolve(video); };
@@ -5006,13 +6054,17 @@ export class EditorWidget {
 
     _getGuideAtFrame(frame) {
         if (!this.activeScene?.guide_frames) return null;
-        // Find the closest guide at or before this frame
+        // Animatic behavior: find the latest guide at or before this frame (holds until next guide)
         let closest = null;
+        let closestIdx = -1;
         for (const g of this.activeScene.guide_frames) {
             const idx = g.frame_index === -1 ? this.totalFrames - 1 : g.frame_index;
-            if (idx === frame) return g;
+            if (idx <= frame && idx > closestIdx) {
+                closest = g;
+                closestIdx = idx;
+            }
         }
-        return null;
+        return closest;
     }
 
     _drawGuideToViewport(guide) {
@@ -5165,7 +6217,7 @@ export class EditorWidget {
             const video = this._getOrCreateVideo(clip.source_path);
             if (!video) continue;
             const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
-            const sourceTime = sourceFrame / this.fps;
+            const sourceTime = sourceFrame / this._effectiveFps;
             video.muted = true;
 
             const startVideoPlayback = (v) => {
@@ -5209,7 +6261,7 @@ export class EditorWidget {
             const audio = this._getOrCreateAudio(track.source_path);
             if (audio) {
                 const audioFrame = this.playhead - track.timeline_start_frame + (track.source_in_frame || 0);
-                audio.currentTime = audioFrame / this.fps;
+                audio.currentTime = audioFrame / this._effectiveFps;
                 audio.volume = track.volume ?? 1.0;
                 audio.play().catch(() => {});
                 this._activePlaybackAudios.push(audio);
@@ -5223,7 +6275,7 @@ export class EditorWidget {
         if (!this.isPlaying) return;
 
         const elapsed = (timestamp - this._playbackStartTime) / 1000;
-        const newFrame = this._playbackStartFrame + Math.floor(elapsed * this.fps);
+        const newFrame = this._playbackStartFrame + Math.floor(elapsed * this._effectiveFps);
 
         if (newFrame >= this.totalFrames) {
             this.playhead = this.totalFrames;
@@ -5255,7 +6307,7 @@ export class EditorWidget {
                 const video = this._getOrCreateVideo(clip.source_path);
                 if (video && video.readyState >= 2) {
                     const sf = newFrame - clip.timeline_start_frame + (clip.source_in_frame || 0);
-                    video.currentTime = sf / this.fps;
+                    video.currentTime = sf / this._effectiveFps;
                     video.muted = true;
                     video.play().catch(() => {});
                     if (!this._activePlaybackVideos) this._activePlaybackVideos = [];
@@ -5303,15 +6355,49 @@ export class EditorWidget {
 
     getHeight() {
         if (this.isFullscreen) return 60;
-        const s = this._uiScale;
-        const barsH = (SCENE_BAR_HEIGHT + 24 + 24) * s; // scene bar + toolbar + info bar
-        const timelineH = this._timelineHeight * s;
-        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * s;
-        return barsH + timelineH + this._galleryHeight + editorsH;
+        const st = this._scaleToolbar;
+        const sg = this._scaleGallery;
+        const barsH = (SCENE_BAR_HEIGHT + 24) * st; // scene bar + toolbar
+        const timelineH = Math.round(RULER_HEIGHT * this._scaleTimeline) + this._totalTracksHeight();
+        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * st;
+        return barsH + Math.max(timelineH, this._timelineHeight) + (this._galleryHeight * sg) + editorsH;
     }
 
     // ── File Import (drag-and-drop files from OS onto node) ────────────
-    async _importFile(file) {
+    _readDroppedDirectoryFiles(dirEntry) {
+        return new Promise((resolve, reject) => {
+            const reader = dirEntry.createReader();
+            const entries = [];
+
+            const readNext = () => {
+                reader.readEntries((batch) => {
+                    if (!batch.length) {
+                        Promise.all(entries
+                            .filter((entry) => entry.isFile)
+                            .map((entry) => new Promise((fileResolve) => {
+                                entry.file((file) => fileResolve(file), () => fileResolve(null));
+                            })))
+                            .then((files) => resolve(files.filter(Boolean)))
+                            .catch(reject);
+                        return;
+                    }
+                    entries.push(...batch);
+                    readNext();
+                }, reject);
+            };
+
+            readNext();
+        });
+    }
+
+    async _importDroppedDirectory(dirEntry) {
+        const files = await this._readDroppedDirectoryFiles(dirEntry);
+        for (const file of files) {
+            await this._importFile(file, dirEntry.name || "");
+        }
+    }
+
+    async _importFile(file, folder = "") {
         if (!this.projectDir) return;
 
         // Upload to ComfyUI first, then import to project via API
@@ -5342,6 +6428,7 @@ export class EditorWidget {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     source_path: uploadedName,
+                    folder,
                     // The import endpoint needs the full path — let the server resolve it
                 }),
             });

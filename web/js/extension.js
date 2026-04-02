@@ -56,7 +56,13 @@ app.registerExtension({
                 const node = this;
                 const projectWidget = this.widgets.find(w => w.name === "project");
                 const creationWidgetNames = ["project_name", "fps", "width", "height"];
-                const hiddenWidgetNames = ["scene_id", "selection_start", "selection_end"];
+                const hiddenWidgetNames = [
+                    "scene_id",
+                    "selection_start",
+                    "selection_end",
+                    "pre_context_frames",
+                    "post_context_frames",
+                ];
 
                 // Store original types
                 for (const w of this.widgets) {
@@ -165,6 +171,7 @@ app.registerExtension({
                 if (this._ltxEditor && this._ltxEditor.projectDir) {
                     this._ltxEditor._fetchScenes();
                     this._ltxEditor._fetchAssets();
+                    this._ltxEditor._fetchRenderQueue();
                 }
             };
         }
@@ -180,6 +187,7 @@ app.registerExtension({
                 );
                 for (const en of editorNodes) {
                     en._ltxEditor._fetchAssets();
+                    en._ltxEditor._fetchScenes();
                 }
             };
         }

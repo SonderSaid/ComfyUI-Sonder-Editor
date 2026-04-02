@@ -27,6 +27,13 @@ def _make_silent_audio(duration_sec: float, sample_rate: int = 44100) -> dict:
 CREATE_NEW = "+ Create New"
 
 
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _get_projects_base_dir():
     return os.path.join(folder_paths.get_output_directory(), "ltx_projects")
 
@@ -58,10 +65,14 @@ class LTXEditor:
     """
 
     CATEGORY = "LTX-Editor"
-    RETURN_TYPES = ("LTX_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO")
+    RETURN_TYPES = ("LTX_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO",
+                     "INT", "INT", "INT", "INT", "FLOAT", "FLOAT")
     RETURN_NAMES = (
         "project", "rendered_frames", "guide_images", "guide_indices", "prompt",
         "frame_count", "fps", "width", "height", "audio",
+        "context_start_frame", "context_end_frame",
+        "generation_start_frame", "generation_end_frame",
+        "mask_start_time", "mask_end_time",
     )
     OUTPUT_TOOLTIPS = (
         "The project object. Connect to LTX Save Video.",
@@ -74,6 +85,12 @@ class LTXEditor:
         "Project width in pixels.",
         "Project height in pixels.",
         "Audio for the selected section (if any).",
+        "Absolute frame where context begins (includes context padding).",
+        "Absolute frame where context ends (includes context padding).",
+        "Absolute frame where new generation starts (original selection start).",
+        "Absolute frame where new generation ends (original selection end).",
+        "Seconds offset within output where generation starts. Wire to temporal mask start_time.",
+        "Seconds offset within output where generation ends. Wire to temporal mask end_time.",
     )
     FUNCTION = "execute"
     DESCRIPTION = (
@@ -120,6 +137,14 @@ class LTXEditor:
                     "default": 0, "min": 0, "max": 999999,
                     "tooltip": "End frame of timeline selection (set by editor UI).",
                 }),
+                "pre_context_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Context frames BEFORE selection. Included in render but not denoised (use mask outputs). Clamped to available frames.",
+                }),
+                "post_context_frames": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Context frames AFTER selection. Included in render but not denoised (use mask outputs). Clamped to available frames.",
+                }),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -131,8 +156,13 @@ class LTXEditor:
         return float("nan")
 
     def execute(self, project, project_name, fps, width, height,
-                scene_id="", selection_start=0, selection_end=0, unique_id=None):
+                scene_id="", selection_start=0, selection_end=0,
+                pre_context_frames=0, post_context_frames=0, unique_id=None):
         base_dir = _get_projects_base_dir()
+        selection_start = max(0, _coerce_int(selection_start, 0))
+        selection_end = max(0, _coerce_int(selection_end, 0))
+        pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
+        post_context_frames = max(0, _coerce_int(post_context_frames, 0))
 
         # --- Load or create project ---
         if project == CREATE_NEW:
@@ -155,11 +185,20 @@ class LTXEditor:
         if scene_id:
             scene = proj.get_scene(scene_id)
 
+        # --- Scene-level overrides (resolution + fps) ---
+        if scene and scene.width > 0:
+            proj_w = scene.width
+        if scene and scene.height > 0:
+            proj_h = scene.height
+        if scene and hasattr(scene, 'fps') and scene.fps > 0:
+            proj_fps = scene.fps
+
         # --- If no scene, return defaults ---
         if not scene:
             empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
             silent_audio = _make_silent_audio(1.0, 44100)
-            return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio)
+            return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio,
+                    0, 0, 0, 0, 0.0, 0.0)
 
         # --- Determine render range ---
         # If selection is set, use it; otherwise render the full scene
@@ -172,9 +211,28 @@ class LTXEditor:
             if render_end <= 0:
                 empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
                 silent_audio = _make_silent_audio(1.0, 44100)
-                return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio)
+                return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio,
+                        0, 0, 0, 0, 0.0, 0.0)
 
+        # --- Context frame expansion (asymmetric pre/post) ---
+        # generation_start/end = the actual new frames to generate (original selection)
+        # context extends the render range to include surrounding frames for temporal consistency
+        generation_start = render_start
+        generation_end = render_end
+        # Clamp to available frames (fallback: can't go below 0 or past scene end)
+        actual_pre = min(pre_context_frames, generation_start)
+        actual_post = min(post_context_frames, scene.duration_frames - generation_end)
+        if actual_pre > 0 or actual_post > 0:
+            render_start = generation_start - actual_pre
+            render_end = generation_end + actual_post
+
+        context_start = render_start
+        context_end = render_end
         frame_count = render_end - render_start
+
+        # Mask times — seconds offset within the output tensor for downstream temporal masks
+        mask_start_time = (generation_start - context_start) / proj_fps if proj_fps > 0 else 0.0
+        mask_end_time = (generation_end - context_start) / proj_fps if proj_fps > 0 else 0.0
 
         # --- Render composited frames ---
         rendered_frames = self._render_scene_frames(proj, scene, render_start, render_end)
@@ -215,7 +273,23 @@ class LTXEditor:
         # --- Load audio from scene's audio tracks for the render range ---
         audio = self._load_scene_audio(proj, scene, render_start, render_end)
 
-        return (proj, rendered_frames, guide_tensor, indices_str, prompt_text, frame_count, proj_fps, proj_w, proj_h, audio)
+        # --- Attach execution context for downstream nodes (e.g., LTXSaveVideo Take mode) ---
+        proj._execution_context = {
+            "scene_id": scene.scene_id,
+            "scene_name": scene.name,
+            "selection_start": generation_start,
+            "selection_end": generation_end,
+            "context_start": context_start,
+            "context_end": context_end,
+            "pre_context_frames": actual_pre,
+            "post_context_frames": actual_post,
+            "prompt": prompt_text,
+        }
+
+        return (proj, rendered_frames, guide_tensor, indices_str, prompt_text, frame_count,
+                proj_fps, proj_w, proj_h, audio,
+                context_start, context_end, generation_start, generation_end,
+                mask_start_time, mask_end_time)
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
                               render_start: int, render_end: int) -> torch.Tensor:
@@ -225,6 +299,11 @@ class LTXEditor:
         re-rendering when the scene hasn't changed.
         """
         proj_w, proj_h = proj.resolution
+        # Scene-level resolution override
+        if scene.width > 0:
+            proj_w = scene.width
+        if scene.height > 0:
+            proj_h = scene.height
         num_frames = render_end - render_start
 
         if num_frames <= 0:
@@ -293,21 +372,20 @@ class LTXEditor:
                         continue
 
                     # Fit frame to canvas preserving aspect ratio
-                    placed = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
+                    # BUG-2 fix: use placement bounds, not pixel values, for compositing
+                    placed, (dx, dy, dw, dh) = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
 
                     if clip.opacity >= 1.0:
-                        # Direct composite — non-black pixels overwrite
-                        mask = np.any(placed > 0, axis=2)
-                        canvas[mask] = placed[mask]
+                        # Direct composite — copy content region (black pixels preserved)
+                        canvas[dy:dy + dh, dx:dx + dw] = placed[dy:dy + dh, dx:dx + dw]
                     else:
-                        # Blend with opacity
-                        mask = np.any(placed > 0, axis=2)
-                        blended = canvas.copy()
-                        blended[mask] = cv2.addWeighted(
-                            canvas[mask].reshape(-1, 1, 3), 1.0 - clip.opacity,
-                            placed[mask].reshape(-1, 1, 3), clip.opacity, 0
-                        ).reshape(-1, 3)
-                        canvas = blended
+                        # Blend with opacity within content region only
+                        roi_canvas = canvas[dy:dy + dh, dx:dx + dw]
+                        roi_placed = placed[dy:dy + dh, dx:dx + dw]
+                        canvas[dy:dy + dh, dx:dx + dw] = cv2.addWeighted(
+                            roi_canvas, 1.0 - clip.opacity,
+                            roi_placed, clip.opacity, 0
+                        )
 
                 # Convert BGR -> RGB
                 frames.append(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
@@ -331,8 +409,12 @@ class LTXEditor:
                 cap.release()
 
     @staticmethod
-    def _fit_frame_to_canvas(frame_bgr: np.ndarray, canvas_w: int, canvas_h: int) -> np.ndarray:
-        """Resize frame to fit canvas preserving aspect ratio (letterbox/pillarbox)."""
+    def _fit_frame_to_canvas(frame_bgr: np.ndarray, canvas_w: int, canvas_h: int):
+        """Resize frame to fit canvas preserving aspect ratio (letterbox/pillarbox).
+
+        Returns:
+            tuple: (canvas, (x_off, y_off, new_w, new_h)) — placed frame and content bounds.
+        """
         fh, fw = frame_bgr.shape[:2]
         scale = min(canvas_w / fw, canvas_h / fh)
         new_w = int(fw * scale)
@@ -343,7 +425,7 @@ class LTXEditor:
         x_off = (canvas_w - new_w) // 2
         y_off = (canvas_h - new_h) // 2
         canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
-        return canvas
+        return canvas, (x_off, y_off, new_w, new_h)
 
     def _load_guide_image(self, path: str, asset_type: str,
                           target_w: int, target_h: int) -> torch.Tensor | None:
@@ -383,7 +465,9 @@ class LTXEditor:
 
         Returns a ComfyUI AUDIO dict. Falls back to silent audio if no tracks.
         """
-        duration_sec = (sel_end - sel_start) / proj.fps if proj.fps > 0 else 1.0
+        # Scene-level fps override
+        effective_fps = scene.fps if hasattr(scene, 'fps') and scene.fps > 0 else proj.fps
+        duration_sec = (sel_end - sel_start) / effective_fps if effective_fps > 0 else 1.0
         sample_rate = 44100
 
         if not scene.audio_tracks:
@@ -430,8 +514,10 @@ class LTXEditor:
                 track_offset_frames = max(0, track.timeline_start_frame - sel_start)
                 audio_offset_frames = max(0, sel_start - track.timeline_start_frame)
 
-                track_offset_samples = int(track_offset_frames / proj.fps * sample_rate)
-                audio_offset_samples = int(audio_offset_frames / proj.fps * sample_rate)
+                track_offset_samples = int(track_offset_frames / effective_fps * sample_rate)
+                # BUG-3 fix: include source_in_frame for trimmed/split audio tracks
+                source_offset_frames = track.source_in_frame + audio_offset_frames
+                audio_offset_samples = int(source_offset_frames / effective_fps * sample_rate)
 
                 # Trim source audio
                 src_audio = waveform[:, audio_offset_samples:]
