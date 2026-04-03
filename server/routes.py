@@ -519,6 +519,170 @@ def _load_project_from_request(request: web.Request) -> TimelineProject:
     return project
 
 
+def _pick_active_scene(project: TimelineProject, scene_id: str = "") -> Scene | None:
+    if scene_id:
+        scene = project.get_scene(scene_id)
+        if scene:
+            return scene
+    scenes = project.scenes_ordered()
+    return scenes[0] if scenes else None
+
+
+def _build_selection_summary(
+    scene: Scene | None,
+    selection_start: int = 0,
+    selection_end: int = 0,
+    pre_context_frames: int = 0,
+    post_context_frames: int = 0,
+) -> dict:
+    if not scene:
+        return {
+            "is_full_scene": True,
+            "generation_start_frame": 0,
+            "generation_end_frame": 0,
+            "context_start_frame": 0,
+            "context_end_frame": 0,
+            "frame_count": 0,
+            "pre_context_frames": 0,
+            "post_context_frames": 0,
+            "label": "No scene selected",
+        }
+
+    duration = max(0, int(scene.duration_frames or 0))
+    selection_start = max(0, _coerce_nonnegative_int(selection_start, 0))
+    selection_end = max(0, _coerce_nonnegative_int(selection_end, 0))
+    pre_context_frames = max(0, _coerce_nonnegative_int(pre_context_frames, 0))
+    post_context_frames = max(0, _coerce_nonnegative_int(post_context_frames, 0))
+
+    if selection_end > selection_start:
+        generation_start = min(selection_start, duration)
+        generation_end = min(selection_end, duration)
+        is_full_scene = False
+    else:
+        generation_start = 0
+        generation_end = duration
+        is_full_scene = True
+
+    if generation_end < generation_start:
+        generation_end = generation_start
+
+    actual_pre = min(pre_context_frames, generation_start)
+    actual_post = min(post_context_frames, max(0, duration - generation_end))
+    context_start = generation_start - actual_pre
+    context_end = generation_end + actual_post
+    frame_count = max(0, context_end - context_start)
+
+    if is_full_scene:
+        label = f"Full Scene ({duration}f)"
+    else:
+        label = (
+            f"f{generation_start}-{generation_end} "
+            f"({frame_count}f, ctx {actual_pre}/{actual_post})"
+        )
+
+    return {
+        "is_full_scene": is_full_scene,
+        "generation_start_frame": generation_start,
+        "generation_end_frame": generation_end,
+        "context_start_frame": context_start,
+        "context_end_frame": context_end,
+        "frame_count": frame_count,
+        "pre_context_frames": actual_pre,
+        "post_context_frames": actual_post,
+        "label": label,
+    }
+
+
+def _build_dormant_summary(
+    project: TimelineProject,
+    scene_id: str = "",
+    selection_start: int = 0,
+    selection_end: int = 0,
+    pre_context_frames: int = 0,
+    post_context_frames: int = 0,
+) -> dict:
+    active_scene = _pick_active_scene(project, scene_id)
+
+    asset_counts = {
+        "video": len(project.get_assets_by_type("video")),
+        "image": len(project.get_assets_by_type("image")),
+        "audio": len(project.get_assets_by_type("audio")),
+    }
+    asset_counts["total"] = asset_counts["video"] + asset_counts["image"] + asset_counts["audio"]
+
+    queue_counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0}
+    for job in project.generation_queue:
+        status = (job.status or "pending").lower()
+        queue_counts[status] = queue_counts.get(status, 0) + 1
+    queue_counts["total"] = len(project.generation_queue)
+
+    if active_scene:
+        effective_width = active_scene.width or project.resolution[0]
+        effective_height = active_scene.height or project.resolution[1]
+        effective_fps = active_scene.fps or project.fps
+        selection = _build_selection_summary(
+            active_scene,
+            selection_start=selection_start,
+            selection_end=selection_end,
+            pre_context_frames=pre_context_frames,
+            post_context_frames=post_context_frames,
+        )
+        active_scene_payload = {
+            "scene_id": active_scene.scene_id,
+            "name": active_scene.name,
+            "effective_width": effective_width,
+            "effective_height": effective_height,
+            "effective_fps": effective_fps,
+            "duration_frames": active_scene.duration_frames,
+            "clip_count": len(active_scene.clips),
+            "audio_track_count": len(active_scene.audio_tracks),
+            "guide_count": len(active_scene.guide_frames),
+            "prompt_section_count": len(active_scene.prompt_sections),
+            "selection": selection,
+        }
+    else:
+        active_scene_payload = None
+
+    return {
+        "project_id": project.project_id,
+        "name": project.name,
+        "fps": project.fps,
+        "resolution": list(project.resolution),
+        "modified_at": project.modified_at,
+        "scene_count": len(project.scenes),
+        "asset_counts": asset_counts,
+        "queue_counts": queue_counts,
+        "active_scene": active_scene_payload,
+    }
+
+
+def _normalize_asset_folder(folder: str) -> str:
+    return str(folder or "").strip().replace("\\", "/").strip("/")
+
+
+def _collect_asset_folders(project: TimelineProject) -> list[str]:
+    folders = {
+        _normalize_asset_folder(folder)
+        for folder in project.metadata.get("asset_folders", [])
+        if _normalize_asset_folder(folder)
+    }
+    for asset in project.assets:
+        folder = _normalize_asset_folder(getattr(asset, "folder", ""))
+        if folder:
+            folders.add(folder)
+    return sorted(folders)
+
+
+def _ensure_asset_folder(project: TimelineProject, folder: str) -> None:
+    normalized = _normalize_asset_folder(folder)
+    if not normalized:
+        return
+    folders = _collect_asset_folders(project)
+    if normalized not in folders:
+        folders.append(normalized)
+        project.metadata["asset_folders"] = sorted(folders)
+
+
 if routes is not None:
 
     # -----------------------------------------------------------------------
@@ -540,6 +704,23 @@ if routes is not None:
             return web.json_response(project.to_dict())
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
+
+    @routes.get("/ltx-editor/project/{project_id}/dormant_summary")
+    async def api_get_dormant_summary(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        summary = _build_dormant_summary(
+            project,
+            scene_id=request.query.get("scene_id", ""),
+            selection_start=request.query.get("selection_start", 0),
+            selection_end=request.query.get("selection_end", 0),
+            pre_context_frames=request.query.get("pre_context_frames", 0),
+            post_context_frames=request.query.get("post_context_frames", 0),
+        )
+        return web.json_response(summary)
 
     @routes.post("/ltx-editor/project")
     async def api_create_project(request: web.Request) -> web.Response:
@@ -623,7 +804,42 @@ if routes is not None:
             d["has_thumbnail"] = os.path.isfile(thumb_path)
             result.append(d)
 
-        return web.json_response({"assets": result})
+        return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
+
+    @routes.get("/ltx-editor/project/{project_id}/assets/dormant")
+    async def api_list_dormant_assets(request: web.Request) -> web.Response:
+        """List lightweight asset data without scanning/syncing media folders."""
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        result = []
+        for asset in project.assets:
+            thumb_path = os.path.join(
+                project.project_dir, "cache", "thumbnails",
+                f"{asset.asset_id}.png"
+            )
+            result.append({
+                "asset_id": asset.asset_id,
+                "name": asset.name,
+                "asset_type": asset.asset_type,
+                "path": asset.path,
+                "width": asset.width,
+                "height": asset.height,
+                "frame_count": asset.frame_count,
+                "fps": asset.fps,
+                "duration_sec": asset.duration_sec,
+                "sample_rate": asset.sample_rate,
+                "has_audio": asset.has_audio,
+                "folder": asset.folder,
+                "prompt": asset.prompt,
+                "generation_params": asset.generation_params,
+                "imported_at": asset.imported_at,
+                "has_thumbnail": os.path.isfile(thumb_path),
+            })
+
+        return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
 
     @routes.post("/ltx-editor/project/{project_id}/assets/import")
     async def api_import_asset(request: web.Request) -> web.Response:
@@ -719,7 +935,8 @@ if routes is not None:
             generation_params=body.get("generation_params", {}),
         )
         if body.get("folder"):
-            asset.folder = body["folder"]
+            asset.folder = _normalize_asset_folder(body["folder"])
+            _ensure_asset_folder(project, asset.folder)
         project.add_asset(asset)
         save_project(project)
 
@@ -731,6 +948,26 @@ if routes is not None:
         ensure_thumbnail(asset_type, dest_path, thumb_path)
 
         return web.json_response(asset.to_dict(), status=201)
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/folders")
+    async def api_create_asset_folder(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        folder = _normalize_asset_folder(body.get("folder", ""))
+        if not folder:
+            return _json_error("Folder name required", 400)
+
+        _ensure_asset_folder(project, folder)
+        save_project(project)
+        return web.json_response({"folders": _collect_asset_folders(project)})
 
     @routes.post("/ltx-editor/project/{project_id}/assets/extract_frame")
     async def api_extract_frame(request: web.Request) -> web.Response:
@@ -826,6 +1063,9 @@ if routes is not None:
 
         if "name" in body:
             asset.name = str(body["name"]).strip() or asset.name
+        if "folder" in body:
+            asset.folder = _normalize_asset_folder(body["folder"])
+            _ensure_asset_folder(project, asset.folder)
 
         save_project(project)
         return web.json_response(asset.to_dict())

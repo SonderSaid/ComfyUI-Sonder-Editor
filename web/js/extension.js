@@ -1,7 +1,7 @@
 const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
-import { EditorWidget } from "./editor_widget.js";
+import { EditorNodeController } from "./editor_node_controller.js";
 
 // ── Widget hide/show helpers ───────────────────────────────────────────
 function hideWidget(node, widget) {
@@ -27,18 +27,79 @@ async function getProjectDir(projectValue) {
     if (!projectValue || projectValue === "+ Create New") return "";
     try {
         const resp = await fetch(api.apiURL("/ltx-editor/projects"));
-        if (resp.ok) {
-            const data = await resp.json();
-            const match = (data.projects || []).find(p => {
-                const dirName = p.path.split(/[/\\]/).pop();
-                return dirName === projectValue || p.name === projectValue;
-            });
-            return match ? match.path : "";
-        }
+        if (!resp.ok) return "";
+
+        const data = await resp.json();
+        const match = (data.projects || []).find((project) => {
+            const dirName = project.path.split(/[/\\]/).pop();
+            return dirName === projectValue || project.name === projectValue;
+        });
+        return match ? match.path : "";
     } catch (e) {
         console.warn("[LTX Editor] Failed to get project dir:", e);
     }
     return "";
+}
+
+async function listProjects() {
+    const resp = await fetch(api.apiURL("/ltx-editor/projects"));
+    if (!resp.ok) {
+        throw new Error(`Failed to list projects: ${resp.status}`);
+    }
+    const data = await resp.json();
+    return data.projects || [];
+}
+
+async function syncProjectWidgetChoices(projectWidget) {
+    if (!projectWidget) return [];
+    const projects = await listProjects();
+    const values = ["+ Create New", ...projects.map((project) => project.path.split(/[/\\]/).pop())];
+    projectWidget.options = projectWidget.options || {};
+    projectWidget.options.values = values;
+    return projects;
+}
+
+async function createProjectFromNode(node, projectWidget) {
+    const projectNameWidget = node.widgets.find((widget) => widget.name === "project_name");
+    const fpsWidget = node.widgets.find((widget) => widget.name === "fps");
+    const widthWidget = node.widgets.find((widget) => widget.name === "width");
+    const heightWidget = node.widgets.find((widget) => widget.name === "height");
+
+    const projectName = String(projectNameWidget?.value || "").trim();
+    if (!projectName) {
+        throw new Error("Project name is required");
+    }
+
+    const resp = await fetch(api.apiURL("/ltx-editor/project"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            name: projectName,
+            fps: Number(fpsWidget?.value || 24),
+            width: Number(widthWidget?.value || 768),
+            height: Number(heightWidget?.value || 512),
+        }),
+    });
+    if (!resp.ok) {
+        let message = `Project creation failed: ${resp.status}`;
+        try {
+            const data = await resp.json();
+            if (data?.error) message = data.error;
+        } catch {}
+        throw new Error(message);
+    }
+
+    const created = await resp.json();
+    const projects = await syncProjectWidgetChoices(projectWidget);
+    const createdProject = projects.find((project) => project.project_id === created.project_id)
+        || projects.find((project) => project.name === created.name);
+    const nextValue = createdProject
+        ? createdProject.path.split(/[/\\]/).pop()
+        : created.name;
+
+    projectWidget.value = nextValue;
+    projectWidget.callback?.(nextValue);
+    app.graph.setDirtyCanvas?.(true, true);
 }
 
 // ── Main Extension ─────────────────────────────────────────────────────
@@ -54,7 +115,7 @@ app.registerExtension({
                 origOnNodeCreated?.apply(this, arguments);
 
                 const node = this;
-                const projectWidget = this.widgets.find(w => w.name === "project");
+                const projectWidget = node.widgets.find((widget) => widget.name === "project");
                 const creationWidgetNames = ["project_name", "fps", "width", "height"];
                 const hiddenWidgetNames = [
                     "scene_id",
@@ -65,52 +126,99 @@ app.registerExtension({
                 ];
 
                 // Store original types
-                for (const w of this.widgets) {
-                    w._origType = w.type;
+                for (const widget of node.widgets) {
+                    widget._origType = widget.type;
                 }
 
-                // Create the editor widget
-                const editor = new EditorWidget(node);
-                node._ltxEditor = editor;
+                const controller = new EditorNodeController(node, projectWidget);
+                node._ltxController = controller;
+                node.resizable = true;
+                node.flags = { ...(node.flags || {}), resizable: true };
 
-                const editorElement = editor.getElement();
-                const editorDOMWidget = node.addDOMWidget("ltx_editor_ui", "LTXEditorWidget", editorElement, {
+                const editorDOMWidget = node.addDOMWidget("ltx_editor_ui", "LTXEditorWidget", controller.getElement(), {
                     serialize: false,
                     hideOnZoom: false,
-                    getMinHeight: () => editor.getHeight(),
-                    getMaxHeight: () => editor.getHeight(),
-                    getHeight: () => editor.getHeight(),
+                    getMinHeight: () => 150,
+                    getMaxHeight: () => controller.getHeight(),
+                    getHeight: () => controller.getHeight(),
                 });
-                editorDOMWidget.computeSize = (width) => [width, editor.getHeight()];
+                editorDOMWidget.computeSize = (width) => [width, controller.getHeight()];
+
+                // Override node.computeSize to allow shrinking during interactive resize.
+                // Widget computeSize returns _height (correct for layout), but node.computeSize
+                // replaces the widget's contribution with a fixed 150px floor so LiteGraph
+                // doesn't clamp the node at _height + overhead.
+                const origNodeComputeSize = node.computeSize.bind(node);
+                node.computeSize = function () {
+                    const result = origNodeComputeSize();
+                    const widgetHeight = controller.getHeight();
+                    const overhead = result[1] - widgetHeight;
+                    result[1] = 150 + overhead;
+                    return result;
+                };
+
+                const createButtonWidget = node.addWidget("button", "Create", null, async () => {
+                    try {
+                        await createProjectFromNode(node, projectWidget);
+                    } catch (e) {
+                        console.warn("[LTX Editor] Failed to create project:", e);
+                    }
+                });
+                createButtonWidget.serialize = false;
 
                 const updateVisibility = async () => {
                     const isCreateNew = projectWidget?.value === "+ Create New";
-                    for (const w of node.widgets) {
-                        if (creationWidgetNames.includes(w.name)) {
+                    for (const widget of node.widgets) {
+                        if (creationWidgetNames.includes(widget.name)) {
                             if (isCreateNew) {
-                                showWidget(node, w);
+                                showWidget(node, widget);
                             } else {
-                                hideWidget(node, w);
+                                hideWidget(node, widget);
                             }
                         }
-                        if (hiddenWidgetNames.includes(w.name)) {
-                            hideWidget(node, w);
+                        if (hiddenWidgetNames.includes(widget.name)) {
+                            hideWidget(node, widget);
                         }
                     }
+                    if (isCreateNew) {
+                        showWidget(node, createButtonWidget);
+                    } else {
+                        hideWidget(node, createButtonWidget);
+                    }
 
-                    // Show/hide editor widget based on mode
                     if (isCreateNew) {
                         hideWidget(node, editorDOMWidget);
+                        controller.getElement().style.display = "none";
+                        await controller.updateProject("", projectWidget?.value || "");
                     } else {
                         showWidget(node, editorDOMWidget);
-                        // Load project data into editor
-                        const dir = await getProjectDir(projectWidget.value);
-                        if (dir) {
-                            editor.updateProject(dir);
-                        }
+                        controller.getElement().style.display = "";
+                        const dir = await getProjectDir(projectWidget?.value);
+                        await controller.updateProject(dir, projectWidget?.value || "");
                     }
 
-                    node.setSize(node.computeSize());
+                    const nextSize = node.computeSize();
+                    const preferredWidth = isCreateNew ? 340 : 440;
+                    const modeKey = isCreateNew ? "create" : "existing";
+                    if (!node._ltxInitializedSize) {
+                        node._ltxInitializedSize = true;
+                        node._ltxPreferredWidthMode = modeKey;
+                        node.size = [preferredWidth, Math.max(nextSize?.[1] || 0, node.size?.[1] || 0)];
+                    } else {
+                        if (node._ltxPreferredWidthMode !== modeKey && (node.size?.[0] || 0) < preferredWidth) {
+                            node._ltxPreferredWidthMode = modeKey;
+                            node.size = [preferredWidth, node.size?.[1] || nextSize?.[1] || controller.getHeight()];
+                        }
+                        node.size = [
+                            Math.max(node.size?.[0] || 0, 240),
+                            nextSize?.[1] || node.size?.[1] || controller.getHeight(),
+                        ];
+                    }
+                    node.setSize(node.size);
+
+                    if (!isCreateNew) {
+                        controller.queueResize();
+                    }
                 };
 
                 // Hook dropdown changes
@@ -120,6 +228,9 @@ app.registerExtension({
                         origCallback?.call(projectWidget, value);
                         updateVisibility();
                     };
+                    syncProjectWidgetChoices(projectWidget).catch((e) => {
+                        console.warn("[LTX Editor] Failed to sync project choices:", e);
+                    });
                 }
 
                 // Initial setup
@@ -127,11 +238,15 @@ app.registerExtension({
 
                 // Re-render timeline when node resizes
                 const origOnResize = node.onResize;
-                node.onResize = function (size) {
+                node.onResize = function () {
                     origOnResize?.apply(this, arguments);
-                    if (node._ltxEditor) {
-                        setTimeout(() => node._ltxEditor._renderTimeline(), 50);
-                    }
+                    node._ltxController?.handleNodeResize?.();
+                };
+
+                const origOnRemoved = node.onRemoved;
+                node.onRemoved = function () {
+                    node._ltxController?.destroy();
+                    origOnRemoved?.apply(this, arguments);
                 };
 
                 // Drag-and-drop files onto the node → import to project
@@ -139,7 +254,7 @@ app.registerExtension({
                 node.onDragOver = function (e) {
                     if (e.dataTransfer && e.dataTransfer.items) {
                         const hasFiles = [...e.dataTransfer.items].some(
-                            f => f.kind === "file"
+                            (f) => f.kind === "file"
                         );
                         if (hasFiles) {
                             e.preventDefault?.();
@@ -151,43 +266,35 @@ app.registerExtension({
                 };
 
                 node.onDragDrop = async (e) => {
-                    if (!node._ltxEditor || !node._ltxEditor.projectDir) return false;
+                    if (!node._ltxController?.state?.projectDir) return false;
                     if (!e.dataTransfer?.files?.length) return false;
 
                     e.preventDefault?.();
                     e.stopPropagation?.();
 
-                    for (const file of e.dataTransfer.files) {
-                        await node._ltxEditor._importFile(file);
-                    }
+                    await node._ltxController.importFiles(e.dataTransfer.files);
                     return true;
                 };
             };
 
             // Handle executed results — refresh editor after execution
             const origOnExecuted = nodeType.prototype.onExecuted;
-            nodeType.prototype.onExecuted = function (output) {
+            nodeType.prototype.onExecuted = function () {
                 origOnExecuted?.apply(this, arguments);
-                if (this._ltxEditor && this._ltxEditor.projectDir) {
-                    this._ltxEditor._fetchScenes();
-                    this._ltxEditor._fetchAssets();
-                    this._ltxEditor._fetchRenderQueue();
-                }
+                this._ltxController?.handleNodeExecuted();
             };
         }
 
         // ── LTX Save Video — notify editor nodes to refresh ───────────
         if (nodeData.name === "LTXSaveVideo") {
             const origOnExecuted = nodeType.prototype.onExecuted;
-            nodeType.prototype.onExecuted = function (output) {
+            nodeType.prototype.onExecuted = function () {
                 origOnExecuted?.apply(this, arguments);
-                // Find all LTX Editor nodes and refresh their assets
                 const editorNodes = (app.graph._nodes || app.graph.nodes || []).filter(
-                    n => n.type === "LTXEditor" && n._ltxEditor?.projectDir
+                    (n) => n.type === "LTXEditor" && n._ltxController?.state?.projectDir
                 );
                 for (const en of editorNodes) {
-                    en._ltxEditor._fetchAssets();
-                    en._ltxEditor._fetchScenes();
+                    en._ltxController.handleSaveVideoExecuted();
                 }
             };
         }
@@ -201,6 +308,17 @@ app.registerExtension({
                 const projectWidget = this.widgets.find(w => w.name === "project");
                 const creationWidgetNames = ["project_name", "fps", "width", "height"];
                 const node = this;
+                node.resizable = true;
+                node.flags = { ...(node.flags || {}), resizable: true };
+
+                const createButtonWidget = node.addWidget("button", "Create", null, async () => {
+                    try {
+                        await createProjectFromNode(node, projectWidget);
+                    } catch (e) {
+                        console.warn("[LTX Project Loader] Failed to create project:", e);
+                    }
+                });
+                createButtonWidget.serialize = false;
 
                 const updateVisibility = () => {
                     const isCreateNew = projectWidget?.value === "+ Create New";
@@ -213,7 +331,24 @@ app.registerExtension({
                             }
                         }
                     }
-                    node.setSize(node.computeSize());
+                    if (isCreateNew) {
+                        showWidget(node, createButtonWidget);
+                    } else {
+                        hideWidget(node, createButtonWidget);
+                    }
+
+                    const nextSize = node.computeSize();
+                    const preferredWidth = 340;
+                    if (!node._ltxInitializedSize) {
+                        node._ltxInitializedSize = true;
+                        node.size = [preferredWidth, Math.max(nextSize?.[1] || 0, node.size?.[1] || 0)];
+                    } else {
+                        node.size = [
+                            Math.max(node.size?.[0] || 0, 240),
+                            nextSize?.[1] || node.size?.[1] || preferredWidth,
+                        ];
+                    }
+                    node.setSize(node.size);
                 };
 
                 if (projectWidget) {
@@ -222,6 +357,9 @@ app.registerExtension({
                         origCallback?.call(projectWidget, value);
                         updateVisibility();
                     };
+                    syncProjectWidgetChoices(projectWidget).catch((e) => {
+                        console.warn("[LTX Project Loader] Failed to sync project choices:", e);
+                    });
                 }
 
                 setTimeout(() => updateVisibility(), 50);

@@ -5,6 +5,54 @@
 
 const { api } = window.comfyAPI.api;
 
+import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
+
+export function buildProjectAssetViewURL(projectDir, sourcePath) {
+    if (!projectDir || !sourcePath) return null;
+    const dirName = projectDir.split(/[/\\]/).pop();
+    const fileName = sourcePath.split(/[/\\]/).pop();
+    const subPath = sourcePath.split(/[/\\]/).slice(0, -1).join("/");
+    const subfolder = `ltx_projects/${dirName}/${subPath}`;
+    return api.apiURL(`/view?filename=${encodeURIComponent(fileName)}&subfolder=${encodeURIComponent(subfolder)}&type=output`);
+}
+
+export async function importFileIntoProject(projectDir, file, folder = "") {
+    if (!projectDir || !file) return false;
+
+    const formData = new FormData();
+    formData.append("image", file, file.name);
+    formData.append("overwrite", "true");
+
+    const uploadResp = await fetch(api.apiURL("/upload/image"), {
+        method: "POST",
+        body: formData,
+    });
+
+    if (!uploadResp.ok) {
+        console.warn("[LTX Editor] Upload failed:", await uploadResp.text());
+        return false;
+    }
+
+    const uploadData = await uploadResp.json();
+    const uploadedName = uploadData.name;
+    const dirName = projectDir.split(/[/\\]/).pop();
+    const importResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/import`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            source_path: uploadedName,
+            folder,
+        }),
+    });
+
+    if (!importResp.ok) {
+        console.warn("[LTX Editor] Import failed:", await importResp.text());
+        return false;
+    }
+
+    return true;
+}
+
 // ── Constants ──────────────────────────────────────────────────────────
 const TIMELINE_HEIGHT = 212;
 const GALLERY_HEIGHT = 160;
@@ -57,10 +105,14 @@ const COLORS = {
 
 // ── Editor Widget Class ────────────────────────────────────────────────
 export class EditorWidget {
-    constructor(node) {
+    constructor(node, options = {}) {
         this.node = node;
+        this.options = options;
+        this.onFullscreenExit = options.onFullscreenExit || null;
+        this.onWidgetValueChange = options.onWidgetValueChange || null;
         this.projectDir = "";
         this.projectId = "";
+        this._destroyed = false;
 
         // Scene state
         this.scenes = [];
@@ -193,12 +245,13 @@ export class EditorWidget {
         this._applyScales();
 
         // Window resize handler for fullscreen
-        window.addEventListener("resize", () => {
+        this._windowResizeHandler = () => {
             if (this.isFullscreen) {
                 this._recalcFullscreenHeights();
                 this._renderTimeline();
             }
-        });
+        };
+        window.addEventListener("resize", this._windowResizeHandler);
 
         // ResizeObserver on container to auto-re-render timeline when size changes
         this._containerResizeObserver = new ResizeObserver(() => {
@@ -655,58 +708,31 @@ export class EditorWidget {
         gallery.style.cssText = `
             background: ${COLORS.galleryBg}; border-top: 1px solid #333;
             min-height: ${this._galleryHeight}px; overflow: hidden;
+            display: flex; flex-direction: column;
         `;
-
-        // Tab bar
-        const tabs = document.createElement("div");
-        tabs.style.cssText = `
-            display: flex; border-bottom: 1px solid #333;
-        `;
-
-        this.tabBtns = {};
-        for (const type of ["video", "image", "audio"]) {
-            const tab = document.createElement("button");
-            tab.textContent = type.charAt(0).toUpperCase() + type.slice(1) + "s";
-            tab.style.cssText = `
-                flex: 1; padding: 5px 8px; background: none; border: none;
-                color: ${COLORS.galleryLabel}; font-size: 11px; cursor: pointer;
-                border-bottom: 2px solid transparent; transition: all 0.15s;
-            `;
-            tab.addEventListener("click", () => this._selectAssetTab(type));
-            tabs.appendChild(tab);
-            this.tabBtns[type] = tab;
-        }
-
-        // Refresh button
-        const refreshBtn = document.createElement("button");
-        refreshBtn.textContent = "Refresh";
-        refreshBtn.title = "Refresh assets (R)";
-        refreshBtn.style.cssText = `
-            padding: 4px 8px; background: none; border: none;
-            color: ${COLORS.textDim}; font-size: 10px; cursor: pointer;
-        `;
-        refreshBtn.addEventListener("click", () => this._fetchAssets());
-        refreshBtn.addEventListener("mouseenter", () => refreshBtn.style.color = COLORS.text);
-        refreshBtn.addEventListener("mouseleave", () => refreshBtn.style.color = COLORS.textDim);
-        tabs.appendChild(refreshBtn);
 
         // Asset grid
         this.assetGrid = document.createElement("div");
         this.assetGrid.style.cssText = `
-            display: flex; flex-wrap: wrap; gap: 6px; padding: 6px;
-            align-content: start;
-            overflow-y: auto; max-height: ${this._galleryHeight - 30}px;
-            min-height: 60px;
+            flex: 1; min-height: 0; overflow: hidden; padding: 6px;
+            box-sizing: border-box;
         `;
-
-        // Empty message
-        this.emptyMsg = document.createElement("div");
-        this.emptyMsg.style.cssText = `
-            width: 100%; text-align: center; padding: 20px;
-            color: ${COLORS.textDim}; font-size: 11px;
-        `;
-        this.emptyMsg.textContent = "No assets yet. Import media into your project.";
-        this.assetGrid.appendChild(this.emptyMsg);
+        this._assetGallery = mountSharedAssetGallery(this.assetGrid, {
+            getProjectDir: () => this.projectDir,
+            initialData: { assets: [], folders: [] },
+            onImportFiles: async (files, folder) => {
+                let importedAny = false;
+                for (const file of files) {
+                    if (await importFileIntoProject(this.projectDir, file, folder)) {
+                        importedAny = true;
+                    }
+                }
+                if (importedAny) await this._fetchAssets();
+            },
+            onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
+            onCreateFolder: async (folderName) => await this._createAssetFolder(folderName),
+            onRefresh: async () => await this._fetchAssets(),
+        });
 
         // Render Queue section (collapsible)
         const queueSection = document.createElement("div");
@@ -733,58 +759,9 @@ export class EditorWidget {
 
         queueSection.append(queueHeader, this._queueContainer);
 
-        gallery.append(tabs, this.assetGrid, queueSection);
+        gallery.append(this.assetGrid, queueSection);
         this.container.appendChild(gallery);
         this.galleryEl = gallery;
-
-        // External file drop zone on gallery
-        gallery.addEventListener("dragover", (e) => {
-            // Only handle file drops (not internal asset drags)
-            if (e.dataTransfer.types.includes("Files")) {
-                e.preventDefault();
-                e.stopPropagation();
-                e.dataTransfer.dropEffect = "copy";
-                gallery.style.outline = "2px dashed " + COLORS.selectionBorder;
-            }
-        });
-        gallery.addEventListener("dragleave", () => {
-            gallery.style.outline = "none";
-        });
-        gallery.addEventListener("drop", async (e) => {
-            gallery.style.outline = "none";
-            if (!e.dataTransfer?.types?.includes("Files")) return;
-
-            e.preventDefault();
-            e.stopPropagation();
-
-            const items = Array.from(e.dataTransfer.items || []);
-            let handledEntries = false;
-
-            for (const item of items) {
-                const entry = typeof item.webkitGetAsEntry === "function"
-                    ? item.webkitGetAsEntry()
-                    : null;
-                if (entry?.isDirectory) {
-                    handledEntries = true;
-                    await this._importDroppedDirectory(entry);
-                } else if (entry?.isFile) {
-                    const file = item.getAsFile?.();
-                    if (file) {
-                        handledEntries = true;
-                        await this._importFile(file);
-                    }
-                }
-            }
-
-            if (handledEntries) return;
-
-            for (const file of Array.from(e.dataTransfer.files || [])) {
-                await this._importFile(file);
-            }
-        });
-
-        // Default to video tab
-        this._selectAssetTab("video");
     }
 
     // ── Button Helper ──────────────────────────────────────────────────
@@ -1177,15 +1154,51 @@ export class EditorWidget {
                     }
                     if (asset.path) this._pathToAsset[asset.path] = asset;
                 }
-                this._renderAssetGrid();
+                this._assetGallery?.setData({
+                    assets: data.assets || [],
+                    folders: data.folders || [],
+                });
             }
         } catch (e) {
             console.warn("[LTX Editor] Failed to fetch assets:", e);
         }
     }
 
+    async _updateAssetMetadata(assetId, updates) {
+        if (!this.projectDir || !assetId) return null;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}`), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(updates),
+        });
+        if (!resp.ok) {
+            throw new Error(`Asset update failed: ${resp.status}`);
+        }
+        const updatedAsset = await resp.json();
+        await this._fetchAssets();
+        return updatedAsset;
+    }
+
+    async _createAssetFolder(folderName) {
+        if (!this.projectDir || !folderName) return [];
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/folders`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ folder: folderName }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Folder create failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await this._fetchAssets();
+        return payload.folders || [];
+    }
+
     _selectAssetTab(type) {
         this.selectedAssetType = type;
+        if (!this.tabBtns || !this.emptyMsg) return;
         for (const [t, btn] of Object.entries(this.tabBtns)) {
             const count = (this.assets[t] || []).length;
             const label = t.charAt(0).toUpperCase() + t.slice(1) + "s";
@@ -1197,6 +1210,7 @@ export class EditorWidget {
     }
 
     _renderAssetGrid() {
+        if (!this.emptyMsg) return;
         this.assetGrid.innerHTML = "";
         const items = this.assets[this.selectedAssetType] || [];
 
@@ -4802,9 +4816,9 @@ export class EditorWidget {
         this.galleryEl.style.flexDirection = "column";
         this.assetGrid.style.maxHeight = "none";
         this.assetGrid.style.flex = "1";
-        this.assetGrid.style.overflowY = "auto";
+        this.assetGrid.style.overflow = "hidden";
         this.assetGrid.style.minHeight = "0";
-        this.assetGrid.style.gridTemplateColumns = "repeat(auto-fill, minmax(70px, 1fr))";
+        this.assetGrid.style.gridTemplateColumns = "";
 
         // Move timeline container (without gallery) to bottom row
         this._fsBottomRow.appendChild(this.container);
@@ -4871,10 +4885,10 @@ export class EditorWidget {
             this.galleryEl.style.overflow = "";
             this.galleryEl.style.display = "";
             this.galleryEl.style.flexDirection = "";
-            this.assetGrid.style.maxHeight = (GALLERY_HEIGHT - 30) + "px";
+            this.assetGrid.style.maxHeight = "";
             this.assetGrid.style.flex = "";
-            this.assetGrid.style.overflowY = "auto";
-            this.assetGrid.style.minHeight = "60px";
+            this.assetGrid.style.overflow = "hidden";
+            this.assetGrid.style.minHeight = "0";
             this.assetGrid.style.gridTemplateColumns = "";
             this.container.insertBefore(this.galleryEl, this._galleryNextSibling || null);
         }
@@ -4907,6 +4921,8 @@ export class EditorWidget {
         } else {
             this.node.setSize?.(this.node.computeSize?.());
         }
+
+        this.onFullscreenExit?.();
     }
 
     _toggleFullscreen() {
@@ -5646,6 +5662,7 @@ export class EditorWidget {
         const widget = this.node.widgets?.find(w => w.name === name);
         if (widget) {
             widget.value = value;
+            this.onWidgetValueChange?.(name, value);
         }
     }
 
@@ -5673,6 +5690,22 @@ export class EditorWidget {
         // Fetch assets first (triggers audio duration repair), then scenes
         this._fetchAssets().then(() => this._fetchScenes());
         this._renderTimeline();
+    }
+
+    refresh(keys = []) {
+        const wanted = new Set(keys);
+        if (!wanted.size || wanted.has("project")) {
+            this._fetchProjectSettings();
+        }
+        if (!wanted.size || wanted.has("assets")) {
+            this._fetchAssets();
+        }
+        if (!wanted.size || wanted.has("scenes")) {
+            this._fetchScenes();
+        }
+        if (!wanted.size || wanted.has("queue")) {
+            this._fetchRenderQueue();
+        }
     }
 
     async _fetchProjectSettings() {
@@ -5789,12 +5822,7 @@ export class EditorWidget {
     }
 
     _buildViewURL(sourcePath) {
-        if (!this.projectDir || !sourcePath) return null;
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const fileName = sourcePath.split(/[/\\]/).pop();
-        const subPath = sourcePath.split(/[/\\]/).slice(0, -1).join("/");
-        const subfolder = `ltx_projects/${dirName}/${subPath}`;
-        return api.apiURL(`/view?filename=${encodeURIComponent(fileName)}&subfolder=${encodeURIComponent(subfolder)}&type=output`);
+        return buildProjectAssetViewURL(this.projectDir, sourcePath);
     }
 
     _getOrCreateVideo(sourcePath) {
@@ -6399,48 +6427,102 @@ export class EditorWidget {
 
     async _importFile(file, folder = "") {
         if (!this.projectDir) return;
-
-        // Upload to ComfyUI first, then import to project via API
-        const formData = new FormData();
-        formData.append("image", file, file.name);
-        formData.append("overwrite", "true");
-
         try {
-            // Upload to ComfyUI's input directory
-            const uploadResp = await fetch(api.apiURL("/upload/image"), {
-                method: "POST",
-                body: formData,
-            });
-
-            if (!uploadResp.ok) {
-                console.warn("[LTX Editor] Upload failed:", await uploadResp.text());
-                return;
-            }
-
-            const uploadData = await uploadResp.json();
-            const uploadedName = uploadData.name;
-
-            // Now get the full path and import to project
-            // ComfyUI stores uploads in its input directory
-            const dirName = this.projectDir.split(/[/\\]/).pop();
-            const importResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/import`), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    source_path: uploadedName,
-                    folder,
-                    // The import endpoint needs the full path — let the server resolve it
-                }),
-            });
-
-            if (importResp.ok) {
+            if (await importFileIntoProject(this.projectDir, file, folder)) {
                 console.log("[LTX Editor] Imported:", file.name);
                 await this._fetchAssets();
-            } else {
-                console.warn("[LTX Editor] Import failed:", await importResp.text());
             }
         } catch (e) {
             console.warn("[LTX Editor] File import error:", e);
+        }
+    }
+
+    destroy() {
+        if (this._destroyed) return;
+        this._destroyed = true;
+
+        this._stopPlayback();
+        if (this._seekAbort) {
+            this._seekAbort();
+            this._seekAbort = null;
+        }
+
+        if (this._containerResizeObserver) {
+            this._containerResizeObserver.disconnect();
+            this._containerResizeObserver = null;
+        }
+        if (this._vpResizeObserver) {
+            this._vpResizeObserver.disconnect();
+            this._vpResizeObserver = null;
+        }
+        if (this._windowResizeHandler) {
+            window.removeEventListener("resize", this._windowResizeHandler);
+            this._windowResizeHandler = null;
+        }
+        if (this._keyHandler) {
+            document.removeEventListener("keydown", this._keyHandler, true);
+            this._keyHandler = null;
+        }
+        if (this._focusHandler) {
+            document.removeEventListener("mousedown", this._focusHandler, true);
+            this._focusHandler = null;
+        }
+        if (this._shortcutOverlayEscHandler) {
+            document.removeEventListener("keydown", this._shortcutOverlayEscHandler, true);
+            this._shortcutOverlayEscHandler = null;
+        }
+        if (this._settingsPanelEscHandler) {
+            document.removeEventListener("keydown", this._settingsPanelEscHandler, true);
+            this._settingsPanelEscHandler = null;
+        }
+
+        if (this._previewEl) {
+            for (const media of this._previewEl.querySelectorAll("video, audio")) {
+                media.pause?.();
+                media.removeAttribute?.("src");
+                media.load?.();
+            }
+            this._previewEl.remove();
+            this._previewEl = null;
+        }
+        if (this._savedSelDropdown) {
+            this._savedSelDropdown.remove();
+            this._savedSelDropdown = null;
+        }
+        if (this._contextMenuEl) {
+            this._contextMenuEl.remove();
+            this._contextMenuEl = null;
+        }
+        if (this._shortcutOverlayEl) {
+            this._shortcutOverlayEl.remove();
+            this._shortcutOverlayEl = null;
+        }
+        if (this._settingsPanelEl) {
+            this._settingsPanelEl.remove();
+            this._settingsPanelEl = null;
+        }
+        if (this._fullscreenPlaceholder) {
+            this._fullscreenPlaceholder.remove();
+            this._fullscreenPlaceholder = null;
+        }
+        if (this._assetGallery) {
+            this._assetGallery.destroy();
+            this._assetGallery = null;
+        }
+
+        this._clearVideoCache();
+
+        if (this._fullscreenOverlay) {
+            this._fullscreenOverlay.remove();
+            this._fullscreenOverlay = null;
+        }
+        if (this.container?.parentElement) {
+            this.container.remove();
+        }
+
+        this.isFullscreen = false;
+        if (EditorWidget._activeFullscreen === this) {
+            EditorWidget._activeFullscreen = null;
         }
     }
 }
