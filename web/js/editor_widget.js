@@ -7,6 +7,27 @@ const { api } = window.comfyAPI.api;
 
 import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
 
+export async function uploadFileToComfyInput(file) {
+    if (!file) return "";
+
+    const formData = new FormData();
+    formData.append("image", file, file.name);
+    formData.append("overwrite", "true");
+
+    const uploadResp = await fetch(api.apiURL("/upload/image"), {
+        method: "POST",
+        body: formData,
+    });
+
+    if (!uploadResp.ok) {
+        const message = await uploadResp.text();
+        throw new Error(message || `Upload failed: ${uploadResp.status}`);
+    }
+
+    const uploadData = await uploadResp.json();
+    return uploadData.name || "";
+}
+
 export function buildProjectAssetViewURL(projectDir, sourcePath) {
     if (!projectDir || !sourcePath) return null;
     const dirName = projectDir.split(/[/\\]/).pop();
@@ -19,22 +40,14 @@ export function buildProjectAssetViewURL(projectDir, sourcePath) {
 export async function importFileIntoProject(projectDir, file, folder = "") {
     if (!projectDir || !file) return false;
 
-    const formData = new FormData();
-    formData.append("image", file, file.name);
-    formData.append("overwrite", "true");
-
-    const uploadResp = await fetch(api.apiURL("/upload/image"), {
-        method: "POST",
-        body: formData,
-    });
-
-    if (!uploadResp.ok) {
-        console.warn("[LTX Editor] Upload failed:", await uploadResp.text());
+    let uploadedName = "";
+    try {
+        uploadedName = await uploadFileToComfyInput(file);
+    } catch (error) {
+        console.warn("[LTX Editor] Upload failed:", error);
         return false;
     }
 
-    const uploadData = await uploadResp.json();
-    const uploadedName = uploadData.name;
     const dirName = projectDir.split(/[/\\]/).pop();
     const importResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/import`), {
         method: "POST",
@@ -51,6 +64,30 @@ export async function importFileIntoProject(projectDir, file, folder = "") {
     }
 
     return true;
+}
+
+export async function replaceAssetInProject(projectDir, assetId, file) {
+    if (!projectDir || !assetId || !file) return null;
+
+    const uploadedName = await uploadFileToComfyInput(file);
+    const dirName = projectDir.split(/[/\\]/).pop();
+    const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}/replace`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_path: uploadedName }),
+    });
+    if (!resp.ok) {
+        let message = `Asset replace failed: ${resp.status}`;
+        try {
+            const payload = await resp.json();
+            if (payload?.error) message = payload.error;
+        } catch {
+            const text = await resp.text();
+            if (text) message = text;
+        }
+        throw new Error(message);
+    }
+    return await resp.json();
 }
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -730,7 +767,12 @@ export class EditorWidget {
                 if (importedAny) await this._fetchAssets();
             },
             onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
+            onGetAssetUsages: async (assetId) => await this._getAssetUsages(assetId),
+            onDeleteAsset: async (assetId, force) => await this._deleteAsset(assetId, force),
             onCreateFolder: async (folderName) => await this._createAssetFolder(folderName),
+            onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
+            onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
+            onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
             onRefresh: async () => await this._fetchAssets(),
         });
 
@@ -850,6 +892,9 @@ export class EditorWidget {
 
         this.activeScene = scene;
         this.activeSceneId = scene.scene_id;
+        if (isSameScene) {
+            this._reconcileSelection();
+        }
         this._buildTrackLayout();
         this.totalFrames = scene.duration_frames || 200;
         this._refreshDurationInput();
@@ -1180,6 +1225,39 @@ export class EditorWidget {
         return updatedAsset;
     }
 
+    async _getAssetUsages(assetId) {
+        if (!this.projectDir || !assetId) return null;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}/usages`));
+        if (!resp.ok) {
+            throw new Error(`Asset usage fetch failed: ${resp.status}`);
+        }
+        return await resp.json();
+    }
+
+    async _deleteAsset(assetId, force = false) {
+        if (!this.projectDir || !assetId) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}`), {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Asset delete failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchRenderQueue(),
+        ]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
     async _createAssetFolder(folderName) {
         if (!this.projectDir || !folderName) return [];
         const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -1194,6 +1272,53 @@ export class EditorWidget {
         const payload = await resp.json();
         await this._fetchAssets();
         return payload.folders || [];
+    }
+
+    async _renameAssetFolder(folderName, newFolderName) {
+        if (!this.projectDir || !folderName || !newFolderName) return [];
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/folders`), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ old_folder: folderName, new_folder: newFolderName }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Folder rename failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await this._fetchAssets();
+        return payload || { folders: [] };
+    }
+
+    async _deleteAssetFolder(folderName, force = false) {
+        if (!this.projectDir || !folderName) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/folders`), {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ folder: folderName, force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Folder delete failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await this._fetchAssets();
+        return { status: "deleted", ...(payload || {}) };
+    }
+
+    async _replaceAsset(assetId, file) {
+        if (!this.projectDir || !assetId || !file) return null;
+        const payload = await replaceAssetInProject(this.projectDir, assetId, file);
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchScenes(),
+            this._fetchRenderQueue(),
+        ]);
+        return payload?.asset || null;
     }
 
     _selectAssetTab(type) {
@@ -2020,13 +2145,17 @@ export class EditorWidget {
         for (const guide of guides) {
             let idx = guide._previewFrameIndex ?? guide.frame_index;
             if (idx === -1) idx = this.totalFrames - 1;
+            const guideAsset = this._getGuideAsset(guide);
+            const isMissingGuide = !guideAsset || !!guideAsset.missing;
 
             const x = this._frameToX(idx);
             if (x < 0 || x > width) continue;
 
             // Diamond marker
             const isSelectedGuide = this._isSelected("guide", guide.frame_index);
-            ctx.fillStyle = isSelectedGuide ? COLORS.guideSelected : COLORS.guide;
+            ctx.fillStyle = isMissingGuide
+                ? (isSelectedGuide ? "#ffb18c" : "#c97a59")
+                : (isSelectedGuide ? COLORS.guideSelected : COLORS.guide);
             ctx.beginPath();
             ctx.moveTo(x, y + 4);
             ctx.lineTo(x + 8, y + h / 2);
@@ -2084,15 +2213,18 @@ export class EditorWidget {
                 const isSelectedClip = this._isSelected("clip", clip.clip_id);
                 const opacity = clip.opacity ?? 1.0;
                 const baseAlpha = laneHidden ? 0.3 : (opacity < 1.0 ? Math.max(0.3, opacity) : 1.0);
+                const clipAsset = this._getAssetForSourcePath(clip.source_path);
+                const isMissingClip = !clipAsset || !!clipAsset.missing;
                 ctx.globalAlpha = baseAlpha;
 
                 // Draw base fill
-                ctx.fillStyle = isSelectedClip ? COLORS.clipSelected : COLORS.clip;
+                ctx.fillStyle = isMissingClip
+                    ? (isSelectedClip ? "#c97a59" : "#6d3f33")
+                    : (isSelectedClip ? COLORS.clipSelected : COLORS.clip);
                 ctx.fillRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
 
                 // Thumbnail strip filmstrip (tiled at natural aspect ratio)
-                const clipAsset = this._pathToAsset[clip.source_path];
-                if (clipAsset && (x2 - x1) > 10) {
+                if (clipAsset && !isMissingClip && (x2 - x1) > 10) {
                     const strip = this._getOrLoadThumbStrip(clipAsset.asset_id);
                     if (strip && strip.loaded && strip.img.naturalWidth > 0) {
                         ctx.save();
@@ -2129,7 +2261,7 @@ export class EditorWidget {
                         ctx.fillRect(x1 + 1, videoY + 2, clipPixelW, destH);
                         ctx.restore();
                     }
-                } else if (_vlEntry.color) {
+                } else if (!isMissingClip && _vlEntry.color) {
                     // No thumbnail — apply lane color tint directly on base fill
                     const lc = _vlEntry.color;
                     const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
@@ -2166,13 +2298,30 @@ export class EditorWidget {
                 }
 
                 // Clip label
-                ctx.fillStyle = COLORS.text;
+                ctx.fillStyle = isMissingClip ? "#ffd0bc" : COLORS.text;
                 ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
                 ctx.textAlign = "left";
                 const dur = clip.timeline_end_frame - clip.timeline_start_frame;
                 let label = this._timecodeMode === "timecode" ? this._frameToTimecode(dur) : `${dur}f`;
+                if (isMissingClip) label = `Missing | ${label}`;
                 if (opacity < 1.0) label += ` ${Math.round(opacity * 100)}%`;
                 ctx.fillText(label, x1 + 4, videoY + videoH / 2 + Math.round(3 * this._scaleTimeline));
+
+                if (isMissingClip) {
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
+                    ctx.clip();
+                    ctx.strokeStyle = "rgba(255,208,188,0.35)";
+                    ctx.lineWidth = 1;
+                    for (let lx = x1 - videoH; lx < x2 + videoH; lx += 8) {
+                        ctx.beginPath();
+                        ctx.moveTo(lx, videoY + videoH - 2);
+                        ctx.lineTo(lx + videoH, videoY + 2);
+                        ctx.stroke();
+                    }
+                    ctx.restore();
+                }
 
                 // Permanent trim ghost
                 const clipOrigin = clip.source_origin_frame || 0;
@@ -2219,13 +2368,16 @@ export class EditorWidget {
 
                 const isSelectedAudio = this._isSelected("audio", track.track_id);
                 const vol = track.volume ?? 1.0;
+                const audioAsset = this._getAssetForSourcePath(track.source_path);
+                const isMissingAudio = !audioAsset || !!audioAsset.missing;
                 ctx.globalAlpha = audioLaneHidden ? 0.3 : 1.0;
-                ctx.fillStyle = (track.muted || audioLaneHidden) ? "#555" : (isSelectedAudio ? COLORS.audioClipSelected : COLORS.audioClip);
+                ctx.fillStyle = isMissingAudio
+                    ? (isSelectedAudio ? "#c97a59" : "#5f4038")
+                    : ((track.muted || audioLaneHidden) ? "#555" : (isSelectedAudio ? COLORS.audioClipSelected : COLORS.audioClip));
                 ctx.fillRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
 
                 // Waveform visualization
-                const audioAsset = this._pathToAsset[track.source_path];
-                if (audioAsset && (x2 - x1) > 6) {
+                if (audioAsset && !isMissingAudio && (x2 - x1) > 6) {
                     const waveform = this._getOrLoadWaveform(audioAsset.asset_id);
                     if (waveform && waveform.loaded && waveform.peaks.length > 0) {
                         ctx.save();
@@ -2265,7 +2417,7 @@ export class EditorWidget {
                 }
 
                 // Lane color tint (over waveform)
-                if (_alEntry.color) {
+                if (!isMissingAudio && _alEntry.color) {
                     const lc = _alEntry.color;
                     const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
                     const prevAlpha = ctx.globalAlpha;
@@ -2290,12 +2442,28 @@ export class EditorWidget {
 
                 // Audio label
                 if ((x2 - x1) > 30) {
-                    ctx.fillStyle = COLORS.text;
+                    ctx.fillStyle = isMissingAudio ? "#ffd0bc" : COLORS.text;
                     ctx.font = `${Math.round(8 * this._scaleTimeline)}px sans-serif`;
                     ctx.textAlign = "left";
-                    let aLabel = track.muted ? "M" : "";
+                    let aLabel = isMissingAudio ? "Missing" : (track.muted ? "M" : "");
                     if (vol < 1.0 && !track.muted) aLabel += `${Math.round(vol * 100)}%`;
                     if (aLabel) ctx.fillText(aLabel, x1 + 4, audioY + audioH / 2 + Math.round(3 * this._scaleTimeline));
+                }
+
+                if (isMissingAudio) {
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
+                    ctx.clip();
+                    ctx.strokeStyle = "rgba(255,208,188,0.35)";
+                    ctx.lineWidth = 1;
+                    for (let lx = x1 - audioH; lx < x2 + audioH; lx += 8) {
+                        ctx.beginPath();
+                        ctx.moveTo(lx, audioY + audioH - 2);
+                        ctx.lineTo(lx + audioH, audioY + 2);
+                        ctx.stroke();
+                    }
+                    ctx.restore();
                 }
 
                 // Permanent trim ghost for audio
@@ -2539,6 +2707,27 @@ export class EditorWidget {
         return this._hitTestClip(x, y) || this._hitTestAudio(x, y) || this._hitTestGuide(x, y) || this._hitTestPrompt(x, y);
     }
 
+    _findSceneItemBySelection(type, id) {
+        if (!this.activeScene) return null;
+        if (type === "clip") {
+            const clip = (this.activeScene.clips || []).find((item) => item.clip_id === id);
+            return clip ? { type, id, data: clip } : null;
+        }
+        if (type === "audio") {
+            const track = (this.activeScene.audio_tracks || []).find((item) => item.track_id === id);
+            return track ? { type, id, data: track } : null;
+        }
+        if (type === "guide") {
+            const guide = (this.activeScene.guide_frames || []).find((item) => item.frame_index === id);
+            return guide ? { type, id, data: guide } : null;
+        }
+        if (type === "prompt") {
+            const section = (this.activeScene.prompt_sections || [])[id];
+            return section ? { type, id, data: section } : null;
+        }
+        return null;
+    }
+
     /** Detect if the mouse is near the left or right edge of a clip/audio track for trimming.
      *  Returns { type, id, data, edge: "left"|"right" } or null. */
     _hitTestEdge(x, y) {
@@ -2604,6 +2793,29 @@ export class EditorWidget {
         return this.selectedItems.some(s => s.type === type && s.id === id);
     }
 
+    _reconcileSelection() {
+        if (!this.activeScene || !this.selectedItems.length) return;
+
+        const reconciled = this.selectedItems
+            .map((item) => this._findSceneItemBySelection(item.type, item.id))
+            .filter(Boolean);
+
+        if (!reconciled.length) {
+            this._clearSelection();
+            this._hideItemEditor();
+            return;
+        }
+
+        this.selectedItems = reconciled;
+        if (this.selectedItem) {
+            this.selectedItem = this._findSceneItemBySelection(this.selectedItem.type, this.selectedItem.id)
+                || reconciled[reconciled.length - 1]
+                || null;
+        } else {
+            this.selectedItem = reconciled[reconciled.length - 1] || null;
+        }
+    }
+
     /** Clear the entire selection. */
     _clearSelection() {
         this.selectedItems = [];
@@ -2613,6 +2825,15 @@ export class EditorWidget {
     /** Select a single item (replaces selection). */
     _selectItem(hit) {
         this.selectedItems = [hit];
+        this.selectedItem = hit;
+    }
+
+    _refreshSelectedHit(hit) {
+        if (!hit) return;
+        const idx = this.selectedItems.findIndex((item) => item.type === hit.type && item.id === hit.id);
+        if (idx >= 0) {
+            this.selectedItems[idx] = hit;
+        }
         this.selectedItem = hit;
     }
 
@@ -2632,6 +2853,9 @@ export class EditorWidget {
     _addToSelection(hit) {
         if (!this._isSelected(hit.type, hit.id)) {
             this.selectedItems.push(hit);
+        } else {
+            this._refreshSelectedHit(hit);
+            return;
         }
         this.selectedItem = hit;
     }
@@ -2796,7 +3020,7 @@ export class EditorWidget {
                             this._selectItem(hit);
                         } else {
                             // Plain click on already-selected item = keep selection (for drag)
-                            this.selectedItem = hit;
+                            this._refreshSelectedHit(hit);
                         }
                         this._hideItemEditor(); // Will show on mouseup if no drag
                         // Block drag if any selected item is on a locked lane
@@ -3057,6 +3281,11 @@ export class EditorWidget {
                     }
                 }
                 canvas.style.cursor = "grab";
+                this._dragItemsOrig = null;
+                this._origAllClipLanes = {};
+                this._origAllAudioLanes = {};
+                this._lastSnappedDelta = 0;
+                this._dragLaneChanged = false;
             } else {
                 // Normalize selection direction
                 if (this.selectionStart > this.selectionEnd) {
@@ -3189,6 +3418,8 @@ export class EditorWidget {
             if (hit) {
                 if (!this._isSelected(hit.type, hit.id)) {
                     this._selectItem(hit);
+                } else {
+                    this._refreshSelectedHit(hit);
                 }
                 this._renderTimeline();
 
@@ -5803,6 +6034,19 @@ export class EditorWidget {
             .sort((a, b) => (a.track_index || 0) - (b.track_index || 0));
     }
 
+    _getAssetForSourcePath(sourcePath) {
+        return sourcePath ? (this._pathToAsset[sourcePath] || null) : null;
+    }
+
+    _isMissingSourcePath(sourcePath) {
+        const asset = this._getAssetForSourcePath(sourcePath);
+        return !asset || !!asset.missing;
+    }
+
+    _getGuideAsset(guide) {
+        return guide ? (this.assets.image?.find((asset) => asset.asset_id === guide.asset_id) || null) : null;
+    }
+
     _getAudioAtFrame(frame) {
         if (!this.activeScene?.audio_tracks) return null;
         for (const track of this.activeScene.audio_tracks) {
@@ -5818,11 +6062,34 @@ export class EditorWidget {
         return this.activeScene.audio_tracks.filter(
             a => frame >= a.timeline_start_frame && frame < a.timeline_end_frame
                 && !this._isLaneHidden(TRACK_TYPE.AUDIO, a.lane_index || 0)
+                && !this._isMissingSourcePath(a.source_path)
         );
     }
 
     _buildViewURL(sourcePath) {
         return buildProjectAssetViewURL(this.projectDir, sourcePath);
+    }
+
+    _drawMissingViewportPlaceholder(title, subtitle = "") {
+        if (!this._vpCtx || !this._vpCanvas) return;
+        const ctx = this._vpCtx;
+        const w = this._vpCanvas.width;
+        const h = this._vpCanvas.height;
+        ctx.fillStyle = "#120c09";
+        ctx.fillRect(0, 0, w, h);
+        ctx.strokeStyle = "rgba(255,177,140,0.35)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(10, 10, Math.max(0, w - 20), Math.max(0, h - 20));
+        ctx.fillStyle = "#ffb18c";
+        ctx.font = `${Math.max(16, h / 14)}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(title || "Missing asset", w / 2, h / 2 - 12);
+        if (subtitle) {
+            ctx.fillStyle = "rgba(255,220,204,0.8)";
+            ctx.font = `${Math.max(11, h / 24)}px sans-serif`;
+            ctx.fillText(subtitle, w / 2, h / 2 + 14);
+        }
     }
 
     _getOrCreateVideo(sourcePath) {
@@ -5906,9 +6173,12 @@ export class EditorWidget {
 
         // Animatic: guides render BENEATH video (as holdframe reference)
         const guide = this._getGuideAtFrame(this.playhead);
+        const guideAsset = guide ? this._getGuideAsset(guide) : null;
         const clips = this._getClipsAtFrame(this.playhead);
+        const playableClips = clips.filter((clip) => !this._isMissingSourcePath(clip.source_path));
+        const missingClips = clips.filter((clip) => this._isMissingSourcePath(clip.source_path));
 
-        if (clips.length === 0 && !guide) {
+        if (playableClips.length === 0 && missingClips.length === 0 && !guide) {
             // No clip and no guide — show frame number centered
             ctx.fillStyle = "#000";
             ctx.fillRect(0, 0, w, h);
@@ -5920,11 +6190,26 @@ export class EditorWidget {
             return;
         }
 
-        if (clips.length === 0 && guide) {
+        if (playableClips.length === 0 && missingClips.length > 0) {
+            const missingClip = missingClips[0];
+            const missingAsset = this._pathToAsset[missingClip.source_path];
+            this._drawMissingViewportPlaceholder("Missing clip", missingAsset?.name || missingClip.source_path.split(/[/\\]/).pop() || "");
+            return;
+        }
+
+        if (playableClips.length === 0 && guide) {
             // Guide only — show as animatic reference (no video to cover it)
             if (this._seekAbort) {
                 this._seekAbort();
                 this._seekAbort = null;
+            }
+            if (!guideAsset) {
+                this._drawMissingViewportPlaceholder("Missing guide", "Guide asset entry not found.");
+                return;
+            }
+            if (guideAsset.missing) {
+                this._drawMissingViewportPlaceholder("Missing guide", guideAsset.name || guideAsset.path.split(/[/\\]/).pop() || "");
+                return;
             }
             this._drawGuideToViewport(guide);
             return;
@@ -5933,8 +6218,8 @@ export class EditorWidget {
         // Video clips exist — they take visual priority over guides
 
         // Single clip: use existing fast path
-        if (clips.length === 1) {
-            const clip = clips[0];
+        if (playableClips.length === 1) {
+            const clip = playableClips[0];
             const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
             const sourceTime = sourceFrame / this._effectiveFps;
             this._viewportClipOpacity = clip.opacity ?? 1.0;
@@ -5982,7 +6267,7 @@ export class EditorWidget {
             }
         } else {
             // Scrubbing — seek all videos then composite
-            this._renderViewportComposite(this.playhead, clips);
+            this._renderViewportComposite(this.playhead, playableClips);
         }
     }
 
@@ -6098,11 +6383,21 @@ export class EditorWidget {
     _drawGuideToViewport(guide) {
         if (!this._vpCtx || !this._vpCanvas) return;
         // Find the asset for this guide
-        const asset = this.assets.image?.find(a => a.asset_id === guide.asset_id);
-        if (!asset) return;
+        const asset = this._getGuideAsset(guide);
+        if (!asset) {
+            this._drawMissingViewportPlaceholder("Missing guide", "Guide asset entry not found.");
+            return;
+        }
+        if (asset.missing) {
+            this._drawMissingViewportPlaceholder("Missing guide", asset.name || asset.path.split(/[/\\]/).pop() || "");
+            return;
+        }
 
         const url = this._buildViewURL(asset.path);
-        if (!url) return;
+        if (!url) {
+            this._drawMissingViewportPlaceholder("Missing guide", asset.name || "");
+            return;
+        }
 
         // Use a cached image element
         const cacheKey = `guide_${guide.asset_id}`;
@@ -6239,7 +6534,8 @@ export class EditorWidget {
         }
 
         // Start video elements for all visible clips at current frame
-        const visibleClips = this._getClipsAtFrame(this.playhead);
+        const visibleClips = this._getClipsAtFrame(this.playhead)
+            .filter((clip) => !this._isMissingSourcePath(clip.source_path));
         this._activePlaybackVideos = [];
         for (const clip of visibleClips) {
             const video = this._getOrCreateVideo(clip.source_path);
@@ -6315,8 +6611,10 @@ export class EditorWidget {
         this.playhead = newFrame;
 
         // Detect clip boundary crossing (multi-layer aware)
-        const prevClips = this._getClipsAtFrame(prevFrame);
-        const currClips = this._getClipsAtFrame(newFrame);
+        const prevClips = this._getClipsAtFrame(prevFrame)
+            .filter((clip) => !this._isMissingSourcePath(clip.source_path));
+        const currClips = this._getClipsAtFrame(newFrame)
+            .filter((clip) => !this._isMissingSourcePath(clip.source_path));
         const prevPaths = new Set(prevClips.map(c => c.source_path));
         const currPaths = new Set(currClips.map(c => c.source_path));
 

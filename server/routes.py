@@ -40,6 +40,91 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"}
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
 
 
+def _resolve_source_path(source_path: str) -> str:
+    source_path = str(source_path or "")
+    if source_path and os.path.isfile(source_path):
+        return source_path
+
+    try:
+        import folder_paths
+        input_path = os.path.join(folder_paths.get_input_directory(), source_path)
+        if os.path.isfile(input_path):
+            return input_path
+    except Exception:
+        pass
+
+    return source_path
+
+
+def _detect_asset_type(source_path: str, fallback: str = "video") -> str:
+    ext = os.path.splitext(source_path or "")[1].lower()
+    if ext in VIDEO_EXTS:
+        return "video"
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in AUDIO_EXTS:
+        return "audio"
+    return fallback
+
+
+def _extract_asset_media_metadata(source_path: str, asset_type: str) -> dict:
+    width, height, frame_count, fps, duration_sec, sample_rate = 0, 0, 0, 0.0, 0.0, 0
+
+    if asset_type == "video":
+        try:
+            import cv2
+            cap = cv2.VideoCapture(source_path)
+            if cap.isOpened():
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                duration_sec = frame_count / fps if fps > 0 else 0.0
+                cap.release()
+        except Exception as e:
+            logger.warning("Failed to extract video metadata: %s", e)
+    elif asset_type == "image":
+        try:
+            from PIL import Image
+            img = Image.open(source_path)
+            width, height = img.size
+        except Exception as e:
+            logger.warning("Failed to extract image metadata: %s", e)
+    elif asset_type == "audio":
+        duration_sec = _get_audio_duration(source_path)
+
+    has_audio = _video_has_audio(source_path) if asset_type == "video" else False
+    return {
+        "width": width,
+        "height": height,
+        "frame_count": frame_count,
+        "fps": fps,
+        "duration_sec": duration_sec,
+        "sample_rate": sample_rate,
+        "has_audio": has_audio,
+    }
+
+
+def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
+    return os.path.join(project.project_dir, asset.path) if getattr(asset, "path", "") else ""
+
+
+def _asset_missing(project: TimelineProject, asset: Asset) -> bool:
+    source_path = _asset_abspath(project, asset)
+    return not source_path or not os.path.isfile(source_path)
+
+
+def _asset_payload(project: TimelineProject, asset: Asset) -> dict:
+    payload = asset.to_dict()
+    thumb_path = os.path.join(
+        project.project_dir, "cache", "thumbnails",
+        f"{asset.asset_id}.png"
+    )
+    payload["has_thumbnail"] = os.path.isfile(thumb_path)
+    payload["missing"] = _asset_missing(project, asset)
+    return payload
+
+
 def _get_audio_duration(filepath: str) -> float:
     """Get audio duration in seconds using multiple fallback methods."""
     # Method 1: mutagen auto-detect
@@ -683,6 +768,365 @@ def _ensure_asset_folder(project: TimelineProject, folder: str) -> None:
         project.metadata["asset_folders"] = sorted(folders)
 
 
+def _set_asset_folders(project: TimelineProject, folders: list[str]) -> list[str]:
+    normalized = sorted({
+        _normalize_asset_folder(folder)
+        for folder in folders
+        if _normalize_asset_folder(folder)
+    })
+    if normalized:
+        project.metadata["asset_folders"] = normalized
+    else:
+        project.metadata.pop("asset_folders", None)
+    return normalized
+
+
+def _folder_descendants(folder: str, folders: list[str]) -> list[str]:
+    normalized = _normalize_asset_folder(folder)
+    if not normalized:
+        return []
+    prefix = f"{normalized}/"
+    return sorted([
+        candidate for candidate in folders
+        if candidate == normalized or candidate.startswith(prefix)
+    ])
+
+
+def _rename_folder_path(folder: str, old_folder: str, new_folder: str) -> str:
+    normalized = _normalize_asset_folder(folder)
+    old_normalized = _normalize_asset_folder(old_folder)
+    new_normalized = _normalize_asset_folder(new_folder)
+    if not normalized or not old_normalized:
+        return normalized
+    if normalized == old_normalized:
+        return new_normalized
+    prefix = f"{old_normalized}/"
+    if normalized.startswith(prefix):
+        suffix = normalized[len(old_normalized):].lstrip("/")
+        return f"{new_normalized}/{suffix}".strip("/")
+    return normalized
+
+
+def _delete_folder_path(folder: str, deleted_folder: str) -> str:
+    normalized = _normalize_asset_folder(folder)
+    deleted_normalized = _normalize_asset_folder(deleted_folder)
+    if not normalized or not deleted_normalized:
+        return normalized
+    if normalized == deleted_normalized:
+        return ""
+    prefix = f"{deleted_normalized}/"
+    if normalized.startswith(prefix):
+        return normalized[len(prefix):].strip("/")
+    return normalized
+
+
+def _rename_project_asset_folder(project: TimelineProject, folder: str, new_folder: str) -> tuple[list[str], int]:
+    current = _normalize_asset_folder(folder)
+    updated = _normalize_asset_folder(new_folder)
+    if not current or not updated:
+        raise ValueError("Both folder and new_folder are required")
+    if current == updated:
+        return _collect_asset_folders(project), 0
+    if updated.startswith(f"{current}/"):
+        raise ValueError("Cannot rename a folder into one of its own descendants")
+
+    all_folders = _collect_asset_folders(project)
+    descendants = _folder_descendants(current, all_folders)
+    if not descendants:
+        raise FileNotFoundError(f"Folder not found: {current}")
+
+    renamed_descendants = {
+        _rename_folder_path(candidate, current, updated)
+        for candidate in descendants
+    }
+    existing = {
+        candidate for candidate in all_folders
+        if candidate not in descendants
+    }
+    conflicts = sorted(existing.intersection(renamed_descendants))
+    if conflicts:
+        raise FileExistsError(f"Folder rename would merge into existing folder: {conflicts[0]}")
+
+    assets_moved = 0
+    for asset in project.assets:
+        next_folder = _rename_folder_path(asset.folder, current, updated)
+        if next_folder != _normalize_asset_folder(asset.folder):
+            assets_moved += 1
+        asset.folder = next_folder
+
+    next_folders = [
+        _rename_folder_path(candidate, current, updated)
+        for candidate in all_folders
+    ]
+    return _set_asset_folders(project, next_folders), assets_moved
+
+
+def _folder_contains_path(folder: str, candidate: str) -> bool:
+    normalized_folder = _normalize_asset_folder(folder)
+    normalized_candidate = _normalize_asset_folder(candidate)
+    if not normalized_folder or not normalized_candidate:
+        return False
+    return normalized_candidate == normalized_folder or normalized_candidate.startswith(f"{normalized_folder}/")
+
+
+def _find_assets_in_folder(project: TimelineProject, folder: str) -> list[Asset]:
+    current = _normalize_asset_folder(folder)
+    if not current:
+        raise ValueError("Folder is required")
+
+    all_folders = _collect_asset_folders(project)
+    descendants = _folder_descendants(current, all_folders)
+    if not descendants:
+        raise FileNotFoundError(f"Folder not found: {current}")
+    return [
+        asset for asset in project.assets
+        if _folder_contains_path(current, getattr(asset, "folder", ""))
+    ]
+
+
+def _usage_sort_key(project: TimelineProject, usage: dict) -> tuple:
+    scene_order = {
+        scene.scene_id: index
+        for index, scene in enumerate(project.scenes_ordered())
+    }
+    position = usage.get("start_frame")
+    if position is None:
+        position = usage.get("frame_index")
+    if position is None:
+        position = 10 ** 9
+    item_id = (
+        usage.get("clip_id")
+        or usage.get("track_id")
+        or usage.get("job_id")
+        or ""
+    )
+    return (
+        scene_order.get(usage.get("scene_id"), 10 ** 9),
+        str(usage.get("scene_name") or ""),
+        position,
+        str(usage.get("type") or ""),
+        str(item_id),
+    )
+
+
+def _find_asset_usages(project: TimelineProject, asset: Asset) -> dict:
+    usages = []
+
+    for scene in project.scenes_ordered():
+        for clip in scene.clips:
+            if clip.source_path == asset.path:
+                usages.append({
+                    "asset_id": asset.asset_id,
+                    "type": "clip",
+                    "scene_id": scene.scene_id,
+                    "scene_name": scene.name,
+                    "clip_id": clip.clip_id,
+                    "track_index": clip.track_index,
+                    "start_frame": clip.timeline_start_frame,
+                    "end_frame": clip.timeline_end_frame,
+                })
+        for track in scene.audio_tracks:
+            if track.source_path == asset.path:
+                usages.append({
+                    "asset_id": asset.asset_id,
+                    "type": "audio_track",
+                    "scene_id": scene.scene_id,
+                    "scene_name": scene.name,
+                    "track_id": track.track_id,
+                    "lane_index": track.lane_index,
+                    "start_frame": track.timeline_start_frame,
+                    "end_frame": track.timeline_end_frame,
+                })
+        for guide in scene.guide_frames:
+            if guide.asset_id == asset.asset_id:
+                usages.append({
+                    "asset_id": asset.asset_id,
+                    "type": "guide_frame",
+                    "scene_id": scene.scene_id,
+                    "scene_name": scene.name,
+                    "frame_index": guide.frame_index,
+                    "strength": guide.strength,
+                })
+
+    for job in project.generation_queue:
+        if job.result_asset_id == asset.asset_id:
+            scene_name = job.scene_name
+            if not scene_name and job.scene_id:
+                scene = project.get_scene(job.scene_id)
+                scene_name = scene.name if scene else ""
+            usages.append({
+                "asset_id": asset.asset_id,
+                "type": "generation_job",
+                "scene_id": job.scene_id,
+                "scene_name": scene_name or "Project Queue",
+                "job_id": job.job_id,
+                "status": job.status,
+            })
+
+    usages.sort(key=lambda usage: _usage_sort_key(project, usage))
+    return {
+        "asset_id": asset.asset_id,
+        "usages": usages,
+        "usage_count": len(usages),
+    }
+
+
+def _aggregate_asset_usages(project: TimelineProject, assets: list[Asset]) -> dict:
+    usages = []
+    for asset in assets:
+        usage_payload = _find_asset_usages(project, asset)
+        for usage in usage_payload["usages"]:
+            usages.append({
+                **usage,
+                "asset_name": asset.name or os.path.basename(asset.path or "") or asset.asset_id,
+                "asset_path": asset.path,
+                "asset_type": asset.asset_type,
+            })
+    usages.sort(key=lambda usage: _usage_sort_key(project, usage))
+    return {
+        "usages": usages,
+        "usage_count": len(usages),
+    }
+
+
+def _delete_asset_cache_files(project: TimelineProject, asset: Asset) -> None:
+    thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
+    strip_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}_strip.jpg")
+    strip_info_path = strip_path + ".json"
+    waveform_path = os.path.join(project.project_dir, "cache", "waveforms", f"{asset.asset_id}.json")
+    for cache_path in [thumb_path, strip_path, strip_info_path, waveform_path]:
+        if os.path.isfile(cache_path):
+            try:
+                os.remove(cache_path)
+            except OSError:
+                logger.warning("Failed to clear asset cache file: %s", cache_path)
+
+
+def _delete_asset_source_file(project: TimelineProject, asset: Asset, excluded_asset_ids: set[str] | None = None) -> None:
+    source_path = _asset_abspath(project, asset)
+    if not source_path or not os.path.isfile(source_path):
+        return
+
+    excluded = excluded_asset_ids or set()
+    shared_source = any(
+        other.asset_id != asset.asset_id
+        and other.asset_id not in excluded
+        and other.path == asset.path
+        for other in project.assets
+    )
+    if shared_source:
+        return
+
+    os.remove(source_path)
+
+
+def _delete_project_asset(project: TimelineProject, asset: Asset, usages_orphaned: int = 0) -> dict:
+    _delete_asset_source_file(project, asset)
+    _delete_asset_cache_files(project, asset)
+    project.remove_asset(asset.asset_id)
+    return {
+        "deleted": True,
+        "asset_id": asset.asset_id,
+        "usages_orphaned": usages_orphaned,
+    }
+
+
+def _delete_project_asset_folder(project: TimelineProject, folder: str) -> tuple[list[str], list[Asset]]:
+    current = _normalize_asset_folder(folder)
+    if not current:
+        raise ValueError("Folder is required")
+
+    all_folders = _collect_asset_folders(project)
+    descendants = _folder_descendants(current, all_folders)
+    if not descendants:
+        raise FileNotFoundError(f"Folder not found: {current}")
+
+    assets_to_delete = _find_assets_in_folder(project, current)
+    deleted_ids = {asset.asset_id for asset in assets_to_delete}
+    for asset in assets_to_delete:
+        _delete_asset_source_file(project, asset, deleted_ids)
+        _delete_asset_cache_files(project, asset)
+
+    for asset in list(assets_to_delete):
+        project.remove_asset(asset.asset_id)
+
+    remaining_folders = [
+        candidate for candidate in all_folders
+        if candidate not in descendants
+    ]
+    folders = _set_asset_folders(project, remaining_folders)
+    return folders, assets_to_delete
+
+
+def _update_asset_references_for_path(project: TimelineProject, old_path: str, new_path: str) -> None:
+    if not old_path or old_path == new_path:
+        return
+
+    for scene in project.scenes:
+        for clip in scene.clips:
+            if clip.source_path == old_path:
+                clip.source_path = new_path
+        for track in scene.audio_tracks:
+            if track.source_path == old_path:
+                track.source_path = new_path
+
+
+def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: str) -> Asset:
+    resolved_source = _resolve_source_path(source_path)
+    if not resolved_source or not os.path.isfile(resolved_source):
+        raise FileNotFoundError(f"File not found: {source_path}")
+
+    replacement_type = _detect_asset_type(resolved_source, asset.asset_type)
+    if replacement_type != asset.asset_type:
+        raise ValueError(f"Replacement type mismatch: expected {asset.asset_type}, got {replacement_type}")
+
+    media_dir = os.path.join(project.project_dir, "media")
+    os.makedirs(media_dir, exist_ok=True)
+
+    old_rel_path = asset.path
+    old_abs_path = _asset_abspath(project, asset)
+    old_ext = os.path.splitext(old_rel_path or "")[1].lower()
+    new_ext = os.path.splitext(resolved_source)[1].lower()
+
+    if old_rel_path and old_ext and old_ext == new_ext:
+        next_rel_path = old_rel_path
+    else:
+        next_rel_path = os.path.join("media", f"{uuid.uuid4().hex[:8]}_{os.path.basename(resolved_source)}")
+    next_abs_path = os.path.join(project.project_dir, next_rel_path)
+
+    if os.path.abspath(resolved_source) != os.path.abspath(next_abs_path):
+        shutil.copy2(resolved_source, next_abs_path)
+
+    if old_rel_path != next_rel_path:
+        _update_asset_references_for_path(project, old_rel_path, next_rel_path)
+        asset.path = next_rel_path
+        if old_abs_path and os.path.isfile(old_abs_path):
+            shared_old_path = any(
+                other.asset_id != asset.asset_id and other.path == old_rel_path
+                for other in project.assets
+            )
+            if not shared_old_path:
+                try:
+                    os.remove(old_abs_path)
+                except OSError:
+                    logger.warning("Failed to remove replaced asset file: %s", old_abs_path)
+
+    metadata = _extract_asset_media_metadata(next_abs_path, asset.asset_type)
+    asset.width = metadata["width"]
+    asset.height = metadata["height"]
+    asset.frame_count = metadata["frame_count"]
+    asset.fps = metadata["fps"]
+    asset.duration_sec = metadata["duration_sec"]
+    asset.sample_rate = metadata["sample_rate"]
+    asset.has_audio = metadata["has_audio"]
+
+    old_basename = os.path.basename(old_rel_path or "")
+    if not asset.name or asset.name == old_basename:
+        asset.name = os.path.basename(asset.path)
+
+    return asset
+
+
 if routes is not None:
 
     # -----------------------------------------------------------------------
@@ -794,15 +1238,7 @@ if routes is not None:
         else:
             assets = project.assets
 
-        result = []
-        for asset in assets:
-            d = asset.to_dict()
-            thumb_path = os.path.join(
-                project.project_dir, "cache", "thumbnails",
-                f"{asset.asset_id}.png"
-            )
-            d["has_thumbnail"] = os.path.isfile(thumb_path)
-            result.append(d)
+        result = [_asset_payload(project, asset) for asset in assets]
 
         return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
 
@@ -814,30 +1250,7 @@ if routes is not None:
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        result = []
-        for asset in project.assets:
-            thumb_path = os.path.join(
-                project.project_dir, "cache", "thumbnails",
-                f"{asset.asset_id}.png"
-            )
-            result.append({
-                "asset_id": asset.asset_id,
-                "name": asset.name,
-                "asset_type": asset.asset_type,
-                "path": asset.path,
-                "width": asset.width,
-                "height": asset.height,
-                "frame_count": asset.frame_count,
-                "fps": asset.fps,
-                "duration_sec": asset.duration_sec,
-                "sample_rate": asset.sample_rate,
-                "has_audio": asset.has_audio,
-                "folder": asset.folder,
-                "prompt": asset.prompt,
-                "generation_params": asset.generation_params,
-                "imported_at": asset.imported_at,
-                "has_thumbnail": os.path.isfile(thumb_path),
-            })
+        result = [_asset_payload(project, asset) for asset in project.assets]
 
         return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
 
@@ -854,32 +1267,12 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        source_path = body.get("source_path", "")
-
-        # Resolve relative paths against ComfyUI's input directory
-        if source_path and not os.path.isfile(source_path):
-            try:
-                import folder_paths
-                input_path = os.path.join(folder_paths.get_input_directory(), source_path)
-                if os.path.isfile(input_path):
-                    source_path = input_path
-            except Exception:
-                pass
+        source_path = _resolve_source_path(body.get("source_path", ""))
 
         if not source_path or not os.path.isfile(source_path):
             return _json_error(f"File not found: {source_path}", 400)
 
-        # Determine asset type from extension
-        ext = os.path.splitext(source_path)[1].lower()
-
-        if ext in VIDEO_EXTS:
-            asset_type = "video"
-        elif ext in IMAGE_EXTS:
-            asset_type = "image"
-        elif ext in AUDIO_EXTS:
-            asset_type = "audio"
-        else:
-            asset_type = body.get("type", "video")
+        asset_type = _detect_asset_type(source_path, body.get("type", "video"))
 
         # Copy to project media directory
         media_dir = os.path.join(project.project_dir, "media")
@@ -889,48 +1282,20 @@ if routes is not None:
         dest_path = os.path.join(media_dir, dest_filename)
         shutil.copy2(source_path, dest_path)
 
-        # Extract metadata
-        width, height, frame_count, fps, duration_sec, sample_rate = 0, 0, 0, 0.0, 0.0, 0
-        if asset_type == "video":
-            try:
-                import cv2
-                cap = cv2.VideoCapture(dest_path)
-                if cap.isOpened():
-                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-                    duration_sec = frame_count / fps if fps > 0 else 0.0
-                    cap.release()
-            except Exception as e:
-                logger.warning("Failed to extract video metadata: %s", e)
-        elif asset_type == "image":
-            try:
-                from PIL import Image
-                img = Image.open(dest_path)
-                width, height = img.size
-            except Exception as e:
-                logger.warning("Failed to extract image metadata: %s", e)
-        elif asset_type == "audio":
-            duration_sec = _get_audio_duration(dest_path)
-
-        # Check for audio in video files
-        has_audio = False
-        if asset_type == "video":
-            has_audio = _video_has_audio(dest_path)
+        metadata = _extract_asset_media_metadata(dest_path, asset_type)
 
         # Create asset entry
         asset = Asset(
             name=basename,
             asset_type=asset_type,
             path=os.path.join("media", dest_filename),
-            width=width,
-            height=height,
-            frame_count=frame_count,
-            fps=fps,
-            duration_sec=duration_sec,
-            sample_rate=sample_rate,
-            has_audio=has_audio,
+            width=metadata["width"],
+            height=metadata["height"],
+            frame_count=metadata["frame_count"],
+            fps=metadata["fps"],
+            duration_sec=metadata["duration_sec"],
+            sample_rate=metadata["sample_rate"],
+            has_audio=metadata["has_audio"],
             prompt=body.get("prompt", ""),
             generation_params=body.get("generation_params", {}),
         )
@@ -947,7 +1312,7 @@ if routes is not None:
         )
         ensure_thumbnail(asset_type, dest_path, thumb_path)
 
-        return web.json_response(asset.to_dict(), status=201)
+        return web.json_response(_asset_payload(project, asset), status=201)
 
     @routes.post("/ltx-editor/project/{project_id}/assets/folders")
     async def api_create_asset_folder(request: web.Request) -> web.Response:
@@ -968,6 +1333,80 @@ if routes is not None:
         _ensure_asset_folder(project, folder)
         save_project(project)
         return web.json_response({"folders": _collect_asset_folders(project)})
+
+    @routes.put("/ltx-editor/project/{project_id}/assets/folders")
+    async def api_rename_asset_folder(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        try:
+            folders, assets_moved = _rename_project_asset_folder(
+                project,
+                body.get("old_folder", ""),
+                body.get("new_folder", ""),
+            )
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except FileExistsError as e:
+            return _json_error(str(e), 409)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        save_project(project)
+        return web.json_response({"folders": folders, "assets_moved": assets_moved})
+
+    @routes.delete("/ltx-editor/project/{project_id}/assets/folders")
+    async def api_delete_asset_folder(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        folder = body.get("folder", "")
+        force = bool(body.get("force", False))
+
+        try:
+            assets_to_delete = _find_assets_in_folder(project, folder)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        usage = _aggregate_asset_usages(project, assets_to_delete)
+        if usage["usage_count"] > 0 and not force:
+            return web.json_response({
+                "error": "Folder contains assets that are still in use",
+                "usages": usage["usages"],
+                "usage_count": usage["usage_count"],
+            }, status=409)
+
+        try:
+            _folders, deleted_assets = _delete_project_asset_folder(project, folder)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+        except OSError as e:
+            return _json_error(str(e), 500)
+
+        save_project(project)
+        return web.json_response({
+            "deleted_folder": _normalize_asset_folder(folder),
+            "deleted_assets": len(deleted_assets),
+        })
 
     @routes.post("/ltx-editor/project/{project_id}/assets/extract_frame")
     async def api_extract_frame(request: web.Request) -> web.Response:
@@ -1068,7 +1507,93 @@ if routes is not None:
             _ensure_asset_folder(project, asset.folder)
 
         save_project(project)
-        return web.json_response(asset.to_dict())
+        return web.json_response(_asset_payload(project, asset))
+
+    @routes.get("/ltx-editor/project/{project_id}/assets/{asset_id}/usages")
+    async def api_get_asset_usages(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_id = request.match_info["asset_id"]
+        asset = project.get_asset(asset_id)
+        if not asset:
+            return _json_error(f"Asset not found: {asset_id}", 404)
+
+        return web.json_response(_find_asset_usages(project, asset))
+
+    @routes.delete("/ltx-editor/project/{project_id}/assets/{asset_id}")
+    async def api_delete_asset(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_id = request.match_info["asset_id"]
+        asset = project.get_asset(asset_id)
+        if not asset:
+            return _json_error(f"Asset not found: {asset_id}", 404)
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        usage = _find_asset_usages(project, asset)
+        force = bool(body.get("force", False))
+        if usage["usage_count"] > 0 and not force:
+            return web.json_response({
+                "error": "Asset is in use",
+                "usages": usage["usages"],
+                "usage_count": usage["usage_count"],
+            }, status=409)
+
+        try:
+            payload = _delete_project_asset(project, asset, usage["usage_count"])
+        except OSError as e:
+            return _json_error(str(e), 500)
+
+        save_project(project)
+        return web.json_response(payload)
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/{asset_id}/replace")
+    async def api_replace_asset(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_id = request.match_info["asset_id"]
+        asset = project.get_asset(asset_id)
+        if not asset:
+            return _json_error(f"Asset not found: {asset_id}", 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        source_path = body.get("source_path", "")
+        try:
+            _replace_project_asset(project, asset, source_path)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 400)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        _delete_asset_cache_files(project, asset)
+
+        if not _asset_missing(project, asset):
+            thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
+            ensure_thumbnail(asset.asset_type, _asset_abspath(project, asset), thumb_path)
+
+        save_project(project)
+        return web.json_response({
+            "asset": _asset_payload(project, asset),
+            "usage": _find_asset_usages(project, asset),
+        })
 
     @routes.get("/ltx-editor/project/{project_id}/thumbnail/{asset_id}")
     async def api_get_thumbnail(request: web.Request) -> web.Response:
@@ -1087,8 +1612,12 @@ if routes is not None:
             project.project_dir, "cache", "thumbnails",
             f"{asset_id}.png"
         )
-        source_path = os.path.join(project.project_dir, asset.path)
+        if os.path.isfile(thumb_path):
+            return web.FileResponse(thumb_path)
 
+        source_path = _asset_abspath(project, asset)
+        if not source_path or not os.path.isfile(source_path):
+            return _json_error("Thumbnail unavailable for missing asset", 404)
         if not ensure_thumbnail(asset.asset_type, source_path, thumb_path):
             return _json_error("Failed to generate thumbnail", 500)
 
@@ -1115,7 +1644,9 @@ if routes is not None:
 
         # Generate if not cached
         if not os.path.isfile(strip_path):
-            source_path = os.path.join(project.project_dir, asset.path)
+            source_path = _asset_abspath(project, asset)
+            if not source_path or not os.path.isfile(source_path):
+                return _json_error("Thumbnail strip unavailable for missing asset", 404)
             info = generate_thumbnail_strip(source_path, strip_path)
             if info:
                 import json as _json
@@ -1152,7 +1683,9 @@ if routes is not None:
 
         # Generate if not cached
         if not os.path.isfile(waveform_path):
-            source_path = os.path.join(project.project_dir, asset.path)
+            source_path = _asset_abspath(project, asset)
+            if not source_path or not os.path.isfile(source_path):
+                return _json_error("Waveform unavailable for missing asset", 404)
             data = generate_waveform_data(source_path, waveform_path)
             if not data:
                 return _json_error("Failed to generate waveform data", 500)

@@ -1,6 +1,6 @@
 const { api } = window.comfyAPI.api;
 
-import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject } from "./editor_widget.js";
+import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
 import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
 
 function style(el, cssText) {
@@ -74,6 +74,7 @@ function pickPreviewTarget(projectDir, summary, scene, assets) {
     const fallbackFrame = activeScene?.selection?.generation_start_frame || 0;
     const assetsByPath = new Map((assets || []).map(asset => [asset.path, asset]));
     const assetsById = new Map((assets || []).map(asset => [asset.asset_id, asset]));
+    const isMissingAsset = (asset) => !asset || !!asset.missing;
 
     const activeClips = (scene?.clips || [])
         .filter(clip => fallbackFrame >= clip.timeline_start_frame && fallbackFrame < clip.timeline_end_frame)
@@ -83,6 +84,13 @@ function pickPreviewTarget(projectDir, summary, scene, assets) {
     if (activeClips.length > 0) {
         const clip = activeClips[0];
         const asset = assetsByPath.get(clip.source_path);
+        if (isMissingAsset(asset)) {
+            return {
+                kind: "missing",
+                label: "Missing Video",
+                subtitle: asset?.name || clip.source_path.split(/[/\\]/).pop() || "Clip",
+            };
+        }
         return {
             kind: "video",
             label: `Frame ${fallbackFrame}`,
@@ -107,6 +115,13 @@ function pickPreviewTarget(projectDir, summary, scene, assets) {
     }
     if (guide) {
         const asset = assetsById.get(guide.asset_id);
+        if (isMissingAsset(asset)) {
+            return {
+                kind: "missing",
+                label: `Missing Guide ${guideFrame}`,
+                subtitle: asset?.name || asset?.path?.split(/[/\\]/).pop() || "Guide asset entry not found.",
+            };
+        }
         if (asset) {
             return {
                 kind: "image",
@@ -395,16 +410,6 @@ class DormantNodeCard {
     }
 
     _applyModuleContainerSizing(moduleId) {
-        const baseStyle = `
-            display: flex;
-            flex-direction: column;
-            flex: 1 1 auto;
-            min-height: 0;
-            border-top: 1px solid #333;
-            padding-top: 8px;
-            box-sizing: border-box;
-            overflow: hidden;
-        `;
         style(this._moduleContainerEl, `
             display: flex;
             flex-direction: column;
@@ -417,10 +422,27 @@ class DormantNodeCard {
         `);
     }
 
+    _measureAvailableModuleHeight() {
+        const rootRect = this.root.getBoundingClientRect();
+        const containerRect = this._moduleContainerEl.getBoundingClientRect();
+        if (!rootRect.height) return 0;
+        const rootStyle = window.getComputedStyle(this.root);
+        const paddingBottom = parseFloat(rootStyle.paddingBottom) || 0;
+        return Math.max(0, Math.floor(rootRect.bottom - paddingBottom - containerRect.top));
+    }
+
     syncModuleContainerHeight() {
         const moduleId = this.controller.state.expandedModuleId;
         if (!moduleId || this._moduleContainerEl.style.display === "none") return;
         this._applyModuleContainerSizing(moduleId);
+        if (moduleId !== "assets") {
+            this._moduleContainerEl.style.height = "";
+            this._moduleContainerEl.style.maxHeight = "";
+            return;
+        }
+        const availableHeight = this._measureAvailableModuleHeight();
+        this._moduleContainerEl.style.height = availableHeight > 0 ? `${availableHeight}px` : "";
+        this._moduleContainerEl.style.maxHeight = availableHeight > 0 ? `${availableHeight}px` : "";
     }
 
     _renderModuleState() {
@@ -936,6 +958,39 @@ export class EditorNodeController {
         return updatedAsset;
     }
 
+    async _getAssetUsages(assetId) {
+        if (!this.state.projectDir || !assetId) return null;
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}/usages`));
+        if (!resp.ok) {
+            throw new Error(`Asset usage fetch failed: ${resp.status}`);
+        }
+        return await resp.json();
+    }
+
+    async _deleteAsset(assetId, force = false) {
+        if (!this.state.projectDir || !assetId) return { status: "noop" };
+
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}`), {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Asset delete failed: ${resp.status}`);
+        }
+
+        const payload = await resp.json();
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
     async _createAssetFolder(folderName) {
         if (!this.state.projectDir || !folderName) return [];
         const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
@@ -955,6 +1010,56 @@ export class EditorNodeController {
         }
         this.fullscreenSession?.refresh(["assets"]);
         return Array.isArray(payload.folders) ? payload.folders : [];
+    }
+
+    async _renameAssetFolder(folderName, newFolderName) {
+        if (!this.state.projectDir || !folderName || !newFolderName) return [];
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ old_folder: folderName, new_folder: newFolderName }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Asset folder rename failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        this._invalidateModules(["assets"]);
+        this._reloadExpandedModuleIfNeeded(["assets"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets"]);
+        return payload || { folders: [] };
+    }
+
+    async _deleteAssetFolder(folderName, force = false) {
+        if (!this.state.projectDir || !folderName) return { status: "noop" };
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ folder: folderName, force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Asset folder delete failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
+    async _replaceAsset(assetId, file) {
+        if (!this.state.projectDir || !assetId || !file) return null;
+        const payload = await replaceAssetInProject(this.state.projectDir, assetId, file);
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return payload?.asset || null;
     }
 
     async _loadDormantAssets(signal) {
@@ -997,8 +1102,11 @@ export class EditorNodeController {
 
     _mountAssetsModule(container, data) {
         const galleryHost = container.appendChild(style(document.createElement("div"), `
-            flex: 1;
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
             min-height: 0;
+            height: 100%;
             width: 100%;
             overflow: hidden;
         `));
@@ -1007,7 +1115,12 @@ export class EditorNodeController {
             initialData: data || { assets: [], folders: [] },
             onImportFiles: async (files, folder) => await this.importFiles(files, folder),
             onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
+            onGetAssetUsages: async (assetId) => await this._getAssetUsages(assetId),
+            onDeleteAsset: async (assetId, force) => await this._deleteAsset(assetId, force),
             onCreateFolder: async (folderName) => await this._createAssetFolder(folderName),
+            onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
+            onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
+            onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
             onRefresh: async () => {
                 const payload = await this._loadDormantAssets();
                 this.moduleCache.assets = payload;
@@ -1070,14 +1183,16 @@ export class EditorNodeController {
             liveVideo = null;
         };
 
-        if (data.kind === "empty") {
+        if (data.kind === "empty" || data.kind === "missing") {
             const emptyEl = style(document.createElement("div"), `
-                color: #8ea0af;
+                color: ${data.kind === "missing" ? "#ffb18c" : "#8ea0af"};
                 font-size: 10px;
                 padding: 14px;
                 text-align: center;
             `);
-            emptyEl.textContent = data.subtitle || "No preview available.";
+            emptyEl.textContent = data.kind === "missing"
+                ? `Missing asset: ${data.subtitle || "Select a replacement from the gallery."}`
+                : (data.subtitle || "No preview available.");
             surface.appendChild(emptyEl);
         } else if (data.kind === "image") {
             const img = style(document.createElement("img"), `
