@@ -768,7 +768,10 @@ export class EditorWidget {
             },
             onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
             onGetAssetUsages: async (assetId) => await this._getAssetUsages(assetId),
+            onGetBulkAssetUsages: async (assetIds) => await this._getBulkAssetUsages(assetIds),
             onDeleteAsset: async (assetId, force) => await this._deleteAsset(assetId, force),
+            onBulkMoveAssets: async (assetIds, folder) => await this._bulkMoveAssets(assetIds, folder),
+            onBulkDeleteAssets: async (assetIds, force) => await this._bulkDeleteAssets(assetIds, force),
             onCreateFolder: async (folderName) => await this._createAssetFolder(folderName),
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
             onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
@@ -1235,6 +1238,34 @@ export class EditorWidget {
         return await resp.json();
     }
 
+    async _getBulkAssetUsages(assetIds) {
+        if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return null;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-usages`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_ids: assetIds }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Bulk asset usage fetch failed: ${resp.status}`);
+        }
+        return await resp.json();
+    }
+
+    async _bulkMoveAssets(assetIds, folder = "") {
+        if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { updated: 0 };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-move`), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_ids: assetIds, folder }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Bulk asset move failed: ${resp.status}`);
+        }
+        return await resp.json();
+    }
+
     async _deleteAsset(assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -1249,6 +1280,29 @@ export class EditorWidget {
         }
         if (!resp.ok) {
             throw new Error(`Asset delete failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchRenderQueue(),
+        ]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
+    async _bulkDeleteAssets(assetIds, force = false) {
+        if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-delete`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Bulk asset delete failed: ${resp.status}`);
         }
         const payload = await resp.json();
         await Promise.all([
