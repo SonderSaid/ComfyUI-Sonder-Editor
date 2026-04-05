@@ -217,6 +217,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         type: "all",
         query: "",
         selectedAssetId: "",
+        selectedAssetIds: new Set(),
         focusedAssetId: "",
         allowAutoFocus: true,
         liveMedia: null,
@@ -224,6 +225,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         destroyed: false,
         collapsedFolders: new Set(),
         inspectorCollapsed: false,
+        manageMode: false,
         sortMode: DEFAULT_SORT_MODE,
         storageProjectId: "",
         contextMenuEl: null,
@@ -290,6 +292,9 @@ export function mountSharedAssetGallery(container, options = {}) {
     });
     controls.appendChild(refreshBtn);
 
+    const manageBtn = makeActionButton();
+    controls.appendChild(manageBtn);
+
     root.appendChild(controls);
 
     const tabsRow = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;`);
@@ -299,9 +304,10 @@ export function mountSharedAssetGallery(container, options = {}) {
     root.appendChild(content);
 
     const listPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:6px;min-height:0;overflow:hidden;`);
+    const bulkToolbarHost = style(document.createElement("div"), `display:none;flex:0 0 auto;`);
     const listScroller = style(document.createElement("div"), `overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:2px;min-height:0;outline:none;${options.maxListHeight ? `max-height:${options.maxListHeight}px;` : "flex:1 1 0;"}`);
     listScroller.tabIndex = 0;
-    listPane.appendChild(listScroller);
+    listPane.append(bulkToolbarHost, listScroller);
 
     const detailPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:8px;padding:8px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;min-height:0;overflow:auto;`);
     content.append(listPane, detailPane);
@@ -334,6 +340,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 : [],
         );
         state.inspectorCollapsed = !!readStoredJson(storageKey("inspector-collapsed"), false);
+        state.manageMode = !!readStoredJson(storageKey("manage-mode"), false);
         const storedSort = readStoredJson(storageKey("sort-mode"), DEFAULT_SORT_MODE);
         state.sortMode = SORT_OPTIONS.some((entry) => entry.value === storedSort) ? storedSort : DEFAULT_SORT_MODE;
     }
@@ -344,6 +351,10 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function persistInspectorCollapsed() {
         safeStorageSet(storageKey("inspector-collapsed"), JSON.stringify(!!state.inspectorCollapsed));
+    }
+
+    function persistManageMode() {
+        safeStorageSet(storageKey("manage-mode"), JSON.stringify(!!state.manageMode));
     }
 
     function persistSortMode() {
@@ -362,6 +373,9 @@ export function mountSharedAssetGallery(container, options = {}) {
     function updateControlState() {
         sortSelect.value = state.sortMode;
         inspectorBtn.textContent = state.inspectorCollapsed ? "Show Inspector" : "Hide Inspector";
+        manageBtn.textContent = state.manageMode ? "Done" : "Manage";
+        manageBtn.style.background = state.manageMode ? "#4a5c6b" : "#1d2630";
+        manageBtn.style.borderColor = state.manageMode ? "#6f8ea8" : "#364655";
     }
 
     function setBusyButton(btn, isBusy, busyLabel, idleLabel) {
@@ -372,6 +386,17 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function queueResize() {
         options.onRequestResize?.();
+    }
+
+    function setDropFolderHighlight(folderName = "") {
+        state.dropFolder = folderName;
+        for (const el of root.querySelectorAll("[data-folder-drop]")) {
+            el.style.borderColor = el.dataset.folderDrop === state.dropFolder ? "#6f8ea8" : "transparent";
+        }
+    }
+
+    function clearDropFolderHighlight() {
+        setDropFolderHighlight("");
     }
 
     function destroyLiveMedia() {
@@ -493,8 +518,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const selected = data.assets.find((asset) => asset.asset_id === state.selectedAssetId);
             if (selected && folderContainsPath(folderName, selected.folder)) {
                 const nextVisibleAsset = visibleNavigableAssets(filteredAssets())[0] || null;
-                state.selectedAssetId = nextVisibleAsset?.asset_id || "";
-                state.focusedAssetId = nextVisibleAsset?.asset_id || "";
+                applySelectionState(nextVisibleAsset ? [nextVisibleAsset.asset_id] : [], nextVisibleAsset?.asset_id || "");
             }
         }
         persistCollapsedFolders();
@@ -543,8 +567,51 @@ export function mountSharedAssetGallery(container, options = {}) {
         return assets.filter((asset) => !isFolderCollapsed(asset.folder) && !isAncestorCollapsed(asset.folder));
     }
 
-    function selectedAsset(assets) {
-        return assets.find((item) => item.asset_id === state.selectedAssetId) || null;
+    function selectedAssetIdsList() {
+        const validIds = new Set(data.assets.map((asset) => asset.asset_id));
+        return Array.from(state.selectedAssetIds).filter((assetId) => validIds.has(assetId));
+    }
+
+    function selectedAssets() {
+        const ids = new Set(selectedAssetIdsList());
+        return data.assets.filter((asset) => ids.has(asset.asset_id));
+    }
+
+    function normalizeSelection(assetIds, primaryAssetId = "") {
+        const validIds = new Set(data.assets.map((asset) => asset.asset_id));
+        const nextIds = [];
+        const seen = new Set();
+
+        for (const rawId of assetIds || []) {
+            const assetId = String(rawId || "").trim();
+            if (!assetId || !validIds.has(assetId) || seen.has(assetId)) continue;
+            nextIds.push(assetId);
+            seen.add(assetId);
+        }
+
+        let primaryId = String(primaryAssetId || "").trim();
+        if (primaryId && validIds.has(primaryId) && !seen.has(primaryId)) {
+            nextIds.push(primaryId);
+            seen.add(primaryId);
+        }
+        if (!seen.has(primaryId)) {
+            primaryId = nextIds[nextIds.length - 1] || "";
+        }
+
+        return { ids: nextIds, primaryId };
+    }
+
+    function applySelectionState(assetIds, primaryAssetId = "") {
+        const { ids, primaryId } = normalizeSelection(assetIds, primaryAssetId);
+        state.selectedAssetIds = new Set(ids);
+        state.selectedAssetId = primaryId;
+        state.focusedAssetId = primaryId || ids[0] || "";
+        state.allowAutoFocus = ids.length > 0;
+        return data.assets.find((item) => item.asset_id === state.selectedAssetId) || null;
+    }
+
+    function selectedAsset() {
+        return data.assets.find((item) => item.asset_id === state.selectedAssetId) || null;
     }
 
     function ensureFocusedAsset(assets) {
@@ -558,14 +625,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         return navigable;
     }
 
-    function selectAsset(assetId, options = {}) {
+    function applySelection(assetIds, primaryAssetId, options = {}) {
         const { focusList = false, scrollIntoView = false } = options;
-        const asset = data.assets.find((entry) => entry.asset_id === assetId) || null;
-        state.selectedAssetId = asset?.asset_id || "";
-        state.focusedAssetId = asset?.asset_id || "";
-        state.allowAutoFocus = !!asset;
+        const asset = applySelectionState(assetIds, primaryAssetId);
 
-        if (!asset) {
+        if (state.selectedAssetIds.size > 1) {
+            clearUsageView();
+            render();
+        } else if (!asset) {
             clearUsageView();
             render();
         } else if (state.showingUsagesFor && state.showingUsagesFor !== asset.asset_id) {
@@ -585,13 +652,89 @@ export function mountSharedAssetGallery(container, options = {}) {
         return asset;
     }
 
+    function selectAsset(assetId, options = {}) {
+        return applySelection(assetId ? [assetId] : [], assetId, options);
+    }
+
+    function toggleAssetSelection(assetId, options = {}) {
+        const nextIds = new Set(selectedAssetIdsList());
+        if (nextIds.has(assetId)) {
+            nextIds.delete(assetId);
+        } else {
+            nextIds.add(assetId);
+        }
+        const ids = Array.from(nextIds);
+        const primaryId = nextIds.has(assetId) ? assetId : (ids[ids.length - 1] || "");
+        return applySelection(ids, primaryId, options);
+    }
+
+    function selectAssetRange(assetId, assets, options = {}) {
+        const navigableAssets = visibleNavigableAssets(assets);
+        const anchorId = state.selectedAssetId || state.focusedAssetId;
+        if (!anchorId) return selectAsset(assetId, options);
+
+        const startIndex = navigableAssets.findIndex((asset) => asset.asset_id === anchorId);
+        const endIndex = navigableAssets.findIndex((asset) => asset.asset_id === assetId);
+        if (startIndex < 0 || endIndex < 0) return selectAsset(assetId, options);
+
+        const [from, to] = startIndex <= endIndex
+            ? [startIndex, endIndex]
+            : [endIndex, startIndex];
+        const rangeIds = navigableAssets.slice(from, to + 1).map((asset) => asset.asset_id);
+        return applySelection(rangeIds, assetId, options);
+    }
+
+    function handleAssetActivation(assetId, event, assets, options = {}) {
+        if ((event?.ctrlKey || event?.metaKey) && !event?.shiftKey) {
+            return toggleAssetSelection(assetId, options);
+        }
+        if (event?.shiftKey) {
+            return selectAssetRange(assetId, assets, options);
+        }
+        if (state.manageMode) {
+            return toggleAssetSelection(assetId, options);
+        }
+        return selectAsset(assetId, options);
+    }
+
+    function clearSelection(options = {}) {
+        const { renderNow = true } = options;
+        state.selectedAssetIds = new Set();
+        state.selectedAssetId = "";
+        state.focusedAssetId = "";
+        state.allowAutoFocus = false;
+        clearUsageView();
+        if (renderNow) render();
+    }
+
+    function reduceSelectionToPrimary(options = {}) {
+        const currentIds = selectedAssetIdsList();
+        const primaryId = currentIds.includes(state.selectedAssetId)
+            ? state.selectedAssetId
+            : (currentIds[currentIds.length - 1] || "");
+        if (!primaryId) {
+            clearSelection(options);
+            return null;
+        }
+        return applySelection([primaryId], primaryId, options);
+    }
+
     function updateLayout() {
         const width = root.getBoundingClientRect().width || 0;
         const singleColumn = state.inspectorCollapsed || (width > 0 && width < 520);
-        content.style.gridTemplateColumns = singleColumn
-            ? "minmax(0,1fr)"
-            : "minmax(0,1.2fr) minmax(260px,1fr)";
-        detailPane.style.display = state.inspectorCollapsed ? "none" : "flex";
+        if (singleColumn && !state.inspectorCollapsed) {
+            content.style.gridTemplateColumns = "minmax(0,1fr)";
+            content.style.gridTemplateRows = "minmax(0,1.5fr) minmax(0,1fr)";
+            detailPane.style.display = "flex";
+        } else if (singleColumn) {
+            content.style.gridTemplateColumns = "minmax(0,1fr)";
+            content.style.gridTemplateRows = "minmax(0,1fr)";
+            detailPane.style.display = "none";
+        } else {
+            content.style.gridTemplateColumns = "minmax(0,1.2fr) minmax(260px,1fr)";
+            content.style.gridTemplateRows = "minmax(0,1fr)";
+            detailPane.style.display = "flex";
+        }
     }
 
     function updateAsset(updatedAsset) {
@@ -610,8 +753,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         const ids = new Set((assetIds || []).filter(Boolean));
         if (!ids.size) return;
         data.assets = data.assets.filter((asset) => !ids.has(asset.asset_id));
-        if (ids.has(state.selectedAssetId)) state.selectedAssetId = "";
-        if (ids.has(state.focusedAssetId)) state.focusedAssetId = "";
+        const nextSelectedIds = selectedAssetIdsList().filter((assetId) => !ids.has(assetId));
+        const nextPrimaryId = ids.has(state.selectedAssetId)
+            ? (nextSelectedIds[nextSelectedIds.length - 1] || "")
+            : state.selectedAssetId;
+        applySelectionState(nextSelectedIds, nextPrimaryId);
+        if (!state.selectedAssetId && ids.has(state.focusedAssetId)) state.focusedAssetId = "";
         if (ids.has(state.showingUsagesFor)) clearUsageView();
         state.allowAutoFocus = true;
     }
@@ -767,6 +914,152 @@ export function mountSharedAssetGallery(container, options = {}) {
         render();
     }
 
+    function summarizeAssetTypes(assets) {
+        return assets.reduce((counts, asset) => {
+            if (asset?.asset_type === "video") counts.video += 1;
+            else if (asset?.asset_type === "image") counts.image += 1;
+            else if (asset?.asset_type === "audio") counts.audio += 1;
+            return counts;
+        }, { video: 0, image: 0, audio: 0 });
+    }
+
+    function aggregateDurationLabel(assets) {
+        const totalSeconds = assets.reduce((sum, asset) => {
+            const durationSec = Number(asset?.duration_sec);
+            return sum + (Number.isFinite(durationSec) && durationSec > 0 ? durationSec : 0);
+        }, 0);
+        return totalSeconds > 0 ? `${totalSeconds.toFixed(2)}s` : "-";
+    }
+
+    function commonFolderForAssets(assets) {
+        if (!assets.length) return "";
+        const firstFolder = normalizeFolderName(assets[0].folder);
+        return assets.every((asset) => normalizeFolderName(asset.folder) === firstFolder) ? firstFolder : "";
+    }
+
+    async function handleBulkMove(assetIds = selectedAssetIdsList(), event) {
+        const ids = normalizeSelection(assetIds, state.selectedAssetId).ids;
+        if (!ids.length) return;
+        if (ids.length === 1) {
+            const asset = data.assets.find((entry) => entry.asset_id === ids[0]);
+            if (asset) {
+                await handleAssetMoveToFolder(asset, event);
+            }
+            return;
+        }
+        if (!options.onBulkMoveAssets) return;
+
+        const assets = data.assets.filter((asset) => ids.includes(asset.asset_id));
+        const currentFolder = commonFolderForAssets(assets);
+        showFolderPicker(event, currentFolder, async (folder) => {
+            try {
+                await options.onBulkMoveAssets(ids, folder);
+                clearUsageView();
+                await options.onRefresh?.();
+            } catch (error) {
+                console.warn("[LTX Editor] Failed to move selected assets:", error);
+                alert(error?.message || "Failed to move selected assets.");
+            }
+        });
+    }
+
+    async function handleBulkDelete(assetIds = selectedAssetIdsList()) {
+        const ids = normalizeSelection(assetIds, state.selectedAssetId).ids;
+        if (!ids.length) return;
+        if (ids.length === 1) {
+            const asset = data.assets.find((entry) => entry.asset_id === ids[0]);
+            if (asset) {
+                await handleAssetDelete(asset);
+            }
+            return;
+        }
+        if (!options.onBulkDeleteAssets) return;
+
+        try {
+            let usage = { usages: [], usage_count: 0 };
+            if (options.onGetBulkAssetUsages) {
+                usage = await options.onGetBulkAssetUsages(ids) || usage;
+            } else if (options.onGetAssetUsages) {
+                const payloads = await Promise.all(ids.map((assetId) => options.onGetAssetUsages(assetId)));
+                usage = {
+                    usages: payloads.flatMap((payload) => payload?.usages || []),
+                    usage_count: payloads.reduce((sum, payload) => sum + (payload?.usage_count || 0), 0),
+                };
+            }
+
+            const counts = summarizeUsageTypes(usage?.usages || []);
+            const message = usage?.usage_count > 0
+                ? [
+                    `Delete ${ids.length} selected assets from the project?`,
+                    "These assets are still referenced.",
+                    `Clips: ${counts.clip}`,
+                    `Audio: ${counts.audio_track}`,
+                    `Guides: ${counts.guide_frame}`,
+                    `Queue: ${counts.generation_job}`,
+                    "",
+                    "Existing references will stay in place and become missing placeholders.",
+                ].join("\n")
+                : `Delete ${ids.length} selected assets from the project? This cannot be undone.`;
+            if (!confirm(message)) return;
+
+            const result = await options.onBulkDeleteAssets(ids, true);
+            if (result?.status === "conflict") {
+                throw new Error("Bulk asset delete unexpectedly reported a usage conflict.");
+            }
+
+            removeAssetsByIds(ids);
+            render();
+        } catch (error) {
+            console.warn("[LTX Editor] Failed to delete selected assets:", error);
+            alert(error?.message || "Failed to delete selected assets.");
+        }
+    }
+
+    function renderBulkToolbar() {
+        bulkToolbarHost.innerHTML = "";
+        const assets = selectedAssets();
+        if (assets.length <= 1) {
+            bulkToolbarHost.style.display = "none";
+            return;
+        }
+
+        bulkToolbarHost.style.display = "flex";
+        const bar = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px;border-radius:6px;background:rgba(75,105,135,0.14);border:1px solid rgba(111,142,168,0.4);flex-wrap:wrap;`);
+        const label = style(document.createElement("div"), `color:#d9e7f3;font-size:10px;font-weight:700;`);
+        label.textContent = `${assets.length} selected`;
+
+        const actions = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;`);
+        const moveBtn = makeActionButton();
+        moveBtn.textContent = "Move to...";
+        moveBtn.disabled = !options.onBulkMoveAssets;
+        moveBtn.addEventListener("click", async (event) => {
+            await handleBulkMove(assets.map((asset) => asset.asset_id), event);
+        });
+        actions.appendChild(moveBtn);
+
+        const deleteBtn = makeActionButton();
+        deleteBtn.textContent = "Delete";
+        deleteBtn.style.background = "#392420";
+        deleteBtn.style.borderColor = "#73443b";
+        deleteBtn.disabled = !options.onBulkDeleteAssets;
+        deleteBtn.addEventListener("click", async () => {
+            await handleBulkDelete(assets.map((asset) => asset.asset_id));
+        });
+        actions.appendChild(deleteBtn);
+
+        const clearBtn = makeActionButton();
+        clearBtn.textContent = "Clear";
+        clearBtn.style.background = "#1d2630";
+        clearBtn.style.borderColor = "#364655";
+        clearBtn.addEventListener("click", () => {
+            clearSelection();
+        });
+        actions.appendChild(clearBtn);
+
+        bar.append(label, actions);
+        bulkToolbarHost.appendChild(bar);
+    }
+
     function renderGenerationSection(asset) {
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         if (asset.prompt) {
@@ -879,7 +1172,66 @@ export function mountSharedAssetGallery(container, options = {}) {
         queueResize();
     }
 
+    function renderMultiDetail(assetIds) {
+        destroyLiveMedia();
+        detailPane.innerHTML = "";
+
+        const assets = assetIds
+            .map((assetId) => data.assets.find((asset) => asset.asset_id === assetId))
+            .filter(Boolean);
+        if (assets.length <= 1) {
+            renderDetail(selectedAsset());
+            return;
+        }
+
+        const typeBreakdown = summarizeAssetTypes(assets);
+        const missingCount = assets.filter((asset) => assetIsMissing(asset)).length;
+
+        const title = style(document.createElement("div"), `color:#ececec;font-size:11px;font-weight:700;`);
+        title.textContent = `${assets.length} Assets Selected`;
+        const subtitle = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.45;`);
+        subtitle.textContent = "Bulk actions apply to the current selection across both fullscreen and dormant galleries.";
+
+        const stats = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;`);
+        stats.append(
+            makeMetaCell("Videos", String(typeBreakdown.video)),
+            makeMetaCell("Images", String(typeBreakdown.image)),
+            makeMetaCell("Audio", String(typeBreakdown.audio)),
+            makeMetaCell("Missing", String(missingCount)),
+            makeMetaCell("Total Duration", aggregateDurationLabel(assets)),
+            makeMetaCell("Primary", selectedAsset() ? assetDisplayName(selectedAsset()) : "-"),
+        );
+
+        const actionRow = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;align-items:center;`);
+        const moveBtn = makeActionButton();
+        moveBtn.textContent = "Move to Folder...";
+        moveBtn.disabled = !options.onBulkMoveAssets;
+        moveBtn.addEventListener("click", async (event) => {
+            await handleBulkMove(assets.map((asset) => asset.asset_id), event);
+        });
+        actionRow.appendChild(moveBtn);
+
+        const deleteBtn = makeActionButton();
+        deleteBtn.textContent = "Delete Selected";
+        deleteBtn.style.background = "#392420";
+        deleteBtn.style.borderColor = "#73443b";
+        deleteBtn.disabled = !options.onBulkDeleteAssets;
+        deleteBtn.addEventListener("click", async () => {
+            await handleBulkDelete(assets.map((asset) => asset.asset_id));
+        });
+        actionRow.appendChild(deleteBtn);
+
+        detailPane.append(title, subtitle, stats, actionRow);
+        queueResize();
+    }
+
     function renderDetail(asset) {
+        const selectedIds = selectedAssetIdsList();
+        if (selectedIds.length > 1) {
+            renderMultiDetail(selectedIds);
+            return;
+        }
+
         if (state.showingUsagesFor) {
             const usageAsset = asset?.asset_id === state.showingUsagesFor
                 ? asset
@@ -1050,10 +1402,33 @@ export function mountSharedAssetGallery(container, options = {}) {
         await applyAssetUpdate(asset, { name: nextName.trim() });
     }
 
-    async function handleAssetMoveToFolder(asset) {
-        const nextFolder = prompt("Move asset to folder (blank for Root):", normalizeFolderName(asset.folder));
-        if (nextFolder === null) return;
-        await applyAssetUpdate(asset, { folder: nextFolder });
+    function showFolderPicker(event, currentFolder, onSelect) {
+        const folders = ["", ...data.folders.filter(Boolean)];
+        const items = folders.map((folder) => ({
+            label: folder || "Root",
+            action: () => onSelect(normalizeFolderName(folder)),
+            disabled: normalizeFolderName(folder) === normalizeFolderName(currentFolder),
+        }));
+        items.push({ type: "separator" });
+        items.push({
+            label: "New Folder...",
+            action: async () => {
+                const name = prompt("New folder name:");
+                if (!name) return;
+                const normalized = normalizeFolderName(name);
+                if (normalized) onSelect(normalized);
+            },
+        });
+        const rect = event?.currentTarget?.getBoundingClientRect?.();
+        const x = rect ? rect.left : (event?.clientX ?? 100);
+        const y = rect ? rect.bottom + 2 : (event?.clientY ?? 100);
+        showContextMenu(x, y, items);
+    }
+
+    async function handleAssetMoveToFolder(asset, event) {
+        showFolderPicker(event, asset.folder, async (folder) => {
+            await applyAssetUpdate(asset, { folder });
+        });
     }
 
     async function beginAssetReplace(asset) {
@@ -1188,24 +1563,35 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function assetContextMenuItems(asset) {
+        const selectedIds = selectedAssetIdsList();
+        if (selectedIds.length > 1 && state.selectedAssetIds.has(asset.asset_id)) {
+            return [
+                {
+                    label: `Move ${selectedIds.length} assets to folder...`,
+                    disabled: !options.onBulkMoveAssets,
+                    action: async () => await handleBulkMove(selectedIds),
+                },
+                {
+                    label: `Delete ${selectedIds.length} assets`,
+                    disabled: !options.onBulkDeleteAssets,
+                    danger: true,
+                    action: async () => await handleBulkDelete(selectedIds),
+                },
+            ];
+        }
+
         return [
             {
                 label: "Rename",
                 action: async () => {
-                    state.selectedAssetId = asset.asset_id;
-                    state.focusedAssetId = asset.asset_id;
-                    state.allowAutoFocus = true;
-                    render();
+                    selectAsset(asset.asset_id, { focusList: true });
                     await handleAssetRename(asset);
                 },
             },
             {
                 label: "Move to Folder...",
                 action: async () => {
-                    state.selectedAssetId = asset.asset_id;
-                    state.focusedAssetId = asset.asset_id;
-                    state.allowAutoFocus = true;
-                    render();
+                    selectAsset(asset.asset_id, { focusList: true });
                     await handleAssetMoveToFolder(asset);
                 },
             },
@@ -1213,10 +1599,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 label: "Where Used...",
                 disabled: !options.onGetAssetUsages,
                 action: async () => {
-                    state.selectedAssetId = asset.asset_id;
-                    state.focusedAssetId = asset.asset_id;
-                    state.allowAutoFocus = true;
-                    render();
+                    selectAsset(asset.asset_id, { focusList: true });
                     await openUsageView(asset);
                 },
             },
@@ -1224,10 +1607,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 label: assetIsMissing(asset) ? "Relink..." : "Replace File...",
                 disabled: !options.onReplaceAsset,
                 action: async () => {
-                    state.selectedAssetId = asset.asset_id;
-                    state.focusedAssetId = asset.asset_id;
-                    state.allowAutoFocus = true;
-                    render();
+                    selectAsset(asset.asset_id, { focusList: true });
                     await beginAssetReplace(asset);
                 },
             },
@@ -1242,7 +1622,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${normalized ? "#1a1a2e" : "#1f2530"};color:#8fc0f0;font-size:10px;font-weight:600;border:1px solid transparent;`);
         header.dataset.folderDrop = normalized;
         header.dataset.folderHeader = normalized || "__root__";
-        header.title = normalized ? "Drop files here to import into this folder." : "Root folder";
+        header.title = state.manageMode
+            ? (normalized ? "Drop selected assets here to move them into this folder." : "Drop selected assets here to move them to Root.")
+            : (normalized ? "Drop files here to import into this folder." : "Root folder");
 
         const left = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;min-width:0;`);
         const toggle = style(document.createElement("button"), `width:18px;height:18px;border-radius:4px;border:1px solid #34414d;background:#182330;color:#9fc8ea;cursor:pointer;font-size:10px;line-height:1;padding:0;flex:0 0 auto;`);
@@ -1273,6 +1655,38 @@ export function mountSharedAssetGallery(container, options = {}) {
             event.preventDefault();
             event.stopPropagation();
             showContextMenu(event.clientX, event.clientY, folderContextMenuItems(normalized));
+        });
+        header.addEventListener("dragover", (event) => {
+            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/ltx-asset-move")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            event.dataTransfer.dropEffect = "move";
+            root.style.outline = "none";
+            setDropFolderHighlight(normalized);
+        });
+        header.addEventListener("dragleave", (event) => {
+            if (event.currentTarget !== event.target) return;
+            if (state.dropFolder === normalized) clearDropFolderHighlight();
+        });
+        header.addEventListener("drop", async (event) => {
+            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/ltx-asset-move")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            root.style.outline = "none";
+            clearDropFolderHighlight();
+            hideContextMenu();
+            try {
+                const rawPayload = event.dataTransfer.getData("application/ltx-asset-move");
+                const payload = rawPayload ? JSON.parse(rawPayload) : {};
+                const assetIds = Array.isArray(payload?.assetIds) ? payload.assetIds : [];
+                if (!assetIds.length) return;
+                await options.onBulkMoveAssets(assetIds, normalized);
+                clearUsageView();
+                await options.onRefresh?.();
+            } catch (error) {
+                console.warn("[LTX Editor] Failed to drop-move assets:", error);
+                alert(error?.message || "Failed to move selected assets.");
+            }
         });
         return header;
     }
@@ -1313,6 +1727,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         updateControlState();
         updateLayout();
         updateFolderOptions();
+        renderBulkToolbar();
         tabsRow.innerHTML = "";
         listScroller.innerHTML = "";
 
@@ -1342,7 +1757,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const assets = filteredAssets();
         ensureFocusedAsset(assets);
-        const selected = selectedAsset(assets);
+        const selected = selectedAsset();
         const folders = allFolders();
         let renderedAnything = false;
 
@@ -1363,37 +1778,83 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
 
             for (const asset of inFolder) {
-                const isSelected = state.selectedAssetId === asset.asset_id;
+                const isSelected = state.selectedAssetIds.has(asset.asset_id);
+                const isPrimary = state.selectedAssetId === asset.asset_id;
                 const isFocused = state.focusedAssetId === asset.asset_id;
                 const isMissing = assetIsMissing(asset);
                 const borderColor = isSelected
-                    ? (isMissing ? "#c97a59" : "#6f8ea8")
+                    ? (isMissing ? "#c97a59" : (isPrimary ? "#8fbbe5" : "#6f8ea8"))
                     : (isMissing ? "#8d5c4b" : (isFocused ? "#7f8b96" : "#373737"));
                 const background = isSelected
                     ? (isMissing ? "rgba(133,82,58,0.24)" : "rgba(75,105,135,0.18)")
                     : (isMissing ? "rgba(96,54,39,0.18)" : (isFocused ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.03)"));
-                const focusRing = isFocused
-                    ? "box-shadow:inset 0 0 0 1px rgba(143,192,240,0.25);"
-                    : "";
-                const row = style(document.createElement("div"), `display:grid;grid-template-columns:72px minmax(0,1fr);gap:8px;padding:6px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
+                const focusRing = isPrimary
+                    ? "box-shadow:inset 0 0 0 1px rgba(143,192,240,0.45);"
+                    : (isFocused ? "box-shadow:inset 0 0 0 1px rgba(143,192,240,0.25);" : "");
+                const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? "24px 72px minmax(0,1fr)" : "72px minmax(0,1fr)"};gap:8px;padding:6px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
                 row.dataset.assetRow = asset.asset_id;
-                row.draggable = true;
-                row.title = "Click to inspect. Drag onto the graph to create a loader node.";
-                row.addEventListener("click", () => {
-                    selectAsset(asset.asset_id, { focusList: true, scrollIntoView: true });
+                row.draggable = state.manageMode ? !!options.onBulkMoveAssets : true;
+                row.title = state.manageMode
+                    ? "Click to inspect. Drag onto a folder header to move assets."
+                    : "Click to inspect. Drag onto the graph to create a loader node.";
+                row.addEventListener("click", (event) => {
+                    handleAssetActivation(asset.asset_id, event, assets, { focusList: true, scrollIntoView: true });
                 });
                 row.addEventListener("contextmenu", (event) => {
                     event.preventDefault();
                     event.stopPropagation();
-                    selectAsset(asset.asset_id, { focusList: true });
+                    if (!(state.selectedAssetIds.has(asset.asset_id) && selectedAssetIdsList().length > 1)) {
+                        selectAsset(asset.asset_id, { focusList: true });
+                    }
                     showContextMenu(event.clientX, event.clientY, assetContextMenuItems(asset));
                 });
                 row.addEventListener("dragstart", (event) => {
+                    if (state.manageMode) {
+                        if (!options.onBulkMoveAssets) {
+                            event.preventDefault();
+                            return;
+                        }
+                        const moveIds = state.selectedAssetIds.has(asset.asset_id)
+                            ? selectedAssetIdsList()
+                            : [asset.asset_id];
+                        event.dataTransfer.effectAllowed = "move";
+                        event.dataTransfer.setData("application/ltx-asset-move", JSON.stringify({ assetIds: moveIds }));
+                        event.dataTransfer.setData("text/plain", moveIds.length > 1 ? `${moveIds.length} assets` : assetDisplayName(asset));
+                        if (!state.selectedAssetIds.has(asset.asset_id) || moveIds.length === 1) {
+                            applySelectionState(moveIds, asset.asset_id);
+                            clearUsageView();
+                            requestAnimationFrame(() => render());
+                        }
+                        return;
+                    }
                     const payload = JSON.stringify({ ...asset, _projectDir: projectIdFromDir(currentProjectDir()) });
                     event.dataTransfer.effectAllowed = "copy";
                     event.dataTransfer.setData("application/ltx-asset", payload);
                     event.dataTransfer.setData("text/plain", assetDisplayName(asset));
                 });
+                row.addEventListener("dragend", () => {
+                    root.style.outline = "none";
+                    clearDropFolderHighlight();
+                });
+
+                if (state.manageMode) {
+                    const checkboxWrap = style(document.createElement("div"), `display:flex;align-items:center;justify-content:center;`);
+                    checkboxWrap.addEventListener("mousedown", (event) => {
+                        event.stopPropagation();
+                    });
+                    const checkbox = style(document.createElement("input"), `margin:0;cursor:pointer;`);
+                    checkbox.type = "checkbox";
+                    checkbox.checked = isSelected;
+                    checkbox.addEventListener("click", (event) => {
+                        event.stopPropagation();
+                    });
+                    checkbox.addEventListener("change", (event) => {
+                        event.stopPropagation();
+                        toggleAssetSelection(asset.asset_id, { focusList: true });
+                    });
+                    checkboxWrap.appendChild(checkbox);
+                    row.appendChild(checkboxWrap);
+                }
 
                 const thumb = style(document.createElement("div"), `height:54px;border-radius:5px;background:${isMissing ? "#211714" : "#161616"};border:1px solid ${isMissing ? "#6f4a3d" : "#2e2e2e"};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? "#ffb18c" : "#75818c"};font-size:10px;`);
                 if (isMissing) {
@@ -1476,6 +1937,15 @@ export function mountSharedAssetGallery(container, options = {}) {
         hideContextMenu();
         await promptCreateFolder();
     });
+    manageBtn.addEventListener("click", () => {
+        state.manageMode = !state.manageMode;
+        persistManageMode();
+        if (!state.manageMode) {
+            reduceSelectionToPrimary({ focusList: true });
+            return;
+        }
+        render();
+    });
     searchInput.addEventListener("input", () => {
         state.query = searchInput.value || "";
         state.allowAutoFocus = true;
@@ -1489,6 +1959,18 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const assets = filteredAssets();
         const navigableAssets = ensureFocusedAsset(assets);
+        const selectionCount = selectedAssetIdsList().length;
+
+        if ((event.ctrlKey || event.metaKey) && String(event.key || "").toLowerCase() === "a") {
+            event.preventDefault();
+            const allVisibleIds = navigableAssets.map((asset) => asset.asset_id);
+            if (!allVisibleIds.length) return;
+            const primaryId = allVisibleIds.includes(state.selectedAssetId)
+                ? state.selectedAssetId
+                : allVisibleIds[allVisibleIds.length - 1];
+            applySelection(allVisibleIds, primaryId, { focusList: true, scrollIntoView: true });
+            return;
+        }
 
         if (LIST_NAV_KEYS.has(event.key)) {
             event.preventDefault();
@@ -1513,18 +1995,22 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (event.key === "Escape") {
             event.preventDefault();
-            state.selectedAssetId = "";
-            state.focusedAssetId = "";
-            state.allowAutoFocus = false;
-            clearUsageView();
             hideContextMenu();
-            render();
+            if (selectionCount > 1) {
+                reduceSelectionToPrimary({ focusList: true, scrollIntoView: true });
+            } else {
+                clearSelection();
+            }
             return;
         }
 
         if (event.key === "Delete") {
             event.preventDefault();
-            const asset = selectedAsset(assets);
+            if (selectionCount > 1) {
+                void handleBulkDelete();
+                return;
+            }
+            const asset = selectedAsset();
             if (asset) {
                 void handleAssetDelete(asset);
             }
@@ -1538,21 +2024,16 @@ export function mountSharedAssetGallery(container, options = {}) {
         root.style.outline = "2px dashed rgba(100, 180, 255, 0.6)";
         const folderTarget = event.target.closest("[data-folder-drop]");
         if (state.dropFolder !== folderTarget?.dataset.folderDrop) {
-            state.dropFolder = folderTarget?.dataset.folderDrop || "";
-            for (const el of root.querySelectorAll("[data-folder-drop]")) {
-                el.style.borderColor = el.dataset.folderDrop === state.dropFolder ? "#6f8ea8" : "transparent";
-            }
+            setDropFolderHighlight(folderTarget?.dataset.folderDrop || "");
         }
     });
     root.addEventListener("dragleave", (event) => {
         if (event.currentTarget !== event.target) return;
         root.style.outline = "none";
-        state.dropFolder = "";
-        for (const el of root.querySelectorAll("[data-folder-drop]")) el.style.borderColor = "transparent";
+        clearDropFolderHighlight();
     });
     root.addEventListener("drop", async (event) => {
-        state.dropFolder = "";
-        for (const el of root.querySelectorAll("[data-folder-drop]")) el.style.borderColor = "transparent";
+        clearDropFolderHighlight();
         await handleDrop(event);
     });
     root.addEventListener("contextmenu", (event) => {
@@ -1575,9 +2056,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         const payload = Array.isArray(nextData) ? { assets: nextData, folders: [] } : (nextData || {});
         data.assets = Array.isArray(payload.assets) ? [...payload.assets] : [];
         data.folders = Array.isArray(payload.folders) ? payload.folders.map(normalizeFolderName).filter(Boolean) : [];
-        if (!data.assets.some((asset) => asset.asset_id === state.selectedAssetId)) {
-            state.selectedAssetId = data.assets[0]?.asset_id || "";
-        }
+        const preservedSelection = selectedAssetIdsList();
+        const fallbackId = data.assets.some((asset) => asset.asset_id === state.selectedAssetId)
+            ? state.selectedAssetId
+            : (preservedSelection[preservedSelection.length - 1] || data.assets[0]?.asset_id || "");
+        applySelectionState(preservedSelection.length ? preservedSelection : (fallbackId ? [fallbackId] : []), fallbackId);
         if (!data.assets.some((asset) => asset.asset_id === state.focusedAssetId)) {
             state.focusedAssetId = data.assets[0]?.asset_id || "";
         }

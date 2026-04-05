@@ -989,6 +989,27 @@ def _aggregate_asset_usages(project: TimelineProject, assets: list[Asset]) -> di
     }
 
 
+def _resolve_assets_from_ids(project: TimelineProject, asset_ids) -> list[Asset]:
+    if not isinstance(asset_ids, list):
+        raise ValueError("asset_ids must be a list")
+
+    resolved = []
+    seen = set()
+    for raw_asset_id in asset_ids:
+        asset_id = str(raw_asset_id or "").strip()
+        if not asset_id or asset_id in seen:
+            continue
+        asset = project.get_asset(asset_id)
+        if not asset:
+            raise FileNotFoundError(f"Asset not found: {asset_id}")
+        resolved.append(asset)
+        seen.add(asset_id)
+
+    if not resolved:
+        raise ValueError("asset_ids is required")
+    return resolved
+
+
 def _delete_asset_cache_files(project: TimelineProject, asset: Asset) -> None:
     thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
     strip_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}_strip.jpg")
@@ -1481,6 +1502,98 @@ if routes is not None:
         except Exception as e:
             logger.warning("Failed to extract frame: %s", e)
             return _json_error(str(e), 500)
+
+    @routes.put("/ltx-editor/project/{project_id}/assets/bulk-move")
+    async def api_bulk_move_assets(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        try:
+            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        folder = _normalize_asset_folder(body.get("folder", ""))
+        if folder:
+            _ensure_asset_folder(project, folder)
+
+        for asset in assets:
+            asset.folder = folder
+
+        save_project(project)
+        return web.json_response({"updated": len(assets)})
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-usages")
+    async def api_bulk_asset_usages(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        try:
+            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        return web.json_response(_aggregate_asset_usages(project, assets))
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-delete")
+    async def api_bulk_delete_assets(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        try:
+            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        usage = _aggregate_asset_usages(project, assets)
+        force = bool(body.get("force", False))
+        if usage["usage_count"] > 0 and not force:
+            return web.json_response({
+                "error": "One or more assets are still in use",
+                "usages": usage["usages"],
+                "usage_count": usage["usage_count"],
+            }, status=409)
+
+        deleted_ids = []
+        try:
+            for asset in assets:
+                _delete_project_asset(project, asset)
+                deleted_ids.append(asset.asset_id)
+        except OSError as e:
+            return _json_error(str(e), 500)
+
+        save_project(project)
+        return web.json_response({
+            "deleted": deleted_ids,
+            "usages_orphaned": usage["usage_count"],
+        })
 
     @routes.put("/ltx-editor/project/{project_id}/assets/{asset_id}")
     async def api_update_asset(request: web.Request) -> web.Response:
