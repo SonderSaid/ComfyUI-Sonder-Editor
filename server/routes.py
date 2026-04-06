@@ -3,6 +3,7 @@ import logging
 import os
 import shutil
 import uuid
+from datetime import datetime, timedelta
 
 from aiohttp import web
 
@@ -38,6 +39,7 @@ def _coerce_nonnegative_int(value, default: int = 0) -> int:
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"}
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
+TRASH_RETENTION_DAYS = 30
 
 
 def _resolve_source_path(source_path: str) -> str:
@@ -122,6 +124,7 @@ def _asset_payload(project: TimelineProject, asset: Asset) -> dict:
     )
     payload["has_thumbnail"] = os.path.isfile(thumb_path)
     payload["missing"] = _asset_missing(project, asset)
+    payload["trashed_at"] = getattr(asset, "trashed_at", "") or ""
     return payload
 
 
@@ -432,14 +435,13 @@ def _sync_media_folder(project: TimelineProject) -> bool:
 
     Returns True if any changes were made (new assets discovered or repaired).
     """
+    changed = _purge_expired_trashed_assets(project)
     media_dir = os.path.join(project.project_dir, "media")
     if not os.path.isdir(media_dir):
-        return False
+        return changed
 
     # Build set of known relative paths
     known_paths = {a.path for a in project.assets}
-
-    changed = False
     for filename in os.listdir(media_dir):
         filepath = os.path.join(media_dir, filename)
         if not os.path.isfile(filepath):
@@ -745,6 +747,45 @@ def _normalize_asset_folder(folder: str) -> str:
     return str(folder or "").strip().replace("\\", "/").strip("/")
 
 
+def _query_flag(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _asset_is_trashed(asset: Asset) -> bool:
+    return bool(getattr(asset, "trashed_at", ""))
+
+
+def _project_trashed_assets(project: TimelineProject) -> list[Asset]:
+    return [asset for asset in project.assets if _asset_is_trashed(asset)]
+
+
+def _trash_project_asset(asset: Asset) -> dict:
+    if not _asset_is_trashed(asset):
+        asset.trash_previous_folder = _normalize_asset_folder(getattr(asset, "folder", ""))
+    asset.folder = ""
+    asset.trashed_at = datetime.now().isoformat()
+    return {
+        "trashed": True,
+        "asset_id": asset.asset_id,
+        "trashed_at": asset.trashed_at,
+        "trash_previous_folder": asset.trash_previous_folder,
+    }
+
+
+def _restore_project_asset(project: TimelineProject, asset: Asset) -> dict:
+    restore_folder = _normalize_asset_folder(getattr(asset, "trash_previous_folder", ""))
+    asset.folder = restore_folder
+    asset.trashed_at = ""
+    asset.trash_previous_folder = ""
+    if restore_folder:
+        _ensure_asset_folder(project, restore_folder)
+    return {
+        "restored": True,
+        "asset_id": asset.asset_id,
+        "folder": asset.folder,
+    }
+
+
 def _collect_asset_folders(project: TimelineProject) -> list[str]:
     folders = {
         _normalize_asset_folder(folder)
@@ -752,6 +793,8 @@ def _collect_asset_folders(project: TimelineProject) -> list[str]:
         if _normalize_asset_folder(folder)
     }
     for asset in project.assets:
+        if _asset_is_trashed(asset):
+            continue
         folder = _normalize_asset_folder(getattr(asset, "folder", ""))
         if folder:
             folders.add(folder)
@@ -1015,7 +1058,8 @@ def _delete_asset_cache_files(project: TimelineProject, asset: Asset) -> None:
     strip_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}_strip.jpg")
     strip_info_path = strip_path + ".json"
     waveform_path = os.path.join(project.project_dir, "cache", "waveforms", f"{asset.asset_id}.json")
-    for cache_path in [thumb_path, strip_path, strip_info_path, waveform_path]:
+    extracted_audio_path = os.path.join(project.project_dir, "cache", "waveforms", f"{asset.asset_id}_audio.wav")
+    for cache_path in [thumb_path, strip_path, strip_info_path, waveform_path, extracted_audio_path]:
         if os.path.isfile(cache_path):
             try:
                 os.remove(cache_path)
@@ -1050,6 +1094,45 @@ def _delete_project_asset(project: TimelineProject, asset: Asset, usages_orphane
         "asset_id": asset.asset_id,
         "usages_orphaned": usages_orphaned,
     }
+
+
+def _purge_expired_trashed_assets(project: TimelineProject) -> bool:
+    changed = False
+    for asset in list(project.assets):
+        trashed_at = str(getattr(asset, "trashed_at", "") or "").strip()
+        if not trashed_at:
+            continue
+        try:
+            parsed = datetime.fromisoformat(trashed_at)
+        except ValueError:
+            continue
+        compare_now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
+        if parsed <= (compare_now - timedelta(days=TRASH_RETENTION_DAYS)):
+            _delete_project_asset(project, asset)
+            changed = True
+    return changed
+
+
+def _trash_project_asset_folder(project: TimelineProject, folder: str) -> tuple[list[str], list[Asset]]:
+    current = _normalize_asset_folder(folder)
+    if not current:
+        raise ValueError("Folder is required")
+
+    all_folders = _collect_asset_folders(project)
+    descendants = _folder_descendants(current, all_folders)
+    if not descendants:
+        raise FileNotFoundError(f"Folder not found: {current}")
+
+    assets_to_trash = _find_assets_in_folder(project, current)
+    for asset in assets_to_trash:
+        _trash_project_asset(asset)
+
+    remaining_folders = [
+        candidate for candidate in all_folders
+        if candidate not in descendants
+    ]
+    folders = _set_asset_folders(project, remaining_folders)
+    return folders, assets_to_trash
 
 
 def _delete_project_asset_folder(project: TimelineProject, folder: str) -> tuple[list[str], list[Asset]]:
@@ -1254,10 +1337,13 @@ if routes is not None:
             save_project(project)
 
         asset_type = request.query.get("type", "")
+        include_trashed = _query_flag(request.query.get("include_trashed"))
         if asset_type:
             assets = project.get_assets_by_type(asset_type)
         else:
             assets = project.assets
+        if not include_trashed:
+            assets = [asset for asset in assets if not _asset_is_trashed(asset)]
 
         result = [_asset_payload(project, asset) for asset in assets]
 
@@ -1271,7 +1357,9 @@ if routes is not None:
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        result = [_asset_payload(project, asset) for asset in project.assets]
+        include_trashed = _query_flag(request.query.get("include_trashed"))
+        assets = project.assets if include_trashed else [asset for asset in project.assets if not _asset_is_trashed(asset)]
+        result = [_asset_payload(project, asset) for asset in assets]
 
         return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
 
@@ -1397,8 +1485,6 @@ if routes is not None:
             pass
 
         folder = body.get("folder", "")
-        force = bool(body.get("force", False))
-
         try:
             assets_to_delete = _find_assets_in_folder(project, folder)
         except FileNotFoundError as e:
@@ -1406,16 +1492,8 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
-        usage = _aggregate_asset_usages(project, assets_to_delete)
-        if usage["usage_count"] > 0 and not force:
-            return web.json_response({
-                "error": "Folder contains assets that are still in use",
-                "usages": usage["usages"],
-                "usage_count": usage["usage_count"],
-            }, status=409)
-
         try:
-            _folders, deleted_assets = _delete_project_asset_folder(project, folder)
+            _folders, trashed_assets = _trash_project_asset_folder(project, folder)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         except ValueError as e:
@@ -1425,8 +1503,8 @@ if routes is not None:
 
         save_project(project)
         return web.json_response({
-            "deleted_folder": _normalize_asset_folder(folder),
-            "deleted_assets": len(deleted_assets),
+            "trashed_folder": _normalize_asset_folder(folder),
+            "trashed_assets": len(trashed_assets),
         })
 
     @routes.post("/ltx-editor/project/{project_id}/assets/extract_frame")
@@ -1572,6 +1650,125 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
+        trashed_ids = []
+        for asset in assets:
+            _trash_project_asset(asset)
+            trashed_ids.append(asset.asset_id)
+        save_project(project)
+        return web.json_response({
+            "trashed": trashed_ids,
+        })
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/restore")
+    async def api_restore_asset(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        asset_id = str(body.get("asset_id", "")).strip()
+        if not asset_id:
+            return _json_error("asset_id is required", 400)
+
+        asset = project.get_asset(asset_id)
+        if not asset:
+            return _json_error(f"Asset not found: {asset_id}", 404)
+
+        payload = _restore_project_asset(project, asset)
+        save_project(project)
+        return web.json_response({
+            **payload,
+            "asset": _asset_payload(project, asset),
+        })
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-restore")
+    async def api_bulk_restore_assets(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        try:
+            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        restored_ids = []
+        for asset in assets:
+            _restore_project_asset(project, asset)
+            restored_ids.append(asset.asset_id)
+
+        save_project(project)
+        return web.json_response({"restored": restored_ids})
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/permanent")
+    async def api_permanent_delete_asset(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        asset_id = str(body.get("asset_id", "")).strip()
+        if not asset_id:
+            return _json_error("asset_id is required", 400)
+
+        asset = project.get_asset(asset_id)
+        if not asset:
+            return _json_error(f"Asset not found: {asset_id}", 404)
+
+        usage = _find_asset_usages(project, asset)
+        force = bool(body.get("force", False))
+        if usage["usage_count"] > 0 and not force:
+            return web.json_response({
+                "error": "Asset is in use",
+                "usages": usage["usages"],
+                "usage_count": usage["usage_count"],
+            }, status=409)
+
+        try:
+            payload = _delete_project_asset(project, asset, usage["usage_count"])
+        except OSError as e:
+            return _json_error(str(e), 500)
+
+        save_project(project)
+        return web.json_response(payload)
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-permanent-delete")
+    async def api_bulk_permanent_delete_assets(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        try:
+            assets = _resolve_assets_from_ids(project, body.get("asset_ids", []))
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
         usage = _aggregate_asset_usages(project, assets)
         force = bool(body.get("force", False))
         if usage["usage_count"] > 0 and not force:
@@ -1593,6 +1790,27 @@ if routes is not None:
         return web.json_response({
             "deleted": deleted_ids,
             "usages_orphaned": usage["usage_count"],
+        })
+
+    @routes.post("/ltx-editor/project/{project_id}/assets/empty-trash")
+    async def api_empty_asset_trash(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        deleted_ids = []
+        try:
+            for asset in list(_project_trashed_assets(project)):
+                _delete_project_asset(project, asset)
+                deleted_ids.append(asset.asset_id)
+        except OSError as e:
+            return _json_error(str(e), 500)
+
+        save_project(project)
+        return web.json_response({
+            "deleted": deleted_ids,
+            "emptied": len(deleted_ids),
         })
 
     @routes.put("/ltx-editor/project/{project_id}/assets/{asset_id}")
@@ -1648,26 +1866,7 @@ if routes is not None:
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            pass
-
-        usage = _find_asset_usages(project, asset)
-        force = bool(body.get("force", False))
-        if usage["usage_count"] > 0 and not force:
-            return web.json_response({
-                "error": "Asset is in use",
-                "usages": usage["usages"],
-                "usage_count": usage["usage_count"],
-            }, status=409)
-
-        try:
-            payload = _delete_project_asset(project, asset, usage["usage_count"])
-        except OSError as e:
-            return _json_error(str(e), 500)
-
+        payload = _trash_project_asset(asset)
         save_project(project)
         return web.json_response(payload)
 
@@ -1778,7 +1977,7 @@ if routes is not None:
 
     @routes.get("/ltx-editor/project/{project_id}/waveform/{asset_id}")
     async def api_get_waveform(request: web.Request) -> web.Response:
-        """Serve waveform peaks data for an audio asset."""
+        """Serve waveform peaks data for an audio asset or a video asset with audio."""
         try:
             project = _load_project_from_request(request)
         except FileNotFoundError as e:
@@ -1786,8 +1985,10 @@ if routes is not None:
 
         asset_id = request.match_info["asset_id"]
         asset = project.get_asset(asset_id)
-        if not asset or asset.asset_type != "audio":
-            return _json_error(f"Audio asset not found: {asset_id}", 404)
+        if not asset or asset.asset_type not in {"audio", "video"}:
+            return _json_error(f"Audio-capable asset not found: {asset_id}", 404)
+        if asset.asset_type == "video" and not asset.has_audio:
+            return _json_error("Waveform unavailable for video without audio", 404)
 
         waveform_path = os.path.join(
             project.project_dir, "cache", "waveforms",
@@ -1799,7 +2000,16 @@ if routes is not None:
             source_path = _asset_abspath(project, asset)
             if not source_path or not os.path.isfile(source_path):
                 return _json_error("Waveform unavailable for missing asset", 404)
-            data = generate_waveform_data(source_path, waveform_path)
+            waveform_source = source_path
+            extracted_audio_path = os.path.join(
+                project.project_dir, "cache", "waveforms",
+                f"{asset_id}_audio.wav"
+            )
+            if asset.asset_type == "video":
+                if not os.path.isfile(extracted_audio_path) and not _extract_audio_from_video(source_path, extracted_audio_path):
+                    return _json_error("Failed to extract video audio for waveform", 500)
+                waveform_source = extracted_audio_path
+            data = generate_waveform_data(waveform_source, waveform_path)
             if not data:
                 return _json_error("Failed to generate waveform data", 500)
 

@@ -66,6 +66,23 @@ def test_asset_audio_metadata():
     assert restored.duration_sec == 30.5
 
 
+def test_asset_trash_metadata_roundtrip():
+    asset = Asset(
+        asset_id="trash1",
+        name="clip.mp4",
+        asset_type="video",
+        path="media/clip.mp4",
+        folder="",
+        trashed_at="2026-04-05T12:00:00",
+        trash_previous_folder="Shots",
+    )
+    data = asset.to_dict()
+    restored = Asset.from_dict(data)
+
+    assert restored.trashed_at == "2026-04-05T12:00:00"
+    assert restored.trash_previous_folder == "Shots"
+
+
 # --- GuideFrame ---
 
 def test_guide_frame_roundtrip():

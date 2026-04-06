@@ -2,6 +2,7 @@ const { api } = window.comfyAPI.api;
 
 const DEFAULT_SORT_MODE = "newest";
 const ROOT_FOLDER_COLLAPSE_KEY = "__ltx_root__";
+const TRASH_FOLDER_COLLAPSE_KEY = "__ltx_trash__";
 const SORT_OPTIONS = [
     { value: "newest", label: "Newest" },
     { value: "oldest", label: "Oldest" },
@@ -43,6 +44,32 @@ function buildThumbnailUrl(projectDir, assetId) {
     return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${assetId}`);
 }
 
+function buildWaveformUrl(projectDir, assetId) {
+    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/waveform/${assetId}`);
+}
+
+function loadMediaAsBlob(url, mediaEl) {
+    if (!url || !mediaEl) return { cleanup: () => {} };
+    let blobUrl = null;
+    let aborted = false;
+    fetch(url)
+        .then((resp) => resp.blob())
+        .then((blob) => {
+            if (aborted) return;
+            blobUrl = URL.createObjectURL(blob);
+            mediaEl.src = blobUrl;
+        })
+        .catch(() => {
+            if (!aborted) mediaEl.src = url;
+        });
+    return {
+        cleanup() {
+            aborted = true;
+            if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+        },
+    };
+}
+
 function assetKindLabel(type) {
     if (type === "video") return "Video";
     if (type === "image") return "Image";
@@ -65,6 +92,10 @@ function assetIsMissing(asset) {
     return !!asset?.missing;
 }
 
+function isTrashed(asset) {
+    return !!asset?.trashed_at;
+}
+
 function formatResolution(asset) {
     return asset?.width && asset?.height ? `${asset.width}x${asset.height}` : "-";
 }
@@ -81,6 +112,18 @@ function formatDate(value) {
     if (!value) return "-";
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatClockTime(seconds) {
+    const safeSeconds = Math.max(0, Number(seconds) || 0);
+    const totalSeconds = Math.floor(safeSeconds);
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
 }
 
 function formatGenerationValue(value) {
@@ -221,6 +264,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         focusedAssetId: "",
         allowAutoFocus: true,
         liveMedia: null,
+        liveMediaCleanup: null,
         dropFolder: "",
         destroyed: false,
         collapsedFolders: new Set(),
@@ -235,6 +279,21 @@ export function mountSharedAssetGallery(container, options = {}) {
         usageError: "",
         usageData: null,
         replaceAssetId: "",
+        overlayState: {
+            open: false,
+            assetId: "",
+            zoomLevel: 1,
+            panX: 0,
+            panY: 0,
+            overlayEl: null,
+            cleanupFns: [],
+            compareMode: false,
+            compareLeftAssetId: "",
+            compareRightAssetId: "",
+            dividerRatio: 0.5,
+            audioFocus: "none",
+            showWaveform: false,
+        },
     };
     const data = { assets: [], folders: [] };
     const root = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;flex:1 1 auto;min-width:0;min-height:0;width:100%;height:100%;box-sizing:border-box;overflow:hidden;`);
@@ -400,6 +459,10 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function destroyLiveMedia() {
+        if (state.liveMediaCleanup) {
+            state.liveMediaCleanup();
+            state.liveMediaCleanup = null;
+        }
         if (!state.liveMedia) return;
         state.liveMedia.pause?.();
         state.liveMedia.removeAttribute?.("src");
@@ -488,10 +551,11 @@ export function mountSharedAssetGallery(container, options = {}) {
     function allFolders() {
         const folders = new Set((data.folders || []).map(normalizeFolderName).filter(Boolean));
         for (const asset of data.assets) {
+            if (isTrashed(asset)) continue;
             const folder = normalizeFolderName(asset.folder || "");
             if (folder) folders.add(folder);
         }
-        if (!folders.size && !data.assets.length) return [];
+        if (!folders.size && !data.assets.some((asset) => !isTrashed(asset))) return [];
         return ["", ...Array.from(folders).sort(compareStrings)];
     }
 
@@ -516,8 +580,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         } else {
             state.collapsedFolders.add(key);
             const selected = data.assets.find((asset) => asset.asset_id === state.selectedAssetId);
-            if (selected && folderContainsPath(folderName, selected.folder)) {
-                const nextVisibleAsset = visibleNavigableAssets(filteredAssets())[0] || null;
+            const hidesSelected = selected && (
+                (key === TRASH_FOLDER_COLLAPSE_KEY && isTrashed(selected))
+                || folderContainsPath(folderName, selected.folder)
+            );
+            if (hidesSelected) {
+                const nextVisibleAsset = navigableAssets()[0] || null;
                 applySelectionState(nextVisibleAsset ? [nextVisibleAsset.asset_id] : [], nextVisibleAsset?.asset_id || "");
             }
         }
@@ -525,21 +593,24 @@ export function mountSharedAssetGallery(container, options = {}) {
         render();
     }
 
-    function filteredAssets() {
+    function assetMatchesCurrentFilter(asset) {
+        if (!asset) return false;
+        if (state.type !== "all" && asset.asset_type !== state.type) return false;
         const query = state.query.trim().toLowerCase();
-        return data.assets.filter((asset) => {
-            if (state.type !== "all" && asset.asset_type !== state.type) return false;
-            if (!query) return true;
-            const haystack = [
-                asset.name,
-                asset.path,
-                asset.folder,
-                asset.asset_type,
-                asset.prompt,
-                formatGenerationValue(asset.generation_params),
-            ].filter(Boolean).join(" ").toLowerCase();
-            return haystack.includes(query);
-        }).sort((left, right) => {
+        if (!query) return true;
+        const haystack = [
+            asset.name,
+            asset.path,
+            asset.folder,
+            asset.asset_type,
+            asset.prompt,
+            formatGenerationValue(asset.generation_params),
+        ].filter(Boolean).join(" ").toLowerCase();
+        return haystack.includes(query);
+    }
+
+    function sortAssets(assets) {
+        return [...assets].sort((left, right) => {
             if (state.sortMode === "oldest") {
                 return assetImportedAt(left) - assetImportedAt(right) || compareStrings(assetDisplayName(left), assetDisplayName(right));
             }
@@ -559,12 +630,33 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
     }
 
+    function filteredAssets() {
+        return sortAssets(data.assets.filter((asset) => !isTrashed(asset) && assetMatchesCurrentFilter(asset)));
+    }
+
+    function trashedAssets() {
+        return data.assets
+            .filter((asset) => isTrashed(asset) && assetMatchesCurrentFilter(asset))
+            .sort((left, right) => {
+                return assetImportedAt({ imported_at: right.trashed_at }) - assetImportedAt({ imported_at: left.trashed_at })
+                    || compareStrings(assetDisplayName(left), assetDisplayName(right));
+            });
+    }
+
     function folderAssets(folderName, assets) {
         return assets.filter((asset) => normalizeFolderName(asset.folder || "") === normalizeFolderName(folderName));
     }
 
     function visibleNavigableAssets(assets) {
         return assets.filter((asset) => !isFolderCollapsed(asset.folder) && !isAncestorCollapsed(asset.folder));
+    }
+
+    function visibleTrashedAssets() {
+        return isFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY) ? [] : trashedAssets();
+    }
+
+    function navigableAssets() {
+        return [...visibleNavigableAssets(filteredAssets()), ...visibleTrashedAssets()];
     }
 
     function selectedAssetIdsList() {
@@ -615,7 +707,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function ensureFocusedAsset(assets) {
-        const navigable = visibleNavigableAssets(assets);
+        const navigable = Array.isArray(assets) ? assets : navigableAssets();
         if (!navigable.length) {
             state.focusedAssetId = "";
             return navigable;
@@ -976,21 +1068,136 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!options.onBulkDeleteAssets) return;
 
         try {
-            let usage = { usages: [], usage_count: 0 };
-            if (options.onGetBulkAssetUsages) {
-                usage = await options.onGetBulkAssetUsages(ids) || usage;
-            } else if (options.onGetAssetUsages) {
-                const payloads = await Promise.all(ids.map((assetId) => options.onGetAssetUsages(assetId)));
-                usage = {
-                    usages: payloads.flatMap((payload) => payload?.usages || []),
-                    usage_count: payloads.reduce((sum, payload) => sum + (payload?.usage_count || 0), 0),
-                };
+            const message = `Move ${ids.length} selected asset(s) to Trash? You can restore them later until the trash is emptied.`;
+            if (!confirm(message)) return;
+
+            const result = await options.onBulkDeleteAssets(ids, false);
+            if (result?.status === "conflict") {
+                throw new Error("Bulk trash unexpectedly reported a conflict.");
             }
 
+            for (const assetId of ids) {
+                const asset = data.assets.find((entry) => entry.asset_id === assetId);
+                if (!asset) continue;
+                updateAsset({
+                    ...asset,
+                    folder: "",
+                    trashed_at: result?.trashed_at || new Date().toISOString(),
+                    trash_previous_folder: asset.trash_previous_folder || normalizeFolderName(asset.folder),
+                });
+            }
+            clearUsageView();
+            render();
+        } catch (error) {
+            console.warn("[LTX Editor] Failed to trash selected assets:", error);
+            alert(error?.message || "Failed to move selected assets to Trash.");
+        }
+    }
+
+    async function handleAssetRestore(asset) {
+        if (!asset?.asset_id || !options.onRestoreAsset) return;
+        try {
+            const result = await options.onRestoreAsset(asset.asset_id);
+            updateAsset({
+                ...asset,
+                ...(result?.asset || {}),
+                trashed_at: "",
+                trash_previous_folder: "",
+                folder: normalizeFolderName(result?.asset?.folder ?? asset.trash_previous_folder ?? ""),
+            });
+            clearUsageView();
+            render();
+        } catch (error) {
+            console.warn("[LTX Editor] Failed to restore asset:", error);
+            alert(error?.message || "Failed to restore asset.");
+        }
+    }
+
+    async function handleBulkRestore(assetIds = selectedAssetIdsList()) {
+        const ids = normalizeSelection(assetIds, state.selectedAssetId).ids.filter((assetId) => isTrashed(data.assets.find((entry) => entry.asset_id === assetId)));
+        if (!ids.length || !options.onBulkRestoreAssets) return;
+        try {
+            await options.onBulkRestoreAssets(ids);
+            for (const assetId of ids) {
+                const asset = data.assets.find((entry) => entry.asset_id === assetId);
+                if (!asset) continue;
+                updateAsset({
+                    ...asset,
+                    folder: normalizeFolderName(asset.trash_previous_folder || ""),
+                    trashed_at: "",
+                    trash_previous_folder: "",
+                });
+            }
+            clearUsageView();
+            render();
+        } catch (error) {
+            console.warn("[LTX Editor] Failed to restore selected assets:", error);
+            alert(error?.message || "Failed to restore selected assets.");
+        }
+    }
+
+    async function getBulkUsagePayload(assetIds) {
+        if (options.onGetBulkAssetUsages) {
+            return await options.onGetBulkAssetUsages(assetIds) || { usages: [], usage_count: 0 };
+        }
+        if (options.onGetAssetUsages) {
+            const payloads = await Promise.all(assetIds.map((assetId) => options.onGetAssetUsages(assetId)));
+            return {
+                usages: payloads.flatMap((payload) => payload?.usages || []),
+                usage_count: payloads.reduce((sum, payload) => sum + (payload?.usage_count || 0), 0),
+            };
+        }
+        return { usages: [], usage_count: 0 };
+    }
+
+    async function handleAssetPermanentDelete(asset) {
+        if (!asset?.asset_id || !options.onPermanentDeleteAsset) return;
+        try {
+            const usage = await getBulkUsagePayload([asset.asset_id]);
             const counts = summarizeUsageTypes(usage?.usages || []);
             const message = usage?.usage_count > 0
                 ? [
-                    `Delete ${ids.length} selected assets from the project?`,
+                    `Permanently delete "${assetDisplayName(asset)}"?`,
+                    "This asset is still referenced.",
+                    `Clips: ${counts.clip}`,
+                    `Audio: ${counts.audio_track}`,
+                    `Guides: ${counts.guide_frame}`,
+                    `Queue: ${counts.generation_job}`,
+                    "",
+                    "Existing references will stay in place and become missing placeholders.",
+                ].join("\n")
+                : `Permanently delete "${assetDisplayName(asset)}"? This cannot be undone.`;
+            if (!confirm(message)) return;
+
+            const result = await options.onPermanentDeleteAsset(asset.asset_id, usage?.usage_count > 0);
+            if (result?.status === "conflict") {
+                throw new Error("Permanent delete unexpectedly reported a usage conflict.");
+            }
+            removeAssetsByIds([asset.asset_id]);
+            clearUsageView();
+            render();
+        } catch (error) {
+            console.warn("[LTX Editor] Failed to permanently delete asset:", error);
+            alert(error?.message || "Failed to permanently delete asset.");
+        }
+    }
+
+    async function handleBulkPermanentDelete(assetIds = selectedAssetIdsList()) {
+        const ids = normalizeSelection(assetIds, state.selectedAssetId).ids;
+        if (!ids.length) return;
+        if (ids.length === 1) {
+            const asset = data.assets.find((entry) => entry.asset_id === ids[0]);
+            if (asset) await handleAssetPermanentDelete(asset);
+            return;
+        }
+        if (!options.onBulkPermanentDeleteAssets) return;
+
+        try {
+            const usage = await getBulkUsagePayload(ids);
+            const counts = summarizeUsageTypes(usage?.usages || []);
+            const message = usage?.usage_count > 0
+                ? [
+                    `Permanently delete ${ids.length} selected asset(s)?`,
                     "These assets are still referenced.",
                     `Clips: ${counts.clip}`,
                     `Audio: ${counts.audio_track}`,
@@ -999,19 +1206,35 @@ export function mountSharedAssetGallery(container, options = {}) {
                     "",
                     "Existing references will stay in place and become missing placeholders.",
                 ].join("\n")
-                : `Delete ${ids.length} selected assets from the project? This cannot be undone.`;
+                : `Permanently delete ${ids.length} selected asset(s)? This cannot be undone.`;
             if (!confirm(message)) return;
 
-            const result = await options.onBulkDeleteAssets(ids, true);
+            const result = await options.onBulkPermanentDeleteAssets(ids, usage?.usage_count > 0);
             if (result?.status === "conflict") {
-                throw new Error("Bulk asset delete unexpectedly reported a usage conflict.");
+                throw new Error("Bulk permanent delete unexpectedly reported a usage conflict.");
             }
-
             removeAssetsByIds(ids);
+            clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to delete selected assets:", error);
-            alert(error?.message || "Failed to delete selected assets.");
+            console.warn("[LTX Editor] Failed to permanently delete selected assets:", error);
+            alert(error?.message || "Failed to permanently delete selected assets.");
+        }
+    }
+
+    async function handleEmptyTrash() {
+        if (!options.onEmptyTrash) return;
+        const ids = trashedAssets().map((asset) => asset.asset_id);
+        if (!ids.length) return;
+        if (!confirm(`Permanently delete all ${ids.length} asset(s) in Trash? This cannot be undone.`)) return;
+        try {
+            await options.onEmptyTrash();
+            removeAssetsByIds(ids);
+            clearUsageView();
+            render();
+        } catch (error) {
+            console.warn("[LTX Editor] Failed to empty trash:", error);
+            alert(error?.message || "Failed to empty trash.");
         }
     }
 
@@ -1029,23 +1252,50 @@ export function mountSharedAssetGallery(container, options = {}) {
         label.textContent = `${assets.length} selected`;
 
         const actions = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;`);
-        const moveBtn = makeActionButton();
-        moveBtn.textContent = "Move to...";
-        moveBtn.disabled = !options.onBulkMoveAssets;
-        moveBtn.addEventListener("click", async (event) => {
-            await handleBulkMove(assets.map((asset) => asset.asset_id), event);
-        });
-        actions.appendChild(moveBtn);
+        const activeAssets = assets.filter((asset) => !isTrashed(asset));
+        const trashedSelection = assets.filter((asset) => isTrashed(asset));
 
-        const deleteBtn = makeActionButton();
-        deleteBtn.textContent = "Delete";
-        deleteBtn.style.background = "#392420";
-        deleteBtn.style.borderColor = "#73443b";
-        deleteBtn.disabled = !options.onBulkDeleteAssets;
-        deleteBtn.addEventListener("click", async () => {
-            await handleBulkDelete(assets.map((asset) => asset.asset_id));
-        });
-        actions.appendChild(deleteBtn);
+        if (activeAssets.length) {
+            const moveBtn = makeActionButton();
+            moveBtn.textContent = activeAssets.length === assets.length ? "Move to..." : `Move ${activeAssets.length}`;
+            moveBtn.disabled = !options.onBulkMoveAssets;
+            moveBtn.addEventListener("click", async (event) => {
+                await handleBulkMove(activeAssets.map((asset) => asset.asset_id), event);
+            });
+            actions.appendChild(moveBtn);
+
+            const deleteBtn = makeActionButton();
+            deleteBtn.textContent = activeAssets.length === assets.length ? "Trash" : `Trash ${activeAssets.length}`;
+            deleteBtn.style.background = "#392420";
+            deleteBtn.style.borderColor = "#73443b";
+            deleteBtn.disabled = !options.onBulkDeleteAssets;
+            deleteBtn.addEventListener("click", async () => {
+                await handleBulkDelete(activeAssets.map((asset) => asset.asset_id));
+            });
+            actions.appendChild(deleteBtn);
+        }
+
+        if (trashedSelection.length) {
+            const restoreBtn = makeActionButton();
+            restoreBtn.textContent = trashedSelection.length === assets.length ? "Restore" : `Restore ${trashedSelection.length}`;
+            restoreBtn.style.background = "#203427";
+            restoreBtn.style.borderColor = "#48644f";
+            restoreBtn.disabled = !options.onBulkRestoreAssets;
+            restoreBtn.addEventListener("click", async () => {
+                await handleBulkRestore(trashedSelection.map((asset) => asset.asset_id));
+            });
+            actions.appendChild(restoreBtn);
+
+            const permanentBtn = makeActionButton();
+            permanentBtn.textContent = trashedSelection.length === assets.length ? "Delete Permanently" : `Delete ${trashedSelection.length} Permanently`;
+            permanentBtn.style.background = "#4a1c1c";
+            permanentBtn.style.borderColor = "#8a3f3f";
+            permanentBtn.disabled = !options.onBulkPermanentDeleteAssets;
+            permanentBtn.addEventListener("click", async () => {
+                await handleBulkPermanentDelete(trashedSelection.map((asset) => asset.asset_id));
+            });
+            actions.appendChild(permanentBtn);
+        }
 
         const clearBtn = makeActionButton();
         clearBtn.textContent = "Clear";
@@ -1083,6 +1333,1004 @@ export function mountSharedAssetGallery(container, options = {}) {
             wrap.appendChild(empty);
         }
         return wrap;
+    }
+
+    function renderMediaScrubBar(mediaEl) {
+        const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
+        const track = style(document.createElement("div"), `position:relative;flex:1 1 auto;height:10px;border-radius:999px;background:#1a2631;cursor:pointer;overflow:hidden;`);
+        const fill = style(document.createElement("div"), `position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#6fa7d8,#8fc0f0);`);
+        const thumb = style(document.createElement("div"), `position:absolute;top:50%;width:12px;height:12px;border-radius:50%;background:#d9ebfb;border:1px solid rgba(0,0,0,0.35);transform:translate(-50%,-50%);left:100%;pointer-events:none;box-shadow:0 1px 3px rgba(0,0,0,0.35);`);
+        fill.appendChild(thumb);
+        track.appendChild(fill);
+        const label = style(document.createElement("div"), `color:#a9bccb;font-size:10px;white-space:nowrap;min-width:72px;text-align:right;`);
+        wrap.append(track, label);
+
+        let dragging = false;
+
+        const duration = () => {
+            const value = Number(mediaEl?.duration);
+            return Number.isFinite(value) && value > 0 ? value : 0;
+        };
+
+        const updateUI = () => {
+            const total = duration();
+            const current = clamp(Number(mediaEl?.currentTime) || 0, 0, total || Number.MAX_SAFE_INTEGER);
+            const ratio = total > 0 ? current / total : 0;
+            fill.style.width = `${ratio * 100}%`;
+            label.textContent = `${formatClockTime(current)} / ${formatClockTime(total)}`;
+        };
+
+        const seekFromClientX = (clientX) => {
+            const total = duration();
+            if (!total) return;
+            const rect = track.getBoundingClientRect();
+            const ratio = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+            mediaEl.currentTime = ratio * total;
+            updateUI();
+        };
+
+        const handlePointerMove = (event) => {
+            if (!dragging) return;
+            seekFromClientX(event.clientX);
+        };
+        const handlePointerUp = (event) => {
+            if (!dragging) return;
+            dragging = false;
+            seekFromClientX(event.clientX);
+            window.removeEventListener("mousemove", handlePointerMove);
+            window.removeEventListener("mouseup", handlePointerUp);
+        };
+        const handlePointerDown = (event) => {
+            event.preventDefault();
+            dragging = true;
+            seekFromClientX(event.clientX);
+            window.addEventListener("mousemove", handlePointerMove);
+            window.addEventListener("mouseup", handlePointerUp);
+        };
+
+        track.addEventListener("mousedown", handlePointerDown);
+        mediaEl?.addEventListener?.("timeupdate", updateUI);
+        mediaEl?.addEventListener?.("loadedmetadata", updateUI);
+        mediaEl?.addEventListener?.("durationchange", updateUI);
+        mediaEl?.addEventListener?.("ended", updateUI);
+        updateUI();
+
+        return {
+            el: wrap,
+            cleanup() {
+                dragging = false;
+                window.removeEventListener("mousemove", handlePointerMove);
+                window.removeEventListener("mouseup", handlePointerUp);
+                track.removeEventListener("mousedown", handlePointerDown);
+                mediaEl?.removeEventListener?.("timeupdate", updateUI);
+                mediaEl?.removeEventListener?.("loadedmetadata", updateUI);
+                mediaEl?.removeEventListener?.("durationchange", updateUI);
+                mediaEl?.removeEventListener?.("ended", updateUI);
+            },
+        };
+    }
+
+    function renderSynchronizedScrubBar(mediaEls) {
+        const mediaList = (mediaEls || []).filter(Boolean);
+        const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
+        const track = style(document.createElement("div"), `position:relative;flex:1 1 auto;height:10px;border-radius:999px;background:#1a2631;cursor:pointer;overflow:hidden;`);
+        const fill = style(document.createElement("div"), `position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#6fa7d8,#8fc0f0);`);
+        track.appendChild(fill);
+        const label = style(document.createElement("div"), `color:#a9bccb;font-size:10px;white-space:nowrap;min-width:72px;text-align:right;`);
+        wrap.append(track, label);
+
+        let dragging = false;
+        const primary = () => mediaList[0] || null;
+        const duration = () => {
+            const values = mediaList
+                .map((media) => Number(media?.duration))
+                .filter((value) => Number.isFinite(value) && value > 0);
+            return values.length ? Math.max(...values) : 0;
+        };
+        const currentTime = () => clamp(Number(primary()?.currentTime) || 0, 0, duration() || Number.MAX_SAFE_INTEGER);
+        const updateUI = () => {
+            const total = duration();
+            const current = currentTime();
+            const ratio = total > 0 ? current / total : 0;
+            fill.style.width = `${ratio * 100}%`;
+            label.textContent = `${formatClockTime(current)} / ${formatClockTime(total)}`;
+        };
+        const seekFromClientX = (clientX) => {
+            const total = duration();
+            if (!total) return;
+            const rect = track.getBoundingClientRect();
+            const ratio = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+            const nextTime = ratio * total;
+            for (const media of mediaList) {
+                media.currentTime = nextTime;
+            }
+            updateUI();
+        };
+        const handlePointerMove = (event) => {
+            if (!dragging) return;
+            seekFromClientX(event.clientX);
+        };
+        const handlePointerUp = (event) => {
+            if (!dragging) return;
+            dragging = false;
+            seekFromClientX(event.clientX);
+            window.removeEventListener("mousemove", handlePointerMove);
+            window.removeEventListener("mouseup", handlePointerUp);
+        };
+        const handlePointerDown = (event) => {
+            event.preventDefault();
+            dragging = true;
+            seekFromClientX(event.clientX);
+            window.addEventListener("mousemove", handlePointerMove);
+            window.addEventListener("mouseup", handlePointerUp);
+        };
+
+        track.addEventListener("mousedown", handlePointerDown);
+        for (const media of mediaList) {
+            media.addEventListener?.("timeupdate", updateUI);
+            media.addEventListener?.("loadedmetadata", updateUI);
+            media.addEventListener?.("durationchange", updateUI);
+            media.addEventListener?.("ended", updateUI);
+        }
+        updateUI();
+
+        return {
+            el: wrap,
+            cleanup() {
+                dragging = false;
+                window.removeEventListener("mousemove", handlePointerMove);
+                window.removeEventListener("mouseup", handlePointerUp);
+                track.removeEventListener("mousedown", handlePointerDown);
+                for (const media of mediaList) {
+                    media.removeEventListener?.("timeupdate", updateUI);
+                    media.removeEventListener?.("loadedmetadata", updateUI);
+                    media.removeEventListener?.("durationchange", updateUI);
+                    media.removeEventListener?.("ended", updateUI);
+                }
+            },
+        };
+    }
+
+    function clearOverlayRuntime() {
+        const overlay = state.overlayState;
+        for (const cleanup of overlay.cleanupFns.splice(0)) {
+            try {
+                cleanup?.();
+            } catch (error) {
+                console.warn("[LTX Editor] Overlay cleanup failed:", error);
+            }
+        }
+    }
+
+    function overlayAssets() {
+        return filteredAssets();
+    }
+
+    function currentOverlayAsset() {
+        const assetId = state.overlayState.assetId;
+        return overlayAssets().find((asset) => asset.asset_id === assetId) || null;
+    }
+
+    function sameTypeOverlayAssets(asset) {
+        return asset ? overlayAssets().filter((entry) => entry.asset_type === asset.asset_type) : [];
+    }
+
+    function resetOverlayTransform() {
+        state.overlayState.zoomLevel = 1;
+        state.overlayState.panX = 0;
+        state.overlayState.panY = 0;
+    }
+
+    function closeInspectOverlay() {
+        if (!state.overlayState.open) return;
+        clearOverlayRuntime();
+        state.overlayState.open = false;
+        state.overlayState.assetId = "";
+        state.overlayState.compareMode = false;
+        state.overlayState.compareLeftAssetId = "";
+        state.overlayState.compareRightAssetId = "";
+        state.overlayState.showWaveform = false;
+        state.overlayState.audioFocus = "none";
+        state.overlayState.overlayEl?.remove();
+        state.overlayState.overlayEl = null;
+    }
+
+    function attachZoomPan(surface, targets) {
+        const targetList = (Array.isArray(targets) ? targets : [targets]).filter(Boolean);
+        let dragging = false;
+        let lastX = 0;
+        let lastY = 0;
+
+        const applyTransform = () => {
+            const transform = `translate(${state.overlayState.panX}px, ${state.overlayState.panY}px) scale(${state.overlayState.zoomLevel})`;
+            for (const target of targetList) {
+                target.style.transformOrigin = "center center";
+                target.style.transform = transform;
+            }
+        };
+
+        const handleWheel = (event) => {
+            event.preventDefault();
+            const rect = surface.getBoundingClientRect();
+            const cursorX = event.clientX - rect.left - rect.width / 2;
+            const cursorY = event.clientY - rect.top - rect.height / 2;
+            const previousZoom = state.overlayState.zoomLevel;
+            const nextZoom = clamp(previousZoom * (event.deltaY < 0 ? 1.12 : (1 / 1.12)), 1, 8);
+            if (nextZoom === previousZoom) return;
+            const scale = nextZoom / previousZoom;
+            state.overlayState.panX -= cursorX * (scale - 1);
+            state.overlayState.panY -= cursorY * (scale - 1);
+            state.overlayState.zoomLevel = nextZoom;
+            applyTransform();
+        };
+
+        const handleMouseMove = (event) => {
+            if (!dragging) return;
+            state.overlayState.panX += event.clientX - lastX;
+            state.overlayState.panY += event.clientY - lastY;
+            lastX = event.clientX;
+            lastY = event.clientY;
+            applyTransform();
+        };
+
+        const handleMouseUp = () => {
+            dragging = false;
+            window.removeEventListener("mousemove", handleMouseMove);
+            window.removeEventListener("mouseup", handleMouseUp);
+        };
+
+        const handleMouseDown = (event) => {
+            if (event.button !== 0) return;
+            event.preventDefault();
+            dragging = true;
+            lastX = event.clientX;
+            lastY = event.clientY;
+            window.addEventListener("mousemove", handleMouseMove);
+            window.addEventListener("mouseup", handleMouseUp);
+        };
+
+        const handleDoubleClick = () => {
+            resetOverlayTransform();
+            applyTransform();
+        };
+
+        surface.addEventListener("wheel", handleWheel, { passive: false });
+        surface.addEventListener("mousedown", handleMouseDown);
+        surface.addEventListener("dblclick", handleDoubleClick);
+        applyTransform();
+
+        return () => {
+            dragging = false;
+            surface.removeEventListener("wheel", handleWheel);
+            surface.removeEventListener("mousedown", handleMouseDown);
+            surface.removeEventListener("dblclick", handleDoubleClick);
+            window.removeEventListener("mousemove", handleMouseMove);
+            window.removeEventListener("mouseup", handleMouseUp);
+        };
+    }
+
+    function renderWaveformPanel(assets, colors) {
+        const assetList = (Array.isArray(assets) ? assets : [assets]).filter(Boolean);
+        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
+        const label = style(document.createElement("div"), `color:#a9bccb;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;`);
+        label.textContent = assetList.length > 1 ? "Waveform Compare" : "Waveform";
+        const status = style(document.createElement("div"), `color:#8ea0af;font-size:10px;`);
+        status.textContent = "Loading waveform...";
+        const canvas = style(document.createElement("canvas"), `width:100%;height:88px;border-radius:6px;background:#0a0f13;display:block;`);
+        wrap.append(label, status, canvas);
+
+        let active = true;
+
+        const draw = (datasets) => {
+            if (!active) return;
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(320, Math.floor(rect.width || 640));
+            const height = 88;
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = "#0a0f13";
+            ctx.fillRect(0, 0, width, height);
+            ctx.strokeStyle = "rgba(255,255,255,0.08)";
+            ctx.beginPath();
+            ctx.moveTo(0, height / 2);
+            ctx.lineTo(width, height / 2);
+            ctx.stroke();
+
+            datasets.forEach((dataset, datasetIndex) => {
+                if (!dataset?.peaks?.length) return;
+                ctx.strokeStyle = colors?.[datasetIndex] || "#7fc0ff";
+                ctx.globalAlpha = datasetIndex === 0 ? 0.9 : 0.7;
+                const peaks = dataset.peaks;
+                const step = width / peaks.length;
+                for (let i = 0; i < peaks.length; i++) {
+                    const [minValue, maxValue] = peaks[i];
+                    const x = i * step;
+                    const y1 = clamp((1 - ((maxValue + 1) / 2)) * height, 0, height);
+                    const y2 = clamp((1 - ((minValue + 1) / 2)) * height, 0, height);
+                    ctx.beginPath();
+                    ctx.moveTo(x, y1);
+                    ctx.lineTo(x, y2);
+                    ctx.stroke();
+                }
+            });
+            ctx.globalAlpha = 1;
+        };
+
+        Promise.all(assetList.map(async (asset) => {
+            try {
+                const resp = await fetch(buildWaveformUrl(currentProjectDir(), asset.asset_id));
+                return resp.ok ? await resp.json() : null;
+            } catch {
+                return null;
+            }
+        })).then((datasets) => {
+            if (!active) return;
+            if (!datasets.some((dataset) => dataset?.peaks?.length)) {
+                status.textContent = "Waveform unavailable.";
+                return;
+            }
+            status.textContent = assetList.length > 1
+                ? assetList.map((asset, index) => `${assetDisplayName(asset)}: ${colors?.[index] || "#7fc0ff"}`).join(" | ")
+                : assetDisplayName(assetList[0]);
+            requestAnimationFrame(() => draw(datasets));
+        });
+
+        return {
+            el: wrap,
+            cleanup() {
+                active = false;
+            },
+        };
+    }
+
+    function renderInteractiveWaveform(assets, mediaEls, colors, opts = {}) {
+        const { enableZoom = false } = opts;
+        const assetList = (Array.isArray(assets) ? assets : [assets]).filter(Boolean);
+        const mediaList = (Array.isArray(mediaEls) ? mediaEls : [mediaEls]).filter(Boolean);
+        const primary = () => mediaList[0] || null;
+
+        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
+        const headerRow = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;`);
+        const status = style(document.createElement("div"), `color:#8ea0af;font-size:10px;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        status.textContent = "Loading waveform...";
+        const timeLabel = style(document.createElement("div"), `color:#a9bccb;font-size:10px;white-space:nowrap;`);
+        headerRow.append(status, timeLabel);
+        const canvas = style(document.createElement("canvas"), `width:100%;height:88px;border-radius:6px;background:#0a0f13;display:block;cursor:pointer;`);
+        wrap.append(headerRow, canvas);
+
+        let datasets = null;
+        let active = true;
+        let dragging = false;
+        let zoomLevel = 1;
+        let viewOffset = 0;
+
+        const duration = () => {
+            const values = mediaList.map((m) => Number(m?.duration)).filter((v) => Number.isFinite(v) && v > 0);
+            return values.length ? Math.max(...values) : 0;
+        };
+        const currentTime = () => clamp(Number(primary()?.currentTime) || 0, 0, duration() || Number.MAX_SAFE_INTEGER);
+        const updateTimeLabel = () => {
+            timeLabel.textContent = `${formatClockTime(currentTime())} / ${formatClockTime(duration())}`;
+        };
+
+        const draw = () => {
+            if (!active) return;
+            const rect = canvas.getBoundingClientRect();
+            const width = Math.max(320, Math.floor(rect.width || 640));
+            const height = 88;
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = "#0a0f13";
+            ctx.fillRect(0, 0, width, height);
+            ctx.strokeStyle = "rgba(255,255,255,0.08)";
+            ctx.beginPath();
+            ctx.moveTo(0, height / 2);
+            ctx.lineTo(width, height / 2);
+            ctx.stroke();
+
+            if (!datasets || !datasets.some((d) => d?.peaks?.length)) {
+                updateTimeLabel();
+                return;
+            }
+
+            const visibleRange = 1 / zoomLevel;
+            const viewStart = viewOffset;
+            const viewEnd = viewOffset + visibleRange;
+            const total = duration();
+            const progressRatio = total > 0 ? currentTime() / total : 0;
+            const progressCanvasX = total > 0 ? ((progressRatio - viewStart) / visibleRange) * width : 0;
+
+            const drawPass = (clipStartX, clipEndX, bright) => {
+                ctx.save();
+                if (clipStartX !== 0 || clipEndX !== width) {
+                    ctx.beginPath();
+                    ctx.rect(clipStartX, 0, clipEndX - clipStartX, height);
+                    ctx.clip();
+                }
+                datasets.forEach((dataset, datasetIndex) => {
+                    if (!dataset?.peaks?.length) return;
+                    ctx.strokeStyle = colors?.[datasetIndex] || "#7fc0ff";
+                    ctx.globalAlpha = bright
+                        ? (datasetIndex === 0 ? 0.95 : 0.8)
+                        : (datasetIndex === 0 ? 0.3 : 0.2);
+                    const peaks = dataset.peaks;
+                    const totalPeaks = peaks.length;
+                    const peakStart = Math.floor(viewStart * totalPeaks);
+                    const peakEnd = Math.ceil(viewEnd * totalPeaks);
+                    const visiblePeaks = Math.max(1, peakEnd - peakStart);
+                    const step = width / visiblePeaks;
+                    for (let i = peakStart; i < peakEnd && i < totalPeaks; i++) {
+                        const [minVal, maxVal] = peaks[i];
+                        const x = (i - peakStart) * step;
+                        const y1 = clamp((1 - ((maxVal + 1) / 2)) * height, 0, height);
+                        const y2 = clamp((1 - ((minVal + 1) / 2)) * height, 0, height);
+                        ctx.beginPath();
+                        ctx.moveTo(x, y1);
+                        ctx.lineTo(x, y2);
+                        ctx.stroke();
+                    }
+                });
+                ctx.globalAlpha = 1;
+                ctx.restore();
+            };
+
+            drawPass(0, width, false);
+            if (progressCanvasX > 0) {
+                drawPass(0, clamp(progressCanvasX, 0, width), true);
+            }
+
+            if (progressCanvasX >= 0 && progressCanvasX <= width) {
+                ctx.strokeStyle = "#ffffff";
+                ctx.lineWidth = 1.5;
+                ctx.globalAlpha = 0.9;
+                ctx.beginPath();
+                ctx.moveTo(progressCanvasX, 0);
+                ctx.lineTo(progressCanvasX, height);
+                ctx.stroke();
+                ctx.lineWidth = 1;
+                ctx.globalAlpha = 1;
+            }
+
+            updateTimeLabel();
+        };
+
+        const seekFromClientX = (clientX) => {
+            const total = duration();
+            if (!total) return;
+            const rect = canvas.getBoundingClientRect();
+            const canvasRatio = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+            const visibleRange = 1 / zoomLevel;
+            const timeRatio = clamp(viewOffset + canvasRatio * visibleRange, 0, 1);
+            for (const media of mediaList) {
+                media.currentTime = timeRatio * total;
+            }
+            draw();
+        };
+
+        const handlePointerMove = (event) => { if (dragging) seekFromClientX(event.clientX); };
+        const handlePointerUp = (event) => {
+            if (!dragging) return;
+            dragging = false;
+            seekFromClientX(event.clientX);
+            window.removeEventListener("mousemove", handlePointerMove);
+            window.removeEventListener("mouseup", handlePointerUp);
+        };
+        const handlePointerDown = (event) => {
+            event.preventDefault();
+            dragging = true;
+            seekFromClientX(event.clientX);
+            window.addEventListener("mousemove", handlePointerMove);
+            window.addEventListener("mouseup", handlePointerUp);
+        };
+        canvas.addEventListener("mousedown", handlePointerDown);
+
+        const handleWheel = enableZoom ? (event) => {
+            event.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const cursorRatio = (event.clientX - rect.left) / Math.max(1, rect.width);
+            const visibleRange = 1 / zoomLevel;
+            const cursorTime = viewOffset + cursorRatio * visibleRange;
+            const factor = event.deltaY < 0 ? 1.2 : (1 / 1.2);
+            zoomLevel = clamp(zoomLevel * factor, 1, 32);
+            const newVisibleRange = 1 / zoomLevel;
+            viewOffset = clamp(cursorTime - cursorRatio * newVisibleRange, 0, Math.max(0, 1 - newVisibleRange));
+            draw();
+        } : null;
+        if (handleWheel) canvas.addEventListener("wheel", handleWheel, { passive: false });
+
+        const ensurePlayheadVisible = () => {
+            if (zoomLevel <= 1) return;
+            const total = duration();
+            if (!total) return;
+            const ratio = currentTime() / total;
+            const visibleRange = 1 / zoomLevel;
+            const viewEnd = viewOffset + visibleRange;
+            if (ratio < viewOffset) viewOffset = ratio;
+            else if (ratio > viewEnd) viewOffset = clamp(ratio - visibleRange * 0.9, 0, Math.max(0, 1 - visibleRange));
+        };
+
+        const handleTimeUpdate = () => {
+            if (!dragging) {
+                ensurePlayheadVisible();
+                draw();
+            }
+        };
+
+        for (const media of mediaList) {
+            media.addEventListener?.("timeupdate", handleTimeUpdate);
+            media.addEventListener?.("loadedmetadata", draw);
+            media.addEventListener?.("durationchange", draw);
+            media.addEventListener?.("seeked", draw);
+            media.addEventListener?.("ended", draw);
+        }
+
+        Promise.all(assetList.map(async (asset) => {
+            try {
+                const resp = await fetch(buildWaveformUrl(currentProjectDir(), asset.asset_id));
+                return resp.ok ? await resp.json() : null;
+            } catch {
+                return null;
+            }
+        })).then((results) => {
+            if (!active) return;
+            datasets = results;
+            if (!results.some((d) => d?.peaks?.length)) {
+                status.textContent = "Waveform unavailable.";
+                return;
+            }
+            status.textContent = assetList.length > 1
+                ? assetList.map((a, i) => `${assetDisplayName(a)}: ${colors?.[i] || "#7fc0ff"}`).join(" | ")
+                : assetDisplayName(assetList[0]);
+            requestAnimationFrame(() => draw());
+        });
+
+        updateTimeLabel();
+
+        return {
+            el: wrap,
+            cleanup() {
+                active = false;
+                dragging = false;
+                window.removeEventListener("mousemove", handlePointerMove);
+                window.removeEventListener("mouseup", handlePointerUp);
+                canvas.removeEventListener("mousedown", handlePointerDown);
+                if (handleWheel) canvas.removeEventListener("wheel", handleWheel);
+                for (const media of mediaList) {
+                    media.removeEventListener?.("timeupdate", handleTimeUpdate);
+                    media.removeEventListener?.("loadedmetadata", draw);
+                    media.removeEventListener?.("durationchange", draw);
+                    media.removeEventListener?.("seeked", draw);
+                    media.removeEventListener?.("ended", draw);
+                }
+            },
+        };
+    }
+
+    function cycleOverlayAsset(direction) {
+        const assets = overlayAssets();
+        if (!assets.length) return;
+        const currentIndex = assets.findIndex((asset) => asset.asset_id === state.overlayState.assetId);
+        const safeIndex = currentIndex >= 0 ? currentIndex : 0;
+        const nextIndex = (safeIndex + direction + assets.length) % assets.length;
+        state.overlayState.assetId = assets[nextIndex].asset_id;
+        state.overlayState.compareMode = false;
+        state.overlayState.showWaveform = false;
+        resetOverlayTransform();
+        renderInspectOverlay();
+    }
+
+    function ensureCompareDefaults(asset) {
+        const candidates = sameTypeOverlayAssets(asset);
+        if (!candidates.length) return;
+        state.overlayState.compareLeftAssetId = state.overlayState.compareLeftAssetId || asset.asset_id;
+        if (!state.overlayState.compareRightAssetId || state.overlayState.compareRightAssetId === state.overlayState.compareLeftAssetId) {
+            state.overlayState.compareRightAssetId = candidates.find((entry) => entry.asset_id !== state.overlayState.compareLeftAssetId)?.asset_id || state.overlayState.compareLeftAssetId;
+        }
+    }
+
+    function openInspectOverlay(asset) {
+        if (!asset || isTrashed(asset)) return;
+        state.overlayState.open = true;
+        state.overlayState.assetId = asset.asset_id;
+        state.overlayState.compareMode = false;
+        state.overlayState.compareLeftAssetId = asset.asset_id;
+        state.overlayState.compareRightAssetId = "";
+        state.overlayState.dividerRatio = 0.5;
+        state.overlayState.audioFocus = "none";
+        state.overlayState.showWaveform = false;
+        resetOverlayTransform();
+        renderInspectOverlay();
+    }
+
+    function renderSingleOverlay(asset, host) {
+        const projectDir = currentProjectDir();
+        const content = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;flex:1 1 auto;min-height:0;`);
+        host.appendChild(content);
+
+        if (assetIsMissing(asset)) {
+            const missing = style(document.createElement("div"), `margin:auto;color:#f0b39f;font-size:13px;`);
+            missing.textContent = "Missing asset preview unavailable.";
+            content.appendChild(missing);
+            return;
+        }
+
+        if (asset.asset_type === "image") {
+            const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
+            const img = style(document.createElement("img"), `max-width:100%;max-height:100%;display:block;user-select:none;pointer-events:none;`);
+            img.src = buildAssetViewUrl(projectDir, asset.path);
+            img.alt = assetDisplayName(asset);
+            stage.appendChild(img);
+            state.overlayState.cleanupFns.push(attachZoomPan(stage, img));
+            content.appendChild(stage);
+            return;
+        }
+
+        if (asset.asset_type === "video") {
+            const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
+            const video = style(document.createElement("video"), `max-width:100%;max-height:100%;display:block;background:#000;user-select:none;`);
+            video.draggable = false;
+            video.preload = "auto";
+            video.playsInline = true;
+            if (asset.has_thumbnail) video.poster = buildThumbnailUrl(projectDir, asset.asset_id);
+            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), video);
+            video.addEventListener("click", () => {
+                if (video.paused) {
+                    void video.play();
+                } else {
+                    video.pause();
+                }
+            });
+            const scrub = renderMediaScrubBar(video);
+            stage.appendChild(video);
+            content.append(stage, scrub.el);
+            state.overlayState.cleanupFns.push(attachZoomPan(stage, video), scrub.cleanup, blobHandle.cleanup);
+            if (asset.has_audio) {
+                const toggleBtn = makeActionButton();
+                toggleBtn.textContent = state.overlayState.showWaveform ? "Hide Waveform" : "Show Waveform";
+                toggleBtn.style.background = "#1d2630";
+                toggleBtn.style.borderColor = "#364655";
+                toggleBtn.addEventListener("click", () => {
+                    state.overlayState.showWaveform = !state.overlayState.showWaveform;
+                    renderInspectOverlay();
+                });
+                content.appendChild(toggleBtn);
+                if (state.overlayState.showWaveform) {
+                    const waveform = renderWaveformPanel(asset, ["#7fc0ff"]);
+                    state.overlayState.cleanupFns.push(waveform.cleanup);
+                    content.appendChild(waveform.el);
+                }
+            }
+            return;
+        }
+
+        if (asset.asset_type === "audio") {
+            const card = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;max-width:900px;width:100%;margin:auto;padding:18px;border-radius:12px;background:#04090d;border:1px solid #24323e;`);
+            const audio = document.createElement("audio");
+            audio.preload = "auto";
+            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), audio);
+            const playBtn = makeActionButton();
+            playBtn.textContent = "Play / Pause";
+            playBtn.addEventListener("click", () => {
+                if (audio.paused) void audio.play();
+                else audio.pause();
+            });
+            const waveform = renderInteractiveWaveform(asset, audio, ["#7fc0ff"]);
+            card.append(playBtn, waveform.el);
+            state.overlayState.cleanupFns.push(waveform.cleanup, blobHandle.cleanup, () => audio.pause());
+            content.appendChild(card);
+        }
+    }
+
+    function renderCompareChooser(assets, slotLabel, selectedId, onAssign) {
+        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;height:100%;padding:10px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);overflow:hidden;`);
+        const title = style(document.createElement("div"), `color:#d7e5f1;font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;`);
+        title.textContent = slotLabel;
+        const hint = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.45;`);
+        hint.textContent = "Left click assigns A. Right click assigns B.";
+        const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;`);
+        for (const asset of assets) {
+            const row = style(document.createElement("div"), `display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:center;padding:6px;border-radius:8px;border:1px solid ${selectedId === asset.asset_id ? "#7fc0ff" : "#35414c"};background:${selectedId === asset.asset_id ? "rgba(78,121,160,0.18)" : "rgba(255,255,255,0.02)"};cursor:pointer;`);
+            const thumb = style(document.createElement("div"), `height:40px;border-radius:6px;background:#111;border:1px solid #293542;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#7f93a5;font-size:10px;`);
+            if (asset.has_thumbnail) {
+                const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+                img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
+                thumb.appendChild(img);
+            } else {
+                thumb.textContent = assetFallbackGlyph(asset.asset_type);
+            }
+            const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
+            const name = style(document.createElement("div"), `color:#edf3f8;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+            name.textContent = assetDisplayName(asset);
+            const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+            meta.textContent = `${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
+            text.append(name, meta);
+            row.append(thumb, text);
+            row.addEventListener("click", () => onAssign("left", asset.asset_id));
+            row.addEventListener("contextmenu", (event) => {
+                event.preventDefault();
+                onAssign("right", asset.asset_id);
+            });
+            list.appendChild(row);
+        }
+        wrap.append(title, hint, list);
+        return wrap;
+    }
+
+    function renderCompareOverlay(asset, host) {
+        const candidates = sameTypeOverlayAssets(asset);
+        const compareA = candidates.find((entry) => entry.asset_id === state.overlayState.compareLeftAssetId) || asset;
+        const compareB = candidates.find((entry) => entry.asset_id === state.overlayState.compareRightAssetId) || candidates.find((entry) => entry.asset_id !== compareA.asset_id) || compareA;
+
+        const layout = style(document.createElement("div"), `display:grid;grid-template-columns:minmax(220px,260px) minmax(0,1fr) minmax(220px,260px);gap:12px;flex:1 1 auto;min-height:0;width:100%;`);
+        const assignSlot = (slot, assetId) => {
+            if (slot === "left") {
+                state.overlayState.compareLeftAssetId = assetId;
+            } else {
+                state.overlayState.compareRightAssetId = assetId;
+            }
+            renderInspectOverlay();
+        };
+
+        layout.appendChild(renderCompareChooser(candidates, "Gallery A", compareA.asset_id, assignSlot));
+
+        const center = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;`);
+        const hint = style(document.createElement("div"), `color:#8ea0af;font-size:11px;`);
+        hint.textContent = "Left click = A | Right click = B";
+        center.appendChild(hint);
+
+        if (asset.asset_type === "audio") {
+            const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
+            const audioA = new Audio();
+            const audioB = new Audio();
+            const blobHandleA = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareA.path), audioA);
+            const blobHandleB = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareB.path), audioB);
+            audioA.preload = "auto";
+            audioB.preload = "auto";
+            audioA.muted = state.overlayState.audioFocus !== "a";
+            audioB.muted = state.overlayState.audioFocus !== "b";
+            const playBtn = makeActionButton();
+            playBtn.textContent = "Play / Pause";
+            playBtn.addEventListener("click", () => {
+                const focus = state.overlayState.audioFocus;
+                const activeAudio = focus === "b" ? audioB : (focus === "a" ? audioA : null);
+                if (!activeAudio) return;
+                if (activeAudio.paused) {
+                    void activeAudio.play();
+                } else {
+                    activeAudio.pause();
+                }
+            });
+            controls.appendChild(playBtn);
+            for (const [labelText, value] of [["A", "a"], ["B", "b"], ["None", "none"]]) {
+                const btn = makeActionButton();
+                btn.textContent = labelText;
+                btn.style.background = state.overlayState.audioFocus === value ? "#4a5c6b" : "#1d2630";
+                btn.style.borderColor = state.overlayState.audioFocus === value ? "#7fa2bf" : "#364655";
+                btn.addEventListener("click", () => {
+                    state.overlayState.audioFocus = value;
+                    audioA.muted = value !== "a";
+                    audioB.muted = value !== "b";
+                    if (value === "none") {
+                        audioA.pause();
+                        audioB.pause();
+                    }
+                    renderInspectOverlay();
+                });
+                controls.appendChild(btn);
+            }
+            const waveform = renderInteractiveWaveform([compareA, compareB], [audioA, audioB], ["#7fc0ff", "#f5a97a"], { enableZoom: true });
+            state.overlayState.cleanupFns.push(waveform.cleanup, blobHandleA.cleanup, blobHandleB.cleanup, () => { audioA.pause(); audioB.pause(); });
+            center.append(controls, waveform.el);
+        } else {
+            const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;overflow:hidden;display:flex;align-items:center;justify-content:center;`);
+            const layerA = asset.asset_type === "image" ? document.createElement("img") : document.createElement("video");
+            const layerB = asset.asset_type === "image" ? document.createElement("img") : document.createElement("video");
+            const mediaStyle = `position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;background:#000;pointer-events:none;user-select:none;`;
+            layerA.style.cssText = mediaStyle;
+            layerB.style.cssText = mediaStyle;
+            if (asset.asset_type === "image") {
+                layerA.src = buildAssetViewUrl(currentProjectDir(), compareA.path);
+                layerB.src = buildAssetViewUrl(currentProjectDir(), compareB.path);
+                layerA.alt = assetDisplayName(compareA);
+                layerB.alt = assetDisplayName(compareB);
+            } else {
+                layerA.preload = "auto";
+                layerB.preload = "auto";
+                layerA.playsInline = true;
+                layerB.playsInline = true;
+                const blobHandleA = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareA.path), layerA);
+                const blobHandleB = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareB.path), layerB);
+                state.overlayState.cleanupFns.push(blobHandleA.cleanup, blobHandleB.cleanup);
+                layerA.muted = state.overlayState.audioFocus !== "a";
+                layerB.muted = state.overlayState.audioFocus !== "b";
+            }
+            const contentGroup = style(document.createElement("div"), `position:relative;width:100%;height:100%;`);
+            contentGroup.append(layerA, layerB);
+            const divider = style(document.createElement("div"), `position:absolute;top:0;bottom:0;width:2px;background:#f1f5f8;box-shadow:0 0 0 1px rgba(0,0,0,0.35);cursor:col-resize;pointer-events:auto;z-index:1;`);
+            contentGroup.appendChild(divider);
+            stage.appendChild(contentGroup);
+            const applyDivider = () => {
+                const leftInset = `${clamp(state.overlayState.dividerRatio * 100, 0, 100)}%`;
+                layerB.style.clipPath = `inset(0 0 0 ${leftInset})`;
+                divider.style.left = leftInset;
+            };
+            applyDivider();
+
+            const handleDividerMove = (event) => {
+                const rect = stage.getBoundingClientRect();
+                const stageX = event.clientX - rect.left;
+                const halfW = rect.width / 2;
+                const localX = (stageX - halfW - state.overlayState.panX) / state.overlayState.zoomLevel + halfW;
+                state.overlayState.dividerRatio = clamp(localX / Math.max(1, rect.width), 0, 1);
+                applyDivider();
+            };
+            const handleDividerUp = () => {
+                window.removeEventListener("mousemove", handleDividerMove);
+                window.removeEventListener("mouseup", handleDividerUp);
+            };
+            divider.addEventListener("mousedown", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                window.addEventListener("mousemove", handleDividerMove);
+                window.addEventListener("mouseup", handleDividerUp);
+            });
+            state.overlayState.cleanupFns.push(() => {
+                window.removeEventListener("mousemove", handleDividerMove);
+                window.removeEventListener("mouseup", handleDividerUp);
+            });
+
+            if (asset.asset_type === "video") {
+                const syncSecondary = () => {
+                    if (Math.abs((layerB.currentTime || 0) - (layerA.currentTime || 0)) > 0.15) {
+                        layerB.currentTime = layerA.currentTime || 0;
+                    }
+                };
+                const handlePlay = () => {
+                    layerB.currentTime = layerA.currentTime || 0;
+                    void layerB.play().catch(() => {});
+                };
+                const handlePause = () => layerB.pause();
+                const handleSeek = () => {
+                    layerB.currentTime = layerA.currentTime || 0;
+                };
+                layerA.addEventListener("play", handlePlay);
+                layerA.addEventListener("pause", handlePause);
+                layerA.addEventListener("seeked", handleSeek);
+                layerA.addEventListener("timeupdate", syncSecondary);
+                stage.addEventListener("click", () => {
+                    if (layerA.paused) {
+                        void layerA.play();
+                    } else {
+                        layerA.pause();
+                    }
+                });
+                state.overlayState.cleanupFns.push(() => {
+                    layerA.removeEventListener("play", handlePlay);
+                    layerA.removeEventListener("pause", handlePause);
+                    layerA.removeEventListener("seeked", handleSeek);
+                    layerA.removeEventListener("timeupdate", syncSecondary);
+                    layerA.pause();
+                    layerB.pause();
+                });
+            }
+
+            center.appendChild(stage);
+            state.overlayState.cleanupFns.push(attachZoomPan(stage, contentGroup));
+
+            if (asset.asset_type === "video") {
+                const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
+                for (const [labelText, value] of [["A", "a"], ["B", "b"], ["None", "none"]]) {
+                    const btn = makeActionButton();
+                    btn.textContent = labelText;
+                    btn.style.background = state.overlayState.audioFocus === value ? "#4a5c6b" : "#1d2630";
+                    btn.style.borderColor = state.overlayState.audioFocus === value ? "#7fa2bf" : "#364655";
+                    btn.addEventListener("click", () => {
+                        state.overlayState.audioFocus = value;
+                        renderInspectOverlay();
+                    });
+                    controls.appendChild(btn);
+                }
+                const scrub = renderSynchronizedScrubBar([layerA, layerB]);
+                state.overlayState.cleanupFns.push(scrub.cleanup);
+                center.append(controls, scrub.el);
+            }
+        }
+
+        layout.appendChild(center);
+        layout.appendChild(renderCompareChooser(candidates, "Gallery B", compareB.asset_id, assignSlot));
+        host.appendChild(layout);
+    }
+
+    function renderInspectOverlay() {
+        const overlay = state.overlayState;
+        const asset = currentOverlayAsset();
+        if (!overlay.open || !asset) {
+            closeInspectOverlay();
+            return;
+        }
+
+        clearOverlayRuntime();
+        let overlayEl = overlay.overlayEl;
+        if (!overlayEl) {
+            overlayEl = style(document.createElement("div"), `position:fixed;inset:0;z-index:99999;background:rgba(4,8,12,0.92);display:flex;align-items:stretch;justify-content:center;padding:20px;box-sizing:border-box;`);
+            overlayEl.addEventListener("mousedown", (event) => {
+                if (event.target === overlayEl) {
+                    closeInspectOverlay();
+                }
+            });
+            document.body.appendChild(overlayEl);
+            overlay.overlayEl = overlayEl;
+        }
+
+        const keyHandler = (event) => {
+            if (!overlay.open) return;
+            if (event.target?.closest?.("input, textarea, select")) return;
+            if (event.key === "Escape") {
+                event.preventDefault();
+                closeInspectOverlay();
+                return;
+            }
+            if (event.key === "ArrowLeft") {
+                event.preventDefault();
+                cycleOverlayAsset(-1);
+                return;
+            }
+            if (event.key === "ArrowRight") {
+                event.preventDefault();
+                cycleOverlayAsset(1);
+            }
+        };
+        document.addEventListener("keydown", keyHandler);
+        overlay.cleanupFns.push(() => document.removeEventListener("keydown", keyHandler));
+
+        overlayEl.innerHTML = "";
+        const shell = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;max-width:min(1600px,100%);width:100%;height:100%;padding:18px;border-radius:16px;background:#091017;border:1px solid rgba(255,255,255,0.08);box-shadow:0 20px 80px rgba(0,0,0,0.45);box-sizing:border-box;`);
+        const toolbar = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;`);
+        const titleWrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:2px;min-width:0;`);
+        const title = style(document.createElement("div"), `color:#f1f5f8;font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        title.textContent = assetDisplayName(asset);
+        const counter = style(document.createElement("div"), `color:#89a0b3;font-size:11px;`);
+        const assets = overlayAssets();
+        const assetIndex = Math.max(0, assets.findIndex((entry) => entry.asset_id === asset.asset_id));
+        counter.textContent = `${assetIndex + 1} / ${Math.max(assets.length, 1)}`;
+        titleWrap.append(title, counter);
+
+        const toolbarActions = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;`);
+        const compareCandidates = sameTypeOverlayAssets(asset);
+        const compareBtn = makeActionButton();
+        compareBtn.textContent = overlay.compareMode ? "Compare Off" : "Compare";
+        compareBtn.disabled = compareCandidates.length < 2;
+        compareBtn.addEventListener("click", () => {
+            overlay.compareMode = !overlay.compareMode;
+            ensureCompareDefaults(asset);
+            resetOverlayTransform();
+            renderInspectOverlay();
+        });
+        toolbarActions.appendChild(compareBtn);
+
+        const closeBtn = makeActionButton();
+        closeBtn.textContent = "Close";
+        closeBtn.style.background = "#1d2630";
+        closeBtn.style.borderColor = "#364655";
+        closeBtn.addEventListener("click", () => closeInspectOverlay());
+        toolbarActions.appendChild(closeBtn);
+
+        toolbar.append(titleWrap, toolbarActions);
+
+        const contentWrap = style(document.createElement("div"), `flex:1 1 auto;min-height:0;display:flex;`);
+        shell.append(toolbar, contentWrap);
+        overlayEl.appendChild(shell);
+
+        if (overlay.compareMode && compareCandidates.length >= 2) {
+            ensureCompareDefaults(asset);
+            renderCompareOverlay(asset, contentWrap);
+        } else {
+            renderSingleOverlay(asset, contentWrap);
+        }
     }
 
     function renderUsagesDetail(asset) {
@@ -1186,6 +2434,9 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const typeBreakdown = summarizeAssetTypes(assets);
         const missingCount = assets.filter((asset) => assetIsMissing(asset)).length;
+        const trashedCount = assets.filter((asset) => isTrashed(asset)).length;
+        const activeAssets = assets.filter((asset) => !isTrashed(asset));
+        const trashedSelection = assets.filter((asset) => isTrashed(asset));
 
         const title = style(document.createElement("div"), `color:#ececec;font-size:11px;font-weight:700;`);
         title.textContent = `${assets.length} Assets Selected`;
@@ -1198,28 +2449,53 @@ export function mountSharedAssetGallery(container, options = {}) {
             makeMetaCell("Images", String(typeBreakdown.image)),
             makeMetaCell("Audio", String(typeBreakdown.audio)),
             makeMetaCell("Missing", String(missingCount)),
+            makeMetaCell("Trashed", String(trashedCount)),
             makeMetaCell("Total Duration", aggregateDurationLabel(assets)),
             makeMetaCell("Primary", selectedAsset() ? assetDisplayName(selectedAsset()) : "-"),
         );
 
         const actionRow = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;align-items:center;`);
-        const moveBtn = makeActionButton();
-        moveBtn.textContent = "Move to Folder...";
-        moveBtn.disabled = !options.onBulkMoveAssets;
-        moveBtn.addEventListener("click", async (event) => {
-            await handleBulkMove(assets.map((asset) => asset.asset_id), event);
-        });
-        actionRow.appendChild(moveBtn);
+        if (activeAssets.length) {
+            const moveBtn = makeActionButton();
+            moveBtn.textContent = activeAssets.length === assets.length ? "Move to Folder..." : `Move ${activeAssets.length} Active`;
+            moveBtn.disabled = !options.onBulkMoveAssets;
+            moveBtn.addEventListener("click", async (event) => {
+                await handleBulkMove(activeAssets.map((asset) => asset.asset_id), event);
+            });
+            actionRow.appendChild(moveBtn);
 
-        const deleteBtn = makeActionButton();
-        deleteBtn.textContent = "Delete Selected";
-        deleteBtn.style.background = "#392420";
-        deleteBtn.style.borderColor = "#73443b";
-        deleteBtn.disabled = !options.onBulkDeleteAssets;
-        deleteBtn.addEventListener("click", async () => {
-            await handleBulkDelete(assets.map((asset) => asset.asset_id));
-        });
-        actionRow.appendChild(deleteBtn);
+            const deleteBtn = makeActionButton();
+            deleteBtn.textContent = activeAssets.length === assets.length ? "Move to Trash" : `Trash ${activeAssets.length} Active`;
+            deleteBtn.style.background = "#392420";
+            deleteBtn.style.borderColor = "#73443b";
+            deleteBtn.disabled = !options.onBulkDeleteAssets;
+            deleteBtn.addEventListener("click", async () => {
+                await handleBulkDelete(activeAssets.map((asset) => asset.asset_id));
+            });
+            actionRow.appendChild(deleteBtn);
+        }
+
+        if (trashedSelection.length) {
+            const restoreBtn = makeActionButton();
+            restoreBtn.textContent = trashedSelection.length === assets.length ? "Restore Selected" : `Restore ${trashedSelection.length} Trashed`;
+            restoreBtn.style.background = "#203427";
+            restoreBtn.style.borderColor = "#48644f";
+            restoreBtn.disabled = !options.onBulkRestoreAssets;
+            restoreBtn.addEventListener("click", async () => {
+                await handleBulkRestore(trashedSelection.map((asset) => asset.asset_id));
+            });
+            actionRow.appendChild(restoreBtn);
+
+            const permanentBtn = makeActionButton();
+            permanentBtn.textContent = trashedSelection.length === assets.length ? "Delete Permanently" : `Delete ${trashedSelection.length} Permanently`;
+            permanentBtn.style.background = "#4a1c1c";
+            permanentBtn.style.borderColor = "#8a3f3f";
+            permanentBtn.disabled = !options.onBulkPermanentDeleteAssets;
+            permanentBtn.addEventListener("click", async () => {
+                await handleBulkPermanentDelete(trashedSelection.map((asset) => asset.asset_id));
+            });
+            actionRow.appendChild(permanentBtn);
+        }
 
         detailPane.append(title, subtitle, stats, actionRow);
         queueResize();
@@ -1262,6 +2538,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         const kind = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(143,192,240,0.12);border:1px solid rgba(143,192,240,0.28);color:#9fc8ea;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
         kind.textContent = assetKindLabel(asset.asset_type);
         badges.appendChild(kind);
+        if (isTrashed(asset)) {
+            const trashedBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(184,96,72,0.18);border:1px solid rgba(214,132,98,0.45);color:#f0b39f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
+            trashedBadge.textContent = "Trashed";
+            badges.appendChild(trashedBadge);
+        }
         if (assetIsMissing(asset)) {
             const missingBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(204,92,48,0.14);border:1px solid rgba(255,158,112,0.35);color:#ffb18c;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
             missingBadge.textContent = "Missing";
@@ -1272,6 +2553,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         pathLine.textContent = asset.path || "-";
 
         const previewSurface = style(document.createElement("div"), `min-height:140px;border-radius:6px;border:1px solid #2f2f2f;background:#111;overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;`);
+        const previewExtras = [];
         const projectDir = currentProjectDir();
         if (assetIsMissing(asset)) {
             const missingWrap = style(document.createElement("div"), `padding:18px;text-align:center;display:flex;flex-direction:column;gap:6px;align-items:center;`);
@@ -1291,10 +2573,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             video.controls = true;
             video.preload = "metadata";
             video.playsInline = true;
-            video.src = buildAssetViewUrl(projectDir, asset.path);
             if (asset.has_thumbnail) video.poster = buildThumbnailUrl(projectDir, asset.asset_id);
+            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), video);
             previewSurface.appendChild(video);
             state.liveMedia = video;
+            const scrubBar = renderMediaScrubBar(video);
+            const scrubCleanup = scrubBar.cleanup;
+            state.liveMediaCleanup = () => { scrubCleanup(); blobHandle.cleanup(); };
+            previewExtras.push(scrubBar.el);
         } else if (asset.asset_type === "audio") {
             const audioWrap = style(document.createElement("div"), `width:100%;padding:16px;display:flex;flex-direction:column;gap:12px;align-items:stretch;box-sizing:border-box;`);
             const audioLabel = style(document.createElement("div"), `color:#9fb6c8;font-size:10px;text-transform:uppercase;letter-spacing:0.08em;`);
@@ -1302,10 +2588,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             const audio = style(document.createElement("audio"), `width:100%;display:block;`);
             audio.controls = true;
             audio.preload = "metadata";
-            audio.src = buildAssetViewUrl(projectDir, asset.path);
+            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), audio);
             audioWrap.append(audioLabel, audio);
             previewSurface.appendChild(audioWrap);
             state.liveMedia = audio;
+            const scrubBar = renderMediaScrubBar(audio);
+            const scrubCleanup = scrubBar.cleanup;
+            state.liveMediaCleanup = () => { scrubCleanup(); blobHandle.cleanup(); };
+            previewExtras.push(scrubBar.el);
         } else {
             const placeholder = style(document.createElement("div"), `color:#8ea0af;font-size:10px;`);
             placeholder.textContent = "Preview unavailable.";
@@ -1324,55 +2614,87 @@ export function mountSharedAssetGallery(container, options = {}) {
             ["Embedded Audio", asset.has_audio ? "Yes" : "No"],
             ["Imported", formatDate(asset.imported_at)],
         ];
+        if (isTrashed(asset)) {
+            rows.push(["Trashed At", formatDate(asset.trashed_at)]);
+            rows.push(["Restore To", normalizeFolderName(asset.trash_previous_folder) || "Root"]);
+        }
         for (const [label, value] of rows) meta.appendChild(makeMetaCell(label, value));
 
-        const form = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
-        const nameLabel = makeSectionTitle("Display Name");
-        const nameInput = style(document.createElement("input"), `background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
-        nameInput.value = asset.name || "";
-        const renameHint = style(document.createElement("div"), `color:#7f8b96;font-size:10px;line-height:1.35;`);
-        renameHint.textContent = "This only changes the display name. The file path and extension on disk stay unchanged.";
-        const folderLabel = makeSectionTitle("Folder");
-        const folderInput = style(document.createElement("input"), `background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
-        folderInput.value = normalizeFolderName(asset.folder);
-        folderInput.placeholder = "Root";
-        folderInput.setAttribute("list", folderListId);
-        const saveBtn = makeActionButton();
-        saveBtn.textContent = "Save Metadata";
-        const actionRow = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;align-items:center;`);
-        saveBtn.addEventListener("click", async () => {
-            try {
-                setBusyButton(saveBtn, true, "Saving...", "Save Metadata");
-                await applyAssetUpdate(asset, { name: nameInput.value, folder: folderInput.value });
-            } catch (error) {
-                console.warn("[LTX Editor] Failed to save asset metadata:", error);
-            } finally {
-                setBusyButton(saveBtn, false, "Saving...", "Save Metadata");
-            }
-        });
-        actionRow.appendChild(saveBtn);
+        const detailSections = [titleRow, pathLine, previewSurface, ...previewExtras, meta, renderGenerationSection(asset)];
+        if (isTrashed(asset)) {
+            const trashedNote = style(document.createElement("div"), `padding:8px;border-radius:6px;background:rgba(184,96,72,0.12);border:1px solid rgba(214,132,98,0.3);color:#d8b4aa;font-size:10px;line-height:1.45;`);
+            trashedNote.textContent = "Trashed assets stay out of the normal gallery but keep their references recoverable until they are permanently deleted.";
+            const trashActions = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;align-items:center;`);
+            const restoreBtn = makeActionButton();
+            restoreBtn.textContent = "Restore";
+            restoreBtn.style.background = "#203427";
+            restoreBtn.style.borderColor = "#48644f";
+            restoreBtn.disabled = !options.onRestoreAsset;
+            restoreBtn.addEventListener("click", async () => {
+                await handleAssetRestore(asset);
+            });
+            trashActions.appendChild(restoreBtn);
 
-        const replaceBtn = makeActionButton();
-        replaceBtn.textContent = assetIsMissing(asset) ? "Relink" : "Replace File";
-        replaceBtn.style.background = "#1d2630";
-        replaceBtn.style.borderColor = "#5b6c7a";
-        replaceBtn.addEventListener("click", async () => {
-            await beginAssetReplace(asset);
-        });
-        actionRow.appendChild(replaceBtn);
+            const permanentBtn = makeActionButton();
+            permanentBtn.textContent = "Delete Permanently";
+            permanentBtn.style.background = "#4a1c1c";
+            permanentBtn.style.borderColor = "#8a3f3f";
+            permanentBtn.disabled = !options.onPermanentDeleteAsset;
+            permanentBtn.addEventListener("click", async () => {
+                await handleAssetPermanentDelete(asset);
+            });
+            trashActions.appendChild(permanentBtn);
+            detailSections.push(trashedNote, trashActions);
+        } else {
+            const form = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
+            const nameLabel = makeSectionTitle("Display Name");
+            const nameInput = style(document.createElement("input"), `background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
+            nameInput.value = asset.name || "";
+            const renameHint = style(document.createElement("div"), `color:#7f8b96;font-size:10px;line-height:1.35;`);
+            renameHint.textContent = "This only changes the display name. The file path and extension on disk stay unchanged.";
+            const folderLabel = makeSectionTitle("Folder");
+            const folderInput = style(document.createElement("input"), `background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
+            folderInput.value = normalizeFolderName(asset.folder);
+            folderInput.placeholder = "Root";
+            folderInput.setAttribute("list", folderListId);
+            const saveBtn = makeActionButton();
+            saveBtn.textContent = "Save Metadata";
+            const actionRow = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;align-items:center;`);
+            saveBtn.addEventListener("click", async () => {
+                try {
+                    setBusyButton(saveBtn, true, "Saving...", "Save Metadata");
+                    await applyAssetUpdate(asset, { name: nameInput.value, folder: folderInput.value });
+                } catch (error) {
+                    console.warn("[LTX Editor] Failed to save asset metadata:", error);
+                } finally {
+                    setBusyButton(saveBtn, false, "Saving...", "Save Metadata");
+                }
+            });
+            actionRow.appendChild(saveBtn);
 
-        const deleteBtn = makeActionButton();
-        deleteBtn.textContent = "Delete Asset";
-        deleteBtn.style.background = "#392420";
-        deleteBtn.style.borderColor = "#73443b";
-        deleteBtn.addEventListener("click", async () => {
-            await handleAssetDelete(asset);
-        });
-        actionRow.appendChild(deleteBtn);
+            const replaceBtn = makeActionButton();
+            replaceBtn.textContent = assetIsMissing(asset) ? "Relink" : "Replace File";
+            replaceBtn.style.background = "#1d2630";
+            replaceBtn.style.borderColor = "#5b6c7a";
+            replaceBtn.addEventListener("click", async () => {
+                await beginAssetReplace(asset);
+            });
+            actionRow.appendChild(replaceBtn);
 
-        form.append(nameLabel, nameInput, renameHint, folderLabel, folderInput, actionRow);
+            const deleteBtn = makeActionButton();
+            deleteBtn.textContent = "Move to Trash";
+            deleteBtn.style.background = "#392420";
+            deleteBtn.style.borderColor = "#73443b";
+            deleteBtn.addEventListener("click", async () => {
+                await handleAssetDelete(asset);
+            });
+            actionRow.appendChild(deleteBtn);
 
-        detailPane.append(titleRow, pathLine, previewSurface, meta, renderGenerationSection(asset), form);
+            form.append(nameLabel, nameInput, renameHint, folderLabel, folderInput, actionRow);
+            detailSections.push(form);
+        }
+
+        detailPane.append(...detailSections);
         queueResize();
     }
 
@@ -1441,34 +2763,25 @@ export function mountSharedAssetGallery(container, options = {}) {
     async function handleAssetDelete(asset) {
         if (!asset?.asset_id || !options.onDeleteAsset) return;
         try {
-            const usage = options.onGetAssetUsages
-                ? await options.onGetAssetUsages(asset.asset_id)
-                : { asset_id: asset.asset_id, usages: [], usage_count: 0 };
-            const counts = summarizeUsageTypes(usage?.usages || []);
-            const message = usage?.usage_count > 0
-                ? [
-                    `Delete asset "${assetDisplayName(asset)}" from the project?`,
-                    "This asset is still referenced.",
-                    `Clips: ${counts.clip}`,
-                    `Audio: ${counts.audio_track}`,
-                    `Guides: ${counts.guide_frame}`,
-                    `Queue: ${counts.generation_job}`,
-                    "",
-                    "Existing references will stay in place and become missing placeholders.",
-                ].join("\n")
-                : `Delete asset "${assetDisplayName(asset)}" from the project? This cannot be undone.`;
+            const message = `Move "${assetDisplayName(asset)}" to Trash? You can restore it later until the trash is emptied.`;
             if (!confirm(message)) return;
 
-            const result = await options.onDeleteAsset(asset.asset_id, true);
+            const result = await options.onDeleteAsset(asset.asset_id, false);
             if (result?.status === "conflict") {
-                throw new Error("Asset delete unexpectedly reported a usage conflict.");
+                throw new Error("Asset trash unexpectedly reported a conflict.");
             }
 
-            removeAssetsByIds([asset.asset_id]);
+            updateAsset({
+                ...asset,
+                folder: "",
+                trashed_at: result?.trashed_at || new Date().toISOString(),
+                trash_previous_folder: asset.trash_previous_folder || normalizeFolderName(asset.folder),
+            });
+            clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to delete asset:", error);
-            alert(error?.message || "Failed to delete asset.");
+            console.warn("[LTX Editor] Failed to trash asset:", error);
+            alert(error?.message || "Failed to move asset to Trash.");
         }
     }
 
@@ -1494,45 +2807,30 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!folderName || !options.onDeleteFolder) return;
         try {
             const containedAssets = folderAssetsRecursive(folderName);
-            const usagePayloads = options.onGetAssetUsages && containedAssets.length
-                ? await Promise.all(containedAssets.map((asset) => options.onGetAssetUsages(asset.asset_id)))
-                : [];
-            const aggregatedUsages = usagePayloads.flatMap((payload, index) => (
-                (payload?.usages || []).map((usage) => ({
-                    ...usage,
-                    asset_id: containedAssets[index]?.asset_id || usage.asset_id,
-                    asset_name: assetDisplayName(containedAssets[index]),
-                }))
-            ));
-            const counts = summarizeUsageTypes(aggregatedUsages);
-            const message = aggregatedUsages.length > 0
-                ? [
-                    `Delete folder "${folderName}" and its contained assets?`,
-                    `${containedAssets.length} asset(s) will be removed.`,
-                    `Clips: ${counts.clip}`,
-                    `Audio: ${counts.audio_track}`,
-                    `Guides: ${counts.guide_frame}`,
-                    `Queue: ${counts.generation_job}`,
-                    "",
-                    "Existing references will stay in place and become missing placeholders.",
-                ].join("\n")
-                : (containedAssets.length > 0
-                    ? `Delete folder "${folderName}" and its ${containedAssets.length} contained asset(s)? This cannot be undone.`
-                    : `Delete empty folder "${folderName}"?`);
+            const message = containedAssets.length > 0
+                ? `Move folder "${folderName}" and its ${containedAssets.length} asset(s) to Trash? You can restore the assets later from Trash.`
+                : `Delete empty folder "${folderName}"?`;
             if (!confirm(message)) return;
 
-            const result = await options.onDeleteFolder(folderName, true);
+            const result = await options.onDeleteFolder(folderName, false);
             if (result?.status === "conflict") {
-                throw new Error("Folder delete unexpectedly reported a usage conflict.");
+                throw new Error("Folder trash unexpectedly reported a conflict.");
             }
 
-            removeAssetsByIds(containedAssets.map((asset) => asset.asset_id));
+            for (const asset of containedAssets) {
+                updateAsset({
+                    ...asset,
+                    folder: "",
+                    trashed_at: new Date().toISOString(),
+                    trash_previous_folder: asset.trash_previous_folder || normalizeFolderName(asset.folder),
+                });
+            }
             removeFolderLocally(folderName);
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to delete folder:", error);
-            alert(error?.message || "Failed to delete folder.");
+            console.warn("[LTX Editor] Failed to trash folder:", error);
+            alert(error?.message || "Failed to move folder to Trash.");
         }
     }
 
@@ -1546,6 +2844,15 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function folderContextMenuItems(folderName) {
         const normalized = normalizeFolderName(folderName);
+        if (normalized === TRASH_FOLDER_COLLAPSE_KEY) {
+            const trashCount = trashedAssets().length;
+            return [
+                { label: isFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY) ? "Expand Trash" : "Collapse Trash", action: () => toggleFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY) },
+                { type: "separator" },
+                { label: `Restore All (${trashCount})`, disabled: !trashCount || !options.onBulkRestoreAssets, action: async () => await handleBulkRestore(trashedAssets().map((asset) => asset.asset_id)) },
+                { label: "Empty Trash", disabled: !trashCount || !options.onEmptyTrash, danger: true, action: async () => await handleEmptyTrash() },
+            ];
+        }
         if (!normalized) {
             return [
                 { label: isFolderCollapsed("") ? "Expand Root" : "Collapse Root", action: () => toggleFolderCollapsed("") },
@@ -1565,17 +2872,54 @@ export function mountSharedAssetGallery(container, options = {}) {
     function assetContextMenuItems(asset) {
         const selectedIds = selectedAssetIdsList();
         if (selectedIds.length > 1 && state.selectedAssetIds.has(asset.asset_id)) {
+            const selectionAssets = data.assets.filter((entry) => selectedIds.includes(entry.asset_id));
+            const activeIds = selectionAssets.filter((entry) => !isTrashed(entry)).map((entry) => entry.asset_id);
+            const trashedIds = selectionAssets.filter((entry) => isTrashed(entry)).map((entry) => entry.asset_id);
             return [
-                {
-                    label: `Move ${selectedIds.length} assets to folder...`,
+                ...(activeIds.length ? [{
+                    label: `Move ${activeIds.length} asset${activeIds.length === 1 ? "" : "s"} to folder...`,
                     disabled: !options.onBulkMoveAssets,
-                    action: async () => await handleBulkMove(selectedIds),
-                },
-                {
-                    label: `Delete ${selectedIds.length} assets`,
+                    action: async () => await handleBulkMove(activeIds),
+                }] : []),
+                ...(activeIds.length ? [{
+                    label: `Trash ${activeIds.length} asset${activeIds.length === 1 ? "" : "s"}`,
                     disabled: !options.onBulkDeleteAssets,
                     danger: true,
-                    action: async () => await handleBulkDelete(selectedIds),
+                    action: async () => await handleBulkDelete(activeIds),
+                }] : []),
+                ...((activeIds.length && trashedIds.length) ? [{ type: "separator" }] : []),
+                ...(trashedIds.length ? [{
+                    label: `Restore ${trashedIds.length} asset${trashedIds.length === 1 ? "" : "s"}`,
+                    disabled: !options.onBulkRestoreAssets,
+                    action: async () => await handleBulkRestore(trashedIds),
+                }] : []),
+                ...(trashedIds.length ? [{
+                    label: `Delete ${trashedIds.length} permanently`,
+                    disabled: !options.onBulkPermanentDeleteAssets,
+                    danger: true,
+                    action: async () => await handleBulkPermanentDelete(trashedIds),
+                }] : []),
+            ];
+        }
+
+        if (isTrashed(asset)) {
+            return [
+                {
+                    label: "Restore",
+                    disabled: !options.onRestoreAsset,
+                    action: async () => {
+                        selectAsset(asset.asset_id, { focusList: true });
+                        await handleAssetRestore(asset);
+                    },
+                },
+                {
+                    label: "Delete Permanently",
+                    disabled: !options.onPermanentDeleteAsset,
+                    danger: true,
+                    action: async () => {
+                        selectAsset(asset.asset_id, { focusList: true });
+                        await handleAssetPermanentDelete(asset);
+                    },
                 },
             ];
         }
@@ -1612,7 +2956,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 },
             },
             { type: "separator" },
-            { label: "Delete Asset", disabled: !options.onDeleteAsset, danger: true, action: async () => await handleAssetDelete(asset) },
+            { label: "Move to Trash", disabled: !options.onDeleteAsset, danger: true, action: async () => await handleAssetDelete(asset) },
         ];
     }
 
@@ -1691,6 +3035,39 @@ export function mountSharedAssetGallery(container, options = {}) {
         return header;
     }
 
+    function renderTrashFolderHeader(assetCount) {
+        const collapsed = isFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY);
+        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:#2a1814;color:#f0b39f;font-size:10px;font-weight:600;border:1px solid rgba(214,132,98,0.22);`);
+        header.dataset.folderHeader = TRASH_FOLDER_COLLAPSE_KEY;
+
+        const left = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;min-width:0;`);
+        const toggle = style(document.createElement("button"), `width:18px;height:18px;border-radius:4px;border:1px solid #73443b;background:#3a211d;color:#f3c9bb;cursor:pointer;font-size:10px;line-height:1;padding:0;flex:0 0 auto;`);
+        toggle.type = "button";
+        toggle.textContent = collapsed ? ">" : "v";
+        toggle.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggleFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY);
+        });
+        const label = style(document.createElement("div"), `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;`);
+        label.textContent = "Trash";
+        label.addEventListener("click", (event) => {
+            event.preventDefault();
+            toggleFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY);
+        });
+        left.append(toggle, label);
+
+        const count = style(document.createElement("div"), `color:#f0b39f;font-size:10px;flex:0 0 auto;`);
+        count.textContent = String(assetCount);
+        header.append(left, count);
+        header.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            showContextMenu(event.clientX, event.clientY, folderContextMenuItems(TRASH_FOLDER_COLLAPSE_KEY));
+        });
+        return header;
+    }
+
     async function handleFileInputChange() {
         const files = Array.from(fileInput.files || []);
         if (!files.length) return;
@@ -1731,11 +3108,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         tabsRow.innerHTML = "";
         listScroller.innerHTML = "";
 
+        const activeAssets = data.assets.filter((asset) => !isTrashed(asset));
         const counts = {
-            all: data.assets.length,
-            video: data.assets.filter((asset) => asset.asset_type === "video").length,
-            image: data.assets.filter((asset) => asset.asset_type === "image").length,
-            audio: data.assets.filter((asset) => asset.asset_type === "audio").length,
+            all: activeAssets.length,
+            video: activeAssets.filter((asset) => asset.asset_type === "video").length,
+            image: activeAssets.filter((asset) => asset.asset_type === "image").length,
+            audio: activeAssets.filter((asset) => asset.asset_type === "audio").length,
         };
         const tabs = [
             ["all", `All (${counts.all})`],
@@ -1756,7 +3134,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         const assets = filteredAssets();
-        ensureFocusedAsset(assets);
+        const visibleAssets = navigableAssets();
+        ensureFocusedAsset(visibleAssets);
         const selected = selectedAsset();
         const folders = allFolders();
         let renderedAnything = false;
@@ -1798,7 +3177,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                     ? "Click to inspect. Drag onto a folder header to move assets."
                     : "Click to inspect. Drag onto the graph to create a loader node.";
                 row.addEventListener("click", (event) => {
-                    handleAssetActivation(asset.asset_id, event, assets, { focusList: true, scrollIntoView: true });
+                    handleAssetActivation(asset.asset_id, event, visibleAssets, { focusList: true, scrollIntoView: true });
+                });
+                row.addEventListener("dblclick", () => {
+                    openInspectOverlay(asset);
                 });
                 row.addEventListener("contextmenu", (event) => {
                     event.preventDefault();
@@ -1881,6 +3263,76 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
         }
 
+        const trashedList = trashedAssets();
+        if (trashedList.length) {
+            renderedAnything = true;
+            listScroller.appendChild(renderTrashFolderHeader(trashedList.length));
+
+            if (!isFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY)) {
+                for (const asset of trashedList) {
+                    const isSelected = state.selectedAssetIds.has(asset.asset_id);
+                    const isPrimary = state.selectedAssetId === asset.asset_id;
+                    const isFocused = state.focusedAssetId === asset.asset_id;
+                    const borderColor = isSelected
+                        ? (isPrimary ? "#d39b86" : "#9f6d5f")
+                        : (isFocused ? "#8e6f67" : "#5a433c");
+                    const background = isSelected
+                        ? "rgba(123,73,58,0.26)"
+                        : (isFocused ? "rgba(123,73,58,0.17)" : "rgba(90,52,41,0.14)");
+                    const focusRing = isPrimary
+                        ? "box-shadow:inset 0 0 0 1px rgba(240,179,159,0.42);"
+                        : (isFocused ? "box-shadow:inset 0 0 0 1px rgba(240,179,159,0.2);" : "");
+                    const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? "24px 72px minmax(0,1fr)" : "72px minmax(0,1fr)"};gap:8px;padding:6px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;opacity:0.92;${focusRing}`);
+                    row.dataset.assetRow = asset.asset_id;
+                    row.title = "Trashed asset. Restore to bring it back to its previous folder.";
+                    row.addEventListener("click", (event) => {
+                        handleAssetActivation(asset.asset_id, event, visibleAssets, { focusList: true, scrollIntoView: true });
+                    });
+                    row.addEventListener("contextmenu", (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (!(state.selectedAssetIds.has(asset.asset_id) && selectedAssetIdsList().length > 1)) {
+                            selectAsset(asset.asset_id, { focusList: true });
+                        }
+                        showContextMenu(event.clientX, event.clientY, assetContextMenuItems(asset));
+                    });
+                    if (state.manageMode) {
+                        const checkboxWrap = style(document.createElement("div"), `display:flex;align-items:center;justify-content:center;`);
+                        const checkbox = style(document.createElement("input"), `margin:0;cursor:pointer;`);
+                        checkbox.type = "checkbox";
+                        checkbox.checked = isSelected;
+                        checkbox.addEventListener("click", (event) => event.stopPropagation());
+                        checkbox.addEventListener("change", (event) => {
+                            event.stopPropagation();
+                            toggleAssetSelection(asset.asset_id, { focusList: true });
+                        });
+                        checkboxWrap.appendChild(checkbox);
+                        row.appendChild(checkboxWrap);
+                    }
+
+                    const thumb = style(document.createElement("div"), `height:54px;border-radius:5px;background:#1a1412;border:1px solid #6b4d43;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#f0b39f;font-size:10px;`);
+                    if (asset.has_thumbnail) {
+                        const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;opacity:0.74;filter:saturate(0.6);`);
+                        img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
+                        img.alt = assetDisplayName(asset);
+                        img.draggable = false;
+                        thumb.appendChild(img);
+                    } else {
+                        thumb.textContent = assetFallbackGlyph(asset.asset_type);
+                    }
+
+                    const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
+                    const name = style(document.createElement("div"), `color:#f0d6cc;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                    name.textContent = assetDisplayName(asset);
+                    const meta = style(document.createElement("div"), `color:#c0a49a;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                    meta.textContent = `trashed | ${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatDate(asset.trashed_at)}`;
+                    text.append(name, meta);
+                    row.append(thumb, text);
+                    listScroller.appendChild(row);
+                }
+            }
+        }
+
         if (!renderedAnything) {
             const empty = style(document.createElement("div"), `padding:10px;border-radius:6px;background:rgba(255,255,255,0.04);color:#9aa6b2;font-size:10px;`);
             empty.textContent = data.assets.length ? "No assets match the current filter." : "No assets in this project yet. Drag files here or use Import.";
@@ -1957,13 +3409,12 @@ export function mountSharedAssetGallery(container, options = {}) {
     listScroller.addEventListener("keydown", (event) => {
         if (event.target !== listScroller) return;
 
-        const assets = filteredAssets();
-        const navigableAssets = ensureFocusedAsset(assets);
+        const visibleAssetList = ensureFocusedAsset(navigableAssets());
         const selectionCount = selectedAssetIdsList().length;
 
         if ((event.ctrlKey || event.metaKey) && String(event.key || "").toLowerCase() === "a") {
             event.preventDefault();
-            const allVisibleIds = navigableAssets.map((asset) => asset.asset_id);
+            const allVisibleIds = visibleAssetList.map((asset) => asset.asset_id);
             if (!allVisibleIds.length) return;
             const primaryId = allVisibleIds.includes(state.selectedAssetId)
                 ? state.selectedAssetId
@@ -1974,14 +3425,14 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (LIST_NAV_KEYS.has(event.key)) {
             event.preventDefault();
-            if (!navigableAssets.length) return;
+            if (!visibleAssetList.length) return;
             const direction = event.key === "ArrowUp" || event.key === "ArrowLeft" ? -1 : 1;
-            const currentIndex = navigableAssets.findIndex((asset) => asset.asset_id === state.focusedAssetId);
+            const currentIndex = visibleAssetList.findIndex((asset) => asset.asset_id === state.focusedAssetId);
             const nextIndex = Math.min(
-                navigableAssets.length - 1,
+                visibleAssetList.length - 1,
                 Math.max(0, (currentIndex >= 0 ? currentIndex : 0) + direction),
             );
-            const nextAssetId = navigableAssets[nextIndex]?.asset_id || "";
+            const nextAssetId = visibleAssetList[nextIndex]?.asset_id || "";
             selectAsset(nextAssetId, { scrollIntoView: true });
             return;
         }
@@ -1990,6 +3441,16 @@ export function mountSharedAssetGallery(container, options = {}) {
             event.preventDefault();
             if (!state.focusedAssetId) return;
             selectAsset(state.focusedAssetId, { scrollIntoView: true });
+            return;
+        }
+
+        if (event.key === " " || event.key === "Spacebar") {
+            event.preventDefault();
+            if (!state.focusedAssetId) return;
+            const focusedAsset = data.assets.find((asset) => asset.asset_id === state.focusedAssetId);
+            if (focusedAsset) {
+                openInspectOverlay(focusedAsset);
+            }
             return;
         }
 
@@ -2007,12 +3468,23 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (event.key === "Delete") {
             event.preventDefault();
             if (selectionCount > 1) {
-                void handleBulkDelete();
+                const selection = selectedAssets();
+                const activeIds = selection.filter((asset) => !isTrashed(asset)).map((asset) => asset.asset_id);
+                const trashedIds = selection.filter((asset) => isTrashed(asset)).map((asset) => asset.asset_id);
+                if (activeIds.length) {
+                    void handleBulkDelete(activeIds);
+                } else if (trashedIds.length) {
+                    void handleBulkPermanentDelete(trashedIds);
+                }
                 return;
             }
             const asset = selectedAsset();
             if (asset) {
-                void handleAssetDelete(asset);
+                if (isTrashed(asset)) {
+                    void handleAssetPermanentDelete(asset);
+                } else {
+                    void handleAssetDelete(asset);
+                }
             }
         }
     });
@@ -2075,6 +3547,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (state.destroyed) return;
         state.destroyed = true;
         resizeObserver?.disconnect();
+        closeInspectOverlay();
         hideContextMenu();
         destroyLiveMedia();
     }

@@ -772,6 +772,11 @@ export class EditorWidget {
             onDeleteAsset: async (assetId, force) => await this._deleteAsset(assetId, force),
             onBulkMoveAssets: async (assetIds, folder) => await this._bulkMoveAssets(assetIds, folder),
             onBulkDeleteAssets: async (assetIds, force) => await this._bulkDeleteAssets(assetIds, force),
+            onRestoreAsset: async (assetId) => await this._restoreAsset(assetId),
+            onBulkRestoreAssets: async (assetIds) => await this._bulkRestoreAssets(assetIds),
+            onPermanentDeleteAsset: async (assetId, force) => await this._permanentDeleteAsset(assetId, force),
+            onBulkPermanentDeleteAssets: async (assetIds, force) => await this._bulkPermanentDeleteAssets(assetIds, force),
+            onEmptyTrash: async () => await this._emptyTrash(),
             onCreateFolder: async (folderName) => await this._createAssetFolder(folderName),
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
             onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
@@ -1191,7 +1196,7 @@ export class EditorWidget {
 
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets`));
+            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets?include_trashed=true`));
             if (resp.ok) {
                 const data = await resp.json();
                 this.assets = { video: [], image: [], audio: [] };
@@ -1286,7 +1291,7 @@ export class EditorWidget {
             this._fetchAssets(),
             this._fetchRenderQueue(),
         ]);
-        return { status: "deleted", ...(payload || {}) };
+        return { status: "trashed", ...(payload || {}) };
     }
 
     async _bulkDeleteAssets(assetIds, force = false) {
@@ -1303,6 +1308,107 @@ export class EditorWidget {
         }
         if (!resp.ok) {
             throw new Error(`Bulk asset delete failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchRenderQueue(),
+        ]);
+        return { status: "trashed", ...(payload || {}) };
+    }
+
+    async _restoreAsset(assetId) {
+        if (!this.projectDir || !assetId) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/restore`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_id: assetId }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Asset restore failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchRenderQueue(),
+        ]);
+        return { status: "restored", ...(payload || {}) };
+    }
+
+    async _bulkRestoreAssets(assetIds) {
+        if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-restore`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_ids: assetIds }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Bulk asset restore failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchRenderQueue(),
+        ]);
+        return { status: "restored", ...(payload || {}) };
+    }
+
+    async _permanentDeleteAsset(assetId, force = false) {
+        if (!this.projectDir || !assetId) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/permanent`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_id: assetId, force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Permanent asset delete failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchRenderQueue(),
+        ]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
+    async _bulkPermanentDeleteAssets(assetIds, force = false) {
+        if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-permanent-delete`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Bulk permanent asset delete failed: ${resp.status}`);
+        }
+        const payload = await resp.json();
+        await Promise.all([
+            this._fetchAssets(),
+            this._fetchRenderQueue(),
+        ]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
+    async _emptyTrash() {
+        if (!this.projectDir) return { status: "noop" };
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/empty-trash`), {
+            method: "POST",
+        });
+        if (!resp.ok) {
+            throw new Error(`Empty trash failed: ${resp.status}`);
         }
         const payload = await resp.json();
         await Promise.all([

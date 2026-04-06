@@ -46,7 +46,7 @@ function buildDormantSummaryUrl(state) {
 }
 
 function buildDormantAssetsUrl(projectDir) {
-    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/assets/dormant`);
+    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/assets/dormant?include_trashed=true`);
 }
 
 function buildQueueUrl(projectDir) {
@@ -1012,11 +1012,50 @@ export class EditorNodeController {
         }
 
         const payload = await resp.json();
-        this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
+        this._invalidateModules(["assets"]);
+        this._reloadExpandedModuleIfNeeded(["assets"]);
         await this.refreshSummary({ syncAssets: true });
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
-        return { status: "deleted", ...(payload || {}) };
+        return { status: "trashed", ...(payload || {}) };
+    }
+
+    async _restoreAsset(assetId) {
+        if (!this.state.projectDir || !assetId) return { status: "noop" };
+
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/restore`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_id: assetId }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Asset restore failed: ${resp.status}`);
+        }
+
+        const payload = await resp.json();
+        this._invalidateModules(["assets"]);
+        this._reloadExpandedModuleIfNeeded(["assets"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return { status: "restored", ...(payload || {}) };
+    }
+
+    async _bulkRestoreAssets(assetIds) {
+        if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-restore`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_ids: assetIds }),
+        });
+        if (!resp.ok) {
+            throw new Error(`Bulk asset restore failed: ${resp.status}`);
+        }
+
+        const payload = await resp.json();
+        this._invalidateModules(["assets"]);
+        this._reloadExpandedModuleIfNeeded(["assets"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return { status: "restored", ...(payload || {}) };
     }
 
     async _bulkDeleteAssets(assetIds, force = false) {
@@ -1032,6 +1071,70 @@ export class EditorNodeController {
         }
         if (!resp.ok) {
             throw new Error(`Bulk asset delete failed: ${resp.status}`);
+        }
+
+        const payload = await resp.json();
+        this._invalidateModules(["assets"]);
+        this._reloadExpandedModuleIfNeeded(["assets"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return { status: "trashed", ...(payload || {}) };
+    }
+
+    async _permanentDeleteAsset(assetId, force = false) {
+        if (!this.state.projectDir || !assetId) return { status: "noop" };
+
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/permanent`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_id: assetId, force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Permanent asset delete failed: ${resp.status}`);
+        }
+
+        const payload = await resp.json();
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
+    async _bulkPermanentDeleteAssets(assetIds, force = false) {
+        if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-permanent-delete`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
+        });
+        if (resp.status === 409) {
+            const payload = await resp.json();
+            return { status: "conflict", ...(payload || {}) };
+        }
+        if (!resp.ok) {
+            throw new Error(`Bulk permanent asset delete failed: ${resp.status}`);
+        }
+
+        const payload = await resp.json();
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
+        await this.refreshSummary({ syncAssets: true });
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        return { status: "deleted", ...(payload || {}) };
+    }
+
+    async _emptyTrash() {
+        if (!this.state.projectDir) return { status: "noop" };
+        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/empty-trash`), {
+            method: "POST",
+        });
+        if (!resp.ok) {
+            throw new Error(`Empty trash failed: ${resp.status}`);
         }
 
         const payload = await resp.json();
@@ -1171,6 +1274,11 @@ export class EditorNodeController {
             onDeleteAsset: async (assetId, force) => await this._deleteAsset(assetId, force),
             onBulkMoveAssets: async (assetIds, folder) => await this._bulkMoveAssets(assetIds, folder),
             onBulkDeleteAssets: async (assetIds, force) => await this._bulkDeleteAssets(assetIds, force),
+            onRestoreAsset: async (assetId) => await this._restoreAsset(assetId),
+            onBulkRestoreAssets: async (assetIds) => await this._bulkRestoreAssets(assetIds),
+            onPermanentDeleteAsset: async (assetId, force) => await this._permanentDeleteAsset(assetId, force),
+            onBulkPermanentDeleteAssets: async (assetIds, force) => await this._bulkPermanentDeleteAssets(assetIds, force),
+            onEmptyTrash: async () => await this._emptyTrash(),
             onCreateFolder: async (folderName) => await this._createAssetFolder(folderName),
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
             onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
