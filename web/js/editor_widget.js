@@ -6,6 +6,18 @@
 const { api } = window.comfyAPI.api;
 
 import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import {
+    CLIP_LABEL_MODE_OPTIONS,
+    DEFAULT_EDITOR_SETTINGS,
+    GALLERY_SORT_OPTIONS,
+    GALLERY_THUMBNAIL_SIZE_OPTIONS,
+    PLAYBACK_RESOLUTION_OPTIONS,
+    SNAP_TARGET_OPTIONS,
+    TIMECODE_MODE_OPTIONS,
+    getEditorSettings,
+    subscribeEditorSettings,
+    updateEditorSettings,
+} from "./editor_settings.js";
 
 export async function uploadFileToComfyInput(file) {
     if (!file) return "";
@@ -96,6 +108,10 @@ const GALLERY_HEIGHT = 160;
 const RULER_HEIGHT = 24;
 const TRACK_HEIGHT = 32;
 const SCENE_BAR_HEIGHT = 36;
+const FULLSCREEN_SIDEBAR_DEFAULT_WIDTH = 240;
+const FULLSCREEN_SIDEBAR_MIN_WIDTH = 180;
+const FULLSCREEN_TIMELINE_MIN_HEIGHT = 160;
+const FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT = 600;
 const TRACK_TYPE = { VIDEO: "video", AUDIO: "audio", GUIDES: "guides", PROMPT: "prompt" };
 const TRACK_COLLAPSED_HEIGHT = 8; // Height when a track is collapsed
 const LABEL_WIDTH = 55; // px reserved for track labels (node mode)
@@ -140,6 +156,26 @@ const COLORS = {
     textDim: "#777",
 };
 
+function lightenColor(hex, amount) {
+    if (typeof hex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
+    const mix = Math.max(0, Math.min(1, amount));
+    const channel = (offset) => {
+        const value = parseInt(hex.slice(offset, offset + 2), 16);
+        return Math.round(value + (255 - value) * mix);
+    };
+    return `#${channel(1).toString(16).padStart(2, "0")}${channel(3).toString(16).padStart(2, "0")}${channel(5).toString(16).padStart(2, "0")}`;
+}
+
+function scaleColor(hex, factor) {
+    if (typeof hex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
+    const scale = Math.max(0.2, Math.min(2.0, factor));
+    const channel = (offset) => {
+        const value = parseInt(hex.slice(offset, offset + 2), 16);
+        return Math.round(Math.max(0, Math.min(255, value * scale)));
+    };
+    return `#${channel(1).toString(16).padStart(2, "0")}${channel(3).toString(16).padStart(2, "0")}${channel(5).toString(16).padStart(2, "0")}`;
+}
+
 // ── Editor Widget Class ────────────────────────────────────────────────
 export class EditorWidget {
     constructor(node, options = {}) {
@@ -150,6 +186,8 @@ export class EditorWidget {
         this.projectDir = "";
         this.projectId = "";
         this._destroyed = false;
+        this._settings = getEditorSettings();
+        this._settingsUnsubscribe = null;
 
         // Scene state
         this.scenes = [];
@@ -157,11 +195,12 @@ export class EditorWidget {
         this.activeScene = null;
 
         // Timeline state
-        this.totalFrames = 200;
+        this.totalFrames = this._settings.projectDefaults.newSceneDuration;
         this.selectionStart = 0;
         this.selectionEnd = 0;
         this.playhead = 0;
         this.scrollX = 0;
+        this.scrollY = 0;
         this.pixelsPerFrame = 3;
         this.isDragging = false;
         this.dragType = null; // "selection", "playhead", "selStart", "selEnd"
@@ -210,6 +249,8 @@ export class EditorWidget {
         this._playbackRAF = null;
         this._playbackStartTime = 0;
         this._playbackStartFrame = 0;
+        this._playbackSessionStartFrame = 0;
+        this._playbackLoopRange = null;
         this._videoCache = {};       // source_path → HTMLVideoElement
         this._audioCacheMap = {};    // source_path → HTMLAudioElement
         this._vpCanvas = null;
@@ -219,8 +260,8 @@ export class EditorWidget {
         this._activePlaybackAudios = [];
 
         // Snapping
-        this.snappingEnabled = true;
-        this._snapThreshold = 5; // frames
+        this.snappingEnabled = !!this._settings.timelineBehavior.snappingEnabled;
+        this._snapThreshold = this._settings.timelineBehavior.snapThreshold;
         this._snapIndicator = null; // frame number of active snap line, or null
 
         // Track layout: dynamically built array of { type, label, laneIndex, collapsed }
@@ -228,7 +269,7 @@ export class EditorWidget {
         this._buildTrackLayout();
 
         // Timecode display mode: "frames" or "timecode" (HH:MM:SS:FF)
-        this._timecodeMode = "frames";
+        this._timecodeMode = this._settings.timelineBehavior.timecodeMode;
 
         // Undo/Redo state
         this._undoStack = [];   // Array of { sceneId, snapshot, label }
@@ -242,24 +283,13 @@ export class EditorWidget {
         // Asset path→assetId reverse lookup (rebuilt on asset fetch)
         this._pathToAsset = {};
 
-        // Per-section UI scale factors (persisted via localStorage)
-        // Migrate old global scale to per-section if present
-        const _oldScale = localStorage.getItem("ltx-editor-ui-scale");
-        if (_oldScale) {
-            for (const k of ["toolbar", "trackheaders", "timeline", "gallery"]) {
-                if (!localStorage.getItem(`ltx-editor-scale-${k}`))
-                    localStorage.setItem(`ltx-editor-scale-${k}`, _oldScale);
-            }
-            localStorage.removeItem("ltx-editor-ui-scale");
-        }
-        this._scaleToolbar = parseFloat(localStorage.getItem("ltx-editor-scale-toolbar") || "1.0");
-        this._scaleTrackHeaders = parseFloat(localStorage.getItem("ltx-editor-scale-trackheaders") || "1.0");
-        this._scaleTimeline = parseFloat(localStorage.getItem("ltx-editor-scale-timeline") || "1.0");
-        this._scaleGallery = parseFloat(localStorage.getItem("ltx-editor-scale-gallery") || "1.0");
-
-        // User-adjustable track header width (persisted per mode)
-        this._labelWidthUser = parseInt(localStorage.getItem("ltx-editor-label-width") || "0"); // 0 = use default
-        this._labelWidthUserFS = parseInt(localStorage.getItem("ltx-editor-label-width-fs") || "0");
+        // Per-section UI scale factors and layout settings
+        this._scaleToolbar = this._settings.layout.scaleToolbar;
+        this._scaleTrackHeaders = this._settings.layout.scaleTrackHeaders;
+        this._scaleTimeline = this._settings.layout.scaleTimeline;
+        this._scaleGallery = this._settings.layout.scaleGallery;
+        this._labelWidthUser = this._settings.layout.labelWidth;
+        this._labelWidthUserFS = this._settings.layout.labelWidthFullscreen;
 
         // Editor focus state — true when user last clicked inside the editor
         this._editorFocused = false;
@@ -280,6 +310,7 @@ export class EditorWidget {
 
         // Apply initial UI scales (bars + canvas will be scaled on first render)
         this._applyScales();
+        this._settingsUnsubscribe = subscribeEditorSettings((settings) => this._handleSettingsChange(settings));
 
         // Window resize handler for fullscreen
         this._windowResizeHandler = () => {
@@ -316,7 +347,7 @@ export class EditorWidget {
 
         // Timeline canvas
         this.timelineCanvas = document.createElement("canvas");
-        this.timelineCanvas.style.cssText = `width: 100%; cursor: crosshair;`;
+        this.timelineCanvas.style.cssText = `cursor: crosshair; flex-shrink: 0; display: block;`;
         this.timelineCanvas.height = this._timelineHeight;
         this.container.appendChild(this.timelineCanvas);
 
@@ -385,7 +416,7 @@ export class EditorWidget {
         this.durationInput.type = "number";
         this.durationInput.min = 1;
         this.durationInput.max = 99999;
-        this.durationInput.value = 200;
+        this.durationInput.value = this.totalFrames;
         this.durationInput.style.cssText = `
             width: 55px; background: #333; border: 1px solid #555; color: #ddd;
             padding: 2px 4px; font-size: 11px; border-radius: 3px; text-align: center;
@@ -565,8 +596,7 @@ export class EditorWidget {
         };
 
         this._toolBtnSnap = makeToolBtn("⊞ Snap", "S", "Toggle snapping", () => this.snappingEnabled, () => {
-            this.snappingEnabled = !this.snappingEnabled;
-            this._updateToolbar();
+            this._setSnappingEnabled(!this.snappingEnabled);
         });
 
         this._toolBtnRazor = makeToolBtn("✂ Cut", "C", "Toggle razor/cut mode", () => this._razorMode, () => {
@@ -861,7 +891,7 @@ export class EditorWidget {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     name: `Scene ${this.scenes.length + 1}`,
-                    duration_frames: Math.max(1, this.totalFrames || 200),
+                    duration_frames: Math.max(1, this._defaultNewSceneDuration()),
                 }),
             });
             if (resp.ok) {
@@ -875,7 +905,9 @@ export class EditorWidget {
     }
 
     _setActiveScene(scene) {
-        const isSameScene = this.activeSceneId === scene.scene_id;
+        const hasActiveScene = !!this.activeScene;
+        const preservePendingFrameSelection = !hasActiveScene && this.activeSceneId === scene.scene_id;
+        const isSameScene = hasActiveScene && this.activeSceneId === scene.scene_id;
 
         if (!isSameScene) {
             if (this._animaticMode && this._restoreAnimaticState()) {
@@ -887,20 +919,23 @@ export class EditorWidget {
             // Clear undo/redo on scene switch (snapshots are scene-specific)
             this._undoStack = [];
             this._redoStack = [];
-            this.selectionStart = 0;
-            this.selectionEnd = 0;
-            this.playhead = 0;
+            this.scrollY = 0;
             this._selectedPromptIdx = null;
             this._hidePromptEditor();
             this._clearSelection();
             this._hideItemEditor();
-            this._setWidgetValue("selection_start", 0);
-            this._setWidgetValue("selection_end", 0);
+            if (!preservePendingFrameSelection) {
+                this.selectionStart = 0;
+                this.selectionEnd = 0;
+                this.playhead = 0;
+                this._setWidgetValue("selection_start", 0);
+                this._setWidgetValue("selection_end", 0);
+            }
         }
 
         this.activeScene = scene;
         this.activeSceneId = scene.scene_id;
-        if (isSameScene) {
+        if (isSameScene || preservePendingFrameSelection) {
             this._reconcileSelection();
         }
         this._buildTrackLayout();
@@ -1878,15 +1913,26 @@ export class EditorWidget {
         return `${m}:${String(s).padStart(2,"0")}:${String(f).padStart(2,"0")}`;
     }
 
+    _setSnappingEnabled(enabled) {
+        this._updateSettings({
+            timelineBehavior: {
+                snappingEnabled: !!enabled,
+            },
+        });
+    }
+
+    _setTimecodeMode(mode) {
+        const nextMode = mode === "timecode" ? "timecode" : "frames";
+        if (nextMode === this._timecodeMode) return;
+        this._updateSettings({
+            timelineBehavior: {
+                timecodeMode: nextMode,
+            },
+        });
+    }
+
     _toggleTimecodeMode() {
-        this._timecodeMode = this._timecodeMode === "frames" ? "timecode" : "frames";
-        this._refreshDurationInput();
-        if (this._itemEditorEl && this.selectedItem) {
-            this._showItemEditor();
-        }
-        this._renderTimeline();
-        this._updateToolbar();
-        this._updateTransportUI();
+        this._setTimecodeMode(this._timecodeMode === "frames" ? "timecode" : "frames");
     }
 
     async _toggleAnimatic() {
@@ -1981,6 +2027,7 @@ export class EditorWidget {
         });
 
         this._trackLayout = layout;
+        this._clampScrollY();
     }
 
     /** Find layout index for a video lane */
@@ -2033,6 +2080,216 @@ export class EditorWidget {
         return h;
     }
 
+    _timelineRulerHeight() {
+        return Math.round(RULER_HEIGHT * this._scaleTimeline);
+    }
+
+    _visibleTimelineContentHeight() {
+        return Math.max(0, this._timelineHeight - this._timelineRulerHeight());
+    }
+
+    _clampScrollY() {
+        const maxScroll = Math.max(0, this._totalTracksHeight() - this._visibleTimelineContentHeight());
+        this.scrollY = Math.max(0, Math.min(maxScroll, this.scrollY));
+    }
+
+    _trackContentYFromRawY(rawY) {
+        const rulerH = this._timelineRulerHeight();
+        if (rawY < rulerH) return null;
+        return rawY - rulerH + this.scrollY;
+    }
+
+    _layoutIndexFromRawY(rawY) {
+        const contentY = this._trackContentYFromRawY(rawY);
+        if (contentY === null) return -1;
+        let offset = 0;
+        for (let i = 0; i < this._trackLayout.length; i++) {
+            const trackH = this._trackH(i);
+            if (contentY >= offset && contentY < offset + trackH) {
+                return i;
+            }
+            offset += trackH;
+        }
+        return -1;
+    }
+
+    _updateSettings(partial) {
+        return updateEditorSettings(partial);
+    }
+
+    _handleSettingsChange(settings) {
+        const nextSettings = settings || getEditorSettings();
+        const prevTimecodeMode = this._timecodeMode;
+        this._settings = nextSettings;
+        this.snappingEnabled = !!nextSettings.timelineBehavior.snappingEnabled;
+        this._snapThreshold = nextSettings.timelineBehavior.snapThreshold;
+        this._timecodeMode = nextSettings.timelineBehavior.timecodeMode;
+        this._scaleToolbar = nextSettings.layout.scaleToolbar;
+        this._scaleTrackHeaders = nextSettings.layout.scaleTrackHeaders;
+        this._scaleTimeline = nextSettings.layout.scaleTimeline;
+        this._scaleGallery = nextSettings.layout.scaleGallery;
+        this._labelWidthUser = nextSettings.layout.labelWidth;
+        this._labelWidthUserFS = nextSettings.layout.labelWidthFullscreen;
+
+        if (!this.activeScene) {
+            this.totalFrames = nextSettings.projectDefaults.newSceneDuration;
+        }
+        if (this.durationInput) {
+            this._refreshDurationInput();
+        }
+        if (prevTimecodeMode !== this._timecodeMode && this._itemEditorEl && this.selectedItem) {
+            this._showItemEditor();
+        }
+        this._syncSettingsPanelControls();
+        if (this._sceneBar) {
+            this._applyScales();
+        }
+        if (this.isFullscreen) {
+            if (this._fsSidebar && nextSettings.layout.fullscreenSidebarWidth > 0) {
+                const sidebarMax = this._computeFullscreenSidebarMaxWidth();
+                this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, nextSettings.layout.fullscreenSidebarWidth))}px`;
+            }
+            if (this._fsBottomRow && nextSettings.layout.fullscreenTimelineHeight > 0) {
+                const timelineMax = this._computeFullscreenTimelineMaxHeight();
+                this._fsBottomRow.style.height = `${Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.min(timelineMax, nextSettings.layout.fullscreenTimelineHeight))}px`;
+            }
+            this._recalcFullscreenHeights();
+            requestAnimationFrame(() => {
+                if (this._destroyed || !this.isFullscreen) return;
+                this._resizeViewportCanvas();
+                this._renderViewportFrame();
+            });
+        } else if (this._vpCanvas) {
+            this._resizeViewportCanvas();
+            this._renderViewportFrame();
+        }
+        this._updateToolbar();
+        this._updateTransportUI();
+    }
+
+    _syncSettingsPanelControls() {
+        if (!this._settingsPanelControls) return;
+        const controls = this._settingsPanelControls;
+        if (controls.scaleToolbarLabel) controls.scaleToolbarLabel.textContent = `${Math.round(this._settings.layout.scaleToolbar * 100)}%`;
+        if (controls.scaleTrackHeadersLabel) controls.scaleTrackHeadersLabel.textContent = `${Math.round(this._settings.layout.scaleTrackHeaders * 100)}%`;
+        if (controls.scaleTimelineLabel) controls.scaleTimelineLabel.textContent = `${Math.round(this._settings.layout.scaleTimeline * 100)}%`;
+        if (controls.scaleGalleryLabel) controls.scaleGalleryLabel.textContent = `${Math.round(this._settings.layout.scaleGallery * 100)}%`;
+        if (controls.snappingEnabled) controls.snappingEnabled.checked = !!this._settings.timelineBehavior.snappingEnabled;
+        if (controls.snapThreshold) controls.snapThreshold.value = String(this._settings.timelineBehavior.snapThreshold);
+        for (const option of SNAP_TARGET_OPTIONS) {
+            const control = controls[`snapTarget_${option.key}`];
+            if (control) control.checked = !!this._settings.timelineBehavior.snapTargets[option.key];
+        }
+        if (controls.timecodeMode) controls.timecodeMode.value = this._settings.timelineBehavior.timecodeMode;
+        if (controls.loopSelection) controls.loopSelection.checked = !!this._settings.playback.loopSelection;
+        if (controls.autoScrollPlayhead) controls.autoScrollPlayhead.checked = !!this._settings.playback.autoScrollPlayhead;
+        if (controls.returnToPlaybackStart) controls.returnToPlaybackStart.checked = !!this._settings.playback.returnToPlaybackStart;
+        if (controls.playbackResolution) controls.playbackResolution.value = this._settings.playback.resolution;
+        if (controls.waveformAccent) controls.waveformAccent.value = this._settings.appearance.waveformAccent;
+        if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
+        if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
+        if (controls.clipLabelMode) controls.clipLabelMode.value = this._settings.appearance.clipLabelMode;
+        if (controls.defaultProjectFps) controls.defaultProjectFps.value = String(this._settings.projectDefaults.fps);
+        if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
+        if (controls.defaultProjectHeight) controls.defaultProjectHeight.value = String(this._settings.projectDefaults.height);
+        if (controls.defaultSceneDuration) controls.defaultSceneDuration.value = String(this._settings.projectDefaults.newSceneDuration);
+        if (controls.gallerySortMode) controls.gallerySortMode.value = this._settings.gallery.sortMode;
+        if (controls.galleryInspectorCollapsed) controls.galleryInspectorCollapsed.checked = !!this._settings.gallery.inspectorCollapsed;
+        if (controls.galleryThumbnailSize) controls.galleryThumbnailSize.value = this._settings.gallery.thumbnailSize;
+    }
+
+    _timelineBrightnessFactor() {
+        return (this._settings?.appearance?.timelineBrightness || DEFAULT_EDITOR_SETTINGS.appearance.timelineBrightness) / 100;
+    }
+
+    _timelineColor(hex) {
+        return scaleColor(hex, this._timelineBrightnessFactor());
+    }
+
+    _waveformAccentColor() {
+        return this._settings?.appearance?.waveformAccent || DEFAULT_EDITOR_SETTINGS.appearance.waveformAccent;
+    }
+
+    _clipLabelMode() {
+        return this._settings?.appearance?.clipLabelMode || DEFAULT_EDITOR_SETTINGS.appearance.clipLabelMode;
+    }
+
+    _defaultNewSceneDuration() {
+        return this._settings?.projectDefaults?.newSceneDuration || DEFAULT_EDITOR_SETTINGS.projectDefaults.newSceneDuration;
+    }
+
+    _fullscreenPersistStorageKey(persistKey) {
+        return persistKey ? `ltx-editor-fs-${persistKey}` : "";
+    }
+
+    _readFullscreenPersistValue(persistKey) {
+        if (persistKey === "sidebar-width") {
+            return this._settings.layout.fullscreenSidebarWidth || null;
+        }
+        if (persistKey === "timeline-height") {
+            return this._settings.layout.fullscreenTimelineHeight || null;
+        }
+        return null;
+    }
+
+    _writeFullscreenPersistValue(persistKey, value) {
+        if (!Number.isFinite(value)) return;
+        if (persistKey === "sidebar-width") {
+            this._updateSettings({ layout: { fullscreenSidebarWidth: Math.round(value) } });
+        } else if (persistKey === "timeline-height") {
+            this._updateSettings({ layout: { fullscreenTimelineHeight: Math.round(value) } });
+        }
+    }
+
+    _clearFullscreenPersistValue(persistKey) {
+        if (persistKey === "sidebar-width") {
+            this._updateSettings({ layout: { fullscreenSidebarWidth: 0 } });
+        } else if (persistKey === "timeline-height") {
+            this._updateSettings({ layout: { fullscreenTimelineHeight: 0 } });
+        }
+    }
+
+    _computeFullscreenSidebarMaxWidth() {
+        return Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.floor(window.innerWidth * 0.5));
+    }
+
+    _computeFullscreenTimelineMaxHeight() {
+        return Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.floor(window.innerHeight * 0.8));
+    }
+
+    _defaultFullscreenTimelineHeight() {
+        return Math.max(200, Math.min(FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT, Math.round(window.innerHeight * 0.4)));
+    }
+
+    _resetEditorLayout() {
+        this._updateSettings({
+            layout: {
+                scaleToolbar: 1.0,
+                scaleTrackHeaders: 1.0,
+                scaleTimeline: 1.0,
+                scaleGallery: 1.0,
+                labelWidth: 0,
+                labelWidthFullscreen: 0,
+                fullscreenSidebarWidth: 0,
+                fullscreenTimelineHeight: 0,
+            },
+        });
+        if (this._fsSidebar) {
+            this._fsSidebar.style.width = `${FULLSCREEN_SIDEBAR_DEFAULT_WIDTH}px`;
+        }
+        if (this._fsBottomRow) {
+            this._fsBottomRow.style.height = `${this._defaultFullscreenTimelineHeight()}px`;
+        }
+        if (this.isFullscreen) {
+            this._recalcFullscreenHeights();
+            this._renderTimeline();
+            requestAnimationFrame(() => {
+                this._resizeViewportCanvas();
+                this._renderViewportFrame();
+            });
+        }
+    }
+
     /** Fit timeline zoom to show all content */
     _fitToView() {
         // Find the rightmost content edge
@@ -2073,9 +2330,10 @@ export class EditorWidget {
         const canvas = this.timelineCanvas;
         const rect = canvas.parentElement?.getBoundingClientRect();
         const width = rect ? Math.floor(rect.width) : 400;
-        const rulerH = Math.round(RULER_HEIGHT * this._scaleTimeline);
-        const totalH = rulerH + this._totalTracksHeight();
-        const canvasH = Math.max(totalH, this._timelineHeight);
+        const rulerH = this._timelineRulerHeight();
+        const canvasH = Math.max(rulerH + 1, this._timelineHeight);
+        this._clampScrollX();
+        this._clampScrollY();
 
         // Canvas at 1:1 — per-section scales handle individual elements
         canvas.width = width;
@@ -2088,16 +2346,26 @@ export class EditorWidget {
         ctx.save();
 
         // Background
-        ctx.fillStyle = COLORS.bg;
+        ctx.fillStyle = this._timelineColor(COLORS.bg);
         ctx.fillRect(0, 0, width, canvasH);
 
         this._drawRuler(ctx, width);
+        this._drawPlayheadTriangle(ctx, width);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, rulerH, width, Math.max(0, canvasH - rulerH));
+        ctx.clip();
+        ctx.translate(0, -this.scrollY);
         this._drawTracks(ctx, width);
         this._drawSelection(ctx, width);
         this._drawGuideMarkers(ctx, width);
         this._drawClips(ctx, width);
-        this._drawPlayhead(ctx, width);
-        this._drawSnapIndicator(ctx, width);
+        this._drawPlayheadLine(ctx, width);
+        ctx.restore();
+
+        this._drawSnapIndicator(ctx, width, canvasH);
+        this._drawVerticalScrollbar(ctx, width, canvasH);
         ctx.restore();
         this._updateToolbar();
     }
@@ -2127,7 +2395,7 @@ export class EditorWidget {
     _drawRuler(ctx, width) {
         const ts = this._scaleTimeline;
         const rulerH = Math.round(RULER_HEIGHT * ts);
-        ctx.fillStyle = COLORS.ruler;
+        ctx.fillStyle = this._timelineColor(COLORS.ruler);
         ctx.fillRect(0, 0, width, rulerH);
 
         ctx.strokeStyle = COLORS.rulerTick;
@@ -2185,7 +2453,7 @@ export class EditorWidget {
             const isLane = entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO;
 
             // Track background
-            ctx.fillStyle = i % 2 === 0 ? COLORS.track : COLORS.bg;
+            ctx.fillStyle = i % 2 === 0 ? this._timelineColor(COLORS.track) : this._timelineColor(COLORS.bg);
             ctx.fillRect(0, y, width, h);
 
             if (collapsed) {
@@ -2253,7 +2521,7 @@ export class EditorWidget {
             }
 
             // Border
-            ctx.strokeStyle = COLORS.trackBorder;
+            ctx.strokeStyle = this._timelineColor(COLORS.trackBorder);
             ctx.beginPath();
             ctx.moveTo(0, y + h);
             ctx.lineTo(width, y + h);
@@ -2375,12 +2643,14 @@ export class EditorWidget {
                 const baseAlpha = laneHidden ? 0.3 : (opacity < 1.0 ? Math.max(0.3, opacity) : 1.0);
                 const clipAsset = this._getAssetForSourcePath(clip.source_path);
                 const isMissingClip = !clipAsset || !!clipAsset.missing;
+                const laneBaseColor = _vlEntry.color || COLORS.clip;
+                const clipFillColor = isSelectedClip ? lightenColor(laneBaseColor, 0.3) : laneBaseColor;
                 ctx.globalAlpha = baseAlpha;
 
                 // Draw base fill
                 ctx.fillStyle = isMissingClip
                     ? (isSelectedClip ? "#c97a59" : "#6d3f33")
-                    : (isSelectedClip ? COLORS.clipSelected : COLORS.clip);
+                    : clipFillColor;
                 ctx.fillRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
 
                 // Thumbnail strip filmstrip (tiled at natural aspect ratio)
@@ -2391,6 +2661,7 @@ export class EditorWidget {
                         ctx.beginPath();
                         ctx.rect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
                         ctx.clip();
+                        ctx.globalAlpha = baseAlpha * 0.55;
 
                         const destH = videoH - 4;
                         // Scale each strip frame to fill track height, preserving aspect ratio
@@ -2414,26 +2685,12 @@ export class EditorWidget {
                         }
 
                         // Tint overlay — use lane color if available, fallback to default blue
-                        const lc = _vlEntry.color || "#3a7ca5";
-                        const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
-                        const tintAlpha = isSelectedClip ? 0.4 : 0.25;
-                        ctx.fillStyle = `rgba(${r},${g},${b},${tintAlpha})`;
-                        ctx.fillRect(x1 + 1, videoY + 2, clipPixelW, destH);
                         ctx.restore();
                     }
-                } else if (!isMissingClip && _vlEntry.color) {
-                    // No thumbnail — apply lane color tint directly on base fill
-                    const lc = _vlEntry.color;
-                    const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
-                    const prevAlpha = ctx.globalAlpha;
-                    ctx.globalAlpha = prevAlpha * 0.25;
-                    ctx.fillStyle = `rgb(${r},${g},${b})`;
-                    ctx.fillRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
-                    ctx.globalAlpha = prevAlpha;
                 }
-
+                    // No thumbnail — apply lane color tint directly on base fill
                 if (isSelectedClip) {
-                    ctx.strokeStyle = COLORS.clipSelected;
+                    ctx.strokeStyle = isMissingClip ? "#ffd0bc" : lightenColor(laneBaseColor, 0.45);
                     ctx.lineWidth = 1;
                     ctx.strokeRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
                 }
@@ -2458,14 +2715,13 @@ export class EditorWidget {
                 }
 
                 // Clip label
-                ctx.fillStyle = isMissingClip ? "#ffd0bc" : COLORS.text;
-                ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
-                ctx.textAlign = "left";
-                const dur = clip.timeline_end_frame - clip.timeline_start_frame;
-                let label = this._timecodeMode === "timecode" ? this._frameToTimecode(dur) : `${dur}f`;
-                if (isMissingClip) label = `Missing | ${label}`;
-                if (opacity < 1.0) label += ` ${Math.round(opacity * 100)}%`;
-                ctx.fillText(label, x1 + 4, videoY + videoH / 2 + Math.round(3 * this._scaleTimeline));
+                const label = this._formatClipTimelineLabel(clip, clipAsset, isMissingClip);
+                if (label) {
+                    ctx.fillStyle = isMissingClip ? "#ffd0bc" : COLORS.text;
+                    ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
+                    ctx.textAlign = "left";
+                    ctx.fillText(label, x1 + 4, videoY + videoH / 2 + Math.round(3 * this._scaleTimeline));
+                }
 
                 if (isMissingClip) {
                     ctx.save();
@@ -2493,21 +2749,21 @@ export class EditorWidget {
                     if (leftTrimmed > 0) {
                         const ghostX = this._frameToX(clip.timeline_start_frame - leftTrimmed);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = COLORS.clip;
+                        ctx.fillStyle = laneBaseColor;
                         ctx.fillRect(ghostX + 1, videoY + 2, x1 - ghostX - 1, videoH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                     if (rightTrimmed > 0) {
                         const ghostX2 = this._frameToX(clip.timeline_end_frame + rightTrimmed);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = COLORS.clip;
+                        ctx.fillStyle = laneBaseColor;
                         ctx.fillRect(x2 - 1, videoY + 2, ghostX2 - x2, videoH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                 }
 
                 // Active trim drag ghost (during edge-drag)
-                if (this.dragType === "trimEdge") drawTrimGhost(clip, videoY, videoH, COLORS.clip);
+                if (this.dragType === "trimEdge") drawTrimGhost(clip, videoY, videoH, laneBaseColor);
             }
             ctx.globalAlpha = 1.0;
         }
@@ -2530,10 +2786,12 @@ export class EditorWidget {
                 const vol = track.volume ?? 1.0;
                 const audioAsset = this._getAssetForSourcePath(track.source_path);
                 const isMissingAudio = !audioAsset || !!audioAsset.missing;
+                const laneBaseColor = _alEntry.color || COLORS.audioClip;
+                const audioFillColor = isSelectedAudio ? lightenColor(laneBaseColor, 0.3) : laneBaseColor;
                 ctx.globalAlpha = audioLaneHidden ? 0.3 : 1.0;
                 ctx.fillStyle = isMissingAudio
                     ? (isSelectedAudio ? "#c97a59" : "#5f4038")
-                    : ((track.muted || audioLaneHidden) ? "#555" : (isSelectedAudio ? COLORS.audioClipSelected : COLORS.audioClip));
+                    : audioFillColor;
                 ctx.fillRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
 
                 // Waveform visualization
@@ -2559,7 +2817,7 @@ export class EditorWidget {
                         const endBucket = Math.ceil(endFrac * waveform.numBuckets);
                         const bucketSpan = Math.max(1, endBucket - startBucket);
 
-                        ctx.strokeStyle = track.muted ? "rgba(180,180,180,0.5)" : "rgba(220,255,220,0.9)";
+                        ctx.strokeStyle = track.muted ? "rgba(180,180,180,0.5)" : this._waveformAccentColor();
                         ctx.lineWidth = 1;
                         ctx.beginPath();
                         for (let px = 0; px < clipW; px++) {
@@ -2576,19 +2834,8 @@ export class EditorWidget {
                     }
                 }
 
-                // Lane color tint (over waveform)
-                if (!isMissingAudio && _alEntry.color) {
-                    const lc = _alEntry.color;
-                    const r = parseInt(lc.slice(1,3),16), g = parseInt(lc.slice(3,5),16), b = parseInt(lc.slice(5,7),16);
-                    const prevAlpha = ctx.globalAlpha;
-                    ctx.globalAlpha = prevAlpha * 0.2;
-                    ctx.fillStyle = `rgb(${r},${g},${b})`;
-                    ctx.fillRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
-                    ctx.globalAlpha = prevAlpha;
-                }
-
                 if (isSelectedAudio) {
-                    ctx.strokeStyle = COLORS.audioClipSelected;
+                    ctx.strokeStyle = isMissingAudio ? "#ffd0bc" : lightenColor(laneBaseColor, 0.45);
                     ctx.lineWidth = 1;
                     ctx.strokeRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
                 }
@@ -2602,12 +2849,13 @@ export class EditorWidget {
 
                 // Audio label
                 if ((x2 - x1) > 30) {
-                    ctx.fillStyle = isMissingAudio ? "#ffd0bc" : COLORS.text;
-                    ctx.font = `${Math.round(8 * this._scaleTimeline)}px sans-serif`;
-                    ctx.textAlign = "left";
-                    let aLabel = isMissingAudio ? "Missing" : (track.muted ? "M" : "");
-                    if (vol < 1.0 && !track.muted) aLabel += `${Math.round(vol * 100)}%`;
-                    if (aLabel) ctx.fillText(aLabel, x1 + 4, audioY + audioH / 2 + Math.round(3 * this._scaleTimeline));
+                    const audioLabel = this._formatAudioTimelineLabel(track, audioAsset, isMissingAudio);
+                    if (audioLabel) {
+                        ctx.fillStyle = isMissingAudio ? "#ffd0bc" : COLORS.text;
+                        ctx.font = `${Math.round(8 * this._scaleTimeline)}px sans-serif`;
+                        ctx.textAlign = "left";
+                        ctx.fillText(audioLabel, x1 + 4, audioY + audioH / 2 + Math.round(3 * this._scaleTimeline));
+                    }
                 }
 
                 if (isMissingAudio) {
@@ -2636,21 +2884,21 @@ export class EditorWidget {
                     if (audioLeftTrim > 0) {
                         const ghostX = this._frameToX(track.timeline_start_frame - audioLeftTrim);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = COLORS.audioClip;
+                        ctx.fillStyle = laneBaseColor;
                         ctx.fillRect(ghostX + 1, audioY + 2, x1 - ghostX - 1, audioH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                     if (audioRightTrim > 0) {
                         const ghostX2 = this._frameToX(track.timeline_end_frame + audioRightTrim);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = COLORS.audioClip;
+                        ctx.fillStyle = laneBaseColor;
                         ctx.fillRect(x2 - 1, audioY + 2, ghostX2 - x2, audioH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                 }
 
                 // Active trim drag ghost
-                if (this.dragType === "trimEdge") drawTrimGhost(track, audioY, audioH, COLORS.audioClip);
+                if (this.dragType === "trimEdge") drawTrimGhost(track, audioY, audioH, laneBaseColor);
             }
             ctx.globalAlpha = 1.0;
         }
@@ -2698,17 +2946,9 @@ export class EditorWidget {
         }
     }
 
-    _drawPlayhead(ctx, width) {
+    _drawPlayheadTriangle(ctx, width) {
         const x = this._frameToX(this.playhead);
         if (x < 0 || x > width) return;
-
-        const totalH = Math.round(RULER_HEIGHT * this._scaleTimeline) + this._totalTracksHeight();
-        ctx.strokeStyle = COLORS.playhead;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, totalH);
-        ctx.stroke();
 
         // Triangle at top
         ctx.fillStyle = COLORS.playhead;
@@ -2720,53 +2960,81 @@ export class EditorWidget {
         ctx.fill();
     }
 
-    _drawSnapIndicator(ctx, width) {
+    _drawPlayheadLine(ctx, width) {
+        const x = this._frameToX(this.playhead);
+        if (x < 0 || x > width) return;
+
+        const rulerH = this._timelineRulerHeight();
+        const totalH = rulerH + this._totalTracksHeight();
+        ctx.strokeStyle = COLORS.playhead;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, rulerH);
+        ctx.lineTo(x, totalH);
+        ctx.stroke();
+    }
+
+    _drawSnapIndicator(ctx, width, height = this.timelineCanvas?.height || 0) {
         if (this._snapIndicator === null) return;
         const x = this._frameToX(this._snapIndicator);
         if (x < 0 || x > width) return;
 
-        const totalH = Math.round(RULER_HEIGHT * this._scaleTimeline) + this._totalTracksHeight();
         ctx.strokeStyle = "#ffff00";
         ctx.lineWidth = 1;
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
         ctx.moveTo(x, 0);
-        ctx.lineTo(x, totalH);
+        ctx.lineTo(x, height);
         ctx.stroke();
         ctx.setLineDash([]);
+    }
+
+    _drawVerticalScrollbar(ctx, width, height) {
+        const rulerH = this._timelineRulerHeight();
+        const visibleH = Math.max(0, height - rulerH);
+        const contentH = this._totalTracksHeight();
+        if (visibleH <= 0 || contentH <= visibleH) return;
+
+        const trackX = Math.max(this._labelW + 4, width - 8);
+        const trackY = rulerH + 2;
+        const trackH = Math.max(8, visibleH - 4);
+        const thumbH = Math.max(18, Math.round((visibleH / contentH) * trackH));
+        const maxThumbOffset = Math.max(0, trackH - thumbH);
+        const scrollRatio = this.scrollY / Math.max(1, contentH - visibleH);
+        const thumbY = trackY + Math.round(maxThumbOffset * scrollRatio);
+
+        ctx.fillStyle = "rgba(0,0,0,0.32)";
+        ctx.fillRect(trackX, trackY, 5, trackH);
+        ctx.fillStyle = "rgba(190,205,220,0.58)";
+        ctx.fillRect(trackX + 1, thumbY, 3, thumbH);
     }
 
     // _updateInfoLabel removed — merged into _updateToolbar()
 
     // ── Hit Testing ──────────────────────────────────────────────────
     /** Hit-test track header area — returns { layoutIdx, zone } or null */
-    _hitTestTrackHeader(x, y) {
+    _hitTestTrackHeader(x, rawY) {
         const headerWidth = this._labelW; // already scaled by _scaleTrackHeaders
         if (x > headerWidth) return null;
         const fs = this.isFullscreen;
         const hs = this._scaleTrackHeaders;
         const iconSize = Math.round((fs ? 14 : 11) * hs);
-        for (let i = 0; i < this._trackLayout.length; i++) {
-            const ty = this._trackY(i);
-            const th = this._trackH(i);
-            if (y >= ty && y < ty + th) {
-                const entry = this._trackLayout[i];
-                const isLane = entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO;
-                if (entry.collapsed || !isLane) {
-                    return { layoutIdx: i, zone: "collapse" };
-                }
-                // Zone detection (left to right) matching _drawTracks layout
-                const arrowX = Math.round((fs ? 6 : 3) * hs);
-                let zoneEnd = arrowX + iconSize + Math.round(2 * hs);
-                if (x < zoneEnd) return { layoutIdx: i, zone: "collapse" };
-                zoneEnd += iconSize + Math.round(1 * hs);
-                if (x < zoneEnd) return { layoutIdx: i, zone: "lock" };
-                zoneEnd += iconSize + Math.round(1 * hs);
-                if (x < zoneEnd) return { layoutIdx: i, zone: "hide" };
-                return { layoutIdx: i, zone: "label" };
-            }
+        const layoutIdx = this._layoutIndexFromRawY(rawY);
+        if (layoutIdx < 0) return null;
+        const entry = this._trackLayout[layoutIdx];
+        const isLane = entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO;
+        if (entry.collapsed || !isLane) {
+            return { layoutIdx, zone: "collapse" };
         }
-        return null;
+        // Zone detection (left to right) matching _drawTracks layout
+        const arrowX = Math.round((fs ? 6 : 3) * hs);
+        let zoneEnd = arrowX + iconSize + Math.round(2 * hs);
+        if (x < zoneEnd) return { layoutIdx, zone: "collapse" };
+        zoneEnd += iconSize + Math.round(1 * hs);
+        if (x < zoneEnd) return { layoutIdx, zone: "lock" };
+        zoneEnd += iconSize + Math.round(1 * hs);
+        if (x < zoneEnd) return { layoutIdx, zone: "hide" };
+        return { layoutIdx, zone: "label" };
     }
 
     /** Hit-test the header/timeline boundary for drag resize */
@@ -2775,62 +3043,47 @@ export class EditorWidget {
         return Math.abs(x - headerW) <= 4 && y >= 0;
     }
 
-    _hitTestClip(x, y) {
+    _hitTestClip(x, rawY) {
         if (!this.activeScene) return null;
+        const layoutIdx = this._layoutIndexFromRawY(rawY);
+        if (layoutIdx < 0) return null;
+        const entry = this._trackLayout[layoutIdx];
+        if (entry.type !== TRACK_TYPE.VIDEO || entry.collapsed) return null;
         const clips = this.activeScene.clips || [];
-
-        for (let li = 0; li < this._trackLayout.length; li++) {
-            const entry = this._trackLayout[li];
-            if (entry.type !== TRACK_TYPE.VIDEO || entry.collapsed) continue;
-
-            const trackY = this._trackY(li);
-            const trackH = this._trackH(li);
-            if (y < trackY || y > trackY + trackH) continue;
-
-            for (const clip of clips) {
-                if ((clip.track_index || 0) !== entry.laneIndex) continue;
-                const x1 = this._frameToX(clip.timeline_start_frame);
-                const x2 = this._frameToX(clip.timeline_end_frame);
-                if (x >= x1 && x <= x2) {
-                    return { type: "clip", id: clip.clip_id, data: clip };
-                }
+        for (const clip of clips) {
+            if ((clip.track_index || 0) !== entry.laneIndex) continue;
+            const x1 = this._frameToX(clip.timeline_start_frame);
+            const x2 = this._frameToX(clip.timeline_end_frame);
+            if (x >= x1 && x <= x2) {
+                return { type: "clip", id: clip.clip_id, data: clip };
             }
         }
         return null;
     }
 
-    _hitTestAudio(x, y) {
+    _hitTestAudio(x, rawY) {
         if (!this.activeScene) return null;
+        const layoutIdx = this._layoutIndexFromRawY(rawY);
+        if (layoutIdx < 0) return null;
+        const entry = this._trackLayout[layoutIdx];
+        if (entry.type !== TRACK_TYPE.AUDIO || entry.collapsed) return null;
         const tracks = this.activeScene.audio_tracks || [];
-
-        for (let li = 0; li < this._trackLayout.length; li++) {
-            const entry = this._trackLayout[li];
-            if (entry.type !== TRACK_TYPE.AUDIO || entry.collapsed) continue;
-
-            const trackY = this._trackY(li);
-            const trackH = this._trackH(li);
-            if (y < trackY || y > trackY + trackH) continue;
-
-            for (const track of tracks) {
-                if ((track.lane_index || 0) !== entry.laneIndex) continue;
-                const x1 = this._frameToX(track.timeline_start_frame);
-                const x2 = this._frameToX(track.timeline_end_frame);
-                if (x >= x1 && x <= x2) {
-                    return { type: "audio", id: track.track_id, data: track };
-                }
+        for (const track of tracks) {
+            if ((track.lane_index || 0) !== entry.laneIndex) continue;
+            const x1 = this._frameToX(track.timeline_start_frame);
+            const x2 = this._frameToX(track.timeline_end_frame);
+            if (x >= x1 && x <= x2) {
+                return { type: "audio", id: track.track_id, data: track };
             }
         }
         return null;
     }
 
-    _hitTestGuide(x, y) {
+    _hitTestGuide(x, rawY) {
         if (!this.activeScene) return null;
         const gi = this._guidesLayoutIdx();
-        if (gi < 0 || this._trackLayout[gi].collapsed) return null;
+        if (gi < 0 || this._trackLayout[gi].collapsed || this._layoutIndexFromRawY(rawY) !== gi) return null;
         const guides = this.activeScene.guide_frames || [];
-        const trackY = this._trackY(gi);
-        const trackH = this._trackH(gi);
-        if (y < trackY || y > trackY + trackH) return null;
 
         for (const guide of guides) {
             let idx = guide.frame_index;
@@ -2843,14 +3096,11 @@ export class EditorWidget {
         return null;
     }
 
-    _hitTestPrompt(x, y) {
+    _hitTestPrompt(x, rawY) {
         if (!this.activeScene) return null;
         const pli = this._promptLayoutIdx();
-        if (pli < 0 || this._trackLayout[pli].collapsed) return null;
+        if (pli < 0 || this._trackLayout[pli].collapsed || this._layoutIndexFromRawY(rawY) !== pli) return null;
         const sections = this.activeScene.prompt_sections || [];
-        const trackY = this._trackY(pli);
-        const trackH = this._trackH(pli);
-        if (y < trackY || y > trackY + trackH) return null;
 
         for (let i = 0; i < sections.length; i++) {
             const section = sections[i];
@@ -2863,8 +3113,8 @@ export class EditorWidget {
         return null;
     }
 
-    _hitTestItem(x, y) {
-        return this._hitTestClip(x, y) || this._hitTestAudio(x, y) || this._hitTestGuide(x, y) || this._hitTestPrompt(x, y);
+    _hitTestItem(x, rawY) {
+        return this._hitTestClip(x, rawY) || this._hitTestAudio(x, rawY) || this._hitTestGuide(x, rawY) || this._hitTestPrompt(x, rawY);
     }
 
     _findSceneItemBySelection(type, id) {
@@ -2890,58 +3140,41 @@ export class EditorWidget {
 
     /** Detect if the mouse is near the left or right edge of a clip/audio track for trimming.
      *  Returns { type, id, data, edge: "left"|"right" } or null. */
-    _hitTestEdge(x, y) {
+    _hitTestEdge(x, rawY) {
         const edgePx = 6;
         if (!this.activeScene) return null;
+        const layoutIdx = this._layoutIndexFromRawY(rawY);
+        if (layoutIdx < 0) return null;
+        const entry = this._trackLayout[layoutIdx];
 
-        // Check clips (all video lanes)
-        for (let li = 0; li < this._trackLayout.length; li++) {
-            const entry = this._trackLayout[li];
-            if (entry.type !== TRACK_TYPE.VIDEO || entry.collapsed) continue;
-            const clipTrackY = this._trackY(li);
-            const clipTrackH = this._trackH(li);
-            if (y >= clipTrackY && y <= clipTrackY + clipTrackH) {
-                for (const clip of (this.activeScene.clips || [])) {
-                    if ((clip.track_index || 0) !== entry.laneIndex) continue;
-                    const x1 = this._frameToX(clip.timeline_start_frame);
-                    const x2 = this._frameToX(clip.timeline_end_frame);
-                    if (Math.abs(x - x1) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "left" };
-                    if (Math.abs(x - x2) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "right" };
-                }
+        if (entry.type === TRACK_TYPE.VIDEO && !entry.collapsed) {
+            for (const clip of (this.activeScene.clips || [])) {
+                if ((clip.track_index || 0) !== entry.laneIndex) continue;
+                const x1 = this._frameToX(clip.timeline_start_frame);
+                const x2 = this._frameToX(clip.timeline_end_frame);
+                if (Math.abs(x - x1) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "left" };
+                if (Math.abs(x - x2) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "right" };
             }
         }
 
-        // Check audio tracks (all audio lanes)
-        for (let li = 0; li < this._trackLayout.length; li++) {
-            const entry = this._trackLayout[li];
-            if (entry.type !== TRACK_TYPE.AUDIO || entry.collapsed) continue;
-            const audioTrackY = this._trackY(li);
-            const audioTrackH = this._trackH(li);
-            if (y >= audioTrackY && y <= audioTrackY + audioTrackH) {
-                for (const track of (this.activeScene.audio_tracks || [])) {
-                    if ((track.lane_index || 0) !== entry.laneIndex) continue;
-                    const x1 = this._frameToX(track.timeline_start_frame);
-                    const x2 = this._frameToX(track.timeline_end_frame);
-                    if (Math.abs(x - x1) < edgePx) return { type: "audio", id: track.track_id, data: track, edge: "left" };
-                    if (Math.abs(x - x2) < edgePx) return { type: "audio", id: track.track_id, data: track, edge: "right" };
-                }
+        if (entry.type === TRACK_TYPE.AUDIO && !entry.collapsed) {
+            for (const track of (this.activeScene.audio_tracks || [])) {
+                if ((track.lane_index || 0) !== entry.laneIndex) continue;
+                const x1 = this._frameToX(track.timeline_start_frame);
+                const x2 = this._frameToX(track.timeline_end_frame);
+                if (Math.abs(x - x1) < edgePx) return { type: "audio", id: track.track_id, data: track, edge: "left" };
+                if (Math.abs(x - x2) < edgePx) return { type: "audio", id: track.track_id, data: track, edge: "right" };
             }
         }
 
-        // Check prompt sections
-        const pli = this._promptLayoutIdx();
-        if (pli >= 0 && !this._trackLayout[pli].collapsed) {
-            const promptTrackY = this._trackY(pli);
-            const promptTrackH = this._trackH(pli);
-            if (y >= promptTrackY && y <= promptTrackY + promptTrackH) {
-                const sections = this.activeScene.prompt_sections || [];
-                for (let i = 0; i < sections.length; i++) {
-                    const section = sections[i];
-                    const x1 = this._frameToX(section.start_frame);
-                    const x2 = this._frameToX(section.end_frame);
-                    if (Math.abs(x - x1) < edgePx) return { type: "prompt", id: i, data: section, edge: "left" };
-                    if (Math.abs(x - x2) < edgePx) return { type: "prompt", id: i, data: section, edge: "right" };
-                }
+        if (entry.type === TRACK_TYPE.PROMPT && !entry.collapsed) {
+            const sections = this.activeScene.prompt_sections || [];
+            for (let i = 0; i < sections.length; i++) {
+                const section = sections[i];
+                const x1 = this._frameToX(section.start_frame);
+                const x2 = this._frameToX(section.end_frame);
+                if (Math.abs(x - x1) < edgePx) return { type: "prompt", id: i, data: section, edge: "left" };
+                if (Math.abs(x - x2) < edgePx) return { type: "prompt", id: i, data: section, edge: "right" };
             }
         }
 
@@ -3031,42 +3264,55 @@ export class EditorWidget {
 
         const threshold = this._snapThreshold;
         const candidates = [];
+        const snapTargets = this._settings.timelineBehavior.snapTargets;
 
         // Playhead
-        candidates.push(this.playhead);
+        if (snapTargets.playhead) {
+            candidates.push(this.playhead);
+        }
 
         // Selection bounds
-        if (this.selectionStart < this.selectionEnd) {
+        if (snapTargets.selection && this.selectionStart < this.selectionEnd) {
             candidates.push(this.selectionStart, this.selectionEnd);
         }
 
         // Clip edges
-        for (const clip of (this.activeScene.clips || [])) {
-            if (excludeIds.includes(clip.clip_id)) continue;
-            candidates.push(clip.timeline_start_frame, clip.timeline_end_frame);
+        if (snapTargets.clipEdges) {
+            for (const clip of (this.activeScene.clips || [])) {
+                if (excludeIds.includes(clip.clip_id)) continue;
+                candidates.push(clip.timeline_start_frame, clip.timeline_end_frame);
+            }
         }
 
         // Audio track edges
-        for (const track of (this.activeScene.audio_tracks || [])) {
-            if (excludeIds.includes(track.track_id)) continue;
-            candidates.push(track.timeline_start_frame, track.timeline_end_frame);
+        if (snapTargets.audioEdges) {
+            for (const track of (this.activeScene.audio_tracks || [])) {
+                if (excludeIds.includes(track.track_id)) continue;
+                candidates.push(track.timeline_start_frame, track.timeline_end_frame);
+            }
         }
 
         // Guide frames
-        for (const g of (this.activeScene.guide_frames || [])) {
-            const idx = g.frame_index === -1 ? this.totalFrames - 1 : g.frame_index;
-            candidates.push(idx);
+        if (snapTargets.guides) {
+            for (const g of (this.activeScene.guide_frames || [])) {
+                const idx = g.frame_index === -1 ? this.totalFrames - 1 : g.frame_index;
+                candidates.push(idx);
+            }
         }
 
         // Prompt section edges
-        for (let i = 0; i < (this.activeScene.prompt_sections || []).length; i++) {
-            if (excludeIds.includes(i)) continue;
-            const s = this.activeScene.prompt_sections[i];
-            candidates.push(s.start_frame, s.end_frame);
+        if (snapTargets.promptSections) {
+            for (let i = 0; i < (this.activeScene.prompt_sections || []).length; i++) {
+                if (excludeIds.includes(i)) continue;
+                const s = this.activeScene.prompt_sections[i];
+                candidates.push(s.start_frame, s.end_frame);
+            }
         }
 
         // Frame 0 and last frame
-        candidates.push(0, this.totalFrames);
+        if (snapTargets.sceneBounds) {
+            candidates.push(0, this.totalFrames);
+        }
 
         let best = frame;
         let bestDist = threshold + 1;
@@ -3093,7 +3339,7 @@ export class EditorWidget {
             // Close context menu on any click
             this._hideContextMenu();
 
-            const { x, y } = this._canvasMouseCoords(e);
+            const { x, y, rawY } = this._canvasMouseCoords(e);
 
             // Header edge resize drag
             if (this._hitTestHeaderEdge(x, y)) {
@@ -3115,8 +3361,8 @@ export class EditorWidget {
                 this.dragType = "playhead";
                 if (this.isPlaying) this._stopPlayback();
                 this._renderViewportFrame();
-            } else if (this._hitTestTrackHeader(x, y)) {
-                const headerHit = this._hitTestTrackHeader(x, y);
+            } else if (this._hitTestTrackHeader(x, rawY)) {
+                const headerHit = this._hitTestTrackHeader(x, rawY);
                 const entry = this._trackLayout[headerHit.layoutIdx];
                 switch (headerHit.zone) {
                     case "collapse":
@@ -3137,14 +3383,14 @@ export class EditorWidget {
                 // Selection is set only via I/O shortcuts — no mouse selection drag
                 if (this._razorMode) {
                     // Razor mode: split clip or audio at click position
-                    const hit = this._hitTestItem(x, y);
+                    const hit = this._hitTestItem(x, rawY);
                     if (hit && (hit.type === "clip" || hit.type === "audio")) {
                         this._splitClipAtFrame(hit, frame);
                     }
                     return;
                 } else {
                     // Check if near clip/audio/prompt edges for trimming
-                    const edgeHit = this._hitTestEdge(x, y);
+                    const edgeHit = this._hitTestEdge(x, rawY);
                     if (edgeHit) {
                         // Block trim on locked lanes
                         if (edgeHit.type === "clip" && this._isLaneLocked(TRACK_TYPE.VIDEO, edgeHit.data.track_index || 0)) return;
@@ -3167,7 +3413,7 @@ export class EditorWidget {
                     }
 
                     // Check if clicking on a timeline item
-                    const hit = this._hitTestItem(x, y);
+                    const hit = this._hitTestItem(x, rawY);
                     if (hit) {
                         if (e.ctrlKey || e.metaKey) {
                             // Ctrl+click = toggle item in selection
@@ -3225,7 +3471,7 @@ export class EditorWidget {
         });
 
         canvas.addEventListener("mousemove", (e) => {
-            const { x, y } = this._canvasMouseCoords(e);
+            const { x, y, rawY } = this._canvasMouseCoords(e);
 
             if (!this.isDragging) {
                 // Update cursor based on position
@@ -3233,9 +3479,9 @@ export class EditorWidget {
                     canvas.style.cursor = "col-resize";
                 } else if (this._razorMode) {
                     canvas.style.cursor = "crosshair";
-                } else if (this._hitTestEdge(x, y)) {
+                } else if (this._hitTestEdge(x, rawY)) {
                     canvas.style.cursor = "ew-resize";
-                } else if (this._hitTestItem(x, y)) {
+                } else if (this._hitTestItem(x, rawY)) {
                     canvas.style.cursor = "grab";
                 } else {
                     canvas.style.cursor = "crosshair";
@@ -3324,15 +3570,11 @@ export class EditorWidget {
                 // Detect lane from Y position for cross-lane drag
                 let hoverLaneType = null;
                 let hoverLaneIndex = -1;
-                for (let li = 0; li < this._trackLayout.length; li++) {
-                    const entry = this._trackLayout[li];
-                    const ty = this._trackY(li);
-                    const th = this._trackH(li);
-                    if (y >= ty && y < ty + th) {
-                        hoverLaneType = entry.type;
-                        hoverLaneIndex = entry.laneIndex;
-                        break;
-                    }
+                const hoverLayoutIdx = this._layoutIndexFromRawY(rawY);
+                if (hoverLayoutIdx >= 0) {
+                    const hoverEntry = this._trackLayout[hoverLayoutIdx];
+                    hoverLaneType = hoverEntry.type;
+                    hoverLaneIndex = hoverEntry.laneIndex;
                 }
 
                 // Step 1: Restore ALL clips/audio to their original lanes
@@ -3405,9 +3647,12 @@ export class EditorWidget {
             this._snapIndicator = null;
 
             if (wasDragType === "headerResize") {
-                // Persist header width to localStorage
-                localStorage.setItem("ltx-editor-label-width", this._labelWidthUser.toString());
-                localStorage.setItem("ltx-editor-label-width-fs", this._labelWidthUserFS.toString());
+                this._updateSettings({
+                    layout: {
+                        labelWidth: this._labelWidthUser,
+                        labelWidthFullscreen: this._labelWidthUserFS,
+                    },
+                });
                 canvas.style.cursor = "crosshair";
                 this._renderTimeline();
                 return;
@@ -3466,16 +3711,21 @@ export class EditorWidget {
         // Scroll to pan
         canvas.addEventListener("wheel", (e) => {
             e.preventDefault();
-            if (e.ctrlKey) {
+            if (e.shiftKey) {
                 // Zoom
                 this._zoom(e.deltaY < 0 ? 1 : -1);
-            } else {
-                // Pan
+            } else if (e.ctrlKey) {
+                // Horizontal pan
                 this.scrollX += e.deltaY / this.pixelsPerFrame * 3;
                 this._clampScrollX();
                 this._renderTimeline();
+            } else {
+                // Vertical scroll
+                this.scrollY += e.deltaY;
+                this._clampScrollY();
+                this._renderTimeline();
             }
-        });
+        }, { passive: false });
 
         // Drop assets onto timeline
         canvas.addEventListener("dragover", (e) => {
@@ -3492,10 +3742,10 @@ export class EditorWidget {
 
             try {
                 const asset = JSON.parse(assetData);
-                const { x, y } = this._canvasMouseCoords(e);
+                const { x, rawY } = this._canvasMouseCoords(e);
                 const frame = Math.max(0, this._xToFrame(x));
 
-                this._handleAssetDrop(asset, frame, y);
+                this._handleAssetDrop(asset, frame, rawY);
             } catch (err) {
                 console.warn("[LTX Editor] Drop failed:", err);
             }
@@ -3503,14 +3753,11 @@ export class EditorWidget {
 
         // Double-click on Prompt track = create prompt section
         canvas.addEventListener("dblclick", (e) => {
-            const { x, y } = this._canvasMouseCoords(e);
-            const _pli = this._promptLayoutIdx();
-            if (_pli >= 0) {
-                const promptTrackY = this._trackY(_pli);
-                if (y >= promptTrackY && y <= promptTrackY + this._trackH(_pli)) {
-                    const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
-                    this._createPromptSection(frame);
-                }
+            const { x, rawY } = this._canvasMouseCoords(e);
+            const promptLayoutIdx = this._promptLayoutIdx();
+            if (promptLayoutIdx >= 0 && this._layoutIndexFromRawY(rawY) === promptLayoutIdx) {
+                const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
+                this._createPromptSection(frame);
             }
         });
 
@@ -3518,17 +3765,14 @@ export class EditorWidget {
         canvas.addEventListener("click", (e) => {
             // Prompt deselection is handled by the unified mousedown/mouseup system
             // When clicking empty space, deselect prompt editor too
-            const { x, y } = this._canvasMouseCoords(e);
+            const { rawY } = this._canvasMouseCoords(e);
 
             if (this._selectedPromptIdx !== null) {
-                const _pli2 = this._promptLayoutIdx();
-                if (_pli2 >= 0) {
-                    const promptTrackY = this._trackY(_pli2);
-                    if (y < promptTrackY || y > promptTrackY + this._trackH(_pli2)) {
-                        this._selectedPromptIdx = null;
-                        this._hidePromptEditor();
-                        this._renderTimeline();
-                    }
+                const promptLayoutIdx = this._promptLayoutIdx();
+                if (promptLayoutIdx >= 0 && this._layoutIndexFromRawY(rawY) !== promptLayoutIdx) {
+                    this._selectedPromptIdx = null;
+                    this._hidePromptEditor();
+                    this._renderTimeline();
                 }
             }
         });
@@ -3537,13 +3781,13 @@ export class EditorWidget {
         canvas.addEventListener("contextmenu", (e) => {
             e.preventDefault();
 
-            const { x, y } = this._canvasMouseCoords(e);
+            const { x, rawY } = this._canvasMouseCoords(e);
             const frame = Math.max(0, this._xToFrame(x));
 
             const menuItems = [];
 
             // Check for track header right-click (lane management)
-            const headerHit = this._hitTestTrackHeader(x, y);
+            const headerHit = this._hitTestTrackHeader(x, rawY);
             if (headerHit) {
                 const entry = this._trackLayout[headerHit.layoutIdx];
                 if (entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO) {
@@ -3556,12 +3800,12 @@ export class EditorWidget {
                     menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(headerHit.layoutIdx) });
                     menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
                     if (laneCount > 1) {
-                        // Only allow removing if lane is empty
                         const hasItems = isVideo
                             ? (this.activeScene?.clips || []).some(c => (c.track_index || 0) === entry.laneIndex)
                             : (this.activeScene?.audio_tracks || []).some(a => (a.lane_index || 0) === entry.laneIndex);
                         if (hasItems) {
                             menuItems.push({ label: `Remove ${label} Lane (move items)`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
+                            menuItems.push({ label: `Remove ${label} Lane (delete items)`, action: () => this._removeLaneDeleteItems(entry.type, entry.laneIndex), danger: true });
                         } else {
                             menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
                         }
@@ -3574,7 +3818,7 @@ export class EditorWidget {
             }
 
             // Check for timeline item hits
-            const hit = this._hitTestItem(x, y);
+            const hit = this._hitTestItem(x, rawY);
             if (hit) {
                 if (!this._isSelected(hit.type, hit.id)) {
                     this._selectItem(hit);
@@ -3614,8 +3858,7 @@ export class EditorWidget {
 
             // Check prompt track
             const _pli3 = this._promptLayoutIdx();
-            const promptTrackY = _pli3 >= 0 ? this._trackY(_pli3) : -1;
-            if (_pli3 >= 0 && y >= promptTrackY && y <= promptTrackY + this._trackH(_pli3)) {
+            if (_pli3 >= 0 && this._layoutIndexFromRawY(rawY) === _pli3) {
                 const sections = this.activeScene?.prompt_sections || [];
                 const idx = sections.findIndex(s => frame >= s.start_frame && frame <= s.end_frame);
                 if (idx >= 0) {
@@ -3636,7 +3879,7 @@ export class EditorWidget {
         });
     }
 
-    async _handleAssetDrop(asset, frame, trackY) {
+    async _handleAssetDrop(asset, frame, trackRawY) {
         if (!this.activeScene || !this.projectDir) return;
 
         // Take-aware drop: if asset has take_metadata, auto-place at original position
@@ -3650,16 +3893,12 @@ export class EditorWidget {
         // Determine drop target lane from Y position
         let targetVideoLane = 0;
         let targetAudioLane = 0;
-        if (trackY !== undefined) {
-            for (let i = 0; i < this._trackLayout.length; i++) {
-                const entry = this._trackLayout[i];
-                const ty = this._trackY(i);
-                const th = this._trackH(i);
-                if (trackY >= ty && trackY < ty + th) {
-                    if (entry.type === TRACK_TYPE.VIDEO) targetVideoLane = entry.laneIndex;
-                    if (entry.type === TRACK_TYPE.AUDIO) targetAudioLane = entry.laneIndex;
-                    break;
-                }
+        if (trackRawY !== undefined) {
+            const layoutIdx = this._layoutIndexFromRawY(trackRawY);
+            if (layoutIdx >= 0) {
+                const entry = this._trackLayout[layoutIdx];
+                if (entry.type === TRACK_TYPE.VIDEO) targetVideoLane = entry.laneIndex;
+                if (entry.type === TRACK_TYPE.AUDIO) targetAudioLane = entry.laneIndex;
             }
         }
 
@@ -3876,7 +4115,7 @@ export class EditorWidget {
         input.style.cssText = `
             position: fixed;
             left: ${rect.left + 2}px;
-            top: ${rect.top + ty + 1}px;
+            top: ${rect.top + ty + 1 - this.scrollY}px;
             width: ${headerW - 4}px;
             height: ${th - 2}px;
             font-size: ${Math.round(10 * this._scaleTrackHeaders)}px;
@@ -4018,6 +4257,34 @@ export class EditorWidget {
             await this._removeLane(trackType, laneIndex);
         } catch (e) {
             console.warn("[LTX Editor] Failed to remove lane with items:", e);
+        }
+    }
+
+    async _removeLaneDeleteItems(trackType, laneIndex) {
+        if (!this.activeScene || !this.projectDir) return;
+        const isVideo = trackType === TRACK_TYPE.VIDEO;
+        const label = isVideo ? "video" : "audio";
+        const items = isVideo
+            ? (this.activeScene?.clips || []).filter(c => (c.track_index || 0) === laneIndex)
+            : (this.activeScene?.audio_tracks || []).filter(a => (a.lane_index || 0) === laneIndex);
+        if (!items.length) {
+            await this._removeLane(trackType, laneIndex);
+            return;
+        }
+        if (!confirm(`Delete ${items.length} ${label} item(s) on lane ${laneIndex + 1} and remove this lane?`)) return;
+
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        try {
+            for (const item of items) {
+                const id = isVideo ? item.clip_id : item.track_id;
+                const endpoint = isVideo ? "clips" : "audio_tracks";
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
+                    method: "DELETE",
+                });
+            }
+            await this._removeLane(trackType, laneIndex);
+        } catch (e) {
+            console.warn("[LTX Editor] Failed to delete lane items:", e);
         }
     }
 
@@ -4631,67 +4898,58 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
 
         try {
-            // Lane swap: use original lane snapshots to find items that need swapping
             const draggedClipIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "clip").map(o => o.id));
             const draggedAudioIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "audio").map(o => o.id));
             const origClipLanes = this._origAllClipLanes || {};
             const origAudioLanes = this._origAllAudioLanes || {};
 
-            for (const orig of (this._dragItemsOrig || [])) {
-                if (orig.type === "clip") {
-                    const newLane = orig.data.track_index || 0;
-                    if (newLane !== orig.origLane) {
-                        // Swap: all non-dragged clips originally on targetLane → origLane
-                        for (const c of (this.activeScene.clips || [])) {
-                            if (!draggedClipIds.has(c.clip_id) && (origClipLanes[c.clip_id] ?? 0) === newLane) {
-                                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${c.clip_id}`), {
-                                    method: "PUT",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ track_index: orig.origLane }),
-                                });
-                            }
-                        }
-                    }
-                } else if (orig.type === "audio") {
-                    const newLane = orig.data.lane_index || 0;
-                    if (newLane !== orig.origLane) {
-                        for (const a of (this.activeScene.audio_tracks || [])) {
-                            if (!draggedAudioIds.has(a.track_id) && (origAudioLanes[a.track_id] ?? 0) === newLane) {
-                                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${a.track_id}`), {
-                                    method: "PUT",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ lane_index: orig.origLane }),
-                                });
-                            }
-                        }
-                    }
+            // Persist the exact previewed lane map so swap-on-drag commits
+            // the same final state the user saw during the drag.
+            for (const clip of (this.activeScene.clips || [])) {
+                const clipId = clip.clip_id;
+                const isDragged = draggedClipIds.has(clipId);
+                const origLane = origClipLanes[clipId];
+                const laneChanged = origLane !== undefined && (clip.track_index || 0) !== origLane;
+                if (!isDragged && !laneChanged) continue;
+                const putBody = { track_index: clip.track_index || 0 };
+                if (isDragged) {
+                    putBody.timeline_start_frame = clip.timeline_start_frame;
+                    putBody.timeline_end_frame = clip.timeline_end_frame;
                 }
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${clipId}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(putBody),
+                });
             }
 
-            // Now commit the dragged items themselves
+            for (const track of (this.activeScene.audio_tracks || [])) {
+                const trackId = track.track_id;
+                const isDragged = draggedAudioIds.has(trackId);
+                const origLane = origAudioLanes[trackId];
+                const laneChanged = origLane !== undefined && (track.lane_index || 0) !== origLane;
+                if (!isDragged && !laneChanged) continue;
+                const putBody = { lane_index: track.lane_index || 0 };
+                if (isDragged) {
+                    putBody.timeline_start_frame = track.timeline_start_frame;
+                    putBody.timeline_end_frame = track.timeline_end_frame;
+                }
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${trackId}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(putBody),
+                });
+            }
+
             for (const orig of (this._dragItemsOrig || [])) {
                 const { type, id, data } = orig;
-                if (type === "clip") {
-                    const newStart = Math.max(0, orig.origStart + frameDelta);
-                    const putBody = { timeline_start_frame: newStart };
-                    if (data.track_index !== undefined) putBody.track_index = data.track_index;
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`), {
-                        method: "PUT",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(putBody),
-                    });
-                } else if (type === "audio") {
-                    const newStart = Math.max(0, orig.origStart + frameDelta);
-                    const putBody = { timeline_start_frame: newStart };
-                    if (data.lane_index !== undefined) putBody.lane_index = data.lane_index;
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`), {
-                        method: "PUT",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(putBody),
-                    });
-                } else if (type === "guide") {
+                if (type === "clip" || type === "audio") {
+                    continue;
+                }
+                if (type === "guide") {
                     const oldIdx = orig.origStart;
-                    const newIdx = Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
+                    const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
+                    const newIdx = previewIdx ?? Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
                     // Move guide = delete old + create new
                     await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/guides/${oldIdx}`), {
                         method: "DELETE",
@@ -4708,14 +4966,12 @@ export class EditorWidget {
                     });
                     delete data._previewFrameIndex;
                 } else if (type === "prompt") {
-                    const duration = orig.origEnd - orig.origStart;
-                    const newStart = Math.max(0, orig.origStart + frameDelta);
                     await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
-                            start_frame: newStart,
-                            end_frame: newStart + duration,
+                            start_frame: data.start_frame,
+                            end_frame: data.end_frame,
                         }),
                     });
                 }
@@ -4902,6 +5158,9 @@ export class EditorWidget {
                 ["Ctrl+Y", "Redo"],
             ]) +
             this._shortcutSection("View", [
+                ["Wheel", "Vertical lane scroll"],
+                ["Ctrl+Wheel", "Horizontal timeline pan"],
+                ["Shift+Wheel", "Timeline zoom"],
                 ["+ / -", "Zoom in / out"],
                 ["Esc", "Exit fullscreen"],
                 ["?", "Show this overlay"],
@@ -4983,7 +5242,7 @@ export class EditorWidget {
         // Assets sidebar (left)
         this._fsSidebar = document.createElement("div");
         this._fsSidebar.style.cssText = `
-            width: 240px; min-width: 180px; max-width: 400px;
+            width: ${FULLSCREEN_SIDEBAR_DEFAULT_WIDTH}px; min-width: ${FULLSCREEN_SIDEBAR_MIN_WIDTH}px; max-width: ${this._computeFullscreenSidebarMaxWidth()}px;
             background: ${COLORS.galleryBg}; border-right: 2px solid #333;
             display: flex; flex-direction: column; overflow: hidden;
             flex-shrink: 0; position: relative;
@@ -5005,7 +5264,7 @@ export class EditorWidget {
             position: absolute; right: -3px; top: 0; bottom: 0; width: 6px;
             cursor: ew-resize; z-index: 2;
         `;
-        this._setupResizeHandle(sidebarHandle, this._fsSidebar, "width", 180, 400);
+        this._setupResizeHandle(sidebarHandle, this._fsSidebar, "width", FULLSCREEN_SIDEBAR_MIN_WIDTH, () => this._computeFullscreenSidebarMaxWidth(), false, "sidebar-width");
         this._fsSidebar.appendChild(sidebarHandle);
 
         // Viewport panel (center)
@@ -5093,8 +5352,7 @@ export class EditorWidget {
             const rect = progressWrap.getBoundingClientRect();
             const pct = (e.clientX - rect.left) / rect.width;
             this.playhead = Math.round(pct * this.totalFrames);
-            this._renderTimeline();
-            this._renderViewportFrame();
+            this._onPlayheadChange();
         });
 
         transport.append(this._vpPlayBtn, this._vpFrameCounter, progressWrap);
@@ -5103,9 +5361,9 @@ export class EditorWidget {
 
         // Bottom area: timeline (will hold this.container minus gallery)
         this._fsBottomRow = document.createElement("div");
-        const _defaultTimelineH = Math.max(200, Math.min(600, Math.round(window.innerHeight * 0.4)));
+        const _defaultTimelineH = this._defaultFullscreenTimelineHeight();
         this._fsBottomRow.style.cssText = `
-            height: ${_defaultTimelineH}px; min-height: 160px; max-height: 600px;
+            height: ${_defaultTimelineH}px; min-height: ${FULLSCREEN_TIMELINE_MIN_HEIGHT}px; max-height: ${this._computeFullscreenTimelineMaxHeight()}px;
             border-top: 2px solid #333; display: flex; flex-direction: column;
             overflow: hidden; flex-shrink: 0; position: relative;
         `;
@@ -5116,7 +5374,7 @@ export class EditorWidget {
             position: absolute; top: -3px; left: 0; right: 0; height: 6px;
             cursor: ns-resize; z-index: 2;
         `;
-        this._setupResizeHandle(timelineHandle, this._fsBottomRow, "height", 160, 600, true);
+        this._setupResizeHandle(timelineHandle, this._fsBottomRow, "height", FULLSCREEN_TIMELINE_MIN_HEIGHT, () => this._computeFullscreenTimelineMaxHeight(), true, "timeline-height");
         this._fsBottomRow.appendChild(timelineHandle);
 
         this._fsContent.append(this._fsTopRow, this._fsBottomRow);
@@ -5125,17 +5383,18 @@ export class EditorWidget {
         this._fullscreenOverlay = overlay;
     }
 
-    _setupResizeHandle(handle, target, prop, min, max, invert = false) {
+    _setupResizeHandle(handle, target, prop, min, max, invert = false, persistKey = "") {
         let startPos = 0;
         let startSize = 0;
 
         const onMouseMove = (e) => {
+            const maxValue = typeof max === "function" ? max() : max;
             const delta = prop === "width"
                 ? e.clientX - startPos
                 : e.clientY - startPos;
             const newSize = invert
-                ? Math.max(min, Math.min(max, startSize - delta))
-                : Math.max(min, Math.min(max, startSize + delta));
+                ? Math.max(min, Math.min(maxValue, startSize - delta))
+                : Math.max(min, Math.min(maxValue, startSize + delta));
             target.style[prop] = newSize + "px";
 
             // Recalc timeline height to fill remaining space
@@ -5150,6 +5409,10 @@ export class EditorWidget {
             document.removeEventListener("mouseup", onMouseUp);
             document.body.style.cursor = "";
             document.body.style.userSelect = "";
+            if (persistKey) {
+                const currentSize = parseInt(getComputedStyle(target)[prop], 10);
+                this._writeFullscreenPersistValue(persistKey, currentSize);
+            }
         };
 
         handle.addEventListener("mousedown", (e) => {
@@ -5164,6 +5427,19 @@ export class EditorWidget {
     }
 
     _recalcFullscreenHeights() {
+        if (this._fsSidebar) {
+            const sidebarMax = this._computeFullscreenSidebarMaxWidth();
+            const sidebarWidth = parseInt(getComputedStyle(this._fsSidebar).width, 10) || FULLSCREEN_SIDEBAR_DEFAULT_WIDTH;
+            this._fsSidebar.style.maxWidth = `${sidebarMax}px`;
+            this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, sidebarWidth))}px`;
+        }
+        if (this._fsBottomRow) {
+            const timelineMax = this._computeFullscreenTimelineMaxHeight();
+            const timelineHeight = parseInt(getComputedStyle(this._fsBottomRow).height, 10) || this._defaultFullscreenTimelineHeight();
+            this._fsBottomRow.style.maxHeight = `${timelineMax}px`;
+            this._fsBottomRow.style.height = `${Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.min(timelineMax, timelineHeight))}px`;
+        }
+
         // In three-panel layout, timeline height is based on the bottom row height
         const bottomH = this._fsBottomRow ? parseInt(getComputedStyle(this._fsBottomRow).height) || 280 : 280;
         const st = this._scaleToolbar;
@@ -5173,6 +5449,7 @@ export class EditorWidget {
 
         // Timeline height — canvas renders at 1:1 now (individual elements scale themselves)
         this._timelineHeight = Math.max(100, bottomH - sceneBarH - toolbarH - editorsH);
+        this._clampScrollY();
         // Gallery is in the sidebar now, doesn't need height calc
         this._galleryHeight = GALLERY_HEIGHT; // Not used in fullscreen layout
     }
@@ -5182,6 +5459,16 @@ export class EditorWidget {
         if (EditorWidget._activeFullscreen && EditorWidget._activeFullscreen !== this) return;
 
         this._createFullscreenOverlay();
+        const savedSidebarWidth = this._readFullscreenPersistValue("sidebar-width");
+        const savedTimelineHeight = this._readFullscreenPersistValue("timeline-height");
+        if (savedSidebarWidth && this._fsSidebar) {
+            const sidebarMax = this._computeFullscreenSidebarMaxWidth();
+            this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, savedSidebarWidth))}px`;
+        }
+        if (savedTimelineHeight && this._fsBottomRow) {
+            const timelineMax = this._computeFullscreenTimelineMaxHeight();
+            this._fsBottomRow.style.height = `${Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.min(timelineMax, savedTimelineHeight))}px`;
+        }
 
         // Save position and node size for re-insertion
         this._nodeParent = this.container.parentElement;
@@ -5451,8 +5738,7 @@ export class EditorWidget {
             // ── S = toggle snapping ──
             if (key === "s" || key === "S") {
                 consume();
-                this.snappingEnabled = !this.snappingEnabled;
-                this._updateToolbar();
+                this._setSnappingEnabled(!this.snappingEnabled);
                 return;
             }
 
@@ -5505,7 +5791,28 @@ export class EditorWidget {
     }
 
     /** Called whenever the playhead changes position (arrow keys, etc.). */
+    _visibleTimelineFrameSpan() {
+        const rect = this.timelineCanvas?.parentElement?.getBoundingClientRect();
+        const width = rect ? Math.floor(rect.width) : (this.timelineCanvas?.width || 400);
+        return Math.max(1, (width - this._labelW) / Math.max(0.2, this.pixelsPerFrame));
+    }
+
+    _maybeAutoScrollToPlayhead() {
+        if (!this._settings?.playback?.autoScrollPlayhead) return;
+        const visibleFrames = this._visibleTimelineFrameSpan();
+        const marginFrames = Math.max(2, Math.floor(visibleFrames * 0.12));
+        const leftBound = this.scrollX + marginFrames;
+        const rightBound = this.scrollX + visibleFrames - marginFrames;
+        if (this.playhead < leftBound) {
+            this.scrollX = Math.max(0, this.playhead - marginFrames);
+        } else if (this.playhead > rightBound) {
+            this.scrollX = Math.max(0, this.playhead - visibleFrames + marginFrames);
+        }
+        this._clampScrollX();
+    }
+
     _onPlayheadChange() {
+        this._maybeAutoScrollToPlayhead();
         this._renderTimeline();
         if (this.isFullscreen) this._renderViewportFrame();
         this._updateToolbar();
@@ -5523,13 +5830,19 @@ export class EditorWidget {
     // ── UI Scale (per-section) ───────────────────────────────────────
     _setScale(key, value) {
         const clamped = Math.round(Math.max(0.7, Math.min(2.0, value)) * 10) / 10;
-        this[`_scale${key}`] = clamped;
-        localStorage.setItem(`ltx-editor-scale-${key.toLowerCase()}`, clamped.toString());
-        // Update settings panel label if open
-        if (this._settingsLabels && this._settingsLabels[key]) {
-            this._settingsLabels[key].textContent = `${Math.round(clamped * 100)}%`;
-        }
-        this._applyScales();
+        const keyMap = {
+            Toolbar: "scaleToolbar",
+            TrackHeaders: "scaleTrackHeaders",
+            Timeline: "scaleTimeline",
+            Gallery: "scaleGallery",
+        };
+        const layoutKey = keyMap[key];
+        if (!layoutKey) return;
+        this._updateSettings({
+            layout: {
+                [layoutKey]: clamped,
+            },
+        });
     }
 
     _applyScales() {
@@ -5552,10 +5865,16 @@ export class EditorWidget {
     }
 
     _canvasMouseCoords(e) {
-        const rect = this.timelineCanvas.getBoundingClientRect();
+        const canvas = this.timelineCanvas;
+        const rect = canvas.getBoundingClientRect();
+        const rulerH = this._timelineRulerHeight();
+        const sx = rect.width > 0 ? canvas.width / rect.width : 1;
+        const sy = rect.height > 0 ? canvas.height / rect.height : 1;
+        const rawY = (e.clientY - rect.top) * sy;
         return {
-            x: e.clientX - rect.left,
-            y: e.clientY - rect.top
+            x: (e.clientX - rect.left) * sx,
+            rawY,
+            y: rawY >= rulerH ? rawY + this.scrollY : rawY,
         };
     }
 
@@ -5563,6 +5882,50 @@ export class EditorWidget {
     _projectDirName() {
         if (!this.projectDir) return "";
         return this.projectDir.split(/[/\\]/).pop();
+    }
+
+    _assetDisplayName(asset, sourcePath = "") {
+        if (asset?.name) return asset.name;
+        if (sourcePath) {
+            const fileName = sourcePath.split(/[/\\]/).pop();
+            if (fileName) return fileName;
+        }
+        return "Untitled";
+    }
+
+    _formatClipTimelineLabel(clip, asset, isMissingClip) {
+        const mode = this._clipLabelMode();
+        if (mode === "hidden") return "";
+        const name = this._assetDisplayName(asset, clip?.source_path || "");
+        const dur = Math.max(1, (clip?.timeline_end_frame || 0) - (clip?.timeline_start_frame || 0));
+        const durationText = this._timecodeMode === "timecode" ? this._frameToTimecode(dur) : `${dur}f`;
+        let label = mode === "name_only" ? name : `${name} | ${durationText}`;
+        if (isMissingClip) {
+            label = `Missing | ${label}`;
+        }
+        const opacity = clip?.opacity ?? 1.0;
+        if (opacity < 1.0) {
+            label += ` | ${Math.round(opacity * 100)}%`;
+        }
+        return label;
+    }
+
+    _formatAudioTimelineLabel(track, asset, isMissingAudio) {
+        const mode = this._clipLabelMode();
+        if (mode === "hidden") return "";
+        const name = this._assetDisplayName(asset, track?.source_path || "");
+        const dur = Math.max(1, (track?.timeline_end_frame || 0) - (track?.timeline_start_frame || 0));
+        const durationText = this._timecodeMode === "timecode" ? this._frameToTimecode(dur) : `${dur}f`;
+        let label = mode === "name_only" ? name : `${name} | ${durationText}`;
+        if (isMissingAudio) {
+            label = `Missing | ${label}`;
+        }
+        if (track?.muted) {
+            label += " | M";
+        } else if ((track?.volume ?? 1.0) < 1.0) {
+            label += ` | ${Math.round((track.volume ?? 1.0) * 100)}%`;
+        }
+        return label;
     }
 
     // ── Saved Selections ──────────────────────────────────────────────
@@ -5838,7 +6201,7 @@ export class EditorWidget {
     }
 
     // ── Settings Panel ────────────────────────────────────────────────
-    _showSettingsPanel() {
+    _showLegacySettingsPanelUnused() {
         if (this._settingsPanelEl) return;
         const backdrop = document.createElement("div");
         backdrop.style.cssText = `position:fixed;inset:0;z-index:10001;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;`;
@@ -5886,14 +6249,14 @@ export class EditorWidget {
             panel.appendChild(row);
         }
 
-        // Reset All button
+        // Reset layout button
         const resetRow = document.createElement("div");
         resetRow.style.cssText = "margin-top:14px;text-align:center;";
         const resetBtn = document.createElement("button");
-        resetBtn.textContent = "Reset All to 100%";
+        resetBtn.textContent = "Reset Editor Layout";
         resetBtn.style.cssText = "background:#333;border:1px solid #555;color:#aaa;cursor:pointer;padding:4px 16px;border-radius:4px;font-size:11px;";
         resetBtn.addEventListener("click", () => {
-            for (const { key } of sections) this._setScale(key, 1.0);
+            this._resetEditorLayout();
         });
         resetRow.appendChild(resetBtn);
         panel.appendChild(resetRow);
@@ -5907,7 +6270,7 @@ export class EditorWidget {
         document.addEventListener("keydown", this._settingsPanelEscHandler, true);
     }
 
-    _hideSettingsPanel() {
+    _hideLegacySettingsPanelUnused() {
         if (this._settingsPanelEl) {
             this._settingsPanelEl.remove();
             this._settingsPanelEl = null;
@@ -6163,8 +6526,13 @@ export class EditorWidget {
             canvasH = Math.floor(canvasW / aspect);
         }
 
-        this._vpCanvas.width = canvasW;
-        this._vpCanvas.height = canvasH;
+        const resolutionScale = this._settings.playback.resolution === "quarter"
+            ? 0.25
+            : this._settings.playback.resolution === "half"
+                ? 0.5
+                : 1;
+        this._vpCanvas.width = Math.max(1, Math.floor(canvasW * resolutionScale));
+        this._vpCanvas.height = Math.max(1, Math.floor(canvasH * resolutionScale));
         this._vpCanvas.style.width = canvasW + "px";
         this._vpCanvas.style.height = canvasH + "px";
 
@@ -6679,45 +7047,61 @@ export class EditorWidget {
         }
     }
 
-    _startPlayback() {
-        if (this.isPlaying) return;
-        this.isPlaying = true;
-        if (this._vpPlayBtn) this._vpPlayBtn.textContent = "⏸";
-
-        this._playbackStartTime = performance.now();
-        this._playbackStartFrame = this.playhead;
-
-        // Cancel any pending scrub seek
-        if (this._seekAbort) {
-            this._seekAbort();
-            this._seekAbort = null;
+    _clearActivePlaybackMedia() {
+        if (this._activePlaybackVideos) {
+            for (const video of this._activePlaybackVideos) {
+                video.pause();
+            }
+            this._activePlaybackVideos = [];
         }
+        if (this._activePlaybackVideo) {
+            this._activePlaybackVideo.pause();
+            this._activePlaybackVideo = null;
+        }
+        for (const audio of this._activePlaybackAudios) {
+            audio.pause();
+        }
+        this._activePlaybackAudios = [];
+    }
 
-        // Start video elements for all visible clips at current frame
-        const visibleClips = this._getClipsAtFrame(this.playhead)
+    _resolvePlaybackLoopRange() {
+        if (!this._settings?.playback?.loopSelection) return null;
+        if (this.selectionStart < this.selectionEnd) {
+            return {
+                start: this.selectionStart,
+                end: this.selectionEnd,
+            };
+        }
+        return null;
+    }
+
+    _startPlaybackMedia(frame) {
+        this._clearActivePlaybackMedia();
+
+        const visibleClips = this._getClipsAtFrame(frame)
             .filter((clip) => !this._isMissingSourcePath(clip.source_path));
         this._activePlaybackVideos = [];
         for (const clip of visibleClips) {
             const video = this._getOrCreateVideo(clip.source_path);
             if (!video) continue;
-            const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
+            const sourceFrame = frame - clip.timeline_start_frame + (clip.source_in_frame || 0);
             const sourceTime = sourceFrame / this._effectiveFps;
             video.muted = true;
 
-            const startVideoPlayback = (v) => {
+            const startVideoPlayback = (element) => {
                 const onSeeked = () => {
-                    v.removeEventListener("seeked", onSeeked);
-                    v.play().catch(() => {});
+                    element.removeEventListener("seeked", onSeeked);
+                    element.play().catch(() => {});
                 };
-                if (Math.abs(v.currentTime - sourceTime) > 0.01) {
-                    v.addEventListener("seeked", onSeeked);
-                    v.currentTime = sourceTime;
+                if (Math.abs(element.currentTime - sourceTime) > 0.01) {
+                    element.addEventListener("seeked", onSeeked);
+                    element.currentTime = sourceTime;
                     setTimeout(() => {
-                        v.removeEventListener("seeked", onSeeked);
-                        v.play().catch(() => {});
+                        element.removeEventListener("seeked", onSeeked);
+                        element.play().catch(() => {});
                     }, 200);
                 } else {
-                    v.play().catch(() => {});
+                    element.play().catch(() => {});
                 }
             };
 
@@ -6734,24 +7118,60 @@ export class EditorWidget {
             }
             this._activePlaybackVideos.push(video);
         }
-        // Backward compat
-        this._activePlaybackVideo = this._activePlaybackVideos.length > 0 ? this._activePlaybackVideos[this._activePlaybackVideos.length - 1] : null;
+        this._activePlaybackVideo = this._activePlaybackVideos.length > 0
+            ? this._activePlaybackVideos[this._activePlaybackVideos.length - 1]
+            : null;
 
-        // Start audio tracks
-        const audioTracks = this._getAudioTracksAtFrame(this.playhead);
+        const audioTracks = this._getAudioTracksAtFrame(frame);
         this._activePlaybackAudios = [];
         for (const track of audioTracks) {
             if (track.muted) continue;
             const audio = this._getOrCreateAudio(track.source_path);
-            if (audio) {
-                const audioFrame = this.playhead - track.timeline_start_frame + (track.source_in_frame || 0);
-                audio.currentTime = audioFrame / this._effectiveFps;
-                audio.volume = track.volume ?? 1.0;
-                audio.play().catch(() => {});
-                this._activePlaybackAudios.push(audio);
-            }
+            if (!audio) continue;
+            const audioFrame = frame - track.timeline_start_frame + (track.source_in_frame || 0);
+            audio.currentTime = audioFrame / this._effectiveFps;
+            audio.volume = track.volume ?? 1.0;
+            audio.play().catch(() => {});
+            this._activePlaybackAudios.push(audio);
+        }
+    }
+
+    _restartPlaybackLoop(timestamp) {
+        if (!this._playbackLoopRange) return;
+        this.playhead = this._playbackLoopRange.start;
+        this._playbackStartTime = timestamp;
+        this._playbackStartFrame = this.playhead;
+        this._maybeAutoScrollToPlayhead();
+        this._startPlaybackMedia(this.playhead);
+        this._renderViewportFrame();
+        this._renderTimeline();
+        this._playbackRAF = requestAnimationFrame((nextTimestamp) => this._playbackTick(nextTimestamp));
+    }
+
+    _startPlayback() {
+        if (this.isPlaying) return;
+        const loopRange = this._resolvePlaybackLoopRange();
+        if (loopRange && (this.playhead < loopRange.start || this.playhead >= loopRange.end)) {
+            this.playhead = loopRange.start;
+        }
+        this.isPlaying = true;
+        if (this._vpPlayBtn) this._vpPlayBtn.textContent = "⏸";
+
+        this._playbackStartTime = performance.now();
+        this._playbackStartFrame = this.playhead;
+        this._playbackSessionStartFrame = this.playhead;
+        this._playbackLoopRange = loopRange;
+
+        // Cancel any pending scrub seek
+        if (this._seekAbort) {
+            this._seekAbort();
+            this._seekAbort = null;
         }
 
+        this._maybeAutoScrollToPlayhead();
+        this._startPlaybackMedia(this.playhead);
+        this._renderTimeline();
+        this._renderViewportFrame();
         this._playbackRAF = requestAnimationFrame((t) => this._playbackTick(t));
     }
 
@@ -6760,8 +7180,14 @@ export class EditorWidget {
 
         const elapsed = (timestamp - this._playbackStartTime) / 1000;
         const newFrame = this._playbackStartFrame + Math.floor(elapsed * this._effectiveFps);
+        const loopRange = this._playbackLoopRange;
+        const playbackEndFrame = loopRange ? loopRange.end : this.totalFrames;
 
-        if (newFrame >= this.totalFrames) {
+        if (newFrame >= playbackEndFrame) {
+            if (loopRange) {
+                this._restartPlaybackLoop(timestamp);
+                return;
+            }
             this.playhead = this.totalFrames;
             this._stopPlayback();
             return;
@@ -6769,6 +7195,7 @@ export class EditorWidget {
 
         const prevFrame = this.playhead;
         this.playhead = newFrame;
+        this._maybeAutoScrollToPlayhead();
 
         // Detect clip boundary crossing (multi-layer aware)
         const prevClips = this._getClipsAtFrame(prevFrame)
@@ -6810,7 +7237,7 @@ export class EditorWidget {
         this._playbackRAF = requestAnimationFrame((t) => this._playbackTick(t));
     }
 
-    _stopPlayback() {
+    _stopPlayback({ preservePlayhead = false } = {}) {
         if (this._playbackRAF) {
             cancelAnimationFrame(this._playbackRAF);
             this._playbackRAF = null;
@@ -6818,21 +7245,14 @@ export class EditorWidget {
         this.isPlaying = false;
         if (this._vpPlayBtn) this._vpPlayBtn.textContent = "▶";
 
-        // Pause active videos (multi-layer)
-        if (this._activePlaybackVideos) {
-            for (const v of this._activePlaybackVideos) v.pause();
-            this._activePlaybackVideos = [];
+        this._clearActivePlaybackMedia();
+        if (!preservePlayhead && this._settings?.playback?.returnToPlaybackStart) {
+            this.playhead = this._playbackSessionStartFrame;
+            this._maybeAutoScrollToPlayhead();
         }
-        if (this._activePlaybackVideo) {
-            this._activePlaybackVideo.pause();
-            this._activePlaybackVideo = null;
-        }
-
-        // Pause active audios
-        for (const audio of this._activePlaybackAudios) {
-            audio.pause();
-        }
-        this._activePlaybackAudios = [];
+        this._playbackLoopRange = null;
+        this._renderViewportFrame();
+        this._renderTimeline();
     }
 
     getElement() {
@@ -6844,9 +7264,9 @@ export class EditorWidget {
         const st = this._scaleToolbar;
         const sg = this._scaleGallery;
         const barsH = (SCENE_BAR_HEIGHT + 24) * st; // scene bar + toolbar
-        const timelineH = Math.round(RULER_HEIGHT * this._scaleTimeline) + this._totalTracksHeight();
+        const timelineH = this._timelineHeight;
         const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * st;
-        return barsH + Math.max(timelineH, this._timelineHeight) + (this._galleryHeight * sg) + editorsH;
+        return barsH + timelineH + (this._galleryHeight * sg) + editorsH;
     }
 
     // ── File Import (drag-and-drop files from OS onto node) ────────────
@@ -6895,6 +7315,461 @@ export class EditorWidget {
         }
     }
 
+    _showSettingsPanel() {
+        if (this._settingsPanelEl) return;
+
+        const backdrop = document.createElement("div");
+        backdrop.style.cssText = `
+            position: fixed; inset: 0; z-index: 10001;
+            background: rgba(0,0,0,0.72);
+            display: flex; align-items: center; justify-content: center;
+            padding: 24px;
+        `;
+
+        const panel = document.createElement("div");
+        panel.style.cssText = `
+            background: #171717;
+            border: 1px solid #4a4a4a;
+            border-radius: 12px;
+            width: min(860px, 96vw);
+            max-height: min(780px, 88vh);
+            overflow: auto;
+            color: #ddd;
+            font-family: sans-serif;
+            font-size: 12px;
+            box-shadow: 0 22px 60px rgba(0,0,0,0.45);
+        `;
+
+        const header = document.createElement("div");
+        header.style.cssText = `
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 18px 22px 14px;
+            border-bottom: 1px solid #2f2f2f;
+            position: sticky; top: 0; background: #171717; z-index: 1;
+        `;
+        const titleWrap = document.createElement("div");
+        titleWrap.innerHTML = `
+            <div style="font-size:15px;font-weight:700;color:#fff;">Editor Settings</div>
+            <div style="font-size:11px;color:#909090;margin-top:3px;">Local browser preferences for layout, playback, appearance, project defaults, and gallery behavior.</div>
+        `;
+        const closeBtn = document.createElement("button");
+        closeBtn.textContent = "Close";
+        closeBtn.style.cssText = `
+            background: #262626; border: 1px solid #505050; color: #d7d7d7;
+            cursor: pointer; padding: 6px 12px; border-radius: 7px; font-size: 11px;
+        `;
+        closeBtn.addEventListener("click", () => this._hideSettingsPanel());
+        header.append(titleWrap, closeBtn);
+        panel.appendChild(header);
+
+        const body = document.createElement("div");
+        body.style.cssText = `
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 14px;
+            padding: 18px 22px 22px;
+        `;
+        panel.appendChild(body);
+
+        this._settingsPanelControls = {};
+        const controls = this._settingsPanelControls;
+
+        const updateCategory = (category, key, value) => {
+            this._updateSettings({
+                [category]: {
+                    [key]: value,
+                },
+            });
+        };
+
+        const createSection = (title, description) => {
+            const section = document.createElement("section");
+            section.style.cssText = `
+                background: #1f1f1f;
+                border: 1px solid #333;
+                border-radius: 10px;
+                padding: 14px 14px 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                align-self: start;
+            `;
+            const heading = document.createElement("div");
+            heading.innerHTML = `
+                <div style="font-size:12px;font-weight:700;color:#f0f0f0;letter-spacing:0.02em;">${title}</div>
+                <div style="font-size:10px;color:#888;margin-top:2px;line-height:1.35;">${description}</div>
+            `;
+            section.appendChild(heading);
+            body.appendChild(section);
+            return section;
+        };
+
+        const createRow = (section, label, description) => {
+            const row = document.createElement("div");
+            row.style.cssText = `
+                display: flex; align-items: center; justify-content: space-between;
+                gap: 12px; padding: 8px 0; border-top: 1px solid #2b2b2b;
+            `;
+            const labelWrap = document.createElement("div");
+            labelWrap.style.cssText = "flex: 1; min-width: 0;";
+            labelWrap.innerHTML = `
+                <div style="color:#ddd;font-size:11px;line-height:1.35;">${label}</div>
+                <div style="color:#777;font-size:10px;line-height:1.35;margin-top:1px;">${description}</div>
+            `;
+            const controlWrap = document.createElement("div");
+            controlWrap.style.cssText = "display:flex;align-items:center;gap:8px;flex-shrink:0;";
+            row.append(labelWrap, controlWrap);
+            section.appendChild(row);
+            return controlWrap;
+        };
+
+        const createCheckbox = (section, key, label, description, getter, onChange) => {
+            const controlWrap = createRow(section, label, description);
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.checked = !!getter();
+            checkbox.addEventListener("change", () => onChange(checkbox.checked));
+            controlWrap.appendChild(checkbox);
+            controls[key] = checkbox;
+            return checkbox;
+        };
+
+        const createSelect = (section, key, label, description, options, getter, onChange) => {
+            const controlWrap = createRow(section, label, description);
+            const select = document.createElement("select");
+            select.style.cssText = `
+                min-width: 126px; background:#292929; border:1px solid #555;
+                color:#ddd; border-radius:6px; padding:4px 8px; font-size:11px;
+            `;
+            for (const option of options) {
+                const el = document.createElement("option");
+                el.value = option.value;
+                el.textContent = option.label;
+                select.appendChild(el);
+            }
+            select.value = getter();
+            select.addEventListener("change", () => onChange(select.value));
+            controlWrap.appendChild(select);
+            controls[key] = select;
+            return select;
+        };
+
+        const createNumberInput = (section, key, label, description, config) => {
+            const controlWrap = createRow(section, label, description);
+            const input = document.createElement("input");
+            input.type = "number";
+            input.min = String(config.min);
+            input.max = String(config.max);
+            input.step = String(config.step ?? 1);
+            input.value = String(config.getter());
+            input.style.cssText = `
+                width: 86px; background:#292929; border:1px solid #555; color:#ddd;
+                border-radius:6px; padding:4px 8px; font-size:11px; text-align:right;
+            `;
+            input.addEventListener("change", () => {
+                const numeric = Number(input.value);
+                const fallback = config.getter();
+                const nextValue = Number.isFinite(numeric) ? numeric : fallback;
+                config.onChange(nextValue);
+            });
+            controlWrap.appendChild(input);
+            controls[key] = input;
+            return input;
+        };
+
+        const createScaleRow = (section, key, label, description, getter) => {
+            const controlWrap = createRow(section, label, description);
+            const downBtn = document.createElement("button");
+            downBtn.textContent = "-";
+            downBtn.style.cssText = `
+                background:#2a2a2a;border:1px solid #555;color:#ccc;cursor:pointer;
+                padding:3px 9px;border-radius:6px;font-size:13px;line-height:1;
+            `;
+            downBtn.addEventListener("click", () => this._setScale(key, getter() - 0.1));
+
+            const valueLabel = document.createElement("span");
+            valueLabel.style.cssText = "font-size:11px;color:#cfcfcf;min-width:42px;text-align:center;";
+            valueLabel.textContent = `${Math.round(getter() * 100)}%`;
+            controls[`scale${key}Label`] = valueLabel;
+
+            const upBtn = document.createElement("button");
+            upBtn.textContent = "+";
+            upBtn.style.cssText = `
+                background:#2a2a2a;border:1px solid #555;color:#ccc;cursor:pointer;
+                padding:3px 9px;border-radius:6px;font-size:13px;line-height:1;
+            `;
+            upBtn.addEventListener("click", () => this._setScale(key, getter() + 0.1));
+
+            controlWrap.append(downBtn, valueLabel, upBtn);
+        };
+
+        const layoutSection = createSection(
+            "Layout & UI Scale",
+            "Adjust the editor chrome and restore saved fullscreen sizing."
+        );
+        createScaleRow(layoutSection, "Toolbar", "Toolbar & Bars", "Scene strip, toolbar, and transport controls.", () => this._settings.layout.scaleToolbar);
+        createScaleRow(layoutSection, "TrackHeaders", "Track Headers", "Lane labels, icons, and left-side track controls.", () => this._settings.layout.scaleTrackHeaders);
+        createScaleRow(layoutSection, "Timeline", "Timeline", "Ruler, track heights, clip blocks, and inline editors.", () => this._settings.layout.scaleTimeline);
+        createScaleRow(layoutSection, "Gallery", "Asset Gallery", "Gallery lists, tabs, metadata text, and inspector chrome.", () => this._settings.layout.scaleGallery);
+        const resetControls = createRow(layoutSection, "Reset Editor Layout", "Clear saved fullscreen widths, label widths, and UI scale overrides.");
+        const resetBtn = document.createElement("button");
+        resetBtn.textContent = "Reset";
+        resetBtn.style.cssText = `
+            background:#2f2f2f;border:1px solid #555;color:#ddd;cursor:pointer;
+            padding:5px 12px;border-radius:6px;font-size:11px;
+        `;
+        resetBtn.addEventListener("click", () => this._resetEditorLayout());
+        resetControls.appendChild(resetBtn);
+
+        const timelineSection = createSection(
+            "Timeline Behavior",
+            "Default snapping behavior, candidate types, and frame/timecode display mode."
+        );
+        createCheckbox(
+            timelineSection,
+            "snappingEnabled",
+            "Enable Snapping By Default",
+            "Use snap guides for drag, trim, and move operations unless toggled off.",
+            () => this._settings.timelineBehavior.snappingEnabled,
+            (checked) => this._setSnappingEnabled(checked)
+        );
+        createNumberInput(
+            timelineSection,
+            "snapThreshold",
+            "Snap Threshold",
+            "Maximum distance, in frames, before the editor snaps to a candidate.",
+            {
+                min: 1,
+                max: 60,
+                step: 1,
+                getter: () => this._settings.timelineBehavior.snapThreshold,
+                onChange: (value) => updateCategory("timelineBehavior", "snapThreshold", Math.round(value)),
+            }
+        );
+        for (const option of SNAP_TARGET_OPTIONS) {
+            createCheckbox(
+                timelineSection,
+                `snapTarget_${option.key}`,
+                option.label,
+                "Include this target type when evaluating snap candidates.",
+                () => this._settings.timelineBehavior.snapTargets[option.key],
+                (checked) => {
+                    this._updateSettings({
+                        timelineBehavior: {
+                            snapTargets: {
+                                [option.key]: checked,
+                            },
+                        },
+                    });
+                }
+            );
+        }
+        createSelect(
+            timelineSection,
+            "timecodeMode",
+            "Default Time Display",
+            "Choose whether editor inputs and readouts default to frame counts or timecode.",
+            TIMECODE_MODE_OPTIONS,
+            () => this._settings.timelineBehavior.timecodeMode,
+            (value) => this._setTimecodeMode(value)
+        );
+
+        const playbackSection = createSection(
+            "Playback",
+            "Controls for timeline playback flow and viewport preview quality."
+        );
+        createCheckbox(
+            playbackSection,
+            "loopSelection",
+            "Loop Active Selection",
+            "If a selection exists, playback repeats within that range.",
+            () => this._settings.playback.loopSelection,
+            (checked) => updateCategory("playback", "loopSelection", checked)
+        );
+        createCheckbox(
+            playbackSection,
+            "autoScrollPlayhead",
+            "Auto-Scroll Playhead",
+            "Keep the playhead visible as playback or keyboard scrubbing moves forward.",
+            () => this._settings.playback.autoScrollPlayhead,
+            (checked) => updateCategory("playback", "autoScrollPlayhead", checked)
+        );
+        createCheckbox(
+            playbackSection,
+            "returnToPlaybackStart",
+            "Return To Start On Stop",
+            "Stopping playback jumps back to the frame where playback began.",
+            () => this._settings.playback.returnToPlaybackStart,
+            (checked) => updateCategory("playback", "returnToPlaybackStart", checked)
+        );
+        createSelect(
+            playbackSection,
+            "playbackResolution",
+            "Viewport Playback Resolution",
+            "Lower preview resolution for smoother playback on heavier scenes.",
+            PLAYBACK_RESOLUTION_OPTIONS,
+            () => this._settings.playback.resolution,
+            (value) => updateCategory("playback", "resolution", value)
+        );
+
+        const appearanceSection = createSection(
+            "Appearance",
+            "Non-destructive visual preferences for timeline readability."
+        );
+        const waveformControls = createRow(appearanceSection, "Waveform Accent Color", "Tint used for the audio waveform overlay.");
+        const waveformInput = document.createElement("input");
+        waveformInput.type = "color";
+        waveformInput.value = this._settings.appearance.waveformAccent;
+        waveformInput.style.cssText = "width:44px;height:28px;padding:0;border:none;background:none;cursor:pointer;";
+        waveformInput.addEventListener("change", () => updateCategory("appearance", "waveformAccent", waveformInput.value));
+        waveformControls.appendChild(waveformInput);
+        controls.waveformAccent = waveformInput;
+
+        const brightnessControls = createRow(appearanceSection, "Timeline Background Brightness", "Lighten or darken timeline chrome without changing lane colors.");
+        const brightnessInput = document.createElement("input");
+        brightnessInput.type = "range";
+        brightnessInput.min = "70";
+        brightnessInput.max = "130";
+        brightnessInput.step = "1";
+        brightnessInput.value = String(this._settings.appearance.timelineBrightness);
+        brightnessInput.style.width = "120px";
+        brightnessInput.addEventListener("input", () => {
+            updateCategory("appearance", "timelineBrightness", Math.round(Number(brightnessInput.value) || 100));
+        });
+        const brightnessLabel = document.createElement("span");
+        brightnessLabel.style.cssText = "font-size:11px;color:#ccc;min-width:38px;text-align:right;";
+        brightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
+        brightnessControls.append(brightnessInput, brightnessLabel);
+        controls.timelineBrightness = brightnessInput;
+        controls.timelineBrightnessLabel = brightnessLabel;
+
+        createSelect(
+            appearanceSection,
+            "clipLabelMode",
+            "Clip Label Content",
+            "Choose how much text appears inside clip and audio blocks.",
+            CLIP_LABEL_MODE_OPTIONS,
+            () => this._settings.appearance.clipLabelMode,
+            (value) => updateCategory("appearance", "clipLabelMode", value)
+        );
+
+        const projectDefaultsSection = createSection(
+            "Project Defaults",
+            "Values used to prefill new projects and new blank scenes."
+        );
+        createNumberInput(
+            projectDefaultsSection,
+            "defaultProjectFps",
+            "Default FPS",
+            "Used to prefill create-project widgets in LTXEditor and LTXProjectLoader.",
+            {
+                min: 1,
+                max: 240,
+                step: 1,
+                getter: () => this._settings.projectDefaults.fps,
+                onChange: (value) => updateCategory("projectDefaults", "fps", value),
+            }
+        );
+        createNumberInput(
+            projectDefaultsSection,
+            "defaultProjectWidth",
+            "Default Project Width",
+            "Used as the starting width for newly created projects.",
+            {
+                min: 64,
+                max: 8192,
+                step: 8,
+                getter: () => this._settings.projectDefaults.width,
+                onChange: (value) => updateCategory("projectDefaults", "width", Math.round(value)),
+            }
+        );
+        createNumberInput(
+            projectDefaultsSection,
+            "defaultProjectHeight",
+            "Default Project Height",
+            "Used as the starting height for newly created projects.",
+            {
+                min: 64,
+                max: 8192,
+                step: 8,
+                getter: () => this._settings.projectDefaults.height,
+                onChange: (value) => updateCategory("projectDefaults", "height", Math.round(value)),
+            }
+        );
+        createNumberInput(
+            projectDefaultsSection,
+            "defaultSceneDuration",
+            "Default New-Scene Duration",
+            "Applies only when creating a new blank scene; duplicated scenes keep their source duration.",
+            {
+                min: 1,
+                max: 99999,
+                step: 1,
+                getter: () => this._settings.projectDefaults.newSceneDuration,
+                onChange: (value) => updateCategory("projectDefaults", "newSceneDuration", Math.round(value)),
+            }
+        );
+
+        const gallerySection = createSection(
+            "Asset Gallery",
+            "Global defaults for gallery ordering and inspector presentation."
+        );
+        createSelect(
+            gallerySection,
+            "gallerySortMode",
+            "Default Sort Mode",
+            "New gallery instances use this order unless changed later.",
+            GALLERY_SORT_OPTIONS,
+            () => this._settings.gallery.sortMode,
+            (value) => updateCategory("gallery", "sortMode", value)
+        );
+        createCheckbox(
+            gallerySection,
+            "galleryInspectorCollapsed",
+            "Inspector Starts Collapsed",
+            "Open the shared asset gallery with the right-side inspector hidden.",
+            () => this._settings.gallery.inspectorCollapsed,
+            (checked) => updateCategory("gallery", "inspectorCollapsed", checked)
+        );
+        createSelect(
+            gallerySection,
+            "galleryThumbnailSize",
+            "Thumbnail Size",
+            "Controls the default media preview size in gallery lists and trash.",
+            GALLERY_THUMBNAIL_SIZE_OPTIONS,
+            () => this._settings.gallery.thumbnailSize,
+            (value) => updateCategory("gallery", "thumbnailSize", value)
+        );
+
+        backdrop.appendChild(panel);
+        document.body.appendChild(backdrop);
+        this._settingsPanelEl = backdrop;
+        this._syncSettingsPanelControls();
+
+        backdrop.addEventListener("click", (e) => {
+            if (e.target === backdrop) this._hideSettingsPanel();
+        });
+        this._settingsPanelEscHandler = (e) => {
+            if (e.key === "Escape") {
+                e.stopImmediatePropagation();
+                this._hideSettingsPanel();
+            }
+        };
+        document.addEventListener("keydown", this._settingsPanelEscHandler, true);
+    }
+
+    _hideSettingsPanel() {
+        if (this._settingsPanelEl) {
+            this._settingsPanelEl.remove();
+            this._settingsPanelEl = null;
+            this._settingsPanelControls = null;
+        }
+        if (this._settingsPanelEscHandler) {
+            document.removeEventListener("keydown", this._settingsPanelEscHandler, true);
+            this._settingsPanelEscHandler = null;
+        }
+    }
+
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
@@ -6924,6 +7799,10 @@ export class EditorWidget {
         if (this._focusHandler) {
             document.removeEventListener("mousedown", this._focusHandler, true);
             this._focusHandler = null;
+        }
+        if (this._settingsUnsubscribe) {
+            this._settingsUnsubscribe();
+            this._settingsUnsubscribe = null;
         }
         if (this._shortcutOverlayEscHandler) {
             document.removeEventListener("keydown", this._shortcutOverlayEscHandler, true);

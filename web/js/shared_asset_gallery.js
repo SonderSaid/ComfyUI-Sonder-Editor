@@ -1,17 +1,24 @@
 const { api } = window.comfyAPI.api;
 
-const DEFAULT_SORT_MODE = "newest";
+import {
+    DEFAULT_EDITOR_SETTINGS,
+    GALLERY_SORT_OPTIONS,
+    getEditorSettings,
+    migrateLegacyGalleryProjectPrefs,
+    subscribeEditorSettings,
+    updateEditorSettings,
+} from "./editor_settings.js";
+
+const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const ROOT_FOLDER_COLLAPSE_KEY = "__ltx_root__";
 const TRASH_FOLDER_COLLAPSE_KEY = "__ltx_trash__";
-const SORT_OPTIONS = [
-    { value: "newest", label: "Newest" },
-    { value: "oldest", label: "Oldest" },
-    { value: "name", label: "Name" },
-    { value: "type", label: "Type" },
-    { value: "duration", label: "Duration" },
-    { value: "resolution", label: "Resolution" },
-];
+const SORT_OPTIONS = GALLERY_SORT_OPTIONS;
 const LIST_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
+const THUMBNAIL_SIZE_CONFIG = {
+    small: { thumbWidth: 60, thumbHeight: 44, gap: 6, padding: 5, nameFont: 10, metaFont: 9 },
+    medium: { thumbWidth: 72, thumbHeight: 54, gap: 8, padding: 6, nameFont: 11, metaFont: 10 },
+    large: { thumbWidth: 88, thumbHeight: 66, gap: 10, padding: 8, nameFont: 12, metaFont: 10 },
+};
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -124,6 +131,10 @@ function formatClockTime(seconds) {
 
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+}
+
+function thumbnailSizeConfig(size) {
+    return THUMBNAIL_SIZE_CONFIG[size] || THUMBNAIL_SIZE_CONFIG[DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize];
 }
 
 function formatGenerationValue(value) {
@@ -256,6 +267,7 @@ function makeSectionTitle(label) {
 }
 
 export function mountSharedAssetGallery(container, options = {}) {
+    const initialSettings = getEditorSettings();
     const state = {
         type: "all",
         query: "",
@@ -268,9 +280,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         dropFolder: "",
         destroyed: false,
         collapsedFolders: new Set(),
-        inspectorCollapsed: false,
+        inspectorCollapsed: !!initialSettings.gallery.inspectorCollapsed,
         manageMode: false,
-        sortMode: DEFAULT_SORT_MODE,
+        sortMode: initialSettings.gallery.sortMode || DEFAULT_SORT_MODE,
+        thumbnailSize: initialSettings.gallery.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize,
         storageProjectId: "",
         contextMenuEl: null,
         contextMenuCleanup: null,
@@ -338,7 +351,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     controls.appendChild(importBtn);
 
     const folderBtn = makeActionButton();
-    folderBtn.textContent = "Folder";
+    folderBtn.textContent = "+ Folder";
     controls.appendChild(folderBtn);
 
     const refreshBtn = makeActionButton();
@@ -398,10 +411,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 ? storedCollapsed.map(normalizeFolderName).filter(Boolean)
                 : [],
         );
-        state.inspectorCollapsed = !!readStoredJson(storageKey("inspector-collapsed"), false);
         state.manageMode = !!readStoredJson(storageKey("manage-mode"), false);
-        const storedSort = readStoredJson(storageKey("sort-mode"), DEFAULT_SORT_MODE);
-        state.sortMode = SORT_OPTIONS.some((entry) => entry.value === storedSort) ? storedSort : DEFAULT_SORT_MODE;
+        const migratedSettings = migrateLegacyGalleryProjectPrefs(projectId);
+        applyGallerySettings(migratedSettings, { skipRender: true });
     }
 
     function persistCollapsedFolders() {
@@ -409,7 +421,11 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function persistInspectorCollapsed() {
-        safeStorageSet(storageKey("inspector-collapsed"), JSON.stringify(!!state.inspectorCollapsed));
+        updateEditorSettings({
+            gallery: {
+                inspectorCollapsed: !!state.inspectorCollapsed,
+            },
+        });
     }
 
     function persistManageMode() {
@@ -417,7 +433,25 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function persistSortMode() {
-        safeStorageSet(storageKey("sort-mode"), JSON.stringify(state.sortMode));
+        updateEditorSettings({
+            gallery: {
+                sortMode: state.sortMode,
+            },
+        });
+    }
+
+    function applyGallerySettings(settings, { skipRender = false } = {}) {
+        const nextSettings = settings || getEditorSettings();
+        const nextSort = SORT_OPTIONS.some((entry) => entry.value === nextSettings?.gallery?.sortMode)
+            ? nextSettings.gallery.sortMode
+            : DEFAULT_SORT_MODE;
+        state.sortMode = nextSort;
+        state.inspectorCollapsed = !!nextSettings?.gallery?.inspectorCollapsed;
+        state.thumbnailSize = nextSettings?.gallery?.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize;
+        updateControlState();
+        if (!skipRender && !state.destroyed) {
+            render();
+        }
     }
 
     function updateFolderOptions() {
@@ -436,6 +470,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         manageBtn.style.background = state.manageMode ? "#4a5c6b" : "#1d2630";
         manageBtn.style.borderColor = state.manageMode ? "#6f8ea8" : "#364655";
     }
+
+    const unsubscribeSettings = subscribeEditorSettings((settings) => {
+        applyGallerySettings(settings);
+    });
 
     function setBusyButton(btn, isBusy, busyLabel, idleLabel) {
         btn.disabled = isBusy;
@@ -1535,11 +1573,15 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.overlayEl = null;
     }
 
-    function attachZoomPan(surface, targets) {
+    function attachZoomPan(surface, targets, onTransform = null) {
         const targetList = (Array.isArray(targets) ? targets : [targets]).filter(Boolean);
         let dragging = false;
+        let pendingDrag = false;
+        let suppressClick = false;
         let lastX = 0;
         let lastY = 0;
+        let dragStartX = 0;
+        let dragStartY = 0;
 
         const applyTransform = () => {
             const transform = `translate(${state.overlayState.panX}px, ${state.overlayState.panY}px) scale(${state.overlayState.zoomLevel})`;
@@ -1547,6 +1589,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 target.style.transformOrigin = "center center";
                 target.style.transform = transform;
             }
+            onTransform?.();
+        };
+
+        const updateCursor = () => {
+            surface.style.cursor = pendingDrag || dragging ? "grabbing" : "grab";
         };
 
         const handleWheel = (event) => {
@@ -1565,7 +1612,15 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
 
         const handleMouseMove = (event) => {
-            if (!dragging) return;
+            if (!pendingDrag && !dragging) return;
+            if (!dragging) {
+                const distance = Math.hypot(event.clientX - dragStartX, event.clientY - dragStartY);
+                if (distance < 5) return;
+                dragging = true;
+                lastX = event.clientX;
+                lastY = event.clientY;
+                event.preventDefault();
+            }
             state.overlayState.panX += event.clientX - lastX;
             state.overlayState.panY += event.clientY - lastY;
             lastX = event.clientX;
@@ -1574,19 +1629,39 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
 
         const handleMouseUp = () => {
+            const dragged = dragging;
             dragging = false;
+            pendingDrag = false;
+            updateCursor();
             window.removeEventListener("mousemove", handleMouseMove);
             window.removeEventListener("mouseup", handleMouseUp);
+            if (dragged) {
+                suppressClick = true;
+                setTimeout(() => {
+                    suppressClick = false;
+                }, 0);
+            }
         };
 
         const handleMouseDown = (event) => {
             if (event.button !== 0) return;
-            event.preventDefault();
-            dragging = true;
+            pendingDrag = true;
+            dragging = false;
+            dragStartX = event.clientX;
+            dragStartY = event.clientY;
             lastX = event.clientX;
             lastY = event.clientY;
+            updateCursor();
             window.addEventListener("mousemove", handleMouseMove);
             window.addEventListener("mouseup", handleMouseUp);
+        };
+
+        const handleClickCapture = (event) => {
+            if (!suppressClick) return;
+            suppressClick = false;
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
         };
 
         const handleDoubleClick = () => {
@@ -1596,16 +1671,22 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         surface.addEventListener("wheel", handleWheel, { passive: false });
         surface.addEventListener("mousedown", handleMouseDown);
+        surface.addEventListener("click", handleClickCapture, true);
         surface.addEventListener("dblclick", handleDoubleClick);
+        updateCursor();
         applyTransform();
 
         return () => {
             dragging = false;
+            pendingDrag = false;
+            suppressClick = false;
             surface.removeEventListener("wheel", handleWheel);
             surface.removeEventListener("mousedown", handleMouseDown);
+            surface.removeEventListener("click", handleClickCapture, true);
             surface.removeEventListener("dblclick", handleDoubleClick);
             window.removeEventListener("mousemove", handleMouseMove);
             window.removeEventListener("mouseup", handleMouseUp);
+            surface.style.cursor = "";
         };
     }
 
@@ -2150,13 +2231,18 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
             const contentGroup = style(document.createElement("div"), `position:relative;width:100%;height:100%;`);
             contentGroup.append(layerA, layerB);
-            const divider = style(document.createElement("div"), `position:absolute;top:0;bottom:0;width:2px;background:#f1f5f8;box-shadow:0 0 0 1px rgba(0,0,0,0.35);cursor:col-resize;pointer-events:auto;z-index:1;`);
-            contentGroup.appendChild(divider);
+            const divider = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:2px;transform:translateX(-50%);background:#f1f5f8;box-shadow:0 0 0 1px rgba(0,0,0,0.35);cursor:col-resize;pointer-events:auto;z-index:2;`);
             stage.appendChild(contentGroup);
+            stage.appendChild(divider);
             const applyDivider = () => {
+                const rect = stage.getBoundingClientRect();
+                const safeWidth = Math.max(1, rect.width);
+                const localX = clamp(state.overlayState.dividerRatio, 0, 1) * safeWidth;
                 const leftInset = `${clamp(state.overlayState.dividerRatio * 100, 0, 100)}%`;
+                const halfW = safeWidth / 2;
+                const screenX = halfW + state.overlayState.panX + ((localX - halfW) * state.overlayState.zoomLevel);
                 layerB.style.clipPath = `inset(0 0 0 ${leftInset})`;
-                divider.style.left = leftInset;
+                divider.style.left = `${clamp(screenX, 0, safeWidth)}px`;
             };
             applyDivider();
 
@@ -2182,6 +2268,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 window.removeEventListener("mousemove", handleDividerMove);
                 window.removeEventListener("mouseup", handleDividerUp);
             });
+            const handleResize = () => applyDivider();
+            window.addEventListener("resize", handleResize);
+            state.overlayState.cleanupFns.push(() => window.removeEventListener("resize", handleResize));
 
             if (asset.asset_type === "video") {
                 const syncSecondary = () => {
@@ -2219,7 +2308,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
 
             center.appendChild(stage);
-            state.overlayState.cleanupFns.push(attachZoomPan(stage, contentGroup));
+            state.overlayState.cleanupFns.push(attachZoomPan(stage, contentGroup, applyDivider));
 
             if (asset.asset_type === "video") {
                 const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
@@ -2926,6 +3015,14 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         return [
             {
+                label: "Inspect Asset",
+                action: () => {
+                    selectAsset(asset.asset_id, { focusList: true });
+                    openInspectOverlay(asset);
+                },
+            },
+            { type: "separator" },
+            {
                 label: "Rename",
                 action: async () => {
                     selectAsset(asset.asset_id, { focusList: true });
@@ -3135,6 +3232,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const assets = filteredAssets();
         const visibleAssets = navigableAssets();
+        const thumbConfig = thumbnailSizeConfig(state.thumbnailSize);
         ensureFocusedAsset(visibleAssets);
         const selected = selectedAsset();
         const folders = allFolders();
@@ -3170,7 +3268,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const focusRing = isPrimary
                     ? "box-shadow:inset 0 0 0 1px rgba(143,192,240,0.45);"
                     : (isFocused ? "box-shadow:inset 0 0 0 1px rgba(143,192,240,0.25);" : "");
-                const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? "24px 72px minmax(0,1fr)" : "72px minmax(0,1fr)"};gap:8px;padding:6px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
+                const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
                 row.dataset.assetRow = asset.asset_id;
                 row.draggable = state.manageMode ? !!options.onBulkMoveAssets : true;
                 row.title = state.manageMode
@@ -3238,7 +3336,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     row.appendChild(checkboxWrap);
                 }
 
-                const thumb = style(document.createElement("div"), `height:54px;border-radius:5px;background:${isMissing ? "#211714" : "#161616"};border:1px solid ${isMissing ? "#6f4a3d" : "#2e2e2e"};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? "#ffb18c" : "#75818c"};font-size:10px;`);
+                const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${isMissing ? "#211714" : "#161616"};border:1px solid ${isMissing ? "#6f4a3d" : "#2e2e2e"};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? "#ffb18c" : "#75818c"};font-size:${thumbConfig.metaFont}px;`);
                 if (isMissing) {
                     thumb.textContent = "Missing";
                 } else if (asset.has_thumbnail) {
@@ -3252,10 +3350,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
 
                 const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
-                const name = style(document.createElement("div"), `color:#ececec;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                const name = style(document.createElement("div"), `color:#ececec;font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                 name.textContent = assetDisplayName(asset);
                 if (isMissing) name.style.color = "#ffd0bc";
-                const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                const meta = style(document.createElement("div"), `color:#8ea0af;font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                 meta.textContent = `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
                 text.append(name, meta);
                 row.append(thumb, text);
@@ -3282,7 +3380,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const focusRing = isPrimary
                         ? "box-shadow:inset 0 0 0 1px rgba(240,179,159,0.42);"
                         : (isFocused ? "box-shadow:inset 0 0 0 1px rgba(240,179,159,0.2);" : "");
-                    const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? "24px 72px minmax(0,1fr)" : "72px minmax(0,1fr)"};gap:8px;padding:6px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;opacity:0.92;${focusRing}`);
+                    const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;opacity:0.92;${focusRing}`);
                     row.dataset.assetRow = asset.asset_id;
                     row.title = "Trashed asset. Restore to bring it back to its previous folder.";
                     row.addEventListener("click", (event) => {
@@ -3310,7 +3408,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                         row.appendChild(checkboxWrap);
                     }
 
-                    const thumb = style(document.createElement("div"), `height:54px;border-radius:5px;background:#1a1412;border:1px solid #6b4d43;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#f0b39f;font-size:10px;`);
+                    const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:#1a1412;border:1px solid #6b4d43;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#f0b39f;font-size:${thumbConfig.metaFont}px;`);
                     if (asset.has_thumbnail) {
                         const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;opacity:0.74;filter:saturate(0.6);`);
                         img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
@@ -3322,9 +3420,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                     }
 
                     const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
-                    const name = style(document.createElement("div"), `color:#f0d6cc;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                    const name = style(document.createElement("div"), `color:#f0d6cc;font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                     name.textContent = assetDisplayName(asset);
-                    const meta = style(document.createElement("div"), `color:#c0a49a;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                    const meta = style(document.createElement("div"), `color:#c0a49a;font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                     meta.textContent = `trashed | ${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatDate(asset.trashed_at)}`;
                     text.append(name, meta);
                     row.append(thumb, text);
@@ -3546,6 +3644,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function destroy() {
         if (state.destroyed) return;
         state.destroyed = true;
+        unsubscribeSettings();
         resizeObserver?.disconnect();
         closeInspectOverlay();
         hideContextMenu();

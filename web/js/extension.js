@@ -2,6 +2,7 @@ const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 import { EditorNodeController } from "./editor_node_controller.js";
+import { getEditorSettings } from "./editor_settings.js";
 
 // ── Widget hide/show helpers ───────────────────────────────────────────
 function hideWidget(node, widget) {
@@ -102,6 +103,17 @@ async function createProjectFromNode(node, projectWidget) {
     app.graph.setDirtyCanvas?.(true, true);
 }
 
+function applyProjectCreationDefaults(node) {
+    if (!node?.widgets) return;
+    const settings = getEditorSettings();
+    const fpsWidget = node.widgets.find((widget) => widget.name === "fps");
+    const widthWidget = node.widgets.find((widget) => widget.name === "width");
+    const heightWidget = node.widgets.find((widget) => widget.name === "height");
+    if (fpsWidget) fpsWidget.value = settings.projectDefaults.fps;
+    if (widthWidget) widthWidget.value = settings.projectDefaults.width;
+    if (heightWidget) heightWidget.value = settings.projectDefaults.height;
+}
+
 // ── Main Extension ─────────────────────────────────────────────────────
 app.registerExtension({
     name: "ltx.editor",
@@ -134,6 +146,7 @@ app.registerExtension({
                 node._ltxController = controller;
                 node.resizable = true;
                 node.flags = { ...(node.flags || {}), resizable: true };
+                controller.render();
 
                 const editorDOMWidget = node.addDOMWidget("ltx_editor_ui", "LTXEditorWidget", controller.getElement(), {
                     serialize: false,
@@ -181,10 +194,12 @@ app.registerExtension({
                         }
                     }
                     if (isCreateNew) {
+                        applyProjectCreationDefaults(node);
                         showWidget(node, createButtonWidget);
                     } else {
                         hideWidget(node, createButtonWidget);
                     }
+                    app.graph.setDirtyCanvas?.(true, true);
 
                     if (isCreateNew) {
                         hideWidget(node, editorDOMWidget);
@@ -196,6 +211,8 @@ app.registerExtension({
                         const dir = await getProjectDir(projectWidget?.value);
                         await controller.updateProject(dir, projectWidget?.value || "");
                     }
+
+                    app.graph.setDirtyCanvas?.(true, true);
 
                     const nextSize = node.computeSize();
                     const preferredWidth = isCreateNew ? 340 : 440;
@@ -221,20 +238,28 @@ app.registerExtension({
                     }
                 };
 
+                const runUpdateVisibility = () => {
+                    Promise.resolve(updateVisibility()).catch((e) => {
+                        console.warn("[LTX Editor] Failed to update node visibility:", e);
+                    });
+                };
+
                 // Hook dropdown changes
                 if (projectWidget) {
                     const origCallback = projectWidget.callback;
                     projectWidget.callback = (value) => {
                         origCallback?.call(projectWidget, value);
-                        updateVisibility();
+                        runUpdateVisibility();
                     };
-                    syncProjectWidgetChoices(projectWidget).catch((e) => {
-                        console.warn("[LTX Editor] Failed to sync project choices:", e);
-                    });
+                    syncProjectWidgetChoices(projectWidget)
+                        .then(() => runUpdateVisibility())
+                        .catch((e) => {
+                            console.warn("[LTX Editor] Failed to sync project choices:", e);
+                        });
                 }
 
                 // Initial setup
-                setTimeout(() => updateVisibility(), 100);
+                runUpdateVisibility();
 
                 // Re-render timeline when node resizes
                 const origOnResize = node.onResize;
@@ -332,10 +357,12 @@ app.registerExtension({
                         }
                     }
                     if (isCreateNew) {
+                        applyProjectCreationDefaults(node);
                         showWidget(node, createButtonWidget);
                     } else {
                         hideWidget(node, createButtonWidget);
                     }
+                    app.graph.setDirtyCanvas?.(true, true);
 
                     const nextSize = node.computeSize();
                     const preferredWidth = 340;
@@ -351,18 +378,26 @@ app.registerExtension({
                     node.setSize(node.size);
                 };
 
+                const runUpdateVisibility = () => {
+                    Promise.resolve(updateVisibility()).catch((e) => {
+                        console.warn("[LTX Project Loader] Failed to update node visibility:", e);
+                    });
+                };
+
                 if (projectWidget) {
                     const origCallback = projectWidget.callback;
                     projectWidget.callback = (value) => {
                         origCallback?.call(projectWidget, value);
-                        updateVisibility();
+                        runUpdateVisibility();
                     };
-                    syncProjectWidgetChoices(projectWidget).catch((e) => {
-                        console.warn("[LTX Project Loader] Failed to sync project choices:", e);
-                    });
+                    syncProjectWidgetChoices(projectWidget)
+                        .then(() => runUpdateVisibility())
+                        .catch((e) => {
+                            console.warn("[LTX Project Loader] Failed to sync project choices:", e);
+                        });
                 }
 
-                setTimeout(() => updateVisibility(), 50);
+                runUpdateVisibility();
             };
         }
     },
