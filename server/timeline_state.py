@@ -572,6 +572,7 @@ class GenerationJob:
     scene_width: int = 0
     scene_height: int = 0
     scene_fps: float = 0.0
+    template_id: str = "free"
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     completed_at: str = ""
     result_asset_id: str = ""
@@ -598,6 +599,7 @@ class GenerationJob:
             "scene_width": self.scene_width,
             "scene_height": self.scene_height,
             "scene_fps": self.scene_fps,
+            "template_id": self.template_id,
             "created_at": self.created_at,
             "completed_at": self.completed_at,
             "result_asset_id": self.result_asset_id,
@@ -629,6 +631,7 @@ class GenerationJob:
             scene_width=data.get("scene_width", 0),
             scene_height=data.get("scene_height", 0),
             scene_fps=data.get("scene_fps", 0.0),
+            template_id=data.get("template_id", "free"),
             created_at=data.get("created_at", ""),
             completed_at=data.get("completed_at", ""),
             result_asset_id=data.get("result_asset_id", ""),
@@ -646,6 +649,7 @@ class TimelineProject:
     name: str = "Untitled Project"
     fps: float = 24.0
     resolution: tuple = (768, 512)
+    template_id: str = "free"
     scenes: list = field(default_factory=list)           # list[Scene] — ordered compositions
     assets: list = field(default_factory=list)           # list[Asset] — project media registry
     generation_queue: list = field(default_factory=list)  # list[GenerationJob]
@@ -768,6 +772,7 @@ class TimelineProject:
             "name": self.name,
             "fps": self.fps,
             "resolution": list(self.resolution),
+            "template_id": self.template_id,
             "scenes": [s.to_dict() for s in self.scenes],
             "assets": [a.to_dict() for a in self.assets],
             "generation_queue": [j.to_dict() for j in self.generation_queue],
@@ -784,6 +789,7 @@ class TimelineProject:
             name=data.get("name", "Untitled Project"),
             fps=data.get("fps", 24.0),
             resolution=tuple(data.get("resolution", [768, 512])),
+            template_id=data.get("template_id", "free"),
             metadata=data.get("metadata", {}),
             created_at=data.get("created_at", datetime.now().isoformat()),
             modified_at=data.get("modified_at", datetime.now().isoformat()),

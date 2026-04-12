@@ -20,6 +20,7 @@ def create_project(
     fps: float = 24.0,
     width: int = 768,
     height: int = 512,
+    template_id: str = "free",
     base_dir: str = "",
 ) -> TimelineProject:
     if not base_dir:
@@ -43,6 +44,7 @@ def create_project(
         name=name,
         fps=fps,
         resolution=(width, height),
+        template_id=template_id or "free",
     )
 
     save_project(project)

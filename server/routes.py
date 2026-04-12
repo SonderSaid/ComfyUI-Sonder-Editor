@@ -1281,13 +1281,14 @@ if routes is not None:
         fps = body.get("fps", 24.0)
         width = body.get("width", 768)
         height = body.get("height", 512)
+        template_id = body.get("template_id", "free") or "free"
         base_dir = body.get("base_dir", "") or _get_base_dir()
 
         if not base_dir:
             return _json_error("base_dir is required", 400)
 
         try:
-            project = create_project(name, fps, width, height, base_dir)
+            project = create_project(name, fps, width, height, template_id, base_dir)
             return web.json_response(project.to_dict(), status=201)
         except Exception as e:
             logger.exception("Failed to create project")
@@ -1311,6 +1312,8 @@ if routes is not None:
             project.fps = float(body["fps"])
         if "resolution" in body:
             project.resolution = tuple(body["resolution"])
+        if "template_id" in body:
+            project.template_id = str(body.get("template_id") or "free")
         if "metadata" in body:
             project.metadata.update(body["metadata"])
 
@@ -2885,6 +2888,7 @@ if routes is not None:
             "scene_width",
             "scene_height",
             "scene_fps",
+            "template_id",
         )):
             params["snapshot_version"] = 1
 
@@ -2902,6 +2906,7 @@ if routes is not None:
             scene_width=int(body.get("scene_width", 0)),
             scene_height=int(body.get("scene_height", 0)),
             scene_fps=float(body.get("scene_fps", 0.0) or 0.0),
+            template_id=str(body.get("template_id", "free") or "free"),
             params=params,
         )
         project.generation_queue.append(job)

@@ -43,6 +43,42 @@ export const SNAP_TARGET_OPTIONS = [
     { key: "sceneBounds", label: "Scene Bounds" },
 ];
 
+export const MODEL_TEMPLATE_PARAM_KEYS = ["width", "height", "frames", "fps"];
+
+export const BUILTIN_MODEL_TEMPLATES = [
+    { id: "free", name: "No Model Template", builtIn: true, constraints: {} },
+    {
+        id: "ltxv-2.3",
+        name: "LTXV 2.3",
+        builtIn: true,
+        hintTier: 720,
+        constraints: {
+            width: { step: 32, offset: 0, min: 64, max: 2048 },
+            height: { step: 32, offset: 0, min: 64, max: 2048 },
+            frames: { step: 8, offset: 1, min: 1, max: 257 },
+            fps: { min: 1, max: 120 },
+        },
+    },
+];
+
+export const RESOLUTION_TIERS = [
+    { label: "~480p", c: 640 },
+    { label: "~540p", c: 720 },
+    { label: "~720p", c: 960 },
+    { label: "~1080p", c: 1440 },
+    { label: "~1440p", c: 1920 },
+    { label: "~4K", c: 2880 },
+];
+
+export const ASPECT_RATIO_PRESETS = [
+    { label: "16:9", a: 16, b: 9 },
+    { label: "4:3", a: 4, b: 3 },
+    { label: "1:1", a: 1, b: 1 },
+    { label: "21:9", a: 21, b: 9 },
+    { label: "9:16", a: 9, b: 16 },
+    { label: "Free", a: 0, b: 0 },
+];
+
 export const DEFAULT_EDITOR_SETTINGS = {
     version: SETTINGS_VERSION,
     meta: {
@@ -85,11 +121,15 @@ export const DEFAULT_EDITOR_SETTINGS = {
         timelineBrightness: 100,
         clipLabelMode: "name_duration",
     },
+    modelTemplates: {
+        customTemplates: [],
+    },
     projectDefaults: {
         fps: 24,
         width: 768,
         height: 512,
         newSceneDuration: 200,
+        defaultTemplateId: "free",
     },
     gallery: {
         sortMode: "newest",
@@ -104,6 +144,7 @@ const VALID_PLAYBACK_RESOLUTIONS = new Set(PLAYBACK_RESOLUTION_OPTIONS.map((entr
 const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
+const BUILTIN_MODEL_TEMPLATE_IDS = new Set(BUILTIN_MODEL_TEMPLATES.map((entry) => entry.id));
 
 const listeners = new Set();
 
@@ -149,6 +190,92 @@ function clampNumber(value, min, max, fallback, round = false) {
     if (!Number.isFinite(numeric)) return fallback;
     const clamped = Math.max(min, Math.min(max, numeric));
     return round ? Math.round(clamped) : clamped;
+}
+
+function coerceFiniteNumber(value, { integer = false, min = null } = {}) {
+    if (value === "" || value === null || value === undefined) return undefined;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return undefined;
+    const nextValue = integer ? Math.round(numeric) : numeric;
+    if (min != null && nextValue < min) return undefined;
+    return nextValue;
+}
+
+function sanitizeTemplateId(value, fallback = "custom-template") {
+    if (typeof value !== "string") return fallback;
+    const normalized = value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return normalized || fallback;
+}
+
+function normalizeConstraint(constraint, key) {
+    if (!constraint || typeof constraint !== "object" || Array.isArray(constraint)) {
+        return undefined;
+    }
+    const integer = key !== "fps";
+    const normalized = {};
+    const step = coerceFiniteNumber(constraint.step, { integer, min: integer ? 1 : 0 });
+    const offset = coerceFiniteNumber(constraint.offset, { integer });
+    const min = coerceFiniteNumber(constraint.min, { integer });
+    const max = coerceFiniteNumber(constraint.max, { integer });
+    if (step !== undefined && step > 0) normalized.step = step;
+    if (offset !== undefined) normalized.offset = offset;
+    if (min !== undefined) normalized.min = min;
+    if (max !== undefined) normalized.max = max;
+    if (normalized.min !== undefined && normalized.max !== undefined && normalized.max < normalized.min) {
+        normalized.max = normalized.min;
+    }
+    return Object.keys(normalized).length ? normalized : undefined;
+}
+
+function normalizeCustomTemplate(template, index = 0) {
+    if (!template || typeof template !== "object" || Array.isArray(template)) {
+        return null;
+    }
+    const name = typeof template.name === "string" && template.name.trim()
+        ? template.name.trim()
+        : `Custom Template ${index + 1}`;
+    const id = sanitizeTemplateId(template.id, sanitizeTemplateId(name, `custom-template-${index + 1}`));
+    const constraints = {};
+    for (const key of MODEL_TEMPLATE_PARAM_KEYS) {
+        const normalizedConstraint = normalizeConstraint(template.constraints?.[key], key);
+        if (normalizedConstraint) {
+            constraints[key] = normalizedConstraint;
+        }
+    }
+    const hintTier = coerceFiniteNumber(template.hintTier, { integer: true, min: 1 });
+    return {
+        id,
+        name,
+        builtIn: false,
+        ...(hintTier !== undefined ? { hintTier } : {}),
+        constraints,
+    };
+}
+
+function normalizeCustomTemplates(templates) {
+    if (!Array.isArray(templates)) return [];
+    const usedIds = new Set(BUILTIN_MODEL_TEMPLATE_IDS);
+    const normalized = [];
+    for (let index = 0; index < templates.length; index += 1) {
+        const template = normalizeCustomTemplate(templates[index], index);
+        if (!template) continue;
+        if (usedIds.has(template.id)) {
+            let suffix = 2;
+            let nextId = `${template.id}-${suffix}`;
+            while (usedIds.has(nextId)) {
+                suffix += 1;
+                nextId = `${template.id}-${suffix}`;
+            }
+            template.id = nextId;
+        }
+        usedIds.add(template.id);
+        normalized.push(template);
+    }
+    return normalized;
 }
 
 function pickDefined(...values) {
@@ -212,6 +339,11 @@ function normalizeEditorSettings(source = null) {
     const stored = source && typeof source === "object" ? source : {};
     const legacyLayout = legacyLayoutSettings();
     const defaults = DEFAULT_EDITOR_SETTINGS;
+    const customTemplates = normalizeCustomTemplates(stored?.modelTemplates?.customTemplates);
+    const validTemplateIds = new Set([
+        ...BUILTIN_MODEL_TEMPLATE_IDS,
+        ...customTemplates.map((template) => template.id),
+    ]);
     return {
         version: SETTINGS_VERSION,
         meta: {
@@ -320,6 +452,9 @@ function normalizeEditorSettings(source = null) {
                 ? stored.appearance.clipLabelMode
                 : defaults.appearance.clipLabelMode,
         },
+        modelTemplates: {
+            customTemplates,
+        },
         projectDefaults: {
             fps: clampNumber(stored?.projectDefaults?.fps, 1, 240, defaults.projectDefaults.fps),
             width: clampNumber(stored?.projectDefaults?.width, 64, 8192, defaults.projectDefaults.width, true),
@@ -331,6 +466,9 @@ function normalizeEditorSettings(source = null) {
                 defaults.projectDefaults.newSceneDuration,
                 true,
             ),
+            defaultTemplateId: validTemplateIds.has(stored?.projectDefaults?.defaultTemplateId)
+                ? stored.projectDefaults.defaultTemplateId
+                : defaults.projectDefaults.defaultTemplateId,
         },
         gallery: {
             sortMode: VALID_SORT_MODES.has(stored?.gallery?.sortMode)
@@ -400,6 +538,74 @@ export function subscribeEditorSettings(listener) {
     return () => {
         listeners.delete(listener);
     };
+}
+
+export function getAllModelTemplates(settings) {
+    return [...BUILTIN_MODEL_TEMPLATES, ...(settings?.modelTemplates?.customTemplates || [])];
+}
+
+export function getTemplateById(id, settings) {
+    return getAllModelTemplates(settings).find((template) => template.id === id) || BUILTIN_MODEL_TEMPLATES[0];
+}
+
+export function snapToConstraint(value, constraint) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 0;
+    let snapped = numeric;
+    if (constraint?.step) {
+        const step = constraint.step;
+        const offset = constraint.offset || 0;
+        snapped = Math.round((numeric - offset) / step) * step + offset;
+    }
+    if (constraint?.min != null) snapped = Math.max(constraint.min, snapped);
+    if (constraint?.max != null) snapped = Math.min(constraint.max, snapped);
+    return snapped;
+}
+
+export function computeResolutionFromTier(c, a, b, template) {
+    if (a <= 0 || b <= 0) return null;
+    const rawW = Number(c) * Math.sqrt(a / b);
+    const rawH = Number(c) * Math.sqrt(b / a);
+    const width = Math.round(snapToConstraint(rawW, template?.constraints?.width));
+    const height = Math.round(snapToConstraint(rawH, template?.constraints?.height));
+    return { width, height };
+}
+
+export function snapResolution(width, height, template) {
+    return {
+        width: Math.round(snapToConstraint(width, template?.constraints?.width)),
+        height: Math.round(snapToConstraint(height, template?.constraints?.height)),
+    };
+}
+
+export function describeConstraintFormula(constraint) {
+    if (!constraint || !constraint.step) return "Any";
+    const step = constraint.step;
+    const offset = constraint.offset || 0;
+    if (!offset) return `${step}n`;
+    return `${step}n ${offset > 0 ? "+" : "-"} ${Math.abs(offset)}`;
+}
+
+export function previewConstraintValues(constraint, count = 5) {
+    if (!constraint) return [];
+    if (!constraint.step) {
+        const values = [];
+        if (constraint.min != null) values.push(constraint.min);
+        if (constraint.max != null && constraint.max !== constraint.min) values.push(constraint.max);
+        return values;
+    }
+    const values = [];
+    const offset = constraint.offset || 0;
+    const start = constraint.min != null
+        ? Math.ceil((constraint.min - offset) / constraint.step)
+        : 0;
+    for (let index = 0; index < count; index += 1) {
+        const value = (start + index) * constraint.step + offset;
+        if (constraint.max != null && value > constraint.max) break;
+        if (constraint.min != null && value < constraint.min) continue;
+        values.push(value);
+    }
+    return values;
 }
 
 export function migrateLegacyGalleryProjectPrefs(projectId = "") {

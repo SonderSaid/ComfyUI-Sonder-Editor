@@ -12,11 +12,12 @@ from server.timeline_state import ClipReference, Scene
 
 def test_create_project():
     with tempfile.TemporaryDirectory() as base_dir:
-        project = create_project("Test Video", fps=30.0, width=1920, height=1080, base_dir=base_dir)
+        project = create_project("Test Video", fps=30.0, width=1920, height=1080, template_id="ltxv-2.3", base_dir=base_dir)
 
         assert project.name == "Test Video"
         assert project.fps == 30.0
         assert project.resolution == (1920, 1080)
+        assert project.template_id == "ltxv-2.3"
         assert os.path.isdir(project.project_dir)
         assert os.path.isfile(os.path.join(project.project_dir, "project.json"))
         assert os.path.isdir(os.path.join(project.project_dir, "media"))
@@ -29,6 +30,7 @@ def test_create_project():
 def test_save_and_load_roundtrip():
     with tempfile.TemporaryDirectory() as base_dir:
         project = create_project("Roundtrip Test", base_dir=base_dir)
+        project.template_id = "ltxv-2.3"
 
         clip = ClipReference(
             clip_id="test_clip",
@@ -43,6 +45,7 @@ def test_save_and_load_roundtrip():
 
         assert loaded.name == "Roundtrip Test"
         assert loaded.project_id == project.project_id
+        assert loaded.template_id == "ltxv-2.3"
         assert len(loaded.clips) == 1
         assert loaded.clips[0].clip_id == "test_clip"
         assert loaded.clips[0].timeline_end_frame == 48

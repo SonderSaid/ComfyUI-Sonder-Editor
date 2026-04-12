@@ -8,14 +8,24 @@ const { api } = window.comfyAPI.api;
 import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
+    ASPECT_RATIO_PRESETS,
     CLIP_LABEL_MODE_OPTIONS,
     DEFAULT_EDITOR_SETTINGS,
     GALLERY_SORT_OPTIONS,
     GALLERY_THUMBNAIL_SIZE_OPTIONS,
+    MODEL_TEMPLATE_PARAM_KEYS,
     PLAYBACK_RESOLUTION_OPTIONS,
+    RESOLUTION_TIERS,
     SNAP_TARGET_OPTIONS,
     TIMECODE_MODE_OPTIONS,
+    computeResolutionFromTier,
+    describeConstraintFormula,
     getEditorSettings,
+    getAllModelTemplates,
+    getTemplateById,
+    previewConstraintValues,
+    snapResolution,
+    snapToConstraint,
     subscribeEditorSettings,
     updateEditorSettings,
 } from "./editor_settings.js";
@@ -385,9 +395,12 @@ export class EditorWidget {
         this._animaticMode = false;
         this._preAnimaticHidden = null;
 
-        // Resolution lock state
-        this._lockAspectRatio = false;
-        this._lockedRatio = 1.0;
+        // Project template state
+        this._templateId = this._settings.projectDefaults.defaultTemplateId || "free";
+        this._customAspectRatioValue = "";
+        this._templateFormState = { expanded: false, editId: "" };
+        this._resolutionEditAxis = "w";
+        this._freeAspectTierDraft = { width: false, height: false };
 
         // Viewport / playback state
         this.isPlaying = false;
@@ -576,6 +589,8 @@ export class EditorWidget {
             } else {
                 this.totalFrames = Math.max(1, parseInt(this.durationInput.value) || 200);
             }
+            this.totalFrames = this._snapSceneDurationToTemplate(this.totalFrames);
+            this._refreshDurationInput();
             if (this.activeScene) {
                 this._updateSceneDuration(this.totalFrames);
             }
@@ -633,7 +648,7 @@ export class EditorWidget {
 
         const xLabel = document.createElement("span");
         xLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
-        xLabel.textContent = "×";
+        xLabel.textContent = "x";
 
         this._resHInput = document.createElement("input");
         this._resHInput.type = "number"; this._resHInput.min = 0; this._resHInput.max = 4096; this._resHInput.step = 8;
@@ -641,56 +656,34 @@ export class EditorWidget {
         this._resHInput.style.cssText = inputStyle;
         this._resHInput.addEventListener("change", () => this._onResolutionChange("h"));
 
-        // Lock aspect ratio toggle
-        this._lockBtn = document.createElement("button");
-        this._lockBtn.textContent = "🔓";
-        this._lockBtn.title = "Lock aspect ratio";
-        this._lockBtn.style.cssText = `
-            background: transparent; border: 1px solid transparent; color: ${COLORS.textDim};
-            cursor: pointer; font-size: 11px; padding: 1px 4px; border-radius: 4px;
-            min-width: 24px; transition: background 0.15s, border-color 0.15s, color 0.15s;
-        `;
-        this._lockBtn.addEventListener("click", () => {
-            this._lockAspectRatio = !this._lockAspectRatio;
-            if (this._lockAspectRatio) {
-                this._captureLockedRatio();
-            }
-            this._updateAspectLockButton();
-        });
-        this._updateAspectLockButton();
-
-        // Resolution preset dropdown
-        this._resPreset = document.createElement("select");
-        this._resPreset.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 132px;`;
-        // Inferred from official LTX spatial constraints:
-        // keep common aspect ratios while using dimensions divisible by 32.
-        const presets = [
-            ["Default", 0, 0],
-            ["LTX Wide 1216×704", 1216, 704],
-            ["HD 1280×720", 1280, 720],
-            ["Square 1024×1024", 1024, 1024],
-            ["Photo 1152×768", 1152, 768],
-            ["Portrait 768×1152", 768, 1152],
-            ["4:3 1088×832", 1088, 832],
-            ["3:4 832×1088", 832, 1088],
-            ["Vertical 704×1216", 704, 1216],
-            ["Cinema 1280×640", 1280, 640],
-        ];
-        for (const [label, w, h] of presets) {
+        this._aspectRatioSelect = document.createElement("select");
+        this._aspectRatioSelect.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 72px;`;
+        for (const preset of ASPECT_RATIO_PRESETS) {
             const opt = document.createElement("option");
-            opt.value = `${w},${h}`;
-            opt.textContent = label;
-            this._resPreset.appendChild(opt);
+            opt.value = this._aspectRatioOptionValue(preset.a, preset.b);
+            opt.textContent = preset.label;
+            this._aspectRatioSelect.appendChild(opt);
         }
-        this._resPreset.addEventListener("change", () => {
-            const [w, h] = this._resPreset.value.split(",").map(Number);
-            this._resWInput.value = w || "";
-            this._resHInput.value = h || "";
-            if (w > 0 && h > 0 && this._lockAspectRatio) {
-                this._lockedRatio = w / h;
-            }
-            this._updateSceneResolution(w, h);
+        this._aspectRatioSelect.addEventListener("change", () => {
+            this._resetFreeAspectTierDraft();
+            this._updateResolutionInputMode();
+            this._recalculateResolution();
         });
+
+        this._resTierSelect = document.createElement("select");
+        this._resTierSelect.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 92px;`;
+        this._resTierSelect.addEventListener("change", () => {
+            this._resetFreeAspectTierDraft();
+            this._recalculateResolution();
+        });
+
+        this._templateSelect = document.createElement("select");
+        this._templateSelect.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 108px;`;
+        this._templateSelect.addEventListener("change", () => this._handleTemplateSelectionChange());
+        this._rebuildTemplateOptions();
+        this._rebuildResolutionTierOptions();
+        this._applyTemplateConstraintMetadata();
+        this._updateResolutionInputMode();
 
         // FPS input
         const fpsLabel = document.createElement("span");
@@ -702,7 +695,12 @@ export class EditorWidget {
         this._fpsInput.placeholder = String(this.fps);
         this._fpsInput.style.cssText = chromeInputCss({ width: "42px", fontSize: "10px", padding: "2px 3px" });
         this._fpsInput.addEventListener("change", () => {
-            const val = parseFloat(this._fpsInput.value) || 0;
+            const template = this._getActiveTemplate();
+            const rawValue = parseFloat(this._fpsInput.value) || 0;
+            const val = template.id === "free"
+                ? rawValue
+                : Number(snapToConstraint(rawValue, template?.constraints?.fps).toFixed(3));
+            this._fpsInput.value = val || "";
             if (this.activeScene) {
                 this._updateSceneFps(val);
             }
@@ -711,7 +709,7 @@ export class EditorWidget {
         bar.append(prevBtn, this.sceneLabel, nextBtn, addBtn,
             this._durLabel, this.durationInput,
             ctxLabel, preCtxLabel, this._preContextInput, postCtxLabel, this._postContextInput,
-            resLabel, this._resWInput, xLabel, this._resHInput, this._lockBtn, this._resPreset,
+            resLabel, this._resWInput, xLabel, this._resHInput, this._aspectRatioSelect, this._resTierSelect, this._templateSelect,
             fpsLabel, this._fpsInput);
         this._sceneBar = bar;
         this.container.appendChild(bar);
@@ -935,6 +933,7 @@ export class EditorWidget {
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
             onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
             onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
+            onSetSceneAspectRatio: (width, height) => this._setSceneAspectRatioFromDimensions(width, height),
             onRefresh: async () => await this._fetchAssets(),
         });
 
@@ -1070,10 +1069,6 @@ export class EditorWidget {
             this._fpsInput.placeholder = String(this.fps);
         }
         this._updateViewportHeader();
-        this._updateAspectLockButton();
-        if (this._lockAspectRatio) {
-            this._captureLockedRatio();
-        }
 
         // Update hidden widgets
         this._setWidgetValue("scene_id", scene.scene_id);
@@ -1119,22 +1114,49 @@ export class EditorWidget {
         this._setWidgetValue("selection_end", this.selectionEnd);
     }
 
-    _onResolutionChange(axis) {
-        let w = parseInt(this._resWInput.value) || 0;
-        let h = parseInt(this._resHInput.value) || 0;
-        if (this._lockAspectRatio && this._lockedRatio > 0) {
-            if (axis === "w" && w > 0) {
-                h = Math.round(w / this._lockedRatio / 8) * 8;
-                this._resHInput.value = h || "";
-            } else if (axis === "h" && h > 0) {
-                w = Math.round(h * this._lockedRatio / 8) * 8;
-                this._resWInput.value = w || "";
-            }
+    _onResolutionChange(axis = "w") {
+        this._resolutionEditAxis = axis === "h" ? "h" : "w";
+        const mode = this._resolutionControlMode();
+        if (mode === "locked") {
+            this._syncSceneResolutionControls({ detectSelections: false });
+            return;
         }
-        this._updateSceneResolution(w, h);
+
+        if (mode === "aspect-custom") {
+            this._resetFreeAspectTierDraft();
+            const resolution = this._resolveAspectCustomResolution(this._resolutionEditAxis);
+            if (!resolution) return;
+            this._setResolutionInputs(resolution.width, resolution.height);
+            this._updateSceneResolution(resolution.width, resolution.height, { detectSelections: false });
+            return;
+        }
+
+        if (mode === "tier-custom-aspect") {
+            this._markFreeAspectTierDraft(this._resolutionEditAxis);
+            const resolution = this._resolveFreeAspectTierResolution({ requireDraftComplete: true });
+            if (!resolution) {
+                return;
+            }
+            this._resetFreeAspectTierDraft();
+            this._setResolutionInputs(resolution.width, resolution.height);
+            this._updateSceneResolution(resolution.width, resolution.height, { detectSelections: false });
+            return;
+        }
+
+        this._resetFreeAspectTierDraft();
+        let { width, height } = this._readResolutionInputs();
+        const template = this._getActiveTemplate();
+        if (template.id !== "free") {
+            ({ width, height } = snapResolution(width, height, template));
+        }
+        this._setResolutionInputs(width, height);
+        if (this._resTierSelect) {
+            this._resTierSelect.value = "custom";
+        }
+        this._updateSceneResolution(width, height, { detectSelections: false });
     }
 
-    async _updateSceneResolution(w, h) {
+    async _updateSceneResolution(w, h, { detectSelections = true } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         w = Math.max(0, parseInt(w, 10) || 0);
         h = Math.max(0, parseInt(h, 10) || 0);
@@ -1146,10 +1168,7 @@ export class EditorWidget {
         sceneRef.width = w;
         sceneRef.height = h;
         if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
-            this._syncSceneResolutionControls();
-            if (w > 0 && h > 0 && this._lockAspectRatio) {
-                this._lockedRatio = w / h;
-            }
+            this._syncSceneResolutionControls({ detectSelections });
             this._updateViewportHeader();
             this._resizeViewportCanvas();
             this._renderViewportFrame();
@@ -1164,7 +1183,7 @@ export class EditorWidget {
             sceneRef.width = prevWidth;
             sceneRef.height = prevHeight;
             if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
-                this._syncSceneResolutionControls();
+                this._syncSceneResolutionControls({ detectSelections });
                 this._updateViewportHeader();
                 this._resizeViewportCanvas();
                 this._renderViewportFrame();
@@ -1949,40 +1968,401 @@ export class EditorWidget {
 
     _updateViewportHeader() {
         if (!this._vpHeaderText) return;
-        this._vpHeaderText.textContent = `${this._effectiveSceneWidth}×${this._effectiveSceneHeight} @ ${this._effectiveFps}fps`;
+        const template = this._getActiveTemplate();
+        const templateSuffix = template.id !== "free" ? ` [${template.name}]` : "";
+        this._vpHeaderText.textContent = `${this._effectiveSceneWidth}x${this._effectiveSceneHeight} @ ${this._effectiveFps}fps${templateSuffix}`;
     }
 
-    _updateAspectLockButton() {
-        if (!this._lockBtn) return;
-        const locked = !!this._lockAspectRatio;
-        this._lockBtn.textContent = locked ? "🔒" : "🔓";
-        this._lockBtn.title = locked ? "Aspect ratio lock enabled" : "Aspect ratio lock disabled";
-        this._lockBtn.style.background = locked ? COLORS.accentSoft : "transparent";
-        this._lockBtn.style.borderColor = locked ? COLORS.accentBorder : "transparent";
-        this._lockBtn.style.color = locked ? "#f4fbff" : COLORS.textDim;
+    _snapSceneDurationToTemplate(frames) {
+        const numeric = Math.max(1, parseInt(frames, 10) || 1);
+        const frameConstraint = this._getActiveTemplate()?.constraints?.frames;
+        if (!frameConstraint) return numeric;
+        const durationConstraint = { ...frameConstraint };
+        delete durationConstraint.max;
+        return Math.max(1, Math.round(snapToConstraint(numeric, durationConstraint)));
     }
 
-    _captureLockedRatio() {
-        const w = parseInt(this._resWInput?.value, 10) || this._effectiveSceneWidth;
-        const h = parseInt(this._resHInput?.value, 10) || this._effectiveSceneHeight;
-        if (w > 0 && h > 0) {
-            this._lockedRatio = w / h;
+    _getActiveTemplate() {
+        return getTemplateById(this._templateId, this._settings);
+    }
+
+    _aspectRatioOptionValue(a, b) {
+        return `${a},${b}`;
+    }
+
+    _parseAspectRatioValue(value) {
+        const [a, b] = String(value || "").split(",").map(Number);
+        return {
+            a: Number.isFinite(a) ? a : 0,
+            b: Number.isFinite(b) ? b : 0,
+        };
+    }
+
+    _readSelectedAspectRatio() {
+        return this._parseAspectRatioValue(this._aspectRatioSelect?.value);
+    }
+
+    _readSelectedResolutionTier() {
+        const value = this._resTierSelect?.value;
+        if (!value || value === "custom") return null;
+        const numeric = Number(value);
+        return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+    }
+
+    _isCustomTierSelected() {
+        return !this._readSelectedResolutionTier();
+    }
+
+    _isFreeAspectSelected() {
+        const { a, b } = this._readSelectedAspectRatio();
+        return !(a > 0 && b > 0);
+    }
+
+    _resolutionControlMode() {
+        const hasAspectPreset = !this._isFreeAspectSelected();
+        const hasResolutionTier = !this._isCustomTierSelected();
+        if (hasAspectPreset && hasResolutionTier) return "locked";
+        if (hasAspectPreset) return "aspect-custom";
+        if (hasResolutionTier) return "tier-custom-aspect";
+        return "free-custom";
+    }
+
+    _matchesAspectRatio(width, height, a, b, tolerance = 0.01) {
+        if (!(width > 0 && height > 0 && a > 0 && b > 0)) return false;
+        const actualRatio = width / height;
+        const targetRatio = a / b;
+        return Math.abs(actualRatio - targetRatio) / targetRatio <= tolerance;
+    }
+
+    _findMatchingAspectPreset(width, height, tolerance = 0.03) {
+        return ASPECT_RATIO_PRESETS.find(
+            (preset) => preset.a > 0 && preset.b > 0 && this._matchesAspectRatio(width, height, preset.a, preset.b, tolerance)
+        ) || null;
+    }
+
+    _findNearestResolutionTier(width, height, tolerance = 0.10) {
+        if (!(width > 0 && height > 0)) return null;
+        const c = Math.sqrt(width * height);
+        let bestTier = null;
+        let bestDiff = Infinity;
+        for (const tier of RESOLUTION_TIERS) {
+            const diff = Math.abs(tier.c - c) / tier.c;
+            if (diff < bestDiff) {
+                bestTier = tier;
+                bestDiff = diff;
+            }
+        }
+        return bestDiff <= tolerance ? bestTier : null;
+    }
+
+    _clearCustomAspectRatioOption() {
+        if (!this._aspectRatioSelect) return;
+        for (const option of Array.from(this._aspectRatioSelect.options)) {
+            if (option.dataset.ltxCustomAspect === "true") {
+                option.remove();
+            }
+        }
+        this._customAspectRatioValue = "";
+    }
+
+    _ensureCustomAspectRatioOption(a, b, label = `Custom ${a}:${b}`) {
+        if (!this._aspectRatioSelect) return "";
+        const value = this._aspectRatioOptionValue(a, b);
+        this._clearCustomAspectRatioOption();
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        option.dataset.ltxCustomAspect = "true";
+        const freeOption = Array.from(this._aspectRatioSelect.options).find(
+            (entry) => entry.value === this._aspectRatioOptionValue(0, 0)
+        );
+        if (freeOption?.parentNode) {
+            freeOption.parentNode.insertBefore(option, freeOption);
+        } else {
+            this._aspectRatioSelect.appendChild(option);
+        }
+        this._customAspectRatioValue = value;
+        this._aspectRatioSelect.value = value;
+        return value;
+    }
+
+    _selectAspectRatioForDimensions(width, height, { preferExistingCustom = false } = {}) {
+        if (!this._aspectRatioSelect) return;
+        const preset = this._findMatchingAspectPreset(width, height);
+        if (preset) {
+            this._clearCustomAspectRatioOption();
+            this._aspectRatioSelect.value = this._aspectRatioOptionValue(preset.a, preset.b);
+            return;
+        }
+        if (preferExistingCustom && this._customAspectRatioValue) {
+            const { a, b } = this._parseAspectRatioValue(this._customAspectRatioValue);
+            if (this._matchesAspectRatio(width, height, a, b)) {
+                this._aspectRatioSelect.value = this._customAspectRatioValue;
+                return;
+            }
+        }
+        this._clearCustomAspectRatioOption();
+        this._aspectRatioSelect.value = this._aspectRatioOptionValue(0, 0);
+    }
+
+    _setResolutionInputs(width, height) {
+        if (this._resWInput) this._resWInput.value = width || "";
+        if (this._resHInput) this._resHInput.value = height || "";
+    }
+
+    _readResolutionInputs() {
+        return {
+            width: Math.max(0, parseInt(this._resWInput?.value, 10) || 0),
+            height: Math.max(0, parseInt(this._resHInput?.value, 10) || 0),
+        };
+    }
+
+    _resetFreeAspectTierDraft() {
+        this._freeAspectTierDraft = { width: false, height: false };
+    }
+
+    _markFreeAspectTierDraft(axis) {
+        if (axis === "w") this._freeAspectTierDraft.width = true;
+        if (axis === "h") this._freeAspectTierDraft.height = true;
+    }
+
+    _resolveAspectCustomResolution(axis = this._resolutionEditAxis || "w") {
+        const { a, b } = this._readSelectedAspectRatio();
+        if (!(a > 0 && b > 0)) return null;
+        let { width, height } = this._readResolutionInputs();
+        const template = this._getActiveTemplate();
+        if (axis === "h" && height > 0) {
+            if (template.id !== "free") {
+                height = Math.round(snapToConstraint(height, template?.constraints?.height));
+            }
+            width = Math.max(1, Math.round(height * a / b));
+            if (template.id !== "free") {
+                width = Math.round(snapToConstraint(width, template?.constraints?.width));
+            }
+        } else if (width > 0) {
+            if (template.id !== "free") {
+                width = Math.round(snapToConstraint(width, template?.constraints?.width));
+            }
+            height = Math.max(1, Math.round(width * b / a));
+            if (template.id !== "free") {
+                height = Math.round(snapToConstraint(height, template?.constraints?.height));
+            }
+        } else if (height > 0) {
+            if (template.id !== "free") {
+                height = Math.round(snapToConstraint(height, template?.constraints?.height));
+            }
+            width = Math.max(1, Math.round(height * a / b));
+            if (template.id !== "free") {
+                width = Math.round(snapToConstraint(width, template?.constraints?.width));
+            }
+        } else {
+            return null;
+        }
+        return { width, height };
+    }
+
+    _resolveFreeAspectTierResolution({ requireDraftComplete = false } = {}) {
+        const tier = this._readSelectedResolutionTier();
+        const { width, height } = this._readResolutionInputs();
+        if (!(tier && width > 0 && height > 0)) return null;
+        if (requireDraftComplete && !(this._freeAspectTierDraft.width && this._freeAspectTierDraft.height)) {
+            return null;
+        }
+        return computeResolutionFromTier(tier, width, height, this._getActiveTemplate());
+    }
+
+    _rebuildTemplateOptions() {
+        if (!this._templateSelect) return;
+        const resolvedTemplate = getTemplateById(this._templateId, this._settings);
+        this._templateId = resolvedTemplate.id;
+        this._templateSelect.innerHTML = "";
+        for (const template of getAllModelTemplates(this._settings)) {
+            const option = document.createElement("option");
+            option.value = template.id;
+            option.textContent = template.name;
+            this._templateSelect.appendChild(option);
+        }
+        this._templateSelect.value = this._templateId;
+    }
+
+    _rebuildResolutionTierOptions(selectedValue = this._resTierSelect?.value || "custom") {
+        if (!this._resTierSelect) return;
+        const template = this._getActiveTemplate();
+        this._resTierSelect.innerHTML = "";
+        for (const tier of RESOLUTION_TIERS) {
+            const option = document.createElement("option");
+            option.value = String(tier.c);
+            option.textContent = tier.label + (template.hintTier === tier.c ? " (default)" : "");
+            this._resTierSelect.appendChild(option);
+        }
+        const customOption = document.createElement("option");
+        customOption.value = "custom";
+        customOption.textContent = "Custom";
+        this._resTierSelect.appendChild(customOption);
+        this._resTierSelect.value = Array.from(this._resTierSelect.options).some((option) => option.value === String(selectedValue))
+            ? String(selectedValue)
+            : "custom";
+    }
+
+    _applyTemplateConstraintMetadata() {
+        const template = this._getActiveTemplate();
+        const widthConstraint = template?.constraints?.width || null;
+        const heightConstraint = template?.constraints?.height || null;
+        const frameConstraint = template?.constraints?.frames || null;
+        const fpsConstraint = template?.constraints?.fps || null;
+        if (this._resWInput) {
+            this._resWInput.step = String(widthConstraint?.step || 1);
+            this._resWInput.min = String(widthConstraint?.min ?? 0);
+            this._resWInput.max = String(widthConstraint?.max ?? 8192);
+        }
+        if (this._resHInput) {
+            this._resHInput.step = String(heightConstraint?.step || 1);
+            this._resHInput.min = String(heightConstraint?.min ?? 0);
+            this._resHInput.max = String(heightConstraint?.max ?? 8192);
+        }
+        if (this.durationInput) {
+            this.durationInput.step = String(frameConstraint?.step || 1);
+            this.durationInput.min = String(frameConstraint?.min ?? 1);
+        }
+        if (this._fpsInput) {
+            this._fpsInput.min = String(fpsConstraint?.min ?? 0);
+            this._fpsInput.max = String(fpsConstraint?.max ?? 240);
+            this._fpsInput.step = String(fpsConstraint?.step || 0.001);
         }
     }
 
-    _syncSceneResolutionControls() {
+    _updateResolutionInputMode() {
+        const readOnly = this._resolutionControlMode() === "locked";
+        for (const input of [this._resWInput, this._resHInput]) {
+            if (!input) continue;
+            input.readOnly = readOnly;
+            input.style.opacity = readOnly ? "0.68" : "1";
+            input.style.background = readOnly ? COLORS.panelMuted : "";
+            input.style.cursor = readOnly ? "default" : "text";
+        }
+    }
+
+    async _updateProjectTemplateId(templateId) {
+        if (!this.projectDir) return true;
+        const dirName = this._projectDirName();
+        try {
+            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ template_id: templateId }),
+            });
+            return !!resp.ok;
+        } catch (error) {
+            console.warn("[LTX Editor] Failed to update project template:", error);
+            return false;
+        }
+    }
+
+    async _handleTemplateSelectionChange() {
+        const nextTemplateId = getTemplateById(this._templateSelect?.value, this._settings).id;
+        if (!nextTemplateId || nextTemplateId === this._templateId) {
+            this._rebuildTemplateOptions();
+            return;
+        }
+        if (!(await this._updateProjectTemplateId(nextTemplateId))) {
+            this._rebuildTemplateOptions();
+            return;
+        }
+        this._templateId = nextTemplateId;
+        this._rebuildTemplateOptions();
+        this._rebuildResolutionTierOptions();
+        this._applyTemplateConstraintMetadata();
+        this._resetFreeAspectTierDraft();
+        this._syncSceneResolutionControls({ detectSelections: false });
+        if (this._resolutionControlMode() === "free-custom") {
+            const template = this._getActiveTemplate();
+            const width = parseInt(this._resWInput?.value, 10) || this.activeScene?.width || 0;
+            const height = parseInt(this._resHInput?.value, 10) || this.activeScene?.height || 0;
+            const nextResolution = template.id === "free"
+                ? { width, height }
+                : snapResolution(width, height, template);
+            this._setResolutionInputs(nextResolution.width, nextResolution.height);
+            await this._updateSceneResolution(nextResolution.width, nextResolution.height, { detectSelections: false });
+        } else {
+            await this._recalculateResolution();
+        }
+        this._updateViewportHeader();
+    }
+
+    async _recalculateResolution() {
+        this._resetFreeAspectTierDraft();
+        this._updateResolutionInputMode();
+        const mode = this._resolutionControlMode();
+        let resolution = null;
+        if (mode === "locked") {
+            const { a, b } = this._readSelectedAspectRatio();
+            const tier = this._readSelectedResolutionTier();
+            if (!(a > 0 && b > 0 && tier)) return;
+            resolution = computeResolutionFromTier(tier, a, b, this._getActiveTemplate());
+        } else if (mode === "aspect-custom") {
+            resolution = this._resolveAspectCustomResolution(this._resolutionEditAxis || "w");
+        } else if (mode === "tier-custom-aspect") {
+            resolution = this._resolveFreeAspectTierResolution();
+        } else {
+            return;
+        }
+        if (!resolution) return;
+        this._setResolutionInputs(resolution.width, resolution.height);
+        await this._updateSceneResolution(resolution.width, resolution.height, { detectSelections: false });
+    }
+
+    _setSceneAspectRatioFromDimensions(width, height) {
+        width = Math.max(0, parseInt(width, 10) || 0);
+        height = Math.max(0, parseInt(height, 10) || 0);
+        if (!(width > 0 && height > 0) || !this._aspectRatioSelect) return;
+        const gcd = (a, b) => {
+            let x = Math.abs(a);
+            let y = Math.abs(b);
+            while (y) {
+                const next = x % y;
+                x = y;
+                y = next;
+            }
+            return x || 1;
+        };
+        const divisor = gcd(width, height);
+        const a = Math.max(1, Math.round(width / divisor));
+        const b = Math.max(1, Math.round(height / divisor));
+        const preset = this._findMatchingAspectPreset(width, height);
+        if (preset) {
+            this._clearCustomAspectRatioOption();
+            this._aspectRatioSelect.value = this._aspectRatioOptionValue(preset.a, preset.b);
+        } else {
+            this._ensureCustomAspectRatioOption(a, b, `Custom ${a}:${b}`);
+        }
+        this._resetFreeAspectTierDraft();
+        this._updateResolutionInputMode();
+        this._recalculateResolution();
+    }
+
+    _syncSceneResolutionControls({ detectSelections = true } = {}) {
+        this._resetFreeAspectTierDraft();
+        const width = this.activeScene?.width || 0;
+        const height = this.activeScene?.height || 0;
         if (this._resWInput) {
-            this._resWInput.value = this.activeScene?.width || "";
+            this._resWInput.value = width || "";
             this._resWInput.placeholder = String(this.sceneWidth || 768);
         }
         if (this._resHInput) {
-            this._resHInput.value = this.activeScene?.height || "";
+            this._resHInput.value = height || "";
             this._resHInput.placeholder = String(this.sceneHeight || 512);
         }
-        if (this._resPreset) {
-            const val = `${this.activeScene?.width || 0},${this.activeScene?.height || 0}`;
-            this._resPreset.value = Array.from(this._resPreset.options).some((opt) => opt.value === val) ? val : "0,0";
+        this._rebuildTemplateOptions();
+        this._rebuildResolutionTierOptions();
+        this._applyTemplateConstraintMetadata();
+        if (detectSelections) {
+            this._selectAspectRatioForDimensions(width, height, { preferExistingCustom: true });
+            const tier = this._findNearestResolutionTier(width, height);
+            if (this._resTierSelect) {
+                this._resTierSelect.value = tier ? String(tier.c) : "custom";
+            }
         }
+        this._updateResolutionInputMode();
     }
 
     _contextFrameValue(name) {
@@ -2289,6 +2669,9 @@ export class EditorWidget {
         const nextTrackCollapseSignature = this._activeTrackCollapseSignature(nextSettings);
         const prevTimecodeMode = this._timecodeMode;
         this._settings = nextSettings;
+        const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
+        const templateChanged = resolvedTemplateId !== this._templateId;
+        this._templateId = resolvedTemplateId;
         this.snappingEnabled = !!nextSettings.timelineBehavior.snappingEnabled;
         this._snapThreshold = nextSettings.timelineBehavior.snapThreshold;
         this._timecodeMode = nextSettings.timelineBehavior.timecodeMode;
@@ -2306,6 +2689,15 @@ export class EditorWidget {
         }
         if (this.durationInput) {
             this._refreshDurationInput();
+        }
+        this._rebuildTemplateOptions();
+        this._rebuildResolutionTierOptions();
+        this._applyTemplateConstraintMetadata();
+        if (this.activeScene || this._sceneBar) {
+            this._syncSceneResolutionControls({ detectSelections: false });
+        }
+        if (templateChanged && this.projectDir && resolvedTemplateId === "free") {
+            this._updateProjectTemplateId("free");
         }
         if (this.activeScene && prevTrackCollapseSignature !== nextTrackCollapseSignature) {
             this._buildTrackLayout();
@@ -2345,6 +2737,7 @@ export class EditorWidget {
             this._resizeViewportCanvas();
             this._renderViewportFrame();
         }
+        this._updateViewportHeader();
         this._updateToolbar();
         this._updateTransportUI();
     }
@@ -2375,9 +2768,11 @@ export class EditorWidget {
         if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
         if (controls.defaultProjectHeight) controls.defaultProjectHeight.value = String(this._settings.projectDefaults.height);
         if (controls.defaultSceneDuration) controls.defaultSceneDuration.value = String(this._settings.projectDefaults.newSceneDuration);
+        if (controls.defaultTemplateId) controls.defaultTemplateId.value = this._settings.projectDefaults.defaultTemplateId || "free";
         if (controls.gallerySortMode) controls.gallerySortMode.value = this._settings.gallery.sortMode;
         if (controls.galleryInspectorCollapsed) controls.galleryInspectorCollapsed.checked = !!this._settings.gallery.inspectorCollapsed;
         if (controls.galleryThumbnailSize) controls.galleryThumbnailSize.value = this._settings.gallery.thumbnailSize;
+        this._renderModelTemplateSettings?.();
     }
 
     _timelineBrightnessFactor() {
@@ -4018,8 +4413,15 @@ export class EditorWidget {
                 if (count > 1) {
                     menuItems.push({ label: `Delete ${count} items`, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "clip") {
+                    const clipAsset = this._getAssetForSourcePath(hit.data.source_path);
                     menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
                     menuItems.push({ label: "Add Frame to Guides", action: () => this._addClipFrameToGuides(hit.data) });
+                    if ((clipAsset?.width || 0) > 0 && (clipAsset?.height || 0) > 0) {
+                        menuItems.push({
+                            label: `Set Scene Aspect Ratio (${clipAsset.width}:${clipAsset.height})`,
+                            action: () => this._setSceneAspectRatioFromDimensions(clipAsset.width, clipAsset.height),
+                        });
+                    }
                     // Extend scene to clip end
                     const clipEnd = hit.data.timeline_end_frame || 0;
                     const sceneDur = this.activeScene?.duration_frames || 0;
@@ -4037,6 +4439,13 @@ export class EditorWidget {
                     }
                     menuItems.push({ label: itemLocked ? "Delete Audio (locked)" : "Delete Audio Track", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "guide") {
+                    const guideAsset = this._getGuideAsset(hit.data);
+                    if ((guideAsset?.width || 0) > 0 && (guideAsset?.height || 0) > 0) {
+                        menuItems.push({
+                            label: `Set Scene Aspect Ratio (${guideAsset.width}:${guideAsset.height})`,
+                            action: () => this._setSceneAspectRatioFromDimensions(guideAsset.width, guideAsset.height),
+                        });
+                    }
                     menuItems.push({ label: "Delete Guide", action: () => this._deleteSelectedItems(), danger: true });
                 }
             }
@@ -5257,6 +5666,12 @@ export class EditorWidget {
         `;
 
         for (const item of items) {
+            if (item?.type === "separator") {
+                const separator = document.createElement("div");
+                separator.style.cssText = `height: 1px; margin: 4px 8px; background: ${COLORS.borderSoft};`;
+                menu.appendChild(separator);
+                continue;
+            }
             const row = document.createElement("div");
             row.textContent = item.label;
             const isDisabled = item.disabled;
@@ -6343,6 +6758,7 @@ export class EditorWidget {
                     scene_width: Math.max(0, parseInt(this.activeScene.width, 10) || 0),
                     scene_height: Math.max(0, parseInt(this.activeScene.height, 10) || 0),
                     scene_fps: Math.max(0, parseFloat(this.activeScene.fps) || 0),
+                    template_id: this._templateId || "free",
                 }),
             });
             if (resp.ok) {
@@ -6735,6 +7151,7 @@ export class EditorWidget {
                     this.sceneWidth = data.resolution[0] || 768;
                     this.sceneHeight = data.resolution[1] || 512;
                 }
+                this._templateId = getTemplateById(data.template_id, this._settings).id;
                 this._syncSceneResolutionControls();
                 this._updateViewportHeader();
                 this._resizeViewportCanvas();
@@ -7812,6 +8229,309 @@ export class EditorWidget {
             controlWrap.append(downBtn, valueLabel, upBtn);
         };
 
+        const setSelectOptions = (select, options, selectedValue) => {
+            if (!select) return;
+            select.innerHTML = "";
+            for (const option of options) {
+                const el = document.createElement("option");
+                el.value = option.value;
+                el.textContent = option.label;
+                select.appendChild(el);
+            }
+            select.value = Array.from(select.options).some((option) => option.value === String(selectedValue))
+                ? String(selectedValue)
+                : (options[0]?.value ?? "");
+        };
+
+        const summarizeConstraint = (constraint, key) => {
+            if (!constraint || typeof constraint !== "object") return `${key}: Any`;
+            const formula = describeConstraintFormula(constraint);
+            if (constraint.min != null || constraint.max != null) {
+                const min = constraint.min != null ? constraint.min : "-";
+                const max = constraint.max != null ? constraint.max : "-";
+                return `${key}: ${formula} [${min}..${max}]`;
+            }
+            return `${key}: ${formula}`;
+        };
+
+        const parseDraftNumber = (value, integer = true) => {
+            if (value === "" || value == null) return undefined;
+            const numeric = Number(value);
+            if (!Number.isFinite(numeric)) return undefined;
+            return integer ? Math.round(numeric) : numeric;
+        };
+
+        const buildConstraintDraft = (paramKey, fields) => {
+            const integer = paramKey !== "fps";
+            const constraint = {};
+            const step = parseDraftNumber(fields.step.value, integer);
+            const offset = parseDraftNumber(fields.offset.value, integer);
+            const min = parseDraftNumber(fields.min.value, integer);
+            const max = parseDraftNumber(fields.max.value, integer);
+            if (step != null && step > 0) constraint.step = step;
+            if (offset != null) constraint.offset = offset;
+            if (min != null) constraint.min = min;
+            if (max != null) constraint.max = max;
+            if (constraint.min != null && constraint.max != null && constraint.max < constraint.min) {
+                constraint.max = constraint.min;
+            }
+            return Object.keys(constraint).length ? constraint : null;
+        };
+
+        const makeUniqueTemplateId = (name, existingId = "") => {
+            const base = String(name || "")
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, "-")
+                .replace(/^-+|-+$/g, "") || "custom-template";
+            const usedIds = new Set(getAllModelTemplates(this._settings).map((template) => template.id).filter((id) => id !== existingId));
+            let candidate = base;
+            let suffix = 2;
+            while (usedIds.has(candidate)) {
+                candidate = `${base}-${suffix}`;
+                suffix += 1;
+            }
+            return candidate;
+        };
+
+        const templateOptions = () => getAllModelTemplates(this._settings).map((template) => ({
+            value: template.id,
+            label: template.name,
+        }));
+
+        const modelTemplatesSection = createSection(
+            "Model Templates",
+            "Manage model-specific parameter constraints and choose which template new projects should start with."
+        );
+        const templateList = document.createElement("div");
+        templateList.style.cssText = "display:flex;flex-direction:column;gap:8px;";
+        const templateFormHost = document.createElement("div");
+        templateFormHost.style.cssText = "display:flex;flex-direction:column;gap:8px;";
+        modelTemplatesSection.append(templateList, templateFormHost);
+
+        this._renderModelTemplateSettings = () => {
+            const formState = this._templateFormState || { expanded: false, editId: "" };
+            const templates = getAllModelTemplates(this._settings);
+            const customTemplates = this._settings.modelTemplates.customTemplates || [];
+            templateList.innerHTML = "";
+            templateFormHost.innerHTML = "";
+
+            if (controls.defaultTemplateId) {
+                setSelectOptions(controls.defaultTemplateId, templateOptions(), this._settings.projectDefaults.defaultTemplateId || "free");
+            }
+
+            for (const template of templates) {
+                const card = document.createElement("div");
+                card.style.cssText = `
+                    border: 1px solid ${COLORS.borderSoft};
+                    border-radius: 8px;
+                    padding: 10px 11px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 7px;
+                    background: ${COLORS.panelMuted};
+                `;
+
+                const head = document.createElement("div");
+                head.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:10px;";
+                const nameWrap = document.createElement("div");
+                const badge = template.builtIn ? "Built-in" : "Custom";
+                nameWrap.innerHTML = `
+                    <div style="font-size:11px;font-weight:700;color:${COLORS.text};">${template.name}</div>
+                    <div style="font-size:10px;color:${COLORS.textMuted};">${badge}${template.id === this._templateId ? " • Active Project Template" : ""}</div>
+                `;
+                head.appendChild(nameWrap);
+
+                if (!template.builtIn) {
+                    const actions = document.createElement("div");
+                    actions.style.cssText = "display:flex;gap:6px;";
+
+                    const editBtn = document.createElement("button");
+                    editBtn.textContent = "Edit";
+                    editBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "4px 9px", fontSize: "10px", radius: "6px" });
+                    editBtn.addEventListener("click", () => {
+                        this._templateFormState = { expanded: true, editId: template.id };
+                        this._renderModelTemplateSettings?.();
+                    });
+
+                    const deleteBtn = document.createElement("button");
+                    deleteBtn.textContent = "Delete";
+                    deleteBtn.style.cssText = chromeButtonCss({ variant: "danger", padding: "4px 9px", fontSize: "10px", radius: "6px" });
+                    deleteBtn.addEventListener("click", async () => {
+                        const nextCustomTemplates = customTemplates.filter((entry) => entry.id !== template.id);
+                        const nextDefaultTemplateId = this._settings.projectDefaults.defaultTemplateId === template.id ? "free" : this._settings.projectDefaults.defaultTemplateId;
+                        this._templateFormState = { expanded: false, editId: "" };
+                        this._updateSettings({
+                            modelTemplates: { customTemplates: nextCustomTemplates },
+                            projectDefaults: { defaultTemplateId: nextDefaultTemplateId },
+                        });
+                        if (this._templateId === template.id) {
+                            await this._updateProjectTemplateId("free");
+                            this._templateId = "free";
+                            this._rebuildTemplateOptions();
+                            this._rebuildResolutionTierOptions();
+                            this._applyTemplateConstraintMetadata();
+                            this._syncSceneResolutionControls({ detectSelections: false });
+                            this._updateViewportHeader();
+                        }
+                    });
+
+                    actions.append(editBtn, deleteBtn);
+                    head.appendChild(actions);
+                }
+
+                const summary = document.createElement("div");
+                summary.style.cssText = "font-size:10px;color:#9ca9b5;line-height:1.45;";
+                summary.textContent = MODEL_TEMPLATE_PARAM_KEYS
+                    .map((key) => summarizeConstraint(template.constraints?.[key], key))
+                    .join(" | ");
+
+                card.append(head, summary);
+                templateList.appendChild(card);
+            }
+
+            const formToggle = document.createElement("button");
+            formToggle.textContent = formState.expanded ? "Cancel Template Edit" : "Add Custom Template";
+            formToggle.style.cssText = chromeButtonCss({ variant: "subtle", padding: "5px 12px", fontSize: "11px", radius: "7px" });
+            formToggle.addEventListener("click", () => {
+                this._templateFormState = formState.expanded
+                    ? { expanded: false, editId: "" }
+                    : { expanded: true, editId: "" };
+                this._renderModelTemplateSettings?.();
+            });
+            templateFormHost.appendChild(formToggle);
+
+            if (!formState.expanded) {
+                return;
+            }
+
+            const editingTemplate = customTemplates.find((template) => template.id === formState.editId) || null;
+            const form = document.createElement("div");
+            form.style.cssText = `
+                border: 1px solid ${COLORS.border};
+                border-radius: 8px;
+                padding: 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                background: ${COLORS.panelMuted};
+            `;
+
+            const title = document.createElement("div");
+            title.style.cssText = "font-size:11px;font-weight:700;color:#eef3f8;";
+            title.textContent = editingTemplate ? `Edit ${editingTemplate.name}` : "Add Custom Template";
+            form.appendChild(title);
+
+            const nameRow = document.createElement("div");
+            nameRow.style.cssText = "display:flex;align-items:center;gap:8px;";
+            const nameLabel = document.createElement("div");
+            nameLabel.style.cssText = "font-size:10px;color:#92a0ad;min-width:90px;";
+            nameLabel.textContent = "Template Name";
+            const nameInput = document.createElement("input");
+            nameInput.type = "text";
+            nameInput.value = editingTemplate?.name || "";
+            nameInput.placeholder = "My Model";
+            nameInput.style.cssText = `${chromeInputCss({ fontSize: "11px", padding: "5px 8px", textAlign: "left" })} flex:1;`;
+            nameRow.append(nameLabel, nameInput);
+            form.appendChild(nameRow);
+
+            const constraintInputs = {};
+            const previewRows = [];
+            for (const paramKey of MODEL_TEMPLATE_PARAM_KEYS) {
+                const existingConstraint = editingTemplate?.constraints?.[paramKey] || {};
+                const row = document.createElement("div");
+                row.style.cssText = `
+                    display:grid;
+                    grid-template-columns: 84px repeat(4, minmax(0, 1fr));
+                    gap: 6px;
+                    align-items: center;
+                `;
+                const header = document.createElement("div");
+                header.style.cssText = "font-size:10px;color:#d9e1e8;font-weight:700;text-transform:capitalize;";
+                header.textContent = paramKey;
+                row.appendChild(header);
+                const fields = {};
+                for (const fieldKey of ["step", "offset", "min", "max"]) {
+                    const input = document.createElement("input");
+                    input.type = "number";
+                    input.step = paramKey === "fps" ? "0.001" : "1";
+                    input.value = existingConstraint[fieldKey] ?? "";
+                    input.placeholder = fieldKey;
+                    input.style.cssText = chromeInputCss({ fontSize: "10px", padding: "4px 6px", textAlign: "right" });
+                    fields[fieldKey] = input;
+                    row.appendChild(input);
+                }
+                constraintInputs[paramKey] = fields;
+                form.appendChild(row);
+
+                const preview = document.createElement("div");
+                preview.style.cssText = "margin-left:84px;font-size:10px;color:#8f9cab;line-height:1.4;";
+                form.appendChild(preview);
+                previewRows.push({ key: paramKey, el: preview });
+            }
+
+            const refreshConstraintPreviews = () => {
+                for (const preview of previewRows) {
+                    const constraint = buildConstraintDraft(preview.key, constraintInputs[preview.key]);
+                    const values = previewConstraintValues(constraint, 5);
+                    const formula = describeConstraintFormula(constraint);
+                    preview.el.textContent = values.length
+                        ? `Formula: ${formula} | Sample: ${values.join(", ")}`
+                        : `Formula: ${formula}`;
+                }
+            };
+
+            for (const paramKey of MODEL_TEMPLATE_PARAM_KEYS) {
+                for (const field of Object.values(constraintInputs[paramKey])) {
+                    field.addEventListener("input", refreshConstraintPreviews);
+                }
+            }
+            refreshConstraintPreviews();
+
+            const actionRow = document.createElement("div");
+            actionRow.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:4px;";
+            const saveBtn = document.createElement("button");
+            saveBtn.textContent = editingTemplate ? "Save Template" : "Create Template";
+            saveBtn.style.cssText = chromeButtonCss({ variant: "primary", padding: "6px 12px", fontSize: "11px", radius: "7px" });
+            saveBtn.addEventListener("click", () => {
+                const name = String(nameInput.value || "").trim();
+                if (!name) {
+                    alert("Template name is required.");
+                    return;
+                }
+                const nextTemplate = {
+                    id: editingTemplate?.id || makeUniqueTemplateId(name),
+                    name,
+                    constraints: {},
+                };
+                for (const paramKey of MODEL_TEMPLATE_PARAM_KEYS) {
+                    const constraint = buildConstraintDraft(paramKey, constraintInputs[paramKey]);
+                    if (constraint) {
+                        nextTemplate.constraints[paramKey] = constraint;
+                    }
+                }
+                const nextCustomTemplates = editingTemplate
+                    ? customTemplates.map((template) => template.id === editingTemplate.id ? nextTemplate : template)
+                    : [...customTemplates, nextTemplate];
+                this._templateFormState = { expanded: false, editId: "" };
+                this._updateSettings({
+                    modelTemplates: { customTemplates: nextCustomTemplates },
+                });
+            });
+
+            const cancelBtn = document.createElement("button");
+            cancelBtn.textContent = "Cancel";
+            cancelBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "6px 12px", fontSize: "11px", radius: "7px" });
+            cancelBtn.addEventListener("click", () => {
+                this._templateFormState = { expanded: false, editId: "" };
+                this._renderModelTemplateSettings?.();
+            });
+
+            actionRow.append(cancelBtn, saveBtn);
+            form.appendChild(actionRow);
+            templateFormHost.appendChild(form);
+        };
+
         const layoutSection = createSection(
             "Layout & UI Scale",
             "Adjust the editor chrome and restore saved fullscreen sizing."
@@ -8015,6 +8735,17 @@ export class EditorWidget {
                 onChange: (value) => updateCategory("projectDefaults", "newSceneDuration", Math.round(value)),
             }
         );
+        createSelect(
+            projectDefaultsSection,
+            "defaultTemplateId",
+            "Default Template",
+            "Used when creating new projects from the editor node.",
+            templateOptions(),
+            () => this._settings.projectDefaults.defaultTemplateId || "free",
+            (value) => updateCategory("projectDefaults", "defaultTemplateId", value)
+        );
+        body.appendChild(modelTemplatesSection);
+        this._renderModelTemplateSettings();
 
         const gallerySection = createSection(
             "Asset Gallery",
@@ -8069,6 +8800,7 @@ export class EditorWidget {
             this._settingsPanelEl.remove();
             this._settingsPanelEl = null;
             this._settingsPanelControls = null;
+            this._renderModelTemplateSettings = null;
         }
         if (this._settingsPanelEscHandler) {
             document.removeEventListener("keydown", this._settingsPanelEscHandler, true);

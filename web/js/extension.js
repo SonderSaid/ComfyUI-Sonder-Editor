@@ -65,6 +65,7 @@ async function createProjectFromNode(node, projectWidget) {
     const fpsWidget = node.widgets.find((widget) => widget.name === "fps");
     const widthWidget = node.widgets.find((widget) => widget.name === "width");
     const heightWidget = node.widgets.find((widget) => widget.name === "height");
+    const settings = getEditorSettings();
 
     const projectName = String(projectNameWidget?.value || "").trim();
     if (!projectName) {
@@ -79,6 +80,7 @@ async function createProjectFromNode(node, projectWidget) {
             fps: Number(fpsWidget?.value || 24),
             width: Number(widthWidget?.value || 768),
             height: Number(heightWidget?.value || 512),
+            template_id: settings.projectDefaults.defaultTemplateId || "free",
         }),
     });
     if (!resp.ok) {

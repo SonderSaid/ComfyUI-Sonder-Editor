@@ -3189,6 +3189,16 @@ export function mountSharedAssetGallery(container, options = {}) {
                     openInspectOverlay(asset);
                 },
             },
+            ...((asset.width || 0) > 0 && (asset.height || 0) > 0 ? [
+                {
+                    label: "Set Scene Aspect Ratio",
+                    disabled: !options.onSetSceneAspectRatio,
+                    action: () => {
+                        selectAsset(asset.asset_id, { focusList: true });
+                        options.onSetSceneAspectRatio?.(asset.width, asset.height);
+                    },
+                },
+            ] : []),
             { type: "separator" },
             {
                 label: "Rename",
