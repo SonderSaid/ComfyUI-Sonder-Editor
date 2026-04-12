@@ -565,6 +565,13 @@ class GenerationJob:
     prompt: str = ""
     scene_name: str = ""
     context_frames: int = 0
+    pre_context_frames: int = 0
+    post_context_frames: int = 0
+    guide_frame_snapshots: list = field(default_factory=list)
+    prompt_sections: list = field(default_factory=list)
+    scene_width: int = 0
+    scene_height: int = 0
+    scene_fps: float = 0.0
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     completed_at: str = ""
     result_asset_id: str = ""
@@ -584,6 +591,13 @@ class GenerationJob:
             "prompt": self.prompt,
             "scene_name": self.scene_name,
             "context_frames": self.context_frames,
+            "pre_context_frames": self.pre_context_frames,
+            "post_context_frames": self.post_context_frames,
+            "guide_frame_snapshots": list(self.guide_frame_snapshots),
+            "prompt_sections": list(self.prompt_sections),
+            "scene_width": self.scene_width,
+            "scene_height": self.scene_height,
+            "scene_fps": self.scene_fps,
             "created_at": self.created_at,
             "completed_at": self.completed_at,
             "result_asset_id": self.result_asset_id,
@@ -591,6 +605,9 @@ class GenerationJob:
 
     @classmethod
     def from_dict(cls, data: dict) -> "GenerationJob":
+        legacy_context = data.get("context_frames", 0)
+        pre_context = data.get("pre_context_frames", legacy_context)
+        post_context = data.get("post_context_frames", legacy_context)
         return cls(
             job_id=data.get("job_id", uuid.uuid4().hex[:8]),
             clip_id=data.get("clip_id", ""),
@@ -604,7 +621,14 @@ class GenerationJob:
             selection_end=data.get("selection_end", 0),
             prompt=data.get("prompt", ""),
             scene_name=data.get("scene_name", ""),
-            context_frames=data.get("context_frames", 0),
+            context_frames=legacy_context,
+            pre_context_frames=pre_context,
+            post_context_frames=post_context,
+            guide_frame_snapshots=list(data.get("guide_frame_snapshots", []) or []),
+            prompt_sections=list(data.get("prompt_sections", []) or []),
+            scene_width=data.get("scene_width", 0),
+            scene_height=data.get("scene_height", 0),
+            scene_fps=data.get("scene_fps", 0.0),
             created_at=data.get("created_at", ""),
             completed_at=data.get("completed_at", ""),
             result_asset_id=data.get("result_asset_id", ""),

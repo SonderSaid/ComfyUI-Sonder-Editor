@@ -53,6 +53,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
         scaleTrackHeaders: 1.0,
         scaleTimeline: 1.0,
         scaleGallery: 1.0,
+        queuePanelExpanded: false,
+        trackCollapseByScene: {},
         labelWidth: 0,
         labelWidthFullscreen: 0,
         fullscreenSidebarWidth: 0,
@@ -192,6 +194,20 @@ function normalizeSnapTargets(nextValue) {
     return normalized;
 }
 
+function normalizeTrackCollapseByScene(nextValue) {
+    if (!nextValue || typeof nextValue !== "object" || Array.isArray(nextValue)) {
+        return {};
+    }
+    const normalized = {};
+    for (const [sceneKey, collapsedKeys] of Object.entries(nextValue)) {
+        if (!sceneKey || !Array.isArray(collapsedKeys)) continue;
+        normalized[sceneKey] = Array.from(new Set(
+            collapsedKeys.filter((value) => typeof value === "string" && value)
+        ));
+    }
+    return normalized;
+}
+
 function normalizeEditorSettings(source = null) {
     const stored = source && typeof source === "object" ? source : {};
     const legacyLayout = legacyLayoutSettings();
@@ -226,6 +242,10 @@ function normalizeEditorSettings(source = null) {
                 2.0,
                 defaults.layout.scaleGallery,
             ),
+            queuePanelExpanded: stored?.layout?.queuePanelExpanded == null
+                ? defaults.layout.queuePanelExpanded
+                : !!stored.layout.queuePanelExpanded,
+            trackCollapseByScene: normalizeTrackCollapseByScene(stored?.layout?.trackCollapseByScene),
             labelWidth: clampNumber(
                 pickDefined(stored?.layout?.labelWidth, legacyLayout.labelWidth),
                 0,

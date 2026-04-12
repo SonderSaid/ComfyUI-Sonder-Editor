@@ -6,33 +6,16 @@ try:
     from .nodes.editor_node import LTXEditor
     from .nodes.io_nodes import LTXSaveVideo, LTXPreviewVideo
 
-    # Keep old nodes temporarily for backward compat during transition
-    from .nodes.project_node import LTXProjectLoader, LTXProjectInfo, LTXProjectSave
-    from .nodes.io_nodes import LTXLoadVideo, LTXLoadAudio
-
     NODE_CLASS_MAPPINGS = {
-        # --- New editor node ---
         "LTXEditor": LTXEditor,
-        # --- I/O nodes (keeping) ---
         "LTXSaveVideo": LTXSaveVideo,
         "LTXPreviewVideo": LTXPreviewVideo,
-        # --- Legacy nodes (will be removed once editor is fully working) ---
-        "LTXProjectLoader": LTXProjectLoader,
-        "LTXProjectInfo": LTXProjectInfo,
-        "LTXProjectSave": LTXProjectSave,
-        "LTXLoadVideo": LTXLoadVideo,
-        "LTXLoadAudio": LTXLoadAudio,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "LTXEditor": "LTX Editor",
         "LTXSaveVideo": "LTX Save Video",
         "LTXPreviewVideo": "LTX Preview Video",
-        "LTXProjectLoader": "LTX Project Loader (Legacy)",
-        "LTXProjectInfo": "LTX Project Info (Legacy)",
-        "LTXProjectSave": "LTX Project Save (Legacy)",
-        "LTXLoadVideo": "LTX Load Video (Legacy)",
-        "LTXLoadAudio": "LTX Load Audio (Legacy)",
     }
 
     WEB_DIRECTORY = "./web"

@@ -263,6 +263,47 @@ def test_list_dormant_assets_filters_trashed_by_default(tmp_path, monkeypatch):
     assert {asset["asset_id"] for asset in shown_payload["assets"]} == {"a1", "a2"}
 
 
+def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    request = DummyRequest(match_info={"project_id": "phase-4"}, body={
+        "scene_id": "scene-1",
+        "scene_name": "Opening",
+        "selection_start": 24,
+        "selection_end": 72,
+        "prompt": "queued prompt",
+        "context_frames": 12,
+        "pre_context_frames": 8,
+        "post_context_frames": 12,
+        "guide_frame_snapshots": [
+            {"frame_index": 20, "asset_id": "guide-1", "source": "asset", "strength": 0.7},
+        ],
+        "prompt_sections": [
+            {"start_frame": 0, "end_frame": 96, "prompt": "section prompt"},
+        ],
+        "scene_width": 1024,
+        "scene_height": 576,
+        "scene_fps": 30.0,
+    })
+    response = asyncio.run(module.api_add_queue_job(request))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert len(project.generation_queue) == 1
+    assert payload["pre_context_frames"] == 8
+    assert payload["post_context_frames"] == 12
+    assert payload["guide_frame_snapshots"][0]["asset_id"] == "guide-1"
+    assert payload["prompt_sections"][0]["prompt"] == "section prompt"
+    assert payload["scene_width"] == 1024
+    assert payload["scene_height"] == 576
+    assert payload["scene_fps"] == 30.0
+    assert payload["params"]["snapshot_version"] == 1
+
+
 def test_delete_asset_route_soft_deletes_in_use_asset(tmp_path, monkeypatch):
     module = _load_route_module(monkeypatch)
     project = _make_project(tmp_path)

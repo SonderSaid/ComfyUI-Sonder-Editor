@@ -6,6 +6,7 @@
 const { api } = window.comfyAPI.api;
 
 import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { createViewportSurface } from "./viewport_surface.js";
 import {
     CLIP_LABEL_MODE_OPTIONS,
     DEFAULT_EDITOR_SETTINGS,
@@ -125,36 +126,178 @@ const LANE_PALETTE = [
     "#3a8a7a",  // Teal
 ];
 const COLORS = {
-    bg: "#1a1a1a",
-    ruler: "#2a2a2a",
-    rulerText: "#888",
-    rulerTick: "#555",
-    track: "#252525",
-    trackBorder: "#333",
+    bg: "#121820",
+    panelMuted: "#10161d",
+    panel: "#151c24",
+    panelRaised: "#1b2430",
+    panelRaisedHover: "#25313f",
+    ruler: "#25303c",
+    rulerText: "#8694a3",
+    rulerTick: "#54616f",
+    track: "#202934",
+    trackBorder: "#33404d",
     clip: "#3a7ca5",
-    clipSelected: "#5aacD5",
+    clipSelected: "#5aacd5",
     audioClip: "#5a8a5a",
     audioClipSelected: "#7aba7a",
     guide: "#e8a030",
     guideSelected: "#ffcc44",
-    selection: "rgba(100, 180, 255, 0.15)",
-    selectionBorder: "rgba(100, 180, 255, 0.6)",
+    selection: "rgba(100, 180, 255, 0.14)",
+    selectionBorder: "rgba(100, 180, 255, 0.58)",
     playhead: "#ff4444",
     promptSection: "rgba(180, 120, 255, 0.2)",
     promptBorder: "rgba(180, 120, 255, 0.5)",
-    galleryBg: "#1e1e1e",
-    galleryItem: "#2a2a2a",
-    galleryItemHover: "#3a3a3a",
-    galleryItemBorder: "#444",
-    galleryText: "#ccc",
-    galleryLabel: "#888",
-    sceneBar: "#222",
-    sceneBtn: "#333",
-    sceneBtnHover: "#444",
-    sceneBtnActive: "#3a7ca5",
-    text: "#ddd",
-    textDim: "#777",
+    galleryBg: "#171e26",
+    galleryItem: "#202934",
+    galleryItemHover: "#2a3644",
+    galleryItemBorder: "#3a4a5b",
+    galleryText: "#d6dde5",
+    galleryLabel: "#8795a3",
+    sceneBar: "#171e26",
+    sceneBtn: "#243342",
+    sceneBtnHover: "#304456",
+    sceneBtnActive: "#4a82ad",
+    text: "#dbe3ea",
+    textDim: "#90a0af",
+    textMuted: "#748291",
+    border: "#34414d",
+    borderSoft: "#28313b",
+    borderStrong: "#587089",
+    accentSoft: "#263a4d",
+    accentSoftHover: "#314961",
+    accentBorder: "#6686a3",
+    warningSoft: "#45361f",
+    warningBorder: "#9a7a42",
+    warningText: "#efd79f",
+    dangerSoft: "#44292d",
+    dangerBorder: "#8f5f66",
+    dangerText: "#efc0c4",
 };
+
+const BUTTON_VARIANTS = {
+    muted: {
+        background: COLORS.sceneBtn,
+        hoverBackground: COLORS.sceneBtnHover,
+        border: COLORS.borderStrong,
+        text: COLORS.textDim,
+    },
+    subtle: {
+        background: COLORS.panelRaised,
+        hoverBackground: COLORS.panelRaisedHover,
+        border: COLORS.border,
+        text: COLORS.textDim,
+    },
+    primary: {
+        background: COLORS.accentSoft,
+        hoverBackground: COLORS.accentSoftHover,
+        border: COLORS.accentBorder,
+        text: "#f7fbff",
+    },
+    active: {
+        background: COLORS.sceneBtnActive,
+        hoverBackground: lightenColor(COLORS.sceneBtnActive, 0.08),
+        border: lightenColor(COLORS.sceneBtnActive, 0.2),
+        text: "#ffffff",
+    },
+    warning: {
+        background: COLORS.warningSoft,
+        hoverBackground: lightenColor(COLORS.warningSoft, 0.08),
+        border: COLORS.warningBorder,
+        text: COLORS.warningText,
+    },
+    danger: {
+        background: COLORS.dangerSoft,
+        hoverBackground: lightenColor(COLORS.dangerSoft, 0.08),
+        border: COLORS.dangerBorder,
+        text: COLORS.dangerText,
+    },
+};
+
+function buttonPalette(variant = "muted") {
+    return BUTTON_VARIANTS[variant] || BUTTON_VARIANTS.muted;
+}
+
+function chromeButtonCss({
+    variant = "muted",
+    padding = "2px 8px",
+    fontSize = "12px",
+    radius = "6px",
+    lineHeight = "1.4",
+    fontWeight = "600",
+} = {}) {
+    const palette = buttonPalette(variant);
+    return `
+        background: ${palette.background};
+        border: 1px solid ${palette.border};
+        color: ${palette.text};
+        padding: ${padding};
+        cursor: pointer;
+        border-radius: ${radius};
+        font-size: ${fontSize};
+        line-height: ${lineHeight};
+        font-weight: ${fontWeight};
+        transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    `;
+}
+
+function setButtonVariant(btn, variant = "muted", { persist = true } = {}) {
+    if (!btn) return;
+    const palette = buttonPalette(variant);
+    btn.style.background = palette.background;
+    btn.style.borderColor = palette.border;
+    btn.style.color = palette.text;
+    if (persist) {
+        btn.dataset.ltxBaseVariant = variant;
+    }
+}
+
+function chromeInputCss({ width = "auto", fontSize = "11px", padding = "2px 4px", textAlign = "center" } = {}) {
+    return `
+        width: ${width};
+        background: ${COLORS.panelRaised};
+        border: 1px solid ${COLORS.borderStrong};
+        color: ${COLORS.text};
+        padding: ${padding};
+        font-size: ${fontSize};
+        border-radius: 6px;
+        text-align: ${textAlign};
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+    `;
+}
+
+function chromeDividerCss(height = 16) {
+    return `width: 1px; height: ${height}px; background: ${COLORS.border}; margin: 0 4px;`;
+}
+
+function chromeMenuCss(minWidth = 140) {
+    return `
+        background: ${COLORS.panelRaised};
+        border: 1px solid ${COLORS.borderStrong};
+        border-radius: 8px;
+        box-shadow: 0 12px 28px rgba(0,0,0,0.42);
+        min-width: ${minWidth}px;
+        padding: 6px 0;
+        font-size: 11px;
+    `;
+}
+
+function chromeOverlayPanelCss({ width = "90%", maxWidth = "520px", maxHeight = "80vh", padding = "20px 28px", fontFamily = "sans-serif" } = {}) {
+    return `
+        background: ${COLORS.panel};
+        border: 1px solid ${COLORS.borderStrong};
+        border-radius: 12px;
+        padding: ${padding};
+        width: ${width};
+        max-width: ${maxWidth};
+        max-height: ${maxHeight};
+        overflow-y: auto;
+        color: ${COLORS.text};
+        font-family: ${fontFamily};
+        font-size: 12px;
+        box-shadow: 0 24px 60px rgba(0,0,0,0.46);
+    `;
+}
 
 function lightenColor(hex, amount) {
     if (typeof hex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
@@ -210,6 +353,8 @@ export class EditorWidget {
         this.selectedAssetType = "video";
         this._collapsedFolders = {};
         this._renderQueue = [];
+        this._queueExpanded = !!this._settings.layout.queuePanelExpanded;
+        this._queueHeaderLabel = null;
         this._savedSelDropdown = null;
 
         // Prompt section state
@@ -253,6 +398,8 @@ export class EditorWidget {
         this._playbackLoopRange = null;
         this._videoCache = {};       // source_path → HTMLVideoElement
         this._audioCacheMap = {};    // source_path → HTMLAudioElement
+        this._viewportImageCache = {};
+        this._viewportSurface = null;
         this._vpCanvas = null;
         this._vpCtx = null;
         this._vpSeekDebounce = null;
@@ -337,6 +484,7 @@ export class EditorWidget {
             font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px;
             color: ${COLORS.text}; user-select: none;
             box-sizing: border-box;
+            background: linear-gradient(180deg, ${COLORS.panel} 0%, ${COLORS.panelMuted} 100%);
         `;
 
         // Scene bar
@@ -368,7 +516,7 @@ export class EditorWidget {
         bar.style.cssText = `
             display: flex; align-items: center; gap: 4px;
             padding: 4px 6px; background: ${COLORS.sceneBar};
-            border-bottom: 1px solid #333; min-height: ${SCENE_BAR_HEIGHT}px;
+            border-bottom: 1px solid ${COLORS.border}; min-height: ${SCENE_BAR_HEIGHT}px;
         `;
 
         // Prev scene
@@ -404,7 +552,8 @@ export class EditorWidget {
 
         // Add scene
         const addBtn = this._makeBtn("+", "Create new scene");
-        addBtn.style.color = "#8c8";
+        setButtonVariant(addBtn, "primary");
+        addBtn.dataset.ltxHoverVariant = "primary";
         addBtn.addEventListener("click", () => this._createScene());
 
         // Duration input
@@ -418,8 +567,7 @@ export class EditorWidget {
         this.durationInput.max = 99999;
         this.durationInput.value = this.totalFrames;
         this.durationInput.style.cssText = `
-            width: 55px; background: #333; border: 1px solid #555; color: #ddd;
-            padding: 2px 4px; font-size: 11px; border-radius: 3px; text-align: center;
+            ${chromeInputCss({ width: "55px", fontSize: "11px", padding: "2px 4px" })}
         `;
         this.durationInput.addEventListener("change", () => {
             if (this._timecodeMode === "timecode") {
@@ -439,8 +587,7 @@ export class EditorWidget {
         ctxLabel.textContent = "Ctx:";
 
         const ctxInputStyle = `
-            width: 40px; background: #333; border: 1px solid #555; color: #ddd;
-            padding: 2px 3px; font-size: 10px; border-radius: 3px; text-align: center;
+            ${chromeInputCss({ width: "40px", fontSize: "10px", padding: "2px 3px" })}
         `;
 
         const preCtxLabel = document.createElement("span");
@@ -476,8 +623,7 @@ export class EditorWidget {
         resLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
         resLabel.textContent = "Res:";
 
-        const inputStyle = `width: 48px; background: #333; border: 1px solid #555; color: #ddd;
-            padding: 2px 3px; font-size: 10px; border-radius: 3px; text-align: center;`;
+        const inputStyle = chromeInputCss({ width: "48px", fontSize: "10px", padding: "2px 3px" });
 
         this._resWInput = document.createElement("input");
         this._resWInput.type = "number"; this._resWInput.min = 0; this._resWInput.max = 4096; this._resWInput.step = 8;
@@ -500,7 +646,7 @@ export class EditorWidget {
         this._lockBtn.textContent = "🔓";
         this._lockBtn.title = "Lock aspect ratio";
         this._lockBtn.style.cssText = `
-            background: transparent; border: 1px solid transparent; color: #aaa;
+            background: transparent; border: 1px solid transparent; color: ${COLORS.textDim};
             cursor: pointer; font-size: 11px; padding: 1px 4px; border-radius: 4px;
             min-width: 24px; transition: background 0.15s, border-color 0.15s, color 0.15s;
         `;
@@ -515,8 +661,7 @@ export class EditorWidget {
 
         // Resolution preset dropdown
         this._resPreset = document.createElement("select");
-        this._resPreset.style.cssText = `background: #333; border: 1px solid #555; color: #ddd;
-            font-size: 9px; border-radius: 3px; padding: 1px;`;
+        this._resPreset.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 132px;`;
         // Inferred from official LTX spatial constraints:
         // keep common aspect ratios while using dimensions divisible by 32.
         const presets = [
@@ -555,8 +700,7 @@ export class EditorWidget {
         this._fpsInput = document.createElement("input");
         this._fpsInput.type = "number"; this._fpsInput.min = 0; this._fpsInput.max = 120; this._fpsInput.step = 0.001;
         this._fpsInput.placeholder = String(this.fps);
-        this._fpsInput.style.cssText = `width: 42px; background: #333; border: 1px solid #555; color: #ddd;
-            padding: 2px 3px; font-size: 10px; border-radius: 3px; text-align: center;`;
+        this._fpsInput.style.cssText = chromeInputCss({ width: "42px", fontSize: "10px", padding: "2px 3px" });
         this._fpsInput.addEventListener("change", () => {
             const val = parseFloat(this._fpsInput.value) || 0;
             if (this.activeScene) {
@@ -577,18 +721,14 @@ export class EditorWidget {
         this._toolbar = document.createElement("div");
         this._toolbar.style.cssText = `
             display: flex; align-items: center; gap: 2px;
-            padding: 2px 6px; background: #1e1e1e;
-            border-bottom: 1px solid #333; font-size: 10px; min-height: 24px;
+            padding: 3px 6px; background: ${COLORS.panel};
+            border-bottom: 1px solid ${COLORS.border}; font-size: 10px; min-height: 26px;
         `;
 
         // Tool buttons with active states
         const makeToolBtn = (label, shortcut, tooltip, getter, toggle) => {
             const btn = document.createElement("button");
-            btn.style.cssText = `
-                background: #333; border: 1px solid #555; color: #ccc;
-                padding: 2px 8px; font-size: 10px; border-radius: 3px;
-                cursor: pointer; white-space: nowrap;
-            `;
+            btn.style.cssText = `${chromeButtonCss({ variant: "muted", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
             btn.textContent = label;
             btn.title = `${tooltip} [${shortcut}]`;
             btn.addEventListener("click", toggle);
@@ -621,11 +761,11 @@ export class EditorWidget {
 
         // Separator
         const sep1 = document.createElement("span");
-        sep1.style.cssText = `width: 1px; height: 16px; background: #444; margin: 0 4px;`;
+        sep1.style.cssText = chromeDividerCss();
 
         // Selection (In/Out) display
         this._selectionLabel = document.createElement("span");
-        this._selectionLabel.style.cssText = `color: #999; font-size: 9px; white-space: nowrap; min-width: 80px;`;
+        this._selectionLabel.style.cssText = `color: ${COLORS.textMuted}; font-size: 9px; white-space: nowrap; min-width: 80px;`;
         this._selectionLabel.textContent = "In/Out: —";
 
         const clearSelBtn = makeToolBtn("✕", "X", "Clear selection", () => false, () => {
@@ -642,7 +782,7 @@ export class EditorWidget {
 
         // Separator 2
         const sep2 = document.createElement("span");
-        sep2.style.cssText = `width: 1px; height: 16px; background: #444; margin: 0 4px;`;
+        sep2.style.cssText = chromeDividerCss();
 
         // Fit to view button
         const fitBtn = makeToolBtn("⊞ Fit", "F", "Fit timeline to view", () => false, () => {
@@ -665,7 +805,7 @@ export class EditorWidget {
 
         // Separator 3
         const sep3 = document.createElement("span");
-        sep3.style.cssText = `width: 1px; height: 16px; background: #444; margin: 0 4px;`;
+        sep3.style.cssText = chromeDividerCss();
 
         // Spacer
         const spacer = document.createElement("span");
@@ -675,40 +815,28 @@ export class EditorWidget {
         const helpBtn = document.createElement("button");
         helpBtn.textContent = "?";
         helpBtn.title = "Keyboard Shortcuts";
-        helpBtn.style.cssText = `
-            background: #333; border: 1px solid #555; color: #aaa; cursor: pointer;
-            padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: bold;
-        `;
+        helpBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "1px 7px", fontSize: "10px", radius: "999px" });
         helpBtn.addEventListener("click", () => this._showShortcutOverlay());
 
         // Settings gear button
         const settingsBtn = document.createElement("button");
         settingsBtn.textContent = "⚙";
         settingsBtn.title = "Editor Settings";
-        settingsBtn.style.cssText = `
-            background: #333; border: 1px solid #555; color: #aaa; cursor: pointer;
-            padding: 1px 7px; border-radius: 10px; font-size: 12px; margin-left: 4px;
-        `;
+        settingsBtn.style.cssText = `${chromeButtonCss({ variant: "subtle", padding: "1px 7px", fontSize: "12px", radius: "999px" })} margin-left: 4px;`;
         settingsBtn.addEventListener("click", () => this._showSettingsPanel());
 
         // Saved selections bookmark button
         this._bookmarkBtn = document.createElement("button");
         this._bookmarkBtn.textContent = "🔖";
         this._bookmarkBtn.title = "Saved Selections";
-        this._bookmarkBtn.style.cssText = `
-            background: #333; border: 1px solid #555; color: #ccc; cursor: pointer;
-            padding: 1px 6px; border-radius: 3px; font-size: 11px; position: relative;
-        `;
+        this._bookmarkBtn.style.cssText = `${chromeButtonCss({ variant: "subtle", padding: "1px 6px", fontSize: "11px", radius: "6px" })} position: relative;`;
         this._bookmarkBtn.addEventListener("click", (e) => this._toggleSavedSelectionsDropdown(e));
 
         // + Queue button
         this._queueBtn = document.createElement("button");
         this._queueBtn.textContent = "+ Queue";
         this._queueBtn.title = "Add current selection to render queue";
-        this._queueBtn.style.cssText = `
-            background: #333; border: 1px solid #555; color: #ccc; cursor: pointer;
-            padding: 2px 8px; font-size: 10px; border-radius: 3px; white-space: nowrap;
-        `;
+        this._queueBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
         this._queueBtn.addEventListener("click", () => this._addToRenderQueue());
 
         // Animatic toggle button
@@ -736,14 +864,11 @@ export class EditorWidget {
 
     _updateToolbar() {
         if (!this._toolBtnSnap) return;
-        this._toolBtnSnap.style.background = this.snappingEnabled ? "#3a7ca5" : "#333";
-        this._toolBtnSnap.style.color = this.snappingEnabled ? "#fff" : "#ccc";
-        this._toolBtnRazor.style.background = this._razorMode ? "#a53a3a" : "#333";
-        this._toolBtnRazor.style.color = this._razorMode ? "#fff" : "#ccc";
+        setButtonVariant(this._toolBtnSnap, this.snappingEnabled ? "active" : "muted");
+        setButtonVariant(this._toolBtnRazor, this._razorMode ? "danger" : "muted");
         if (this._toolBtnTimecode) {
             const isTc = this._timecodeMode === "timecode";
-            this._toolBtnTimecode.style.background = isTc ? "#5a5a3a" : "#333";
-            this._toolBtnTimecode.style.color = isTc ? "#ffd" : "#ccc";
+            setButtonVariant(this._toolBtnTimecode, isTc ? "warning" : "muted");
         }
 
         // Update selection display
@@ -754,17 +879,16 @@ export class EditorWidget {
             if (this.selectionStart < this.selectionEnd) {
                 const dur = this.selectionEnd - this.selectionStart;
                 this._selectionLabel.textContent = `In: ${this._frameToTimecode(this.selectionStart)} Out: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(dur)})${ctxSuffix}`;
-                this._selectionLabel.style.color = "#8cf";
+                this._selectionLabel.style.color = lightenColor(COLORS.sceneBtnActive, 0.28);
             } else {
                 this._selectionLabel.textContent = `Playhead: ${this._frameToTimecode(this.playhead)} | Total: ${this._frameToTimecode(this.totalFrames)}${ctxSuffix}`;
-                this._selectionLabel.style.color = "#999";
+                this._selectionLabel.style.color = COLORS.textMuted;
             }
         }
 
         // Animatic toggle state
         if (this._toolBtnAnimatic) {
-            this._toolBtnAnimatic.style.background = this._animaticMode ? "#5a3a5a" : "#333";
-            this._toolBtnAnimatic.style.color = this._animaticMode ? "#f8f" : "#ccc";
+            setButtonVariant(this._toolBtnAnimatic, this._animaticMode ? "warning" : "muted");
         }
     }
 
@@ -773,7 +897,7 @@ export class EditorWidget {
     _buildAssetGallery() {
         const gallery = document.createElement("div");
         gallery.style.cssText = `
-            background: ${COLORS.galleryBg}; border-top: 1px solid #333;
+            background: ${COLORS.galleryBg}; border-top: 1px solid ${COLORS.border};
             min-height: ${this._galleryHeight}px; overflow: hidden;
             display: flex; flex-direction: column;
         `;
@@ -816,25 +940,23 @@ export class EditorWidget {
 
         // Render Queue section (collapsible)
         const queueSection = document.createElement("div");
-        queueSection.style.cssText = `border-top: 1px solid #444;`;
+        queueSection.style.cssText = `border-top: 1px solid ${COLORS.border};`;
 
         const queueHeader = document.createElement("div");
         queueHeader.style.cssText = `
             display: flex; align-items: center; justify-content: space-between;
-            padding: 3px 8px; background: #252525; cursor: pointer; font-size: 10px; color: #999;
+            padding: 4px 8px; background: ${COLORS.panelRaised}; cursor: pointer; font-size: 10px; color: ${COLORS.textDim};
+            border-bottom: 1px solid ${COLORS.borderSoft};
         `;
-        queueHeader.innerHTML = `<span>▸ Render Queue</span>`;
+        this._queueHeaderLabel = document.createElement("span");
+        queueHeader.appendChild(this._queueHeaderLabel);
         this._queueContainer = document.createElement("div");
-        this._queueContainer.style.cssText = `max-height: 0; overflow: hidden; transition: max-height 0.2s;`;
-        this._queueContainer.innerHTML = `<div style="padding: 8px; color: #666; font-style: italic; font-size: 10px;">Queue empty — use + Queue to add jobs</div>`;
+        this._queueContainer.style.cssText = `max-height: 0; overflow: hidden; transition: max-height 0.2s; background: ${COLORS.panelMuted};`;
+        this._queueContainer.innerHTML = `<div style="padding: 10px; color: ${COLORS.textMuted}; font-style: italic; font-size: 10px;">Queue empty — use + Queue to add jobs</div>`;
 
-        let queueExpanded = false;
+        this._applyQueueExpandedState();
         queueHeader.addEventListener("click", () => {
-            queueExpanded = !queueExpanded;
-            this._queueContainer.style.maxHeight = queueExpanded ? "200px" : "0";
-            this._queueContainer.style.overflowY = queueExpanded ? "auto" : "hidden";
-            queueHeader.querySelector("span").textContent = `${queueExpanded ? "▾" : "▸"} Render Queue (${(this._renderQueue || []).length})`;
-            if (queueExpanded) this._fetchRenderQueue();
+            this._setQueueExpanded(!this._queueExpanded, { persist: true, fetch: true });
         });
 
         queueSection.append(queueHeader, this._queueContainer);
@@ -849,13 +971,11 @@ export class EditorWidget {
         const btn = document.createElement("button");
         btn.textContent = text;
         btn.title = title;
-        btn.style.cssText = `
-            background: ${COLORS.sceneBtn}; border: 1px solid #555;
-            color: ${COLORS.text}; padding: 2px 8px; cursor: pointer;
-            border-radius: 3px; font-size: 12px; line-height: 1.4;
-        `;
-        btn.addEventListener("mouseenter", () => btn.style.background = COLORS.sceneBtnHover);
-        btn.addEventListener("mouseleave", () => btn.style.background = COLORS.sceneBtn);
+        btn.style.cssText = chromeButtonCss({ variant: "muted", padding: "2px 8px", fontSize: "12px", radius: "6px" });
+        setButtonVariant(btn, "muted");
+        btn.dataset.ltxHoverVariant = "primary";
+        btn.addEventListener("mouseenter", () => setButtonVariant(btn, btn.dataset.ltxHoverVariant || btn.dataset.ltxBaseVariant || "muted", { persist: false }));
+        btn.addEventListener("mouseleave", () => setButtonVariant(btn, btn.dataset.ltxBaseVariant || "muted", { persist: false }));
         return btn;
     }
 
@@ -1837,9 +1957,9 @@ export class EditorWidget {
         const locked = !!this._lockAspectRatio;
         this._lockBtn.textContent = locked ? "🔒" : "🔓";
         this._lockBtn.title = locked ? "Aspect ratio lock enabled" : "Aspect ratio lock disabled";
-        this._lockBtn.style.background = locked ? "rgba(58, 124, 165, 0.35)" : "transparent";
-        this._lockBtn.style.borderColor = locked ? "#5aacd5" : "transparent";
-        this._lockBtn.style.color = locked ? "#d7f1ff" : "#aaa";
+        this._lockBtn.style.background = locked ? COLORS.accentSoft : "transparent";
+        this._lockBtn.style.borderColor = locked ? COLORS.accentBorder : "transparent";
+        this._lockBtn.style.color = locked ? "#f4fbff" : COLORS.textDim;
     }
 
     _captureLockedRatio() {
@@ -1965,12 +2085,9 @@ export class EditorWidget {
         const audioLanes = scene?.audio_lane_count || 1;
         const vConfigs = scene?.video_lane_configs || [];
         const aConfigs = scene?.audio_lane_configs || [];
-
-        // Preserve collapsed state across rebuilds
-        const oldCollapsed = {};
-        for (const entry of this._trackLayout) {
-            oldCollapsed[entry.type + ":" + entry.laneIndex] = entry.collapsed;
-        }
+        const storedCollapse = this._readStoredTrackCollapseState(scene);
+        const isStored = storedCollapse.exists;
+        const storedCollapsed = storedCollapse.collapsed;
 
         // Video lanes: highest index at top (foreground on top)
         for (let i = videoLanes - 1; i >= 0; i--) {
@@ -1981,7 +2098,7 @@ export class EditorWidget {
                 label: cfg.name || (videoLanes > 1 ? `V${i + 1}` : "Video"),
                 customName: cfg.name || "",
                 laneIndex: i,
-                collapsed: oldCollapsed[key] ?? false,
+                collapsed: isStored ? storedCollapsed.has(key) : false,
                 color: cfg.color || LANE_PALETTE[i % LANE_PALETTE.length],
                 locked: cfg.locked || false,
                 hidden: cfg.hidden || false,
@@ -1997,7 +2114,7 @@ export class EditorWidget {
                 label: cfg.name || (audioLanes > 1 ? `A${i + 1}` : "Audio"),
                 customName: cfg.name || "",
                 laneIndex: i,
-                collapsed: oldCollapsed[key] ?? false,
+                collapsed: isStored ? storedCollapsed.has(key) : false,
                 color: cfg.color || LANE_PALETTE[i % LANE_PALETTE.length],
                 locked: cfg.locked || false,
                 hidden: cfg.hidden || false,
@@ -2010,7 +2127,7 @@ export class EditorWidget {
             label: "Guides",
             customName: "",
             laneIndex: 0,
-            collapsed: oldCollapsed[TRACK_TYPE.GUIDES + ":0"] ?? false,
+            collapsed: isStored ? storedCollapsed.has(TRACK_TYPE.GUIDES + ":0") : false,
             color: "",
             locked: false,
             hidden: false,
@@ -2020,7 +2137,7 @@ export class EditorWidget {
             label: "Prompt",
             customName: "",
             laneIndex: 0,
-            collapsed: oldCollapsed[TRACK_TYPE.PROMPT + ":0"] ?? false,
+            collapsed: isStored ? storedCollapsed.has(TRACK_TYPE.PROMPT + ":0") : false,
             color: "",
             locked: false,
             hidden: false,
@@ -2117,8 +2234,59 @@ export class EditorWidget {
         return updateEditorSettings(partial);
     }
 
+    _trackCollapseSceneKey(scene = this.activeScene) {
+        const projectKey = this._projectDirName();
+        const sceneId = scene?.scene_id || "";
+        if (!projectKey || !sceneId) return "";
+        return `${projectKey}:${sceneId}`;
+    }
+
+    _trackCollapseKey(entry) {
+        if (!entry) return "";
+        return `${entry.type}:${entry.laneIndex}`;
+    }
+
+    _readStoredTrackCollapseState(scene = this.activeScene, settings = this._settings) {
+        const sceneKey = this._trackCollapseSceneKey(scene);
+        const collapsedByScene = settings?.layout?.trackCollapseByScene;
+        const collapsedKeys = sceneKey && collapsedByScene && typeof collapsedByScene === "object"
+            ? collapsedByScene[sceneKey]
+            : null;
+        if (!Array.isArray(collapsedKeys)) {
+            return { exists: false, collapsed: new Set() };
+        }
+        return {
+            exists: true,
+            collapsed: new Set(collapsedKeys.filter((value) => typeof value === "string" && value)),
+        };
+    }
+
+    _activeTrackCollapseSignature(settings = this._settings) {
+        const state = this._readStoredTrackCollapseState(this.activeScene, settings);
+        if (!state.exists) return "";
+        return JSON.stringify(Array.from(state.collapsed).sort());
+    }
+
+    _persistTrackCollapseState() {
+        const sceneKey = this._trackCollapseSceneKey();
+        if (!sceneKey) return;
+        const collapsedKeys = this._trackLayout
+            .filter((entry) => !!entry?.collapsed)
+            .map((entry) => this._trackCollapseKey(entry))
+            .filter(Boolean);
+        this._updateSettings({
+            layout: {
+                trackCollapseByScene: {
+                    [sceneKey]: collapsedKeys,
+                },
+            },
+        });
+    }
+
     _handleSettingsChange(settings) {
         const nextSettings = settings || getEditorSettings();
+        const prevTrackCollapseSignature = this._activeTrackCollapseSignature(this._settings);
+        const nextTrackCollapseSignature = this._activeTrackCollapseSignature(nextSettings);
         const prevTimecodeMode = this._timecodeMode;
         this._settings = nextSettings;
         this.snappingEnabled = !!nextSettings.timelineBehavior.snappingEnabled;
@@ -2128,6 +2296,8 @@ export class EditorWidget {
         this._scaleTrackHeaders = nextSettings.layout.scaleTrackHeaders;
         this._scaleTimeline = nextSettings.layout.scaleTimeline;
         this._scaleGallery = nextSettings.layout.scaleGallery;
+        const prevQueueExpanded = !!this._queueExpanded;
+        this._queueExpanded = !!nextSettings.layout.queuePanelExpanded;
         this._labelWidthUser = nextSettings.layout.labelWidth;
         this._labelWidthUserFS = nextSettings.layout.labelWidthFullscreen;
 
@@ -2136,6 +2306,18 @@ export class EditorWidget {
         }
         if (this.durationInput) {
             this._refreshDurationInput();
+        }
+        if (this.activeScene && prevTrackCollapseSignature !== nextTrackCollapseSignature) {
+            this._buildTrackLayout();
+            if (this.timelineCanvas) {
+                this._renderTimeline();
+            }
+        }
+        if (this._queueContainer && prevQueueExpanded !== this._queueExpanded) {
+            this._applyQueueExpandedState();
+            if (this._queueExpanded) {
+                this._fetchRenderQueue();
+            }
         }
         if (prevTimecodeMode !== this._timecodeMode && this._itemEditorEl && this.selectedItem) {
             this._showItemEditor();
@@ -2268,6 +2450,8 @@ export class EditorWidget {
                 scaleTrackHeaders: 1.0,
                 scaleTimeline: 1.0,
                 scaleGallery: 1.0,
+                queuePanelExpanded: false,
+                trackCollapseByScene: null,
                 labelWidth: 0,
                 labelWidthFullscreen: 0,
                 fullscreenSidebarWidth: 0,
@@ -3367,6 +3551,7 @@ export class EditorWidget {
                 switch (headerHit.zone) {
                     case "collapse":
                         entry.collapsed = !entry.collapsed;
+                        this._persistTrackCollapseState();
                         break;
                     case "lock":
                         entry.locked = !entry.locked;
@@ -4365,7 +4550,7 @@ export class EditorWidget {
         const editor = document.createElement("div");
         editor.style.cssText = `
             display: flex; gap: 4px; padding: 4px 6px;
-            background: #1a1a1a; border-top: 1px solid ${COLORS.promptBorder};
+            background: ${COLORS.panel}; border-top: 1px solid ${COLORS.promptBorder};
             align-items: center;
         `;
 
@@ -4376,10 +4561,7 @@ export class EditorWidget {
         const input = document.createElement("input");
         input.type = "text";
         input.placeholder = "Enter prompt for this section...";
-        input.style.cssText = `
-            flex: 1; background: #2a2a2a; border: 1px solid #555; color: #ddd;
-            padding: 3px 6px; font-size: 11px; border-radius: 3px;
-        `;
+        input.style.cssText = `flex: 1; ${chromeInputCss({ fontSize: "11px", padding: "3px 6px", textAlign: "left" })}`;
         input.addEventListener("keydown", (e) => {
             if (e.key === "Enter" && input.value.trim()) {
                 this._saveNewPromptSection(startFrame, endFrame, input.value.trim());
@@ -4390,6 +4572,8 @@ export class EditorWidget {
         });
 
         const createBtn = this._makeBtn("Create", "Create prompt section");
+        setButtonVariant(createBtn, "primary");
+        createBtn.dataset.ltxHoverVariant = "primary";
         createBtn.addEventListener("click", () => {
             if (input.value.trim()) {
                 this._saveNewPromptSection(startFrame, endFrame, input.value.trim());
@@ -4397,7 +4581,8 @@ export class EditorWidget {
         });
 
         const cancelBtn = this._makeBtn("Cancel", "Cancel");
-        cancelBtn.style.color = COLORS.textDim;
+        setButtonVariant(cancelBtn, "subtle");
+        cancelBtn.dataset.ltxHoverVariant = "subtle";
         cancelBtn.addEventListener("click", () => this._hidePromptEditor());
 
         editor.append(label, input, createBtn, cancelBtn);
@@ -4437,7 +4622,7 @@ export class EditorWidget {
         const editor = document.createElement("div");
         editor.style.cssText = `
             display: flex; gap: 4px; padding: 4px 6px;
-            background: #1a1a1a; border-top: 1px solid ${COLORS.promptBorder};
+            background: ${COLORS.panel}; border-top: 1px solid ${COLORS.promptBorder};
             align-items: center;
         `;
 
@@ -4448,10 +4633,7 @@ export class EditorWidget {
         const input = document.createElement("input");
         input.type = "text";
         input.value = section.prompt;
-        input.style.cssText = `
-            flex: 1; background: #2a2a2a; border: 1px solid #555; color: #ddd;
-            padding: 3px 6px; font-size: 11px; border-radius: 3px;
-        `;
+        input.style.cssText = `flex: 1; ${chromeInputCss({ fontSize: "11px", padding: "3px 6px", textAlign: "left" })}`;
         input.addEventListener("keydown", (e) => {
             if (e.key === "Enter") {
                 this._updatePromptSection(idx, { prompt: input.value });
@@ -4465,13 +4647,16 @@ export class EditorWidget {
         });
 
         const saveBtn = this._makeBtn("Save", "Save prompt");
+        setButtonVariant(saveBtn, "primary");
+        saveBtn.dataset.ltxHoverVariant = "primary";
         saveBtn.addEventListener("click", () => {
             this._updatePromptSection(idx, { prompt: input.value });
             this._hidePromptEditor();
         });
 
         const deleteBtn = this._makeBtn("Delete", "Delete this prompt section");
-        deleteBtn.style.color = "#f66";
+        setButtonVariant(deleteBtn, "danger");
+        deleteBtn.dataset.ltxHoverVariant = "danger";
         deleteBtn.addEventListener("click", () => {
             if (confirm(`Delete this prompt section?`)) {
                 this._deletePromptSection(idx);
@@ -4543,7 +4728,7 @@ export class EditorWidget {
         const editor = document.createElement("div");
         editor.style.cssText = `
             display: flex; gap: 6px; padding: 4px 6px;
-            background: #1a1a1a; border-top: 1px solid ${type === "clip" ? COLORS.clipSelected : type === "audio" ? COLORS.audioClipSelected : COLORS.guideSelected};
+            background: ${COLORS.panel}; border-top: 1px solid ${type === "clip" ? COLORS.clipSelected : type === "audio" ? COLORS.audioClipSelected : COLORS.guideSelected};
             align-items: center; flex-wrap: wrap;
         `;
 
@@ -4698,7 +4883,8 @@ export class EditorWidget {
 
         // Delete button (always present)
         const deleteBtn = this._makeBtn("Delete", "Delete this item");
-        deleteBtn.style.color = "#f66";
+        setButtonVariant(deleteBtn, "danger");
+        deleteBtn.dataset.ltxHoverVariant = "danger";
         deleteBtn.addEventListener("click", () => this._deleteSelectedItems());
         editor.appendChild(deleteBtn);
 
@@ -4736,10 +4922,7 @@ export class EditorWidget {
         input.value = value;
         input.min = min;
         input.max = max;
-        input.style.cssText = `
-            width: 60px; background: #2a2a2a; border: 1px solid #555; color: #ddd;
-            padding: 2px 4px; font-size: 11px; border-radius: 3px; text-align: right;
-        `;
+        input.style.cssText = chromeInputCss({ width: "60px", fontSize: "11px", padding: "2px 4px", textAlign: "right" });
         return input;
     }
 
@@ -5070,9 +5253,7 @@ export class EditorWidget {
         const menu = document.createElement("div");
         menu.style.cssText = `
             position: fixed; left: ${x}px; top: ${y}px; z-index: 10000;
-            background: #2a2a2a; border: 1px solid #555; border-radius: 4px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5); min-width: 140px;
-            padding: 4px 0; font-size: 11px;
+            ${chromeMenuCss(150)}
         `;
 
         for (const item of items) {
@@ -5081,10 +5262,10 @@ export class EditorWidget {
             const isDisabled = item.disabled;
             row.style.cssText = `
                 padding: 6px 14px; cursor: ${isDisabled ? "default" : "pointer"};
-                color: ${isDisabled ? "#666" : (item.danger ? "#f66" : "#ddd")};
+                color: ${isDisabled ? COLORS.textMuted : (item.danger ? COLORS.dangerText : COLORS.text)};
             `;
             if (!isDisabled) {
-                row.addEventListener("mouseenter", () => row.style.background = "#3a3a3a");
+                row.addEventListener("mouseenter", () => row.style.background = COLORS.panelRaisedHover);
                 row.addEventListener("mouseleave", () => row.style.background = "transparent");
                 row.addEventListener("click", () => {
                     this._hideContextMenu();
@@ -5130,10 +5311,10 @@ export class EditorWidget {
     _showShortcutOverlay() {
         if (this._shortcutOverlayEl) return;
         const backdrop = document.createElement("div");
-        backdrop.style.cssText = `position:fixed;inset:0;z-index:10001;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;`;
+        backdrop.style.cssText = `position:fixed;inset:0;z-index:10001;background:rgba(7,10,14,0.78);display:flex;align-items:center;justify-content:center;padding:20px;`;
         const panel = document.createElement("div");
-        panel.style.cssText = `background:#1e1e1e;border:1px solid #555;border-radius:8px;padding:20px 28px;max-width:520px;width:90%;max-height:80vh;overflow-y:auto;color:#ddd;font-family:monospace;font-size:12px;`;
-        panel.innerHTML = `<h3 style="margin:0 0 12px;color:#fff;font-size:14px;">Keyboard Shortcuts</h3>` +
+        panel.style.cssText = chromeOverlayPanelCss({ width: "min(560px, 100%)", maxWidth: "560px", maxHeight: "80vh", padding: "20px 24px", fontFamily: "'Segoe UI', Arial, sans-serif" });
+        panel.innerHTML = `<h3 style="margin:0 0 14px;color:#fff;font-size:15px;letter-spacing:0.02em;">Keyboard Shortcuts</h3>` +
             this._shortcutSection("Playback", [
                 ["Space", "Play / Pause (fullscreen)"],
                 ["\u2190 / \u2192", "Frame back / forward"],
@@ -5157,6 +5338,13 @@ export class EditorWidget {
                 ["Ctrl+Z", "Undo"],
                 ["Ctrl+Y", "Redo"],
             ]) +
+            this._shortcutSection("Asset Gallery", [
+                ["Arrow keys", "Move asset focus / selection"],
+                ["Space", "Open inspect overlay for focused asset"],
+                ["Ctrl+A", "Select all visible assets"],
+                ["Delete", "Trash or permanently delete selection"],
+                ["Esc", "Clear or reduce gallery selection"],
+            ]) +
             this._shortcutSection("View", [
                 ["Wheel", "Vertical lane scroll"],
                 ["Ctrl+Wheel", "Horizontal timeline pan"],
@@ -5164,7 +5352,7 @@ export class EditorWidget {
                 ["+ / -", "Zoom in / out"],
                 ["Esc", "Exit fullscreen"],
                 ["?", "Show this overlay"],
-                ["⚙", "Editor Settings (toolbar gear)"],
+                ["Gear", "Editor Settings (toolbar button)"],
             ]);
 
         backdrop.appendChild(panel);
@@ -5177,9 +5365,9 @@ export class EditorWidget {
     }
 
     _shortcutSection(title, shortcuts) {
-        let html = `<div style="margin-bottom:10px;"><div style="color:#aaa;font-size:11px;margin-bottom:4px;text-transform:uppercase;">${title}</div>`;
+        let html = `<div style="margin-bottom:12px;"><div style="color:${COLORS.textDim};font-size:10px;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.08em;">${title}</div>`;
         for (const [key, desc] of shortcuts) {
-            html += `<div style="display:flex;justify-content:space-between;padding:2px 0;"><span style="color:#6cf;min-width:120px;">${key}</span><span>${desc}</span></div>`;
+            html += `<div style="display:flex;justify-content:space-between;gap:16px;padding:3px 0;"><span style="color:${lightenColor(COLORS.sceneBtnActive, 0.3)};min-width:120px;font-family:monospace;">${key}</span><span style="color:${COLORS.text};">${desc}</span></div>`;
         }
         return html + `</div>`;
     }
@@ -5202,7 +5390,7 @@ export class EditorWidget {
         const overlay = document.createElement("div");
         overlay.style.cssText = `
             position: fixed; inset: 0; z-index: 9999;
-            background: #111; display: none;
+            background: ${COLORS.bg}; display: none;
             flex-direction: column;
         `;
 
@@ -5210,7 +5398,7 @@ export class EditorWidget {
         const toolbar = document.createElement("div");
         toolbar.style.cssText = `
             display: flex; align-items: center; padding: 0 12px;
-            height: 40px; background: #1a1a1a; border-bottom: 1px solid #333;
+            height: 42px; background: ${COLORS.panel}; border-bottom: 1px solid ${COLORS.border};
             flex-shrink: 0;
         `;
 
@@ -5243,7 +5431,7 @@ export class EditorWidget {
         this._fsSidebar = document.createElement("div");
         this._fsSidebar.style.cssText = `
             width: ${FULLSCREEN_SIDEBAR_DEFAULT_WIDTH}px; min-width: ${FULLSCREEN_SIDEBAR_MIN_WIDTH}px; max-width: ${this._computeFullscreenSidebarMaxWidth()}px;
-            background: ${COLORS.galleryBg}; border-right: 2px solid #333;
+            background: ${COLORS.galleryBg}; border-right: 1px solid ${COLORS.border};
             display: flex; flex-direction: column; overflow: hidden;
             flex-shrink: 0; position: relative;
         `;
@@ -5251,7 +5439,7 @@ export class EditorWidget {
         // Sidebar header with project name
         this._fsSidebarHeader = document.createElement("div");
         this._fsSidebarHeader.style.cssText = `
-            padding: 8px 12px; background: #1a1a1a; border-bottom: 1px solid #333;
+            padding: 8px 12px; background: ${COLORS.panel}; border-bottom: 1px solid ${COLORS.border};
             font-size: 12px; color: ${COLORS.text}; font-weight: 600;
             flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         `;
@@ -5271,13 +5459,13 @@ export class EditorWidget {
         this._fsViewport = document.createElement("div");
         this._fsViewport.style.cssText = `
             flex: 1; display: flex; flex-direction: column;
-            background: #0a0a0a; overflow: hidden; min-width: 0;
+            background: ${COLORS.panelMuted}; overflow: hidden; min-width: 0;
         `;
 
         // Viewport header
         const vpHeader = document.createElement("div");
         vpHeader.style.cssText = `
-            padding: 6px 12px; background: #1a1a1a; border-bottom: 1px solid #333;
+            padding: 6px 12px; background: ${COLORS.panel}; border-bottom: 1px solid ${COLORS.border};
             font-size: 11px; color: ${COLORS.textDim}; flex-shrink: 0;
             display: flex; justify-content: space-between; align-items: center;
         `;
@@ -5314,19 +5502,15 @@ export class EditorWidget {
         // Transport bar
         const transport = document.createElement("div");
         transport.style.cssText = `
-            height: 36px; flex-shrink: 0; background: #1a1a1a;
-            border-top: 1px solid #333; display: flex; align-items: center;
+            height: 38px; flex-shrink: 0; background: ${COLORS.panel};
+            border-top: 1px solid ${COLORS.border}; display: flex; align-items: center;
             padding: 0 12px; gap: 10px;
         `;
 
         // Play/Pause button
         this._vpPlayBtn = document.createElement("button");
-        this._vpPlayBtn.textContent = "▶";
-        this._vpPlayBtn.style.cssText = `
-            background: none; border: 1px solid #555; color: #ddd;
-            cursor: pointer; padding: 4px 10px; border-radius: 3px;
-            font-size: 12px; min-width: 32px;
-        `;
+        this._vpPlayBtn.textContent = "Play";
+        this._vpPlayBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "4px 10px", fontSize: "12px", radius: "6px" })} min-width: 36px;`;
         this._vpPlayBtn.addEventListener("click", () => this._togglePlayback());
 
         // Frame counter
@@ -5339,12 +5523,12 @@ export class EditorWidget {
         // Progress bar
         const progressWrap = document.createElement("div");
         progressWrap.style.cssText = `
-            flex: 1; height: 6px; background: #333; border-radius: 3px;
+            flex: 1; height: 6px; background: ${COLORS.panelRaised}; border-radius: 999px;
             cursor: pointer; position: relative;
         `;
         this._vpProgressFill = document.createElement("div");
         this._vpProgressFill.style.cssText = `
-            height: 100%; background: ${COLORS.selection}; border-radius: 3px;
+            height: 100%; background: ${lightenColor(COLORS.sceneBtnActive, 0.08)}; border-radius: 999px;
             width: 0%; pointer-events: none;
         `;
         progressWrap.appendChild(this._vpProgressFill);
@@ -5364,7 +5548,7 @@ export class EditorWidget {
         const _defaultTimelineH = this._defaultFullscreenTimelineHeight();
         this._fsBottomRow.style.cssText = `
             height: ${_defaultTimelineH}px; min-height: ${FULLSCREEN_TIMELINE_MIN_HEIGHT}px; max-height: ${this._computeFullscreenTimelineMaxHeight()}px;
-            border-top: 2px solid #333; display: flex; flex-direction: column;
+            border-top: 1px solid ${COLORS.border}; display: flex; flex-direction: column;
             overflow: hidden; flex-shrink: 0; position: relative;
         `;
 
@@ -5513,7 +5697,7 @@ export class EditorWidget {
         this._fullscreenPlaceholder = document.createElement("div");
         this._fullscreenPlaceholder.style.cssText = `
             text-align: center; padding: 16px; color: ${COLORS.textDim};
-            background: #1a1a1a; font-size: 12px;
+            background: ${COLORS.panel}; border: 1px solid ${COLORS.border}; border-radius: 8px; font-size: 12px;
         `;
         this._fullscreenPlaceholder.innerHTML = `Editor is in fullscreen mode`;
         const exitPlaceholderBtn = this._makeBtn("Exit Fullscreen", "Return editor to node");
@@ -5622,6 +5806,7 @@ export class EditorWidget {
             // Guard: only handle keys when our editor is focused
             // (fullscreen always focused, node mode only when user clicked inside)
             if (!this.isFullscreen && !this._editorFocused) return;
+            if (this.isFullscreen && this._assetGallery?.isInspectOverlayOpen?.()) return;
 
             const ctrl = e.ctrlKey || e.metaKey;
             const shift = e.shiftKey;
@@ -5941,9 +6126,9 @@ export class EditorWidget {
         const dd = document.createElement("div");
         dd.style.cssText = `
             position: fixed; left: ${rect.left}px; top: ${rect.bottom + 2}px;
-            background: #2a2a2a; border: 1px solid #555; border-radius: 4px;
+            background: ${COLORS.panelRaised}; border: 1px solid ${COLORS.borderStrong}; border-radius: 8px;
             min-width: 200px; max-height: 300px; overflow-y: auto;
-            z-index: 10002; font-size: 11px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            z-index: 10002; font-size: 11px; box-shadow: 0 12px 28px rgba(0,0,0,0.42);
         `;
 
         // Save current selection option
@@ -5951,11 +6136,11 @@ export class EditorWidget {
         const hasSel = this.selectionStart < this.selectionEnd;
         saveItem.style.cssText = `
             padding: 6px 10px; cursor: ${hasSel ? "pointer" : "default"};
-            color: ${hasSel ? "#8cf" : "#666"}; border-bottom: 1px solid #444;
+            color: ${hasSel ? lightenColor(COLORS.sceneBtnActive, 0.28) : COLORS.textMuted}; border-bottom: 1px solid ${COLORS.border};
         `;
         saveItem.textContent = hasSel ? `💾 Save Selection (${this._frameToTimecode(this.selectionStart)}–${this._frameToTimecode(this.selectionEnd)})` : "💾 Save Selection (no selection)";
         if (hasSel) {
-            saveItem.addEventListener("mouseenter", () => { saveItem.style.background = "#333"; });
+            saveItem.addEventListener("mouseenter", () => { saveItem.style.background = COLORS.panelRaisedHover; });
             saveItem.addEventListener("mouseleave", () => { saveItem.style.background = ""; });
             saveItem.addEventListener("click", () => {
                 this._saveCurrentSelection();
@@ -5969,14 +6154,14 @@ export class EditorWidget {
         const selections = this.activeScene?.saved_selections || [];
         if (selections.length === 0) {
             const empty = document.createElement("div");
-            empty.style.cssText = `padding: 8px 10px; color: #666; font-style: italic;`;
+            empty.style.cssText = `padding: 8px 10px; color: ${COLORS.textMuted}; font-style: italic;`;
             empty.textContent = "No saved selections";
             dd.appendChild(empty);
         } else {
             selections.forEach((sel, idx) => {
                 const item = document.createElement("div");
-                item.style.cssText = `padding: 5px 10px; cursor: pointer; color: #ccc; display: flex; justify-content: space-between; align-items: center;`;
-                item.addEventListener("mouseenter", () => { item.style.background = "#383838"; });
+                item.style.cssText = `padding: 5px 10px; cursor: pointer; color: ${COLORS.text}; display: flex; justify-content: space-between; align-items: center;`;
+                item.addEventListener("mouseenter", () => { item.style.background = COLORS.panelRaisedHover; });
                 item.addEventListener("mouseleave", () => { item.style.background = ""; });
 
                 const label = document.createElement("span");
@@ -5988,7 +6173,7 @@ export class EditorWidget {
 
                 const delBtn = document.createElement("span");
                 delBtn.textContent = "✕";
-                delBtn.style.cssText = `color: #888; cursor: pointer; padding: 0 4px; font-size: 10px;`;
+                delBtn.style.cssText = `color: ${COLORS.textMuted}; cursor: pointer; padding: 0 4px; font-size: 10px;`;
                 delBtn.title = "Delete saved selection";
                 delBtn.addEventListener("click", (ev) => {
                     ev.stopPropagation();
@@ -6101,14 +6286,42 @@ export class EditorWidget {
         if (!this.activeScene) return;
         const sceneId = this.activeScene.scene_id;
         const sceneName = this.activeScene.name;
+        const sceneDuration = Math.max(0, parseInt(this.activeScene.duration_frames, 10) || 0);
         const selStart = this.selectionStart < this.selectionEnd ? this.selectionStart : 0;
-        const selEnd = this.selectionStart < this.selectionEnd ? this.selectionEnd : this.activeScene.duration_frames;
-        // Get prompt from prompt sections for the range, or fall back to scene prompt
+        const selEnd = this.selectionStart < this.selectionEnd ? this.selectionEnd : sceneDuration;
+        const preContextFrames = this._contextFrameValue("pre_context_frames");
+        const postContextFrames = this._contextFrameValue("post_context_frames");
+        const snapshotStart = Math.max(0, selStart - preContextFrames);
+        const snapshotEnd = Math.min(sceneDuration, selEnd + postContextFrames);
+
+        // Snapshot the prompt coverage for the full render range, not only the raw selection.
         let prompt = this.activeScene.prompt || "";
         const sections = this.activeScene.prompt_sections || [];
+        const promptSections = [];
         for (const s of sections) {
-            if (s.start_frame <= selStart && s.end_frame >= selEnd) { prompt = s.prompt; break; }
-            if (s.start_frame < selEnd && s.end_frame > selStart) { prompt = s.prompt; break; }
+            if (s.start_frame < snapshotEnd && s.end_frame > snapshotStart) {
+                promptSections.push({
+                    start_frame: s.start_frame,
+                    end_frame: s.end_frame,
+                    prompt: s.prompt,
+                });
+            }
+            if (s.start_frame <= snapshotStart && s.end_frame >= snapshotEnd) { prompt = s.prompt; break; }
+            if (s.start_frame < snapshotEnd && s.end_frame > snapshotStart) { prompt = s.prompt; break; }
+        }
+
+        const guideFrameSnapshots = [];
+        for (const guide of (this.activeScene.guide_frames || [])) {
+            let frameIndex = parseInt(guide.frame_index, 10) || 0;
+            if (frameIndex === -1) frameIndex = Math.max(0, sceneDuration - 1);
+            if (snapshotStart <= frameIndex && frameIndex < snapshotEnd) {
+                guideFrameSnapshots.push({
+                    frame_index: frameIndex,
+                    asset_id: guide.asset_id,
+                    source: guide.source || "asset",
+                    strength: guide.strength ?? 1.0,
+                });
+            }
         }
 
         try {
@@ -6122,15 +6335,20 @@ export class EditorWidget {
                     selection_start: selStart,
                     selection_end: selEnd,
                     prompt: prompt,
-                    context_frames: 0,
+                    context_frames: Math.max(preContextFrames, postContextFrames),
+                    pre_context_frames: preContextFrames,
+                    post_context_frames: postContextFrames,
+                    guide_frame_snapshots: guideFrameSnapshots,
+                    prompt_sections: promptSections,
+                    scene_width: Math.max(0, parseInt(this.activeScene.width, 10) || 0),
+                    scene_height: Math.max(0, parseInt(this.activeScene.height, 10) || 0),
+                    scene_fps: Math.max(0, parseFloat(this.activeScene.fps) || 0),
                 }),
             });
             if (resp.ok) {
-                this._queueBtn.style.background = "#3a7ca5";
-                this._queueBtn.style.color = "#fff";
+                setButtonVariant(this._queueBtn, "active");
                 setTimeout(() => {
-                    this._queueBtn.style.background = "#333";
-                    this._queueBtn.style.color = "#ccc";
+                    setButtonVariant(this._queueBtn, "primary");
                 }, 500);
                 this._fetchRenderQueue();
             }
@@ -6149,26 +6367,63 @@ export class EditorWidget {
         } catch (e) { console.error("Fetch queue failed:", e); }
     }
 
+    _updateQueueHeaderLabel() {
+        if (!this._queueHeaderLabel) return;
+        this._queueHeaderLabel.textContent = `${this._queueExpanded ? "▾" : "▸"} Render Queue (${(this._renderQueue || []).length})`;
+    }
+
+    _applyQueueExpandedState() {
+        if (!this._queueContainer) return;
+        this._queueContainer.style.maxHeight = this._queueExpanded ? "200px" : "0";
+        this._queueContainer.style.overflowY = this._queueExpanded ? "auto" : "hidden";
+        this._updateQueueHeaderLabel();
+    }
+
+    _setQueueExpanded(expanded, options = {}) {
+        const { persist = false, fetch = false } = options;
+        const nextExpanded = !!expanded;
+        const changed = this._queueExpanded !== nextExpanded;
+        this._queueExpanded = nextExpanded;
+        this._applyQueueExpandedState();
+        if (persist && this._settings.layout.queuePanelExpanded !== nextExpanded) {
+            this._updateSettings({
+                layout: {
+                    queuePanelExpanded: nextExpanded,
+                },
+            });
+        }
+        if ((changed || fetch) && nextExpanded) {
+            this._fetchRenderQueue();
+        }
+    }
+
     _renderQueuePanel() {
         if (!this._queueContainer) return;
         this._queueContainer.innerHTML = "";
+        this._updateQueueHeaderLabel();
 
         const queue = this._renderQueue || [];
         if (queue.length === 0) {
-            this._queueContainer.innerHTML = `<div style="padding: 8px; color: #666; font-style: italic; font-size: 10px;">Queue empty — use + Queue to add jobs</div>`;
+            this._queueContainer.innerHTML = `<div style="padding: 10px; color: ${COLORS.textMuted}; font-style: italic; font-size: 10px;">Queue empty — use + Queue to add jobs</div>`;
             return;
         }
 
         queue.forEach(job => {
             const item = document.createElement("div");
             item.style.cssText = `
-                padding: 4px 8px; border-bottom: 1px solid #333; display: flex;
-                align-items: center; gap: 6px; font-size: 10px; color: #ccc;
+                padding: 6px 8px; border-bottom: 1px solid ${COLORS.borderSoft}; display: flex;
+                align-items: center; gap: 8px; font-size: 10px; color: ${COLORS.text};
+                background: ${COLORS.panelMuted};
             `;
 
             // Status badge
             const badge = document.createElement("span");
-            const colors = { pending: "#888", running: "#4a9eff", completed: "#4a4", failed: "#c44" };
+            const colors = {
+                pending: COLORS.textMuted,
+                running: lightenColor(COLORS.sceneBtnActive, 0.15),
+                completed: "#68a376",
+                failed: "#c66d76",
+            };
             badge.style.cssText = `
                 width: 8px; height: 8px; border-radius: 50%;
                 background: ${colors[job.status] || "#888"}; flex-shrink: 0;
@@ -6178,7 +6433,7 @@ export class EditorWidget {
 
             // Job info
             const info = document.createElement("span");
-            info.style.cssText = `flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;`;
+            info.style.cssText = `flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: ${COLORS.text};`;
             info.textContent = `${job.scene_name || "Scene"} ${this._frameToTimecode(job.selection_start)}–${this._frameToTimecode(job.selection_end)}`;
             if (job.prompt) info.title = job.prompt;
             item.appendChild(info);
@@ -6186,7 +6441,7 @@ export class EditorWidget {
             // Delete button
             const delBtn = document.createElement("span");
             delBtn.textContent = "✕";
-            delBtn.style.cssText = `color: #888; cursor: pointer; padding: 0 2px; font-size: 9px;`;
+            delBtn.style.cssText = `color: ${COLORS.textMuted}; cursor: pointer; padding: 0 2px; font-size: 9px;`;
             delBtn.addEventListener("click", async () => {
                 try {
                     const dirName = encodeURIComponent(this._projectDirName());
@@ -6441,8 +6696,14 @@ export class EditorWidget {
         // Fetch project settings (fps, resolution)
         this._fetchProjectSettings();
 
+        this._renderQueue = [];
+        this._renderQueuePanel();
+
         // Fetch assets first (triggers audio duration repair), then scenes
         this._fetchAssets().then(() => this._fetchScenes());
+        if (this._queueExpanded) {
+            this._fetchRenderQueue();
+        }
         this._renderTimeline();
     }
 
@@ -6483,22 +6744,76 @@ export class EditorWidget {
         }
     }
 
+    _ensureViewportSurface() {
+        if (this._viewportSurface || !this._vpCanvas) return this._viewportSurface;
+        this._viewportSurface = createViewportSurface({
+            canvas: this._vpCanvas,
+            initialLiveMediaEnabled: true,
+            videoCache: this._videoCache,
+            audioCache: this._audioCacheMap,
+            imageCache: this._viewportImageCache,
+            getScene: () => this.activeScene,
+            getFrame: () => this.playhead,
+            setFrame: (frame) => {
+                this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
+            },
+            getTotalFrames: () => this.totalFrames,
+            getFps: () => this._effectiveFps,
+            getLoopRange: () => this._resolvePlaybackLoopRange(),
+            shouldReturnToPlaybackStart: () => !!this._settings?.playback?.returnToPlaybackStart,
+            onFrameChange: (frame, meta = {}) => {
+                this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
+                if (meta.reason === "playback" || meta.reason === "playback-loop" || meta.reason === "playback-stop-return") {
+                    this._maybeAutoScrollToPlayhead();
+                }
+                this._renderTimeline();
+                this._updateToolbar();
+                this._updateTransportUI();
+            },
+            onTransportUpdate: () => this._updateTransportUI(),
+            onPlaybackStateChange: (isPlaying) => {
+                this.isPlaying = !!isPlaying;
+                if (this._vpPlayBtn) {
+                    this._vpPlayBtn.textContent = isPlaying ? "Pause" : "Play";
+                }
+                this._renderTimeline();
+                this._updateToolbar();
+            },
+            getAssetForSourcePath: (sourcePath) => this._getAssetForSourcePath(sourcePath),
+            getGuideAsset: (guide) => this._getGuideAsset(guide),
+            isVideoLaneHidden: (trackIndex) => this._isLaneHidden(TRACK_TYPE.VIDEO, trackIndex || 0),
+            isAudioLaneHidden: (laneIndex) => this._isLaneHidden(TRACK_TYPE.AUDIO, laneIndex || 0),
+            buildViewUrl: (sourcePath) => this._buildViewURL(sourcePath),
+            buildThumbnailUrl: (assetId) => this.projectDir
+                ? api.apiURL(`/ltx-editor/project/${this.projectDir.split(/[/\\]/).pop()}/thumbnail/${assetId}`)
+                : null,
+        });
+        return this._viewportSurface;
+    }
+
     _clearVideoCache() {
+        if (this._viewportSurface) {
+            this._viewportSurface.clearMediaCache();
+            return;
+        }
         for (const key of Object.keys(this._videoCache)) {
             const v = this._videoCache[key];
             if (v.pause) v.pause();
             if (v._blobUrl) URL.revokeObjectURL(v._blobUrl);
             if (v.removeAttribute) v.removeAttribute("src");
             if (v.load) v.load();
+            delete this._videoCache[key];
         }
-        this._videoCache = {};
         for (const key of Object.keys(this._audioCacheMap)) {
             const a = this._audioCacheMap[key];
             a.pause();
             if (a._blobUrl) URL.revokeObjectURL(a._blobUrl);
             a.removeAttribute("src");
+            delete this._audioCacheMap[key];
         }
-        this._audioCacheMap = {};
+        for (const key of Object.keys(this._viewportImageCache)) {
+            delete this._viewportImageCache[key];
+        }
     }
 
     // ── Viewport Rendering ──────────────────────────────────────────
@@ -6690,6 +7005,11 @@ export class EditorWidget {
     }
 
     _renderViewportFrame() {
+        const viewportSurface = this._ensureViewportSurface();
+        if (viewportSurface) {
+            viewportSurface.renderFrame();
+            return;
+        }
         if (!this._vpCanvas || !this._vpCtx) return;
         const ctx = this._vpCtx;
         const w = this._vpCanvas.width;
@@ -7040,6 +7360,11 @@ export class EditorWidget {
     // ── Playback ──────────────────────────────────────────────────────
 
     _togglePlayback() {
+        const viewportSurface = this._ensureViewportSurface();
+        if (viewportSurface) {
+            viewportSurface.togglePlayback();
+            return;
+        }
         if (this.isPlaying) {
             this._stopPlayback();
         } else {
@@ -7149,13 +7474,18 @@ export class EditorWidget {
     }
 
     _startPlayback() {
+        const viewportSurface = this._ensureViewportSurface();
+        if (viewportSurface) {
+            viewportSurface.startPlayback();
+            return;
+        }
         if (this.isPlaying) return;
         const loopRange = this._resolvePlaybackLoopRange();
         if (loopRange && (this.playhead < loopRange.start || this.playhead >= loopRange.end)) {
             this.playhead = loopRange.start;
         }
         this.isPlaying = true;
-        if (this._vpPlayBtn) this._vpPlayBtn.textContent = "⏸";
+        if (this._vpPlayBtn) this._vpPlayBtn.textContent = "Pause";
 
         this._playbackStartTime = performance.now();
         this._playbackStartFrame = this.playhead;
@@ -7238,12 +7568,17 @@ export class EditorWidget {
     }
 
     _stopPlayback({ preservePlayhead = false } = {}) {
+        const viewportSurface = this._viewportSurface;
+        if (viewportSurface) {
+            viewportSurface.stopPlayback({ preservePlayhead });
+            return;
+        }
         if (this._playbackRAF) {
             cancelAnimationFrame(this._playbackRAF);
             this._playbackRAF = null;
         }
         this.isPlaying = false;
-        if (this._vpPlayBtn) this._vpPlayBtn.textContent = "▶";
+        if (this._vpPlayBtn) this._vpPlayBtn.textContent = "Play";
 
         this._clearActivePlaybackMedia();
         if (!preservePlayhead && this._settings?.playback?.returnToPlaybackStart) {
@@ -7321,31 +7656,20 @@ export class EditorWidget {
         const backdrop = document.createElement("div");
         backdrop.style.cssText = `
             position: fixed; inset: 0; z-index: 10001;
-            background: rgba(0,0,0,0.72);
+            background: rgba(7,10,14,0.78);
             display: flex; align-items: center; justify-content: center;
             padding: 24px;
         `;
 
         const panel = document.createElement("div");
-        panel.style.cssText = `
-            background: #171717;
-            border: 1px solid #4a4a4a;
-            border-radius: 12px;
-            width: min(860px, 96vw);
-            max-height: min(780px, 88vh);
-            overflow: auto;
-            color: #ddd;
-            font-family: sans-serif;
-            font-size: 12px;
-            box-shadow: 0 22px 60px rgba(0,0,0,0.45);
-        `;
+        panel.style.cssText = `${chromeOverlayPanelCss({ width: "min(860px, 96vw)", maxWidth: "860px", maxHeight: "min(780px, 88vh)", padding: "0", fontFamily: "'Segoe UI', Arial, sans-serif" })}`;
 
         const header = document.createElement("div");
         header.style.cssText = `
             display: flex; align-items: center; justify-content: space-between;
             padding: 18px 22px 14px;
-            border-bottom: 1px solid #2f2f2f;
-            position: sticky; top: 0; background: #171717; z-index: 1;
+            border-bottom: 1px solid ${COLORS.border};
+            position: sticky; top: 0; background: ${COLORS.panel}; z-index: 1;
         `;
         const titleWrap = document.createElement("div");
         titleWrap.innerHTML = `
@@ -7354,10 +7678,7 @@ export class EditorWidget {
         `;
         const closeBtn = document.createElement("button");
         closeBtn.textContent = "Close";
-        closeBtn.style.cssText = `
-            background: #262626; border: 1px solid #505050; color: #d7d7d7;
-            cursor: pointer; padding: 6px 12px; border-radius: 7px; font-size: 11px;
-        `;
+        closeBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "6px 12px", fontSize: "11px", radius: "7px" });
         closeBtn.addEventListener("click", () => this._hideSettingsPanel());
         header.append(titleWrap, closeBtn);
         panel.appendChild(header);
@@ -7385,8 +7706,8 @@ export class EditorWidget {
         const createSection = (title, description) => {
             const section = document.createElement("section");
             section.style.cssText = `
-                background: #1f1f1f;
-                border: 1px solid #333;
+                background: ${COLORS.panelRaised};
+                border: 1px solid ${COLORS.border};
                 border-radius: 10px;
                 padding: 14px 14px 12px;
                 display: flex;
@@ -7408,7 +7729,7 @@ export class EditorWidget {
             const row = document.createElement("div");
             row.style.cssText = `
                 display: flex; align-items: center; justify-content: space-between;
-                gap: 12px; padding: 8px 0; border-top: 1px solid #2b2b2b;
+                gap: 12px; padding: 8px 0; border-top: 1px solid ${COLORS.borderSoft};
             `;
             const labelWrap = document.createElement("div");
             labelWrap.style.cssText = "flex: 1; min-width: 0;";
@@ -7437,10 +7758,7 @@ export class EditorWidget {
         const createSelect = (section, key, label, description, options, getter, onChange) => {
             const controlWrap = createRow(section, label, description);
             const select = document.createElement("select");
-            select.style.cssText = `
-                min-width: 126px; background:#292929; border:1px solid #555;
-                color:#ddd; border-radius:6px; padding:4px 8px; font-size:11px;
-            `;
+            select.style.cssText = `${chromeInputCss({ fontSize: "11px", padding: "4px 8px", textAlign: "left" })} min-width: 126px;`;
             for (const option of options) {
                 const el = document.createElement("option");
                 el.value = option.value;
@@ -7462,10 +7780,7 @@ export class EditorWidget {
             input.max = String(config.max);
             input.step = String(config.step ?? 1);
             input.value = String(config.getter());
-            input.style.cssText = `
-                width: 86px; background:#292929; border:1px solid #555; color:#ddd;
-                border-radius:6px; padding:4px 8px; font-size:11px; text-align:right;
-            `;
+            input.style.cssText = `${chromeInputCss({ width: "86px", fontSize: "11px", padding: "4px 8px", textAlign: "right" })}`;
             input.addEventListener("change", () => {
                 const numeric = Number(input.value);
                 const fallback = config.getter();
@@ -7481,10 +7796,7 @@ export class EditorWidget {
             const controlWrap = createRow(section, label, description);
             const downBtn = document.createElement("button");
             downBtn.textContent = "-";
-            downBtn.style.cssText = `
-                background:#2a2a2a;border:1px solid #555;color:#ccc;cursor:pointer;
-                padding:3px 9px;border-radius:6px;font-size:13px;line-height:1;
-            `;
+            downBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "3px 9px", fontSize: "13px", radius: "6px", lineHeight: "1" });
             downBtn.addEventListener("click", () => this._setScale(key, getter() - 0.1));
 
             const valueLabel = document.createElement("span");
@@ -7494,10 +7806,7 @@ export class EditorWidget {
 
             const upBtn = document.createElement("button");
             upBtn.textContent = "+";
-            upBtn.style.cssText = `
-                background:#2a2a2a;border:1px solid #555;color:#ccc;cursor:pointer;
-                padding:3px 9px;border-radius:6px;font-size:13px;line-height:1;
-            `;
+            upBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "3px 9px", fontSize: "13px", radius: "6px", lineHeight: "1" });
             upBtn.addEventListener("click", () => this._setScale(key, getter() + 0.1));
 
             controlWrap.append(downBtn, valueLabel, upBtn);
@@ -7514,10 +7823,7 @@ export class EditorWidget {
         const resetControls = createRow(layoutSection, "Reset Editor Layout", "Clear saved fullscreen widths, label widths, and UI scale overrides.");
         const resetBtn = document.createElement("button");
         resetBtn.textContent = "Reset";
-        resetBtn.style.cssText = `
-            background:#2f2f2f;border:1px solid #555;color:#ddd;cursor:pointer;
-            padding:5px 12px;border-radius:6px;font-size:11px;
-        `;
+        resetBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "5px 12px", fontSize: "11px", radius: "6px" });
         resetBtn.addEventListener("click", () => this._resetEditorLayout());
         resetControls.appendChild(resetBtn);
 
@@ -7637,7 +7943,7 @@ export class EditorWidget {
             updateCategory("appearance", "timelineBrightness", Math.round(Number(brightnessInput.value) || 100));
         });
         const brightnessLabel = document.createElement("span");
-        brightnessLabel.style.cssText = "font-size:11px;color:#ccc;min-width:38px;text-align:right;";
+        brightnessLabel.style.cssText = `font-size:11px;color:${COLORS.text};min-width:38px;text-align:right;`;
         brightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
         brightnessControls.append(brightnessInput, brightnessLabel);
         controls.timelineBrightness = brightnessInput;
@@ -7661,7 +7967,7 @@ export class EditorWidget {
             projectDefaultsSection,
             "defaultProjectFps",
             "Default FPS",
-            "Used to prefill create-project widgets in LTXEditor and LTXProjectLoader.",
+            "Used to prefill create-project widgets in LTXEditor.",
             {
                 min: 1,
                 max: 240,
@@ -7847,6 +8153,10 @@ export class EditorWidget {
             this._assetGallery = null;
         }
 
+        if (this._viewportSurface) {
+            this._viewportSurface.destroy();
+            this._viewportSurface = null;
+        }
         this._clearVideoCache();
 
         if (this._fullscreenOverlay) {

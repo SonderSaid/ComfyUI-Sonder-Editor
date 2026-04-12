@@ -2875,6 +2875,19 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
+        raw_params = body.get("params", {}) or {}
+        params = dict(raw_params) if isinstance(raw_params, dict) else {}
+        if any(field in body for field in (
+            "pre_context_frames",
+            "post_context_frames",
+            "guide_frame_snapshots",
+            "prompt_sections",
+            "scene_width",
+            "scene_height",
+            "scene_fps",
+        )):
+            params["snapshot_version"] = 1
+
         job = GenerationJob(
             scene_id=body.get("scene_id", ""),
             scene_name=body.get("scene_name", ""),
@@ -2882,7 +2895,14 @@ if routes is not None:
             selection_end=int(body.get("selection_end", 0)),
             prompt=body.get("prompt", ""),
             context_frames=int(body.get("context_frames", 0)),
-            params=body.get("params", {}),
+            pre_context_frames=int(body.get("pre_context_frames", 0)),
+            post_context_frames=int(body.get("post_context_frames", 0)),
+            guide_frame_snapshots=list(body.get("guide_frame_snapshots", []) or []),
+            prompt_sections=list(body.get("prompt_sections", []) or []),
+            scene_width=int(body.get("scene_width", 0)),
+            scene_height=int(body.get("scene_height", 0)),
+            scene_fps=float(body.get("scene_fps", 0.0) or 0.0),
+            params=params,
         )
         project.generation_queue.append(job)
         save_project(project)

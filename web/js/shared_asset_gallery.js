@@ -25,6 +25,52 @@ function style(el, cssText) {
     return el;
 }
 
+const CHROME = {
+    panelMuted: "#10161d",
+    panel: "#151c24",
+    panelRaised: "#1b2430",
+    panelRaisedHover: "#25313f",
+    border: "#34414d",
+    borderSoft: "#28313b",
+    borderStrong: "#587089",
+    text: "#dbe3ea",
+    textDim: "#90a0af",
+    textMuted: "#748291",
+    accent: "#4a82ad",
+    accentSoft: "#263a4d",
+    accentSoftHover: "#314961",
+    accentBorder: "#6686a3",
+    warningBorder: "#9a7a42",
+    dangerBorder: "#8f5f66",
+};
+
+function inputChromeCss({ minWidth = "0", padding = "6px 8px" } = {}) {
+    return `background:${CHROME.panel};border:1px solid ${CHROME.border};border-radius:6px;color:${CHROME.text};padding:${padding};font-size:11px;min-width:${minWidth};box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);`;
+}
+
+function actionButtonCss(variant = "primary") {
+    const variants = {
+        primary: `border:1px solid ${CHROME.accentBorder};background:${CHROME.accentSoft};color:#fff;`,
+        subtle: `border:1px solid ${CHROME.border};background:${CHROME.panelRaised};color:${CHROME.textDim};`,
+        active: `border:1px solid #7ea8c9;background:${CHROME.accent};color:#fff;`,
+        danger: `border:1px solid ${CHROME.dangerBorder};background:#44292d;color:#efc0c4;`,
+    };
+    return `padding:6px 10px;border-radius:6px;${variants[variant] || variants.primary}cursor:pointer;font-size:11px;font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,0.04);`;
+}
+
+function menuChromeCss(minWidth = 160) {
+    return `
+        position: fixed; z-index: 10000;
+        background: ${CHROME.panelRaised};
+        border: 1px solid ${CHROME.borderStrong};
+        border-radius: 8px;
+        box-shadow: 0 12px 28px rgba(0,0,0,0.42);
+        min-width: ${minWidth}px;
+        padding: 6px 0;
+        font-size: 11px;
+    `;
+}
+
 function normalizeFolderName(folder) {
     return String(folder || "")
         .replace(/\\/g, "/")
@@ -55,7 +101,7 @@ function buildWaveformUrl(projectDir, assetId) {
     return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/waveform/${assetId}`);
 }
 
-function loadMediaAsBlob(url, mediaEl) {
+export function loadMediaAsBlob(url, mediaEl) {
     if (!url || !mediaEl) return { cleanup: () => {} };
     let blobUrl = null;
     let aborted = false;
@@ -75,6 +121,56 @@ function loadMediaAsBlob(url, mediaEl) {
             if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
         },
     };
+}
+
+const OVERLAY_CAPTURE_KEYS = new Set([
+    "Escape",
+    " ",
+    "Spacebar",
+    "ArrowLeft",
+    "ArrowRight",
+    "ArrowUp",
+    "ArrowDown",
+    "Home",
+    "End",
+    "Delete",
+    "Backspace",
+    "?",
+    "=",
+    "+",
+    "-",
+    "_",
+    "a",
+    "A",
+    "c",
+    "C",
+    "f",
+    "F",
+    "i",
+    "I",
+    "o",
+    "O",
+    "s",
+    "S",
+    "t",
+    "T",
+    "x",
+    "X",
+]);
+
+function shouldCaptureOverlayShortcut(event) {
+    const key = event?.key;
+    if (!key) return false;
+    if ((event.ctrlKey || event.metaKey) && (key === "z" || key === "Z" || key === "y" || key === "Y")) {
+        return true;
+    }
+    return OVERLAY_CAPTURE_KEYS.has(key);
+}
+
+function consumeOverlayShortcut(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
 }
 
 function assetKindLabel(type) {
@@ -306,6 +402,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             dividerRatio: 0.5,
             audioFocus: "none",
             showWaveform: false,
+            togglePlayback: null,
         },
     };
     const data = { assets: [], folders: [] };
@@ -324,12 +421,12 @@ export function mountSharedAssetGallery(container, options = {}) {
     root.appendChild(replaceInput);
 
     const controls = style(document.createElement("div"), `display:flex;gap:6px;align-items:center;min-width:0;flex-wrap:wrap;`);
-    const searchInput = style(document.createElement("input"), `flex:1 1 180px;min-width:120px;background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
+    const searchInput = style(document.createElement("input"), `flex:1 1 180px;${inputChromeCss({ minWidth: "120px" })}`);
     searchInput.type = "search";
     searchInput.placeholder = "Search assets";
     controls.appendChild(searchInput);
 
-    const sortSelect = style(document.createElement("select"), `flex:0 0 auto;min-width:110px;background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
+    const sortSelect = style(document.createElement("select"), `flex:0 0 auto;${inputChromeCss({ minWidth: "110px" })}`);
     for (const option of SORT_OPTIONS) {
         const optionEl = document.createElement("option");
         optionEl.value = option.value;
@@ -338,11 +435,9 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
     controls.appendChild(sortSelect);
 
-    const makeActionButton = () => style(document.createElement("button"), `padding:6px 10px;border-radius:6px;border:1px solid #47627a;background:#25384a;color:#fff;cursor:pointer;font-size:11px;font-weight:600;`);
+    const makeActionButton = (variant = "primary") => style(document.createElement("button"), actionButtonCss(variant));
 
-    const inspectorBtn = makeActionButton();
-    inspectorBtn.style.background = "#1d2630";
-    inspectorBtn.style.borderColor = "#364655";
+    const inspectorBtn = makeActionButton("subtle");
     controls.appendChild(inspectorBtn);
 
     const importBtn = makeActionButton();
@@ -354,10 +449,8 @@ export function mountSharedAssetGallery(container, options = {}) {
     folderBtn.textContent = "+ Folder";
     controls.appendChild(folderBtn);
 
-    const refreshBtn = makeActionButton();
+    const refreshBtn = makeActionButton("subtle");
     refreshBtn.textContent = "Refresh";
-    refreshBtn.style.background = "#1d2630";
-    refreshBtn.style.borderColor = "#364655";
     refreshBtn.addEventListener("click", async () => {
         hideContextMenu();
         await options.onRefresh?.();
@@ -381,7 +474,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     listScroller.tabIndex = 0;
     listPane.append(bulkToolbarHost, listScroller);
 
-    const detailPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:8px;padding:8px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;min-height:0;overflow:auto;`);
+    const detailPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:8px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.border};min-height:0;overflow:auto;`);
     content.append(listPane, detailPane);
 
     const folderListId = `ltx-gallery-folders-${Math.random().toString(36).slice(2)}`;
@@ -467,8 +560,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         sortSelect.value = state.sortMode;
         inspectorBtn.textContent = state.inspectorCollapsed ? "Show Inspector" : "Hide Inspector";
         manageBtn.textContent = state.manageMode ? "Done" : "Manage";
-        manageBtn.style.background = state.manageMode ? "#4a5c6b" : "#1d2630";
-        manageBtn.style.borderColor = state.manageMode ? "#6f8ea8" : "#364655";
+        manageBtn.style.cssText = actionButtonCss(state.manageMode ? "active" : "subtle");
     }
 
     const unsubscribeSettings = subscribeEditorSettings((settings) => {
@@ -488,7 +580,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function setDropFolderHighlight(folderName = "") {
         state.dropFolder = folderName;
         for (const el of root.querySelectorAll("[data-folder-drop]")) {
-            el.style.borderColor = el.dataset.folderDrop === state.dropFolder ? "#6f8ea8" : "transparent";
+            el.style.borderColor = el.dataset.folderDrop === state.dropFolder ? CHROME.accentBorder : "transparent";
         }
     }
 
@@ -524,16 +616,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         hideContextMenu();
 
         const menu = style(document.createElement("div"), `
-            position: fixed; left: ${x}px; top: ${y}px; z-index: 10000;
-            background: #2a2a2a; border: 1px solid #555; border-radius: 4px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.5); min-width: 160px;
-            padding: 4px 0; font-size: 11px;
+            left: ${x}px; top: ${y}px;
+            ${menuChromeCss(160)}
         `);
 
         for (const item of items) {
             if (!item) continue;
             if (item.type === "separator") {
-                menu.appendChild(style(document.createElement("div"), `height:1px;background:#404040;margin:4px 0;`));
+                menu.appendChild(style(document.createElement("div"), `height:1px;background:${CHROME.border};margin:4px 0;`));
                 continue;
             }
             const row = document.createElement("div");
@@ -541,11 +631,11 @@ export function mountSharedAssetGallery(container, options = {}) {
             const isDisabled = !!item.disabled;
             row.style.cssText = `
                 padding: 6px 14px; cursor: ${isDisabled ? "default" : "pointer"};
-                color: ${isDisabled ? "#666" : (item.danger ? "#f66" : "#ddd")};
+                color: ${isDisabled ? CHROME.textMuted : (item.danger ? "#efc0c4" : CHROME.text)};
             `;
             if (!isDisabled) {
                 row.addEventListener("mouseenter", () => {
-                    row.style.background = "#3a3a3a";
+                    row.style.background = CHROME.panelRaisedHover;
                 });
                 row.addEventListener("mouseleave", () => {
                     row.style.background = "transparent";
@@ -1285,7 +1375,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         bulkToolbarHost.style.display = "flex";
-        const bar = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px;border-radius:6px;background:rgba(75,105,135,0.14);border:1px solid rgba(111,142,168,0.4);flex-wrap:wrap;`);
+        const bar = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px;border-radius:8px;background:rgba(75,105,135,0.14);border:1px solid rgba(111,142,168,0.4);flex-wrap:wrap;`);
         const label = style(document.createElement("div"), `color:#d9e7f3;font-size:10px;font-weight:700;`);
         label.textContent = `${assets.length} selected`;
 
@@ -1304,8 +1394,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const deleteBtn = makeActionButton();
             deleteBtn.textContent = activeAssets.length === assets.length ? "Trash" : `Trash ${activeAssets.length}`;
-            deleteBtn.style.background = "#392420";
-            deleteBtn.style.borderColor = "#73443b";
+            deleteBtn.style.cssText = actionButtonCss("danger");
             deleteBtn.disabled = !options.onBulkDeleteAssets;
             deleteBtn.addEventListener("click", async () => {
                 await handleBulkDelete(activeAssets.map((asset) => asset.asset_id));
@@ -1316,8 +1405,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (trashedSelection.length) {
             const restoreBtn = makeActionButton();
             restoreBtn.textContent = trashedSelection.length === assets.length ? "Restore" : `Restore ${trashedSelection.length}`;
-            restoreBtn.style.background = "#203427";
-            restoreBtn.style.borderColor = "#48644f";
+            restoreBtn.style.cssText = `padding:6px 10px;border-radius:6px;border:1px solid #48644f;background:#203427;color:#e5f7e8;cursor:pointer;font-size:11px;font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,0.04);`;
             restoreBtn.disabled = !options.onBulkRestoreAssets;
             restoreBtn.addEventListener("click", async () => {
                 await handleBulkRestore(trashedSelection.map((asset) => asset.asset_id));
@@ -1326,8 +1414,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const permanentBtn = makeActionButton();
             permanentBtn.textContent = trashedSelection.length === assets.length ? "Delete Permanently" : `Delete ${trashedSelection.length} Permanently`;
-            permanentBtn.style.background = "#4a1c1c";
-            permanentBtn.style.borderColor = "#8a3f3f";
+            permanentBtn.style.cssText = actionButtonCss("danger");
             permanentBtn.disabled = !options.onBulkPermanentDeleteAssets;
             permanentBtn.addEventListener("click", async () => {
                 await handleBulkPermanentDelete(trashedSelection.map((asset) => asset.asset_id));
@@ -1337,8 +1424,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const clearBtn = makeActionButton();
         clearBtn.textContent = "Clear";
-        clearBtn.style.background = "#1d2630";
-        clearBtn.style.borderColor = "#364655";
+        clearBtn.style.cssText = actionButtonCss("subtle");
         clearBtn.addEventListener("click", () => {
             clearSelection();
         });
@@ -1352,7 +1438,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         if (asset.prompt) {
             wrap.appendChild(makeSectionTitle("Prompt"));
-            const promptBox = style(document.createElement("div"), `padding:8px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;color:#d9e0e6;font-size:10px;line-height:1.45;white-space:pre-wrap;`);
+            const promptBox = style(document.createElement("div"), `padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.borderSoft};color:#d9e0e6;font-size:10px;line-height:1.45;white-space:pre-wrap;`);
             promptBox.textContent = asset.prompt;
             wrap.appendChild(promptBox);
         }
@@ -1366,7 +1452,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             wrap.appendChild(grid);
         }
         if (!asset.prompt && !generationEntries.length) {
-            const empty = style(document.createElement("div"), `color:#7f8b96;font-size:10px;font-style:italic;`);
+            const empty = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;font-style:italic;`);
             empty.textContent = "No generation metadata stored for this asset.";
             wrap.appendChild(empty);
         }
@@ -1374,7 +1460,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function renderMediaScrubBar(mediaEl) {
-        const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
+        const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.borderSoft};`);
         const track = style(document.createElement("div"), `position:relative;flex:1 1 auto;height:10px;border-radius:999px;background:#1a2631;cursor:pointer;overflow:hidden;`);
         const fill = style(document.createElement("div"), `position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#6fa7d8,#8fc0f0);`);
         const thumb = style(document.createElement("div"), `position:absolute;top:50%;width:12px;height:12px;border-radius:50%;background:#d9ebfb;border:1px solid rgba(0,0,0,0.35);transform:translate(-50%,-50%);left:100%;pointer-events:none;box-shadow:0 1px 3px rgba(0,0,0,0.35);`);
@@ -1538,6 +1624,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 console.warn("[LTX Editor] Overlay cleanup failed:", error);
             }
         }
+        overlay.togglePlayback = null;
     }
 
     function overlayAssets() {
@@ -1569,11 +1656,16 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.compareRightAssetId = "";
         state.overlayState.showWaveform = false;
         state.overlayState.audioFocus = "none";
+        state.overlayState.togglePlayback = null;
         state.overlayState.overlayEl?.remove();
         state.overlayState.overlayEl = null;
     }
 
-    function attachZoomPan(surface, targets, onTransform = null) {
+    function attachZoomPan(surface, targets, options = {}) {
+        const normalizedOptions = typeof options === "function"
+            ? { onTransform: options }
+            : (options && typeof options === "object" ? options : {});
+        const { onTransform = null, onClick = null } = normalizedOptions;
         const targetList = (Array.isArray(targets) ? targets : [targets]).filter(Boolean);
         let dragging = false;
         let pendingDrag = false;
@@ -1628,18 +1720,21 @@ export function mountSharedAssetGallery(container, options = {}) {
             applyTransform();
         };
 
-        const handleMouseUp = () => {
+        const handleMouseUp = (event) => {
             const dragged = dragging;
             dragging = false;
             pendingDrag = false;
             updateCursor();
             window.removeEventListener("mousemove", handleMouseMove);
             window.removeEventListener("mouseup", handleMouseUp);
-            if (dragged) {
+            if (dragged || (!dragged && onClick)) {
                 suppressClick = true;
                 setTimeout(() => {
                     suppressClick = false;
                 }, 0);
+            }
+            if (!dragged && onClick && (!event?.target || surface.contains(event.target))) {
+                onClick(event);
             }
         };
 
@@ -2052,23 +2147,47 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (asset.asset_type === "video") {
             const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
-            const video = style(document.createElement("video"), `max-width:100%;max-height:100%;display:block;background:#000;user-select:none;`);
+            const video = style(document.createElement("video"), `width:100%;height:100%;object-fit:contain;display:block;background:#000;user-select:none;`);
             video.draggable = false;
             video.preload = "auto";
             video.playsInline = true;
             if (asset.has_thumbnail) video.poster = buildThumbnailUrl(projectDir, asset.asset_id);
             const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), video);
-            video.addEventListener("click", () => {
+            const togglePlayback = () => {
                 if (video.paused) {
                     void video.play();
                 } else {
                     video.pause();
                 }
-            });
+            };
+            state.overlayState.togglePlayback = togglePlayback;
+            const playbackRow = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
+            const playPauseBtn = makeActionButton("subtle");
+            const playbackHint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
+            playbackHint.textContent = "Space = Play / Pause";
+            const syncPlayPauseLabel = () => {
+                playPauseBtn.textContent = video.paused ? "Play" : "Pause";
+            };
+            syncPlayPauseLabel();
+            playPauseBtn.addEventListener("click", togglePlayback);
+            video.addEventListener("play", syncPlayPauseLabel);
+            video.addEventListener("pause", syncPlayPauseLabel);
+            video.addEventListener("ended", syncPlayPauseLabel);
+            playbackRow.append(playPauseBtn, playbackHint);
             const scrub = renderMediaScrubBar(video);
             stage.appendChild(video);
-            content.append(stage, scrub.el);
-            state.overlayState.cleanupFns.push(attachZoomPan(stage, video), scrub.cleanup, blobHandle.cleanup);
+            content.append(stage, playbackRow, scrub.el);
+            state.overlayState.cleanupFns.push(
+                attachZoomPan(stage, video),
+                scrub.cleanup,
+                blobHandle.cleanup,
+                () => {
+                    playPauseBtn.removeEventListener("click", togglePlayback);
+                    video.removeEventListener("play", syncPlayPauseLabel);
+                    video.removeEventListener("pause", syncPlayPauseLabel);
+                    video.removeEventListener("ended", syncPlayPauseLabel);
+                },
+            );
             if (asset.has_audio) {
                 const toggleBtn = makeActionButton();
                 toggleBtn.textContent = state.overlayState.showWaveform ? "Hide Waveform" : "Show Waveform";
@@ -2278,6 +2397,14 @@ export function mountSharedAssetGallery(container, options = {}) {
                         layerB.currentTime = layerA.currentTime || 0;
                     }
                 };
+                const togglePlayback = () => {
+                    if (layerA.paused) {
+                        void layerA.play();
+                    } else {
+                        layerA.pause();
+                    }
+                };
+                state.overlayState.togglePlayback = togglePlayback;
                 const handlePlay = () => {
                     layerB.currentTime = layerA.currentTime || 0;
                     void layerB.play().catch(() => {});
@@ -2290,13 +2417,6 @@ export function mountSharedAssetGallery(container, options = {}) {
                 layerA.addEventListener("pause", handlePause);
                 layerA.addEventListener("seeked", handleSeek);
                 layerA.addEventListener("timeupdate", syncSecondary);
-                stage.addEventListener("click", () => {
-                    if (layerA.paused) {
-                        void layerA.play();
-                    } else {
-                        layerA.pause();
-                    }
-                });
                 state.overlayState.cleanupFns.push(() => {
                     layerA.removeEventListener("play", handlePlay);
                     layerA.removeEventListener("pause", handlePause);
@@ -2308,10 +2428,25 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
 
             center.appendChild(stage);
-            state.overlayState.cleanupFns.push(attachZoomPan(stage, contentGroup, applyDivider));
+            state.overlayState.cleanupFns.push(attachZoomPan(stage, contentGroup, { onTransform: applyDivider }));
 
             if (asset.asset_type === "video") {
                 const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
+                const playPauseBtn = makeActionButton("subtle");
+                const playbackHint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
+                playbackHint.textContent = "Space = Play / Pause";
+                const syncPlayPauseLabel = () => {
+                    playPauseBtn.textContent = layerA.paused ? "Play" : "Pause";
+                };
+                const handlePlayPauseClick = () => {
+                    state.overlayState.togglePlayback?.();
+                };
+                syncPlayPauseLabel();
+                playPauseBtn.addEventListener("click", handlePlayPauseClick);
+                layerA.addEventListener("play", syncPlayPauseLabel);
+                layerA.addEventListener("pause", syncPlayPauseLabel);
+                layerA.addEventListener("ended", syncPlayPauseLabel);
+                controls.append(playPauseBtn, playbackHint);
                 for (const [labelText, value] of [["A", "a"], ["B", "b"], ["None", "none"]]) {
                     const btn = makeActionButton();
                     btn.textContent = labelText;
@@ -2324,7 +2459,15 @@ export function mountSharedAssetGallery(container, options = {}) {
                     controls.appendChild(btn);
                 }
                 const scrub = renderSynchronizedScrubBar([layerA, layerB]);
-                state.overlayState.cleanupFns.push(scrub.cleanup);
+                state.overlayState.cleanupFns.push(
+                    scrub.cleanup,
+                    () => {
+                        playPauseBtn.removeEventListener("click", handlePlayPauseClick);
+                        layerA.removeEventListener("play", syncPlayPauseLabel);
+                        layerA.removeEventListener("pause", syncPlayPauseLabel);
+                        layerA.removeEventListener("ended", syncPlayPauseLabel);
+                    },
+                );
                 center.append(controls, scrub.el);
             }
         }
@@ -2345,7 +2488,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         clearOverlayRuntime();
         let overlayEl = overlay.overlayEl;
         if (!overlayEl) {
-            overlayEl = style(document.createElement("div"), `position:fixed;inset:0;z-index:99999;background:rgba(4,8,12,0.92);display:flex;align-items:stretch;justify-content:center;padding:20px;box-sizing:border-box;`);
+            overlayEl = style(document.createElement("div"), `position:fixed;inset:0;z-index:99999;background:rgba(7,10,14,0.86);display:flex;align-items:stretch;justify-content:center;padding:20px;box-sizing:border-box;`);
             overlayEl.addEventListener("mousedown", (event) => {
                 if (event.target === overlayEl) {
                     closeInspectOverlay();
@@ -2355,34 +2498,56 @@ export function mountSharedAssetGallery(container, options = {}) {
             overlay.overlayEl = overlayEl;
         }
 
-        const keyHandler = (event) => {
+        const keyDownHandler = (event) => {
             if (!overlay.open) return;
             if (event.target?.closest?.("input, textarea, select")) return;
             if (event.key === "Escape") {
-                event.preventDefault();
+                consumeOverlayShortcut(event);
                 closeInspectOverlay();
                 return;
             }
+            if (event.key === " " || event.key === "Spacebar") {
+                consumeOverlayShortcut(event);
+                if (typeof overlay.togglePlayback === "function") {
+                    overlay.togglePlayback();
+                }
+                return;
+            }
             if (event.key === "ArrowLeft") {
-                event.preventDefault();
+                consumeOverlayShortcut(event);
                 cycleOverlayAsset(-1);
                 return;
             }
             if (event.key === "ArrowRight") {
-                event.preventDefault();
+                consumeOverlayShortcut(event);
                 cycleOverlayAsset(1);
+                return;
+            }
+            if (shouldCaptureOverlayShortcut(event)) {
+                consumeOverlayShortcut(event);
             }
         };
-        document.addEventListener("keydown", keyHandler);
-        overlay.cleanupFns.push(() => document.removeEventListener("keydown", keyHandler));
+        const keyUpHandler = (event) => {
+            if (!overlay.open) return;
+            if (event.target?.closest?.("input, textarea, select")) return;
+            if (shouldCaptureOverlayShortcut(event)) {
+                consumeOverlayShortcut(event);
+            }
+        };
+        document.addEventListener("keydown", keyDownHandler, true);
+        document.addEventListener("keyup", keyUpHandler, true);
+        overlay.cleanupFns.push(
+            () => document.removeEventListener("keydown", keyDownHandler, true),
+            () => document.removeEventListener("keyup", keyUpHandler, true),
+        );
 
         overlayEl.innerHTML = "";
-        const shell = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;max-width:min(1600px,100%);width:100%;height:100%;padding:18px;border-radius:16px;background:#091017;border:1px solid rgba(255,255,255,0.08);box-shadow:0 20px 80px rgba(0,0,0,0.45);box-sizing:border-box;`);
+        const shell = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;max-width:min(1600px,100%);width:100%;height:100%;padding:18px;border-radius:16px;background:${CHROME.panelMuted};border:1px solid ${CHROME.borderStrong};box-shadow:0 20px 80px rgba(0,0,0,0.45);box-sizing:border-box;`);
         const toolbar = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;`);
         const titleWrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:2px;min-width:0;`);
         const title = style(document.createElement("div"), `color:#f1f5f8;font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         title.textContent = assetDisplayName(asset);
-        const counter = style(document.createElement("div"), `color:#89a0b3;font-size:11px;`);
+        const counter = style(document.createElement("div"), `color:${CHROME.textDim};font-size:11px;`);
         const assets = overlayAssets();
         const assetIndex = Math.max(0, assets.findIndex((entry) => entry.asset_id === asset.asset_id));
         counter.textContent = `${assetIndex + 1} / ${Math.max(assets.length, 1)}`;
@@ -2390,6 +2555,13 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const toolbarActions = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;`);
         const compareCandidates = sameTypeOverlayAssets(asset);
+        const fitBtn = makeActionButton("subtle");
+        fitBtn.textContent = "Fit";
+        fitBtn.addEventListener("click", () => {
+            resetOverlayTransform();
+            renderInspectOverlay();
+        });
+        toolbarActions.appendChild(fitBtn);
         const compareBtn = makeActionButton();
         compareBtn.textContent = overlay.compareMode ? "Compare Off" : "Compare";
         compareBtn.disabled = compareCandidates.length < 2;
@@ -2403,8 +2575,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const closeBtn = makeActionButton();
         closeBtn.textContent = "Close";
-        closeBtn.style.background = "#1d2630";
-        closeBtn.style.borderColor = "#364655";
+        closeBtn.style.cssText = actionButtonCss("subtle");
         closeBtn.addEventListener("click", () => closeInspectOverlay());
         toolbarActions.appendChild(closeBtn);
 
@@ -2434,16 +2605,15 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const headerRow = style(document.createElement("div"), `display:flex;align-items:flex-start;justify-content:space-between;gap:8px;min-width:0;`);
         const headingWrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:2px;min-width:0;`);
-        const title = style(document.createElement("div"), `color:#ececec;font-size:11px;font-weight:700;`);
+        const title = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;font-weight:700;`);
         title.textContent = "Where Used";
-        const subtitle = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const subtitle = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         subtitle.textContent = assetDisplayName(asset);
         headingWrap.append(title, subtitle);
 
         const backBtn = makeActionButton();
         backBtn.textContent = "Back";
-        backBtn.style.background = "#1d2630";
-        backBtn.style.borderColor = "#364655";
+        backBtn.style.cssText = actionButtonCss("subtle");
         backBtn.addEventListener("click", () => {
             clearUsageView();
             render();
@@ -2451,12 +2621,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         headerRow.append(headingWrap, backBtn);
         detailPane.appendChild(headerRow);
 
-        const pathLine = style(document.createElement("div"), `color:#7f8b96;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const pathLine = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         pathLine.textContent = asset.path || "-";
         detailPane.appendChild(pathLine);
 
         if (state.usageLoading) {
-            const loading = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.45;`);
+            const loading = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;line-height:1.45;`);
             loading.textContent = "Loading usage...";
             detailPane.appendChild(loading);
             queueResize();
@@ -2611,9 +2781,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         destroyLiveMedia();
         detailPane.innerHTML = "";
         if (!asset) {
-            const emptyTitle = style(document.createElement("div"), `color:#ececec;font-size:11px;font-weight:700;`);
+            const emptyTitle = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;font-weight:700;`);
             emptyTitle.textContent = "Asset Details";
-            const emptyText = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.45;`);
+            const emptyText = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;line-height:1.45;`);
             emptyText.textContent = "Select an asset to inspect it. Right-click the gallery background to create folders or import files.";
             detailPane.append(emptyTitle, emptyText);
             queueResize();
@@ -2621,7 +2791,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         const titleRow = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;`);
-        const title = style(document.createElement("div"), `color:#ececec;font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const title = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         title.textContent = assetDisplayName(asset);
         const badges = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;flex:0 0 auto;`);
         const kind = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(143,192,240,0.12);border:1px solid rgba(143,192,240,0.28);color:#9fc8ea;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
@@ -2641,7 +2811,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const pathLine = style(document.createElement("div"), `color:${assetIsMissing(asset) ? "#ffb18c" : "#7f8b96"};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         pathLine.textContent = asset.path || "-";
 
-        const previewSurface = style(document.createElement("div"), `min-height:140px;border-radius:6px;border:1px solid #2f2f2f;background:#111;overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;`);
+        const previewSurface = style(document.createElement("div"), `min-height:140px;border-radius:8px;border:1px solid ${CHROME.border};background:${CHROME.panelMuted};overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;`);
         const previewExtras = [];
         const projectDir = currentProjectDir();
         if (assetIsMissing(asset)) {
@@ -2737,12 +2907,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         } else {
             const form = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
             const nameLabel = makeSectionTitle("Display Name");
-            const nameInput = style(document.createElement("input"), `background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
+            const nameInput = style(document.createElement("input"), inputChromeCss());
             nameInput.value = asset.name || "";
-            const renameHint = style(document.createElement("div"), `color:#7f8b96;font-size:10px;line-height:1.35;`);
+            const renameHint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;line-height:1.35;`);
             renameHint.textContent = "This only changes the display name. The file path and extension on disk stay unchanged.";
             const folderLabel = makeSectionTitle("Folder");
-            const folderInput = style(document.createElement("input"), `background:#171717;border:1px solid #3d3d3d;border-radius:6px;color:#ececec;padding:6px 8px;font-size:11px;`);
+            const folderInput = style(document.createElement("input"), inputChromeCss());
             folderInput.value = normalizeFolderName(asset.folder);
             folderInput.placeholder = "Root";
             folderInput.setAttribute("list", folderListId);
@@ -2763,8 +2933,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const replaceBtn = makeActionButton();
             replaceBtn.textContent = assetIsMissing(asset) ? "Relink" : "Replace File";
-            replaceBtn.style.background = "#1d2630";
-            replaceBtn.style.borderColor = "#5b6c7a";
+            replaceBtn.style.cssText = actionButtonCss("subtle");
             replaceBtn.addEventListener("click", async () => {
                 await beginAssetReplace(asset);
             });
@@ -2772,8 +2941,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const deleteBtn = makeActionButton();
             deleteBtn.textContent = "Move to Trash";
-            deleteBtn.style.background = "#392420";
-            deleteBtn.style.borderColor = "#73443b";
+            deleteBtn.style.cssText = actionButtonCss("danger");
             deleteBtn.addEventListener("click", async () => {
                 await handleAssetDelete(asset);
             });
@@ -3220,7 +3388,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         ];
         for (const [type, label] of tabs) {
             const isActive = state.type === type;
-            const tab = style(document.createElement("button"), `padding:5px 8px;border-radius:6px;border:1px solid ${isActive ? "#6f8ea8" : "#444"};background:${isActive ? "#4a5c6b" : "#232323"};color:${isActive ? "#fff" : "#d2d2d2"};cursor:pointer;font-size:10px;`);
+            const tab = style(document.createElement("button"), `${actionButtonCss(isActive ? "active" : "subtle")} padding:5px 8px;font-size:10px;`);
             tab.textContent = label;
             tab.addEventListener("click", () => {
                 state.type = type;
@@ -3248,7 +3416,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (isFolderCollapsed(folderName)) continue;
 
             if (!inFolder.length) {
-                const emptyFolder = style(document.createElement("div"), `padding:8px 10px;border-radius:6px;border:1px dashed #3b4650;color:#7f8b96;font-size:10px;margin-bottom:2px;`);
+                const emptyFolder = style(document.createElement("div"), `padding:8px 10px;border-radius:6px;border:1px dashed ${CHROME.borderStrong};color:${CHROME.textDim};font-size:10px;margin-bottom:2px;background:rgba(255,255,255,0.02);`);
                 emptyFolder.textContent = folderName ? "Empty folder. Drop files here to import into it." : "No root assets match the current filter.";
                 listScroller.appendChild(emptyFolder);
                 continue;
@@ -3652,5 +3820,10 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     setData(options.initialData || { assets: [], folders: [] });
-    return { root, setData, destroy };
+    return {
+        root,
+        setData,
+        destroy,
+        isInspectOverlayOpen: () => !!state.overlayState.open,
+    };
 }

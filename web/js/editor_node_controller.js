@@ -1,11 +1,72 @@
 const { api } = window.comfyAPI.api;
 
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
-import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 
 function style(el, cssText) {
     el.style.cssText = cssText;
     return el;
+}
+
+const CHROME = {
+    panelMuted: "#10161d",
+    panel: "#151c24",
+    panelRaised: "#1b2430",
+    panelRaisedHover: "#25313f",
+    border: "#34414d",
+    borderSoft: "#28313b",
+    borderStrong: "#587089",
+    text: "#dbe3ea",
+    textDim: "#90a0af",
+    textMuted: "#748291",
+    accent: "#4a82ad",
+    accentSoft: "#263a4d",
+    accentSoftHover: "#314961",
+    accentBorder: "#6686a3",
+    warningSoft: "#45361f",
+    warningBorder: "#9a7a42",
+    warningText: "#efd79f",
+    dangerSoft: "#44292d",
+    dangerBorder: "#8f5f66",
+    dangerText: "#efc0c4",
+};
+
+const BUTTON_STYLES = {
+    muted: {
+        background: CHROME.panelRaised,
+        border: CHROME.border,
+        text: CHROME.textDim,
+    },
+    subtle: {
+        background: CHROME.panel,
+        border: CHROME.border,
+        text: CHROME.textDim,
+    },
+    primary: {
+        background: CHROME.accentSoft,
+        border: CHROME.accentBorder,
+        text: "#f7fbff",
+    },
+    active: {
+        background: CHROME.accent,
+        border: "#7ea8c9",
+        text: "#ffffff",
+    },
+};
+
+function buttonStyle(variant = "muted", { padding = "6px 10px", radius = "6px", fontSize = "11px", fontWeight = "600" } = {}) {
+    const palette = BUTTON_STYLES[variant] || BUTTON_STYLES.muted;
+    return `
+        background: ${palette.background};
+        color: ${palette.text};
+        border: 1px solid ${palette.border};
+        border-radius: ${radius};
+        padding: ${padding};
+        cursor: pointer;
+        font-size: ${fontSize};
+        font-weight: ${fontWeight};
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    `;
 }
 
 function iconForAssetType(type) {
@@ -34,6 +95,222 @@ function formatFrameRange(startFrame, endFrame) {
     return `${start}-${end}`;
 }
 
+function formatClockTime(seconds) {
+    const safeSeconds = Math.max(0, Number(seconds) || 0);
+    const totalSeconds = Math.floor(safeSeconds);
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+}
+
+function renderDormantMediaScrubBar(mediaEl) {
+    const wrap = style(document.createElement("div"), `
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid ${CHROME.borderSoft};
+    `);
+    const track = style(document.createElement("div"), `
+        position: relative;
+        flex: 1 1 auto;
+        height: 10px;
+        border-radius: 999px;
+        background: #1a2631;
+        cursor: pointer;
+        overflow: hidden;
+    `);
+    const fill = style(document.createElement("div"), `
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 0;
+        background: linear-gradient(90deg,#6fa7d8,#8fc0f0);
+    `);
+    const thumb = style(document.createElement("div"), `
+        position: absolute;
+        top: 50%;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #d9ebfb;
+        border: 1px solid rgba(0,0,0,0.35);
+        transform: translate(-50%,-50%);
+        left: 100%;
+        pointer-events: none;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+    `);
+    fill.appendChild(thumb);
+    track.appendChild(fill);
+    const label = style(document.createElement("div"), `
+        color: #a9bccb;
+        font-size: 10px;
+        white-space: nowrap;
+        min-width: 72px;
+        text-align: right;
+    `);
+    wrap.append(track, label);
+
+    let dragging = false;
+
+    const duration = () => {
+        const value = Number(mediaEl?.duration);
+        return Number.isFinite(value) && value > 0 ? value : 0;
+    };
+
+    const updateUI = () => {
+        const total = duration();
+        const current = clamp(Number(mediaEl?.currentTime) || 0, 0, total || Number.MAX_SAFE_INTEGER);
+        const ratio = total > 0 ? current / total : 0;
+        fill.style.width = `${ratio * 100}%`;
+        label.textContent = `${formatClockTime(current)} / ${formatClockTime(total)}`;
+    };
+
+    const seekFromClientX = (clientX) => {
+        const total = duration();
+        if (!total) return;
+        const rect = track.getBoundingClientRect();
+        const ratio = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+        mediaEl.currentTime = ratio * total;
+        updateUI();
+    };
+
+    const handlePointerMove = (event) => {
+        if (!dragging) return;
+        seekFromClientX(event.clientX);
+    };
+
+    const handlePointerUp = (event) => {
+        if (!dragging) return;
+        dragging = false;
+        seekFromClientX(event.clientX);
+        window.removeEventListener("mousemove", handlePointerMove);
+        window.removeEventListener("mouseup", handlePointerUp);
+    };
+
+    track.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        dragging = true;
+        seekFromClientX(event.clientX);
+        window.addEventListener("mousemove", handlePointerMove);
+        window.addEventListener("mouseup", handlePointerUp);
+    });
+
+    const mediaEvents = ["loadedmetadata", "durationchange", "timeupdate", "seeking", "play", "pause", "ended"];
+    for (const eventName of mediaEvents) {
+        mediaEl.addEventListener(eventName, updateUI);
+    }
+    updateUI();
+
+    return {
+        el: wrap,
+        cleanup: () => {
+            dragging = false;
+            window.removeEventListener("mousemove", handlePointerMove);
+            window.removeEventListener("mouseup", handlePointerUp);
+            for (const eventName of mediaEvents) {
+                mediaEl.removeEventListener(eventName, updateUI);
+            }
+        },
+    };
+}
+
+function consumeDormantPointer(event, { preventDefault = false } = {}) {
+    if (!event) return;
+    if (preventDefault) {
+        event.preventDefault();
+    }
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+}
+
+function clearDormantCanvas(canvas) {
+    const ctx = canvas?.getContext?.("2d");
+    if (!ctx || !canvas) return;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, Math.max(1, canvas.width || 1), Math.max(1, canvas.height || 1));
+}
+
+function drawDormantCanvasMessage(canvas, title, subtitle = "") {
+    const ctx = canvas?.getContext?.("2d");
+    if (!ctx || !canvas) return;
+    const width = Math.max(1, canvas.width || 1);
+    const height = Math.max(1, canvas.height || 1);
+    clearDormantCanvas(canvas);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(255,255,255,0.24)";
+    ctx.font = `${Math.max(16, Math.floor(height / 12))}px monospace`;
+    ctx.fillText(title, width / 2, height / 2 - (subtitle ? 12 : 0));
+    if (subtitle) {
+        ctx.fillStyle = "rgba(255,255,255,0.62)";
+        ctx.font = `${Math.max(11, Math.floor(height / 24))}px sans-serif`;
+        ctx.fillText(subtitle, width / 2, height / 2 + 16);
+    }
+}
+
+function loadDormantPreviewImage(cache, src, onReady) {
+    if (!src) return null;
+    const cached = cache.get(src);
+    if (cached?.img) return cached.img;
+    if (cached?.loading) return null;
+    const img = new Image();
+    cache.set(src, { img: null, loading: true });
+    img.onload = () => {
+        cache.set(src, { img, loading: false });
+        onReady?.();
+    };
+    img.onerror = () => {
+        cache.set(src, { img: null, loading: false });
+        onReady?.();
+    };
+    img.src = src;
+    return null;
+}
+
+function drawDormantCanvasMedia(canvas, media, { opacity = 1 } = {}) {
+    const ctx = canvas?.getContext?.("2d");
+    if (!ctx || !canvas || !media) return false;
+    const mediaWidth = Math.max(
+        1,
+        parseInt(media.videoWidth, 10)
+            || parseInt(media.naturalWidth, 10)
+            || parseInt(media.width, 10)
+            || 1
+    );
+    const mediaHeight = Math.max(
+        1,
+        parseInt(media.videoHeight, 10)
+            || parseInt(media.naturalHeight, 10)
+            || parseInt(media.height, 10)
+            || 1
+    );
+    const canvasWidth = Math.max(1, canvas.width || 1);
+    const canvasHeight = Math.max(1, canvas.height || 1);
+    const scale = Math.min(canvasWidth / mediaWidth, canvasHeight / mediaHeight);
+    const drawWidth = Math.max(1, Math.round(mediaWidth * scale));
+    const drawHeight = Math.max(1, Math.round(mediaHeight * scale));
+    const drawX = Math.floor((canvasWidth - drawWidth) / 2);
+    const drawY = Math.floor((canvasHeight - drawHeight) / 2);
+    const prevAlpha = ctx.globalAlpha;
+    if (opacity < 1) ctx.globalAlpha = Math.max(0, opacity);
+    try {
+        ctx.drawImage(media, drawX, drawY, drawWidth, drawHeight);
+    } catch (error) {
+        ctx.globalAlpha = prevAlpha;
+        return false;
+    }
+    ctx.globalAlpha = prevAlpha;
+    return true;
+}
+
 function buildDormantSummaryUrl(state) {
     const projectId = projectIdFromDir(state.projectDir);
     const params = new URLSearchParams();
@@ -53,6 +330,10 @@ function buildQueueUrl(projectDir) {
     return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/queue`);
 }
 
+function buildQueueJobUrl(projectDir, jobId) {
+    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/queue/${jobId}`);
+}
+
 function buildSceneUrl(projectDir, sceneId) {
     return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/scenes/${sceneId}`);
 }
@@ -69,9 +350,14 @@ function isVideoLaneHidden(scene, trackIndex) {
     return !!scene?.video_lane_configs?.[trackIndex || 0]?.hidden;
 }
 
-function pickPreviewTarget(projectDir, summary, scene, assets) {
-    const activeScene = summary?.active_scene;
-    const fallbackFrame = activeScene?.selection?.generation_start_frame || 0;
+function isAudioLaneHidden(scene, laneIndex) {
+    return !!scene?.audio_lane_configs?.[laneIndex || 0]?.hidden;
+}
+
+function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDimensions = {}) {
+    const fallbackFrame = Math.max(0, parseInt(frame, 10) || 0);
+    const frameWidth = Math.max(0, parseInt(scene?.width, 10) || parseInt(fallbackDimensions.width, 10) || 0);
+    const frameHeight = Math.max(0, parseInt(scene?.height, 10) || parseInt(fallbackDimensions.height, 10) || 0);
     const assetsByPath = new Map((assets || []).map(asset => [asset.path, asset]));
     const assetsById = new Map((assets || []).map(asset => [asset.asset_id, asset]));
     const isMissingAsset = (asset) => !asset || !!asset.missing;
@@ -81,7 +367,62 @@ function pickPreviewTarget(projectDir, summary, scene, assets) {
         .filter(clip => !isVideoLaneHidden(scene, clip.track_index || 0))
         .sort((a, b) => (b.track_index || 0) - (a.track_index || 0));
 
-    if (activeClips.length > 0) {
+    let guide = null;
+    let guideFrame = -1;
+    for (const item of (scene?.guide_frames || [])) {
+        const frameIndex = item.frame_index === -1
+            ? Math.max(0, (scene?.duration_frames || 1) - 1)
+            : item.frame_index;
+        if (frameIndex <= fallbackFrame && frameIndex >= guideFrame) {
+            guide = item;
+            guideFrame = frameIndex;
+        }
+    }
+    const guideAsset = guide ? assetsById.get(guide.asset_id) : null;
+    const guidePreview = guideAsset && !isMissingAsset(guideAsset)
+        ? {
+            posterUrl: buildProjectAssetViewURL(projectDir, guideAsset.path),
+        }
+        : null;
+
+    if (activeClips.length > 1) {
+        const layers = activeClips
+            .slice()
+            .reverse()
+            .map((clip) => {
+                const asset = assetsByPath.get(clip.source_path);
+                return {
+                    key: clip.clip_id || `${clip.source_path}:${clip.timeline_start_frame || 0}:${clip.track_index || 0}`,
+                    clip,
+                    sourcePath: clip.source_path,
+                    mediaUrl: !isMissingAsset(asset) ? buildProjectAssetViewURL(projectDir, clip.source_path) : "",
+                    posterUrl: !isMissingAsset(asset) && asset?.has_thumbnail
+                        ? api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
+                        : null,
+                    missing: isMissingAsset(asset),
+                    opacity: Math.max(0, Math.min(1, Number(clip.opacity ?? 1))),
+                };
+            })
+            .filter(layer => !layer.missing || layer.posterUrl);
+        if (layers.length || guidePreview) {
+            return {
+                kind: "composite",
+                label: `Frame ${fallbackFrame}`,
+                subtitle: guidePreview ? `${activeClips.length} layers + guide` : `${activeClips.length} layers`,
+                layers,
+                guide: guidePreview,
+                frameWidth,
+                frameHeight,
+            };
+        }
+        return {
+            kind: "empty",
+            label: `Frame ${fallbackFrame}`,
+            subtitle: "Composite preview unavailable for the current layers.",
+        };
+    }
+
+    if (activeClips.length === 1) {
         const clip = activeClips[0];
         const asset = assetsByPath.get(clip.source_path);
         if (isMissingAsset(asset)) {
@@ -95,39 +436,29 @@ function pickPreviewTarget(projectDir, summary, scene, assets) {
             kind: "video",
             label: `Frame ${fallbackFrame}`,
             subtitle: asset?.name || clip.source_path.split(/[/\\]/).pop() || "Clip",
+            key: clip.clip_id || `${clip.source_path}:${clip.timeline_start_frame || 0}:${clip.track_index || 0}`,
             posterUrl: asset?.has_thumbnail
                 ? api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
                 : null,
             mediaUrl: buildProjectAssetViewURL(projectDir, clip.source_path),
+            clip,
         };
     }
 
-    let guide = null;
-    let guideFrame = -1;
-    for (const item of (scene?.guide_frames || [])) {
-        const frameIndex = item.frame_index === -1
-            ? Math.max(0, (scene?.duration_frames || 1) - 1)
-            : item.frame_index;
-        if (frameIndex <= fallbackFrame && frameIndex >= guideFrame) {
-            guide = item;
-            guideFrame = frameIndex;
-        }
-    }
     if (guide) {
-        const asset = assetsById.get(guide.asset_id);
-        if (isMissingAsset(asset)) {
+        if (isMissingAsset(guideAsset)) {
             return {
                 kind: "missing",
                 label: `Missing Guide ${guideFrame}`,
-                subtitle: asset?.name || asset?.path?.split(/[/\\]/).pop() || "Guide asset entry not found.",
+                subtitle: guideAsset?.name || guideAsset?.path?.split(/[/\\]/).pop() || "Guide asset entry not found.",
             };
         }
-        if (asset) {
+        if (guideAsset) {
             return {
                 kind: "image",
                 label: `Guide ${guideFrame}`,
-                subtitle: asset.name || asset.path.split(/[/\\]/).pop() || "Guide",
-                posterUrl: buildProjectAssetViewURL(projectDir, asset.path),
+                subtitle: guideAsset.name || guideAsset.path.split(/[/\\]/).pop() || "Guide",
+                posterUrl: buildProjectAssetViewURL(projectDir, guideAsset.path),
             };
         }
     }
@@ -137,6 +468,19 @@ function pickPreviewTarget(projectDir, summary, scene, assets) {
         label: "No preview",
         subtitle: "No clip or guide at the current selection.",
     };
+}
+
+function pickPreviewTarget(projectDir, summary, scene, assets) {
+    return pickPreviewTargetForFrame(
+        projectDir,
+        scene,
+        assets,
+        summary?.active_scene?.selection?.generation_start_frame || 0,
+        {
+            width: summary?.active_scene?.effective_width || summary?.active_scene?.width || 0,
+            height: summary?.active_scene?.effective_height || summary?.active_scene?.height || 0,
+        }
+    );
 }
 
 class FullscreenEditorSession {
@@ -209,10 +553,10 @@ class DormantNodeCard {
             flex-direction: column;
             gap: 8px;
             padding: 8px;
-            border: 1px solid #3a3a3a;
-            border-radius: 8px;
-            background: linear-gradient(180deg, #242424 0%, #1b1b1b 100%);
-            color: #ddd;
+            border: 1px solid ${CHROME.border};
+            border-radius: 10px;
+            background: linear-gradient(180deg, ${CHROME.panelRaised} 0%, ${CHROME.panelMuted} 100%);
+            color: ${CHROME.text};
             font-family: 'Segoe UI', Arial, sans-serif;
             font-size: 11px;
             overflow: hidden;
@@ -286,14 +630,14 @@ class DormantNodeCard {
         const projectTitle = style(document.createElement("div"), `
             font-size: 12px;
             font-weight: 700;
-            color: #f0f0f0;
+            color: #f0f4f8;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
         `);
         projectTitle.textContent = summary?.name || state.projectName || "LTX Editor";
         const sceneTitle = style(document.createElement("div"), `
-            color: #8ba0b3;
+            color: ${CHROME.textDim};
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -305,15 +649,16 @@ class DormantNodeCard {
 
         this._badgeRowEl.innerHTML = "";
         const badges = [];
-        if (state.isFullscreenOpen) badges.push({ text: "Editor Active", color: "#284f7a" });
-        if ((queueCounts.running || 0) > 0) badges.push({ text: `${queueCounts.running} Running`, color: "#2f5c90" });
-        if ((queueCounts.pending || 0) > 0) badges.push({ text: `${queueCounts.pending} Pending`, color: "#5b4d2c" });
-        if (!badges.length && summary) badges.push({ text: "Idle", color: "#36453b" });
+        if (state.isFullscreenOpen) badges.push({ text: "Editor Active", color: CHROME.accentSoft, border: CHROME.accentBorder });
+        if ((queueCounts.running || 0) > 0) badges.push({ text: `${queueCounts.running} Running`, color: "#264863", border: "#5d8db5" });
+        if ((queueCounts.pending || 0) > 0) badges.push({ text: `${queueCounts.pending} Pending`, color: CHROME.warningSoft, border: CHROME.warningBorder });
+        if (!badges.length && summary) badges.push({ text: "Idle", color: "#223128", border: "#4d6a58" });
         for (const badge of badges) {
             const pill = style(document.createElement("span"), `
                 padding: 2px 8px;
                 border-radius: 999px;
                 background: ${badge.color};
+                border: 1px solid ${badge.border};
                 color: #f5f5f5;
                 font-size: 10px;
                 font-weight: 600;
@@ -334,16 +679,17 @@ class DormantNodeCard {
                 padding: 6px 8px;
                 border-radius: 6px;
                 background: rgba(255,255,255,0.04);
+                border: 1px solid ${CHROME.borderSoft};
                 min-width: 0;
             `);
             const keyEl = style(document.createElement("div"), `
-                color: #7f8b96;
+                color: ${CHROME.textDim};
                 font-size: 10px;
                 margin-bottom: 2px;
             `);
             keyEl.textContent = label;
             const valueEl = style(document.createElement("div"), `
-                color: #ececec;
+                color: ${CHROME.text};
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
@@ -366,6 +712,7 @@ class DormantNodeCard {
                 padding: 3px 7px;
                 border-radius: 5px;
                 background: rgba(255,255,255,0.05);
+                border: 1px solid ${CHROME.borderSoft};
                 color: #c9d0d6;
             `);
             chip.textContent = text;
@@ -374,14 +721,8 @@ class DormantNodeCard {
 
         this._actionRowEl.innerHTML = "";
         const openBtn = style(document.createElement("button"), `
-            background: ${state.isFullscreenOpen ? "#37414a" : "#3a7ca5"};
-            color: #fff;
-            border: none;
-            border-radius: 6px;
-            padding: 6px 10px;
+            ${buttonStyle(state.isFullscreenOpen ? "subtle" : "primary")}
             cursor: ${state.projectDir && !state.isFullscreenOpen ? "pointer" : "default"};
-            font-size: 11px;
-            font-weight: 600;
         `);
         openBtn.textContent = state.isFullscreenOpen ? "Editor Active" : "Open Editor";
         openBtn.disabled = !state.projectDir || state.isFullscreenOpen;
@@ -391,13 +732,8 @@ class DormantNodeCard {
         for (const moduleId of ["assets", "preview", "queue"]) {
             const isExpanded = state.expandedModuleId === moduleId;
             const btn = style(document.createElement("button"), `
-                background: ${isExpanded ? "#4a5c6b" : "#2b2b2b"};
-                color: ${isExpanded ? "#fff" : "#d2d2d2"};
-                border: 1px solid ${isExpanded ? "#6f8ea8" : "#444"};
-                border-radius: 6px;
-                padding: 6px 10px;
+                ${buttonStyle(isExpanded ? "active" : "muted")}
                 cursor: ${state.projectDir ? "pointer" : "default"};
-                font-size: 11px;
             `);
             btn.textContent = moduleId.charAt(0).toUpperCase() + moduleId.slice(1);
             btn.disabled = !state.projectDir;
@@ -415,7 +751,7 @@ class DormantNodeCard {
             flex-direction: column;
             flex: 1 1 auto;
             min-height: 0;
-            border-top: 1px solid #333;
+            border-top: 1px solid ${CHROME.border};
             padding-top: 8px;
             box-sizing: border-box;
             overflow: hidden;
@@ -435,7 +771,7 @@ class DormantNodeCard {
         const moduleId = this.controller.state.expandedModuleId;
         if (!moduleId || this._moduleContainerEl.style.display === "none") return;
         this._applyModuleContainerSizing(moduleId);
-        if (moduleId !== "assets") {
+        if (moduleId !== "assets" && moduleId !== "preview") {
             this._moduleContainerEl.style.height = "";
             this._moduleContainerEl.style.maxHeight = "";
             return;
@@ -489,7 +825,8 @@ class DormantNodeCard {
                 padding: 10px;
                 border-radius: 6px;
                 background: rgba(255,255,255,0.04);
-                color: #9aa6b2;
+                border: 1px solid ${CHROME.borderSoft};
+                color: ${CHROME.textDim};
             `);
             loadingEl.textContent = "Loading…";
             this._moduleContainerEl.appendChild(loadingEl);
@@ -497,8 +834,9 @@ class DormantNodeCard {
             const errorEl = style(document.createElement("div"), `
                 padding: 10px;
                 border-radius: 6px;
-                background: rgba(120,30,30,0.3);
-                color: #ffc9c9;
+                background: ${CHROME.dangerSoft};
+                border: 1px solid ${CHROME.dangerBorder};
+                color: ${CHROME.dangerText};
             `);
             errorEl.textContent = error;
             this._moduleContainerEl.appendChild(errorEl);
@@ -559,6 +897,7 @@ export class EditorNodeController {
         this._moduleLoadAborters = {};
         this._summaryAborter = null;
         this.fullscreenSession = null;
+        this._preFullscreenModuleId = "";
         this.modules = this._buildModules();
         this.card = new DormantNodeCard(this);
         this.root = this.card.getElement();
@@ -566,6 +905,8 @@ export class EditorNodeController {
         this._resizeScheduled = false;
         this._programmaticResize = false;
         this._destroyed = false;
+        this._queueSaveCompletionCounter = 0;
+        this._lastQueueSettledSaveCompletionCounter = 0;
     }
 
     destroy() {
@@ -627,6 +968,7 @@ export class EditorNodeController {
         requestAnimationFrame(() => {
             this._resizeScheduled = false;
             if (this._destroyed) return;
+            if (this.state.isFullscreenOpen) return;
             if (this.root.style.display === "none") return;
             const currentWidth = Math.max(240, this.node.size?.[0] || 0);
             const currentHeight = Math.max(0, this.node.size?.[1] || 0);
@@ -718,6 +1060,8 @@ export class EditorNodeController {
                 this.fullscreenSession = null;
                 session.destroy();
             }
+            this._queueSaveCompletionCounter = 0;
+            this._lastQueueSettledSaveCompletionCounter = 0;
             this.state.projectDir = "";
             this.state.dormantSummary = null;
             this._invalidateModules(["project", "assets", "scene", "queue"]);
@@ -732,6 +1076,8 @@ export class EditorNodeController {
                 this.fullscreenSession = null;
                 session.destroy();
             }
+            this._queueSaveCompletionCounter = 0;
+            this._lastQueueSettledSaveCompletionCounter = 0;
             this.state.projectDir = projectDir;
             this.state.dormantSummary = null;
             this._invalidateModules(["project", "assets", "scene", "queue"]);
@@ -862,6 +1208,10 @@ export class EditorNodeController {
         if (this._destroyed || !this.state.projectDir || this.fullscreenSession || this.state.isFullscreenOpen) return;
 
         this.syncStateFromWidgets();
+        this._preFullscreenModuleId = this.state.expandedModuleId || "";
+        if (this.state.expandedModuleId) {
+            this.collapseModule();
+        }
         this.state.isFullscreenOpen = true;
         this.render();
 
@@ -871,8 +1221,21 @@ export class EditorNodeController {
             session.mount();
         } catch (e) {
             console.warn("[LTX Editor] Failed to open fullscreen editor:", e);
+            if (this.fullscreenSession) {
+                const failedSession = this.fullscreenSession;
+                this.fullscreenSession = null;
+                try {
+                    failedSession.destroy();
+                } catch (cleanupErr) {
+                    console.warn("[LTX Editor] Failed to clean up fullscreen session after mount error:", cleanupErr);
+                }
+            }
             this.fullscreenSession = null;
             this.state.isFullscreenOpen = false;
+            if (this._preFullscreenModuleId && this.modules[this._preFullscreenModuleId]) {
+                this.expandModule(this._preFullscreenModuleId);
+                this._preFullscreenModuleId = "";
+            }
             this.render();
         }
     }
@@ -886,7 +1249,13 @@ export class EditorNodeController {
         this.state.isFullscreenOpen = false;
         this.syncStateFromWidgets();
         this._invalidateModules(["scene", "assets", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["scene", "assets", "queue"]);
+        const restoreModuleId = this._preFullscreenModuleId;
+        this._preFullscreenModuleId = "";
+        if (restoreModuleId && this.modules[restoreModuleId]) {
+            this.expandModule(restoreModuleId);
+        } else {
+            this._reloadExpandedModuleIfNeeded(["scene", "assets", "queue"]);
+        }
         this.refreshSummary().finally(() => this.render());
     }
 
@@ -901,10 +1270,60 @@ export class EditorNodeController {
 
     handleSaveVideoExecuted() {
         if (this._destroyed || !this.state.projectDir) return;
-        this._invalidateModules(["assets", "scene"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene"]);
+        this._queueSaveCompletionCounter += 1;
+        this.syncStateFromWidgets();
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
         this.refreshSummary({ syncAssets: true }).finally(() => this.render());
-        this.fullscreenSession?.refresh(["assets", "scenes"]);
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+    }
+
+    async handleQueueExecutionSettled({ allowRollback = false } = {}) {
+        if (this._destroyed || !this.state.projectDir) {
+            return this.state.dormantSummary?.queue_counts || {};
+        }
+        this.syncStateFromWidgets();
+        this._invalidateModules(["queue"]);
+        this._reloadExpandedModuleIfNeeded(["queue"]);
+        await this.refreshSummary();
+        let counts = this.state.dormantSummary?.queue_counts || {};
+        const sawSaveCompletion = this._queueSaveCompletionCounter > this._lastQueueSettledSaveCompletionCounter;
+        if (allowRollback && (counts.running || 0) > 0 && !sawSaveCompletion) {
+            const rolledBack = await this._rollbackStaleRunningQueueJobs();
+            if (rolledBack) {
+                this._invalidateModules(["queue"]);
+                this._reloadExpandedModuleIfNeeded(["queue"]);
+                await this.refreshSummary();
+                counts = this.state.dormantSummary?.queue_counts || {};
+            }
+        }
+        this._lastQueueSettledSaveCompletionCounter = this._queueSaveCompletionCounter;
+        this.fullscreenSession?.refresh(["queue"]);
+        this.render();
+        return counts;
+    }
+
+    async _rollbackStaleRunningQueueJobs() {
+        const queue = await this._loadQueueModule();
+        const runningJobs = queue.filter((job) => (job?.status || "").toLowerCase() === "running" && job?.job_id);
+        if (!runningJobs.length) return false;
+        await Promise.all(runningJobs.map(async (job) => {
+            const response = await fetch(buildQueueJobUrl(this.state.projectDir, job.job_id), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    status: "pending",
+                    progress: 0.0,
+                    error: "",
+                    completed_at: "",
+                    result_asset_id: "",
+                }),
+            });
+            if (!response.ok) {
+                throw new Error(`Failed to reconcile queue job ${job.job_id}: ${response.status}`);
+            }
+        }));
+        return true;
     }
 
     async importFiles(files, folder = "") {
@@ -1234,7 +1653,7 @@ export class EditorNodeController {
         if (!sceneId) {
             return {
                 kind: "empty",
-                label: "No scene",
+                label: "Viewport Preview",
                 subtitle: "Open the editor to choose a scene.",
             };
         }
@@ -1251,7 +1670,47 @@ export class EditorNodeController {
             assetsPromise,
         ]);
 
-        return pickPreviewTarget(this.state.projectDir, summary, scene, assets);
+        const durationFrames = Math.max(
+            0,
+            parseInt(scene?.duration_frames, 10)
+                || parseInt(summary?.active_scene?.duration_frames, 10)
+                || 0
+        );
+        const initialFrame = clamp(
+            parseInt(this.state.selectionStart, 10)
+                || parseInt(summary?.active_scene?.selection?.generation_start_frame, 10)
+                || 0,
+            0,
+            durationFrames
+        );
+        return {
+            kind: "viewport",
+            label: "Viewport Preview",
+            subtitle: summary?.active_scene?.name || "Scene",
+            scene,
+            assets,
+            fps: Math.max(
+                1,
+                Number(scene?.fps)
+                    || Number(summary?.active_scene?.effective_fps)
+                    || Number(summary?.fps)
+                    || 24
+            ),
+            initialFrame,
+            durationFrames,
+            frameWidth: Math.max(
+                1,
+                parseInt(scene?.width, 10)
+                    || parseInt(summary?.active_scene?.effective_width, 10)
+                    || 768
+            ),
+            frameHeight: Math.max(
+                1,
+                parseInt(scene?.height, 10)
+                    || parseInt(summary?.active_scene?.effective_height, 10)
+                    || 512
+            ),
+        };
     }
 
     _mountAssetsModule(container, data) {
@@ -1295,10 +1754,20 @@ export class EditorNodeController {
     }
 
     _mountPreviewModule(container, data) {
+        const previousOverflowX = container.style.overflowX;
+        const previousOverflowY = container.style.overflowY;
+        container.style.overflowX = "hidden";
+        container.style.overflowY = "hidden";
+
         const wrap = style(document.createElement("div"), `
             display: flex;
             flex-direction: column;
             gap: 8px;
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding-right: 2px;
         `);
         container.appendChild(wrap);
 
@@ -1306,26 +1775,29 @@ export class EditorNodeController {
             display: flex;
             flex-direction: column;
             gap: 2px;
+            flex: 0 0 auto;
         `);
         const title = style(document.createElement("div"), `
-            color: #ececec;
+            color: ${CHROME.text};
             font-size: 11px;
             font-weight: 600;
         `);
         title.textContent = data.label || "Preview";
         const subtitle = style(document.createElement("div"), `
-            color: #8ea0af;
+            color: ${CHROME.textDim};
             font-size: 10px;
+            word-break: break-word;
         `);
         subtitle.textContent = data.subtitle || "";
         header.append(title, subtitle);
         wrap.appendChild(header);
 
         const surface = style(document.createElement("div"), `
-            min-height: 110px;
+            flex: 1 1 110px;
+            min-height: 96px;
             border-radius: 6px;
-            border: 1px solid #373737;
-            background: #111;
+            border: 1px solid ${CHROME.border};
+            background: ${CHROME.panelMuted};
             overflow: hidden;
             display: flex;
             align-items: center;
@@ -1334,93 +1806,721 @@ export class EditorNodeController {
         `);
         wrap.appendChild(surface);
 
-        let liveVideo = null;
-
-        const destroyVideo = () => {
-            if (!liveVideo) return;
-            liveVideo.pause();
-            liveVideo.removeAttribute("src");
-            liveVideo.load();
-            liveVideo.remove();
-            liveVideo = null;
-        };
-
-        if (data.kind === "empty" || data.kind === "missing") {
+        if (data.kind === "empty") {
             const emptyEl = style(document.createElement("div"), `
-                color: ${data.kind === "missing" ? "#ffb18c" : "#8ea0af"};
+                color: ${CHROME.textDim};
                 font-size: 10px;
                 padding: 14px;
                 text-align: center;
             `);
-            emptyEl.textContent = data.kind === "missing"
-                ? `Missing asset: ${data.subtitle || "Select a replacement from the gallery."}`
-                : (data.subtitle || "No preview available.");
+            emptyEl.textContent = data.subtitle || "No preview available.";
             surface.appendChild(emptyEl);
-        } else if (data.kind === "image") {
-            const img = style(document.createElement("img"), `
-                width: 100%;
-                height: 100%;
-                max-height: 180px;
-                object-fit: cover;
-                display: block;
-            `);
-            img.src = data.posterUrl;
-            img.alt = data.subtitle || "Preview";
-            surface.appendChild(img);
-        } else if (data.kind === "video") {
-            if (data.posterUrl) {
-                const poster = style(document.createElement("img"), `
-                    width: 100%;
-                    height: 100%;
-                    max-height: 180px;
-                    object-fit: cover;
-                    display: block;
-                `);
-                poster.src = data.posterUrl;
-                poster.alt = data.subtitle || "Preview";
-                surface.appendChild(poster);
-            } else {
-                const placeholder = style(document.createElement("div"), `
-                    color: #8ea0af;
-                    font-size: 10px;
-                `);
-                placeholder.textContent = "Preview is available on demand.";
-                surface.appendChild(placeholder);
-            }
-
-            const loadBtn = style(document.createElement("button"), `
-                position: absolute;
-                bottom: 8px;
-                right: 8px;
-                padding: 5px 8px;
-                border-radius: 6px;
-                border: 1px solid #5f7d97;
-                background: rgba(32,48,62,0.92);
-                color: #fff;
-                cursor: pointer;
-                font-size: 10px;
-                font-weight: 600;
-            `);
-            loadBtn.textContent = "Load Preview";
-            loadBtn.addEventListener("click", () => {
-                if (liveVideo) return;
-                surface.innerHTML = "";
-                liveVideo = style(document.createElement("video"), `
-                    width: 100%;
-                    max-height: 180px;
-                    display: block;
-                    background: #000;
-                `);
-                liveVideo.controls = true;
-                liveVideo.preload = "metadata";
-                liveVideo.src = data.mediaUrl;
-                surface.appendChild(liveVideo);
-            });
-            surface.appendChild(loadBtn);
+            return () => {
+                container.style.overflowX = previousOverflowX;
+                container.style.overflowY = previousOverflowY;
+            };
         }
 
+        const stage = style(document.createElement("div"), `
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px;
+            box-sizing: border-box;
+            position: relative;
+            overflow: hidden;
+        `);
+        const canvas = style(document.createElement("canvas"), `
+            display: block;
+            background: #000;
+            border-radius: 6px;
+            box-shadow: 0 10px 22px rgba(0,0,0,0.28);
+        `);
+        stage.appendChild(canvas);
+        surface.appendChild(stage);
+
+        const transport = style(document.createElement("div"), `
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            flex: 0 0 auto;
+        `);
+        wrap.appendChild(transport);
+
+        const buttonRow = style(document.createElement("div"), `
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        `);
+        transport.appendChild(buttonRow);
+
+        const playBtn = style(document.createElement("button"), buttonStyle("subtle", {
+            padding: "5px 10px",
+            fontSize: "10px",
+        }));
+        playBtn.type = "button";
+        playBtn.style.minWidth = "48px";
+
+        const audioBtn = style(document.createElement("button"), buttonStyle("muted", {
+            padding: "5px 10px",
+            fontSize: "10px",
+        }));
+        audioBtn.type = "button";
+        audioBtn.style.minWidth = "64px";
+
+        const modeLabel = style(document.createElement("span"), `
+            color: ${CHROME.textDim};
+            font-size: 10px;
+            margin-left: auto;
+            white-space: nowrap;
+        `);
+        buttonRow.append(playBtn, audioBtn, modeLabel);
+
+        const scrubRow = style(document.createElement("div"), `
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        `);
+        const scrubber = document.createElement("input");
+        scrubber.type = "range";
+        scrubber.min = "0";
+        scrubber.step = "1";
+        scrubber.style.cssText = `
+            flex: 1 1 140px;
+            min-width: 120px;
+            accent-color: #6fa7d8;
+        `;
+        const frameLabel = style(document.createElement("div"), `
+            color: #a9bccb;
+            font-size: 10px;
+            min-width: 92px;
+            text-align: right;
+            white-space: nowrap;
+            font-family: monospace;
+            margin-left: auto;
+        `);
+        scrubRow.append(scrubber, frameLabel);
+        transport.appendChild(scrubRow);
+
+        const projectDir = this.state.projectDir;
+        const assetsByPath = new Map((data.assets || []).map((asset) => [asset.path, asset]));
+        const effectiveFps = Math.max(1, Number(data.fps) || 24);
+        const totalFrames = Math.max(0, parseInt(data.durationFrames, 10) || 0);
+        const lastRenderableFrame = Math.max(0, totalFrames - 1);
+        const hasSceneAudio = (data.scene?.audio_tracks || []).some((track) => {
+            if (track?.muted) return false;
+            if (isAudioLaneHidden(data.scene, track.lane_index || 0)) return false;
+            return !assetsByPath.get(track.source_path)?.missing;
+        });
+
+        let currentFrame = clamp(parseInt(data.initialFrame, 10) || 0, 0, totalFrames);
+        let destroyed = false;
+        let isPlaying = false;
+        let audioEnabled = hasSceneAudio;
+        let playbackRaf = 0;
+        let renderRaf = 0;
+        let pendingRenderForceSeek = false;
+        let playbackStartTs = 0;
+        let playbackStartFrame = currentFrame;
+        let currentTarget = null;
+        let activeVideoKeys = new Set();
+        let activeAudioKeys = new Set();
+        const previewImageCache = new Map();
+        const videoEntries = new Map();
+        const audioEntries = new Map();
+
+        const clipPlaybackKey = (clip) => clip?.clip_id || `${clip?.source_path || ""}:${clip?.timeline_start_frame || 0}:${clip?.track_index || 0}`;
+        const audioPlaybackKey = (track) => track?.track_id || `${track?.source_path || ""}:${track?.timeline_start_frame || 0}:${track?.lane_index || 0}`;
+        const renderFrameIndex = () => (totalFrames > 0 ? clamp(currentFrame, 0, lastRenderableFrame) : 0);
+        const getTargetForFrame = (frame) => pickPreviewTargetForFrame(
+            projectDir,
+            data.scene,
+            data.assets,
+            frame,
+            {
+                width: data.frameWidth,
+                height: data.frameHeight,
+            }
+        );
+        const getTargetForCurrentFrame = () => getTargetForFrame(renderFrameIndex());
+
+        const consumePointerOnly = (event) => consumeDormantPointer(event);
+        stage.addEventListener("pointerdown", consumePointerOnly);
+        stage.addEventListener("mousedown", consumePointerOnly);
+        playBtn.addEventListener("pointerdown", consumePointerOnly);
+        playBtn.addEventListener("mousedown", consumePointerOnly);
+        audioBtn.addEventListener("pointerdown", consumePointerOnly);
+        audioBtn.addEventListener("mousedown", consumePointerOnly);
+        scrubber.addEventListener("pointerdown", consumePointerOnly);
+        scrubber.addEventListener("mousedown", consumePointerOnly);
+
+        function getTargetLayers(target) {
+            if (!target) return [];
+            if (target.kind === "video") {
+                return [{
+                    key: target.key || clipPlaybackKey(target.clip),
+                    clip: target.clip,
+                    sourcePath: target.clip?.source_path || "",
+                    mediaUrl: target.mediaUrl || buildProjectAssetViewURL(projectDir, target.clip?.source_path || ""),
+                    posterUrl: target.posterUrl || null,
+                    opacity: Math.max(0, Math.min(1, Number(target.clip?.opacity ?? 1))),
+                    missing: false,
+                }];
+            }
+            if (target.kind === "composite") {
+                return (target.layers || []).filter(layer => layer?.clip);
+            }
+            return [];
+        }
+
+        function getAudioTracksAtFrame(frame) {
+            return (data.scene?.audio_tracks || [])
+                .filter(track => frame >= track.timeline_start_frame && frame < track.timeline_end_frame)
+                .filter(track => !track.muted)
+                .filter(track => !isAudioLaneHidden(data.scene, track.lane_index || 0))
+                .filter(track => !assetsByPath.get(track.source_path)?.missing)
+                .sort((a, b) => (a.lane_index || 0) - (b.lane_index || 0));
+        }
+
+        function clampMediaTime(mediaEl, seconds) {
+            const raw = Math.max(0, Number(seconds) || 0);
+            const duration = Number(mediaEl?.duration);
+            if (Number.isFinite(duration) && duration > 0) {
+                return clamp(raw, 0, duration);
+            }
+            return raw;
+        }
+
+        function sourceTimeForClip(clip, frame) {
+            const sourceFrame = Math.max(
+                0,
+                frame - (parseInt(clip?.timeline_start_frame, 10) || 0) + (parseInt(clip?.source_in_frame, 10) || 0)
+            );
+            return sourceFrame / effectiveFps;
+        }
+
+        function sourceTimeForAudio(track, frame) {
+            const sourceFrame = Math.max(
+                0,
+                frame - (parseInt(track?.timeline_start_frame, 10) || 0) + (parseInt(track?.source_in_frame, 10) || 0)
+            );
+            return sourceFrame / effectiveFps;
+        }
+
+        function ensureVideoEntry(layer) {
+            const key = layer?.key || clipPlaybackKey(layer?.clip);
+            if (!key || !layer?.sourcePath) return null;
+            const existing = videoEntries.get(key);
+            if (existing) {
+                existing.layer = layer;
+                return existing;
+            }
+
+            const video = document.createElement("video");
+            video.preload = "auto";
+            video.muted = true;
+            video.playsInline = true;
+
+            const entry = {
+                key,
+                layer,
+                el: video,
+                pendingTime: 0,
+                cleanupHandle: null,
+                listeners: [],
+                cleanup: null,
+            };
+
+            const onReady = () => {
+                if (destroyed) return;
+                if (isPlaying && activeVideoKeys.has(key)) {
+                    const desiredTime = clampMediaTime(
+                        video,
+                        entry.pendingTime || sourceTimeForClip(entry.layer?.clip, renderFrameIndex())
+                    );
+                    try {
+                        if (Math.abs((video.currentTime || 0) - desiredTime) > 0.04) {
+                            video.currentTime = desiredTime;
+                        }
+                    } catch (error) {}
+                    video.muted = true;
+                    video.play().catch(() => {});
+                }
+                scheduleRender();
+            };
+
+            for (const eventName of ["loadedmetadata", "loadeddata", "canplay", "seeked", "error"]) {
+                video.addEventListener(eventName, onReady);
+                entry.listeners.push([eventName, onReady]);
+            }
+
+            entry.cleanupHandle = loadMediaAsBlob(
+                layer.mediaUrl || buildProjectAssetViewURL(projectDir, layer.sourcePath),
+                video
+            );
+            entry.cleanup = () => {
+                video.pause();
+                entry.cleanupHandle?.cleanup?.();
+                for (const [eventName, listener] of entry.listeners) {
+                    video.removeEventListener(eventName, listener);
+                }
+                video.removeAttribute("src");
+                try {
+                    video.load();
+                } catch (error) {}
+            };
+
+            videoEntries.set(key, entry);
+            return entry;
+        }
+
+        function ensureAudioEntry(track) {
+            const key = audioPlaybackKey(track);
+            if (!key || !track?.source_path) return null;
+            const existing = audioEntries.get(key);
+            if (existing) {
+                existing.track = track;
+                return existing;
+            }
+
+            const audio = document.createElement("audio");
+            audio.preload = "auto";
+
+            const entry = {
+                key,
+                track,
+                el: audio,
+                pendingTime: 0,
+                cleanupHandle: null,
+                listeners: [],
+                cleanup: null,
+            };
+
+            const onReady = () => {
+                if (destroyed || !isPlaying || !audioEnabled || !activeAudioKeys.has(key)) return;
+                const desiredTime = clampMediaTime(
+                    audio,
+                    entry.pendingTime || sourceTimeForAudio(entry.track, renderFrameIndex())
+                );
+                try {
+                    if (Math.abs((audio.currentTime || 0) - desiredTime) > 0.04) {
+                        audio.currentTime = desiredTime;
+                    }
+                } catch (error) {}
+                audio.volume = clamp(Number(entry.track?.volume ?? 1), 0, 1);
+                audio.play().catch(() => {});
+            };
+
+            for (const eventName of ["loadedmetadata", "loadeddata", "canplay", "error"]) {
+                audio.addEventListener(eventName, onReady);
+                entry.listeners.push([eventName, onReady]);
+            }
+
+            entry.cleanupHandle = loadMediaAsBlob(
+                buildProjectAssetViewURL(projectDir, track.source_path),
+                audio
+            );
+            entry.cleanup = () => {
+                audio.pause();
+                entry.cleanupHandle?.cleanup?.();
+                for (const [eventName, listener] of entry.listeners) {
+                    audio.removeEventListener(eventName, listener);
+                }
+                audio.removeAttribute("src");
+                try {
+                    audio.load();
+                } catch (error) {}
+            };
+
+            audioEntries.set(key, entry);
+            return entry;
+        }
+
+        function pauseAllVideos() {
+            for (const entry of videoEntries.values()) {
+                entry.el.pause();
+            }
+            activeVideoKeys = new Set();
+        }
+
+        function pauseAllAudios() {
+            for (const entry of audioEntries.values()) {
+                entry.el.pause();
+            }
+            activeAudioKeys = new Set();
+        }
+
+        function cleanupAllMedia() {
+            pauseAllVideos();
+            pauseAllAudios();
+            for (const entry of videoEntries.values()) {
+                entry.cleanup?.();
+            }
+            for (const entry of audioEntries.values()) {
+                entry.cleanup?.();
+            }
+            videoEntries.clear();
+            audioEntries.clear();
+        }
+
+        function drawGuideBackground(target) {
+            if (!target?.guide?.posterUrl) return false;
+            const guideImage = loadDormantPreviewImage(previewImageCache, target.guide.posterUrl, () => scheduleRender());
+            return !!guideImage && drawDormantCanvasMedia(canvas, guideImage);
+        }
+
+        function drawLayerPoster(layer) {
+            if (!layer?.posterUrl) return false;
+            const poster = loadDormantPreviewImage(previewImageCache, layer.posterUrl, () => scheduleRender());
+            return !!poster && drawDormantCanvasMedia(canvas, poster, { opacity: layer.opacity ?? 1 });
+        }
+
+        function updateTransport() {
+            scrubber.max = String(totalFrames);
+            scrubber.value = String(currentFrame);
+            frameLabel.textContent = `f${currentFrame} / ${totalFrames}`;
+            playBtn.textContent = isPlaying ? "Pause" : "Play";
+            playBtn.disabled = totalFrames <= 0;
+            audioBtn.textContent = hasSceneAudio ? (audioEnabled ? "Audio On" : "Muted") : "No audio";
+            audioBtn.disabled = !hasSceneAudio;
+            const targetKind = currentTarget?.kind || data.kind;
+            if (targetKind === "video") {
+                modeLabel.textContent = isPlaying ? "Playback" : "Video frame";
+            } else if (targetKind === "composite") {
+                modeLabel.textContent = isPlaying ? "Composite playback" : "Composite preview";
+            } else if (targetKind === "image") {
+                modeLabel.textContent = "Guide preview";
+            } else if (targetKind === "missing") {
+                modeLabel.textContent = "Missing media";
+            } else {
+                modeLabel.textContent = "No preview";
+            }
+            const targetSubtitle = currentTarget?.subtitle ? ` - ${currentTarget.subtitle}` : ` - Frame ${renderFrameIndex()}`;
+            subtitle.textContent = `${data.subtitle || "Scene"}${targetSubtitle}`;
+        }
+
+        function resizeCanvas() {
+            const rect = surface.getBoundingClientRect();
+            const availableWidth = Math.max(1, Math.floor(rect.width - 16));
+            const availableHeight = Math.max(1, Math.floor(rect.height - 16));
+            if (availableWidth <= 0 || availableHeight <= 0) return;
+            const aspect = data.frameWidth / Math.max(1, data.frameHeight);
+            let canvasWidth = availableWidth;
+            let canvasHeight = Math.floor(canvasWidth / Math.max(aspect, 0.01));
+            if (canvasHeight > availableHeight) {
+                canvasHeight = availableHeight;
+                canvasWidth = Math.floor(canvasHeight * aspect);
+            }
+            canvas.width = Math.max(1, canvasWidth);
+            canvas.height = Math.max(1, canvasHeight);
+            canvas.style.width = `${canvasWidth}px`;
+            canvas.style.height = `${canvasHeight}px`;
+        }
+
+        function scheduleRender({ forceSeek = false } = {}) {
+            if (destroyed) return;
+            pendingRenderForceSeek = pendingRenderForceSeek || !!forceSeek;
+            if (renderRaf) return;
+            renderRaf = requestAnimationFrame(() => {
+                renderRaf = 0;
+                const shouldForceSeek = pendingRenderForceSeek;
+                pendingRenderForceSeek = false;
+                renderPreviewFrame({ forceSeek: shouldForceSeek });
+            });
+        }
+
+        function renderStaticTarget(target) {
+            clearDormantCanvas(canvas);
+            if (target.kind === "missing") {
+                drawDormantCanvasMessage(canvas, target.label || "Missing media", target.subtitle || "");
+                return;
+            }
+            if (target.kind === "empty") {
+                drawDormantCanvasMessage(canvas, target.label || "No preview", target.subtitle || "");
+                return;
+            }
+            if (target.kind === "image") {
+                const image = loadDormantPreviewImage(previewImageCache, target.posterUrl, () => scheduleRender());
+                if (image && drawDormantCanvasMedia(canvas, image)) {
+                    return;
+                }
+                drawDormantCanvasMessage(canvas, "Loading guide...", target.subtitle || "");
+                return;
+            }
+            drawDormantCanvasMessage(canvas, target.label || "Preview unavailable", target.subtitle || "");
+        }
+
+        function syncVideoPlayback(target, frame) {
+            const layers = getTargetLayers(target);
+            const nextKeys = new Set(layers.map(layer => layer.key || clipPlaybackKey(layer.clip)));
+
+            for (const [key, entry] of videoEntries) {
+                if (activeVideoKeys.has(key) && !nextKeys.has(key)) {
+                    entry.el.pause();
+                }
+            }
+
+            for (const layer of layers) {
+                const entry = ensureVideoEntry(layer);
+                if (!entry) continue;
+                entry.layer = layer;
+                entry.pendingTime = sourceTimeForClip(layer.clip, frame);
+                const video = entry.el;
+                if (video.readyState >= 2) {
+                    const desiredTime = clampMediaTime(video, entry.pendingTime);
+                    if (!activeVideoKeys.has(entry.key) || Math.abs((video.currentTime || 0) - desiredTime) > 0.25) {
+                        try {
+                            video.currentTime = desiredTime;
+                        } catch (error) {}
+                    }
+                    video.muted = true;
+                    if (video.paused) {
+                        video.play().catch(() => {});
+                    }
+                }
+            }
+
+            activeVideoKeys = nextKeys;
+        }
+
+        function syncAudioPlayback(frame) {
+            if (!audioEnabled) {
+                pauseAllAudios();
+                return;
+            }
+
+            const tracks = getAudioTracksAtFrame(frame);
+            const nextKeys = new Set(tracks.map(audioPlaybackKey));
+
+            for (const [key, entry] of audioEntries) {
+                if (activeAudioKeys.has(key) && !nextKeys.has(key)) {
+                    entry.el.pause();
+                }
+            }
+
+            for (const track of tracks) {
+                const entry = ensureAudioEntry(track);
+                if (!entry) continue;
+                entry.track = track;
+                entry.pendingTime = sourceTimeForAudio(track, frame);
+                const audio = entry.el;
+                audio.volume = clamp(Number(track.volume ?? 1), 0, 1);
+                if (audio.readyState >= 2) {
+                    const desiredTime = clampMediaTime(audio, entry.pendingTime);
+                    if (!activeAudioKeys.has(entry.key) || audio.paused || Math.abs((audio.currentTime || 0) - desiredTime) > 0.25) {
+                        try {
+                            audio.currentTime = desiredTime;
+                        } catch (error) {}
+                        audio.play().catch(() => {});
+                    }
+                }
+            }
+
+            activeAudioKeys = nextKeys;
+        }
+
+        function renderVideoTarget(target, { forceSeek = false } = {}) {
+            clearDormantCanvas(canvas);
+            let drewAny = drawGuideBackground(target);
+            const frame = renderFrameIndex();
+            const layers = getTargetLayers(target);
+
+            if (!layers.length) {
+                if (!drewAny) {
+                    drawDormantCanvasMessage(canvas, target.label || "No preview", target.subtitle || "");
+                }
+                return;
+            }
+
+            for (const layer of layers) {
+                const entry = ensureVideoEntry(layer);
+                if (!entry) {
+                    drewAny = drawLayerPoster(layer) || drewAny;
+                    continue;
+                }
+
+                entry.layer = layer;
+                entry.pendingTime = sourceTimeForClip(layer.clip, frame);
+                const video = entry.el;
+                const desiredTime = clampMediaTime(video, entry.pendingTime);
+
+                if (isPlaying) {
+                    if (video.readyState >= 2) {
+                        const drift = Math.abs((video.currentTime || 0) - desiredTime);
+                        if (forceSeek || drift > 0.25) {
+                            try {
+                                video.currentTime = desiredTime;
+                            } catch (error) {}
+                        }
+                        video.muted = true;
+                        if (video.paused) {
+                            video.play().catch(() => {});
+                        }
+                        if (!forceSeek && !video.seeking) {
+                            drewAny = drawDormantCanvasMedia(canvas, video, { opacity: layer.opacity ?? 1 }) || drewAny;
+                        } else {
+                            drewAny = drawLayerPoster(layer) || drewAny;
+                        }
+                    } else {
+                        drewAny = drawLayerPoster(layer) || drewAny;
+                    }
+                } else {
+                    video.pause();
+                    if (video.readyState >= 2) {
+                        const settled = !forceSeek && !video.seeking && Math.abs((video.currentTime || 0) - desiredTime) < 0.04;
+                        if (!settled) {
+                            try {
+                                video.currentTime = desiredTime;
+                            } catch (error) {}
+                        }
+                        if (settled) {
+                            drewAny = drawDormantCanvasMedia(canvas, video, { opacity: layer.opacity ?? 1 }) || drewAny;
+                        } else {
+                            drewAny = drawLayerPoster(layer) || drewAny;
+                        }
+                    } else {
+                        drewAny = drawLayerPoster(layer) || drewAny;
+                    }
+                }
+            }
+
+            if (!drewAny) {
+                drawDormantCanvasMessage(
+                    canvas,
+                    isPlaying ? "Loading video..." : "Seeking frame...",
+                    target.subtitle || ""
+                );
+            }
+        }
+
+        function renderPreviewFrame({ forceSeek = false } = {}) {
+            if (destroyed) return;
+            resizeCanvas();
+            currentTarget = getTargetForCurrentFrame();
+
+            if (isPlaying) {
+                if (currentTarget?.kind === "video" || currentTarget?.kind === "composite") {
+                    syncVideoPlayback(currentTarget, renderFrameIndex());
+                } else {
+                    pauseAllVideos();
+                }
+                syncAudioPlayback(renderFrameIndex());
+            } else {
+                pauseAllVideos();
+                pauseAllAudios();
+            }
+
+            if (currentTarget?.kind === "video" || currentTarget?.kind === "composite") {
+                renderVideoTarget(currentTarget, { forceSeek });
+            } else {
+                renderStaticTarget(currentTarget || { kind: "empty", label: "No preview", subtitle: "" });
+            }
+            updateTransport();
+        }
+
+        const resizeObserver = new ResizeObserver(() => scheduleRender());
+        resizeObserver.observe(surface);
+
+        function stopPlayback({ preservePlayhead = true, shouldRender = true } = {}) {
+            if (!preservePlayhead) {
+                currentFrame = 0;
+            }
+            if (!isPlaying && !shouldRender) return;
+            isPlaying = false;
+            if (playbackRaf) {
+                cancelAnimationFrame(playbackRaf);
+                playbackRaf = 0;
+            }
+            pauseAllVideos();
+            pauseAllAudios();
+            if (shouldRender) {
+                scheduleRender({ forceSeek: true });
+            }
+            updateTransport();
+        }
+
+        function startPlayback() {
+            if (destroyed || totalFrames <= 0) return;
+            if (currentFrame >= totalFrames) {
+                currentFrame = 0;
+            }
+            isPlaying = true;
+            playbackStartTs = performance.now();
+            playbackStartFrame = renderFrameIndex();
+            currentFrame = playbackStartFrame;
+            const tick = (timestamp) => {
+                if (!isPlaying || destroyed) return;
+                const elapsedFrames = Math.floor(((timestamp - playbackStartTs) / 1000) * effectiveFps);
+                currentFrame = clamp(playbackStartFrame + elapsedFrames, 0, totalFrames);
+                renderPreviewFrame();
+                if (currentFrame >= totalFrames) {
+                    stopPlayback({ preservePlayhead: true, shouldRender: true });
+                    return;
+                }
+                playbackRaf = requestAnimationFrame(tick);
+            };
+            scheduleRender({ forceSeek: true });
+            updateTransport();
+            playbackRaf = requestAnimationFrame(tick);
+        }
+
+        playBtn.addEventListener("click", (event) => {
+            consumeDormantPointer(event, { preventDefault: true });
+            if (isPlaying) {
+                stopPlayback({ preservePlayhead: true, shouldRender: true });
+                return;
+            }
+            startPlayback();
+        });
+
+        audioBtn.addEventListener("click", (event) => {
+            consumeDormantPointer(event, { preventDefault: true });
+            if (!hasSceneAudio) return;
+            audioEnabled = !audioEnabled;
+            if (!audioEnabled) {
+                pauseAllAudios();
+            } else if (isPlaying) {
+                syncAudioPlayback(renderFrameIndex());
+            }
+            updateTransport();
+        });
+
+        scrubber.addEventListener("input", (event) => {
+            consumeDormantPointer(event);
+            if (isPlaying) {
+                stopPlayback({ preservePlayhead: true, shouldRender: false });
+            }
+            currentFrame = clamp(parseInt(scrubber.value, 10) || 0, 0, totalFrames);
+            scheduleRender({ forceSeek: true });
+            updateTransport();
+        });
+
+        updateTransport();
+        scheduleRender({ forceSeek: true });
+
         return () => {
-            destroyVideo();
+            destroyed = true;
+            stopPlayback({ preservePlayhead: true, shouldRender: false });
+            if (renderRaf) {
+                cancelAnimationFrame(renderRaf);
+                renderRaf = 0;
+            }
+            resizeObserver.disconnect();
+            stage.removeEventListener("pointerdown", consumePointerOnly);
+            stage.removeEventListener("mousedown", consumePointerOnly);
+            playBtn.removeEventListener("pointerdown", consumePointerOnly);
+            playBtn.removeEventListener("mousedown", consumePointerOnly);
+            audioBtn.removeEventListener("pointerdown", consumePointerOnly);
+            audioBtn.removeEventListener("mousedown", consumePointerOnly);
+            scrubber.removeEventListener("pointerdown", consumePointerOnly);
+            scrubber.removeEventListener("mousedown", consumePointerOnly);
+            cleanupAllMedia();
+            container.style.overflowX = previousOverflowX;
+            container.style.overflowY = previousOverflowY;
         };
     }
 
@@ -1441,7 +2541,8 @@ export class EditorNodeController {
                 padding: 10px;
                 border-radius: 6px;
                 background: rgba(255,255,255,0.04);
-                color: #9aa6b2;
+                border: 1px solid ${CHROME.borderSoft};
+                color: ${CHROME.textDim};
             `);
             emptyEl.textContent = "Render queue is empty.";
             wrap.appendChild(emptyEl);
@@ -1449,10 +2550,10 @@ export class EditorNodeController {
         }
 
         const colors = {
-            pending: "#888",
-            running: "#4a9eff",
-            completed: "#4a4",
-            failed: "#c44",
+            pending: CHROME.textMuted,
+            running: "#67a6d6",
+            completed: "#68a376",
+            failed: "#c66d76",
         };
 
         for (const job of jobs) {
@@ -1463,7 +2564,7 @@ export class EditorNodeController {
                 padding: 7px 8px;
                 border-radius: 6px;
                 background: rgba(255,255,255,0.03);
-                border: 1px solid #343434;
+                border: 1px solid ${CHROME.borderSoft};
                 align-items: start;
             `);
 
@@ -1482,7 +2583,7 @@ export class EditorNodeController {
                 gap: 2px;
             `);
             const title = style(document.createElement("div"), `
-                color: #ececec;
+                color: ${CHROME.text};
                 font-size: 11px;
                 font-weight: 600;
                 overflow: hidden;
@@ -1492,7 +2593,7 @@ export class EditorNodeController {
             title.textContent = job.scene_name || "Scene";
 
             const meta = style(document.createElement("div"), `
-                color: #8ea0af;
+                color: ${CHROME.textDim};
                 font-size: 10px;
                 overflow: hidden;
                 text-overflow: ellipsis;

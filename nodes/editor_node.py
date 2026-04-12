@@ -4,6 +4,7 @@ Outputs everything the sampler needs based on the current timeline selection:
 guide images, frame indices, prompt, frame count, fps, resolution, audio.
 """
 
+import copy
 import os
 import logging
 
@@ -12,8 +13,8 @@ import numpy as np
 import torch
 import folder_paths
 
-from ..server.project_manager import load_project, list_projects, create_project, save_project
-from ..server.timeline_state import TimelineProject, Scene
+from ..server.project_manager import load_project, create_project, save_project
+from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 
 logger = logging.getLogger("ltx_editor")
 
@@ -147,6 +148,7 @@ class LTXEditor:
                 }),
             },
             "hidden": {
+                "prompt": "PROMPT",
                 "unique_id": "UNIQUE_ID",
             },
         }
@@ -155,141 +157,311 @@ class LTXEditor:
     def IS_CHANGED(s, **kwargs):
         return float("nan")
 
+    @staticmethod
+    def _empty_execute_result(proj: TimelineProject, proj_fps: float, proj_w: int, proj_h: int):
+        empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+        silent_audio = _make_silent_audio(1.0, 44100)
+        return (
+            proj,
+            empty_image,
+            empty_image,
+            "0",
+            "",
+            0,
+            proj_fps,
+            proj_w,
+            proj_h,
+            silent_audio,
+            0,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+        )
+
+    @staticmethod
+    def _queue_snapshot_version(queue_job) -> int:
+        if not queue_job:
+            return 0
+        params = getattr(queue_job, "params", {}) or {}
+        if not isinstance(params, dict):
+            return 0
+        return max(0, _coerce_int(params.get("snapshot_version", 0), 0))
+
+    @staticmethod
+    def _prompt_linked_node_id(value):
+        if not isinstance(value, (list, tuple)) or not value:
+            return None
+        node_id = value[0]
+        if isinstance(node_id, (str, int)):
+            return str(node_id)
+        return None
+
+    @classmethod
+    def _prompt_node_inputs(cls, prompt, node_id):
+        if not isinstance(prompt, dict):
+            return {}
+        node = prompt.get(str(node_id))
+        if not isinstance(node, dict):
+            node = prompt.get(node_id)
+        if not isinstance(node, dict):
+            return {}
+        inputs = node.get("inputs", {})
+        return inputs if isinstance(inputs, dict) else {}
+
+    @classmethod
+    def _execution_reaches_save_video(cls, prompt, unique_id) -> bool:
+        if not isinstance(prompt, dict) or unique_id in {None, ""}:
+            return False
+        target_id = str(unique_id)
+        for node in prompt.values():
+            if not isinstance(node, dict):
+                continue
+            if node.get("class_type") != "LTXSaveVideo":
+                continue
+            inputs = node.get("inputs", {})
+            if not isinstance(inputs, dict):
+                continue
+            project_source = cls._prompt_linked_node_id(inputs.get("project"))
+            if project_source is None:
+                continue
+            stack = [project_source]
+            seen = set()
+            while stack:
+                current_id = stack.pop()
+                if current_id == target_id:
+                    return True
+                if current_id in seen:
+                    continue
+                seen.add(current_id)
+                for upstream in cls._prompt_node_inputs(prompt, current_id).values():
+                    upstream_id = cls._prompt_linked_node_id(upstream)
+                    if upstream_id and upstream_id not in seen:
+                        stack.append(upstream_id)
+        return False
+
+    def _consume_queue_job(self, proj: TimelineProject):
+        queue = getattr(proj, "generation_queue", []) or []
+        # A new consume pass means a fresh ComfyUI prompt execution. Any prior
+        # running job therefore never completed and must be retried.
+        for job in queue:
+            if (job.status or "pending").lower() == "running":
+                job.status = "pending"
+                job.error = ""
+                job.progress = 0.0
+        for job in queue:
+            if (job.status or "pending").lower() != "pending":
+                continue
+            job.status = "running"
+            job.error = ""
+            job.progress = 0.0
+            save_project(proj)
+            return job
+        return None
+
+    def _mark_queue_job_failed(self, proj: TimelineProject, queue_job, error_message: str):
+        if not proj or not queue_job:
+            return
+        queue_job.status = "failed"
+        queue_job.error = str(error_message)
+        queue_job.progress = 0.0
+        save_project(proj)
+
     def execute(self, project, project_name, fps, width, height,
                 scene_id="", selection_start=0, selection_end=0,
-                pre_context_frames=0, post_context_frames=0, unique_id=None):
+                pre_context_frames=0, post_context_frames=0,
+                prompt=None, unique_id=None):
         base_dir = _get_projects_base_dir()
         selection_start = max(0, _coerce_int(selection_start, 0))
         selection_end = max(0, _coerce_int(selection_end, 0))
         pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
         post_context_frames = max(0, _coerce_int(post_context_frames, 0))
+        proj = None
+        queue_job = None
 
-        # --- Load or create project ---
-        if project == CREATE_NEW:
-            proj = create_project(
-                name=project_name,
-                fps=fps,
-                width=int(width),
-                height=int(height),
-                base_dir=base_dir,
-            )
-        else:
-            project_dir = os.path.join(base_dir, project)
-            proj = load_project(project_dir)
+        try:
+            # --- Load or create project ---
+            if project == CREATE_NEW:
+                proj = create_project(
+                    name=project_name,
+                    fps=fps,
+                    width=int(width),
+                    height=int(height),
+                    base_dir=base_dir,
+                )
+            else:
+                project_dir = os.path.join(base_dir, project)
+                proj = load_project(project_dir)
 
-        proj_fps = proj.fps
-        proj_w, proj_h = proj.resolution
+            proj_fps = proj.fps
+            proj_w, proj_h = proj.resolution
 
-        # --- Find active scene ---
-        scene = None
-        if scene_id:
-            scene = proj.get_scene(scene_id)
+            if self._execution_reaches_save_video(prompt, unique_id):
+                queue_job = self._consume_queue_job(proj)
+            snapshot_version = self._queue_snapshot_version(queue_job)
+            if queue_job:
+                scene_id = queue_job.scene_id or scene_id
+                selection_start = max(0, _coerce_int(getattr(queue_job, "selection_start", 0), 0))
+                selection_end = max(0, _coerce_int(getattr(queue_job, "selection_end", 0), 0))
+                pre_context_frames = max(0, _coerce_int(getattr(queue_job, "pre_context_frames", 0), 0))
+                post_context_frames = max(0, _coerce_int(getattr(queue_job, "post_context_frames", 0), 0))
 
-        # --- Scene-level overrides (resolution + fps) ---
-        if scene and scene.width > 0:
-            proj_w = scene.width
-        if scene and scene.height > 0:
-            proj_h = scene.height
-        if scene and hasattr(scene, 'fps') and scene.fps > 0:
-            proj_fps = scene.fps
+            # --- Find active scene ---
+            scene = None
+            if scene_id:
+                scene = proj.get_scene(scene_id)
 
-        # --- If no scene, return defaults ---
-        if not scene:
-            empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
-            silent_audio = _make_silent_audio(1.0, 44100)
-            return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio,
-                    0, 0, 0, 0, 0.0, 0.0)
+            if queue_job and not scene:
+                raise RuntimeError(f"Queued scene not found: {scene_id}")
 
-        # --- Determine render range ---
-        # If selection is set, use it; otherwise render the full scene
-        if selection_end > selection_start:
-            render_start = selection_start
-            render_end = selection_end
-        else:
-            render_start = 0
-            render_end = scene.duration_frames
-            if render_end <= 0:
-                empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
-                silent_audio = _make_silent_audio(1.0, 44100)
-                return (proj, empty_image, empty_image, "0", "", 0, proj_fps, proj_w, proj_h, silent_audio,
-                        0, 0, 0, 0, 0.0, 0.0)
+            # New queue jobs freeze scene-level overrides even when the live scene changes.
+            if scene and queue_job and snapshot_version > 0:
+                scene = copy.deepcopy(scene)
+                scene.width = max(0, _coerce_int(getattr(queue_job, "scene_width", 0), 0))
+                scene.height = max(0, _coerce_int(getattr(queue_job, "scene_height", 0), 0))
+                try:
+                    scene.fps = max(0.0, float(getattr(queue_job, "scene_fps", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    scene.fps = 0.0
 
-        # --- Context frame expansion (asymmetric pre/post) ---
-        # generation_start/end = the actual new frames to generate (original selection)
-        # context extends the render range to include surrounding frames for temporal consistency
-        generation_start = render_start
-        generation_end = render_end
-        # Clamp to available frames (fallback: can't go below 0 or past scene end)
-        actual_pre = min(pre_context_frames, generation_start)
-        actual_post = min(post_context_frames, scene.duration_frames - generation_end)
-        if actual_pre > 0 or actual_post > 0:
-            render_start = generation_start - actual_pre
-            render_end = generation_end + actual_post
+            # --- Scene-level overrides (resolution + fps) ---
+            if scene and scene.width > 0:
+                proj_w = scene.width
+            if scene and scene.height > 0:
+                proj_h = scene.height
+            if scene and hasattr(scene, "fps") and scene.fps > 0:
+                proj_fps = scene.fps
 
-        context_start = render_start
-        context_end = render_end
-        frame_count = render_end - render_start
+            # --- If no scene, return defaults ---
+            if not scene:
+                return self._empty_execute_result(proj, proj_fps, proj_w, proj_h)
 
-        # Mask times — seconds offset within the output tensor for downstream temporal masks
-        mask_start_time = (generation_start - context_start) / proj_fps if proj_fps > 0 else 0.0
-        mask_end_time = (generation_end - context_start) / proj_fps if proj_fps > 0 else 0.0
-
-        # --- Render composited frames ---
-        rendered_frames = self._render_scene_frames(proj, scene, render_start, render_end)
-
-        # --- Gather guide frames within render range ---
-        guide_images = []
-        guide_indices = []
-
-        for guide in scene.guide_frames:
-            idx = guide.frame_index
-            if idx == -1:
-                idx = scene.duration_frames - 1
-
-            if render_start <= idx < render_end:
-                asset = proj.get_asset(guide.asset_id)
-                if asset:
-                    asset_path = os.path.join(proj.project_dir, asset.path)
-                    if os.path.isfile(asset_path):
-                        img = self._load_guide_image(
-                            asset_path, asset.asset_type, proj_w, proj_h
+            # --- Determine render range ---
+            # If selection is set, use it; otherwise render the full scene
+            if selection_end > selection_start:
+                render_start = selection_start
+                render_end = selection_end
+                if queue_job:
+                    render_end = min(render_end, scene.duration_frames)
+                    if render_end <= render_start:
+                        raise RuntimeError(
+                            f"Queued selection is outside scene bounds: {selection_start}-{selection_end}"
                         )
-                        if img is not None:
-                            guide_images.append(img)
-                            local_idx = idx - render_start
-                            guide_indices.append(str(local_idx))
+            else:
+                render_start = 0
+                render_end = scene.duration_frames
+                if render_end <= 0:
+                    if queue_job:
+                        raise RuntimeError(f"Queued scene has no renderable duration: {scene.name}")
+                    return self._empty_execute_result(proj, proj_fps, proj_w, proj_h)
 
-        if guide_images:
-            guide_tensor = torch.stack(guide_images, dim=0)
-        else:
-            guide_tensor = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
-            guide_indices = ["0"]
+            # --- Context frame expansion (asymmetric pre/post) ---
+            # generation_start/end = the actual new frames to generate (original selection)
+            # context extends the render range to include surrounding frames for temporal consistency
+            generation_start = render_start
+            generation_end = render_end
+            actual_pre = min(pre_context_frames, generation_start)
+            actual_post = min(post_context_frames, scene.duration_frames - generation_end)
+            if actual_pre > 0 or actual_post > 0:
+                render_start = generation_start - actual_pre
+                render_end = generation_end + actual_post
 
-        indices_str = ",".join(guide_indices)
+            context_start = render_start
+            context_end = render_end
+            frame_count = render_end - render_start
 
-        # --- Get prompt for render range ---
-        prompt_text = scene.get_prompt_for_range(render_start, render_end)
+            # Mask times - seconds offset within the output tensor for downstream temporal masks
+            mask_start_time = (generation_start - context_start) / proj_fps if proj_fps > 0 else 0.0
+            mask_end_time = (generation_end - context_start) / proj_fps if proj_fps > 0 else 0.0
 
-        # --- Load audio from scene's audio tracks for the render range ---
-        audio = self._load_scene_audio(proj, scene, render_start, render_end)
+            # --- Render composited frames ---
+            rendered_frames = self._render_scene_frames(proj, scene, render_start, render_end)
 
-        # --- Attach execution context for downstream nodes (e.g., LTXSaveVideo Take mode) ---
-        proj._execution_context = {
-            "scene_id": scene.scene_id,
-            "scene_name": scene.name,
-            "selection_start": generation_start,
-            "selection_end": generation_end,
-            "context_start": context_start,
-            "context_end": context_end,
-            "pre_context_frames": actual_pre,
-            "post_context_frames": actual_post,
-            "prompt": prompt_text,
-        }
+            # --- Gather guide frames within render range ---
+            guide_images = []
+            guide_indices = []
+            guide_frames = scene.guide_frames
+            if queue_job and snapshot_version > 0:
+                guide_frames = [
+                    GuideFrame.from_dict(guide)
+                    for guide in getattr(queue_job, "guide_frame_snapshots", [])
+                    if isinstance(guide, dict)
+                ]
 
-        return (proj, rendered_frames, guide_tensor, indices_str, prompt_text, frame_count,
-                proj_fps, proj_w, proj_h, audio,
-                context_start, context_end, generation_start, generation_end,
-                mask_start_time, mask_end_time)
+            for guide in guide_frames:
+                idx = guide.frame_index
+                if idx == -1:
+                    idx = scene.duration_frames - 1
+
+                if render_start <= idx < render_end:
+                    asset = proj.get_asset(guide.asset_id)
+                    if asset:
+                        asset_path = os.path.join(proj.project_dir, asset.path)
+                        if os.path.isfile(asset_path):
+                            img = self._load_guide_image(
+                                asset_path, asset.asset_type, proj_w, proj_h
+                            )
+                            if img is not None:
+                                guide_images.append(img)
+                                local_idx = idx - render_start
+                                guide_indices.append(str(local_idx))
+
+            if guide_images:
+                guide_tensor = torch.stack(guide_images, dim=0)
+            else:
+                guide_tensor = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+                guide_indices = ["0"]
+
+            indices_str = ",".join(guide_indices)
+
+            # --- Get prompt for render range ---
+            if queue_job:
+                prompt_text = getattr(queue_job, "prompt", "")
+                if snapshot_version <= 0 and not prompt_text:
+                    prompt_text = scene.get_prompt_for_range(render_start, render_end)
+            else:
+                prompt_text = scene.get_prompt_for_range(render_start, render_end)
+
+            # --- Load audio from scene's audio tracks for the render range ---
+            audio = self._load_scene_audio(proj, scene, render_start, render_end)
+
+            # --- Attach execution context for downstream nodes (e.g., LTXSaveVideo Take mode) ---
+            proj._execution_context = {
+                "scene_id": scene.scene_id,
+                "scene_name": scene.name,
+                "selection_start": generation_start,
+                "selection_end": generation_end,
+                "context_start": context_start,
+                "context_end": context_end,
+                "pre_context_frames": actual_pre,
+                "post_context_frames": actual_post,
+                "prompt": prompt_text,
+                "queue_job_id": queue_job.job_id if queue_job else "",
+            }
+
+            return (
+                proj,
+                rendered_frames,
+                guide_tensor,
+                indices_str,
+                prompt_text,
+                frame_count,
+                proj_fps,
+                proj_w,
+                proj_h,
+                audio,
+                context_start,
+                context_end,
+                generation_start,
+                generation_end,
+                mask_start_time,
+                mask_end_time,
+            )
+        except Exception as e:
+            if proj is not None and queue_job is not None:
+                self._mark_queue_job_failed(proj, queue_job, str(e))
+            raise
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
                               render_start: int, render_end: int) -> torch.Tensor:

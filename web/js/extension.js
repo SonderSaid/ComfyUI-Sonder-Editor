@@ -114,6 +114,107 @@ function applyProjectCreationDefaults(node) {
     if (heightWidget) heightWidget.value = settings.projectDefaults.height;
 }
 
+function getActiveEditorNodes() {
+    return (app.graph._nodes || app.graph.nodes || []).filter(
+        (node) => node.type === "LTXEditor" && node._ltxController?.state?.projectDir
+    );
+}
+
+function getGraphLinks() {
+    return app.graph?.links || app.graph?._links || {};
+}
+
+function getNodeById(nodeId) {
+    if (nodeId == null) return null;
+    if (typeof app.graph?.getNodeById === "function") {
+        return app.graph.getNodeById(nodeId) || null;
+    }
+    return (app.graph?._nodes || app.graph?.nodes || []).find((node) => node.id === nodeId) || null;
+}
+
+function getLinkedNodeFromInput(node, inputName) {
+    const input = node?.inputs?.find?.((entry) => entry?.name === inputName);
+    const linkId = input?.link;
+    if (linkId == null) return null;
+    const link = getGraphLinks()?.[linkId];
+    if (link?.origin_id == null) return null;
+    return getNodeById(link.origin_id);
+}
+
+function collectUpstreamEditorNodes(startNode, collected = new Set(), visited = new Set()) {
+    if (!startNode || visited.has(startNode.id)) return collected;
+    visited.add(startNode.id);
+    if (startNode.type === "LTXEditor") {
+        collected.add(startNode);
+        return collected;
+    }
+    for (const input of startNode.inputs || []) {
+        if (input?.link == null) continue;
+        const link = getGraphLinks()?.[input.link];
+        if (link?.origin_id == null) continue;
+        const upstreamNode = getNodeById(link.origin_id);
+        if (upstreamNode) {
+            collectUpstreamEditorNodes(upstreamNode, collected, visited);
+        }
+    }
+    return collected;
+}
+
+function editorNodeHasQueuedWork(node) {
+    const counts = node?._ltxController?.state?.dormantSummary?.queue_counts || {};
+    return (counts.pending || 0) > 0 || (counts.running || 0) > 0;
+}
+
+function refreshEditorNodes(editorNodes) {
+    for (const editorNode of editorNodes || []) {
+        editorNode._ltxController.handleSaveVideoExecuted();
+    }
+}
+
+function getSaveVideoEditorNodes(saveNode) {
+    const projectSourceNode = getLinkedNodeFromInput(saveNode, "project");
+    if (!projectSourceNode) return [];
+    return Array.from(collectUpstreamEditorNodes(projectSourceNode)).filter(
+        (node) => node._ltxController?.state?.projectDir
+    );
+}
+
+let queuedExecutionRefreshToken = 0;
+
+function scheduleQueuedExecutionRefresh() {
+    const token = ++queuedExecutionRefreshToken;
+    const delays = [0, 150, 400, 1000];
+    delays.forEach((delay, index) => {
+        window.setTimeout(async () => {
+            if (token !== queuedExecutionRefreshToken) return;
+            const editorNodes = getActiveEditorNodes().filter(editorNodeHasQueuedWork);
+            if (!editorNodes.length) {
+                if (token === queuedExecutionRefreshToken) {
+                    queuedExecutionRefreshToken += 1;
+                }
+                return;
+            }
+            const counts = await Promise.all(editorNodes.map(async (editorNode) => {
+                try {
+                    return await editorNode._ltxController?.handleQueueExecutionSettled?.({
+                        allowRollback: index === delays.length - 1,
+                        attemptIndex: index,
+                        delay,
+                    });
+                } catch (error) {
+                    console.warn("[LTX Editor] Queue reconciliation failed:", error);
+                    return null;
+                }
+            }));
+            if (token !== queuedExecutionRefreshToken) return;
+            const hasRunning = counts.some((value) => (value?.running || 0) > 0);
+            if (!hasRunning) {
+                queuedExecutionRefreshToken += 1;
+            }
+        }, delay);
+    });
+}
+
 // ── Main Extension ─────────────────────────────────────────────────────
 app.registerExtension({
     name: "ltx.editor",
@@ -315,94 +416,23 @@ app.registerExtension({
             const origOnExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function () {
                 origOnExecuted?.apply(this, arguments);
-                const editorNodes = (app.graph._nodes || app.graph.nodes || []).filter(
-                    (n) => n.type === "LTXEditor" && n._ltxController?.state?.projectDir
-                );
-                for (const en of editorNodes) {
-                    en._ltxController.handleSaveVideoExecuted();
-                }
+                const editorNodes = getSaveVideoEditorNodes(this);
+                refreshEditorNodes(editorNodes);
             };
         }
 
         // ── Legacy LTX Project Loader ──────────────────────────────────
-        if (nodeData.name === "LTXProjectLoader") {
-            const origOnNodeCreated = nodeType.prototype.onNodeCreated;
-            nodeType.prototype.onNodeCreated = function () {
-                origOnNodeCreated?.apply(this, arguments);
-
-                const projectWidget = this.widgets.find(w => w.name === "project");
-                const creationWidgetNames = ["project_name", "fps", "width", "height"];
-                const node = this;
-                node.resizable = true;
-                node.flags = { ...(node.flags || {}), resizable: true };
-
-                const createButtonWidget = node.addWidget("button", "Create", null, async () => {
-                    try {
-                        await createProjectFromNode(node, projectWidget);
-                    } catch (e) {
-                        console.warn("[LTX Project Loader] Failed to create project:", e);
-                    }
-                });
-                createButtonWidget.serialize = false;
-
-                const updateVisibility = () => {
-                    const isCreateNew = projectWidget?.value === "+ Create New";
-                    for (const w of node.widgets) {
-                        if (creationWidgetNames.includes(w.name)) {
-                            if (isCreateNew) {
-                                showWidget(node, w);
-                            } else {
-                                hideWidget(node, w);
-                            }
-                        }
-                    }
-                    if (isCreateNew) {
-                        applyProjectCreationDefaults(node);
-                        showWidget(node, createButtonWidget);
-                    } else {
-                        hideWidget(node, createButtonWidget);
-                    }
-                    app.graph.setDirtyCanvas?.(true, true);
-
-                    const nextSize = node.computeSize();
-                    const preferredWidth = 340;
-                    if (!node._ltxInitializedSize) {
-                        node._ltxInitializedSize = true;
-                        node.size = [preferredWidth, Math.max(nextSize?.[1] || 0, node.size?.[1] || 0)];
-                    } else {
-                        node.size = [
-                            Math.max(node.size?.[0] || 0, 240),
-                            nextSize?.[1] || node.size?.[1] || preferredWidth,
-                        ];
-                    }
-                    node.setSize(node.size);
-                };
-
-                const runUpdateVisibility = () => {
-                    Promise.resolve(updateVisibility()).catch((e) => {
-                        console.warn("[LTX Project Loader] Failed to update node visibility:", e);
-                    });
-                };
-
-                if (projectWidget) {
-                    const origCallback = projectWidget.callback;
-                    projectWidget.callback = (value) => {
-                        origCallback?.call(projectWidget, value);
-                        runUpdateVisibility();
-                    };
-                    syncProjectWidgetChoices(projectWidget)
-                        .then(() => runUpdateVisibility())
-                        .catch((e) => {
-                            console.warn("[LTX Project Loader] Failed to sync project choices:", e);
-                        });
-                }
-
-                runUpdateVisibility();
-            };
-        }
     },
 
     setup() {
+        if (typeof api.addEventListener === "function") {
+            api.addEventListener("status", (event) => {
+                const remaining = Number(event?.detail?.exec_info?.queue_remaining);
+                if (!Number.isFinite(remaining) || remaining !== 0) return;
+                if (!getActiveEditorNodes().some(editorNodeHasQueuedWork)) return;
+                scheduleQueuedExecutionRefresh();
+            });
+        }
         // ── Global drop interceptor: asset gallery → ComfyUI graph ───────
         // HTML5 drag can't carry File objects, so we intercept drops with our
         // custom MIME type, fetch the actual asset, upload it to ComfyUI's

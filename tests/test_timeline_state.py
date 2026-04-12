@@ -323,6 +323,18 @@ def test_generation_job_roundtrip():
         status="running",
         params={"steps": 20},
         progress=0.5,
+        selection_start=24,
+        selection_end=72,
+        prompt="queued prompt",
+        scene_name="Scene 1",
+        context_frames=12,
+        pre_context_frames=8,
+        post_context_frames=12,
+        guide_frame_snapshots=[{"frame_index": 12, "asset_id": "guide001", "source": "asset", "strength": 0.8}],
+        prompt_sections=[{"start_frame": 0, "end_frame": 96, "prompt": "section prompt"}],
+        scene_width=1024,
+        scene_height=576,
+        scene_fps=30.0,
     )
 
     data = job.to_dict()
@@ -333,6 +345,29 @@ def test_generation_job_roundtrip():
     assert restored.batch_index == 2
     assert restored.status == "running"
     assert restored.progress == 0.5
+    assert restored.selection_start == 24
+    assert restored.selection_end == 72
+    assert restored.prompt == "queued prompt"
+    assert restored.scene_name == "Scene 1"
+    assert restored.context_frames == 12
+    assert restored.pre_context_frames == 8
+    assert restored.post_context_frames == 12
+    assert restored.guide_frame_snapshots[0]["asset_id"] == "guide001"
+    assert restored.prompt_sections[0]["prompt"] == "section prompt"
+    assert restored.scene_width == 1024
+    assert restored.scene_height == 576
+    assert restored.scene_fps == 30.0
+
+
+def test_generation_job_legacy_context_frames_migrate_to_pre_and_post():
+    restored = GenerationJob.from_dict({
+        "job_id": "legacy",
+        "context_frames": 16,
+    })
+
+    assert restored.context_frames == 16
+    assert restored.pre_context_frames == 16
+    assert restored.post_context_frames == 16
 
 
 # --- TimelineProject ---
