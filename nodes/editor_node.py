@@ -260,12 +260,48 @@ class LTXEditor:
             return job
         return None
 
+    def _mark_later_batch_jobs_failed(self, proj: TimelineProject, queue_job):
+        batch_id = str(getattr(queue_job, "batch_id", "") or "")
+        if not proj or not batch_id:
+            return
+
+        queue = getattr(proj, "generation_queue", []) or []
+        failed_queue_index = None
+        failed_job_id = str(getattr(queue_job, "job_id", "") or "")
+        failed_batch_index = _coerce_int(getattr(queue_job, "batch_index", 0), 0)
+
+        for idx, job in enumerate(queue):
+            if job is queue_job or (failed_job_id and getattr(job, "job_id", "") == failed_job_id):
+                failed_queue_index = idx
+                break
+
+        skip_error = f"Skipped after earlier batch failure ({failed_job_id or 'unknown job'})"
+        for idx, job in enumerate(queue):
+            if job is queue_job:
+                continue
+            if str(getattr(job, "batch_id", "") or "") != batch_id:
+                continue
+            if (getattr(job, "status", "pending") or "pending").lower() != "pending":
+                continue
+
+            job_batch_index = _coerce_int(getattr(job, "batch_index", 0), 0)
+            is_later_chunk = job_batch_index > failed_batch_index
+            if failed_queue_index is not None and idx > failed_queue_index:
+                is_later_chunk = True
+            if not is_later_chunk:
+                continue
+
+            job.status = "failed"
+            job.error = skip_error
+            job.progress = 0.0
+
     def _mark_queue_job_failed(self, proj: TimelineProject, queue_job, error_message: str):
         if not proj or not queue_job:
             return
         queue_job.status = "failed"
         queue_job.error = str(error_message)
         queue_job.progress = 0.0
+        self._mark_later_batch_jobs_failed(proj, queue_job)
         save_project(proj)
 
     def execute(self, project, project_name, fps, width, height,

@@ -275,6 +275,9 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
         "scene_name": "Opening",
         "selection_start": 24,
         "selection_end": 72,
+        "batch_id": "batch-123",
+        "batch_total": 3,
+        "batch_index": 1,
         "prompt": "queued prompt",
         "context_frames": 12,
         "pre_context_frames": 8,
@@ -294,6 +297,9 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
 
     assert response.status == 200
     assert len(project.generation_queue) == 1
+    assert payload["batch_id"] == "batch-123"
+    assert payload["batch_total"] == 3
+    assert payload["batch_index"] == 1
     assert payload["pre_context_frames"] == 8
     assert payload["post_context_frames"] == 12
     assert payload["guide_frame_snapshots"][0]["asset_id"] == "guide-1"

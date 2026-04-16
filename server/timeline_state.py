@@ -555,6 +555,8 @@ class GenerationJob:
     clip_id: str = ""
     scene_id: str = ""                      # which scene this job belongs to
     batch_index: int = 0                    # which batch within the scene
+    batch_id: str = ""                      # shared ID for jobs created by one batch enqueue
+    batch_total: int = 0                    # total jobs in the batch group
     status: str = "pending"                 # pending | running | completed | failed
     params: dict = field(default_factory=dict)
     progress: float = 0.0
@@ -583,6 +585,8 @@ class GenerationJob:
             "clip_id": self.clip_id,
             "scene_id": self.scene_id,
             "batch_index": self.batch_index,
+            "batch_id": self.batch_id,
+            "batch_total": self.batch_total,
             "status": self.status,
             "params": self.params,
             "progress": self.progress,
@@ -615,6 +619,8 @@ class GenerationJob:
             clip_id=data.get("clip_id", ""),
             scene_id=data.get("scene_id", ""),
             batch_index=data.get("batch_index", 0),
+            batch_id=data.get("batch_id", ""),
+            batch_total=data.get("batch_total", 0),
             status=data.get("status", "pending"),
             params=data.get("params", {}),
             progress=data.get("progress", 0.0),

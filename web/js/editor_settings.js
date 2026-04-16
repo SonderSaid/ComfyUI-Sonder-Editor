@@ -57,6 +57,7 @@ export const BUILTIN_MODEL_TEMPLATES = [
             height: { step: 32, offset: 0, min: 64, max: 2048 },
             frames: { step: 8, offset: 1, min: 1, max: 257 },
             fps: { min: 1, max: 120 },
+            batchMaxFrames: 97,
         },
     },
 ];
@@ -90,6 +91,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         scaleTimeline: 1.0,
         scaleGallery: 1.0,
         queuePanelExpanded: false,
+        queueBatchCollapsedByProject: {},
         trackCollapseByScene: {},
         labelWidth: 0,
         labelWidthFullscreen: 0,
@@ -120,6 +122,9 @@ export const DEFAULT_EDITOR_SETTINGS = {
         waveformAccent: "#dcffdc",
         timelineBrightness: 100,
         clipLabelMode: "name_duration",
+    },
+    batchRender: {
+        maxFramesPerChunk: 0,
     },
     modelTemplates: {
         customTemplates: [],
@@ -246,6 +251,10 @@ function normalizeCustomTemplate(template, index = 0) {
             constraints[key] = normalizedConstraint;
         }
     }
+    const batchMaxFrames = coerceFiniteNumber(template.constraints?.batchMaxFrames, { integer: true, min: 1 });
+    if (batchMaxFrames !== undefined) {
+        constraints.batchMaxFrames = batchMaxFrames;
+    }
     const hintTier = coerceFiniteNumber(template.hintTier, { integer: true, min: 1 });
     return {
         id,
@@ -335,6 +344,20 @@ function normalizeTrackCollapseByScene(nextValue) {
     return normalized;
 }
 
+function normalizeQueueBatchCollapsedByProject(nextValue) {
+    if (!nextValue || typeof nextValue !== "object" || Array.isArray(nextValue)) {
+        return {};
+    }
+    const normalized = {};
+    for (const [projectKey, batchIds] of Object.entries(nextValue)) {
+        if (!projectKey || !Array.isArray(batchIds)) continue;
+        normalized[projectKey] = Array.from(new Set(
+            batchIds.filter((value) => typeof value === "string" && value)
+        ));
+    }
+    return normalized;
+}
+
 function normalizeEditorSettings(source = null) {
     const stored = source && typeof source === "object" ? source : {};
     const legacyLayout = legacyLayoutSettings();
@@ -377,6 +400,7 @@ function normalizeEditorSettings(source = null) {
             queuePanelExpanded: stored?.layout?.queuePanelExpanded == null
                 ? defaults.layout.queuePanelExpanded
                 : !!stored.layout.queuePanelExpanded,
+            queueBatchCollapsedByProject: normalizeQueueBatchCollapsedByProject(stored?.layout?.queueBatchCollapsedByProject),
             trackCollapseByScene: normalizeTrackCollapseByScene(stored?.layout?.trackCollapseByScene),
             labelWidth: clampNumber(
                 pickDefined(stored?.layout?.labelWidth, legacyLayout.labelWidth),
@@ -451,6 +475,15 @@ function normalizeEditorSettings(source = null) {
             clipLabelMode: VALID_CLIP_LABEL_MODES.has(stored?.appearance?.clipLabelMode)
                 ? stored.appearance.clipLabelMode
                 : defaults.appearance.clipLabelMode,
+        },
+        batchRender: {
+            maxFramesPerChunk: clampNumber(
+                stored?.batchRender?.maxFramesPerChunk,
+                0,
+                10000,
+                defaults.batchRender.maxFramesPerChunk,
+                true,
+            ),
         },
         modelTemplates: {
             customTemplates,
@@ -576,6 +609,20 @@ export function snapResolution(width, height, template) {
         width: Math.round(snapToConstraint(width, template?.constraints?.width)),
         height: Math.round(snapToConstraint(height, template?.constraints?.height)),
     };
+}
+
+export function resolveBatchChunkSize({ settings, template } = {}) {
+    const requested = pickDefined(
+        settings?.batchRender?.maxFramesPerChunk > 0 ? settings.batchRender.maxFramesPerChunk : undefined,
+        template?.constraints?.batchMaxFrames,
+        97,
+    );
+    const numeric = Math.max(1, Math.round(Number(requested) || 97));
+    const frameConstraint = template?.constraints?.frames;
+    if (frameConstraint && typeof frameConstraint === "object") {
+        return Math.max(1, Math.round(snapToConstraint(numeric, frameConstraint)));
+    }
+    return numeric;
 }
 
 export function describeConstraintFormula(constraint) {

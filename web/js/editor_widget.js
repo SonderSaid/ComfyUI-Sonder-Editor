@@ -24,6 +24,7 @@ import {
     getAllModelTemplates,
     getTemplateById,
     previewConstraintValues,
+    resolveBatchChunkSize,
     snapResolution,
     snapToConstraint,
     subscribeEditorSettings,
@@ -364,6 +365,7 @@ export class EditorWidget {
         this._collapsedFolders = {};
         this._renderQueue = [];
         this._queueExpanded = !!this._settings.layout.queuePanelExpanded;
+        this._queueBatchExpanded = {};
         this._queueHeaderLabel = null;
         this._savedSelDropdown = null;
 
@@ -837,6 +839,12 @@ export class EditorWidget {
         this._queueBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
         this._queueBtn.addEventListener("click", () => this._addToRenderQueue());
 
+        this._batchQueueBtn = document.createElement("button");
+        this._batchQueueBtn.textContent = "+ Batch (1)";
+        this._batchQueueBtn.title = "Add the current selection to the render queue as chunked jobs";
+        this._batchQueueBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
+        this._batchQueueBtn.addEventListener("click", () => this._addBatchToRenderQueue());
+
         // Animatic toggle button
         this._toolBtnAnimatic = makeToolBtn("👁 Anim", "A", "Toggle animatic mode (hide all video)", () => this._animaticMode, () => {
             this._toggleAnimatic();
@@ -855,7 +863,7 @@ export class EditorWidget {
         this._fullscreenBtn.style.fontSize = "14px";
         this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
 
-        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
+        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, this._batchQueueBtn, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
         this.container.appendChild(this._toolbar);
         this._updateToolbar();
     }
@@ -888,6 +896,7 @@ export class EditorWidget {
         if (this._toolBtnAnimatic) {
             setButtonVariant(this._toolBtnAnimatic, this._animaticMode ? "warning" : "muted");
         }
+        this._updateBatchButtonLabel();
     }
 
     // Info bar removed — zoom/fullscreen controls moved to toolbar.
@@ -2647,6 +2656,85 @@ export class EditorWidget {
         return JSON.stringify(Array.from(state.collapsed).sort());
     }
 
+    _queueBatchCollapseProjectKey() {
+        return this._projectDirName();
+    }
+
+    _readStoredQueueBatchCollapseState(settings = this._settings) {
+        const projectKey = this._queueBatchCollapseProjectKey();
+        const collapsedByProject = settings?.layout?.queueBatchCollapsedByProject;
+        const collapsedIds = projectKey && collapsedByProject && typeof collapsedByProject === "object"
+            ? collapsedByProject[projectKey]
+            : null;
+        if (!Array.isArray(collapsedIds)) {
+            return { exists: false, collapsed: new Set() };
+        }
+        return {
+            exists: true,
+            collapsed: new Set(collapsedIds.filter((value) => typeof value === "string" && value)),
+        };
+    }
+
+    _activeQueueBatchCollapseSignature(settings = this._settings) {
+        const state = this._readStoredQueueBatchCollapseState(settings);
+        if (!state.exists) return "";
+        return JSON.stringify(Array.from(state.collapsed).sort());
+    }
+
+    _currentRenderQueueBatchIds(queue = this._renderQueue) {
+        return new Set(
+            this._groupRenderQueueJobs(queue || [])
+                .filter((entry) => entry.type === "batch")
+                .map((entry) => entry.batchId)
+                .filter(Boolean)
+        );
+    }
+
+    _applyStoredQueueBatchCollapseState(settings = this._settings) {
+        const storedState = this._readStoredQueueBatchCollapseState(settings);
+        const nextBatchExpanded = {};
+        for (const batchId of this._currentRenderQueueBatchIds()) {
+            if (storedState.collapsed.has(batchId)) {
+                nextBatchExpanded[batchId] = false;
+            }
+        }
+        this._queueBatchExpanded = nextBatchExpanded;
+    }
+
+    _persistQueueBatchCollapseState() {
+        const projectKey = this._queueBatchCollapseProjectKey();
+        if (!projectKey) return;
+        const collapsedIds = Array.from(this._currentRenderQueueBatchIds())
+            .filter((batchId) => this._queueBatchExpanded[batchId] === false)
+            .sort();
+        const prevSignature = this._activeQueueBatchCollapseSignature(this._settings);
+        const nextSignature = JSON.stringify(collapsedIds);
+        if (prevSignature === nextSignature) return;
+        this._updateSettings({
+            layout: {
+                queueBatchCollapsedByProject: {
+                    [projectKey]: collapsedIds,
+                },
+            },
+        });
+    }
+
+    _setQueueBatchExpanded(batchId, expanded, options = {}) {
+        if (!batchId) return;
+        const { persist = false, render = true } = options;
+        if (expanded) {
+            delete this._queueBatchExpanded[batchId];
+        } else {
+            this._queueBatchExpanded[batchId] = false;
+        }
+        if (persist) {
+            this._persistQueueBatchCollapseState();
+        }
+        if (render) {
+            this._renderQueuePanel();
+        }
+    }
+
     _persistTrackCollapseState() {
         const sceneKey = this._trackCollapseSceneKey();
         if (!sceneKey) return;
@@ -2667,6 +2755,8 @@ export class EditorWidget {
         const nextSettings = settings || getEditorSettings();
         const prevTrackCollapseSignature = this._activeTrackCollapseSignature(this._settings);
         const nextTrackCollapseSignature = this._activeTrackCollapseSignature(nextSettings);
+        const prevQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(this._settings);
+        const nextQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(nextSettings);
         const prevTimecodeMode = this._timecodeMode;
         this._settings = nextSettings;
         const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
@@ -2710,6 +2800,10 @@ export class EditorWidget {
             if (this._queueExpanded) {
                 this._fetchRenderQueue();
             }
+        }
+        if (this._queueContainer && prevQueueBatchCollapseSignature !== nextQueueBatchCollapseSignature) {
+            this._applyStoredQueueBatchCollapseState(nextSettings);
+            this._renderQueuePanel();
         }
         if (prevTimecodeMode !== this._timecodeMode && this._itemEditorEl && this.selectedItem) {
             this._showItemEditor();
@@ -2764,6 +2858,7 @@ export class EditorWidget {
         if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
         if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
         if (controls.clipLabelMode) controls.clipLabelMode.value = this._settings.appearance.clipLabelMode;
+        if (controls.batchRenderMaxFramesPerChunk) controls.batchRenderMaxFramesPerChunk.value = String(this._settings.batchRender.maxFramesPerChunk);
         if (controls.defaultProjectFps) controls.defaultProjectFps.value = String(this._settings.projectDefaults.fps);
         if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
         if (controls.defaultProjectHeight) controls.defaultProjectHeight.value = String(this._settings.projectDefaults.height);
@@ -2846,6 +2941,7 @@ export class EditorWidget {
                 scaleTimeline: 1.0,
                 scaleGallery: 1.0,
                 queuePanelExpanded: false,
+                queueBatchCollapsedByProject: null,
                 trackCollapseByScene: null,
                 labelWidth: 0,
                 labelWidthFullscreen: 0,
@@ -6697,19 +6793,32 @@ export class EditorWidget {
     }
 
     // ── Render Queue ─────────────────────────────────────────────────
-    async _addToRenderQueue() {
-        if (!this.activeScene) return;
-        const sceneId = this.activeScene.scene_id;
-        const sceneName = this.activeScene.name;
+    _resolveQueueSelectionRange() {
+        if (!this.activeScene) return null;
         const sceneDuration = Math.max(0, parseInt(this.activeScene.duration_frames, 10) || 0);
-        const selStart = this.selectionStart < this.selectionEnd ? this.selectionStart : 0;
-        const selEnd = this.selectionStart < this.selectionEnd ? this.selectionEnd : sceneDuration;
+        const hasSelection = this.selectionStart < this.selectionEnd;
+        return {
+            sceneId: this.activeScene.scene_id,
+            sceneName: this.activeScene.name,
+            sceneDuration,
+            selStart: hasSelection ? this.selectionStart : 0,
+            selEnd: hasSelection ? this.selectionEnd : sceneDuration,
+            hasSelection,
+        };
+    }
+
+    _buildQueueSnapshot(selStart, selEnd) {
+        const range = this._resolveQueueSelectionRange();
+        if (!range) return null;
+
+        const sceneDuration = range.sceneDuration;
+        const clampedStart = Math.max(0, Math.min(sceneDuration, parseInt(selStart, 10) || 0));
+        const clampedEnd = Math.max(clampedStart, Math.min(sceneDuration, parseInt(selEnd, 10) || 0));
         const preContextFrames = this._contextFrameValue("pre_context_frames");
         const postContextFrames = this._contextFrameValue("post_context_frames");
-        const snapshotStart = Math.max(0, selStart - preContextFrames);
-        const snapshotEnd = Math.min(sceneDuration, selEnd + postContextFrames);
+        const snapshotStart = Math.max(0, clampedStart - preContextFrames);
+        const snapshotEnd = Math.min(sceneDuration, clampedEnd + postContextFrames);
 
-        // Snapshot the prompt coverage for the full render range, not only the raw selection.
         let prompt = this.activeScene.prompt || "";
         const sections = this.activeScene.prompt_sections || [];
         const promptSections = [];
@@ -6739,36 +6848,172 @@ export class EditorWidget {
             }
         }
 
+        return {
+            scene_id: range.sceneId,
+            scene_name: range.sceneName,
+            selection_start: clampedStart,
+            selection_end: clampedEnd,
+            prompt,
+            context_frames: Math.max(preContextFrames, postContextFrames),
+            pre_context_frames: preContextFrames,
+            post_context_frames: postContextFrames,
+            guide_frame_snapshots: guideFrameSnapshots,
+            prompt_sections: promptSections,
+            scene_width: Math.max(0, parseInt(this.activeScene.width, 10) || 0),
+            scene_height: Math.max(0, parseInt(this.activeScene.height, 10) || 0),
+            scene_fps: Math.max(0, parseFloat(this.activeScene.fps) || 0),
+            template_id: this._templateId || "free",
+        };
+    }
+
+    _buildBatchQueueRanges(selStart, selEnd, chunkSize) {
+        const start = Math.max(0, parseInt(selStart, 10) || 0);
+        const end = Math.max(start, parseInt(selEnd, 10) || 0);
+        const size = Math.max(1, parseInt(chunkSize, 10) || 1);
+        if (end <= start) {
+            return [];
+        }
+
+        const ranges = [];
+        let cursor = start;
+        while (cursor < end) {
+            const nextEnd = Math.min(cursor + size, end);
+            ranges.push({ start: cursor, end: nextEnd });
+            cursor = nextEnd;
+        }
+        return ranges;
+    }
+
+    _updateBatchButtonLabel() {
+        if (!this._batchQueueBtn) return;
+
+        const range = this._resolveQueueSelectionRange();
+        if (!range) {
+            this._batchQueueBtn.textContent = "+ Batch";
+            this._batchQueueBtn.title = "Add the current selection to the render queue as chunked jobs";
+            return;
+        }
+
+        const preContextFrames = this._contextFrameValue("pre_context_frames");
+        const postContextFrames = this._contextFrameValue("post_context_frames");
+        const chunkSize = resolveBatchChunkSize({
+            settings: this._settings,
+            template: this._getActiveTemplate(),
+        });
+        const chunks = this._buildBatchQueueRanges(range.selStart, range.selEnd, chunkSize);
+        const chunkCount = Math.max(1, chunks.length);
+        const scopeLabel = range.hasSelection ? "selection" : "scene";
+        const modeLabel = preContextFrames > 0 || postContextFrames > 0
+            ? "Progressive via queued context"
+            : "Independent with zero context";
+
+        this._batchQueueBtn.textContent = `+ Batch (${chunkCount})`;
+        this._batchQueueBtn.title = `Add current ${scopeLabel} to render queue as ${chunkCount} chunk${chunkCount === 1 ? "" : "s"} — ${modeLabel}`;
+    }
+
+    async _readQueueError(resp, fallback) {
+        try {
+            const payload = await resp.json();
+            if (payload?.error) {
+                return payload.error;
+            }
+        } catch {
+            // Fall through to raw text.
+        }
+
+        try {
+            const text = await resp.text();
+            if (text) {
+                return text;
+            }
+        } catch {
+            // Ignore text-read failures.
+        }
+        return fallback;
+    }
+
+    _flashQueueButton(button) {
+        if (!button) return;
+        setButtonVariant(button, "active");
+        window.setTimeout(() => {
+            if (!button.isConnected) return;
+            setButtonVariant(button, button.dataset.ltxBaseVariant || "primary");
+        }, 500);
+    }
+
+    async _addToRenderQueue() {
+        const range = this._resolveQueueSelectionRange();
+        if (!range) return;
+
+        const snapshot = this._buildQueueSnapshot(range.selStart, range.selEnd);
+        if (!snapshot) return;
+
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    scene_id: sceneId,
-                    scene_name: sceneName,
-                    selection_start: selStart,
-                    selection_end: selEnd,
-                    prompt: prompt,
-                    context_frames: Math.max(preContextFrames, postContextFrames),
-                    pre_context_frames: preContextFrames,
-                    post_context_frames: postContextFrames,
-                    guide_frame_snapshots: guideFrameSnapshots,
-                    prompt_sections: promptSections,
-                    scene_width: Math.max(0, parseInt(this.activeScene.width, 10) || 0),
-                    scene_height: Math.max(0, parseInt(this.activeScene.height, 10) || 0),
-                    scene_fps: Math.max(0, parseFloat(this.activeScene.fps) || 0),
-                    template_id: this._templateId || "free",
-                }),
+                body: JSON.stringify(snapshot),
             });
             if (resp.ok) {
-                setButtonVariant(this._queueBtn, "active");
-                setTimeout(() => {
-                    setButtonVariant(this._queueBtn, "primary");
-                }, 500);
-                this._fetchRenderQueue();
+                this._flashQueueButton(this._queueBtn);
+                await this._fetchRenderQueue();
             }
         } catch (e) { console.error("Add to queue failed:", e); }
+    }
+
+    async _addBatchToRenderQueue() {
+        const range = this._resolveQueueSelectionRange();
+        if (!range) return;
+
+        const chunkSize = resolveBatchChunkSize({
+            settings: this._settings,
+            template: this._getActiveTemplate(),
+        });
+        const chunks = this._buildBatchQueueRanges(range.selStart, range.selEnd, chunkSize);
+        if (chunks.length <= 1) {
+            await this._addToRenderQueue();
+            return;
+        }
+
+        const dirName = encodeURIComponent(this._projectDirName());
+        const batchId = globalThis.crypto?.randomUUID?.()
+            || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+
+        try {
+            for (let index = 0; index < chunks.length; index += 1) {
+                const chunk = chunks[index];
+                const snapshot = this._buildQueueSnapshot(chunk.start, chunk.end);
+                if (!snapshot) {
+                    throw new Error("Failed to build batch queue snapshot.");
+                }
+
+                const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        ...snapshot,
+                        batch_id: batchId,
+                        batch_total: chunks.length,
+                        batch_index: index,
+                    }),
+                });
+
+                if (!resp.ok) {
+                    const message = await this._readQueueError(resp, `Add batch chunk failed: ${resp.status}`);
+                    await this._fetchRenderQueue();
+                    alert(message);
+                    return;
+                }
+            }
+
+            this._flashQueueButton(this._batchQueueBtn);
+            await this._fetchRenderQueue();
+        } catch (e) {
+            console.error("Add batch to queue failed:", e);
+            await this._fetchRenderQueue();
+            alert(e?.message || "Add batch to queue failed.");
+        }
     }
 
     async _fetchRenderQueue() {
@@ -6778,6 +7023,7 @@ export class EditorWidget {
             const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`));
             if (resp.ok) {
                 this._renderQueue = await resp.json();
+                this._applyStoredQueueBatchCollapseState();
                 this._renderQueuePanel();
             }
         } catch (e) { console.error("Fetch queue failed:", e); }
@@ -6813,6 +7059,203 @@ export class EditorWidget {
         }
     }
 
+    _groupRenderQueueJobs(queue) {
+        const groups = [];
+        let index = 0;
+        while (index < queue.length) {
+            const job = queue[index];
+            const batchId = String(job?.batch_id || "");
+            if (!batchId) {
+                groups.push({ type: "single", job });
+                index += 1;
+                continue;
+            }
+
+            const jobs = [job];
+            index += 1;
+            while (index < queue.length && String(queue[index]?.batch_id || "") === batchId) {
+                jobs.push(queue[index]);
+                index += 1;
+            }
+
+            if (jobs.length === 1) {
+                groups.push({ type: "single", job });
+                continue;
+            }
+            groups.push({ type: "batch", batchId, jobs });
+        }
+        return groups;
+    }
+
+    _formatQueueStatusLabel(status) {
+        const raw = String(status || "pending").trim().toLowerCase();
+        if (!raw) return "Pending";
+        return raw.charAt(0).toUpperCase() + raw.slice(1);
+    }
+
+    _formatQueueSelectionSummary(job) {
+        const start = Math.max(0, parseInt(job?.selection_start, 10) || 0);
+        const end = Math.max(start, parseInt(job?.selection_end, 10) || 0);
+        const duration = end - start;
+        const preContext = Math.max(0, parseInt(job?.pre_context_frames, 10) || 0);
+        const postContext = Math.max(0, parseInt(job?.post_context_frames, 10) || 0);
+        return `In: ${this._frameToTimecode(start)} Out: ${this._frameToTimecode(end)} (${this._frameToTimecode(duration)}) | Ctx: -${preContext}/+${postContext}`;
+    }
+
+    _createQueueRow(job, { title = "", nested = false } = {}) {
+        const item = document.createElement("div");
+        item.style.cssText = `
+            padding: 6px 8px${nested ? " 6px 18px" : ""};
+            border-bottom: 1px solid ${COLORS.borderSoft};
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr) auto;
+            gap: 8px;
+            font-size: 10px;
+            color: ${COLORS.text};
+            background: ${nested ? COLORS.panel : COLORS.panelMuted};
+            align-items: start;
+        `;
+
+        const badge = document.createElement("span");
+        const colors = {
+            pending: COLORS.textMuted,
+            running: lightenColor(COLORS.sceneBtnActive, 0.15),
+            completed: "#68a376",
+            failed: "#c66d76",
+        };
+        badge.style.cssText = `
+            width: 8px;
+            height: 8px;
+            margin-top: 4px;
+            border-radius: 50%;
+            background: ${colors[job.status] || "#888"};
+            flex-shrink: 0;
+        `;
+        badge.title = job.status;
+        item.appendChild(badge);
+
+        const content = document.createElement("div");
+        content.style.cssText = "min-width:0;display:flex;flex-direction:column;gap:2px;";
+        if (job.prompt) content.title = job.prompt;
+
+        const headingRow = document.createElement("div");
+        headingRow.style.cssText = "display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0;";
+
+        const heading = document.createElement("div");
+        heading.style.cssText = `
+            color: ${COLORS.text};
+            font-size: 11px;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            min-width: 0;
+        `;
+        heading.textContent = title || job.scene_name || "Scene";
+
+        const statusLabel = document.createElement("div");
+        statusLabel.style.cssText = `
+            color: ${COLORS.textMuted};
+            font-size: 10px;
+            flex-shrink: 0;
+            white-space: nowrap;
+        `;
+        statusLabel.textContent = this._formatQueueStatusLabel(job?.status);
+
+        const selectionSummary = document.createElement("div");
+        selectionSummary.style.cssText = `
+            color: ${COLORS.textDim};
+            font-size: 10px;
+            line-height: 1.35;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        `;
+        selectionSummary.textContent = this._formatQueueSelectionSummary(job);
+
+        headingRow.append(heading, statusLabel);
+        content.append(headingRow, selectionSummary);
+        item.appendChild(content);
+
+        const delBtn = document.createElement("span");
+        delBtn.textContent = "x";
+        delBtn.style.cssText = `color: ${COLORS.textMuted}; cursor: pointer; padding: 0 2px; font-size: 9px;`;
+        delBtn.addEventListener("click", async () => {
+            try {
+                const dirName = encodeURIComponent(this._projectDirName());
+                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
+                await this._fetchRenderQueue();
+            } catch (e) {
+                console.error("Delete queue job failed:", e);
+            }
+        });
+        item.appendChild(delBtn);
+
+        return item;
+    }
+
+    _renderQueueBatchGroup(entry) {
+        const batchTotal = Math.max(
+            entry.jobs.length,
+            ...entry.jobs.map((job) => Math.max(0, parseInt(job.batch_total, 10) || 0)),
+        );
+        const shortId = entry.batchId.slice(0, 8);
+        const isOpen = this._queueBatchExpanded[entry.batchId] !== false;
+
+        const group = document.createElement("div");
+        group.style.cssText = `border-bottom: 1px solid ${COLORS.borderSoft}; background: ${COLORS.panelMuted};`;
+
+        const header = document.createElement("button");
+        header.type = "button";
+        header.style.cssText = `
+            width: 100%;
+            padding: 6px 8px;
+            background: ${COLORS.panelMuted};
+            border: none;
+            border-bottom: 1px solid ${COLORS.borderSoft};
+            color: ${COLORS.text};
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            cursor: pointer;
+            font-size: 10px;
+            font-weight: 700;
+            text-align: left;
+        `;
+
+        const countLabel = entry.jobs.length === batchTotal
+            ? `${batchTotal} chunk${batchTotal === 1 ? "" : "s"}`
+            : `${entry.jobs.length} of ${batchTotal} chunks`;
+
+        const headerLabel = document.createElement("span");
+        headerLabel.textContent = `${isOpen ? "v" : ">"} Batch ${shortId} - ${countLabel}`;
+
+        const headerScene = document.createElement("span");
+        headerScene.style.cssText = `color:${COLORS.textMuted};font-weight:600;`;
+        headerScene.textContent = entry.jobs[0]?.scene_name || "Scene";
+
+        header.append(headerLabel, headerScene);
+        header.addEventListener("click", () => {
+            this._setQueueBatchExpanded(entry.batchId, !isOpen, { persist: true });
+        });
+        group.appendChild(header);
+
+        if (isOpen) {
+            const nested = document.createElement("div");
+            nested.style.cssText = "display:flex;flex-direction:column;";
+            entry.jobs.forEach((job, index) => {
+                const chunkIndex = Math.max(1, (parseInt(job.batch_index, 10) || index) + 1);
+                nested.appendChild(this._createQueueRow(job, {
+                    title: `Chunk ${chunkIndex} of ${batchTotal}`,
+                    nested: true,
+                }));
+            });
+            group.appendChild(nested);
+        }
+
+        return group;
+    }
+
     _renderQueuePanel() {
         if (!this._queueContainer) return;
         this._queueContainer.innerHTML = "";
@@ -6820,55 +7263,18 @@ export class EditorWidget {
 
         const queue = this._renderQueue || [];
         if (queue.length === 0) {
-            this._queueContainer.innerHTML = `<div style="padding: 10px; color: ${COLORS.textMuted}; font-style: italic; font-size: 10px;">Queue empty — use + Queue to add jobs</div>`;
+            this._queueContainer.innerHTML = `<div style="padding: 10px; color: ${COLORS.textMuted}; font-style: italic; font-size: 10px;">Queue empty - use + Queue or + Batch to add jobs</div>`;
             return;
         }
 
-        queue.forEach(job => {
-            const item = document.createElement("div");
-            item.style.cssText = `
-                padding: 6px 8px; border-bottom: 1px solid ${COLORS.borderSoft}; display: flex;
-                align-items: center; gap: 8px; font-size: 10px; color: ${COLORS.text};
-                background: ${COLORS.panelMuted};
-            `;
-
-            // Status badge
-            const badge = document.createElement("span");
-            const colors = {
-                pending: COLORS.textMuted,
-                running: lightenColor(COLORS.sceneBtnActive, 0.15),
-                completed: "#68a376",
-                failed: "#c66d76",
-            };
-            badge.style.cssText = `
-                width: 8px; height: 8px; border-radius: 50%;
-                background: ${colors[job.status] || "#888"}; flex-shrink: 0;
-            `;
-            badge.title = job.status;
-            item.appendChild(badge);
-
-            // Job info
-            const info = document.createElement("span");
-            info.style.cssText = `flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: ${COLORS.text};`;
-            info.textContent = `${job.scene_name || "Scene"} ${this._frameToTimecode(job.selection_start)}–${this._frameToTimecode(job.selection_end)}`;
-            if (job.prompt) info.title = job.prompt;
-            item.appendChild(info);
-
-            // Delete button
-            const delBtn = document.createElement("span");
-            delBtn.textContent = "✕";
-            delBtn.style.cssText = `color: ${COLORS.textMuted}; cursor: pointer; padding: 0 2px; font-size: 9px;`;
-            delBtn.addEventListener("click", async () => {
-                try {
-                    const dirName = encodeURIComponent(this._projectDirName());
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
-                    this._fetchRenderQueue();
-                } catch (e) { console.error("Delete queue job failed:", e); }
-            });
-            item.appendChild(delBtn);
-
-            this._queueContainer.appendChild(item);
-        });
+        const groups = this._groupRenderQueueJobs(queue);
+        for (const entry of groups) {
+            if (entry.type === "single") {
+                this._queueContainer.appendChild(this._createQueueRow(entry.job));
+                continue;
+            }
+            this._queueContainer.appendChild(this._renderQueueBatchGroup(entry));
+        }
     }
 
     // ── Settings Panel ────────────────────────────────────────────────
@@ -7103,6 +7509,7 @@ export class EditorWidget {
         this.activeSceneId = "";
         this.activeScene = null;
         this.scenes = [];
+        this._queueBatchExpanded = {};
         this.sceneLabel.textContent = "Loading...";
 
         // Stop playback and clear video cache on project change
@@ -8382,9 +8789,12 @@ export class EditorWidget {
 
                 const summary = document.createElement("div");
                 summary.style.cssText = "font-size:10px;color:#9ca9b5;line-height:1.45;";
-                summary.textContent = MODEL_TEMPLATE_PARAM_KEYS
-                    .map((key) => summarizeConstraint(template.constraints?.[key], key))
-                    .join(" | ");
+                const summaryParts = MODEL_TEMPLATE_PARAM_KEYS
+                    .map((key) => summarizeConstraint(template.constraints?.[key], key));
+                if ((template.constraints?.batchMaxFrames || 0) > 0) {
+                    summaryParts.push(`batch: ${template.constraints.batchMaxFrames}`);
+                }
+                summary.textContent = summaryParts.join(" | ");
 
                 card.append(head, summary);
                 templateList.appendChild(card);
@@ -8488,6 +8898,26 @@ export class EditorWidget {
             }
             refreshConstraintPreviews();
 
+            const batchRow = document.createElement("div");
+            batchRow.style.cssText = "display:flex;align-items:center;gap:8px;";
+            const batchLabel = document.createElement("div");
+            batchLabel.style.cssText = "font-size:10px;color:#92a0ad;min-width:90px;";
+            batchLabel.textContent = "Batch Max Frames";
+            const batchInput = document.createElement("input");
+            batchInput.type = "number";
+            batchInput.min = "1";
+            batchInput.step = "1";
+            batchInput.value = editingTemplate?.constraints?.batchMaxFrames ?? "";
+            batchInput.placeholder = "97";
+            batchInput.style.cssText = `${chromeInputCss({ width: "120px", fontSize: "10px", padding: "4px 6px", textAlign: "right" })}`;
+            batchRow.append(batchLabel, batchInput);
+            form.appendChild(batchRow);
+
+            const batchHelp = document.createElement("div");
+            batchHelp.style.cssText = "margin-left:90px;font-size:10px;color:#8f9cab;line-height:1.4;";
+            batchHelp.textContent = "Default batch chunk ceiling for this template. The active frame constraint still snaps/clamps the final chunk size.";
+            form.appendChild(batchHelp);
+
             const actionRow = document.createElement("div");
             actionRow.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:4px;";
             const saveBtn = document.createElement("button");
@@ -8509,6 +8939,10 @@ export class EditorWidget {
                     if (constraint) {
                         nextTemplate.constraints[paramKey] = constraint;
                     }
+                }
+                const batchMaxFrames = Number(batchInput.value);
+                if (Number.isFinite(batchMaxFrames) && batchMaxFrames > 0) {
+                    nextTemplate.constraints.batchMaxFrames = Math.round(batchMaxFrames);
                 }
                 const nextCustomTemplates = editingTemplate
                     ? customTemplates.map((template) => template.id === editingTemplate.id ? nextTemplate : template)
@@ -8636,6 +9070,24 @@ export class EditorWidget {
             PLAYBACK_RESOLUTION_OPTIONS,
             () => this._settings.playback.resolution,
             (value) => updateCategory("playback", "resolution", value)
+        );
+
+        const queueSection = createSection(
+            "Render Queue",
+            "Local defaults for chunked queueing. A value of 0 uses the active template's batch ceiling."
+        );
+        createNumberInput(
+            queueSection,
+            "batchRenderMaxFramesPerChunk",
+            "Batch Max Frames",
+            "Preferred chunk size before the active template's frame constraint snaps and clamps it.",
+            {
+                min: 0,
+                max: 10000,
+                step: 1,
+                getter: () => this._settings.batchRender.maxFramesPerChunk,
+                onChange: (value) => updateCategory("batchRender", "maxFramesPerChunk", Math.max(0, Math.round(value))),
+            }
         );
 
         const appearanceSection = createSection(

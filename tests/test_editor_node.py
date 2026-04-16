@@ -504,6 +504,71 @@ def test_consume_resets_sole_stale_running_job(tmp_path, monkeypatch):
     assert save_states == [[("job-a", "running", "", 0.0)]]
 
 
+def test_mark_queue_job_failed_skips_later_batch_siblings(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    job_a = types.SimpleNamespace(
+        job_id="job-a",
+        batch_id="batch-1",
+        batch_index=0,
+        status="pending",
+        error="",
+        progress=0.0,
+    )
+    job_b = types.SimpleNamespace(
+        job_id="job-b",
+        batch_id="batch-1",
+        batch_index=1,
+        status="running",
+        error="",
+        progress=0.5,
+    )
+    job_c = types.SimpleNamespace(
+        job_id="job-c",
+        batch_id="batch-1",
+        batch_index=2,
+        status="pending",
+        error="",
+        progress=0.0,
+    )
+    job_d = types.SimpleNamespace(
+        job_id="job-d",
+        batch_id="other-batch",
+        batch_index=0,
+        status="pending",
+        error="",
+        progress=0.0,
+    )
+    project = types.SimpleNamespace(generation_queue=[job_a, job_b, job_c, job_d])
+    save_states = []
+
+    monkeypatch.setattr(
+        editor_node,
+        "save_project",
+        lambda proj: save_states.append(
+            [(job.job_id, job.status, job.error, job.progress) for job in proj.generation_queue]
+        ),
+    )
+
+    node = editor_node.LTXEditor()
+    node._mark_queue_job_failed(project, job_b, "render exploded")
+
+    assert job_a.status == "pending"
+    assert job_b.status == "failed"
+    assert job_b.error == "render exploded"
+    assert job_b.progress == 0.0
+    assert job_c.status == "failed"
+    assert "Skipped after earlier batch failure (job-b)" == job_c.error
+    assert job_c.progress == 0.0
+    assert job_d.status == "pending"
+    assert save_states == [[
+        ("job-a", "pending", "", 0.0),
+        ("job-b", "failed", "render exploded", 0.0),
+        ("job-c", "failed", "Skipped after earlier batch failure (job-b)", 0.0),
+        ("job-d", "pending", "", 0.0),
+    ]]
+
+
 def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")

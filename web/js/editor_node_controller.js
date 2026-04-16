@@ -1,5 +1,6 @@
 const { api } = window.comfyAPI.api;
 
+import { getEditorSettings, updateEditorSettings } from "./editor_settings.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 
@@ -89,10 +90,88 @@ function formatDurationFrames(frameCount) {
     return `${frameCount}f`;
 }
 
-function formatFrameRange(startFrame, endFrame) {
-    const start = Math.max(0, parseInt(startFrame, 10) || 0);
-    const end = Math.max(start, parseInt(endFrame, 10) || 0);
-    return `${start}-${end}`;
+function formatQueueStatusLabel(status) {
+    const raw = String(status || "pending").trim().toLowerCase();
+    if (!raw) return "Pending";
+    return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+function formatQueueTime(frame, fps, mode = "frames") {
+    const safeFrame = Math.max(0, parseInt(frame, 10) || 0);
+    if (mode !== "timecode") return String(safeFrame);
+    const safeFps = Math.max(1, Number(fps) || 24);
+    const totalSeconds = safeFrame / safeFps;
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = Math.floor(totalSeconds % 60);
+    const f = Math.floor(safeFrame % safeFps);
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}:${String(f).padStart(2, "0")}`;
+    return `${m}:${String(s).padStart(2, "0")}:${String(f).padStart(2, "0")}`;
+}
+
+function formatQueueSelectionSummary(job, options = {}) {
+    const start = Math.max(0, parseInt(job?.selection_start, 10) || 0);
+    const end = Math.max(start, parseInt(job?.selection_end, 10) || 0);
+    const duration = end - start;
+    const preContext = Math.max(0, parseInt(job?.pre_context_frames, 10) || 0);
+    const postContext = Math.max(0, parseInt(job?.post_context_frames, 10) || 0);
+    const fps = Math.max(1, Number(job?.scene_fps) || Number(options.fps) || 24);
+    const mode = options.mode === "timecode" ? "timecode" : "frames";
+    return `In: ${formatQueueTime(start, fps, mode)} Out: ${formatQueueTime(end, fps, mode)} (${formatQueueTime(duration, fps, mode)}) | Ctx: -${preContext}/+${postContext}`;
+}
+
+function groupQueueJobs(queue) {
+    const groups = [];
+    let index = 0;
+    while (index < queue.length) {
+        const job = queue[index];
+        const batchId = String(job?.batch_id || "");
+        if (!batchId) {
+            groups.push({ type: "single", job });
+            index += 1;
+            continue;
+        }
+
+        const jobs = [job];
+        index += 1;
+        while (index < queue.length && String(queue[index]?.batch_id || "") === batchId) {
+            jobs.push(queue[index]);
+            index += 1;
+        }
+
+        if (jobs.length === 1) {
+            groups.push({ type: "single", job });
+            continue;
+        }
+        groups.push({ type: "batch", batchId, jobs });
+    }
+    return groups;
+}
+
+function readQueueBatchCollapseState(projectDir, settings = getEditorSettings()) {
+    const projectKey = projectIdFromDir(projectDir);
+    const collapsedByProject = settings?.layout?.queueBatchCollapsedByProject;
+    const collapsedIds = projectKey && collapsedByProject && typeof collapsedByProject === "object"
+        ? collapsedByProject[projectKey]
+        : null;
+    if (!Array.isArray(collapsedIds)) {
+        return new Set();
+    }
+    return new Set(collapsedIds.filter((value) => typeof value === "string" && value));
+}
+
+function persistQueueBatchCollapseState(projectDir, collapsedIds) {
+    const projectKey = projectIdFromDir(projectDir);
+    if (!projectKey) return;
+    updateEditorSettings({
+        layout: {
+            queueBatchCollapsedByProject: {
+                [projectKey]: Array.from(collapsedIds)
+                    .filter((value) => typeof value === "string" && value)
+                    .sort(),
+            },
+        },
+    });
 }
 
 function formatClockTime(seconds) {
@@ -2549,6 +2628,15 @@ export class EditorNodeController {
             return null;
         }
 
+        const settings = getEditorSettings();
+        const timecodeMode = settings?.timelineBehavior?.timecodeMode === "timecode" ? "timecode" : "frames";
+        const collapsedBatchIds = readQueueBatchCollapseState(this.state.projectDir, settings);
+        const fallbackFps = Math.max(
+            1,
+            Number(this.state?.dormantSummary?.active_scene?.effective_fps)
+                || Number(this.state?.dormantSummary?.fps)
+                || 24
+        );
         const colors = {
             pending: CHROME.textMuted,
             running: "#67a6d6",
@@ -2556,14 +2644,14 @@ export class EditorNodeController {
             failed: "#c66d76",
         };
 
-        for (const job of jobs) {
+        const createQueueRow = (job, options = {}) => {
             const row = style(document.createElement("div"), `
                 display: grid;
-                grid-template-columns: auto 1fr;
+                grid-template-columns: auto minmax(0, 1fr);
                 gap: 8px;
-                padding: 7px 8px;
+                padding: 7px 8px${options.nested ? " 7px 18px" : ""};
                 border-radius: 6px;
-                background: rgba(255,255,255,0.03);
+                background: ${options.nested ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)"};
                 border: 1px solid ${CHROME.borderSoft};
                 align-items: start;
             `);
@@ -2582,6 +2670,18 @@ export class EditorNodeController {
                 flex-direction: column;
                 gap: 2px;
             `);
+            if (job.prompt) {
+                text.title = job.prompt;
+            }
+
+            const headingRow = style(document.createElement("div"), `
+                display: flex;
+                align-items: baseline;
+                justify-content: space-between;
+                gap: 8px;
+                min-width: 0;
+            `);
+
             const title = style(document.createElement("div"), `
                 color: ${CHROME.text};
                 font-size: 11px;
@@ -2589,21 +2689,135 @@ export class EditorNodeController {
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
+                min-width: 0;
             `);
-            title.textContent = job.scene_name || "Scene";
+            title.textContent = options.title || job.scene_name || "Scene";
 
-            const meta = style(document.createElement("div"), `
+            const status = style(document.createElement("div"), `
+                color: ${CHROME.textMuted};
+                font-size: 10px;
+                flex-shrink: 0;
+                white-space: nowrap;
+            `);
+            status.textContent = formatQueueStatusLabel(job?.status);
+
+            const selectionSummary = style(document.createElement("div"), `
                 color: ${CHROME.textDim};
                 font-size: 10px;
+                line-height: 1.35;
+                white-space: normal;
+                overflow-wrap: anywhere;
+            `);
+            selectionSummary.textContent = formatQueueSelectionSummary(job, {
+                fps: fallbackFps,
+                mode: timecodeMode,
+            });
+
+            headingRow.append(title, status);
+            text.append(headingRow, selectionSummary);
+            row.append(dot, text);
+            return row;
+        };
+
+        const groups = groupQueueJobs(jobs);
+        for (const entry of groups) {
+            if (entry.type === "single") {
+                wrap.appendChild(createQueueRow(entry.job));
+                continue;
+            }
+
+            const batchTotal = Math.max(
+                entry.jobs.length,
+                ...entry.jobs.map((job) => Math.max(0, parseInt(job?.batch_total, 10) || 0)),
+            );
+            const countLabel = entry.jobs.length === batchTotal
+                ? `${batchTotal} chunk${batchTotal === 1 ? "" : "s"}`
+                : `${entry.jobs.length} of ${batchTotal} chunks`;
+            const isOpen = !collapsedBatchIds.has(entry.batchId);
+
+            const group = style(document.createElement("div"), `
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                padding: 0;
+                border-radius: 6px;
+                background: rgba(255,255,255,0.02);
+                border: 1px solid ${CHROME.borderSoft};
+            `);
+
+            const header = style(document.createElement("button"), `
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                width: 100%;
+                padding: 7px 8px;
+                background: rgba(255,255,255,0.03);
+                border-bottom: 1px solid ${CHROME.borderSoft};
+                color: ${CHROME.text};
+                font-size: 10px;
+                font-weight: 700;
+                cursor: pointer;
+                border-top: none;
+                border-left: none;
+                border-right: none;
+                border-bottom-left-radius: 0;
+                border-bottom-right-radius: 0;
+                text-align: left;
+            `);
+            header.type = "button";
+            header.setAttribute("aria-expanded", isOpen ? "true" : "false");
+
+            const label = style(document.createElement("span"), `
+                min-width: 0;
                 overflow: hidden;
                 text-overflow: ellipsis;
                 white-space: nowrap;
             `);
-            meta.textContent = `${job.status || "pending"} | ${formatFrameRange(job.selection_start, job.selection_end)}`;
+            label.textContent = `${isOpen ? "v" : ">"} Batch ${entry.batchId.slice(0, 8)} - ${countLabel}`;
 
-            text.append(title, meta);
-            row.append(dot, text);
-            wrap.appendChild(row);
+            const scene = style(document.createElement("span"), `
+                color: ${CHROME.textMuted};
+                font-weight: 600;
+                flex-shrink: 0;
+            `);
+            scene.textContent = entry.jobs[0]?.scene_name || "Scene";
+
+            header.append(label, scene);
+            group.appendChild(header);
+            header.addEventListener("pointerdown", (event) => consumeDormantPointer(event, { preventDefault: true }));
+            header.addEventListener("mousedown", (event) => consumeDormantPointer(event, { preventDefault: true }));
+
+            const rows = style(document.createElement("div"), `
+                display: ${isOpen ? "flex" : "none"};
+                flex-direction: column;
+                gap: 4px;
+                padding: 0 0 4px;
+            `);
+            entry.jobs.forEach((job, index) => {
+                const chunkIndex = Math.max(1, (parseInt(job?.batch_index, 10) || index) + 1);
+                rows.appendChild(createQueueRow(job, {
+                    title: `Chunk ${chunkIndex} of ${batchTotal}`,
+                    nested: true,
+                }));
+            });
+            group.appendChild(rows);
+
+            header.addEventListener("click", (event) => {
+                consumeDormantPointer(event, { preventDefault: true });
+                const nextOpen = rows.style.display === "none";
+                rows.style.display = nextOpen ? "flex" : "none";
+                header.setAttribute("aria-expanded", nextOpen ? "true" : "false");
+                label.textContent = `${nextOpen ? "v" : ">"} Batch ${entry.batchId.slice(0, 8)} - ${countLabel}`;
+                if (nextOpen) {
+                    collapsedBatchIds.delete(entry.batchId);
+                } else {
+                    collapsedBatchIds.add(entry.batchId);
+                }
+                persistQueueBatchCollapseState(this.state.projectDir, collapsedBatchIds);
+            });
+
+            wrap.appendChild(group);
         }
 
         return null;

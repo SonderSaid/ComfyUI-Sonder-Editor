@@ -320,6 +320,8 @@ def test_generation_job_roundtrip():
         clip_id="clip001",
         scene_id="sc001",
         batch_index=2,
+        batch_id="batch-123",
+        batch_total=4,
         status="running",
         params={"steps": 20},
         progress=0.5,
@@ -343,6 +345,8 @@ def test_generation_job_roundtrip():
     assert restored.job_id == job.job_id
     assert restored.scene_id == "sc001"
     assert restored.batch_index == 2
+    assert restored.batch_id == "batch-123"
+    assert restored.batch_total == 4
     assert restored.status == "running"
     assert restored.progress == 0.5
     assert restored.selection_start == 24
