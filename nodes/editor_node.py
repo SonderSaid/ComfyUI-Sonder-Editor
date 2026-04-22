@@ -1,4 +1,4 @@
-"""LTX Editor — single node that serves as the project/scene/timeline editor.
+"""Sonder Editor — single node that serves as the project/scene/timeline editor.
 
 Outputs everything the sampler needs based on the current timeline selection:
 guide images, frame indices, prompt, frame count, fps, resolution, audio.
@@ -7,6 +7,7 @@ guide images, frame indices, prompt, frame count, fps, resolution, audio.
 import copy
 import os
 import logging
+import time
 
 import cv2
 import numpy as np
@@ -16,7 +17,7 @@ import folder_paths
 from ..server.project_manager import load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 
-logger = logging.getLogger("ltx_editor")
+logger = logging.getLogger("sonder_editor")
 
 
 def _make_silent_audio(duration_sec: float, sample_rate: int = 44100) -> dict:
@@ -36,7 +37,7 @@ def _coerce_int(value, default: int = 0) -> int:
 
 
 def _get_projects_base_dir():
-    return os.path.join(folder_paths.get_output_directory(), "ltx_projects")
+    return os.path.join(folder_paths.get_output_directory(), "sonder-projects")
 
 
 def _list_project_choices():
@@ -55,8 +56,8 @@ def _list_scene_choices():
     return [CREATE_NEW]
 
 
-class LTXEditor:
-    """The LTX Editor node — project management, scene editing, and timeline
+class SonderEditor:
+    """The Sonder Editor node — project management, scene editing, and timeline
     control all in one node.
 
     Setup mode: create/select projects and scenes.
@@ -65,8 +66,8 @@ class LTXEditor:
     Outputs are computed based on the selected timeline range.
     """
 
-    CATEGORY = "LTX-Editor"
-    RETURN_TYPES = ("LTX_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO",
+    CATEGORY = "Sonder"
+    RETURN_TYPES = ("SONDER_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO",
                      "INT", "INT", "INT", "INT", "FLOAT", "FLOAT")
     RETURN_NAMES = (
         "project", "rendered_frames", "guide_images", "guide_indices", "prompt",
@@ -76,7 +77,7 @@ class LTXEditor:
         "mask_start_time", "mask_end_time",
     )
     OUTPUT_TOOLTIPS = (
-        "The project object. Connect to LTX Save Video.",
+        "The project object. Connect to Sonder Save Video.",
         "Composited video frames from the timeline (all visible clips layered with opacity).",
         "Guide frame images as an IMAGE batch tensor. Connect to LTX guiders.",
         "Comma-separated frame indices for each guide image (e.g., '0,96').",
@@ -218,7 +219,7 @@ class LTXEditor:
         for node in prompt.values():
             if not isinstance(node, dict):
                 continue
-            if node.get("class_type") != "LTXSaveVideo":
+            if node.get("class_type") != "SonderSaveVideo":
                 continue
             inputs = node.get("inputs", {})
             if not isinstance(inputs, dict):
@@ -309,6 +310,7 @@ class LTXEditor:
                 pre_context_frames=0, post_context_frames=0,
                 prompt=None, unique_id=None):
         base_dir = _get_projects_base_dir()
+        execute_started_at = time.perf_counter()
         selection_start = max(0, _coerce_int(selection_start, 0))
         selection_end = max(0, _coerce_int(selection_end, 0))
         pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
@@ -342,6 +344,12 @@ class LTXEditor:
                 selection_end = max(0, _coerce_int(getattr(queue_job, "selection_end", 0), 0))
                 pre_context_frames = max(0, _coerce_int(getattr(queue_job, "pre_context_frames", 0), 0))
                 post_context_frames = max(0, _coerce_int(getattr(queue_job, "post_context_frames", 0), 0))
+            logger.info(
+                "execute begin: scene_id=%s selection=%d-%d",
+                scene_id or "",
+                selection_start,
+                selection_end,
+            )
 
             # --- Find active scene ---
             scene = None
@@ -371,6 +379,12 @@ class LTXEditor:
 
             # --- If no scene, return defaults ---
             if not scene:
+                logger.info(
+                    "execute end: scene_id=%s frames=%d duration=%.2fs",
+                    scene_id or "",
+                    0,
+                    time.perf_counter() - execute_started_at,
+                )
                 return self._empty_execute_result(proj, proj_fps, proj_w, proj_h)
 
             # --- Determine render range ---
@@ -412,7 +426,15 @@ class LTXEditor:
             mask_end_time = (generation_end - context_start) / proj_fps if proj_fps > 0 else 0.0
 
             # --- Render composited frames ---
+            render_started_at = time.perf_counter()
+            logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
             rendered_frames = self._render_scene_frames(proj, scene, render_start, render_end)
+            logger.info(
+                "render end: scene_id=%s frames=%d duration=%.2fs",
+                scene.scene_id,
+                frame_count,
+                time.perf_counter() - render_started_at,
+            )
 
             # --- Gather guide frames within render range ---
             guide_images = []
@@ -462,7 +484,7 @@ class LTXEditor:
             # --- Load audio from scene's audio tracks for the render range ---
             audio = self._load_scene_audio(proj, scene, render_start, render_end)
 
-            # --- Attach execution context for downstream nodes (e.g., LTXSaveVideo Take mode) ---
+            # --- Attach execution context for downstream nodes (e.g., SonderSaveVideo Take mode) ---
             proj._execution_context = {
                 "scene_id": scene.scene_id,
                 "scene_name": scene.name,
@@ -475,6 +497,12 @@ class LTXEditor:
                 "prompt": prompt_text,
                 "queue_job_id": queue_job.job_id if queue_job else "",
             }
+            logger.info(
+                "execute end: scene_id=%s frames=%d duration=%.2fs",
+                scene.scene_id,
+                frame_count,
+                time.perf_counter() - execute_started_at,
+            )
 
             return (
                 proj,
@@ -495,6 +523,12 @@ class LTXEditor:
                 mask_end_time,
             )
         except Exception as e:
+            logger.warning(
+                "execute failed: scene_id=%s duration=%.2fs error=%s",
+                scene_id or "",
+                time.perf_counter() - execute_started_at,
+                e,
+            )
             if proj is not None and queue_job is not None:
                 self._mark_queue_job_failed(proj, queue_job, str(e))
             raise
@@ -529,6 +563,11 @@ class LTXEditor:
                 return cached
             except Exception as e:
                 logger.warning("Failed to load render cache: %s", e)
+                try:
+                    os.remove(cache_path)
+                    logger.warning("Deleted corrupt render cache: %s", cache_path)
+                except OSError as remove_error:
+                    logger.warning("Failed to delete corrupt render cache %s: %s", cache_path, remove_error)
 
         # --- Collect visible clips (skip hidden video lanes) ---
         hidden_lanes = set()
@@ -638,6 +677,7 @@ class LTXEditor:
     def _load_guide_image(self, path: str, asset_type: str,
                           target_w: int, target_h: int) -> torch.Tensor | None:
         """Load an image file and return as (H, W, 3) float32 RGB tensor."""
+        cap = None
         try:
             if asset_type == "video":
                 # Extract first frame from video
@@ -645,7 +685,6 @@ class LTXEditor:
                 if not cap.isOpened():
                     return None
                 ret, frame = cap.read()
-                cap.release()
                 if not ret:
                     return None
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -666,6 +705,9 @@ class LTXEditor:
         except Exception as e:
             logger.warning("Failed to load guide image %s: %s", path, e)
             return None
+        finally:
+            if cap is not None:
+                cap.release()
 
     def _load_scene_audio(self, proj: TimelineProject, scene: Scene,
                           sel_start: int, sel_end: int) -> dict:
@@ -694,18 +736,42 @@ class LTXEditor:
                     hidden_audio_lanes.add(i)
 
             any_loaded = False
+            considered_tracks = len(scene.audio_tracks)
+            loaded_tracks = 0
             for track in scene.audio_tracks:
-                if track.muted or track.lane_index in hidden_audio_lanes:
+                if track.muted:
+                    logger.debug("Skipping scene audio track %s: muted", track.source_path)
+                    continue
+                if track.lane_index in hidden_audio_lanes:
+                    logger.debug(
+                        "Skipping scene audio track %s: hidden lane %s",
+                        track.source_path,
+                        track.lane_index,
+                    )
                     continue
                 # Check if track overlaps selection
                 if track.timeline_end_frame <= sel_start or track.timeline_start_frame >= sel_end:
+                    logger.debug(
+                        "Skipping scene audio track %s: no overlap with range %d-%d",
+                        track.source_path,
+                        sel_start,
+                        sel_end,
+                    )
                     continue
 
-                src_path = track.source_path
+                raw_path = track.source_path
+                fallback_path = os.path.join(proj.project_dir, track.source_path)
+                src_path = raw_path
                 if not os.path.isfile(src_path):
                     # Try relative to project dir
-                    src_path = os.path.join(proj.project_dir, track.source_path)
+                    src_path = fallback_path
                 if not os.path.isfile(src_path):
+                    logger.info(
+                        "Skipping scene audio track %s: file not found (attempted: %s, %s)",
+                        track.source_path,
+                        raw_path,
+                        fallback_path,
+                    )
                     continue
 
                 waveform, sr = torchaudio.load(src_path)
@@ -731,6 +797,10 @@ class LTXEditor:
                 src_audio = waveform[:, audio_offset_samples:]
                 available = total_samples - track_offset_samples
                 if available <= 0:
+                    logger.debug(
+                        "Skipping scene audio track %s: no buffer space after offsets",
+                        track.source_path,
+                    )
                     continue
                 src_audio = src_audio[:, :available]
 
@@ -742,8 +812,16 @@ class LTXEditor:
 
                 mixed[:, track_offset_samples:end_sample] += src_audio * track.volume
                 any_loaded = True
+                loaded_tracks += 1
 
             if not any_loaded:
+                logger.info(
+                    "Scene audio fell back to silence: considered=%d loaded=%d range=%d-%d",
+                    considered_tracks,
+                    loaded_tracks,
+                    sel_start,
+                    sel_end,
+                )
                 return _make_silent_audio(duration_sec, sample_rate)
 
             # Clamp to prevent clipping

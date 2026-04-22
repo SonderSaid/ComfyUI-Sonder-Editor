@@ -10,8 +10,8 @@ import {
 } from "./editor_settings.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
-const ROOT_FOLDER_COLLAPSE_KEY = "__ltx_root__";
-const TRASH_FOLDER_COLLAPSE_KEY = "__ltx_trash__";
+const ROOT_FOLDER_COLLAPSE_KEY = "__sonder_root__";
+const TRASH_FOLDER_COLLAPSE_KEY = "__sonder_trash__";
 const SORT_OPTIONS = GALLERY_SORT_OPTIONS;
 const LIST_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
 const THUMBNAIL_SIZE_CONFIG = {
@@ -89,16 +89,16 @@ function buildAssetViewUrl(projectDir, sourcePath) {
     const dirName = projectIdFromDir(projectDir);
     const fileName = sourcePath.split(/[/\\]/).pop();
     const subPath = sourcePath.split(/[/\\]/).slice(0, -1).join("/");
-    const subfolder = `ltx_projects/${dirName}/${subPath}`;
+    const subfolder = `sonder-projects/${dirName}/${subPath}`;
     return api.apiURL(`/view?filename=${encodeURIComponent(fileName)}&subfolder=${encodeURIComponent(subfolder)}&type=output`);
 }
 
 function buildThumbnailUrl(projectDir, assetId) {
-    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${assetId}`);
+    return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${assetId}`);
 }
 
 function buildWaveformUrl(projectDir, assetId) {
-    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/waveform/${assetId}`);
+    return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/waveform/${assetId}`);
 }
 
 export function loadMediaAsBlob(url, mediaEl) {
@@ -477,7 +477,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     const detailPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:8px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.border};min-height:0;overflow:auto;`);
     content.append(listPane, detailPane);
 
-    const folderListId = `ltx-gallery-folders-${Math.random().toString(36).slice(2)}`;
+    const folderListId = `sonder-gallery-folders-${Math.random().toString(36).slice(2)}`;
     const folderList = document.createElement("datalist");
     folderList.id = folderListId;
     root.appendChild(folderList);
@@ -491,7 +491,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function storageKey(suffix) {
-        return `ltx-gallery-${currentProjectId()}-${suffix}`;
+        return `sonder-gallery-${currentProjectId()}-${suffix}`;
     }
 
     function ensureProjectPrefs() {
@@ -1177,7 +1177,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 clearUsageView();
                 await options.onRefresh?.();
             } catch (error) {
-                console.warn("[LTX Editor] Failed to move selected assets:", error);
+                console.warn("[Sonder] Failed to move selected assets:", error);
                 alert(error?.message || "Failed to move selected assets.");
             }
         });
@@ -1217,7 +1217,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to trash selected assets:", error);
+            console.warn("[Sonder] Failed to trash selected assets:", error);
             alert(error?.message || "Failed to move selected assets to Trash.");
         }
     }
@@ -1236,7 +1236,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to restore asset:", error);
+            console.warn("[Sonder] Failed to restore asset:", error);
             alert(error?.message || "Failed to restore asset.");
         }
     }
@@ -1259,7 +1259,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to restore selected assets:", error);
+            console.warn("[Sonder] Failed to restore selected assets:", error);
             alert(error?.message || "Failed to restore selected assets.");
         }
     }
@@ -1305,7 +1305,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to permanently delete asset:", error);
+            console.warn("[Sonder] Failed to permanently delete asset:", error);
             alert(error?.message || "Failed to permanently delete asset.");
         }
     }
@@ -1345,7 +1345,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to permanently delete selected assets:", error);
+            console.warn("[Sonder] Failed to permanently delete selected assets:", error);
             alert(error?.message || "Failed to permanently delete selected assets.");
         }
     }
@@ -1361,7 +1361,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to empty trash:", error);
+            console.warn("[Sonder] Failed to empty trash:", error);
             alert(error?.message || "Failed to empty trash.");
         }
     }
@@ -1621,7 +1621,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             try {
                 cleanup?.();
             } catch (error) {
-                console.warn("[LTX Editor] Overlay cleanup failed:", error);
+                console.warn("[Sonder] Overlay cleanup failed:", error);
             }
         }
         overlay.togglePlayback = null;
@@ -2924,7 +2924,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     setBusyButton(saveBtn, true, "Saving...", "Save Metadata");
                     await applyAssetUpdate(asset, { name: nameInput.value, folder: folderInput.value });
                 } catch (error) {
-                    console.warn("[LTX Editor] Failed to save asset metadata:", error);
+                    console.warn("[Sonder] Failed to save asset metadata:", error);
                 } finally {
                     setBusyButton(saveBtn, false, "Saving...", "Save Metadata");
                 }
@@ -2971,7 +2971,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             updateFolderOptions();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to create folder:", error);
+            console.warn("[Sonder] Failed to create folder:", error);
         }
     }
 
@@ -3037,7 +3037,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to trash asset:", error);
+            console.warn("[Sonder] Failed to trash asset:", error);
             alert(error?.message || "Failed to move asset to Trash.");
         }
     }
@@ -3055,7 +3055,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             renameFolderLocally(folderName, nextFolder, Array.isArray(payload) ? payload : payload?.folders);
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to rename folder:", error);
+            console.warn("[Sonder] Failed to rename folder:", error);
             alert(error?.message || "Failed to rename folder.");
         }
     }
@@ -3086,7 +3086,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             render();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to trash folder:", error);
+            console.warn("[Sonder] Failed to trash folder:", error);
             alert(error?.message || "Failed to move folder to Trash.");
         }
     }
@@ -3276,7 +3276,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             showContextMenu(event.clientX, event.clientY, folderContextMenuItems(normalized));
         });
         header.addEventListener("dragover", (event) => {
-            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/ltx-asset-move")) return;
+            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/x-sonder-asset-move")) return;
             event.preventDefault();
             event.stopPropagation();
             event.dataTransfer.dropEffect = "move";
@@ -3288,14 +3288,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (state.dropFolder === normalized) clearDropFolderHighlight();
         });
         header.addEventListener("drop", async (event) => {
-            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/ltx-asset-move")) return;
+            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/x-sonder-asset-move")) return;
             event.preventDefault();
             event.stopPropagation();
             root.style.outline = "none";
             clearDropFolderHighlight();
             hideContextMenu();
             try {
-                const rawPayload = event.dataTransfer.getData("application/ltx-asset-move");
+                const rawPayload = event.dataTransfer.getData("application/x-sonder-asset-move");
                 const payload = rawPayload ? JSON.parse(rawPayload) : {};
                 const assetIds = Array.isArray(payload?.assetIds) ? payload.assetIds : [];
                 if (!assetIds.length) return;
@@ -3303,7 +3303,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 clearUsageView();
                 await options.onRefresh?.();
             } catch (error) {
-                console.warn("[LTX Editor] Failed to drop-move assets:", error);
+                console.warn("[Sonder] Failed to drop-move assets:", error);
                 alert(error?.message || "Failed to move selected assets.");
             }
         });
@@ -3367,7 +3367,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
             await options.onRefresh?.();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to replace asset:", error);
+            console.warn("[Sonder] Failed to replace asset:", error);
         } finally {
             replaceInput.value = "";
         }
@@ -3476,7 +3476,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                             ? selectedAssetIdsList()
                             : [asset.asset_id];
                         event.dataTransfer.effectAllowed = "move";
-                        event.dataTransfer.setData("application/ltx-asset-move", JSON.stringify({ assetIds: moveIds }));
+                        event.dataTransfer.setData("application/x-sonder-asset-move", JSON.stringify({ assetIds: moveIds }));
                         event.dataTransfer.setData("text/plain", moveIds.length > 1 ? `${moveIds.length} assets` : assetDisplayName(asset));
                         if (!state.selectedAssetIds.has(asset.asset_id) || moveIds.length === 1) {
                             applySelectionState(moveIds, asset.asset_id);
@@ -3487,7 +3487,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     }
                     const payload = JSON.stringify({ ...asset, _projectDir: projectIdFromDir(currentProjectDir()) });
                     event.dataTransfer.effectAllowed = "copy";
-                    event.dataTransfer.setData("application/ltx-asset", payload);
+                    event.dataTransfer.setData("application/x-sonder-asset", payload);
                     event.dataTransfer.setData("text/plain", assetDisplayName(asset));
                 });
                 row.addEventListener("dragend", () => {
@@ -3645,7 +3645,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
             await options.onRefresh?.();
         } catch (error) {
-            console.warn("[LTX Editor] Failed to import dropped files:", error);
+            console.warn("[Sonder] Failed to import dropped files:", error);
         }
     }
 

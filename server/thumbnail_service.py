@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-logger = logging.getLogger("ltx_editor")
+logger = logging.getLogger("sonder_editor")
 
 THUMB_SIZE = (192, 128)  # width, height
 

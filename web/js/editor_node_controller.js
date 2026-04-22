@@ -398,23 +398,23 @@ function buildDormantSummaryUrl(state) {
     params.set("selection_end", String(state.selectionEnd || 0));
     params.set("pre_context_frames", String(state.preContextFrames || 0));
     params.set("post_context_frames", String(state.postContextFrames || 0));
-    return api.apiURL(`/ltx-editor/project/${projectId}/dormant_summary?${params.toString()}`);
+    return api.apiURL(`/sonder-editor/project/${projectId}/dormant_summary?${params.toString()}`);
 }
 
 function buildDormantAssetsUrl(projectDir) {
-    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/assets/dormant?include_trashed=true`);
+    return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/assets/dormant?include_trashed=true`);
 }
 
 function buildQueueUrl(projectDir) {
-    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/queue`);
+    return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/queue`);
 }
 
 function buildQueueJobUrl(projectDir, jobId) {
-    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/queue/${jobId}`);
+    return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/queue/${jobId}`);
 }
 
 function buildSceneUrl(projectDir, sceneId) {
-    return api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/scenes/${sceneId}`);
+    return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/scenes/${sceneId}`);
 }
 
 async function fetchJson(url, signal) {
@@ -476,7 +476,7 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
                     sourcePath: clip.source_path,
                     mediaUrl: !isMissingAsset(asset) ? buildProjectAssetViewURL(projectDir, clip.source_path) : "",
                     posterUrl: !isMissingAsset(asset) && asset?.has_thumbnail
-                        ? api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
+                        ? api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
                         : null,
                     missing: isMissingAsset(asset),
                     opacity: Math.max(0, Math.min(1, Number(clip.opacity ?? 1))),
@@ -517,7 +517,7 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
             subtitle: asset?.name || clip.source_path.split(/[/\\]/).pop() || "Clip",
             key: clip.clip_id || `${clip.source_path}:${clip.timeline_start_frame || 0}:${clip.track_index || 0}`,
             posterUrl: asset?.has_thumbnail
-                ? api.apiURL(`/ltx-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
+                ? api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
                 : null,
             mediaUrl: buildProjectAssetViewURL(projectDir, clip.source_path),
             clip,
@@ -640,7 +640,7 @@ class DormantNodeCard {
             font-size: 11px;
             overflow: hidden;
         `);
-        this.root.dataset.ltxEditor = "1";
+        this.root.dataset.sonderEditor = "1";
 
         this._headerEl = this.root.appendChild(document.createElement("div"));
         this._badgeRowEl = this.root.appendChild(style(document.createElement("div"), `
@@ -714,7 +714,7 @@ class DormantNodeCard {
             text-overflow: ellipsis;
             white-space: nowrap;
         `);
-        projectTitle.textContent = summary?.name || state.projectName || "LTX Editor";
+        projectTitle.textContent = summary?.name || state.projectName || "Sonder Editor";
         const sceneTitle = style(document.createElement("div"), `
             color: ${CHROME.textDim};
             overflow: hidden;
@@ -1158,7 +1158,13 @@ export class EditorNodeController {
             this._queueSaveCompletionCounter = 0;
             this._lastQueueSettledSaveCompletionCounter = 0;
             this.state.projectDir = projectDir;
+            this.state.sceneId = "";
+            this.state.selectionStart = 0;
+            this.state.selectionEnd = 0;
             this.state.dormantSummary = null;
+            this._setWidgetValue("scene_id", "");
+            this._setWidgetValue("selection_start", 0);
+            this._setWidgetValue("selection_end", 0);
             this._invalidateModules(["project", "assets", "scene", "queue"]);
             this.state.expandedModuleId = "";
         }
@@ -1179,7 +1185,7 @@ export class EditorNodeController {
 
         try {
             if (syncAssets) {
-                const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets`), {
+                const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets`), {
                     signal: aborter.signal,
                 });
                 if (!resp.ok) {
@@ -1193,7 +1199,7 @@ export class EditorNodeController {
             );
         } catch (e) {
             if (e.name !== "AbortError") {
-                console.warn("[LTX Editor] Failed to fetch dormant summary:", e);
+                console.warn("[Sonder] Failed to fetch dormant summary:", e);
             }
         } finally {
             if (this._summaryAborter === aborter) {
@@ -1299,14 +1305,14 @@ export class EditorNodeController {
             this.fullscreenSession = session;
             session.mount();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to open fullscreen editor:", e);
+            console.warn("[Sonder] Failed to open fullscreen editor:", e);
             if (this.fullscreenSession) {
                 const failedSession = this.fullscreenSession;
                 this.fullscreenSession = null;
                 try {
                     failedSession.destroy();
                 } catch (cleanupErr) {
-                    console.warn("[LTX Editor] Failed to clean up fullscreen session after mount error:", cleanupErr);
+                    console.warn("[Sonder] Failed to clean up fullscreen session after mount error:", cleanupErr);
                 }
             }
             this.fullscreenSession = null;
@@ -1427,7 +1433,7 @@ export class EditorNodeController {
     async _updateAssetMetadata(assetId, updates) {
         if (!this.state.projectDir || !assetId) return null;
 
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(updates),
@@ -1458,7 +1464,7 @@ export class EditorNodeController {
 
     async _getAssetUsages(assetId) {
         if (!this.state.projectDir || !assetId) return null;
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}/usages`));
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}/usages`));
         if (!resp.ok) {
             throw new Error(`Asset usage fetch failed: ${resp.status}`);
         }
@@ -1467,7 +1473,7 @@ export class EditorNodeController {
 
     async _getBulkAssetUsages(assetIds) {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return null;
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-usages`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-usages`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds }),
@@ -1480,7 +1486,7 @@ export class EditorNodeController {
 
     async _bulkMoveAssets(assetIds, folder = "") {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { updated: 0 };
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-move`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-move`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, folder }),
@@ -1496,7 +1502,7 @@ export class EditorNodeController {
     async _deleteAsset(assetId, force = false) {
         if (!this.state.projectDir || !assetId) return { status: "noop" };
 
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}`), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ force: !!force }),
@@ -1520,7 +1526,7 @@ export class EditorNodeController {
     async _restoreAsset(assetId) {
         if (!this.state.projectDir || !assetId) return { status: "noop" };
 
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/restore`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/restore`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_id: assetId }),
@@ -1539,7 +1545,7 @@ export class EditorNodeController {
 
     async _bulkRestoreAssets(assetIds) {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-restore`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-restore`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds }),
@@ -1558,7 +1564,7 @@ export class EditorNodeController {
 
     async _bulkDeleteAssets(assetIds, force = false) {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-delete`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
@@ -1582,7 +1588,7 @@ export class EditorNodeController {
     async _permanentDeleteAsset(assetId, force = false) {
         if (!this.state.projectDir || !assetId) return { status: "noop" };
 
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/permanent`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/permanent`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_id: assetId, force: !!force }),
@@ -1605,7 +1611,7 @@ export class EditorNodeController {
 
     async _bulkPermanentDeleteAssets(assetIds, force = false) {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-permanent-delete`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-permanent-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
@@ -1628,7 +1634,7 @@ export class EditorNodeController {
 
     async _emptyTrash() {
         if (!this.state.projectDir) return { status: "noop" };
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/empty-trash`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/empty-trash`), {
             method: "POST",
         });
         if (!resp.ok) {
@@ -1645,7 +1651,7 @@ export class EditorNodeController {
 
     async _createAssetFolder(folderName) {
         if (!this.state.projectDir || !folderName) return [];
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ folder: folderName }),
@@ -1666,7 +1672,7 @@ export class EditorNodeController {
 
     async _renameAssetFolder(folderName, newFolderName) {
         if (!this.state.projectDir || !folderName || !newFolderName) return [];
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ old_folder: folderName, new_folder: newFolderName }),
@@ -1684,7 +1690,7 @@ export class EditorNodeController {
 
     async _deleteAssetFolder(folderName, force = false) {
         if (!this.state.projectDir || !folderName) return { status: "noop" };
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ folder: folderName, force: !!force }),

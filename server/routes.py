@@ -14,7 +14,7 @@ from .timeline_state import (
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 
-logger = logging.getLogger("ltx_editor")
+logger = logging.getLogger("sonder_editor")
 
 # Defer route registration until ComfyUI's PromptServer is available.
 try:
@@ -22,7 +22,7 @@ try:
     routes = PromptServer.instance.routes
 except Exception:
     routes = None
-    logger.warning("PromptServer not available — LTX Editor API routes disabled")
+    logger.warning("PromptServer not available — Sonder Editor API routes disabled")
 
 
 def _json_error(msg: str, status: int = 400) -> web.Response:
@@ -558,7 +558,7 @@ def _get_base_dir() -> str:
     """Get the default base directory for projects."""
     try:
         import folder_paths
-        return os.path.join(folder_paths.get_output_directory(), "ltx_projects")
+        return os.path.join(folder_paths.get_output_directory(), "sonder-projects")
     except Exception:
         return ""
 
@@ -1237,7 +1237,7 @@ if routes is not None:
     # Project CRUD
     # -----------------------------------------------------------------------
 
-    @routes.get("/ltx-editor/projects")
+    @routes.get("/sonder-editor/projects")
     async def api_list_projects(request: web.Request) -> web.Response:
         base_dir = request.query.get("base_dir", "") or _get_base_dir()
         if not base_dir:
@@ -1245,7 +1245,7 @@ if routes is not None:
         projects = list_projects(base_dir)
         return web.json_response({"projects": projects})
 
-    @routes.get("/ltx-editor/project/{project_id}")
+    @routes.get("/sonder-editor/project/{project_id}")
     async def api_get_project(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1253,7 +1253,7 @@ if routes is not None:
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-    @routes.get("/ltx-editor/project/{project_id}/dormant_summary")
+    @routes.get("/sonder-editor/project/{project_id}/dormant_summary")
     async def api_get_dormant_summary(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1270,7 +1270,7 @@ if routes is not None:
         )
         return web.json_response(summary)
 
-    @routes.post("/ltx-editor/project")
+    @routes.post("/sonder-editor/project")
     async def api_create_project(request: web.Request) -> web.Response:
         try:
             body = await request.json()
@@ -1294,7 +1294,7 @@ if routes is not None:
             logger.exception("Failed to create project")
             return _json_error(str(e), 500)
 
-    @routes.put("/ltx-editor/project/{project_id}")
+    @routes.put("/sonder-editor/project/{project_id}")
     async def api_update_project(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1324,7 +1324,7 @@ if routes is not None:
     # Asset management
     # -----------------------------------------------------------------------
 
-    @routes.get("/ltx-editor/project/{project_id}/assets")
+    @routes.get("/sonder-editor/project/{project_id}/assets")
     async def api_list_assets(request: web.Request) -> web.Response:
         """List all assets in a project, optionally filtered by type.
         Auto-discovers untracked files in media/ folder.
@@ -1352,7 +1352,7 @@ if routes is not None:
 
         return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
 
-    @routes.get("/ltx-editor/project/{project_id}/assets/dormant")
+    @routes.get("/sonder-editor/project/{project_id}/assets/dormant")
     async def api_list_dormant_assets(request: web.Request) -> web.Response:
         """List lightweight asset data without scanning/syncing media folders."""
         try:
@@ -1366,7 +1366,7 @@ if routes is not None:
 
         return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/import")
+    @routes.post("/sonder-editor/project/{project_id}/assets/import")
     async def api_import_asset(request: web.Request) -> web.Response:
         """Import a media file into the project's media directory."""
         try:
@@ -1426,7 +1426,7 @@ if routes is not None:
 
         return web.json_response(_asset_payload(project, asset), status=201)
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/folders")
+    @routes.post("/sonder-editor/project/{project_id}/assets/folders")
     async def api_create_asset_folder(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1446,7 +1446,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"folders": _collect_asset_folders(project)})
 
-    @routes.put("/ltx-editor/project/{project_id}/assets/folders")
+    @routes.put("/sonder-editor/project/{project_id}/assets/folders")
     async def api_rename_asset_folder(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1474,7 +1474,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"folders": folders, "assets_moved": assets_moved})
 
-    @routes.delete("/ltx-editor/project/{project_id}/assets/folders")
+    @routes.delete("/sonder-editor/project/{project_id}/assets/folders")
     async def api_delete_asset_folder(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1510,7 +1510,7 @@ if routes is not None:
             "trashed_assets": len(trashed_assets),
         })
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/extract_frame")
+    @routes.post("/sonder-editor/project/{project_id}/assets/extract_frame")
     async def api_extract_frame(request: web.Request) -> web.Response:
         """Extract a single video frame and save as an image asset."""
         try:
@@ -1584,7 +1584,7 @@ if routes is not None:
             logger.warning("Failed to extract frame: %s", e)
             return _json_error(str(e), 500)
 
-    @routes.put("/ltx-editor/project/{project_id}/assets/bulk-move")
+    @routes.put("/sonder-editor/project/{project_id}/assets/bulk-move")
     async def api_bulk_move_assets(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1613,7 +1613,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"updated": len(assets)})
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-usages")
+    @routes.post("/sonder-editor/project/{project_id}/assets/bulk-usages")
     async def api_bulk_asset_usages(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1634,7 +1634,7 @@ if routes is not None:
 
         return web.json_response(_aggregate_asset_usages(project, assets))
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-delete")
+    @routes.post("/sonder-editor/project/{project_id}/assets/bulk-delete")
     async def api_bulk_delete_assets(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1662,7 +1662,7 @@ if routes is not None:
             "trashed": trashed_ids,
         })
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/restore")
+    @routes.post("/sonder-editor/project/{project_id}/assets/restore")
     async def api_restore_asset(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1689,7 +1689,7 @@ if routes is not None:
             "asset": _asset_payload(project, asset),
         })
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-restore")
+    @routes.post("/sonder-editor/project/{project_id}/assets/bulk-restore")
     async def api_bulk_restore_assets(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1716,7 +1716,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"restored": restored_ids})
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/permanent")
+    @routes.post("/sonder-editor/project/{project_id}/assets/permanent")
     async def api_permanent_delete_asset(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1753,7 +1753,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(payload)
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/bulk-permanent-delete")
+    @routes.post("/sonder-editor/project/{project_id}/assets/bulk-permanent-delete")
     async def api_bulk_permanent_delete_assets(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1795,7 +1795,7 @@ if routes is not None:
             "usages_orphaned": usage["usage_count"],
         })
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/empty-trash")
+    @routes.post("/sonder-editor/project/{project_id}/assets/empty-trash")
     async def api_empty_asset_trash(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1816,7 +1816,7 @@ if routes is not None:
             "emptied": len(deleted_ids),
         })
 
-    @routes.put("/ltx-editor/project/{project_id}/assets/{asset_id}")
+    @routes.put("/sonder-editor/project/{project_id}/assets/{asset_id}")
     async def api_update_asset(request: web.Request) -> web.Response:
         """Update asset properties (e.g. name)."""
         try:
@@ -1843,7 +1843,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(_asset_payload(project, asset))
 
-    @routes.get("/ltx-editor/project/{project_id}/assets/{asset_id}/usages")
+    @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/usages")
     async def api_get_asset_usages(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1857,7 +1857,7 @@ if routes is not None:
 
         return web.json_response(_find_asset_usages(project, asset))
 
-    @routes.delete("/ltx-editor/project/{project_id}/assets/{asset_id}")
+    @routes.delete("/sonder-editor/project/{project_id}/assets/{asset_id}")
     async def api_delete_asset(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1873,7 +1873,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(payload)
 
-    @routes.post("/ltx-editor/project/{project_id}/assets/{asset_id}/replace")
+    @routes.post("/sonder-editor/project/{project_id}/assets/{asset_id}/replace")
     async def api_replace_asset(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -1910,7 +1910,7 @@ if routes is not None:
             "usage": _find_asset_usages(project, asset),
         })
 
-    @routes.get("/ltx-editor/project/{project_id}/thumbnail/{asset_id}")
+    @routes.get("/sonder-editor/project/{project_id}/thumbnail/{asset_id}")
     async def api_get_thumbnail(request: web.Request) -> web.Response:
         """Serve a thumbnail image for an asset."""
         try:
@@ -1938,7 +1938,7 @@ if routes is not None:
 
         return web.FileResponse(thumb_path)
 
-    @routes.get("/ltx-editor/project/{project_id}/thumbnail_strip/{asset_id}")
+    @routes.get("/sonder-editor/project/{project_id}/thumbnail_strip/{asset_id}")
     async def api_get_thumbnail_strip(request: web.Request) -> web.Response:
         """Serve a filmstrip thumbnail for a video asset (tiled frames)."""
         try:
@@ -1978,7 +1978,7 @@ if routes is not None:
 
         return web.FileResponse(strip_path)
 
-    @routes.get("/ltx-editor/project/{project_id}/waveform/{asset_id}")
+    @routes.get("/sonder-editor/project/{project_id}/waveform/{asset_id}")
     async def api_get_waveform(request: web.Request) -> web.Response:
         """Serve waveform peaks data for an audio asset or a video asset with audio."""
         try:
@@ -2022,7 +2022,7 @@ if routes is not None:
     # Scene CRUD
     # -----------------------------------------------------------------------
 
-    @routes.get("/ltx-editor/project/{project_id}/scenes")
+    @routes.get("/sonder-editor/project/{project_id}/scenes")
     async def api_list_scenes(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2033,7 +2033,7 @@ if routes is not None:
             "scenes": [s.to_dict() for s in project.scenes_ordered()]
         })
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes")
+    @routes.post("/sonder-editor/project/{project_id}/scenes")
     async def api_create_scene(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2055,7 +2055,7 @@ if routes is not None:
 
         return web.json_response(scene.to_dict(), status=201)
 
-    @routes.get("/ltx-editor/project/{project_id}/scenes/{scene_id}")
+    @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_get_scene(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2069,7 +2069,7 @@ if routes is not None:
 
         return web.json_response(scene.to_dict())
 
-    @routes.put("/ltx-editor/project/{project_id}/scenes/{scene_id}")
+    @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_update_scene(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2125,7 +2125,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(scene.to_dict())
 
-    @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}")
+    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_delete_scene(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2143,7 +2143,7 @@ if routes is not None:
     # Scene restore (undo/redo support)
     # -----------------------------------------------------------------------
 
-    @routes.put("/ltx-editor/project/{project_id}/scenes/{scene_id}/restore")
+    @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
     async def api_restore_scene(request: web.Request) -> web.Response:
         """Replace a scene entirely from a snapshot (for undo/redo)."""
         try:
@@ -2206,7 +2206,7 @@ if routes is not None:
     # Guide frames
     # -----------------------------------------------------------------------
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/guides")
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides")
     async def api_add_guide(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2240,7 +2240,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(guide.to_dict(), status=201)
 
-    @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
+    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
     async def api_delete_guide(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2268,7 +2268,7 @@ if routes is not None:
     # Clips (video on timeline)
     # -----------------------------------------------------------------------
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/clips")
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips")
     async def api_add_clip(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2362,7 +2362,7 @@ if routes is not None:
             result["audio_track"] = audio_track_dict
         return web.json_response(result, status=201)
 
-    @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
+    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
     async def api_delete_clip(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2384,7 +2384,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"status": "deleted"})
 
-    @routes.put("/ltx-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
+    @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}")
     async def api_update_clip(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2430,7 +2430,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(clip.to_dict())
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}/split")
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}/split")
     async def api_split_clip(request: web.Request) -> web.Response:
         """Split a clip at a given frame into two clips."""
         try:
@@ -2495,7 +2495,7 @@ if routes is not None:
     # Audio tracks (audio on timeline)
     # -----------------------------------------------------------------------
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/audio_tracks")
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks")
     async def api_add_audio_track(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2535,7 +2535,7 @@ if routes is not None:
 
         return web.json_response(track.to_dict(), status=201)
 
-    @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
+    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
     async def api_delete_audio_track(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2557,7 +2557,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"status": "deleted"})
 
-    @routes.put("/ltx-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
+    @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}")
     async def api_update_audio_track(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2606,7 +2606,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(track.to_dict())
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}/split")
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}/split")
     async def api_split_audio_track(request: web.Request) -> web.Response:
         """Split an audio track at a given frame into two tracks."""
         try:
@@ -2673,7 +2673,7 @@ if routes is not None:
     # Prompt sections
     # -----------------------------------------------------------------------
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/prompt_sections")
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections")
     async def api_add_prompt_section(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2701,7 +2701,7 @@ if routes is not None:
 
         return web.json_response(section.to_dict(), status=201)
 
-    @routes.put("/ltx-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
+    @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
     async def api_update_prompt_section(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2735,7 +2735,7 @@ if routes is not None:
 
         return web.json_response(section.to_dict())
 
-    @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
+    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
     async def api_delete_prompt_section(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2760,7 +2760,7 @@ if routes is not None:
     # Saved selections
     # -----------------------------------------------------------------------
 
-    @routes.get("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
+    @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
     async def api_list_saved_selections(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2773,7 +2773,7 @@ if routes is not None:
 
         return web.json_response(scene.saved_selections)
 
-    @routes.post("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections")
     async def api_add_saved_selection(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2800,7 +2800,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"index": len(scene.saved_selections) - 1, "entry": entry})
 
-    @routes.put("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
+    @routes.put("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
     async def api_update_saved_selection(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2834,7 +2834,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(scene.saved_selections[idx])
 
-    @routes.delete("/ltx-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
+    @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}")
     async def api_delete_saved_selection(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2857,7 +2857,7 @@ if routes is not None:
     # Render queue
     # -----------------------------------------------------------------------
 
-    @routes.get("/ltx-editor/project/{project_id}/queue")
+    @routes.get("/sonder-editor/project/{project_id}/queue")
     async def api_list_queue(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2866,7 +2866,7 @@ if routes is not None:
 
         return web.json_response([j.to_dict() for j in project.generation_queue])
 
-    @routes.post("/ltx-editor/project/{project_id}/queue")
+    @routes.post("/sonder-editor/project/{project_id}/queue")
     async def api_add_queue_job(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2916,7 +2916,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(job.to_dict())
 
-    @routes.put("/ltx-editor/project/{project_id}/queue/{job_id}")
+    @routes.put("/sonder-editor/project/{project_id}/queue/{job_id}")
     async def api_update_queue_job(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2947,7 +2947,7 @@ if routes is not None:
         save_project(project)
         return web.json_response(job.to_dict())
 
-    @routes.delete("/ltx-editor/project/{project_id}/queue/{job_id}")
+    @routes.delete("/sonder-editor/project/{project_id}/queue/{job_id}")
     async def api_delete_queue_job(request: web.Request) -> web.Response:
         try:
             project = _load_project_from_request(request)
@@ -2963,7 +2963,7 @@ if routes is not None:
         save_project(project)
         return web.json_response({"status": "deleted"})
 
-    @routes.delete("/ltx-editor/project/{project_id}/queue")
+    @routes.delete("/sonder-editor/project/{project_id}/queue")
     async def api_clear_queue(request: web.Request) -> web.Response:
         """Clear completed/failed jobs, or all if ?all=1."""
         try:
@@ -2987,7 +2987,7 @@ if routes is not None:
     # WebSocket stub
     # -----------------------------------------------------------------------
 
-    @routes.get("/ltx-editor/ws")
+    @routes.get("/sonder-editor/ws")
     async def api_websocket(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)

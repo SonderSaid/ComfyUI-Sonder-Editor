@@ -1,21 +1,21 @@
-"""ComfyUI-LTX-Editor: NLE-style video editing and AI generation pipeline."""
+"""ComfyUI-Sonder-Editor: NLE-style video editing and AI generation pipeline."""
 
 # Guard all ComfyUI-specific imports — this file is loaded by pytest
 # during test discovery, where folder_paths etc. are unavailable.
 try:
-    from .nodes.editor_node import LTXEditor
-    from .nodes.io_nodes import LTXSaveVideo, LTXPreviewVideo
+    from .nodes.editor_node import SonderEditor
+    from .nodes.io_nodes import SonderSaveVideo, SonderPreviewVideo
 
     NODE_CLASS_MAPPINGS = {
-        "LTXEditor": LTXEditor,
-        "LTXSaveVideo": LTXSaveVideo,
-        "LTXPreviewVideo": LTXPreviewVideo,
+        "SonderEditor": SonderEditor,
+        "SonderSaveVideo": SonderSaveVideo,
+        "SonderPreviewVideo": SonderPreviewVideo,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
-        "LTXEditor": "LTX Editor",
-        "LTXSaveVideo": "LTX Save Video",
-        "LTXPreviewVideo": "LTX Preview Video",
+        "SonderEditor": "Sonder Editor",
+        "SonderSaveVideo": "Sonder Save Video",
+        "SonderPreviewVideo": "Sonder Preview Video",
     }
 
     WEB_DIRECTORY = "./web"

@@ -4,7 +4,7 @@ import logging
 
 from .timeline_state import TimelineProject
 
-logger = logging.getLogger("ltx_editor")
+logger = logging.getLogger("sonder_editor")
 
 PROJECT_SUBDIRS = [
     "media",

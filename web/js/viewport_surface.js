@@ -370,7 +370,7 @@ export function createViewportSurface(options = {}) {
                 return entry.objectUrl;
             })
             .catch((error) => {
-                console.warn("[LTX Editor] Failed to load media as blob, falling back to direct URL:", error);
+                console.warn("[Sonder] Failed to load media as blob, falling back to direct URL:", error);
                 entry.objectUrl = directUrl;
                 entry.usesObjectUrl = false;
                 return directUrl;
@@ -405,8 +405,8 @@ export function createViewportSurface(options = {}) {
         if (!mediaEl || !sourcePath) return null;
         const resolvedUrl = await resolveMediaSourceUrl(sourcePath);
         if (!resolvedUrl || state.destroyed) return null;
-        if (mediaEl._ltxSourceUrl !== resolvedUrl) {
-            mediaEl._ltxSourceUrl = resolvedUrl;
+        if (mediaEl._sonderSourceUrl !== resolvedUrl) {
+            mediaEl._sonderSourceUrl = resolvedUrl;
             mediaEl.src = resolvedUrl;
         }
         await waitForMediaReady(mediaEl, 1);
@@ -639,12 +639,12 @@ export function createViewportSurface(options = {}) {
         }
         if (!state.liveMediaEnabled) {
             renderStaticComposite(snapshot, renderToken).catch((error) => {
-                console.warn("[LTX Editor] Static viewport preview failed:", error);
+                console.warn("[Sonder] Static viewport preview failed:", error);
             });
             return;
         }
         renderLiveComposite(snapshot, renderToken).catch((error) => {
-            console.warn("[LTX Editor] Live viewport render failed:", error);
+            console.warn("[Sonder] Live viewport render failed:", error);
         });
     }
 

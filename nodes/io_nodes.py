@@ -3,6 +3,7 @@ import uuid
 import random
 import logging
 import subprocess
+import time
 from datetime import datetime
 
 import cv2
@@ -12,10 +13,10 @@ import folder_paths
 
 from PIL import Image
 
-from ..server.timeline_state import ClipReference, Asset, LaneConfig
+from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack
 from ..server.project_manager import save_project
 
-logger = logging.getLogger("ltx_editor")
+logger = logging.getLogger("sonder_editor")
 
 
 def _get_ffmpeg() -> str:
@@ -40,7 +41,19 @@ def _tensor_to_frames(tensor: torch.Tensor) -> list[np.ndarray]:
     return [cv2.cvtColor(arr[i], cv2.COLOR_RGB2BGR) for i in range(arr.shape[0])]
 
 
-def _save_preview_thumbnail(frame_bgr: np.ndarray, prefix: str = "ltx_thumb") -> list[dict]:
+def _save_audio_waveform(audio: dict, output_path: str) -> tuple[int, torch.Tensor]:
+    """Persist a ComfyUI AUDIO dict as a waveform file and return sample rate plus waveform."""
+    import torchaudio
+
+    waveform = audio["waveform"]
+    if waveform.dim() == 3:
+        waveform = waveform.squeeze(0)
+    sample_rate = int(audio["sample_rate"])
+    torchaudio.save(output_path, waveform, sample_rate)
+    return sample_rate, waveform
+
+
+def _save_preview_thumbnail(frame_bgr: np.ndarray, prefix: str = "sonder_thumb") -> list[dict]:
     """Save a frame as a PNG thumbnail to ComfyUI's temp dir. Returns UI image list."""
     temp_dir = folder_paths.get_temp_directory()
     os.makedirs(temp_dir, exist_ok=True)
@@ -56,10 +69,10 @@ def _save_preview_thumbnail(frame_bgr: np.ndarray, prefix: str = "ltx_thumb") ->
     return [{"filename": filename, "subfolder": "", "type": "temp"}]
 
 
-class LTXSaveVideo:
+class SonderSaveVideo:
     """Save IMAGE frames as a video file with optional audio."""
 
-    CATEGORY = "LTX-Editor/IO"
+    CATEGORY = "Sonder/IO"
     OUTPUT_NODE = True
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
@@ -71,7 +84,7 @@ class LTXSaveVideo:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "project": ("LTX_PROJECT", {"tooltip": "The project — video saves to its exports/ folder."}),
+                "project": ("SONDER_PROJECT", {"tooltip": "The project — video saves to its exports/ folder."}),
                 "frames": ("IMAGE", {"tooltip": "Batch of frames to encode as video."}),
                 "filename_prefix": ("STRING", {"default": "output", "tooltip": "Prefix for the output filename."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001, "tooltip": "Output video frame rate."}),
@@ -110,29 +123,43 @@ class LTXSaveVideo:
         if audio is not None:
             audio_tmp = os.path.join(media_dir, f"_tmp_audio_{uuid.uuid4().hex[:6]}.wav")
             try:
-                import torchaudio
-                waveform = audio["waveform"]
-                if waveform.dim() == 3:
-                    waveform = waveform.squeeze(0)
-                torchaudio.save(audio_tmp, waveform, audio["sample_rate"])
+                _save_audio_waveform(audio, audio_tmp)
                 cmd += ["-i", audio_tmp]
             except Exception as e:
                 logger.warning("Failed to save temp audio: %s", e)
                 audio_tmp = None
 
-        cmd += [
-            "-c:v", codec, "-crf", str(quality),
-            "-pix_fmt", "yuv420p",
-        ]
+        cmd += ["-c:v", codec, "-crf", str(quality), "-pix_fmt", "yuv420p"]
         if audio_tmp:
-            cmd += ["-shortest"]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"]
         cmd += [output_path, "-y"]
 
         raw_bytes = b"".join(f.tobytes() for f in bgr_frames)
-        proc = subprocess.run(cmd, input=raw_bytes, capture_output=True, timeout=300)
-
-        if audio_tmp and os.path.isfile(audio_tmp):
-            os.remove(audio_tmp)
+        ffmpeg_started_at = time.perf_counter()
+        logger.info(
+            "ffmpeg start: save_video output=%s frames=%d audio=%s",
+            output_path,
+            len(bgr_frames),
+            bool(audio_tmp),
+        )
+        try:
+            proc = subprocess.run(cmd, input=raw_bytes, capture_output=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "ffmpeg timeout: save_video output=%s duration=%.2fs",
+                output_path,
+                time.perf_counter() - ffmpeg_started_at,
+            )
+            raise
+        finally:
+            if audio_tmp and os.path.isfile(audio_tmp):
+                os.remove(audio_tmp)
+        logger.info(
+            "ffmpeg end: save_video output=%s returncode=%s duration=%.2fs",
+            output_path,
+            proc.returncode,
+            time.perf_counter() - ffmpeg_started_at,
+        )
 
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode(errors='replace')[:500]}")
@@ -148,6 +175,7 @@ class LTXSaveVideo:
             frame_count=total_frames,
             fps=fps,
             duration_sec=total_frames / fps if fps > 0 else 0.0,
+            has_audio=bool(audio_tmp),
         )
         project.add_asset(asset)
 
@@ -203,6 +231,49 @@ class LTXSaveVideo:
                     take_metadata=dict(ctx),
                 )
                 scene.clips.append(clip)
+                if audio is not None:
+                    audio_filename = f"{os.path.splitext(output_filename)[0]}_audio.wav"
+                    audio_rel_path = os.path.join("media", audio_filename)
+                    audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
+                    try:
+                        sample_rate, waveform = _save_audio_waveform(audio, audio_abs_path)
+                        audio_duration_sec = waveform.shape[-1] / sample_rate if sample_rate > 0 else 0.0
+                        audio_asset = Asset(
+                            name=f"{output_filename} (audio)",
+                            asset_type="audio",
+                            path=audio_rel_path,
+                            duration_sec=audio_duration_sec,
+                            sample_rate=sample_rate,
+                            folder=asset.folder,
+                            generation_params=dict(ctx),
+                        )
+                        project.add_asset(audio_asset)
+
+                        audio_thumb_path = os.path.join(
+                            project.project_dir, "cache", "thumbnails",
+                            f"{audio_asset.asset_id}.png"
+                        )
+                        ensure_thumbnail("audio", audio_abs_path, audio_thumb_path)
+
+                        existing_audio_lanes = [track.lane_index for track in scene.audio_tracks] if scene.audio_tracks else [-1]
+                        new_audio_lane = max(existing_audio_lanes) + 1
+                        if scene.audio_lane_count <= new_audio_lane:
+                            scene.audio_lane_count = new_audio_lane + 1
+                        while len(scene.audio_lane_configs) < scene.audio_lane_count:
+                            scene.audio_lane_configs.append(LaneConfig())
+
+                        scene.audio_tracks.append(AudioTrack(
+                            source_path=audio_rel_path,
+                            timeline_start_frame=sel_start,
+                            timeline_end_frame=sel_end,
+                            source_in_frame=source_in,
+                            total_source_frames=total_frames,
+                            source_origin_frame=source_in,
+                            lane_index=new_audio_lane,
+                        ))
+                        logger.info("Take audio auto-placed on lane %d at frames %d-%d", new_audio_lane, sel_start, sel_end)
+                    except Exception as e:
+                        logger.warning("Take mode audio auto-placement failed for %s: %s", output_filename, e)
                 logger.info("Take auto-placed on lane %d at frames %d-%d", new_lane, sel_start, sel_end)
             else:
                 logger.warning("Take mode: scene_id '%s' not found, skipping auto-placement", ctx.get("scene_id", ""))
@@ -222,7 +293,7 @@ class LTXSaveVideo:
         save_project(project)
 
         # Generate preview thumbnail for ComfyUI node display
-        preview_images = _save_preview_thumbnail(bgr_frames[0], "ltx_savevid")
+        preview_images = _save_preview_thumbnail(bgr_frames[0], "sonder_savevid")
 
         logger.info("Saved video to %s (%d frames, %.1f fps)", output_path, len(bgr_frames), fps)
         return {
@@ -231,10 +302,10 @@ class LTXSaveVideo:
         }
 
 
-class LTXPreviewVideo:
+class SonderPreviewVideo:
     """Preview video frames directly in ComfyUI's built-in viewer."""
 
-    CATEGORY = "LTX-Editor/IO"
+    CATEGORY = "Sonder/IO"
     OUTPUT_NODE = True
     RETURN_TYPES = ()
     FUNCTION = "preview"
@@ -253,7 +324,7 @@ class LTXPreviewVideo:
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
 
-        preview_filename = f"ltx_preview_{uuid.uuid4().hex[:8]}.mp4"
+        preview_filename = f"sonder_preview_{uuid.uuid4().hex[:8]}.mp4"
         preview_path = os.path.join(temp_dir, preview_filename)
 
         bgr_frames = _tensor_to_frames(frames)
@@ -272,13 +343,33 @@ class LTXPreviewVideo:
         ]
 
         raw_bytes = b"".join(f.tobytes() for f in bgr_frames)
-        proc = subprocess.run(cmd, input=raw_bytes, capture_output=True, timeout=120)
+        ffmpeg_started_at = time.perf_counter()
+        logger.info(
+            "ffmpeg start: preview output=%s frames=%d",
+            preview_path,
+            len(bgr_frames),
+        )
+        try:
+            proc = subprocess.run(cmd, input=raw_bytes, capture_output=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "ffmpeg timeout: preview output=%s duration=%.2fs",
+                preview_path,
+                time.perf_counter() - ffmpeg_started_at,
+            )
+            raise
+        logger.info(
+            "ffmpeg end: preview output=%s returncode=%s duration=%.2fs",
+            preview_path,
+            proc.returncode,
+            time.perf_counter() - ffmpeg_started_at,
+        )
 
         if proc.returncode != 0:
             logger.warning("Preview encode failed: %s", proc.stderr.decode(errors="replace")[:300])
 
         # Also show thumbnail on the node
-        preview_images = _save_preview_thumbnail(bgr_frames[0], "ltx_preview")
+        preview_images = _save_preview_thumbnail(bgr_frames[0], "sonder_preview")
 
         return {"ui": {
             "videos": [{"filename": preview_filename, "subfolder": "", "type": "temp"}],

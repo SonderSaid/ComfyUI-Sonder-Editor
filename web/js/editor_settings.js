@@ -1,4 +1,5 @@
-const SETTINGS_STORAGE_KEY = "ltx-editor-settings";
+// Renamed during the Sonder pivot. No fallback read by design.
+const SETTINGS_STORAGE_KEY = "sonder-editor-settings";
 const SETTINGS_VERSION = 1;
 
 export const GALLERY_SORT_OPTIONS = [
@@ -302,6 +303,7 @@ function readStoredSettings() {
     return readStoredJson(SETTINGS_STORAGE_KEY, null);
 }
 
+// Legacy keys predate the Sonder pivot - not renamed by design.
 function legacyLayoutSettings() {
     const oldGlobalScale = parseStoredNumber("ltx-editor-ui-scale");
     const readScale = (key) => pickDefined(
@@ -547,7 +549,7 @@ function notifyListeners() {
         try {
             listener(snapshot);
         } catch (error) {
-            console.warn("[LTX Editor] Settings listener failed:", error);
+            console.warn("[Sonder] Settings listener failed:", error);
         }
     }
 }
@@ -655,6 +657,7 @@ export function previewConstraintValues(constraint, count = 5) {
     return values;
 }
 
+// Legacy keys predate the Sonder pivot - not renamed by design.
 export function migrateLegacyGalleryProjectPrefs(projectId = "") {
     if (!projectId || currentSettings.meta.legacyGalleryPrefsMigrated) {
         return getEditorSettings();

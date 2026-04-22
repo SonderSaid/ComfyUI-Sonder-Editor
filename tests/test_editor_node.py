@@ -1,4 +1,4 @@
-"""Regression tests for the LTX Editor node execute path."""
+"""Regression tests for the Sonder Editor node execute path."""
 
 import importlib
 import os
@@ -100,17 +100,17 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     project = DummyProject()
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_render_scene_frames",
         lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_load_scene_audio",
         lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
     result = node.execute(
         project="Existing Project",
         project_name="Ignored",
@@ -139,12 +139,12 @@ def test_execution_reaches_save_video_only_for_linked_editor(tmp_path, monkeypat
     editor_node = _import_editor_node(tmp_path, monkeypatch)
 
     prompt = _prompt_graph({
-        "1": _prompt_node("LTXEditor"),
-        "2": _prompt_node("LTXEditor"),
-        "3": _prompt_node("LTXSaveVideo", {"project": ["2", 0]}),
+        "1": _prompt_node("SonderEditor"),
+        "2": _prompt_node("SonderEditor"),
+        "3": _prompt_node("SonderSaveVideo", {"project": ["2", 0]}),
     })
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
 
     assert node._execution_reaches_save_video(prompt, "1") is False
     assert node._execution_reaches_save_video(prompt, "2") is True
@@ -208,17 +208,17 @@ def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path,
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
     monkeypatch.setattr(editor_node, "save_project", lambda proj: save_calls.append("saved"))
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_render_scene_frames",
         lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_load_scene_audio",
         lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
     result = node.execute(
         project="Existing Project",
         project_name="Ignored",
@@ -226,7 +226,7 @@ def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path,
         width=768,
         height=512,
         prompt=_prompt_graph({
-            "editor-1": _prompt_node("LTXEditor"),
+            "editor-1": _prompt_node("SonderEditor"),
         }),
         unique_id="editor-1",
         scene_id="scene-1",
@@ -313,7 +313,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
     monkeypatch.setattr(editor_node, "save_project", lambda proj: saved_statuses.append(project.generation_queue[0].status))
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_render_scene_frames",
         lambda self, proj, scene, start, end: torch.zeros(
             max(1, end - start),
@@ -324,17 +324,17 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_load_scene_audio",
         lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
     )
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_load_guide_image",
         lambda self, path, asset_type, target_w, target_h: torch.ones(target_h, target_w, 3, dtype=torch.float32),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
     result = node.execute(
         project="Existing Project",
         project_name="Ignored",
@@ -342,8 +342,8 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
         width=768,
         height=512,
         prompt=_prompt_graph({
-            "editor-1": _prompt_node("LTXEditor"),
-            "save-1": _prompt_node("LTXSaveVideo", {"project": ["editor-1", 0]}),
+            "editor-1": _prompt_node("SonderEditor"),
+            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0]}),
         }),
         unique_id="editor-1",
         scene_id="widget-scene",
@@ -411,7 +411,7 @@ def test_execute_marks_missing_queued_scene_failed(tmp_path, monkeypatch):
         lambda proj: save_states.append((queue_job.status, queue_job.error)),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
     with pytest.raises(RuntimeError, match="Queued scene not found"):
         node.execute(
             project="Existing Project",
@@ -420,8 +420,8 @@ def test_execute_marks_missing_queued_scene_failed(tmp_path, monkeypatch):
             width=768,
             height=512,
             prompt=_prompt_graph({
-                "editor-1": _prompt_node("LTXEditor"),
-                "save-1": _prompt_node("LTXSaveVideo", {"project": ["editor-1", 0]}),
+                "editor-1": _prompt_node("SonderEditor"),
+                "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0]}),
             }),
             unique_id="editor-1",
         )
@@ -458,7 +458,7 @@ def test_consume_resets_stale_running_job(tmp_path, monkeypatch):
         ),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
     consumed = node._consume_queue_job(project)
 
     assert consumed is job_a
@@ -494,7 +494,7 @@ def test_consume_resets_sole_stale_running_job(tmp_path, monkeypatch):
         ),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
     consumed = node._consume_queue_job(project)
 
     assert consumed is job_a
@@ -550,7 +550,7 @@ def test_mark_queue_job_failed_skips_later_batch_siblings(tmp_path, monkeypatch)
         ),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
     node._mark_queue_job_failed(project, job_b, "render exploded")
 
     assert job_a.status == "pending"
@@ -633,17 +633,17 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_render_scene_frames",
         lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
-        editor_node.LTXEditor,
+        editor_node.SonderEditor,
         "_load_scene_audio",
         lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
     )
 
-    node = editor_node.LTXEditor()
+    node = editor_node.SonderEditor()
 
     first_result = node.execute(
         project="Existing Project",
@@ -652,8 +652,8 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
         width=768,
         height=512,
         prompt=_prompt_graph({
-            "editor-1": _prompt_node("LTXEditor"),
-            "save-1": _prompt_node("LTXSaveVideo", {"project": ["editor-1", 0]}),
+            "editor-1": _prompt_node("SonderEditor"),
+            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0]}),
         }),
         unique_id="editor-1",
     )
@@ -669,8 +669,8 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
         width=768,
         height=512,
         prompt=_prompt_graph({
-            "editor-1": _prompt_node("LTXEditor"),
-            "save-1": _prompt_node("LTXSaveVideo", {"project": ["editor-1", 0]}),
+            "editor-1": _prompt_node("SonderEditor"),
+            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0]}),
         }),
         unique_id="editor-1",
     )
@@ -727,7 +727,7 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
     monkeypatch.setattr(io_nodes, "save_project", lambda project: save_calls.append(project.generation_queue[0].status))
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
 
-    node = io_nodes.LTXSaveVideo()
+    node = io_nodes.SonderSaveVideo()
     frames = torch.zeros(5, 2, 2, 3, dtype=torch.float32)
     result = node.save_video(project, frames, filename_prefix="queued", fps=24.0, mode="Take")
 
@@ -738,6 +738,225 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
     assert project.generation_queue[0].result_asset_id
     assert len(project.assets) == 1
     assert len(scene.clips) == 1
+    assert len(scene.audio_tracks) == 0
     assert scene.clips[0].timeline_start_frame == 4
     assert scene.clips[0].timeline_end_frame == 12
     assert result["result"][0].endswith(".mp4")
+
+
+def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True, exist_ok=True)
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=48, video_lane_count=1, audio_lane_count=1)
+    scene.clips.append(timeline_state.ClipReference(
+        source_path="media/existing.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=4,
+        source_out_frame=4,
+        total_source_frames=4,
+        track_index=0,
+    ))
+    scene.audio_tracks.append(timeline_state.AudioTrack(
+        source_path="media/existing.wav",
+        timeline_start_frame=0,
+        timeline_end_frame=4,
+        total_source_frames=4,
+        lane_index=0,
+    ))
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Take Audio Test",
+        scenes=[scene],
+    )
+    project._execution_context = {
+        "scene_id": "scene-1",
+        "scene_name": "Scene 1",
+        "selection_start": 8,
+        "selection_end": 12,
+        "pre_context_frames": 1,
+        "post_context_frames": 1,
+    }
+
+    saved_audio_paths = []
+
+    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
+        Path(cmd[-2]).write_bytes(b"video")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    def fake_torchaudio_save(path, waveform, sample_rate, *args, **kwargs):
+        Path(path).write_bytes(b"audio")
+        saved_audio_paths.append(path)
+
+    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "torchaudio", types.SimpleNamespace(save=fake_torchaudio_save))
+
+    node = io_nodes.SonderSaveVideo()
+    frames = torch.zeros(5, 2, 2, 3, dtype=torch.float32)
+    sample_rate = 44100
+    audio = {
+        "waveform": torch.zeros(1, 2, int(round((5 / 24.0) * sample_rate)), dtype=torch.float32),
+        "sample_rate": sample_rate,
+    }
+
+    node.save_video(project, frames, filename_prefix="take_audio", fps=24.0, mode="Take", audio=audio)
+
+    video_assets = [asset for asset in project.assets if asset.asset_type == "video"]
+    audio_assets = [asset for asset in project.assets if asset.asset_type == "audio"]
+    assert len(video_assets) == 1
+    assert len(audio_assets) == 1
+    assert video_assets[0].has_audio is True
+    assert audio_assets[0].folder == "Takes/Scene 1"
+    assert len(scene.clips) == 2
+    assert len(scene.audio_tracks) == 2
+    assert scene.clips[-1].track_index == 1
+    assert scene.audio_tracks[-1].lane_index == 1
+    assert scene.audio_lane_count == 2
+    assert scene.audio_tracks[-1].timeline_start_frame == 8
+    assert scene.audio_tracks[-1].timeline_end_frame == 12
+    assert scene.audio_tracks[-1].source_in_frame == 1
+    assert scene.audio_tracks[-1].total_source_frames == 5
+    assert any(str(path).endswith("_audio.wav") for path in saved_audio_paths)
+
+
+def test_save_video_maps_audio_and_uses_shorter_timeout(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    class DummyProject:
+        def __init__(self):
+            self.project_dir = str(tmp_path)
+            self.assets = []
+
+        def add_asset(self, asset):
+            self.assets.append(asset)
+
+    captured = {}
+
+    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
+        captured["cmd"] = cmd
+        captured["timeout"] = timeout
+        Path(cmd[-2]).write_bytes(b"video")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    fake_torchaudio = types.SimpleNamespace(save=lambda *args, **kwargs: None)
+
+    monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
+    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    node = io_nodes.SonderSaveVideo()
+    frames = torch.zeros(2, 2, 2, 3, dtype=torch.float32)
+    audio = {
+        "waveform": torch.zeros(1, 2, 64, dtype=torch.float32),
+        "sample_rate": 44100,
+    }
+
+    node.save_video(DummyProject(), frames, filename_prefix="audio", fps=24.0, audio=audio)
+
+    assert captured["timeout"] == 90
+    assert captured["cmd"].count("-map") == 2
+    assert "0:v:0" in captured["cmd"]
+    assert "1:a:0" in captured["cmd"]
+    assert "-c:a" in captured["cmd"]
+    assert "aac" in captured["cmd"]
+
+
+def test_preview_uses_shorter_timeout(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    captured = {}
+
+    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
+        captured["timeout"] = timeout
+        Path(cmd[-2]).write_bytes(b"video")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+
+    node = io_nodes.SonderPreviewVideo()
+    frames = torch.zeros(2, 2, 2, 3, dtype=torch.float32)
+    node.preview(frames, fps=24.0)
+
+    assert captured["timeout"] == 90
+
+
+def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    cache_dir = tmp_path / "cache" / "renders"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "scene-1_hash.pt"
+    cache_path.write_bytes(b"corrupt")
+
+    class DummyScene:
+        scene_id = "scene-1"
+        width = 0
+        height = 0
+        video_lane_configs = []
+        clips = []
+
+        @staticmethod
+        def content_hash(render_start, render_end, resolution):
+            return "hash"
+
+    project = types.SimpleNamespace(project_dir=str(tmp_path), resolution=(8, 6))
+    removed = []
+
+    def fail_load(*args, **kwargs):
+        raise RuntimeError("corrupt cache")
+
+    monkeypatch.setattr(editor_node.torch, "load", fail_load)
+    monkeypatch.setattr(editor_node.os, "remove", lambda path: removed.append(path))
+
+    node = editor_node.SonderEditor()
+    result = node._render_scene_frames(project, DummyScene(), 0, 4)
+
+    assert str(cache_path) in removed
+    assert tuple(result.shape) == (4, 6, 8, 3)
+
+
+def test_load_scene_audio_logs_missing_source_and_silent_fallback(tmp_path, monkeypatch, caplog):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    fake_torchaudio = types.SimpleNamespace(load=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected load")))
+    monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
+
+    track = types.SimpleNamespace(
+        muted=False,
+        lane_index=0,
+        timeline_start_frame=0,
+        timeline_end_frame=12,
+        source_path="missing.wav",
+        source_in_frame=0,
+        volume=1.0,
+    )
+    scene = types.SimpleNamespace(
+        fps=0.0,
+        audio_tracks=[track],
+        audio_lane_configs=[],
+    )
+    project = types.SimpleNamespace(
+        fps=24.0,
+        project_dir=str(tmp_path),
+    )
+
+    caplog.set_level("INFO", logger="sonder_editor")
+
+    node = editor_node.SonderEditor()
+    audio = node._load_scene_audio(project, scene, 0, 12)
+
+    assert audio["sample_rate"] == 44100
+    assert "file not found" in caplog.text
+    assert "fell back to silence" in caplog.text

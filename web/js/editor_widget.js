@@ -1,5 +1,5 @@
 /**
- * LTX Editor Widget — Timeline + Asset Gallery embedded in a ComfyUI node.
+ * Sonder Editor Widget — Timeline + Asset Gallery embedded in a ComfyUI node.
  * Uses addDOMWidget pattern (same as VHS/KJNodes).
  */
 
@@ -57,7 +57,7 @@ export function buildProjectAssetViewURL(projectDir, sourcePath) {
     const dirName = projectDir.split(/[/\\]/).pop();
     const fileName = sourcePath.split(/[/\\]/).pop();
     const subPath = sourcePath.split(/[/\\]/).slice(0, -1).join("/");
-    const subfolder = `ltx_projects/${dirName}/${subPath}`;
+    const subfolder = `sonder-projects/${dirName}/${subPath}`;
     return api.apiURL(`/view?filename=${encodeURIComponent(fileName)}&subfolder=${encodeURIComponent(subfolder)}&type=output`);
 }
 
@@ -68,12 +68,12 @@ export async function importFileIntoProject(projectDir, file, folder = "") {
     try {
         uploadedName = await uploadFileToComfyInput(file);
     } catch (error) {
-        console.warn("[LTX Editor] Upload failed:", error);
+        console.warn("[Sonder] Upload failed:", error);
         return false;
     }
 
     const dirName = projectDir.split(/[/\\]/).pop();
-    const importResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/import`), {
+    const importResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/import`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -83,7 +83,7 @@ export async function importFileIntoProject(projectDir, file, folder = "") {
     });
 
     if (!importResp.ok) {
-        console.warn("[LTX Editor] Import failed:", await importResp.text());
+        console.warn("[Sonder] Import failed:", await importResp.text());
         return false;
     }
 
@@ -95,7 +95,7 @@ export async function replaceAssetInProject(projectDir, assetId, file) {
 
     const uploadedName = await uploadFileToComfyInput(file);
     const dirName = projectDir.split(/[/\\]/).pop();
-    const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}/replace`), {
+    const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}/replace`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source_path: uploadedName }),
@@ -259,7 +259,7 @@ function setButtonVariant(btn, variant = "muted", { persist = true } = {}) {
     btn.style.borderColor = palette.border;
     btn.style.color = palette.text;
     if (persist) {
-        btn.dataset.ltxBaseVariant = variant;
+        btn.dataset.sonderBaseVariant = variant;
     }
 }
 
@@ -492,7 +492,7 @@ export class EditorWidget {
     _buildDOM() {
         // Main container
         this.container = document.createElement("div");
-        this.container.dataset.ltxEditor = "1"; // marker for global drop interceptor
+        this.container.dataset.sonderEditor = "1"; // marker for global drop interceptor
         this.container.style.cssText = `
             width: 100%; display: flex; flex-direction: column;
             padding: 4px 8px;
@@ -568,7 +568,7 @@ export class EditorWidget {
         // Add scene
         const addBtn = this._makeBtn("+", "Create new scene");
         setButtonVariant(addBtn, "primary");
-        addBtn.dataset.ltxHoverVariant = "primary";
+        addBtn.dataset.sonderHoverVariant = "primary";
         addBtn.addEventListener("click", () => this._createScene());
 
         // Duration input
@@ -981,9 +981,9 @@ export class EditorWidget {
         btn.title = title;
         btn.style.cssText = chromeButtonCss({ variant: "muted", padding: "2px 8px", fontSize: "12px", radius: "6px" });
         setButtonVariant(btn, "muted");
-        btn.dataset.ltxHoverVariant = "primary";
-        btn.addEventListener("mouseenter", () => setButtonVariant(btn, btn.dataset.ltxHoverVariant || btn.dataset.ltxBaseVariant || "muted", { persist: false }));
-        btn.addEventListener("mouseleave", () => setButtonVariant(btn, btn.dataset.ltxBaseVariant || "muted", { persist: false }));
+        btn.dataset.sonderHoverVariant = "primary";
+        btn.addEventListener("mouseenter", () => setButtonVariant(btn, btn.dataset.sonderHoverVariant || btn.dataset.sonderBaseVariant || "muted", { persist: false }));
+        btn.addEventListener("mouseleave", () => setButtonVariant(btn, btn.dataset.sonderBaseVariant || "muted", { persist: false }));
         return btn;
     }
 
@@ -993,7 +993,7 @@ export class EditorWidget {
 
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes`));
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`));
             if (resp.ok) {
                 const data = await resp.json();
                 this.scenes = data.scenes || [];
@@ -1001,11 +1001,15 @@ export class EditorWidget {
                     this._setActiveScene(this.scenes[0]);
                 } else if (this.activeSceneId) {
                     const scene = this.scenes.find(s => s.scene_id === this.activeSceneId);
-                    if (scene) this._setActiveScene(scene);
+                    if (scene) {
+                        this._setActiveScene(scene);
+                    } else if (this.scenes.length > 0) {
+                        this._setActiveScene(this.scenes[0]);
+                    }
                 }
             }
         } catch (e) {
-            console.warn("[LTX Editor] Failed to fetch scenes:", e);
+            console.warn("[Sonder] Failed to fetch scenes:", e);
         }
     }
 
@@ -1014,7 +1018,7 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -1028,7 +1032,7 @@ export class EditorWidget {
                 this._setActiveScene(scene);
             }
         } catch (e) {
-            console.warn("[LTX Editor] Failed to create scene:", e);
+            console.warn("[Sonder] Failed to create scene:", e);
         }
     }
 
@@ -1183,7 +1187,7 @@ export class EditorWidget {
             this._renderViewportFrame();
         }
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ width: w, height: h }),
@@ -1197,7 +1201,7 @@ export class EditorWidget {
                 this._resizeViewportCanvas();
                 this._renderViewportFrame();
             }
-            console.warn("[LTX Editor] Failed to update scene resolution:", e);
+            console.warn("[Sonder] Failed to update scene resolution:", e);
         }
     }
 
@@ -1207,7 +1211,7 @@ export class EditorWidget {
         const sceneRef = this.activeScene;
         const sceneId = this.activeSceneId;
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ fps }),
@@ -1227,7 +1231,7 @@ export class EditorWidget {
                 this._updateTransportUI();
             }
         } catch (e) {
-            console.warn("[LTX Editor] Failed to update scene FPS:", e);
+            console.warn("[Sonder] Failed to update scene FPS:", e);
         }
     }
 
@@ -1248,7 +1252,7 @@ export class EditorWidget {
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ name }),
@@ -1256,7 +1260,7 @@ export class EditorWidget {
             this.activeScene.name = name;
             this.sceneLabel.textContent = name;
         } catch (e) {
-            console.warn("[LTX Editor] Failed to rename scene:", e);
+            console.warn("[Sonder] Failed to rename scene:", e);
         }
     }
 
@@ -1279,7 +1283,7 @@ export class EditorWidget {
             this._updateTransportUI();
         }
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ duration_frames: frames }),
@@ -1295,7 +1299,7 @@ export class EditorWidget {
                 this._updateToolbar();
                 this._updateTransportUI();
             }
-            console.warn("[LTX Editor] Failed to update scene duration:", e);
+            console.warn("[Sonder] Failed to update scene duration:", e);
         }
     }
 
@@ -1309,12 +1313,12 @@ export class EditorWidget {
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
                 method: "DELETE",
             });
             await this._fetchScenes();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to delete scene:", e);
+            console.warn("[Sonder] Failed to delete scene:", e);
         }
     }
 
@@ -1324,7 +1328,7 @@ export class EditorWidget {
 
         try {
             // Create new scene with same duration
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -1339,7 +1343,7 @@ export class EditorWidget {
 
             // Copy guide frames
             for (const guide of (this.activeScene.guide_frames || [])) {
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${newId}/guides`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${newId}/guides`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -1353,7 +1357,7 @@ export class EditorWidget {
 
             // Copy prompt sections
             for (const section of (this.activeScene.prompt_sections || [])) {
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${newId}/prompt_sections`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${newId}/prompt_sections`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -1369,7 +1373,7 @@ export class EditorWidget {
             const copied = this.scenes.find(s => s.scene_id === newId);
             if (copied) this._setActiveScene(copied);
         } catch (e) {
-            console.warn("[LTX Editor] Failed to duplicate scene:", e);
+            console.warn("[Sonder] Failed to duplicate scene:", e);
         }
     }
 
@@ -1379,7 +1383,7 @@ export class EditorWidget {
 
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets?include_trashed=true`));
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets?include_trashed=true`));
             if (resp.ok) {
                 const data = await resp.json();
                 this.assets = { video: [], image: [], audio: [] };
@@ -1396,14 +1400,14 @@ export class EditorWidget {
                 });
             }
         } catch (e) {
-            console.warn("[LTX Editor] Failed to fetch assets:", e);
+            console.warn("[Sonder] Failed to fetch assets:", e);
         }
     }
 
     async _updateAssetMetadata(assetId, updates) {
         if (!this.projectDir || !assetId) return null;
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(updates),
@@ -1419,7 +1423,7 @@ export class EditorWidget {
     async _getAssetUsages(assetId) {
         if (!this.projectDir || !assetId) return null;
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}/usages`));
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}/usages`));
         if (!resp.ok) {
             throw new Error(`Asset usage fetch failed: ${resp.status}`);
         }
@@ -1429,7 +1433,7 @@ export class EditorWidget {
     async _getBulkAssetUsages(assetIds) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return null;
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-usages`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-usages`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds }),
@@ -1443,7 +1447,7 @@ export class EditorWidget {
     async _bulkMoveAssets(assetIds, folder = "") {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { updated: 0 };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-move`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-move`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, folder }),
@@ -1457,7 +1461,7 @@ export class EditorWidget {
     async _deleteAsset(assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${assetId}`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ force: !!force }),
@@ -1480,7 +1484,7 @@ export class EditorWidget {
     async _bulkDeleteAssets(assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-delete`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
@@ -1503,7 +1507,7 @@ export class EditorWidget {
     async _restoreAsset(assetId) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/restore`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/restore`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_id: assetId }),
@@ -1522,7 +1526,7 @@ export class EditorWidget {
     async _bulkRestoreAssets(assetIds) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-restore`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-restore`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds }),
@@ -1541,7 +1545,7 @@ export class EditorWidget {
     async _permanentDeleteAsset(assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/permanent`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/permanent`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_id: assetId, force: !!force }),
@@ -1564,7 +1568,7 @@ export class EditorWidget {
     async _bulkPermanentDeleteAssets(assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/bulk-permanent-delete`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-permanent-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ asset_ids: assetIds, force: !!force }),
@@ -1587,7 +1591,7 @@ export class EditorWidget {
     async _emptyTrash() {
         if (!this.projectDir) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/empty-trash`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/empty-trash`), {
             method: "POST",
         });
         if (!resp.ok) {
@@ -1604,7 +1608,7 @@ export class EditorWidget {
     async _createAssetFolder(folderName) {
         if (!this.projectDir || !folderName) return [];
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ folder: folderName }),
@@ -1620,7 +1624,7 @@ export class EditorWidget {
     async _renameAssetFolder(folderName, newFolderName) {
         if (!this.projectDir || !folderName || !newFolderName) return [];
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ old_folder: folderName, new_folder: newFolderName }),
@@ -1636,7 +1640,7 @@ export class EditorWidget {
     async _deleteAssetFolder(folderName, force = false) {
         if (!this.projectDir || !folderName) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/folders`), {
+        const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ folder: folderName, force: !!force }),
@@ -1756,7 +1760,7 @@ export class EditorWidget {
             if (asset.has_thumbnail) {
                 const dirName = this.projectDir.split(/[/\\]/).pop();
                 const img = document.createElement("img");
-                img.src = api.apiURL(`/ltx-editor/project/${dirName}/thumbnail/${asset.asset_id}`);
+                img.src = api.apiURL(`/sonder-editor/project/${dirName}/thumbnail/${asset.asset_id}`);
                 img.style.cssText = "width: 100%; height: 100%; object-fit: cover;";
                 img.draggable = false; // Prevent browser from dragging thumbnail URL
                 thumb.appendChild(img);
@@ -1809,7 +1813,7 @@ export class EditorWidget {
             item.addEventListener("dragstart", (e) => {
                 // Stash projectDir so the global ComfyUI drop handler can build URLs
                 const enrichedAsset = { ...asset, _projectDir: this.projectDir.split(/[/\\]/).pop() };
-                e.dataTransfer.setData("application/ltx-asset", JSON.stringify(enrichedAsset));
+                e.dataTransfer.setData("application/x-sonder-asset", JSON.stringify(enrichedAsset));
                 e.dataTransfer.effectAllowed = "copy";
             });
 
@@ -1870,9 +1874,9 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         // asset.path is like "media/filename.mp4"
-        // ComfyUI /view needs: filename=filename.mp4&subfolder=ltx_projects/DirName/media&type=output
+        // ComfyUI /view needs: filename=filename.mp4&subfolder=sonder-projects/DirName/media&type=output
         const assetFileName = asset.path.split(/[/\\]/).pop();
-        const assetSubfolder = `ltx_projects/${dirName}/${asset.path.split(/[/\\]/).slice(0, -1).join("/")}`;
+        const assetSubfolder = `sonder-projects/${dirName}/${asset.path.split(/[/\\]/).slice(0, -1).join("/")}`;
         const viewParams = `filename=${encodeURIComponent(assetFileName)}&subfolder=${encodeURIComponent(assetSubfolder)}&type=output`;
 
         if (asset.asset_type === "video") {
@@ -1936,14 +1940,14 @@ export class EditorWidget {
     async _renameAsset(asset, newName) {
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/${asset.asset_id}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${asset.asset_id}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ name: newName }),
             });
             await this._fetchAssets();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to rename asset:", e);
+            console.warn("[Sonder] Failed to rename asset:", e);
         }
     }
 
@@ -2067,7 +2071,7 @@ export class EditorWidget {
     _clearCustomAspectRatioOption() {
         if (!this._aspectRatioSelect) return;
         for (const option of Array.from(this._aspectRatioSelect.options)) {
-            if (option.dataset.ltxCustomAspect === "true") {
+            if (option.dataset.sonderCustomAspect === "true") {
                 option.remove();
             }
         }
@@ -2081,7 +2085,7 @@ export class EditorWidget {
         const option = document.createElement("option");
         option.value = value;
         option.textContent = label;
-        option.dataset.ltxCustomAspect = "true";
+        option.dataset.sonderCustomAspect = "true";
         const freeOption = Array.from(this._aspectRatioSelect.options).find(
             (entry) => entry.value === this._aspectRatioOptionValue(0, 0)
         );
@@ -2255,14 +2259,14 @@ export class EditorWidget {
         if (!this.projectDir) return true;
         const dirName = this._projectDirName();
         try {
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ template_id: templateId }),
             });
             return !!resp.ok;
         } catch (error) {
-            console.warn("[LTX Editor] Failed to update project template:", error);
+            console.warn("[Sonder] Failed to update project template:", error);
             return false;
         }
     }
@@ -2891,7 +2895,7 @@ export class EditorWidget {
     }
 
     _fullscreenPersistStorageKey(persistKey) {
-        return persistKey ? `ltx-editor-fs-${persistKey}` : "";
+        return persistKey ? `sonder-editor-fs-${persistKey}` : "";
     }
 
     _readFullscreenPersistValue(persistKey) {
@@ -4413,7 +4417,7 @@ export class EditorWidget {
         canvas.addEventListener("drop", (e) => {
             e.preventDefault();
             e.stopPropagation(); // Prevent ComfyUI from also handling this drop
-            const assetData = e.dataTransfer.getData("application/ltx-asset");
+            const assetData = e.dataTransfer.getData("application/x-sonder-asset");
             if (!assetData) return;
 
             try {
@@ -4423,7 +4427,7 @@ export class EditorWidget {
 
                 this._handleAssetDrop(asset, frame, rawY);
             } catch (err) {
-                console.warn("[LTX Editor] Drop failed:", err);
+                console.warn("[Sonder] Drop failed:", err);
             }
         });
 
@@ -4615,7 +4619,7 @@ export class EditorWidget {
                 // Auto-add a new video lane and place clip there
                 const newCount = (this.activeScene.video_lane_count || 1) + 1;
                 targetVideoLane = newCount - 1; // highest lane = top
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ video_lane_count: newCount }),
@@ -4636,7 +4640,7 @@ export class EditorWidget {
                 if (hasAudioOverlap) {
                     const newAudioCount = (this.activeScene.audio_lane_count || 1) + 1;
                     targetAudioLane = newAudioCount - 1;
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ audio_lane_count: newAudioCount }),
@@ -4657,7 +4661,7 @@ export class EditorWidget {
             if (hasOverlap) {
                 const newCount = (this.activeScene.audio_lane_count || 1) + 1;
                 targetAudioLane = newCount - 1;
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ audio_lane_count: newCount }),
@@ -4671,7 +4675,7 @@ export class EditorWidget {
         try {
             if (asset.asset_type === "image") {
                 // Images always create guide frames (regardless of which track they're dropped on)
-                resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
+                resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -4682,10 +4686,10 @@ export class EditorWidget {
                     }),
                 });
                 if (!resp.ok) {
-                    console.warn("[LTX Editor] Guide creation failed:", resp.status, await resp.text());
+                    console.warn("[Sonder] Guide creation failed:", resp.status, await resp.text());
                     return;
                 }
-                console.log("[LTX Editor] Guide frame created at frame", frame);
+                console.log("[Sonder] Guide frame created at frame", frame);
             } else if (asset.asset_type === "video") {
                 // Drop video = create clip on target video lane (+ audio track if video has audio)
                 const clipBody = {
@@ -4695,18 +4699,18 @@ export class EditorWidget {
                     audio_lane_index: targetAudioLane,
                     dual_drop: true,  // Always attempt — server handles gracefully
                 };
-                resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
+                resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(clipBody),
                 });
                 if (!resp.ok) {
-                    console.warn("[LTX Editor] Clip creation failed:", resp.status, await resp.text());
+                    console.warn("[Sonder] Clip creation failed:", resp.status, await resp.text());
                     return;
                 }
             } else if (asset.asset_type === "audio") {
                 // Drop audio = create audio track on target audio lane
-                resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks`), {
+                resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -4716,16 +4720,17 @@ export class EditorWidget {
                     }),
                 });
                 if (!resp.ok) {
-                    console.warn("[LTX Editor] Audio track creation failed:", resp.status, await resp.text());
+                    console.warn("[Sonder] Audio track creation failed:", resp.status, await resp.text());
                     return;
                 }
             }
 
-            // Refresh scene data
+            // Refresh both assets and scenes because dual-drop can create a new extracted audio asset.
+            await this._fetchAssets();
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to drop asset:", e);
+            console.warn("[Sonder] Failed to drop asset:", e);
         }
     }
 
@@ -4741,12 +4746,12 @@ export class EditorWidget {
                 // Add a new video lane and move clip there
                 const newCount = (this.activeScene.video_lane_count || 1) + 1;
                 const newLane = newCount - 1;
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ video_lane_count: newCount }),
                 });
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${hit.id}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${hit.id}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ track_index: newLane }),
@@ -4754,12 +4759,12 @@ export class EditorWidget {
             } else if (hit.type === "audio") {
                 const newCount = (this.activeScene.audio_lane_count || 1) + 1;
                 const newLane = newCount - 1;
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ audio_lane_count: newCount }),
                 });
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${hit.id}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${hit.id}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ lane_index: newLane }),
@@ -4769,7 +4774,7 @@ export class EditorWidget {
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to move item to new lane:", e);
+            console.warn("[Sonder] Failed to move item to new lane:", e);
         }
     }
 
@@ -4862,7 +4867,7 @@ export class EditorWidget {
         for (let i = 0; i < videoConfigs.length; i++) if (!videoConfigs[i]) videoConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         for (let i = 0; i < audioConfigs.length; i++) if (!audioConfigs[i]) audioConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ video_lane_configs: videoConfigs, audio_lane_configs: audioConfigs }),
@@ -4873,7 +4878,7 @@ export class EditorWidget {
                 sceneRef.audio_lane_configs = audioConfigs;
             }
         } catch (e) {
-            console.warn("[LTX Editor] Failed to save lane config:", e);
+            console.warn("[Sonder] Failed to save lane config:", e);
         }
     }
 
@@ -4889,7 +4894,7 @@ export class EditorWidget {
         }
         try {
             this._pushUndo("add lane");
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
@@ -4898,7 +4903,7 @@ export class EditorWidget {
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to add lane:", e);
+            console.warn("[Sonder] Failed to add lane:", e);
         }
     }
 
@@ -4928,7 +4933,7 @@ export class EditorWidget {
                     const id = isVideo ? item.clip_id : item.track_id;
                     const endpoint = isVideo ? "clips" : "audio_tracks";
                     const field = isVideo ? "track_index" : "lane_index";
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ [field]: targetLane }),
@@ -4939,14 +4944,14 @@ export class EditorWidget {
                 for (const item of items) {
                     const id = isVideo ? item.clip_id : item.track_id;
                     const endpoint = isVideo ? "clips" : "audio_tracks";
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
                         method: "DELETE",
                     });
                 }
             }
             await this._removeLane(trackType, laneIndex);
         } catch (e) {
-            console.warn("[LTX Editor] Failed to remove lane with items:", e);
+            console.warn("[Sonder] Failed to remove lane with items:", e);
         }
     }
 
@@ -4968,13 +4973,13 @@ export class EditorWidget {
             for (const item of items) {
                 const id = isVideo ? item.clip_id : item.track_id;
                 const endpoint = isVideo ? "clips" : "audio_tracks";
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
                     method: "DELETE",
                 });
             }
             await this._removeLane(trackType, laneIndex);
         } catch (e) {
-            console.warn("[LTX Editor] Failed to delete lane items:", e);
+            console.warn("[Sonder] Failed to delete lane items:", e);
         }
     }
 
@@ -4996,7 +5001,7 @@ export class EditorWidget {
         }
         try {
             this._pushUndo("remove lane");
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
@@ -5005,7 +5010,7 @@ export class EditorWidget {
             if (isVideo) {
                 for (const clip of (this.activeScene.clips || [])) {
                     if ((clip.track_index || 0) > laneIndex) {
-                        await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/clips/${clip.clip_id}`), {
+                        await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips/${clip.clip_id}`), {
                             method: "PUT",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ track_index: clip.track_index - 1 }),
@@ -5015,7 +5020,7 @@ export class EditorWidget {
             } else {
                 for (const track of (this.activeScene.audio_tracks || [])) {
                     if ((track.lane_index || 0) > laneIndex) {
-                        await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks/${track.track_id}`), {
+                        await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks/${track.track_id}`), {
                             method: "PUT",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ lane_index: track.lane_index - 1 }),
@@ -5027,7 +5032,7 @@ export class EditorWidget {
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to remove lane:", e);
+            console.warn("[Sonder] Failed to remove lane:", e);
         }
     }
 
@@ -5078,7 +5083,7 @@ export class EditorWidget {
 
         const createBtn = this._makeBtn("Create", "Create prompt section");
         setButtonVariant(createBtn, "primary");
-        createBtn.dataset.ltxHoverVariant = "primary";
+        createBtn.dataset.sonderHoverVariant = "primary";
         createBtn.addEventListener("click", () => {
             if (input.value.trim()) {
                 this._saveNewPromptSection(startFrame, endFrame, input.value.trim());
@@ -5087,7 +5092,7 @@ export class EditorWidget {
 
         const cancelBtn = this._makeBtn("Cancel", "Cancel");
         setButtonVariant(cancelBtn, "subtle");
-        cancelBtn.dataset.ltxHoverVariant = "subtle";
+        cancelBtn.dataset.sonderHoverVariant = "subtle";
         cancelBtn.addEventListener("click", () => this._hidePromptEditor());
 
         editor.append(label, input, createBtn, cancelBtn);
@@ -5104,7 +5109,7 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -5117,7 +5122,7 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to create prompt section:", e);
+            console.warn("[Sonder] Failed to create prompt section:", e);
         }
     }
 
@@ -5153,7 +5158,7 @@ export class EditorWidget {
 
         const saveBtn = this._makeBtn("Save", "Save prompt");
         setButtonVariant(saveBtn, "primary");
-        saveBtn.dataset.ltxHoverVariant = "primary";
+        saveBtn.dataset.sonderHoverVariant = "primary";
         saveBtn.addEventListener("click", () => {
             this._updatePromptSection(idx, { prompt: input.value });
             this._hidePromptEditor();
@@ -5161,7 +5166,7 @@ export class EditorWidget {
 
         const deleteBtn = this._makeBtn("Delete", "Delete this prompt section");
         setButtonVariant(deleteBtn, "danger");
-        deleteBtn.dataset.ltxHoverVariant = "danger";
+        deleteBtn.dataset.sonderHoverVariant = "danger";
         deleteBtn.addEventListener("click", () => {
             if (confirm(`Delete this prompt section?`)) {
                 this._deletePromptSection(idx);
@@ -5192,7 +5197,7 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections/${idx}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections/${idx}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(updates),
@@ -5201,7 +5206,7 @@ export class EditorWidget {
             this._selectedPromptIdx = null;
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to update prompt section:", e);
+            console.warn("[Sonder] Failed to update prompt section:", e);
         }
     }
 
@@ -5211,7 +5216,7 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections/${idx}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections/${idx}`), {
                 method: "DELETE",
             });
             this._selectedPromptIdx = null;
@@ -5219,7 +5224,7 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to delete prompt section:", e);
+            console.warn("[Sonder] Failed to delete prompt section:", e);
         }
     }
 
@@ -5389,7 +5394,7 @@ export class EditorWidget {
         // Delete button (always present)
         const deleteBtn = this._makeBtn("Delete", "Delete this item");
         setButtonVariant(deleteBtn, "danger");
-        deleteBtn.dataset.ltxHoverVariant = "danger";
+        deleteBtn.dataset.sonderHoverVariant = "danger";
         deleteBtn.addEventListener("click", () => this._deleteSelectedItems());
         editor.appendChild(deleteBtn);
 
@@ -5437,8 +5442,8 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
         const endpoint = type === "clip"
-            ? `/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`
-            : `/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
+            ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`
+            : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
 
         try {
             await fetch(api.apiURL(endpoint), {
@@ -5451,7 +5456,7 @@ export class EditorWidget {
             this._hideItemEditor();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to move item:", e);
+            console.warn("[Sonder] Failed to move item:", e);
         }
     }
 
@@ -5460,8 +5465,8 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
         const endpoint = type === "clip"
-            ? `/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`
-            : `/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
+            ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`
+            : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
 
         try {
             await fetch(api.apiURL(endpoint), {
@@ -5472,7 +5477,7 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to update item property:", e);
+            console.warn("[Sonder] Failed to update item property:", e);
         }
     }
 
@@ -5484,10 +5489,10 @@ export class EditorWidget {
         const oldIdx = guideData.frame_index;
 
         try {
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/guides/${oldIdx}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${oldIdx}`), {
                 method: "DELETE",
             });
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/guides`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -5502,7 +5507,7 @@ export class EditorWidget {
             this._hideItemEditor();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to move guide:", e);
+            console.warn("[Sonder] Failed to move guide:", e);
         }
     }
 
@@ -5513,7 +5518,7 @@ export class EditorWidget {
         const sourceFrame = Math.max(0, this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0));
 
         try {
-            const extractResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/assets/extract_frame`), {
+            const extractResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/extract_frame`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -5522,12 +5527,12 @@ export class EditorWidget {
                 }),
             });
             if (!extractResp.ok) {
-                console.warn("[LTX Editor] Extract frame failed:", await extractResp.text());
+                console.warn("[Sonder] Extract frame failed:", await extractResp.text());
                 return;
             }
 
             const asset = await extractResp.json();
-            const guideResp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
+            const guideResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -5538,13 +5543,13 @@ export class EditorWidget {
                 }),
             });
             if (!guideResp.ok) {
-                console.warn("[LTX Editor] Add guide failed:", await guideResp.text());
+                console.warn("[Sonder] Add guide failed:", await guideResp.text());
                 return;
             }
 
             await Promise.all([this._fetchAssets(), this._fetchScenes()]);
         } catch (e) {
-            console.warn("[LTX Editor] Add frame to guides failed:", e);
+            console.warn("[Sonder] Add frame to guides failed:", e);
         }
     }
 
@@ -5558,13 +5563,13 @@ export class EditorWidget {
             for (const item of this.selectedItems) {
                 let endpoint;
                 if (item.type === "clip") {
-                    endpoint = `/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${item.id}`;
+                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${item.id}`;
                 } else if (item.type === "audio") {
-                    endpoint = `/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${item.id}`;
+                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${item.id}`;
                 } else if (item.type === "guide") {
-                    endpoint = `/ltx-editor/project/${dirName}/scenes/${sceneId}/guides/${item.id}`;
+                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${item.id}`;
                 } else if (item.type === "prompt") {
-                    endpoint = `/ltx-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${item.id}`;
+                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${item.id}`;
                 }
                 if (endpoint) {
                     await fetch(api.apiURL(endpoint), { method: "DELETE" });
@@ -5575,7 +5580,7 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to delete items:", e);
+            console.warn("[Sonder] Failed to delete items:", e);
         }
     }
 
@@ -5604,7 +5609,7 @@ export class EditorWidget {
                     putBody.timeline_start_frame = clip.timeline_start_frame;
                     putBody.timeline_end_frame = clip.timeline_end_frame;
                 }
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${clipId}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${clipId}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(putBody),
@@ -5622,7 +5627,7 @@ export class EditorWidget {
                     putBody.timeline_start_frame = track.timeline_start_frame;
                     putBody.timeline_end_frame = track.timeline_end_frame;
                 }
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${trackId}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${trackId}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(putBody),
@@ -5639,10 +5644,10 @@ export class EditorWidget {
                     const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
                     const newIdx = previewIdx ?? Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
                     // Move guide = delete old + create new
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/guides/${oldIdx}`), {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${oldIdx}`), {
                         method: "DELETE",
                     });
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/guides`), {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides`), {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
@@ -5654,7 +5659,7 @@ export class EditorWidget {
                     });
                     delete data._previewFrameIndex;
                 } else if (type === "prompt") {
-                    await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
@@ -5668,7 +5673,7 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to move items:", e);
+            console.warn("[Sonder] Failed to move items:", e);
             await this._fetchScenes();
             this._renderTimeline();
         }
@@ -5683,7 +5688,7 @@ export class EditorWidget {
 
         try {
             if (type === "clip") {
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -5694,7 +5699,7 @@ export class EditorWidget {
                     }),
                 });
             } else if (type === "audio") {
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -5704,7 +5709,7 @@ export class EditorWidget {
                     }),
                 });
             } else if (type === "prompt") {
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -5716,7 +5721,7 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn("[LTX Editor] Failed to commit trim:", e);
+            console.warn("[Sonder] Failed to commit trim:", e);
             await this._fetchScenes();
             this._renderTimeline();
         }
@@ -5737,8 +5742,8 @@ export class EditorWidget {
 
         try {
             const endpoint = hit.type === "clip"
-                ? `/ltx-editor/project/${dirName}/scenes/${sceneId}/clips/${hit.id}/split`
-                : `/ltx-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${hit.id}/split`;
+                ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${hit.id}/split`
+                : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${hit.id}/split`;
             await fetch(api.apiURL(endpoint), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -5747,7 +5752,7 @@ export class EditorWidget {
             await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
-            console.warn(`[LTX Editor] Failed to split ${hit.type}:`, e);
+            console.warn(`[Sonder] Failed to split ${hit.type}:`, e);
         }
     }
 
@@ -5915,7 +5920,7 @@ export class EditorWidget {
 
         this._fsTitle = document.createElement("span");
         this._fsTitle.style.cssText = `font-size: 13px; color: ${COLORS.text}; font-weight: 600;`;
-        this._fsTitle.textContent = "LTX Editor";
+        this._fsTitle.textContent = "Sonder Editor";
 
         const spacer = document.createElement("span");
         spacer.style.flex = "1";
@@ -6738,7 +6743,7 @@ export class EditorWidget {
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const sceneId = this.activeScene.scene_id;
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/saved_selections`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -6773,7 +6778,7 @@ export class EditorWidget {
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const sceneId = this.activeScene.scene_id;
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), { method: "DELETE" });
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), { method: "DELETE" });
             await this._fetchScenes();
         } catch (e) { console.error("Delete saved selection failed:", e); }
     }
@@ -6783,7 +6788,7 @@ export class EditorWidget {
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const sceneId = this.activeScene.scene_id;
-            await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/saved_selections/${idx}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ name: newName }),
@@ -6937,7 +6942,7 @@ export class EditorWidget {
         setButtonVariant(button, "active");
         window.setTimeout(() => {
             if (!button.isConnected) return;
-            setButtonVariant(button, button.dataset.ltxBaseVariant || "primary");
+            setButtonVariant(button, button.dataset.sonderBaseVariant || "primary");
         }, 500);
     }
 
@@ -6950,7 +6955,7 @@ export class EditorWidget {
 
         try {
             const dirName = encodeURIComponent(this._projectDirName());
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(snapshot),
@@ -6988,7 +6993,7 @@ export class EditorWidget {
                     throw new Error("Failed to build batch queue snapshot.");
                 }
 
-                const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`), {
+                const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
@@ -7020,7 +7025,7 @@ export class EditorWidget {
         if (!this._projectDirName()) return;
         try {
             const dirName = encodeURIComponent(this._projectDirName());
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue`));
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`));
             if (resp.ok) {
                 this._renderQueue = await resp.json();
                 this._applyStoredQueueBatchCollapseState();
@@ -7182,7 +7187,7 @@ export class EditorWidget {
         delBtn.addEventListener("click", async () => {
             try {
                 const dirName = encodeURIComponent(this._projectDirName());
-                await fetch(api.apiURL(`/ltx-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
                 await this._fetchRenderQueue();
             } catch (e) {
                 console.error("Delete queue job failed:", e);
@@ -7373,7 +7378,7 @@ export class EditorWidget {
         this._thumbStripCache[assetId] = cache;
 
         // Fetch info first
-        fetch(api.apiURL(`/ltx-editor/project/${dirName}/thumbnail_strip/${assetId}?info=1`))
+        fetch(api.apiURL(`/sonder-editor/project/${dirName}/thumbnail_strip/${assetId}?info=1`))
             .then(r => r.ok ? r.json() : null)
             .then(info => {
                 if (!info) return;
@@ -7383,7 +7388,7 @@ export class EditorWidget {
                     cache.loaded = true;
                     this._renderTimeline();
                 };
-                cache.img.src = api.apiURL(`/ltx-editor/project/${dirName}/thumbnail_strip/${assetId}`);
+                cache.img.src = api.apiURL(`/sonder-editor/project/${dirName}/thumbnail_strip/${assetId}`);
             })
             .catch(() => {});
 
@@ -7398,7 +7403,7 @@ export class EditorWidget {
         const cache = { peaks: [], numBuckets: 0, loaded: false };
         this._waveformCache[assetId] = cache;
 
-        fetch(api.apiURL(`/ltx-editor/project/${dirName}/waveform/${assetId}`))
+        fetch(api.apiURL(`/sonder-editor/project/${dirName}/waveform/${assetId}`))
             .then(r => r.ok ? r.json() : null)
             .then(data => {
                 if (!data) return;
@@ -7469,7 +7474,7 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}/scenes/${sceneId}/restore`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/restore`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(snapshot),
@@ -7484,7 +7489,7 @@ export class EditorWidget {
                 this._renderViewportFrame();
             }
         } catch (e) {
-            console.warn("[LTX Editor] Undo/redo restore failed:", e);
+            console.warn("[Sonder] Undo/redo restore failed:", e);
         }
     }
 
@@ -7535,11 +7540,17 @@ export class EditorWidget {
         if (!wanted.size || wanted.has("project")) {
             this._fetchProjectSettings();
         }
-        if (!wanted.size || wanted.has("assets")) {
-            this._fetchAssets();
-        }
-        if (!wanted.size || wanted.has("scenes")) {
-            this._fetchScenes();
+        const wantsAssets = !wanted.size || wanted.has("assets");
+        const wantsScenes = !wanted.size || wanted.has("scenes");
+        if (wantsAssets && wantsScenes) {
+            this._fetchAssets().then(() => this._fetchScenes());
+        } else {
+            if (wantsAssets) {
+                this._fetchAssets();
+            }
+            if (wantsScenes) {
+                this._fetchScenes();
+            }
         }
         if (!wanted.size || wanted.has("queue")) {
             this._fetchRenderQueue();
@@ -7550,7 +7561,7 @@ export class EditorWidget {
         if (!this.projectDir) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            const resp = await fetch(api.apiURL(`/ltx-editor/project/${dirName}`));
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`));
             if (resp.ok) {
                 const data = await resp.json();
                 this.fps = data.fps || 24;
@@ -7564,7 +7575,7 @@ export class EditorWidget {
                 this._resizeViewportCanvas();
             }
         } catch (e) {
-            console.warn("[LTX Editor] Failed to fetch project settings:", e);
+            console.warn("[Sonder] Failed to fetch project settings:", e);
         }
     }
 
@@ -7609,7 +7620,7 @@ export class EditorWidget {
             isAudioLaneHidden: (laneIndex) => this._isLaneHidden(TRACK_TYPE.AUDIO, laneIndex || 0),
             buildViewUrl: (sourcePath) => this._buildViewURL(sourcePath),
             buildThumbnailUrl: (assetId) => this.projectDir
-                ? api.apiURL(`/ltx-editor/project/${this.projectDir.split(/[/\\]/).pop()}/thumbnail/${assetId}`)
+                ? api.apiURL(`/sonder-editor/project/${this.projectDir.split(/[/\\]/).pop()}/thumbnail/${assetId}`)
                 : null,
         });
         return this._viewportSurface;
@@ -7794,7 +7805,7 @@ export class EditorWidget {
                 video.src = blobUrl;
             })
             .catch(err => {
-                console.warn("[LTX] Failed to load video as blob, falling back to direct URL:", err);
+                console.warn("[Sonder] Failed to load video as blob, falling back to direct URL:", err);
                 video.crossOrigin = "anonymous";
                 video.src = url;
             });
@@ -7820,7 +7831,7 @@ export class EditorWidget {
                 audio.src = blobUrl;
             })
             .catch(err => {
-                console.warn("[LTX] Failed to load audio as blob, falling back to direct URL:", err);
+                console.warn("[Sonder] Failed to load audio as blob, falling back to direct URL:", err);
                 audio.src = url;
             });
 
@@ -8014,7 +8025,7 @@ export class EditorWidget {
         const drawOnce = (method) => {
             if (cancelled) return;
             this._seekAbort = null;
-            console.log(`[LTX Scrub] Drew frame via ${method}: target=${targetTime.toFixed(3)}, actual=${video.currentTime.toFixed(3)}, prev=${prevTime.toFixed(3)}, readyState=${video.readyState}, seekable=${video.seekable.length > 0 ? video.seekable.start(0).toFixed(1) + '-' + video.seekable.end(0).toFixed(1) : 'none'}`);
+            console.log(`[Sonder Scrub] Drew frame via ${method}: target=${targetTime.toFixed(3)}, actual=${video.currentTime.toFixed(3)}, prev=${prevTime.toFixed(3)}, readyState=${video.readyState}, seekable=${video.seekable.length > 0 ? video.seekable.start(0).toFixed(1) + '-' + video.seekable.end(0).toFixed(1) : 'none'}`);
             this._drawVideoToCanvas(video);
         };
 
@@ -8029,7 +8040,7 @@ export class EditorWidget {
         // Method 2: fallback polling timer (in case seeked event doesn't fire)
         const fallbackTimer = setTimeout(() => {
             video.removeEventListener("seeked", onSeeked);
-            console.warn(`[LTX Scrub] seeked event did not fire in 150ms, using fallback. target=${targetTime.toFixed(3)}, actual=${video.currentTime.toFixed(3)}`);
+            console.warn(`[Sonder Scrub] seeked event did not fire in 150ms, using fallback. target=${targetTime.toFixed(3)}, actual=${video.currentTime.toFixed(3)}`);
             drawOnce("fallback");
         }, 150);
 
@@ -8466,11 +8477,11 @@ export class EditorWidget {
         if (!this.projectDir) return;
         try {
             if (await importFileIntoProject(this.projectDir, file, folder)) {
-                console.log("[LTX Editor] Imported:", file.name);
+                console.log("[Sonder] Imported:", file.name);
                 await this._fetchAssets();
             }
         } catch (e) {
-            console.warn("[LTX Editor] File import error:", e);
+            console.warn("[Sonder] File import error:", e);
         }
     }
 
@@ -9139,7 +9150,7 @@ export class EditorWidget {
             projectDefaultsSection,
             "defaultProjectFps",
             "Default FPS",
-            "Used to prefill create-project widgets in LTXEditor.",
+            "Used to prefill create-project widgets in SonderEditor.",
             {
                 min: 1,
                 max: 240,

@@ -8,16 +8,16 @@ import { getEditorSettings } from "./editor_settings.js";
 function hideWidget(node, widget) {
     if (widget.hidden) return;
     widget.hidden = true;
-    widget._ltx_origComputeSize = widget.computeSize;
+    widget._sonder_origComputeSize = widget.computeSize;
     widget.computeSize = () => [0, -4];
 }
 
 function showWidget(node, widget) {
     if (!widget.hidden) return;
     widget.hidden = false;
-    if (widget._ltx_origComputeSize) {
-        widget.computeSize = widget._ltx_origComputeSize;
-        delete widget._ltx_origComputeSize;
+    if (widget._sonder_origComputeSize) {
+        widget.computeSize = widget._sonder_origComputeSize;
+        delete widget._sonder_origComputeSize;
     } else {
         delete widget.computeSize;
     }
@@ -27,7 +27,7 @@ function showWidget(node, widget) {
 async function getProjectDir(projectValue) {
     if (!projectValue || projectValue === "+ Create New") return "";
     try {
-        const resp = await fetch(api.apiURL("/ltx-editor/projects"));
+        const resp = await fetch(api.apiURL("/sonder-editor/projects"));
         if (!resp.ok) return "";
 
         const data = await resp.json();
@@ -37,13 +37,13 @@ async function getProjectDir(projectValue) {
         });
         return match ? match.path : "";
     } catch (e) {
-        console.warn("[LTX Editor] Failed to get project dir:", e);
+        console.warn("[Sonder] Failed to get project dir:", e);
     }
     return "";
 }
 
 async function listProjects() {
-    const resp = await fetch(api.apiURL("/ltx-editor/projects"));
+    const resp = await fetch(api.apiURL("/sonder-editor/projects"));
     if (!resp.ok) {
         throw new Error(`Failed to list projects: ${resp.status}`);
     }
@@ -66,13 +66,14 @@ async function createProjectFromNode(node, projectWidget) {
     const widthWidget = node.widgets.find((widget) => widget.name === "width");
     const heightWidget = node.widgets.find((widget) => widget.name === "height");
     const settings = getEditorSettings();
+    const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || 200));
 
     const projectName = String(projectNameWidget?.value || "").trim();
     if (!projectName) {
         throw new Error("Project name is required");
     }
 
-    const resp = await fetch(api.apiURL("/ltx-editor/project"), {
+    const resp = await fetch(api.apiURL("/sonder-editor/project"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -96,9 +97,30 @@ async function createProjectFromNode(node, projectWidget) {
     const projects = await syncProjectWidgetChoices(projectWidget);
     const createdProject = projects.find((project) => project.project_id === created.project_id)
         || projects.find((project) => project.name === created.name);
-    const nextValue = createdProject
-        ? createdProject.path.split(/[/\\]/).pop()
-        : created.name;
+    const nextValue = createdProject?.path?.split(/[/\\]/).pop();
+
+    if (!nextValue) {
+        throw new Error("Created project was not found after refreshing the project list");
+    }
+
+    if ((Number(createdProject.scene_count) || 0) <= 0) {
+        const sceneResp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(nextValue)}/scenes`), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                name: "Scene 1",
+                duration_frames: defaultSceneDuration,
+            }),
+        });
+        if (!sceneResp.ok) {
+            let message = `Initial scene creation failed: ${sceneResp.status}`;
+            try {
+                const data = await sceneResp.json();
+                if (data?.error) message = data.error;
+            } catch {}
+            throw new Error(message);
+        }
+    }
 
     projectWidget.value = nextValue;
     projectWidget.callback?.(nextValue);
@@ -118,7 +140,7 @@ function applyProjectCreationDefaults(node) {
 
 function getActiveEditorNodes() {
     return (app.graph._nodes || app.graph.nodes || []).filter(
-        (node) => node.type === "LTXEditor" && node._ltxController?.state?.projectDir
+        (node) => node.type === "SonderEditor" && node._sonderController?.state?.projectDir
     );
 }
 
@@ -146,7 +168,7 @@ function getLinkedNodeFromInput(node, inputName) {
 function collectUpstreamEditorNodes(startNode, collected = new Set(), visited = new Set()) {
     if (!startNode || visited.has(startNode.id)) return collected;
     visited.add(startNode.id);
-    if (startNode.type === "LTXEditor") {
+    if (startNode.type === "SonderEditor") {
         collected.add(startNode);
         return collected;
     }
@@ -163,13 +185,13 @@ function collectUpstreamEditorNodes(startNode, collected = new Set(), visited = 
 }
 
 function editorNodeHasQueuedWork(node) {
-    const counts = node?._ltxController?.state?.dormantSummary?.queue_counts || {};
+    const counts = node?._sonderController?.state?.dormantSummary?.queue_counts || {};
     return (counts.pending || 0) > 0 || (counts.running || 0) > 0;
 }
 
 function refreshEditorNodes(editorNodes) {
     for (const editorNode of editorNodes || []) {
-        editorNode._ltxController.handleSaveVideoExecuted();
+        editorNode._sonderController.handleSaveVideoExecuted();
     }
 }
 
@@ -177,7 +199,7 @@ function getSaveVideoEditorNodes(saveNode) {
     const projectSourceNode = getLinkedNodeFromInput(saveNode, "project");
     if (!projectSourceNode) return [];
     return Array.from(collectUpstreamEditorNodes(projectSourceNode)).filter(
-        (node) => node._ltxController?.state?.projectDir
+        (node) => node._sonderController?.state?.projectDir
     );
 }
 
@@ -198,13 +220,13 @@ function scheduleQueuedExecutionRefresh() {
             }
             const counts = await Promise.all(editorNodes.map(async (editorNode) => {
                 try {
-                    return await editorNode._ltxController?.handleQueueExecutionSettled?.({
+                    return await editorNode._sonderController?.handleQueueExecutionSettled?.({
                         allowRollback: index === delays.length - 1,
                         attemptIndex: index,
                         delay,
                     });
                 } catch (error) {
-                    console.warn("[LTX Editor] Queue reconciliation failed:", error);
+                    console.warn("[Sonder] Queue reconciliation failed:", error);
                     return null;
                 }
             }));
@@ -219,12 +241,12 @@ function scheduleQueuedExecutionRefresh() {
 
 // ── Main Extension ─────────────────────────────────────────────────────
 app.registerExtension({
-    name: "ltx.editor",
+    name: "sonder.editor",
 
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
 
-        // ── LTX Editor Node ────────────────────────────────────────────
-        if (nodeData.name === "LTXEditor") {
+        // ── Sonder Editor Node ────────────────────────────────────────────
+        if (nodeData.name === "SonderEditor") {
             const origOnNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 origOnNodeCreated?.apply(this, arguments);
@@ -246,12 +268,12 @@ app.registerExtension({
                 }
 
                 const controller = new EditorNodeController(node, projectWidget);
-                node._ltxController = controller;
+                node._sonderController = controller;
                 node.resizable = true;
                 node.flags = { ...(node.flags || {}), resizable: true };
                 controller.render();
 
-                const editorDOMWidget = node.addDOMWidget("ltx_editor_ui", "LTXEditorWidget", controller.getElement(), {
+                const editorDOMWidget = node.addDOMWidget("sonder_editor_ui", "SonderEditorWidget", controller.getElement(), {
                     serialize: false,
                     hideOnZoom: false,
                     getMinHeight: () => 150,
@@ -277,7 +299,7 @@ app.registerExtension({
                     try {
                         await createProjectFromNode(node, projectWidget);
                     } catch (e) {
-                        console.warn("[LTX Editor] Failed to create project:", e);
+                        console.warn("[Sonder] Failed to create project:", e);
                     }
                 });
                 createButtonWidget.serialize = false;
@@ -320,13 +342,13 @@ app.registerExtension({
                     const nextSize = node.computeSize();
                     const preferredWidth = isCreateNew ? 340 : 440;
                     const modeKey = isCreateNew ? "create" : "existing";
-                    if (!node._ltxInitializedSize) {
-                        node._ltxInitializedSize = true;
-                        node._ltxPreferredWidthMode = modeKey;
+                    if (!node._sonderInitializedSize) {
+                        node._sonderInitializedSize = true;
+                        node._sonderPreferredWidthMode = modeKey;
                         node.size = [preferredWidth, Math.max(nextSize?.[1] || 0, node.size?.[1] || 0)];
                     } else {
-                        if (node._ltxPreferredWidthMode !== modeKey && (node.size?.[0] || 0) < preferredWidth) {
-                            node._ltxPreferredWidthMode = modeKey;
+                        if (node._sonderPreferredWidthMode !== modeKey && (node.size?.[0] || 0) < preferredWidth) {
+                            node._sonderPreferredWidthMode = modeKey;
                             node.size = [preferredWidth, node.size?.[1] || nextSize?.[1] || controller.getHeight()];
                         }
                         node.size = [
@@ -343,7 +365,7 @@ app.registerExtension({
 
                 const runUpdateVisibility = () => {
                     Promise.resolve(updateVisibility()).catch((e) => {
-                        console.warn("[LTX Editor] Failed to update node visibility:", e);
+                        console.warn("[Sonder] Failed to update node visibility:", e);
                     });
                 };
 
@@ -357,7 +379,7 @@ app.registerExtension({
                     syncProjectWidgetChoices(projectWidget)
                         .then(() => runUpdateVisibility())
                         .catch((e) => {
-                            console.warn("[LTX Editor] Failed to sync project choices:", e);
+                            console.warn("[Sonder] Failed to sync project choices:", e);
                         });
                 }
 
@@ -368,12 +390,12 @@ app.registerExtension({
                 const origOnResize = node.onResize;
                 node.onResize = function () {
                     origOnResize?.apply(this, arguments);
-                    node._ltxController?.handleNodeResize?.();
+                    node._sonderController?.handleNodeResize?.();
                 };
 
                 const origOnRemoved = node.onRemoved;
                 node.onRemoved = function () {
-                    node._ltxController?.destroy();
+                    node._sonderController?.destroy();
                     origOnRemoved?.apply(this, arguments);
                 };
 
@@ -394,13 +416,13 @@ app.registerExtension({
                 };
 
                 node.onDragDrop = async (e) => {
-                    if (!node._ltxController?.state?.projectDir) return false;
+                    if (!node._sonderController?.state?.projectDir) return false;
                     if (!e.dataTransfer?.files?.length) return false;
 
                     e.preventDefault?.();
                     e.stopPropagation?.();
 
-                    await node._ltxController.importFiles(e.dataTransfer.files);
+                    await node._sonderController.importFiles(e.dataTransfer.files);
                     return true;
                 };
             };
@@ -409,12 +431,12 @@ app.registerExtension({
             const origOnExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function () {
                 origOnExecuted?.apply(this, arguments);
-                this._ltxController?.handleNodeExecuted();
+                this._sonderController?.handleNodeExecuted();
             };
         }
 
-        // ── LTX Save Video — notify editor nodes to refresh ───────────
-        if (nodeData.name === "LTXSaveVideo") {
+        // ── Sonder Save Video — notify editor nodes to refresh ───────────
+        if (nodeData.name === "SonderSaveVideo") {
             const origOnExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function () {
                 origOnExecuted?.apply(this, arguments);
@@ -423,7 +445,6 @@ app.registerExtension({
             };
         }
 
-        // ── Legacy LTX Project Loader ──────────────────────────────────
     },
 
     setup() {
@@ -440,11 +461,11 @@ app.registerExtension({
         // custom MIME type, fetch the actual asset, upload it to ComfyUI's
         // input dir, and create the appropriate loader node.
         document.addEventListener("drop", async (e) => {
-            const assetData = e.dataTransfer.getData("application/ltx-asset");
+            const assetData = e.dataTransfer.getData("application/x-sonder-asset");
             if (!assetData) return; // Not our drag
 
             // Don't intercept drops on our own editor elements
-            if (e.target.closest?.("[data-ltx-editor]")) return;
+            if (e.target.closest?.("[data-sonder-editor]")) return;
 
             e.preventDefault();
             e.stopPropagation();
@@ -455,7 +476,7 @@ app.registerExtension({
                 if (!dirName) return;
 
                 const fn = asset.path.split(/[/\\]/).pop();
-                const sf = `ltx_projects/${dirName}/${asset.path.split(/[/\\]/).slice(0, -1).join("/")}`;
+                const sf = `sonder-projects/${dirName}/${asset.path.split(/[/\\]/).slice(0, -1).join("/")}`;
                 const viewUrl = api.apiURL(
                     `/view?filename=${encodeURIComponent(fn)}&subfolder=${encodeURIComponent(sf)}&type=output`
                 );
@@ -469,7 +490,7 @@ app.registerExtension({
                 // Upload to ComfyUI input directory
                 const formData = new FormData();
                 formData.append("image", file);
-                formData.append("subfolder", "ltx_assets");
+                formData.append("subfolder", "sonder_assets");
                 const uploadResp = await api.fetchApi("/upload/image", {
                     method: "POST",
                     body: formData,
@@ -495,7 +516,7 @@ app.registerExtension({
                 }
 
                 if (!nodeType) {
-                    console.warn("[LTX Editor] No suitable node type for:", asset.asset_type);
+                    console.warn("[Sonder] No suitable node type for:", asset.asset_type);
                     return;
                 }
 
@@ -504,7 +525,7 @@ app.registerExtension({
                 const pos = graphCanvas.convertEventToCanvasOffset(e);
                 const node = LiteGraph.createNode(nodeType);
                 if (!node) {
-                    console.warn("[LTX Editor] Could not create node:", nodeType);
+                    console.warn("[Sonder] Could not create node:", nodeType);
                     return;
                 }
                 node.pos = [pos[0], pos[1]];
@@ -517,7 +538,7 @@ app.registerExtension({
                     widget.callback?.(uploadedName);
                 }
             } catch (err) {
-                console.warn("[LTX Editor] ComfyUI graph drop failed:", err);
+                console.warn("[Sonder] ComfyUI graph drop failed:", err);
             }
         }, false); // bubble phase — timeline canvas stopPropagation prevents this from firing for timeline drops
     },
