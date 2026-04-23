@@ -360,7 +360,7 @@ export class EditorWidget {
         this.dragType = null; // "selection", "playhead", "selStart", "selEnd"
 
         // Asset state
-        this.assets = { video: [], image: [], audio: [] };
+        this.assets = { video: [], image: [], audio: [], artifact: [] };
         this.selectedAssetType = "video";
         this._collapsedFolders = {};
         this._renderQueue = [];
@@ -987,6 +987,42 @@ export class EditorWidget {
         return btn;
     }
 
+    _showToast(message, { duration = 2200 } = {}) {
+        if (!message) return;
+        if (this._toastTimer) {
+            window.clearTimeout(this._toastTimer);
+            this._toastTimer = null;
+        }
+        if (!this._toastEl) {
+            this._toastEl = document.createElement("div");
+            this._toastEl.style.cssText = `
+                position: fixed;
+                left: 50%;
+                bottom: 24px;
+                transform: translateX(-50%);
+                z-index: 10020;
+                max-width: min(420px, calc(100vw - 32px));
+                padding: 10px 14px;
+                border-radius: 10px;
+                background: rgba(18, 24, 32, 0.96);
+                border: 1px solid ${COLORS.warningBorder};
+                color: ${COLORS.warningText};
+                box-shadow: 0 16px 34px rgba(0, 0, 0, 0.36);
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.01em;
+                pointer-events: none;
+            `;
+            document.body.appendChild(this._toastEl);
+        }
+        this._toastEl.textContent = message;
+        this._toastEl.style.opacity = "1";
+        this._toastTimer = window.setTimeout(() => {
+            if (!this._toastEl) return;
+            this._toastEl.style.opacity = "0";
+        }, duration);
+    }
+
     // ── Scene Management ───────────────────────────────────────────────
     async _fetchScenes() {
         if (!this.projectDir) return;
@@ -1386,7 +1422,7 @@ export class EditorWidget {
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets?include_trashed=true`));
             if (resp.ok) {
                 const data = await resp.json();
-                this.assets = { video: [], image: [], audio: [] };
+                this.assets = { video: [], image: [], audio: [], artifact: [] };
                 this._pathToAsset = {};
                 for (const asset of (data.assets || [])) {
                     if (this.assets[asset.asset_type]) {
@@ -4575,6 +4611,10 @@ export class EditorWidget {
 
     async _handleAssetDrop(asset, frame, trackRawY) {
         if (!this.activeScene || !this.projectDir) return;
+        if (asset?.asset_type === "artifact") {
+            this._showToast("Artifact assets cannot be added to the timeline.");
+            return;
+        }
 
         // Take-aware drop: if asset has take_metadata, auto-place at original position
         if (asset.generation_params?.selection_start !== undefined && asset.generation_params?.scene_id === this.activeScene.scene_id) {
@@ -4601,7 +4641,7 @@ export class EditorWidget {
 
         // Auto-add lane if target lane has overlapping items at the drop frame
         const _findAsset = (id) => {
-            for (const type of ["video", "image", "audio"]) {
+            for (const type of ["video", "image", "audio", "artifact"]) {
                 const found = (this.assets[type] || []).find(a => a.asset_id === id);
                 if (found) return found;
             }
@@ -9240,6 +9280,14 @@ export class EditorWidget {
             () => this._settings.gallery.thumbnailSize,
             (value) => updateCategory("gallery", "thumbnailSize", value)
         );
+        createCheckbox(
+            gallerySection,
+            "galleryArtifactInspectorExpanded",
+            "Artifact Inspector Expanded",
+            "Show the artifact metadata inspector in its expanded state by default.",
+            () => this._settings.gallery.artifactInspectorExpanded,
+            (checked) => updateCategory("gallery", "artifactInspectorExpanded", checked)
+        );
 
         backdrop.appendChild(panel);
         document.body.appendChild(backdrop);
@@ -9338,6 +9386,14 @@ export class EditorWidget {
         if (this._settingsPanelEl) {
             this._settingsPanelEl.remove();
             this._settingsPanelEl = null;
+        }
+        if (this._toastTimer) {
+            window.clearTimeout(this._toastTimer);
+            this._toastTimer = null;
+        }
+        if (this._toastEl) {
+            this._toastEl.remove();
+            this._toastEl = null;
         }
         if (this._fullscreenPlaceholder) {
             this._fullscreenPlaceholder.remove();

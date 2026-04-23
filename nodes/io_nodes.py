@@ -1,9 +1,13 @@
+import json
 import os
-import uuid
-import random
 import logging
+import random
+import re
+import shutil
 import subprocess
+import threading
 import time
+import uuid
 from datetime import datetime
 
 import cv2
@@ -13,10 +17,727 @@ import folder_paths
 
 from PIL import Image
 
-from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack
-from ..server.project_manager import save_project
+from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
+from ..server.project_manager import load_project, save_project
 
 logger = logging.getLogger("sonder_editor")
+
+BRIDGE_SCAN_SIDECAR = "_scan.json"
+BRIDGE_STALE_DIR_TTL_SEC = 24 * 60 * 60
+BRIDGE_POLL_INTERVAL_SEC = 0.25
+BRIDGE_IDLE_SETTLE_SEC = 1.0
+BRIDGE_FALLBACK_MIN_WAIT_SEC = 5.0
+BRIDGE_MAX_WAIT_SEC = 60 * 60
+
+_BRIDGE_REGISTRY_LOCK = threading.Lock()
+_BRIDGE_REGISTRY = {}
+_BRIDGE_PROMPT_WATCHERS = {}
+_BRIDGE_PROMPT_KEY_BY_OBJECT_ID = {}
+_BRIDGE_PROMPT_OBJECT_IDS_BY_KEY = {}
+_BRIDGE_PROMPT_QUEUE_HOOK_LOCK = threading.Lock()
+_BRIDGE_HOOKED_PROMPT_QUEUE_ID = None
+
+
+def _normalize_asset_folder(folder: str) -> str:
+    return str(folder or "").strip().replace("\\", "/").strip("/")
+
+
+def _ensure_asset_folder_metadata(project, folder: str) -> None:
+    normalized = _normalize_asset_folder(folder)
+    if not normalized:
+        return
+    existing = {
+        _normalize_asset_folder(entry)
+        for entry in project.metadata.get("asset_folders", [])
+        if _normalize_asset_folder(entry)
+    }
+    if normalized in existing:
+        return
+    existing.add(normalized)
+    project.metadata["asset_folders"] = sorted(existing)
+
+
+def _copy_execution_context(project) -> dict:
+    context = getattr(project, "_execution_context", None) or {}
+    return dict(context) if isinstance(context, dict) else {}
+
+
+def _find_queue_job(project, queue_job_id: str):
+    if not project or not queue_job_id:
+        return None
+    for job in getattr(project, "generation_queue", []) or []:
+        if getattr(job, "job_id", "") == queue_job_id:
+            return job
+    return None
+
+
+def _mark_later_batch_jobs_failed(project, queue_job):
+    batch_id = str(getattr(queue_job, "batch_id", "") or "")
+    if not project or not batch_id:
+        return
+
+    queue = getattr(project, "generation_queue", []) or []
+    failed_queue_index = None
+    failed_job_id = str(getattr(queue_job, "job_id", "") or "")
+    failed_batch_index = int(getattr(queue_job, "batch_index", 0) or 0)
+
+    for idx, job in enumerate(queue):
+        if job is queue_job or (failed_job_id and getattr(job, "job_id", "") == failed_job_id):
+            failed_queue_index = idx
+            break
+
+    skip_error = f"Skipped after earlier batch failure ({failed_job_id or 'unknown job'})"
+    for idx, job in enumerate(queue):
+        if job is queue_job:
+            continue
+        if str(getattr(job, "batch_id", "") or "") != batch_id:
+            continue
+        if (getattr(job, "status", "pending") or "pending").lower() != "pending":
+            continue
+
+        job_batch_index = int(getattr(job, "batch_index", 0) or 0)
+        is_later_chunk = job_batch_index > failed_batch_index
+        if failed_queue_index is not None and idx > failed_queue_index:
+            is_later_chunk = True
+        if not is_later_chunk:
+            continue
+
+        job.status = "failed"
+        job.error = skip_error
+        job.progress = 0.0
+
+
+def _mark_queue_job_failed(project, queue_job_id: str, error_message: str) -> bool:
+    queue_job = _find_queue_job(project, queue_job_id)
+    if not queue_job:
+        return False
+    if (queue_job.status or "pending").lower() != "running":
+        logger.info(
+            "Queue fail skipped for %s because status=%s",
+            queue_job_id,
+            getattr(queue_job, "status", ""),
+        )
+        return False
+    queue_job.status = "failed"
+    queue_job.error = str(error_message)
+    queue_job.progress = 0.0
+    queue_job.completed_at = ""
+    queue_job.result_asset_id = ""
+    _mark_later_batch_jobs_failed(project, queue_job)
+    return True
+
+
+def _mark_queue_job_completed(project, queue_job_id: str, result_asset_id: str) -> bool:
+    queue_job = _find_queue_job(project, queue_job_id)
+    if not queue_job:
+        return False
+    if (queue_job.status or "pending").lower() != "running":
+        logger.info(
+            "Queue completion skipped for %s because status=%s",
+            queue_job_id,
+            getattr(queue_job, "status", ""),
+        )
+        return False
+    queue_job.status = "completed"
+    queue_job.progress = 1.0
+    queue_job.error = ""
+    queue_job.completed_at = datetime.now().isoformat()
+    queue_job.result_asset_id = result_asset_id
+    return True
+
+
+def _bridge_root_for_project(project_dir: str) -> str:
+    return os.path.join(project_dir, "cache", "bridge_out")
+
+
+_BRIDGE_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _sanitize_bridge_component(value: str) -> str:
+    replaced = _BRIDGE_SANITIZE_PATTERN.sub("_", str(value or ""))
+    while "__" in replaced:
+        replaced = replaced.replace("__", "_")
+    return replaced.strip("_")
+
+
+def _build_bridge_naming_stem(project, context: dict, prefix: str) -> str:
+    parts: list[str] = []
+    prefix_part = _sanitize_bridge_component(prefix)
+    if prefix_part:
+        parts.append(prefix_part)
+    project_part = _sanitize_bridge_component(getattr(project, "name", "") or "")
+    parts.append(project_part or "bridge")
+    scene_name = context.get("scene_name", "") if isinstance(context, dict) else ""
+    scene_part = _sanitize_bridge_component(scene_name)
+    if scene_part:
+        parts.append(scene_part)
+    parts.append(datetime.now().strftime("%Y%m%d-%H%M%S"))
+    return "_".join(parts)
+
+
+def _safe_bridge_relpath(path: str, root: str) -> str:
+    return os.path.relpath(path, root).replace("\\", "/")
+
+
+def _write_bridge_sidecar(bridge_dir: str, existed: list[str]) -> None:
+    sidecar_path = os.path.join(bridge_dir, BRIDGE_SCAN_SIDECAR)
+    with open(sidecar_path, "w", encoding="utf-8") as handle:
+        json.dump({"existed": sorted(set(existed))}, handle, indent=2)
+
+
+def _read_bridge_sidecar(bridge_dir: str) -> set[str]:
+    sidecar_path = os.path.join(bridge_dir, BRIDGE_SCAN_SIDECAR)
+    if not os.path.isfile(sidecar_path):
+        return set()
+    try:
+        with open(sidecar_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return set()
+    existed = payload.get("existed", []) if isinstance(payload, dict) else []
+    return {
+        str(entry).replace("\\", "/").strip("/")
+        for entry in existed
+        if str(entry or "").strip()
+    }
+
+
+def _list_bridge_files(bridge_dir: str) -> list[str]:
+    results = []
+    for root, _dirs, files in os.walk(bridge_dir):
+        for filename in files:
+            full_path = os.path.join(root, filename)
+            rel_path = _safe_bridge_relpath(full_path, bridge_dir).strip("/")
+            if rel_path == BRIDGE_SCAN_SIDECAR:
+                continue
+            results.append(rel_path)
+    return sorted(results)
+
+
+def _latest_bridge_change_time(bridge_dir: str) -> float:
+    latest = os.path.getmtime(bridge_dir) if os.path.isdir(bridge_dir) else 0.0
+    for root, dirs, files in os.walk(bridge_dir):
+        for name in [*dirs, *files]:
+            try:
+                latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+            except OSError:
+                continue
+    return latest
+
+
+def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
+    bridge_root = os.path.abspath(_bridge_root_for_project(project_dir))
+    if not os.path.isdir(bridge_root):
+        return
+    cutoff = time.time() - BRIDGE_STALE_DIR_TTL_SEC
+    for entry in os.scandir(bridge_root):
+        if not entry.is_dir():
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        target = os.path.abspath(entry.path)
+        if not target.startswith(bridge_root + os.sep):
+            continue
+        recovered_stem = f"bridge_recovered_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        orphan_entry = {
+            "project_dir": project_dir,
+            "prompt_key": f"recovered_{uuid.uuid4().hex[:8]}",
+            "bridge_node_id": "recovered",
+            "bridge_dir": target,
+            "prompt_key_source": "recovered",
+            "target_folder": "",
+            "mark_queue_complete": False,
+            "queue_job_id": "",
+            "prompt_text": "",
+            "generation_params": {},
+            "naming_stem": recovered_stem,
+        }
+        try:
+            _finalize_bridge_entry(orphan_entry)
+        except Exception:
+            logger.exception("Failed to adopt stale bridge dir %s", target)
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def _build_bridge_output_paths(project, prompt_key: str, bridge_node_id: str, naming_stem: str) -> tuple[str, str]:
+    bridge_dir = os.path.join(_bridge_root_for_project(project.project_dir), f"{prompt_key}_{bridge_node_id}")
+    output_root = folder_paths.get_output_directory()
+    relative_dir = os.path.relpath(bridge_dir, output_root).replace("\\", "/")
+    stem = (naming_stem or "").strip() or "out"
+    filename_prefix = f"{relative_dir}/{stem}"
+    return bridge_dir, filename_prefix
+
+
+def _prepare_bridge_output_dir(project, prompt_key: str, bridge_node_id: str, naming_stem: str) -> tuple[str, str]:
+    _cleanup_stale_bridge_dirs(project.project_dir)
+    bridge_dir, filename_prefix = _build_bridge_output_paths(project, prompt_key, bridge_node_id, naming_stem)
+    os.makedirs(bridge_dir, exist_ok=True)
+    existed = _list_bridge_files(bridge_dir)
+    _write_bridge_sidecar(bridge_dir, existed)
+    return bridge_dir, filename_prefix
+
+
+def _bridge_unique_media_name(media_dir: str, basename: str) -> str:
+    stem, ext = os.path.splitext(basename)
+    candidate = basename
+    suffix = 1
+    while os.path.exists(os.path.join(media_dir, candidate)):
+        candidate = f"{stem}_{suffix}{ext}"
+        suffix += 1
+    return candidate
+
+
+def _extract_bridge_asset_metadata(source_path: str, asset_type: str) -> dict:
+    width, height, frame_count, fps, duration_sec, sample_rate = 0, 0, 0, 0.0, 0.0, 0
+    has_audio = False
+
+    if asset_type == "video":
+        cap = None
+        try:
+            cap = cv2.VideoCapture(source_path)
+            if cap.isOpened():
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+                duration_sec = frame_count / fps if fps > 0 else 0.0
+        except Exception as exc:
+            logger.warning("Bridge video metadata failed for %s: %s", source_path, exc)
+        finally:
+            if cap is not None:
+                cap.release()
+        try:
+            from ..server.routes import _video_has_audio as route_video_has_audio
+            has_audio = bool(route_video_has_audio(source_path))
+        except Exception:
+            has_audio = False
+    elif asset_type == "image":
+        try:
+            with Image.open(source_path) as img:
+                width, height = img.size
+        except Exception as exc:
+            logger.warning("Bridge image metadata failed for %s: %s", source_path, exc)
+    elif asset_type == "audio":
+        try:
+            from ..server.routes import _get_audio_duration as route_get_audio_duration
+            duration_sec = float(route_get_audio_duration(source_path) or 0.0)
+        except Exception:
+            duration_sec = 0.0
+
+    return {
+        "width": width,
+        "height": height,
+        "frame_count": frame_count,
+        "fps": fps,
+        "duration_sec": duration_sec,
+        "sample_rate": sample_rate,
+        "has_audio": has_audio,
+    }
+
+
+def _load_prompt_server_instance():
+    try:
+        import importlib
+        server_mod = importlib.import_module("server")
+        prompt_server = getattr(server_mod, "PromptServer", None)
+        return getattr(prompt_server, "instance", None) if prompt_server else None
+    except Exception:
+        return None
+
+
+def _set_bridge_prompt_key_for_object(prompt_key: str, prompt) -> None:
+    normalized_key = str(prompt_key or "").strip()
+    if not normalized_key or not isinstance(prompt, dict):
+        return
+    object_id = id(prompt)
+    with _BRIDGE_REGISTRY_LOCK:
+        previous_key = _BRIDGE_PROMPT_KEY_BY_OBJECT_ID.get(object_id)
+        if previous_key and previous_key != normalized_key:
+            object_ids = _BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.get(previous_key)
+            if isinstance(object_ids, set):
+                object_ids.discard(object_id)
+                if not object_ids:
+                    _BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.pop(previous_key, None)
+        _BRIDGE_PROMPT_KEY_BY_OBJECT_ID[object_id] = normalized_key
+        _BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.setdefault(normalized_key, set()).add(object_id)
+
+
+def _looks_like_prompt_graph(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if any(key in value for key in ("_prompt_id", "prompt_id", "__prompt_id__", "__prompt_key__")):
+        return True
+    return any(
+        isinstance(entry, dict) and ("class_type" in entry or "inputs" in entry)
+        for entry in value.values()
+    )
+
+
+def _find_prompt_graph_in_structure(structure, seen=None):
+    if _looks_like_prompt_graph(structure):
+        return structure
+    if seen is None:
+        seen = set()
+    marker = id(structure)
+    if marker in seen:
+        return None
+    seen.add(marker)
+    if isinstance(structure, dict):
+        for value in structure.values():
+            found = _find_prompt_graph_in_structure(value, seen)
+            if found is not None:
+                return found
+    elif isinstance(structure, (list, tuple, set)):
+        for value in structure:
+            found = _find_prompt_graph_in_structure(value, seen)
+            if found is not None:
+                return found
+    return None
+
+
+def _extract_prompt_key_from_queue_get_result(result) -> tuple[str, dict | None]:
+    prompt = _find_prompt_graph_in_structure(result)
+    if isinstance(result, tuple):
+        if len(result) >= 2 and isinstance(result[1], (str, int)) and str(result[1]).strip():
+            return str(result[1]).strip(), prompt
+        payload = result[0]
+        if isinstance(payload, (tuple, list)) and len(payload) >= 2 and isinstance(payload[1], (str, int)) and str(payload[1]).strip():
+            return str(payload[1]).strip(), prompt
+    explicit = _extract_prompt_key_from_prompt(prompt)
+    if explicit:
+        return explicit, prompt
+    return "", prompt
+
+
+def _extract_prompt_key_from_task_done_call(args, kwargs) -> str:
+    if isinstance(kwargs, dict):
+        for key in ("item_id", "prompt_id", "task_id", "id"):
+            value = kwargs.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+    if args:
+        value = args[0]
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _install_bridge_prompt_queue_hooks() -> bool:
+    global _BRIDGE_HOOKED_PROMPT_QUEUE_ID
+
+    prompt_server = _load_prompt_server_instance()
+    prompt_queue = getattr(prompt_server, "prompt_queue", None) if prompt_server else None
+    if prompt_queue is None:
+        return False
+
+    with _BRIDGE_PROMPT_QUEUE_HOOK_LOCK:
+        current_queue_id = id(prompt_queue)
+        if _BRIDGE_HOOKED_PROMPT_QUEUE_ID == current_queue_id:
+            return (
+                callable(getattr(prompt_queue, "get", None))
+                and callable(getattr(prompt_queue, "task_done", None))
+            )
+
+        original_get = getattr(prompt_queue, "get", None)
+        if callable(original_get) and not getattr(original_get, "_sonder_bridge_wrapped", False):
+            def wrapped_get(*args, **kwargs):
+                result = original_get(*args, **kwargs)
+                try:
+                    prompt_key, prompt = _extract_prompt_key_from_queue_get_result(result)
+                    _set_bridge_prompt_key_for_object(prompt_key, prompt)
+                except Exception:
+                    logger.exception("Failed to capture bridge prompt identity from prompt queue get()")
+                return result
+
+            wrapped_get._sonder_bridge_wrapped = True
+            setattr(prompt_queue, "get", wrapped_get)
+
+        original_task_done = getattr(prompt_queue, "task_done", None)
+        if callable(original_task_done) and not getattr(original_task_done, "_sonder_bridge_wrapped", False):
+            def wrapped_task_done(*args, **kwargs):
+                prompt_key = _extract_prompt_key_from_task_done_call(args, kwargs)
+                try:
+                    return original_task_done(*args, **kwargs)
+                finally:
+                    if prompt_key:
+                        try:
+                            _finalize_prompt_bridges(prompt_key, source="task_done")
+                        except Exception:
+                            logger.exception("Bridge finalization failed from prompt queue task_done for %s", prompt_key)
+
+            wrapped_task_done._sonder_bridge_wrapped = True
+            setattr(prompt_queue, "task_done", wrapped_task_done)
+
+        _BRIDGE_HOOKED_PROMPT_QUEUE_ID = current_queue_id
+        return (
+            callable(getattr(prompt_queue, "get", None))
+            and callable(getattr(prompt_queue, "task_done", None))
+        )
+
+
+def _structure_contains_prompt(structure, prompt, seen=None) -> bool:
+    if structure is prompt:
+        return True
+    if seen is None:
+        seen = set()
+    marker = id(structure)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    if isinstance(structure, dict):
+        for key, value in structure.items():
+            if key == prompt or value is prompt:
+                return True
+            if _structure_contains_prompt(value, prompt, seen):
+                return True
+    elif isinstance(structure, (list, tuple, set)):
+        for value in structure:
+            if value is prompt or _structure_contains_prompt(value, prompt, seen):
+                return True
+    return False
+
+
+def _prompt_currently_running(prompt_key: str, prompt) -> bool:
+    prompt_server = _load_prompt_server_instance()
+    prompt_queue = getattr(prompt_server, "prompt_queue", None) if prompt_server else None
+    if prompt_queue is None:
+        return False
+
+    currently_running = getattr(prompt_queue, "currently_running", None)
+    if isinstance(currently_running, dict):
+        if str(prompt_key) in {str(key) for key in currently_running.keys()}:
+            return True
+        if prompt is not None and _structure_contains_prompt(currently_running, prompt):
+            return True
+    elif currently_running:
+        if prompt is not None and _structure_contains_prompt(currently_running, prompt):
+            return True
+        if str(prompt_key) in {str(value) for value in currently_running}:
+            return True
+    return False
+
+
+def _extract_prompt_key_from_prompt(prompt) -> str:
+    if not isinstance(prompt, dict):
+        return ""
+    for key in ("_prompt_id", "prompt_id", "__prompt_id__", "__prompt_key__"):
+        value = prompt.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _resolve_bridge_prompt_key(prompt) -> tuple[str, str]:
+    hook_ready = _install_bridge_prompt_queue_hooks()
+    object_id = id(prompt) if isinstance(prompt, dict) else None
+    with _BRIDGE_REGISTRY_LOCK:
+        if object_id is not None and object_id in _BRIDGE_PROMPT_KEY_BY_OBJECT_ID:
+            return _BRIDGE_PROMPT_KEY_BY_OBJECT_ID[object_id], ("queue_hook" if hook_ready else "queue_map")
+
+    explicit = _extract_prompt_key_from_prompt(prompt)
+    if explicit:
+        _set_bridge_prompt_key_for_object(explicit, prompt)
+        return explicit, "prompt_field"
+
+    object_id = id(prompt) if isinstance(prompt, dict) else None
+    with _BRIDGE_REGISTRY_LOCK:
+        if object_id is not None and object_id in _BRIDGE_PROMPT_KEY_BY_OBJECT_ID:
+            return _BRIDGE_PROMPT_KEY_BY_OBJECT_ID[object_id], ("queue_hook" if hook_ready else "queue_map")
+        prompt_key = uuid.uuid4().hex[:12]
+        if object_id is not None:
+            _BRIDGE_PROMPT_KEY_BY_OBJECT_ID[object_id] = prompt_key
+            _BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.setdefault(prompt_key, set()).add(object_id)
+        return prompt_key, "fallback"
+
+
+def _cleanup_prompt_key_state(prompt_key: str) -> None:
+    object_ids = _BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.pop(prompt_key, set())
+    for object_id in object_ids:
+        if _BRIDGE_PROMPT_KEY_BY_OBJECT_ID.get(object_id) == prompt_key:
+            _BRIDGE_PROMPT_KEY_BY_OBJECT_ID.pop(object_id, None)
+
+
+def _cleanup_bridge_output_dir(bridge_dir: str) -> None:
+    if os.path.isdir(bridge_dir):
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+def _finalize_bridge_entry(entry: dict) -> list[Asset]:
+    project = load_project(entry["project_dir"])
+    queue_job_id = str(entry.get("queue_job_id") or "")
+    target_folder = _normalize_asset_folder(entry.get("target_folder", ""))
+    bridge_dir = entry["bridge_dir"]
+    naming_stem = str(entry.get("naming_stem") or "").strip() or "bridge_out"
+
+    existed = _read_bridge_sidecar(bridge_dir)
+    new_files = sorted(
+        rel_path
+        for rel_path in _list_bridge_files(bridge_dir)
+        if rel_path not in existed
+    )
+
+    registered_assets = []
+    media_dir = os.path.join(project.project_dir, "media")
+    os.makedirs(media_dir, exist_ok=True)
+
+    counter = 0
+    for rel_path in new_files:
+        source_path = os.path.join(bridge_dir, rel_path)
+        if not os.path.isfile(source_path):
+            continue
+
+        counter += 1
+        source_basename = os.path.basename(source_path)
+        _stem_part, ext = os.path.splitext(source_basename)
+        target_basename = f"{naming_stem}_{counter:04d}{ext}"
+        final_name = _bridge_unique_media_name(media_dir, target_basename)
+        final_path = os.path.join(media_dir, final_name)
+        shutil.move(source_path, final_path)
+
+        asset_type, artifact_kind = classify_asset_path(final_path)
+        metadata = _extract_bridge_asset_metadata(final_path, asset_type)
+        asset = Asset(
+            name=final_name,
+            asset_type=asset_type,
+            artifact_kind=artifact_kind,
+            path=os.path.join("media", final_name),
+            prompt=str(entry.get("prompt_text") or ""),
+            generation_params=dict(entry.get("generation_params") or {}),
+            width=metadata["width"],
+            height=metadata["height"],
+            frame_count=metadata["frame_count"],
+            fps=metadata["fps"],
+            duration_sec=metadata["duration_sec"],
+            sample_rate=metadata["sample_rate"],
+            has_audio=metadata["has_audio"],
+            folder=target_folder,
+        )
+        project.add_asset(asset)
+        if asset_type in {"video", "image", "audio"}:
+            from ..server.thumbnail_service import ensure_thumbnail
+            thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
+            ensure_thumbnail(asset_type, final_path, thumb_path)
+        registered_assets.append((rel_path, asset))
+
+    changed = bool(registered_assets)
+    if target_folder and registered_assets:
+        _ensure_asset_folder_metadata(project, target_folder)
+        changed = True
+    if registered_assets and entry.get("mark_queue_complete"):
+        first_asset = registered_assets[0][1]
+        changed = _mark_queue_job_completed(project, queue_job_id, first_asset.asset_id) or changed
+    elif entry.get("mark_queue_complete") and not registered_assets:
+        changed = _mark_queue_job_failed(project, queue_job_id, "Bridge terminal produced no files") or changed
+    elif not registered_assets:
+        logger.info(
+            "Bridge produced no files for prompt=%s node=%s",
+            entry.get("prompt_key"),
+            entry.get("bridge_node_id"),
+        )
+
+    if changed:
+        save_project(project)
+
+    logger.info(
+        "Bridge finalize: prompt=%s node=%s moved=%d target_folder=%s stem=%s",
+        entry.get("prompt_key"),
+        entry.get("bridge_node_id"),
+        len(registered_assets),
+        target_folder or "(root)",
+        naming_stem,
+    )
+
+    _cleanup_bridge_output_dir(bridge_dir)
+    return [asset for _rel_path, asset in registered_assets]
+
+
+def _finalize_prompt_bridges(prompt_key: str, source: str = "unknown") -> None:
+    with _BRIDGE_REGISTRY_LOCK:
+        entries = [
+            dict(entry)
+            for (_registry_prompt_key, _node_id), entry in list(_BRIDGE_REGISTRY.items())
+            if _registry_prompt_key == prompt_key
+        ]
+        for registry_key in [key for key in _BRIDGE_REGISTRY.keys() if key[0] == prompt_key]:
+            _BRIDGE_REGISTRY.pop(registry_key, None)
+        _BRIDGE_PROMPT_WATCHERS.pop(prompt_key, None)
+        _cleanup_prompt_key_state(prompt_key)
+
+    if entries:
+        logger.info(
+            "Bridge finalize trigger: path=%s prompt=%s entries=%d",
+            source,
+            prompt_key,
+            len(entries),
+        )
+
+    for entry in entries:
+        try:
+            _finalize_bridge_entry(entry)
+        except Exception:
+            logger.exception(
+                "Bridge finalization failed for prompt=%s node=%s",
+                entry.get("prompt_key"),
+                entry.get("bridge_node_id"),
+            )
+
+
+def _watch_prompt_for_bridge_completion(prompt_key: str, prompt) -> None:
+    started_at = time.time()
+    quiet_since = None
+
+    while time.time() - started_at < BRIDGE_MAX_WAIT_SEC:
+        with _BRIDGE_REGISTRY_LOCK:
+            entries = [dict(entry) for (registered_prompt_key, _node_id), entry in _BRIDGE_REGISTRY.items() if registered_prompt_key == prompt_key]
+        if not entries:
+            with _BRIDGE_REGISTRY_LOCK:
+                _BRIDGE_PROMPT_WATCHERS.pop(prompt_key, None)
+                _cleanup_prompt_key_state(prompt_key)
+            return
+
+        activity_points = [
+            _latest_bridge_change_time(entry["bridge_dir"])
+            for entry in entries
+            if os.path.isdir(entry["bridge_dir"])
+        ]
+        latest_activity = max(activity_points) if activity_points else started_at
+        running = _prompt_currently_running(prompt_key, prompt)
+        now = time.time()
+        fallback_wait_met = now - started_at >= BRIDGE_FALLBACK_MIN_WAIT_SEC
+
+        if running:
+            quiet_since = None
+        else:
+            if quiet_since is None:
+                quiet_since = max(latest_activity, now)
+            quiet_since = max(quiet_since, latest_activity)
+            if fallback_wait_met and now - quiet_since >= BRIDGE_IDLE_SETTLE_SEC:
+                break
+
+        time.sleep(BRIDGE_POLL_INTERVAL_SEC)
+
+    _finalize_prompt_bridges(prompt_key, source="watcher")
+
+
+def _ensure_prompt_bridge_watcher(prompt_key: str, prompt) -> None:
+    with _BRIDGE_REGISTRY_LOCK:
+        watcher = _BRIDGE_PROMPT_WATCHERS.get(prompt_key)
+        if watcher and watcher.is_alive():
+            return
+        watcher = threading.Thread(
+            target=_watch_prompt_for_bridge_completion,
+            args=(prompt_key, prompt),
+            name=f"sonder-bridge-{prompt_key}",
+            daemon=True,
+        )
+        _BRIDGE_PROMPT_WATCHERS[prompt_key] = watcher
+        watcher.start()
+
+
+_install_bridge_prompt_queue_hooks()
 
 
 def _get_ffmpeg() -> str:
@@ -89,6 +810,7 @@ class SonderSaveVideo:
                 "filename_prefix": ("STRING", {"default": "output", "tooltip": "Prefix for the output filename."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001, "tooltip": "Output video frame rate."}),
                 "mode": (["Video", "Take"], {"default": "Video", "tooltip": "Video: normal save. Take: saves and auto-places result on timeline as a new lane."}),
+                "mark_queue_complete": ("BOOLEAN", {"default": False, "tooltip": "When enabled, this save node completes the active Sonder queue job after a successful save."}),
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "Audio to mux into the video."}),
@@ -98,7 +820,7 @@ class SonderSaveVideo:
         }
 
     def save_video(self, project, frames, filename_prefix="output", fps=24.0,
-                   mode="Video", audio=None, codec="libx264", quality=23):
+                   mode="Video", mark_queue_complete=False, audio=None, codec="libx264", quality=23):
         # Save to media/ so it appears in the project's asset gallery
         media_dir = os.path.join(project.project_dir, "media")
         os.makedirs(media_dir, exist_ok=True)
@@ -278,17 +1000,9 @@ class SonderSaveVideo:
             else:
                 logger.warning("Take mode: scene_id '%s' not found, skipping auto-placement", ctx.get("scene_id", ""))
 
-        if hasattr(project, "_execution_context") and project._execution_context:
-            ctx = project._execution_context
-            queue_job_id = ctx.get("queue_job_id", "")
-            if queue_job_id:
-                queue_job = next((job for job in project.generation_queue if job.job_id == queue_job_id), None)
-                if queue_job:
-                    queue_job.status = "completed"
-                    queue_job.progress = 1.0
-                    queue_job.error = ""
-                    queue_job.completed_at = datetime.now().isoformat()
-                    queue_job.result_asset_id = asset.asset_id
+        if mark_queue_complete:
+            ctx = _copy_execution_context(project)
+            _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), asset.asset_id)
 
         save_project(project)
 
@@ -300,6 +1014,62 @@ class SonderSaveVideo:
             "ui": {"images": preview_images},
             "result": (output_path,),
         }
+
+
+class SonderSaveBridge:
+    """Expose a prompt-isolated project output directory to external save nodes."""
+
+    CATEGORY = "Sonder/IO"
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("output_dir", "filename_prefix")
+    OUTPUT_TOOLTIPS = (
+        "Absolute prompt-isolated directory for save nodes that expect a folder path. Files written here are renamed to the configured stem on registration.",
+        "ComfyUI-relative filename prefix encoding the configured stem. Native save nodes that honor filename_prefix (SaveImage et al.) produce filenames like <stem>_00001_.ext directly.",
+    )
+    FUNCTION = "prepare_output"
+    DESCRIPTION = "Creates a prompt-isolated output target inside the project cache. External save nodes write there, then the bridge registers the results into the Sonder asset system after the prompt settles."
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "project": ("SONDER_PROJECT", {"tooltip": "The project that owns the bridge output directory."}),
+                "target_folder": ([""], {"default": "", "tooltip": "Optional asset folder label. Existing labels may be reused and new typed labels are created on registration."}),
+                "prefix": ("STRING", {"default": "", "tooltip": "Optional filename prefix prepended to all outputs. Leave empty to skip."}),
+                "mark_queue_complete": ("BOOLEAN", {"default": False, "tooltip": "When enabled, the bridge completes the active Sonder queue job after it successfully registers one or more files."}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    def prepare_output(self, project, target_folder="", prefix="", mark_queue_complete=False, prompt=None, unique_id=None):
+        prompt_key, prompt_key_source = _resolve_bridge_prompt_key(prompt)
+        bridge_node_id = str(unique_id or uuid.uuid4().hex[:8])
+        execution_context = _copy_execution_context(project)
+        naming_stem = _build_bridge_naming_stem(project, execution_context, prefix)
+        output_dir, filename_prefix = _prepare_bridge_output_dir(project, prompt_key, bridge_node_id, naming_stem)
+
+        entry = {
+            "project_dir": project.project_dir,
+            "prompt_key": prompt_key,
+            "bridge_node_id": bridge_node_id,
+            "bridge_dir": output_dir,
+            "prompt_key_source": prompt_key_source,
+            "target_folder": _normalize_asset_folder(target_folder),
+            "mark_queue_complete": bool(mark_queue_complete),
+            "queue_job_id": str(execution_context.get("queue_job_id") or ""),
+            "prompt_text": str(execution_context.get("prompt") or ""),
+            "generation_params": execution_context,
+            "naming_stem": naming_stem,
+        }
+
+        with _BRIDGE_REGISTRY_LOCK:
+            _BRIDGE_REGISTRY[(prompt_key, bridge_node_id)] = entry
+
+        _ensure_prompt_bridge_watcher(prompt_key, prompt)
+        return (output_dir, filename_prefix)
 
 
 class SonderPreviewVideo:

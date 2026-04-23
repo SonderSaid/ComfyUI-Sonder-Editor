@@ -10,7 +10,7 @@ from aiohttp import web
 from .project_manager import create_project, load_project, save_project, list_projects
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
-    ClipReference, LaneConfig, GenerationJob,
+    ClipReference, LaneConfig, GenerationJob, classify_asset_path,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 
@@ -36,9 +36,6 @@ def _coerce_nonnegative_int(value, default: int = 0) -> int:
         return default
 
 
-VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"}
-AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
 TRASH_RETENTION_DAYS = 30
 
 
@@ -59,14 +56,12 @@ def _resolve_source_path(source_path: str) -> str:
 
 
 def _detect_asset_type(source_path: str, fallback: str = "video") -> str:
-    ext = os.path.splitext(source_path or "")[1].lower()
-    if ext in VIDEO_EXTS:
-        return "video"
-    if ext in IMAGE_EXTS:
-        return "image"
-    if ext in AUDIO_EXTS:
-        return "audio"
-    return fallback
+    asset_type, _artifact_kind = classify_asset_path(source_path)
+    return asset_type or fallback
+
+
+def _classify_asset_for_registration(source_path: str) -> tuple[str, str]:
+    return classify_asset_path(source_path)
 
 
 def _extract_asset_media_metadata(source_path: str, asset_type: str) -> dict:
@@ -107,6 +102,13 @@ def _extract_asset_media_metadata(source_path: str, asset_type: str) -> dict:
     }
 
 
+def _asset_file_size(source_path: str) -> int:
+    try:
+        return os.path.getsize(source_path)
+    except OSError:
+        return 0
+
+
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
     return os.path.join(project.project_dir, asset.path) if getattr(asset, "path", "") else ""
 
@@ -118,6 +120,7 @@ def _asset_missing(project: TimelineProject, asset: Asset) -> bool:
 
 def _asset_payload(project: TimelineProject, asset: Asset) -> dict:
     payload = asset.to_dict()
+    source_path = _asset_abspath(project, asset)
     thumb_path = os.path.join(
         project.project_dir, "cache", "thumbnails",
         f"{asset.asset_id}.png"
@@ -125,6 +128,8 @@ def _asset_payload(project: TimelineProject, asset: Asset) -> dict:
     payload["has_thumbnail"] = os.path.isfile(thumb_path)
     payload["missing"] = _asset_missing(project, asset)
     payload["trashed_at"] = getattr(asset, "trashed_at", "") or ""
+    payload["size_bytes"] = _asset_file_size(source_path) if source_path else 0
+    payload["extension"] = os.path.splitext(getattr(asset, "path", "") or "")[1].lower()
     return payload
 
 
@@ -451,66 +456,32 @@ def _sync_media_folder(project: TimelineProject) -> bool:
         if rel_path in known_paths:
             continue
 
-        # Determine type from extension
-        ext = os.path.splitext(filename)[1].lower()
-        if ext in VIDEO_EXTS:
-            asset_type = "video"
-        elif ext in IMAGE_EXTS:
-            asset_type = "image"
-        elif ext in AUDIO_EXTS:
-            asset_type = "audio"
-        else:
-            continue  # skip unknown file types
+        asset_type, artifact_kind = _classify_asset_for_registration(filename)
 
         # Extract metadata
-        width, height, frame_count, fps, duration_sec, sample_rate = 0, 0, 0, 0.0, 0.0, 0
-        if asset_type == "video":
-            try:
-                import cv2
-                cap = cv2.VideoCapture(filepath)
-                if cap.isOpened():
-                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-                    duration_sec = frame_count / fps if fps > 0 else 0.0
-                    cap.release()
-            except Exception:
-                pass
-        elif asset_type == "image":
-            try:
-                from PIL import Image as PILImage
-                img = PILImage.open(filepath)
-                width, height = img.size
-            except Exception:
-                pass
-        elif asset_type == "audio":
-            duration_sec = _get_audio_duration(filepath)
-
-        has_audio = False
-        if asset_type == "video":
-            has_audio = _video_has_audio(filepath)
+        metadata = _extract_asset_media_metadata(filepath, asset_type)
 
         asset = Asset(
             name=filename,
             asset_type=asset_type,
+            artifact_kind=artifact_kind,
             path=rel_path,
-            width=width,
-            height=height,
-            frame_count=frame_count,
-            fps=fps,
-            duration_sec=duration_sec,
-            sample_rate=sample_rate,
-            has_audio=has_audio,
+            width=metadata["width"],
+            height=metadata["height"],
+            frame_count=metadata["frame_count"],
+            fps=metadata["fps"],
+            duration_sec=metadata["duration_sec"],
+            sample_rate=metadata["sample_rate"],
+            has_audio=metadata["has_audio"],
         )
         project.add_asset(asset)
 
-        # Generate thumbnail
-        thumb_path = os.path.join(
-            project.project_dir, "cache", "thumbnails",
-            f"{asset.asset_id}.png"
-        )
-        ensure_thumbnail(asset_type, filepath, thumb_path)
+        if asset_type in {"video", "image", "audio"}:
+            thumb_path = os.path.join(
+                project.project_dir, "cache", "thumbnails",
+                f"{asset.asset_id}.png"
+            )
+            ensure_thumbnail(asset_type, filepath, thumb_path)
 
         changed = True
         logger.info("Auto-registered asset: %s (%s)", filename, asset_type)
@@ -694,8 +665,14 @@ def _build_dormant_summary(
         "video": len(project.get_assets_by_type("video")),
         "image": len(project.get_assets_by_type("image")),
         "audio": len(project.get_assets_by_type("audio")),
+        "artifact": len(project.get_assets_by_type("artifact")),
     }
-    asset_counts["total"] = asset_counts["video"] + asset_counts["image"] + asset_counts["audio"]
+    asset_counts["total"] = (
+        asset_counts["video"]
+        + asset_counts["image"]
+        + asset_counts["audio"]
+        + asset_counts["artifact"]
+    )
 
     queue_counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0}
     for job in project.generation_queue:
@@ -1180,7 +1157,7 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     if not resolved_source or not os.path.isfile(resolved_source):
         raise FileNotFoundError(f"File not found: {source_path}")
 
-    replacement_type = _detect_asset_type(resolved_source, asset.asset_type)
+    replacement_type, replacement_artifact_kind = _classify_asset_for_registration(resolved_source)
     if replacement_type != asset.asset_type:
         raise ValueError(f"Replacement type mismatch: expected {asset.asset_type}, got {replacement_type}")
 
@@ -1223,6 +1200,7 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     asset.duration_sec = metadata["duration_sec"]
     asset.sample_rate = metadata["sample_rate"]
     asset.has_audio = metadata["has_audio"]
+    asset.artifact_kind = replacement_artifact_kind if asset.asset_type == "artifact" else ""
 
     old_basename = os.path.basename(old_rel_path or "")
     if not asset.name or asset.name == old_basename:
@@ -1384,7 +1362,11 @@ if routes is not None:
         if not source_path or not os.path.isfile(source_path):
             return _json_error(f"File not found: {source_path}", 400)
 
-        asset_type = _detect_asset_type(source_path, body.get("type", "video"))
+        requested_type = str(body.get("type") or "").strip().lower()
+        asset_type, artifact_kind = _classify_asset_for_registration(source_path)
+        if requested_type in {"video", "image", "audio", "artifact"}:
+            asset_type = requested_type
+            artifact_kind = artifact_kind if asset_type == "artifact" else ""
 
         # Copy to project media directory
         media_dir = os.path.join(project.project_dir, "media")
@@ -1400,6 +1382,7 @@ if routes is not None:
         asset = Asset(
             name=basename,
             asset_type=asset_type,
+            artifact_kind=artifact_kind,
             path=os.path.join("media", dest_filename),
             width=metadata["width"],
             height=metadata["height"],
@@ -1417,12 +1400,12 @@ if routes is not None:
         project.add_asset(asset)
         save_project(project)
 
-        # Generate thumbnail
-        thumb_path = os.path.join(
-            project.project_dir, "cache", "thumbnails",
-            f"{asset.asset_id}.png"
-        )
-        ensure_thumbnail(asset_type, dest_path, thumb_path)
+        if asset_type in {"video", "image", "audio"}:
+            thumb_path = os.path.join(
+                project.project_dir, "cache", "thumbnails",
+                f"{asset.asset_id}.png"
+            )
+            ensure_thumbnail(asset_type, dest_path, thumb_path)
 
         return web.json_response(_asset_payload(project, asset), status=201)
 

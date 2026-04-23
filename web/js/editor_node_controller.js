@@ -74,6 +74,7 @@ function iconForAssetType(type) {
     if (type === "video") return "🎬";
     if (type === "image") return "🖼";
     if (type === "audio") return "🔊";
+    if (type === "artifact") return "🗂";
     return "•";
 }
 
@@ -784,6 +785,7 @@ class DormantNodeCard {
             formatCountLabel("V", assetCounts.video),
             formatCountLabel("I", assetCounts.image),
             formatCountLabel("A", assetCounts.audio),
+            formatCountLabel("R", assetCounts.artifact),
             `Queue ${queueCounts.total || 0}`,
         ];
         for (const text of chips) {
@@ -1361,6 +1363,20 @@ export class EditorNodeController {
         this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
         this.refreshSummary({ syncAssets: true }).finally(() => this.render());
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+    }
+
+    async handleBridgeExecutionSettled({ allowRollback = false } = {}) {
+        if (this._destroyed || !this.state.projectDir) {
+            return this.state.dormantSummary?.queue_counts || {};
+        }
+        this.syncStateFromWidgets();
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
+        await this.refreshSummary({ syncAssets: true });
+        const counts = this.state.dormantSummary?.queue_counts || {};
+        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this.render();
+        return counts;
     }
 
     async handleQueueExecutionSettled({ allowRollback = false } = {}) {

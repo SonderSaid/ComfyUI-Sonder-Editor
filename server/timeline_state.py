@@ -1,6 +1,7 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+import os
 from typing import Any
 
 
@@ -8,12 +9,39 @@ from typing import Any
 # Asset registry — organized catalog of all project media
 # ---------------------------------------------------------------------------
 
+VIDEO_ASSET_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
+IMAGE_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+AUDIO_ASSET_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".aac"}
+ARTIFACT_KIND_BY_EXT = {
+    ".latent": "latent",
+    ".safetensors": "model",
+    ".pt": "model",
+    ".pth": "model",
+    ".ckpt": "model",
+    ".json": "json",
+    ".txt": "text",
+}
+
+
+def classify_asset_path(path: str) -> tuple[str, str]:
+    """Classify a path into an asset_type plus artifact_kind (if applicable)."""
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext in VIDEO_ASSET_EXTS:
+        return "video", ""
+    if ext in IMAGE_ASSET_EXTS:
+        return "image", ""
+    if ext in AUDIO_ASSET_EXTS:
+        return "audio", ""
+    return "artifact", ARTIFACT_KIND_BY_EXT.get(ext, "other")
+
+
 @dataclass
 class Asset:
     """A media file imported into the project, with metadata."""
     asset_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     name: str = ""                          # display name (e.g., "character_ref.png")
-    asset_type: str = "video"               # video | image | audio
+    asset_type: str = "video"               # video | image | audio | artifact
+    artifact_kind: str = ""                 # latent | model | json | text | other
     path: str = ""                          # relative path inside project media/
     # Generation provenance — how was this asset created?
     prompt: str = ""
@@ -36,6 +64,7 @@ class Asset:
             "asset_id": self.asset_id,
             "name": self.name,
             "asset_type": self.asset_type,
+            "artifact_kind": self.artifact_kind,
             "path": self.path,
             "prompt": self.prompt,
             "generation_params": self.generation_params,
@@ -58,6 +87,7 @@ class Asset:
             asset_id=data.get("asset_id", uuid.uuid4().hex[:8]),
             name=data.get("name", ""),
             asset_type=data.get("asset_type", "video"),
+            artifact_kind=data.get("artifact_kind", ""),
             path=data.get("path", ""),
             prompt=data.get("prompt", ""),
             generation_params=data.get("generation_params", {}),
@@ -707,7 +737,7 @@ class TimelineProject:
         return None
 
     def get_assets_by_type(self, asset_type: str) -> list:
-        """Return assets filtered by type: 'video', 'image', or 'audio'."""
+        """Return assets filtered by type: 'video', 'image', 'audio', or 'artifact'."""
         return [a for a in self.assets if a.asset_type == asset_type]
 
     def add_asset(self, asset: "Asset") -> None:

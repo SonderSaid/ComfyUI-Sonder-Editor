@@ -122,7 +122,7 @@ def test_build_dormant_summary_reports_counts_and_effective_scene_values():
 
     assert summary["name"] == "Dormant Test"
     assert summary["scene_count"] == 1
-    assert summary["asset_counts"] == {"video": 2, "image": 1, "audio": 1, "total": 4}
+    assert summary["asset_counts"] == {"video": 2, "image": 1, "audio": 1, "artifact": 0, "total": 4}
     assert summary["queue_counts"] == {
         "pending": 1,
         "running": 1,

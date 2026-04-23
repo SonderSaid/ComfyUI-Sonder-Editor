@@ -4,16 +4,18 @@
 # during test discovery, where folder_paths etc. are unavailable.
 try:
     from .nodes.editor_node import SonderEditor
-    from .nodes.io_nodes import SonderSaveVideo, SonderPreviewVideo
+    from .nodes.io_nodes import SonderSaveBridge, SonderSaveVideo, SonderPreviewVideo
 
     NODE_CLASS_MAPPINGS = {
         "SonderEditor": SonderEditor,
+        "SonderSaveBridge": SonderSaveBridge,
         "SonderSaveVideo": SonderSaveVideo,
         "SonderPreviewVideo": SonderPreviewVideo,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "SonderEditor": "Sonder Editor",
+        "SonderSaveBridge": "Sonder Save Bridge",
         "SonderSaveVideo": "Sonder Save Video",
         "SonderPreviewVideo": "Sonder Preview Video",
     }

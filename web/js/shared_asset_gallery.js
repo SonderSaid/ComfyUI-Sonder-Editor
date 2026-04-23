@@ -177,6 +177,7 @@ function assetKindLabel(type) {
     if (type === "video") return "Video";
     if (type === "image") return "Image";
     if (type === "audio") return "Audio";
+    if (type === "artifact") return "Artifact";
     return "Asset";
 }
 
@@ -184,6 +185,7 @@ function assetFallbackGlyph(type) {
     if (type === "video") return "V";
     if (type === "image") return "I";
     if (type === "audio") return "A";
+    if (type === "artifact") return "R";
     return "A";
 }
 
@@ -209,6 +211,12 @@ function formatDuration(asset) {
         return `${asset.duration_sec.toFixed(2)}s`;
     }
     return "-";
+}
+
+function formatBytes(value) {
+    const size = Number(value);
+    if (!Number.isFinite(size) || size < 0) return "-";
+    return `${Math.round(size)} B`;
 }
 
 function formatDate(value) {
@@ -242,6 +250,31 @@ function formatGenerationValue(value) {
     } catch {
         return String(value);
     }
+}
+
+function assetExtension(asset) {
+    const path = String(asset?.path || "");
+    const match = path.match(/\.([^.\\/]+)$/);
+    return match ? match[1].toLowerCase() : "";
+}
+
+function parseAssetSearchQuery(rawQuery) {
+    const result = { nameTerms: [], kindTerms: [], extTerms: [] };
+    for (const token of String(rawQuery || "").trim().split(/\s+/).filter(Boolean)) {
+        const lowerToken = token.toLowerCase();
+        if (lowerToken.startsWith("kind:")) {
+            const kind = lowerToken.slice(5).trim();
+            if (kind) result.kindTerms.push(kind);
+            continue;
+        }
+        if (lowerToken.startsWith("ext:")) {
+            const ext = lowerToken.slice(4).replace(/^\./, "").trim();
+            if (ext) result.extTerms.push(ext);
+            continue;
+        }
+        result.nameTerms.push(lowerToken);
+    }
+    return result;
 }
 
 function compareStrings(a, b) {
@@ -377,6 +410,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         destroyed: false,
         collapsedFolders: new Set(),
         inspectorCollapsed: !!initialSettings.gallery.inspectorCollapsed,
+        artifactInspectorExpanded: !!initialSettings.gallery.artifactInspectorExpanded,
         manageMode: false,
         sortMode: initialSettings.gallery.sortMode || DEFAULT_SORT_MODE,
         thumbnailSize: initialSettings.gallery.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize,
@@ -423,7 +457,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     const controls = style(document.createElement("div"), `display:flex;gap:6px;align-items:center;min-width:0;flex-wrap:wrap;`);
     const searchInput = style(document.createElement("input"), `flex:1 1 180px;${inputChromeCss({ minWidth: "120px" })}`);
     searchInput.type = "search";
-    searchInput.placeholder = "Search assets";
+    searchInput.placeholder = "Search assets (kind:/ext:)";
     controls.appendChild(searchInput);
 
     const sortSelect = style(document.createElement("select"), `flex:0 0 auto;${inputChromeCss({ minWidth: "110px" })}`);
@@ -521,6 +555,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
     }
 
+    function persistArtifactInspectorExpanded() {
+        updateEditorSettings({
+            gallery: {
+                artifactInspectorExpanded: !!state.artifactInspectorExpanded,
+            },
+        });
+    }
+
     function persistManageMode() {
         safeStorageSet(storageKey("manage-mode"), JSON.stringify(!!state.manageMode));
     }
@@ -540,6 +582,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             : DEFAULT_SORT_MODE;
         state.sortMode = nextSort;
         state.inspectorCollapsed = !!nextSettings?.gallery?.inspectorCollapsed;
+        state.artifactInspectorExpanded = !!nextSettings?.gallery?.artifactInspectorExpanded;
         state.thumbnailSize = nextSettings?.gallery?.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize;
         updateControlState();
         if (!skipRender && !state.destroyed) {
@@ -724,17 +767,19 @@ export function mountSharedAssetGallery(container, options = {}) {
     function assetMatchesCurrentFilter(asset) {
         if (!asset) return false;
         if (state.type !== "all" && asset.asset_type !== state.type) return false;
-        const query = state.query.trim().toLowerCase();
-        if (!query) return true;
-        const haystack = [
-            asset.name,
-            asset.path,
-            asset.folder,
-            asset.asset_type,
-            asset.prompt,
-            formatGenerationValue(asset.generation_params),
-        ].filter(Boolean).join(" ").toLowerCase();
-        return haystack.includes(query);
+        const query = parseAssetSearchQuery(state.query);
+        if (query.kindTerms.length) {
+            if (asset.asset_type !== "artifact") return false;
+            const artifactKind = String(asset.artifact_kind || "").toLowerCase();
+            if (!query.kindTerms.every((term) => artifactKind === term)) return false;
+        }
+        if (query.extTerms.length) {
+            const ext = assetExtension(asset);
+            if (!query.extTerms.every((term) => ext === term)) return false;
+        }
+        if (!query.nameTerms.length) return true;
+        const name = assetDisplayName(asset).toLowerCase();
+        return query.nameTerms.every((term) => name.includes(term));
     }
 
     function sortAssets(assets) {
@@ -1139,8 +1184,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (asset?.asset_type === "video") counts.video += 1;
             else if (asset?.asset_type === "image") counts.image += 1;
             else if (asset?.asset_type === "audio") counts.audio += 1;
+            else if (asset?.asset_type === "artifact") counts.artifact += 1;
             return counts;
-        }, { video: 0, image: 0, audio: 0 });
+        }, { video: 0, image: 0, audio: 0, artifact: 0 });
     }
 
     function aggregateDurationLabel(assets) {
@@ -2797,6 +2843,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         const kind = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(143,192,240,0.12);border:1px solid rgba(143,192,240,0.28);color:#9fc8ea;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
         kind.textContent = assetKindLabel(asset.asset_type);
         badges.appendChild(kind);
+        if (asset.asset_type === "artifact") {
+            const artifactBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(181,199,116,0.12);border:1px solid rgba(181,199,116,0.3);color:#d7e59f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
+            artifactBadge.textContent = String(asset.artifact_kind || "other");
+            badges.appendChild(artifactBadge);
+        }
         if (isTrashed(asset)) {
             const trashedBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(184,96,72,0.18);border:1px solid rgba(214,132,98,0.45);color:#f0b39f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
             trashedBadge.textContent = "Trashed";
@@ -2855,6 +2906,19 @@ export function mountSharedAssetGallery(container, options = {}) {
             const scrubCleanup = scrubBar.cleanup;
             state.liveMediaCleanup = () => { scrubCleanup(); blobHandle.cleanup(); };
             previewExtras.push(scrubBar.el);
+        } else if (asset.asset_type === "artifact") {
+            const artifactWrap = style(document.createElement("div"), `width:100%;padding:16px;display:flex;flex-direction:column;gap:10px;align-items:flex-start;box-sizing:border-box;`);
+            const artifactLabel = style(document.createElement("div"), `color:#d7e59f;font-size:10px;text-transform:uppercase;letter-spacing:0.08em;`);
+            artifactLabel.textContent = "Artifact Metadata";
+            const artifactIntro = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;line-height:1.5;max-width:340px;`);
+            artifactIntro.textContent = "Artifacts stay inspectable and searchable, but they do not render a media preview in the gallery.";
+            const artifactSummary = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;width:100%;`);
+            artifactSummary.appendChild(makeMetaCell("Kind", String(asset.artifact_kind || "other")));
+            artifactSummary.appendChild(makeMetaCell("Ext", assetExtension(asset) ? `.${assetExtension(asset)}` : "-"));
+            artifactSummary.appendChild(makeMetaCell("Size", formatBytes(asset.size_bytes)));
+            artifactSummary.appendChild(makeMetaCell("Imported", formatDate(asset.imported_at)));
+            artifactWrap.append(artifactLabel, artifactIntro, artifactSummary);
+            previewSurface.appendChild(artifactWrap);
         } else {
             const placeholder = style(document.createElement("div"), `color:#8ea0af;font-size:10px;`);
             placeholder.textContent = "Preview unavailable.";
@@ -2862,24 +2926,49 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         const meta = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;font-size:10px;color:#b9c3cb;`);
-        const rows = [
-            ["Type", assetKindLabel(asset.asset_type)],
-            ["Status", assetIsMissing(asset) ? "Missing" : "Available"],
-            ["Folder", normalizeFolderName(asset.folder) || "Root"],
-            ["Size", formatResolution(asset)],
-            ["Duration", formatDuration(asset)],
-            ["FPS", asset.fps ? String(asset.fps) : "-"],
-            ["Sample Rate", asset.sample_rate ? `${asset.sample_rate} Hz` : "-"],
-            ["Embedded Audio", asset.has_audio ? "Yes" : "No"],
-            ["Imported", formatDate(asset.imported_at)],
-        ];
+        const rows = asset.asset_type === "artifact"
+            ? [
+                ["Type", assetKindLabel(asset.asset_type)],
+                ["Kind", String(asset.artifact_kind || "other")],
+                ["Extension", assetExtension(asset) ? `.${assetExtension(asset)}` : "-"],
+                ["Status", assetIsMissing(asset) ? "Missing" : "Available"],
+                ["Folder", normalizeFolderName(asset.folder) || "Root"],
+                ["Size", formatBytes(asset.size_bytes)],
+                ["Imported", formatDate(asset.imported_at)],
+            ]
+            : [
+                ["Type", assetKindLabel(asset.asset_type)],
+                ["Status", assetIsMissing(asset) ? "Missing" : "Available"],
+                ["Folder", normalizeFolderName(asset.folder) || "Root"],
+                ["Size", formatResolution(asset)],
+                ["Duration", formatDuration(asset)],
+                ["FPS", asset.fps ? String(asset.fps) : "-"],
+                ["Sample Rate", asset.sample_rate ? `${asset.sample_rate} Hz` : "-"],
+                ["Embedded Audio", asset.has_audio ? "Yes" : "No"],
+                ["Imported", formatDate(asset.imported_at)],
+            ];
         if (isTrashed(asset)) {
             rows.push(["Trashed At", formatDate(asset.trashed_at)]);
             rows.push(["Restore To", normalizeFolderName(asset.trash_previous_folder) || "Root"]);
         }
         for (const [label, value] of rows) meta.appendChild(makeMetaCell(label, value));
 
-        const detailSections = [titleRow, pathLine, previewSurface, ...previewExtras, meta, renderGenerationSection(asset)];
+        const detailSections = [titleRow, pathLine, previewSurface, ...previewExtras, meta];
+        if (asset.asset_type === "artifact") {
+            const artifactToggle = makeActionButton(state.artifactInspectorExpanded ? "active" : "subtle");
+            artifactToggle.textContent = state.artifactInspectorExpanded ? "Collapse Metadata" : "Expand Metadata";
+            artifactToggle.addEventListener("click", () => {
+                state.artifactInspectorExpanded = !state.artifactInspectorExpanded;
+                persistArtifactInspectorExpanded();
+                renderDetail(asset);
+            });
+            detailSections.push(artifactToggle);
+            if (state.artifactInspectorExpanded) {
+                detailSections.push(renderGenerationSection(asset));
+            }
+        } else {
+            detailSections.push(renderGenerationSection(asset));
+        }
         if (isTrashed(asset)) {
             const trashedNote = style(document.createElement("div"), `padding:8px;border-radius:6px;background:rgba(184,96,72,0.12);border:1px solid rgba(214,132,98,0.3);color:#d8b4aa;font-size:10px;line-height:1.45;`);
             trashedNote.textContent = "Trashed assets stay out of the normal gallery but keep their references recoverable until they are permanently deleted.";
@@ -3389,12 +3478,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             video: activeAssets.filter((asset) => asset.asset_type === "video").length,
             image: activeAssets.filter((asset) => asset.asset_type === "image").length,
             audio: activeAssets.filter((asset) => asset.asset_type === "audio").length,
+            artifact: activeAssets.filter((asset) => asset.asset_type === "artifact").length,
         };
         const tabs = [
             ["all", `All (${counts.all})`],
             ["video", `Videos (${counts.video})`],
             ["image", `Images (${counts.image})`],
             ["audio", `Audio (${counts.audio})`],
+            ["artifact", `Artifacts (${counts.artifact})`],
         ];
         for (const [type, label] of tabs) {
             const isActive = state.type === type;
@@ -3451,7 +3542,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 row.draggable = state.manageMode ? !!options.onBulkMoveAssets : true;
                 row.title = state.manageMode
                     ? "Click to inspect. Drag onto a folder header to move assets."
-                    : "Click to inspect. Drag onto the graph to create a loader node.";
+                    : (asset.asset_type === "artifact"
+                        ? "Click to inspect. Artifact graph-drop support is deferred."
+                        : "Click to inspect. Drag onto the graph to create a loader node.");
                 row.addEventListener("click", (event) => {
                     handleAssetActivation(asset.asset_id, event, visibleAssets, { focusList: true, scrollIntoView: true });
                 });
@@ -3532,7 +3625,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                 name.textContent = assetDisplayName(asset);
                 if (isMissing) name.style.color = "#ffd0bc";
                 const meta = style(document.createElement("div"), `color:#8ea0af;font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-                meta.textContent = `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
+                const metaLabel = asset.asset_type === "artifact"
+                    ? `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${String(asset.artifact_kind || "other")} | ${assetExtension(asset) ? `.${assetExtension(asset)}` : "no ext"}`
+                    : `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
+                meta.textContent = metaLabel;
                 text.append(name, meta);
                 row.append(thumb, text);
                 listScroller.appendChild(row);

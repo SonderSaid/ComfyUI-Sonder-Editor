@@ -4,6 +4,11 @@ const { api } = window.comfyAPI.api;
 import { EditorNodeController } from "./editor_node_controller.js";
 import { getEditorSettings } from "./editor_settings.js";
 
+function style(el, cssText) {
+    el.style.cssText = cssText;
+    return el;
+}
+
 // ── Widget hide/show helpers ───────────────────────────────────────────
 function hideWidget(node, widget) {
     if (widget.hidden) return;
@@ -58,6 +63,38 @@ async function syncProjectWidgetChoices(projectWidget) {
     projectWidget.options = projectWidget.options || {};
     projectWidget.options.values = values;
     return projects;
+}
+
+function normalizeFolderValue(value) {
+    return String(value || "").trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function uniqueFolderValues(values) {
+    const seen = new Set();
+    const result = [];
+    for (const value of values || []) {
+        const normalized = normalizeFolderValue(value);
+        if (seen.has(normalized)) continue;
+        seen.add(normalized);
+        result.push(normalized);
+    }
+    return result;
+}
+
+function projectIdFromProjectValue(projectValue) {
+    const value = String(projectValue || "").trim();
+    if (!value || value === "+ Create New") return "";
+    return value.split(/[/\\]/).pop();
+}
+
+async function listProjectAssetFolders(projectId) {
+    if (!projectId) return [];
+    const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}/assets/dormant`));
+    if (!resp.ok) {
+        throw new Error(`Failed to list asset folders: ${resp.status}`);
+    }
+    const data = await resp.json();
+    return uniqueFolderValues(data?.folders || []).filter(Boolean);
 }
 
 async function createProjectFromNode(node, projectWidget) {
@@ -203,23 +240,233 @@ function getSaveVideoEditorNodes(saveNode) {
     );
 }
 
+function getSaveBridgeEditorNodes(bridgeNode) {
+    const projectSourceNode = getLinkedNodeFromInput(bridgeNode, "project");
+    if (!projectSourceNode) return [];
+    return Array.from(collectUpstreamEditorNodes(projectSourceNode));
+}
+
+function getEditorProjectId(editorNode) {
+    const projectDir = editorNode?._sonderController?.state?.projectDir || "";
+    if (projectDir) return projectDir.split(/[/\\]/).pop();
+    const projectWidget = editorNode?.widgets?.find((widget) => widget.name === "project");
+    return projectIdFromProjectValue(projectWidget?.value);
+}
+
+function getSaveBridgeProjectId(bridgeNode) {
+    for (const editorNode of getSaveBridgeEditorNodes(bridgeNode)) {
+        const projectId = getEditorProjectId(editorNode);
+        if (projectId) return projectId;
+    }
+    return "";
+}
+
+function buildBridgeFolderOptions(folders, currentValue = "") {
+    const values = [""];
+    const current = normalizeFolderValue(currentValue);
+    if (current) values.push(current);
+    for (const folder of uniqueFolderValues(folders).filter(Boolean)) {
+        if (!values.includes(folder)) {
+            values.push(folder);
+        }
+    }
+    return values;
+}
+
+function setBridgeFolderWidgetChoices(folderWidget, folders, currentValue = "") {
+    if (!folderWidget) return [];
+    const values = buildBridgeFolderOptions(folders, currentValue);
+    folderWidget.options = folderWidget.options || {};
+    folderWidget.options.values = values;
+    folderWidget.options.editable = true;
+    return values;
+}
+
+function renderBridgeFolderSuggestions(node, values) {
+    const datalist = node?._sonderBridgeFolderDatalist;
+    if (!datalist) return;
+    datalist.innerHTML = "";
+    for (const folder of values.filter(Boolean)) {
+        const option = document.createElement("option");
+        option.value = folder;
+        datalist.appendChild(option);
+    }
+}
+
+async function syncBridgeTargetFolderWidget(node) {
+    const folderWidget = node?.widgets?.find((widget) => widget.name === "target_folder");
+    const input = node?._sonderBridgeFolderInput;
+    if (!folderWidget || !input) return [];
+
+    const syncToken = (Number(node._sonderBridgeFolderSyncToken) || 0) + 1;
+    node._sonderBridgeFolderSyncToken = syncToken;
+
+    const projectId = getSaveBridgeProjectId(node);
+    let folders = [];
+    if (projectId) {
+        try {
+            folders = await listProjectAssetFolders(projectId);
+        } catch (error) {
+            console.warn("[Sonder] Failed to load bridge folder suggestions:", error);
+        }
+    }
+    if (syncToken !== node._sonderBridgeFolderSyncToken) return [];
+
+    const currentValue = normalizeFolderValue(input.value || folderWidget.value || "");
+    const values = setBridgeFolderWidgetChoices(folderWidget, folders, currentValue);
+    renderBridgeFolderSuggestions(node, values);
+    input.placeholder = projectId
+        ? "Root (blank) or folder label"
+        : "Connect a Sonder project to load folder suggestions";
+    input.value = currentValue;
+    return values;
+}
+
+function installBridgeFolderPicker(node) {
+    if (!node?.widgets || node._sonderBridgeFolderInput || typeof node.addDOMWidget !== "function") return;
+    const folderWidget = node.widgets.find((widget) => widget.name === "target_folder");
+    if (!folderWidget) return;
+
+    hideWidget(node, folderWidget);
+    setBridgeFolderWidgetChoices(folderWidget, [], folderWidget.value || "");
+
+    const wrapper = style(document.createElement("div"), `
+        display:flex;
+        flex-direction:column;
+        gap:4px;
+        width:100%;
+        box-sizing:border-box;
+        padding-top:2px;
+    `);
+
+    const label = style(document.createElement("div"), `
+        color:#cfd7df;
+        font-size:10px;
+        font-weight:600;
+        line-height:1.2;
+    `);
+    label.textContent = "Target Folder";
+
+    const input = style(document.createElement("input"), `
+        width:100%;
+        box-sizing:border-box;
+        padding:4px 6px;
+        border-radius:6px;
+        border:1px solid rgba(126, 168, 201, 0.35);
+        background:rgba(14, 19, 25, 0.92);
+        color:#e5edf5;
+        font-size:11px;
+        outline:none;
+    `);
+    const datalist = document.createElement("datalist");
+    datalist.id = `sonder-bridge-folders-${Math.random().toString(36).slice(2)}`;
+    input.setAttribute("list", datalist.id);
+
+    const help = style(document.createElement("div"), `
+        color:#7f8d9b;
+        font-size:10px;
+        line-height:1.25;
+    `);
+    help.textContent = "Blank = Root. Existing folders appear here; typing a new label creates it on registration.";
+
+    wrapper.append(label, input, datalist, help);
+
+    const folderDomWidget = node.addDOMWidget("sonder_bridge_folder_picker", "SonderBridgeFolderPicker", wrapper, {
+        serialize: false,
+        hideOnZoom: false,
+        getMinHeight: () => 56,
+        getMaxHeight: () => 56,
+        getHeight: () => 56,
+    });
+    folderDomWidget.computeSize = (width) => [width, 56];
+
+    const applyValue = (value, { fireCallback = false } = {}) => {
+        const normalized = normalizeFolderValue(value);
+        folderWidget.value = normalized;
+        input.value = normalized;
+        if (fireCallback) {
+            folderWidget.callback?.call(folderWidget, normalized);
+        }
+        app.graph.setDirtyCanvas?.(true, true);
+    };
+
+    input.value = normalizeFolderValue(folderWidget.value || "");
+    input.addEventListener("input", () => {
+        folderWidget.value = normalizeFolderValue(input.value);
+        app.graph.setDirtyCanvas?.(true, true);
+    });
+    input.addEventListener("change", () => applyValue(input.value, { fireCallback: true }));
+    input.addEventListener("blur", () => applyValue(input.value, { fireCallback: true }));
+    input.addEventListener("focus", () => {
+        void syncBridgeTargetFolderWidget(node);
+    });
+
+    node._sonderBridgeFolderInput = input;
+    node._sonderBridgeFolderDatalist = datalist;
+
+    const origOnConnectionsChange = node.onConnectionsChange;
+    node.onConnectionsChange = function () {
+        const result = origOnConnectionsChange?.apply(this, arguments);
+        void syncBridgeTargetFolderWidget(this);
+        return result;
+    };
+
+    void syncBridgeTargetFolderWidget(node);
+}
+
+const pendingBridgeEditorNodeIds = new Set();
 let queuedExecutionRefreshToken = 0;
 
-function scheduleQueuedExecutionRefresh() {
+function trackBridgeExecution(bridgeNode) {
+    for (const editorNode of getSaveBridgeEditorNodes(bridgeNode)) {
+        if (!editorNode?._sonderController?.state?.projectDir) continue;
+        pendingBridgeEditorNodeIds.add(editorNode.id);
+    }
+}
+
+function getTrackedBridgeEditorNodes() {
+    const tracked = [];
+    for (const nodeId of [...pendingBridgeEditorNodeIds]) {
+        const node = getNodeById(nodeId);
+        if (!node?._sonderController?.state?.projectDir) {
+            pendingBridgeEditorNodeIds.delete(nodeId);
+            continue;
+        }
+        tracked.push(node);
+    }
+    return tracked;
+}
+
+function schedulePostPromptRefresh() {
     const token = ++queuedExecutionRefreshToken;
-    const delays = [0, 150, 400, 1000];
+    const delays = [0, 150, 400, 1000, 2500, 5000];
     delays.forEach((delay, index) => {
         window.setTimeout(async () => {
             if (token !== queuedExecutionRefreshToken) return;
-            const editorNodes = getActiveEditorNodes().filter(editorNodeHasQueuedWork);
+            const bridgeNodes = getTrackedBridgeEditorNodes();
+            const bridgeNodeIds = new Set(bridgeNodes.map((node) => node.id));
+            const queueNodes = getActiveEditorNodes().filter(editorNodeHasQueuedWork);
+            const editorNodes = Array.from(new Map(
+                [...bridgeNodes, ...queueNodes].map((node) => [node.id, node])
+            ).values());
             if (!editorNodes.length) {
-                if (token === queuedExecutionRefreshToken) {
+                if (index === delays.length - 1) {
+                    pendingBridgeEditorNodeIds.clear();
+                }
+                if (token === queuedExecutionRefreshToken && !pendingBridgeEditorNodeIds.size) {
                     queuedExecutionRefreshToken += 1;
                 }
                 return;
             }
             const counts = await Promise.all(editorNodes.map(async (editorNode) => {
                 try {
+                    if (bridgeNodeIds.has(editorNode.id)) {
+                        return await editorNode._sonderController?.handleBridgeExecutionSettled?.({
+                            allowRollback: index === delays.length - 1,
+                            attemptIndex: index,
+                            delay,
+                        });
+                    }
                     return await editorNode._sonderController?.handleQueueExecutionSettled?.({
                         allowRollback: index === delays.length - 1,
                         attemptIndex: index,
@@ -232,7 +479,10 @@ function scheduleQueuedExecutionRefresh() {
             }));
             if (token !== queuedExecutionRefreshToken) return;
             const hasRunning = counts.some((value) => (value?.running || 0) > 0);
-            if (!hasRunning) {
+            if (index === delays.length - 1) {
+                pendingBridgeEditorNodeIds.clear();
+            }
+            if (!hasRunning && !pendingBridgeEditorNodeIds.size) {
                 queuedExecutionRefreshToken += 1;
             }
         }, delay);
@@ -445,6 +695,24 @@ app.registerExtension({
             };
         }
 
+        if (nodeData.name === "SonderSaveBridge") {
+            const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                origOnNodeCreated?.apply(this, arguments);
+                try {
+                    installBridgeFolderPicker(this);
+                } catch (error) {
+                    console.warn("[Sonder] Failed to install bridge folder picker:", error);
+                }
+            };
+
+            const origOnExecuted = nodeType.prototype.onExecuted;
+            nodeType.prototype.onExecuted = function () {
+                origOnExecuted?.apply(this, arguments);
+                trackBridgeExecution(this);
+            };
+        }
+
     },
 
     setup() {
@@ -452,8 +720,8 @@ app.registerExtension({
             api.addEventListener("status", (event) => {
                 const remaining = Number(event?.detail?.exec_info?.queue_remaining);
                 if (!Number.isFinite(remaining) || remaining !== 0) return;
-                if (!getActiveEditorNodes().some(editorNodeHasQueuedWork)) return;
-                scheduleQueuedExecutionRefresh();
+                if (!getActiveEditorNodes().some(editorNodeHasQueuedWork) && !pendingBridgeEditorNodeIds.size) return;
+                schedulePostPromptRefresh();
             });
         }
         // ── Global drop interceptor: asset gallery → ComfyUI graph ───────
@@ -474,6 +742,7 @@ app.registerExtension({
                 const asset = JSON.parse(assetData);
                 const dirName = asset._projectDir;
                 if (!dirName) return;
+                if (asset.asset_type === "artifact") return;
 
                 const fn = asset.path.split(/[/\\]/).pop();
                 const sf = `sonder-projects/${dirName}/${asset.path.split(/[/\\]/).slice(0, -1).join("/")}`;

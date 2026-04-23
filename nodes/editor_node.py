@@ -199,6 +199,16 @@ class SonderEditor:
             return str(node_id)
         return None
 
+    @staticmethod
+    def _prompt_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
+
     @classmethod
     def _prompt_node_inputs(cls, prompt, node_id):
         if not isinstance(prompt, dict):
@@ -212,17 +222,19 @@ class SonderEditor:
         return inputs if isinstance(inputs, dict) else {}
 
     @classmethod
-    def _execution_reaches_save_video(cls, prompt, unique_id) -> bool:
+    def _execution_reaches_terminal_save(cls, prompt, unique_id) -> bool:
         if not isinstance(prompt, dict) or unique_id in {None, ""}:
             return False
         target_id = str(unique_id)
         for node in prompt.values():
             if not isinstance(node, dict):
                 continue
-            if node.get("class_type") != "SonderSaveVideo":
+            if node.get("class_type") not in {"SonderSaveVideo", "SonderSaveBridge"}:
                 continue
             inputs = node.get("inputs", {})
             if not isinstance(inputs, dict):
+                continue
+            if not cls._prompt_bool(inputs.get("mark_queue_complete")):
                 continue
             project_source = cls._prompt_linked_node_id(inputs.get("project"))
             if project_source is None:
@@ -335,7 +347,7 @@ class SonderEditor:
             proj_fps = proj.fps
             proj_w, proj_h = proj.resolution
 
-            if self._execution_reaches_save_video(prompt, unique_id):
+            if self._execution_reaches_terminal_save(prompt, unique_id):
                 queue_job = self._consume_queue_job(proj)
             snapshot_version = self._queue_snapshot_version(queue_job)
             if queue_job:

@@ -141,6 +141,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         sortMode: "newest",
         inspectorCollapsed: false,
         thumbnailSize: "medium",
+        artifactInspectorExpanded: false,
     },
 };
 
@@ -515,6 +516,9 @@ function normalizeEditorSettings(source = null) {
             thumbnailSize: VALID_THUMBNAIL_SIZES.has(stored?.gallery?.thumbnailSize)
                 ? stored.gallery.thumbnailSize
                 : defaults.gallery.thumbnailSize,
+            artifactInspectorExpanded: stored?.gallery?.artifactInspectorExpanded == null
+                ? defaults.gallery.artifactInspectorExpanded
+                : !!stored.gallery.artifactInspectorExpanded,
         },
     };
 }

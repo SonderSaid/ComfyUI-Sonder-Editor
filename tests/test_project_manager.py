@@ -25,6 +25,7 @@ def test_create_project():
         assert os.path.isdir(os.path.join(project.project_dir, "exports"))
         assert os.path.isdir(os.path.join(project.project_dir, "cache", "thumbnails"))
         assert os.path.isdir(os.path.join(project.project_dir, "cache", "waveforms"))
+        assert os.path.isdir(os.path.join(project.project_dir, "cache", "bridge_out"))
 
 
 def test_save_and_load_roundtrip():

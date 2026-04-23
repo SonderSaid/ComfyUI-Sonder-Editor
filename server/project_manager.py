@@ -12,6 +12,7 @@ PROJECT_SUBDIRS = [
     "exports",
     os.path.join("cache", "thumbnails"),
     os.path.join("cache", "waveforms"),
+    os.path.join("cache", "bridge_out"),
 ]
 
 
