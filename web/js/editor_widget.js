@@ -8,6 +8,12 @@ const { api } = window.comfyAPI.api;
 import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
+    _debugListConsumers as debugKeyboardConsumers,
+    isKeyboardDebugEnabled,
+    register as registerKeyboardConsumer,
+    PRIORITY as KEY_PRIORITY,
+} from "./keyboard_ownership.js";
+import {
     ASPECT_RATIO_PRESETS,
     CLIP_LABEL_MODE_OPTIONS,
     DEFAULT_EDITOR_SETTINGS,
@@ -30,6 +36,17 @@ import {
     subscribeEditorSettings,
     updateEditorSettings,
 } from "./editor_settings.js";
+
+function describeKeyboardDebugElement(element) {
+    if (!element) return "null";
+    const tag = String(element.tagName || element.nodeName || "").toLowerCase();
+    if (!tag) return String(element);
+    const id = element.id ? `#${element.id}` : "";
+    const classes = typeof element.className === "string" && element.className.trim()
+        ? `.${element.className.trim().split(/\s+/).slice(0, 3).join(".")}`
+        : "";
+    return `${tag}${id}${classes}`;
+}
 
 export async function uploadFileToComfyInput(file) {
     if (!file) return "";
@@ -124,7 +141,7 @@ const FULLSCREEN_SIDEBAR_DEFAULT_WIDTH = 240;
 const FULLSCREEN_SIDEBAR_MIN_WIDTH = 180;
 const FULLSCREEN_TIMELINE_MIN_HEIGHT = 160;
 const FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT = 600;
-const TRACK_TYPE = { VIDEO: "video", AUDIO: "audio", GUIDES: "guides", PROMPT: "prompt" };
+const TRACK_TYPE = { VIDEO: "video", AUDIO: "audio", MOTION_DRIVER: "motion_driver", GUIDES: "guides", PROMPT: "prompt" };
 const TRACK_COLLAPSED_HEIGHT = 8; // Height when a track is collapsed
 const LABEL_WIDTH = 55; // px reserved for track labels (node mode)
 const LABEL_WIDTH_FS = 70; // px reserved for track labels (fullscreen)
@@ -149,12 +166,17 @@ const COLORS = {
     trackBorder: "#33404d",
     clip: "#3a7ca5",
     clipSelected: "#5aacd5",
+    motionDriver: "#e8a030",
+    motionDriverSoft: "rgba(232, 160, 48, 0.18)",
+    motionDriverSelected: "#ffcc44",
     audioClip: "#5a8a5a",
     audioClipSelected: "#7aba7a",
     guide: "#e8a030",
     guideSelected: "#ffcc44",
     selection: "rgba(100, 180, 255, 0.14)",
     selectionBorder: "rgba(100, 180, 255, 0.58)",
+    selectionContext: "rgba(100, 180, 255, 0.07)",
+    selectionContextBorder: "rgba(100, 180, 255, 0.24)",
     playhead: "#ff4444",
     promptSection: "rgba(180, 120, 255, 0.2)",
     promptBorder: "rgba(180, 120, 255, 0.5)",
@@ -367,6 +389,7 @@ export class EditorWidget {
         this._queueExpanded = !!this._settings.layout.queuePanelExpanded;
         this._queueBatchExpanded = {};
         this._queueHeaderLabel = null;
+        this._queueStatusWrap = null;
         this._savedSelDropdown = null;
 
         // Prompt section state
@@ -744,17 +767,25 @@ export class EditorWidget {
             this._updateToolbar();
         });
 
-        const cutHereBtn = makeToolBtn("⌇ Split Here", "", "Split clip/audio at playhead", () => false, () => {
-            // Find clip or audio at playhead and split
-            const clip = this._getClipAtFrame(this.playhead);
+        const cutHereBtn = makeToolBtn("⌇ Split Here", "", "Split clip/audio at playhead", () => false, async () => {
+            const selectedTargets = this.selectedItems
+                .filter((item) => (item.type === "clip" || item.type === "audio")
+                    && this.playhead > item.data.timeline_start_frame
+                    && this.playhead < item.data.timeline_end_frame);
+            if (selectedTargets.length) {
+                for (const hit of selectedTargets) {
+                    await this._splitClipAtFrame(hit, this.playhead);
+                }
+                return;
+            }
+
+            const clip = this._getClipAtFrame(this.playhead) || this._getMotionDriverClipAtFrame(this.playhead);
             if (clip) {
-                const hit = { type: "clip", id: clip.clip_id, data: clip };
-                this._splitClipAtFrame(hit, this.playhead);
+                await this._splitClipAtFrame({ type: "clip", id: clip.clip_id, data: clip }, this.playhead);
             }
             const audio = this._getAudioAtFrame(this.playhead);
             if (audio) {
-                const hit = { type: "audio", id: audio.track_id, data: audio };
-                this._splitClipAtFrame(hit, this.playhead);
+                await this._splitClipAtFrame({ type: "audio", id: audio.track_id, data: audio }, this.playhead);
             }
         });
         cutHereBtn.title = "Split clip/audio at current playhead position";
@@ -845,6 +876,17 @@ export class EditorWidget {
         this._batchQueueBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
         this._batchQueueBtn.addEventListener("click", () => this._addBatchToRenderQueue());
 
+        this._queueStatusWrap = document.createElement("div");
+        this._queueStatusWrap.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            margin-left: 4px;
+            min-width: 0;
+            white-space: nowrap;
+        `;
+        this._queueStatusWrap.title = "Queue status";
+
         // Animatic toggle button
         this._toolBtnAnimatic = makeToolBtn("👁 Anim", "A", "Toggle animatic mode (hide all video)", () => this._animaticMode, () => {
             this._toggleAnimatic();
@@ -863,9 +905,70 @@ export class EditorWidget {
         this._fullscreenBtn.style.fontSize = "14px";
         this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
 
-        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, this._batchQueueBtn, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
+        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, this._batchQueueBtn, this._queueStatusWrap, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
         this.container.appendChild(this._toolbar);
         this._updateToolbar();
+    }
+
+    _queueChromeBadges(queue = this._renderQueue) {
+        const counts = { running: 0, pending: 0 };
+        for (const job of Array.isArray(queue) ? queue : []) {
+            const status = String(job?.status || "pending").trim().toLowerCase();
+            if (status === "running") {
+                counts.running += 1;
+            } else if (status === "pending") {
+                counts.pending += 1;
+            }
+        }
+
+        const badges = [];
+        if (counts.running > 0) {
+            badges.push({ text: `${counts.running} Running`, background: "#264863", border: "#5d8db5" });
+        }
+        if (counts.pending > 0) {
+            badges.push({ text: `${counts.pending} Pending`, background: COLORS.warningSoft, border: COLORS.warningBorder });
+        }
+        if (!badges.length) {
+            badges.push({ text: "Idle", background: "#223128", border: "#4d6a58" });
+        }
+        return { badges, counts };
+    }
+
+    _updateQueueChromeStatus() {
+        if (!this._queueStatusWrap) return;
+        this._queueStatusWrap.innerHTML = "";
+
+        const label = document.createElement("span");
+        label.textContent = "Queue";
+        label.style.cssText = `
+            color: ${COLORS.textMuted};
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        `;
+        this._queueStatusWrap.appendChild(label);
+
+        const { badges, counts } = this._queueChromeBadges();
+        for (const badge of badges) {
+            const pill = document.createElement("span");
+            pill.style.cssText = `
+                padding: 1px 7px;
+                border-radius: 999px;
+                background: ${badge.background};
+                border: 1px solid ${badge.border};
+                color: #f5f5f5;
+                font-size: 9px;
+                font-weight: 600;
+                line-height: 1.4;
+            `;
+            pill.textContent = badge.text;
+            this._queueStatusWrap.appendChild(pill);
+        }
+
+        const titleParts = [];
+        if (counts.running > 0) titleParts.push(`${counts.running} running`);
+        if (counts.pending > 0) titleParts.push(`${counts.pending} pending`);
+        this._queueStatusWrap.title = titleParts.length ? `Queue: ${titleParts.join(", ")}` : "Queue: idle";
     }
 
     _updateToolbar() {
@@ -897,6 +1000,7 @@ export class EditorWidget {
             setButtonVariant(this._toolBtnAnimatic, this._animaticMode ? "warning" : "muted");
         }
         this._updateBatchButtonLabel();
+        this._updateQueueChromeStatus();
     }
 
     // Info bar removed — zoom/fullscreen controls moved to toolbar.
@@ -916,6 +1020,7 @@ export class EditorWidget {
             box-sizing: border-box;
         `;
         this._assetGallery = mountSharedAssetGallery(this.assetGrid, {
+            ownerId: this._keyboardConsumerId("gallery"),
             getProjectDir: () => this.projectDir,
             initialData: { assets: [], folders: [] },
             onImportFiles: async (files, folder) => {
@@ -2484,6 +2589,40 @@ export class EditorWidget {
         this._setTimecodeMode(this._timecodeMode === "frames" ? "timecode" : "frames");
     }
 
+    _isLaneTrackType(type) {
+        return type === TRACK_TYPE.VIDEO || type === TRACK_TYPE.AUDIO || type === TRACK_TYPE.MOTION_DRIVER;
+    }
+
+    _isRenderClip(clip) {
+        return !clip?.role || clip.role === "render";
+    }
+
+    _isMotionDriverClip(clip) {
+        return clip?.role === "motion_driver";
+    }
+
+    _clipTrackType(clip) {
+        return this._isMotionDriverClip(clip) ? TRACK_TYPE.MOTION_DRIVER : TRACK_TYPE.VIDEO;
+    }
+
+    _clipMatchesTrackEntry(clip, entry) {
+        return entry
+            && this._clipTrackType(clip) === entry.type
+            && (clip.track_index || 0) === entry.laneIndex;
+    }
+
+    _defaultGuideStrength() {
+        return this._settings?.projectDefaults?.defaultGuideStrength
+            ?? DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultGuideStrength
+            ?? 1.0;
+    }
+
+    _defaultMotionDriverStrength() {
+        return this._settings?.projectDefaults?.defaultMotionDriverStrength
+            ?? DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultMotionDriverStrength
+            ?? 1.0;
+    }
+
     async _toggleAnimatic() {
         if (!this.activeScene || !this.projectDir) return;
 
@@ -2511,8 +2650,10 @@ export class EditorWidget {
         const layout = [];
         const scene = this.activeScene;
         const videoLanes = scene?.video_lane_count || 1;
+        const motionDriverLanes = scene?.motion_driver_lane_count || 1;
         const audioLanes = scene?.audio_lane_count || 1;
         const vConfigs = scene?.video_lane_configs || [];
+        const mdConfigs = scene?.motion_driver_lane_configs || [];
         const aConfigs = scene?.audio_lane_configs || [];
         const storedCollapse = this._readStoredTrackCollapseState(scene);
         const isStored = storedCollapse.exists;
@@ -2545,6 +2686,22 @@ export class EditorWidget {
                 laneIndex: i,
                 collapsed: isStored ? storedCollapsed.has(key) : false,
                 color: cfg.color || LANE_PALETTE[i % LANE_PALETTE.length],
+                locked: cfg.locked || false,
+                hidden: cfg.hidden || false,
+            });
+        }
+
+        // Motion-driver lanes: single lane in Phase 4.3, below audio.
+        for (let i = 0; i < motionDriverLanes; i++) {
+            const key = TRACK_TYPE.MOTION_DRIVER + ":" + i;
+            const cfg = mdConfigs[i] || {};
+            layout.push({
+                type: TRACK_TYPE.MOTION_DRIVER,
+                label: cfg.name || (motionDriverLanes > 1 ? `MD${i + 1}` : "Driver"),
+                customName: cfg.name || "",
+                laneIndex: i,
+                collapsed: isStored ? storedCollapsed.has(key) : false,
+                color: cfg.color || COLORS.motionDriver,
                 locked: cfg.locked || false,
                 hidden: cfg.hidden || false,
             });
@@ -2590,6 +2747,13 @@ export class EditorWidget {
         );
     }
 
+    /** Find layout index for a motion-driver lane */
+    _motionDriverLaneLayoutIdx(laneIndex) {
+        return this._trackLayout.findIndex(
+            e => e.type === TRACK_TYPE.MOTION_DRIVER && e.laneIndex === laneIndex
+        );
+    }
+
     /** Find layout index for guides */
     _guidesLayoutIdx() {
         return this._trackLayout.findIndex(e => e.type === TRACK_TYPE.GUIDES);
@@ -2632,6 +2796,26 @@ export class EditorWidget {
 
     _visibleTimelineContentHeight() {
         return Math.max(0, this._timelineHeight - this._timelineRulerHeight());
+    }
+
+    _selectionContextRange() {
+        if (this.selectionStart >= this.selectionEnd) return null;
+        const sceneEnd = Math.max(
+            this.selectionEnd,
+            Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0)
+        );
+        const preContext = this._contextFrameValue("pre_context_frames");
+        const postContext = this._contextFrameValue("post_context_frames");
+        const contextStart = Math.max(0, this.selectionStart - preContext);
+        const contextEnd = Math.min(sceneEnd, this.selectionEnd + postContext);
+        return {
+            selectionStart: this.selectionStart,
+            selectionEnd: this.selectionEnd,
+            contextStart,
+            contextEnd,
+            hasPreContext: contextStart < this.selectionStart,
+            hasPostContext: contextEnd > this.selectionEnd,
+        };
     }
 
     _clampScrollY() {
@@ -2903,6 +3087,8 @@ export class EditorWidget {
         if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
         if (controls.defaultProjectHeight) controls.defaultProjectHeight.value = String(this._settings.projectDefaults.height);
         if (controls.defaultSceneDuration) controls.defaultSceneDuration.value = String(this._settings.projectDefaults.newSceneDuration);
+        if (controls.defaultGuideStrength) controls.defaultGuideStrength.value = String(this._settings.projectDefaults.defaultGuideStrength);
+        if (controls.defaultMotionDriverStrength) controls.defaultMotionDriverStrength.value = String(this._settings.projectDefaults.defaultMotionDriverStrength);
         if (controls.defaultTemplateId) controls.defaultTemplateId.value = this._settings.projectDefaults.defaultTemplateId || "free";
         if (controls.gallerySortMode) controls.gallerySortMode.value = this._settings.gallery.sortMode;
         if (controls.galleryInspectorCollapsed) controls.galleryInspectorCollapsed.checked = !!this._settings.gallery.inspectorCollapsed;
@@ -3165,10 +3351,12 @@ export class EditorWidget {
             const y = this._trackY(i);
             const h = this._trackH(i);
             const collapsed = entry.collapsed;
-            const isLane = entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO;
+            const isLane = this._isLaneTrackType(entry.type);
 
             // Track background
-            ctx.fillStyle = i % 2 === 0 ? this._timelineColor(COLORS.track) : this._timelineColor(COLORS.bg);
+            ctx.fillStyle = entry.type === TRACK_TYPE.MOTION_DRIVER
+                ? COLORS.motionDriverSoft
+                : (i % 2 === 0 ? this._timelineColor(COLORS.track) : this._timelineColor(COLORS.bg));
             ctx.fillRect(0, y, width, h);
 
             if (collapsed) {
@@ -3204,7 +3392,7 @@ export class EditorWidget {
                     curX += iconSize + Math.round(1 * hs);
 
                     // 3. Hide/Mute icon
-                    if (entry.type === TRACK_TYPE.VIDEO) {
+                    if (entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.MOTION_DRIVER) {
                         ctx.fillStyle = entry.hidden ? "#e05050" : "#555";
                         ctx.fillText(entry.hidden ? "🚫" : "👁", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
                     } else {
@@ -3254,12 +3442,37 @@ export class EditorWidget {
     }
 
     _drawSelection(ctx, width) {
-        if (this.selectionStart >= this.selectionEnd) return;
+        const range = this._selectionContextRange();
+        if (!range) return;
 
-        const x1 = this._frameToX(this.selectionStart);
-        const x2 = this._frameToX(this.selectionEnd);
-        const y = Math.round(RULER_HEIGHT * this._scaleTimeline);
+        const x1 = this._frameToX(range.selectionStart);
+        const x2 = this._frameToX(range.selectionEnd);
+        const contextX1 = this._frameToX(range.contextStart);
+        const contextX2 = this._frameToX(range.contextEnd);
+        const y = this._timelineRulerHeight();
         const h = this._totalTracksHeight();
+
+        if (range.hasPreContext) {
+            ctx.fillStyle = COLORS.selectionContext;
+            ctx.fillRect(contextX1, y, x1 - contextX1, h);
+            ctx.strokeStyle = COLORS.selectionContextBorder;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(contextX1, y);
+            ctx.lineTo(contextX1, y + h);
+            ctx.stroke();
+        }
+
+        if (range.hasPostContext) {
+            ctx.fillStyle = COLORS.selectionContext;
+            ctx.fillRect(x2, y, contextX2 - x2, h);
+            ctx.strokeStyle = COLORS.selectionContextBorder;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(contextX2, y);
+            ctx.lineTo(contextX2, y + h);
+            ctx.stroke();
+        }
 
         // Fill
         ctx.fillStyle = COLORS.selection;
@@ -3339,15 +3552,17 @@ export class EditorWidget {
             ctx.globalAlpha = 1.0;
         };
 
-        // Video clips (all video lanes)
+        // Video and motion-driver clips.
         const allClips = this.activeScene.clips || [];
         for (let _vli = 0; _vli < this._trackLayout.length; _vli++) {
             const _vlEntry = this._trackLayout[_vli];
-            if (_vlEntry.type !== TRACK_TYPE.VIDEO || _vlEntry.collapsed) continue;
+            if (_vlEntry.type !== TRACK_TYPE.VIDEO && _vlEntry.type !== TRACK_TYPE.MOTION_DRIVER) continue;
+            if (_vlEntry.collapsed) continue;
             const videoY = this._trackY(_vli);
             const videoH = this._trackH(_vli);
             const laneHidden = _vlEntry.hidden;
-            const clips = allClips.filter(c => (c.track_index || 0) === _vlEntry.laneIndex);
+            const isMotionDriverLane = _vlEntry.type === TRACK_TYPE.MOTION_DRIVER;
+            const clips = allClips.filter(c => this._clipMatchesTrackEntry(c, _vlEntry));
             for (const clip of clips) {
                 const x1 = this._frameToX(clip.timeline_start_frame);
                 const x2 = this._frameToX(clip.timeline_end_frame);
@@ -3358,8 +3573,10 @@ export class EditorWidget {
                 const baseAlpha = laneHidden ? 0.3 : (opacity < 1.0 ? Math.max(0.3, opacity) : 1.0);
                 const clipAsset = this._getAssetForSourcePath(clip.source_path);
                 const isMissingClip = !clipAsset || !!clipAsset.missing;
-                const laneBaseColor = _vlEntry.color || COLORS.clip;
-                const clipFillColor = isSelectedClip ? lightenColor(laneBaseColor, 0.3) : laneBaseColor;
+                const laneBaseColor = _vlEntry.color || (isMotionDriverLane ? COLORS.motionDriver : COLORS.clip);
+                const clipFillColor = isSelectedClip
+                    ? (isMotionDriverLane ? COLORS.motionDriverSelected : lightenColor(laneBaseColor, 0.3))
+                    : laneBaseColor;
                 ctx.globalAlpha = baseAlpha;
 
                 // Draw base fill
@@ -3435,7 +3652,22 @@ export class EditorWidget {
                     ctx.fillStyle = isMissingClip ? "#ffd0bc" : COLORS.text;
                     ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
                     ctx.textAlign = "left";
-                    ctx.fillText(label, x1 + 4, videoY + videoH / 2 + Math.round(3 * this._scaleTimeline));
+                    const labelX = isMotionDriverLane ? x1 + Math.round(26 * this._scaleTimeline) : x1 + 4;
+                    ctx.fillText(label, labelX, videoY + videoH / 2 + Math.round(3 * this._scaleTimeline));
+                }
+
+                if (isMotionDriverLane && (x2 - x1) > 24) {
+                    const badgeW = Math.round(18 * this._scaleTimeline);
+                    const badgeH = Math.round(12 * this._scaleTimeline);
+                    const badgeX = x1 + Math.round(4 * this._scaleTimeline);
+                    const badgeY = videoY + Math.round(5 * this._scaleTimeline);
+                    ctx.globalAlpha = baseAlpha;
+                    ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
+                    ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
+                    ctx.fillStyle = "#d8ffff";
+                    ctx.font = `${Math.round(8 * this._scaleTimeline)}px sans-serif`;
+                    ctx.textAlign = "center";
+                    ctx.fillText("MD", badgeX + badgeW / 2, badgeY + badgeH - Math.round(3 * this._scaleTimeline));
                 }
 
                 if (isMissingClip) {
@@ -3737,7 +3969,7 @@ export class EditorWidget {
         const layoutIdx = this._layoutIndexFromRawY(rawY);
         if (layoutIdx < 0) return null;
         const entry = this._trackLayout[layoutIdx];
-        const isLane = entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO;
+        const isLane = this._isLaneTrackType(entry.type);
         if (entry.collapsed || !isLane) {
             return { layoutIdx, zone: "collapse" };
         }
@@ -3763,10 +3995,10 @@ export class EditorWidget {
         const layoutIdx = this._layoutIndexFromRawY(rawY);
         if (layoutIdx < 0) return null;
         const entry = this._trackLayout[layoutIdx];
-        if (entry.type !== TRACK_TYPE.VIDEO || entry.collapsed) return null;
+        if ((entry.type !== TRACK_TYPE.VIDEO && entry.type !== TRACK_TYPE.MOTION_DRIVER) || entry.collapsed) return null;
         const clips = this.activeScene.clips || [];
         for (const clip of clips) {
-            if ((clip.track_index || 0) !== entry.laneIndex) continue;
+            if (!this._clipMatchesTrackEntry(clip, entry)) continue;
             const x1 = this._frameToX(clip.timeline_start_frame);
             const x2 = this._frameToX(clip.timeline_end_frame);
             if (x >= x1 && x <= x2) {
@@ -3862,9 +4094,9 @@ export class EditorWidget {
         if (layoutIdx < 0) return null;
         const entry = this._trackLayout[layoutIdx];
 
-        if (entry.type === TRACK_TYPE.VIDEO && !entry.collapsed) {
+        if ((entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.MOTION_DRIVER) && !entry.collapsed) {
             for (const clip of (this.activeScene.clips || [])) {
-                if ((clip.track_index || 0) !== entry.laneIndex) continue;
+                if (!this._clipMatchesTrackEntry(clip, entry)) continue;
                 const x1 = this._frameToX(clip.timeline_start_frame);
                 const x2 = this._frameToX(clip.timeline_end_frame);
                 if (Math.abs(x - x1) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "left" };
@@ -4109,7 +4341,7 @@ export class EditorWidget {
                     const edgeHit = this._hitTestEdge(x, rawY);
                     if (edgeHit) {
                         // Block trim on locked lanes
-                        if (edgeHit.type === "clip" && this._isLaneLocked(TRACK_TYPE.VIDEO, edgeHit.data.track_index || 0)) return;
+                        if (edgeHit.type === "clip" && this._isLaneLocked(this._clipTrackType(edgeHit.data), edgeHit.data.track_index || 0)) return;
                         if (edgeHit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, edgeHit.data.lane_index || 0)) return;
                         this._pushUndo("trim");
                         const isPrompt = edgeHit.type === "prompt";
@@ -4147,7 +4379,7 @@ export class EditorWidget {
                         this._hideItemEditor(); // Will show on mouseup if no drag
                         // Block drag if any selected item is on a locked lane
                         const anyLocked = this.selectedItems.some(s => {
-                            if (s.type === "clip") return this._isLaneLocked(TRACK_TYPE.VIDEO, s.data.track_index || 0);
+                            if (s.type === "clip") return this._isLaneLocked(this._clipTrackType(s.data), s.data.track_index || 0);
                             if (s.type === "audio") return this._isLaneLocked(TRACK_TYPE.AUDIO, s.data.lane_index || 0);
                             return false;
                         });
@@ -4165,6 +4397,7 @@ export class EditorWidget {
                             origStart: s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0,
                             origEnd: s.data.timeline_end_frame ?? s.data.end_frame ?? (s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0),
                             origLane: s.type === "clip" ? (s.data.track_index || 0) : (s.type === "audio" ? (s.data.lane_index || 0) : 0),
+                            origTrackType: s.type === "clip" ? this._clipTrackType(s.data) : (s.type === "audio" ? TRACK_TYPE.AUDIO : ""),
                         }));
                         this._dragLaneChanged = false;
                         // Snapshot ALL clip/audio lanes for swap preview
@@ -4318,13 +4551,14 @@ export class EditorWidget {
                         orig.data.timeline_start_frame = newStart;
                         orig.data.timeline_end_frame = newStart + duration;
                         // Lane swap preview
-                        if (orig.type === "clip" && hoverLaneType === TRACK_TYPE.VIDEO && hoverLaneIndex >= 0) {
+                        const origTrackType = orig.origTrackType || (orig.type === "clip" ? this._clipTrackType(orig.data) : "");
+                        if (orig.type === "clip" && hoverLaneType === origTrackType && hoverLaneIndex >= 0) {
                             if (hoverLaneIndex !== orig.origLane) {
                                 orig.data.track_index = hoverLaneIndex;
                                 this._dragLaneChanged = true;
                                 // Swap: move all non-dragged clips on target lane to source lane
                                 for (const c of (this.activeScene?.clips || [])) {
-                                    if (!draggedClipIds.has(c.clip_id) && c.track_index === hoverLaneIndex) {
+                                    if (!draggedClipIds.has(c.clip_id) && this._clipTrackType(c) === origTrackType && c.track_index === hoverLaneIndex) {
                                         c.track_index = orig.origLane;
                                     }
                                 }
@@ -4506,18 +4740,23 @@ export class EditorWidget {
             const headerHit = this._hitTestTrackHeader(x, rawY);
             if (headerHit) {
                 const entry = this._trackLayout[headerHit.layoutIdx];
-                if (entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO) {
+                if (this._isLaneTrackType(entry.type)) {
                     const isVideo = entry.type === TRACK_TYPE.VIDEO;
+                    const isMotionDriver = entry.type === TRACK_TYPE.MOTION_DRIVER;
                     const laneCount = isVideo
                         ? (this.activeScene?.video_lane_count || 1)
-                        : (this.activeScene?.audio_lane_count || 1);
-                    const label = isVideo ? "Video" : "Audio";
+                        : isMotionDriver
+                            ? (this.activeScene?.motion_driver_lane_count || 1)
+                            : (this.activeScene?.audio_lane_count || 1);
+                    const label = isVideo ? "Video" : (isMotionDriver ? "Motion Driver" : "Audio");
 
                     menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(headerHit.layoutIdx) });
-                    menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
-                    if (laneCount > 1) {
+                    if (!isMotionDriver) {
+                        menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
+                    }
+                    if (!isMotionDriver && laneCount > 1) {
                         const hasItems = isVideo
-                            ? (this.activeScene?.clips || []).some(c => (c.track_index || 0) === entry.laneIndex)
+                            ? (this.activeScene?.clips || []).some(c => this._isRenderClip(c) && (c.track_index || 0) === entry.laneIndex)
                             : (this.activeScene?.audio_tracks || []).some(a => (a.lane_index || 0) === entry.laneIndex);
                         if (hasItems) {
                             menuItems.push({ label: `Remove ${label} Lane (move items)`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
@@ -4544,14 +4783,30 @@ export class EditorWidget {
                 this._renderTimeline();
 
                 const count = this.selectedItems.length;
-                const itemLocked = (hit.type === "clip" && this._isLaneLocked(TRACK_TYPE.VIDEO, hit.data.track_index || 0))
+                const itemLocked = (hit.type === "clip" && this._isLaneLocked(this._clipTrackType(hit.data), hit.data.track_index || 0))
                     || (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0));
                 if (count > 1) {
                     menuItems.push({ label: `Delete ${count} items`, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "clip") {
                     const clipAsset = this._getAssetForSourcePath(hit.data.source_path);
-                    menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+                    const isMotionDriverClip = this._isMotionDriverClip(hit.data);
+                    const canConvertRole = isMotionDriverClip || clipAsset?.asset_type === "video";
+                    menuItems.push({
+                        label: itemLocked || isMotionDriverClip ? "Move to New Lane" + (itemLocked ? " (locked)" : " (unavailable)") : "Move to New Lane",
+                        action: itemLocked || isMotionDriverClip ? () => {} : () => this._moveItemToNewLane(hit),
+                        disabled: itemLocked || isMotionDriverClip,
+                    });
+                    menuItems.push({
+                        label: !canConvertRole && !itemLocked ? "Convert to Motion Driver (video only)" : (isMotionDriverClip ? "Convert to Render Clip" : "Convert to Motion Driver"),
+                        action: itemLocked || !canConvertRole
+                            ? () => {}
+                            : () => this._convertClipRole(hit.data.clip_id, isMotionDriverClip ? "render" : "motion_driver"),
+                        disabled: itemLocked || !canConvertRole,
+                    });
                     menuItems.push({ label: "Add Frame to Guides", action: () => this._addClipFrameToGuides(hit.data) });
+                    if (clipAsset?.asset_id) {
+                        menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(clipAsset) });
+                    }
                     if ((clipAsset?.width || 0) > 0 && (clipAsset?.height || 0) > 0) {
                         menuItems.push({
                             label: `Set Scene Aspect Ratio (${clipAsset.width}:${clipAsset.height})`,
@@ -4570,12 +4825,19 @@ export class EditorWidget {
                     // Extend scene to audio end
                     const audioEnd = hit.data.timeline_end_frame || 0;
                     const audioSceneDur = this.activeScene?.duration_frames || 0;
+                    const audioAsset = this._getAssetForSourcePath(hit.data.source_path);
+                    if (audioAsset?.asset_id) {
+                        menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(audioAsset) });
+                    }
                     if (audioEnd > audioSceneDur) {
                         menuItems.push({ label: "Extend Scene to Audio End", action: () => this._updateSceneDuration(audioEnd) });
                     }
                     menuItems.push({ label: itemLocked ? "Delete Audio (locked)" : "Delete Audio Track", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "guide") {
                     const guideAsset = this._getGuideAsset(hit.data);
+                    if (guideAsset?.asset_id) {
+                        menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(guideAsset) });
+                    }
                     if ((guideAsset?.width || 0) > 0 && (guideAsset?.height || 0) > 0) {
                         menuItems.push({
                             label: `Set Scene Aspect Ratio (${guideAsset.width}:${guideAsset.height})`,
@@ -4621,20 +4883,68 @@ export class EditorWidget {
             frame = asset.generation_params.selection_start;
         }
 
-        this._pushUndo("add asset");
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         // Determine drop target lane from Y position
         let targetVideoLane = 0;
         let targetAudioLane = 0;
+        let targetMotionDriverLane = -1;
         if (trackRawY !== undefined) {
             const layoutIdx = this._layoutIndexFromRawY(trackRawY);
             if (layoutIdx >= 0) {
                 const entry = this._trackLayout[layoutIdx];
                 if (entry.type === TRACK_TYPE.VIDEO) targetVideoLane = entry.laneIndex;
                 if (entry.type === TRACK_TYPE.AUDIO) targetAudioLane = entry.laneIndex;
+                if (entry.type === TRACK_TYPE.MOTION_DRIVER) targetMotionDriverLane = entry.laneIndex;
             }
         }
+
+        if (targetMotionDriverLane >= 0) {
+            if (asset.asset_type !== "video") {
+                this._showToast("Motion drivers accept video assets only");
+                return;
+            }
+            if (this._isLaneLocked(TRACK_TYPE.MOTION_DRIVER, targetMotionDriverLane)) return;
+            this._pushUndo("add motion driver");
+            const assetObj = this._findAssetById(asset.asset_id);
+            const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
+            const dropEnd = frame + dropDuration;
+            const hasOverlap = (this.activeScene.clips || []).some(c =>
+                this._isMotionDriverClip(c) &&
+                (c.track_index || 0) === targetMotionDriverLane &&
+                c.timeline_start_frame < dropEnd && c.timeline_end_frame > frame
+            );
+            if (hasOverlap) {
+                this._showToast("Only the earliest overlapping motion driver will be used.");
+            }
+            try {
+                const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        asset_id: asset.asset_id,
+                        timeline_start_frame: frame,
+                        track_index: targetMotionDriverLane,
+                        role: "motion_driver",
+                        strength: this._defaultMotionDriverStrength(),
+                        dual_drop: false,
+                    }),
+                });
+                if (!resp.ok) {
+                    console.warn("[Sonder] Motion-driver clip creation failed:", resp.status, await resp.text());
+                    return;
+                }
+                await this._fetchAssets();
+                await this._fetchScenes();
+                this._renderTimeline();
+                this._renderViewportFrame();
+            } catch (e) {
+                console.warn("[Sonder] Failed to drop motion driver:", e);
+            }
+            return;
+        }
+
+        this._pushUndo("add asset");
 
         // Block drop on locked lanes
         if (this._isLaneLocked(TRACK_TYPE.VIDEO, targetVideoLane) || this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
@@ -4652,6 +4962,7 @@ export class EditorWidget {
             const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
             const dropEnd = frame + dropDuration;
             const hasOverlap = (this.activeScene.clips || []).some(c =>
+                this._isRenderClip(c) &&
                 (c.track_index || 0) === targetVideoLane &&
                 c.timeline_start_frame < dropEnd && c.timeline_end_frame > frame
             );
@@ -4722,7 +5033,7 @@ export class EditorWidget {
                         frame_index: frame,
                         asset_id: asset.asset_id,
                         source: "asset",
-                        strength: 1.0,
+                        strength: this._defaultGuideStrength(),
                     }),
                 });
                 if (!resp.ok) {
@@ -4775,6 +5086,79 @@ export class EditorWidget {
     }
 
     // ── Lane Management ────────────────────────────────────────────────
+    _firstAvailableLane(type) {
+        const count = type === TRACK_TYPE.VIDEO
+            ? (this.activeScene?.video_lane_count || 1)
+            : type === TRACK_TYPE.MOTION_DRIVER
+                ? (this.activeScene?.motion_driver_lane_count || 1)
+                : (this.activeScene?.audio_lane_count || 1);
+        let visibleLane = -1;
+        for (let i = 0; i < count; i++) {
+            if (this._isLaneHidden(type, i)) continue;
+            if (visibleLane < 0) visibleLane = i;
+            if (!this._isLaneLocked(type, i)) return i;
+        }
+        return visibleLane;
+    }
+
+    async _convertClipRole(clipId, targetRole) {
+        if (!this.activeScene || !this.projectDir || !clipId) return;
+        const clip = (this.activeScene.clips || []).find(c => c.clip_id === clipId);
+        if (!clip) return;
+        const targetType = targetRole === "motion_driver" ? TRACK_TYPE.MOTION_DRIVER : TRACK_TYPE.VIDEO;
+        if (targetRole === "motion_driver") {
+            const sourceAsset = this._getAssetForSourcePath(clip.source_path);
+            if (sourceAsset?.asset_type !== "video") {
+                this._showToast("Motion drivers accept video assets only");
+                return;
+            }
+        }
+        const targetLane = this._firstAvailableLane(targetType);
+        if (targetLane < 0 || this._isLaneHidden(targetType, targetLane)) {
+            this._showToast(targetRole === "motion_driver" ? "No visible motion-driver lane available." : "No visible video lane available.");
+            return;
+        }
+        if (this._isLaneLocked(targetType, targetLane)) {
+            this._showToast("Target lane is locked.");
+            return;
+        }
+
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const sceneId = this.activeSceneId;
+        const oldState = {
+            role: clip.role || "render",
+            track_index: clip.track_index || 0,
+            strength: clip.strength ?? 1.0,
+        };
+        const body = { role: targetRole, track_index: targetLane };
+        if (targetRole === "motion_driver") {
+            body.strength = this._defaultMotionDriverStrength();
+        }
+
+        this._pushUndo("convert clip role");
+        Object.assign(clip, body);
+        try {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${clipId}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            if (!resp.ok) {
+                throw new Error(await resp.text());
+            }
+            await this._fetchScenes();
+            this._clearSelection();
+            this._hideItemEditor();
+            this._renderTimeline();
+            this._renderViewportFrame();
+        } catch (e) {
+            Object.assign(clip, oldState);
+            console.warn("[Sonder] Failed to convert clip role:", e);
+            this._showToast("Failed to convert clip role.");
+            this._renderTimeline();
+        }
+    }
+
     async _moveItemToNewLane(hit) {
         if (!this.activeScene || !this.projectDir) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -4783,6 +5167,10 @@ export class EditorWidget {
 
         try {
             if (hit.type === "clip") {
+                if (this._isMotionDriverClip(hit.data)) {
+                    this._showToast("Motion-driver lanes are single-lane in this phase.");
+                    return;
+                }
                 // Add a new video lane and move clip there
                 const newCount = (this.activeScene.video_lane_count || 1) + 1;
                 const newLane = newCount - 1;
@@ -4822,7 +5210,9 @@ export class EditorWidget {
     _isLaneLocked(type, laneIndex) {
         const idx = type === TRACK_TYPE.VIDEO
             ? this._videoLaneLayoutIdx(laneIndex)
-            : this._audioLaneLayoutIdx(laneIndex);
+            : type === TRACK_TYPE.MOTION_DRIVER
+                ? this._motionDriverLaneLayoutIdx(laneIndex)
+                : this._audioLaneLayoutIdx(laneIndex);
         return idx >= 0 && this._trackLayout[idx]?.locked;
     }
 
@@ -4830,7 +5220,9 @@ export class EditorWidget {
     _isLaneHidden(type, laneIndex) {
         const idx = type === TRACK_TYPE.VIDEO
             ? this._videoLaneLayoutIdx(laneIndex)
-            : this._audioLaneLayoutIdx(laneIndex);
+            : type === TRACK_TYPE.MOTION_DRIVER
+                ? this._motionDriverLaneLayoutIdx(laneIndex)
+                : this._audioLaneLayoutIdx(laneIndex);
         return idx >= 0 && this._trackLayout[idx]?.hidden;
     }
 
@@ -4869,7 +5261,9 @@ export class EditorWidget {
                 entry.customName = newName;
                 entry.label = newName || (entry.type === TRACK_TYPE.VIDEO
                     ? ((this.activeScene?.video_lane_count || 1) > 1 ? `V${entry.laneIndex + 1}` : "Video")
-                    : ((this.activeScene?.audio_lane_count || 1) > 1 ? `A${entry.laneIndex + 1}` : "Audio"));
+                    : entry.type === TRACK_TYPE.MOTION_DRIVER
+                        ? ((this.activeScene?.motion_driver_lane_count || 1) > 1 ? `MD${entry.laneIndex + 1}` : "Driver")
+                        : ((this.activeScene?.audio_lane_count || 1) > 1 ? `A${entry.laneIndex + 1}` : "Audio"));
                 this._saveLaneConfig();
                 this._renderTimeline();
             }
@@ -4895,26 +5289,35 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
         const sceneRef = this.activeScene;
         const videoConfigs = [];
+        const motionDriverConfigs = [];
         const audioConfigs = [];
         for (const e of this._trackLayout) {
             if (e.type === TRACK_TYPE.VIDEO) {
                 videoConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
+            } else if (e.type === TRACK_TYPE.MOTION_DRIVER) {
+                motionDriverConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
             } else if (e.type === TRACK_TYPE.AUDIO) {
                 audioConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
             }
         }
         // Fill any sparse gaps
         for (let i = 0; i < videoConfigs.length; i++) if (!videoConfigs[i]) videoConfigs[i] = { name: "", color: "", locked: false, hidden: false };
+        for (let i = 0; i < motionDriverConfigs.length; i++) if (!motionDriverConfigs[i]) motionDriverConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         for (let i = 0; i < audioConfigs.length; i++) if (!audioConfigs[i]) audioConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         try {
             await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ video_lane_configs: videoConfigs, audio_lane_configs: audioConfigs }),
+                body: JSON.stringify({
+                    video_lane_configs: videoConfigs,
+                    motion_driver_lane_configs: motionDriverConfigs,
+                    audio_lane_configs: audioConfigs,
+                }),
             });
             // Update local scene data
             if (sceneRef) {
                 sceneRef.video_lane_configs = videoConfigs;
+                sceneRef.motion_driver_lane_configs = motionDriverConfigs;
                 sceneRef.audio_lane_configs = audioConfigs;
             }
         } catch (e) {
@@ -4924,6 +5327,10 @@ export class EditorWidget {
 
     async _addLane(trackType) {
         if (!this.activeScene || !this.projectDir) return;
+        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
+            this._showToast("Motion-driver lanes are single-lane in this phase.");
+            return;
+        }
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const isVideo = trackType === TRACK_TYPE.VIDEO;
         const body = {};
@@ -4948,10 +5355,14 @@ export class EditorWidget {
     }
 
     async _removeLaneWithItems(trackType, laneIndex) {
+        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
+            this._showToast("Motion-driver lanes are single-lane in this phase.");
+            return;
+        }
         const isVideo = trackType === TRACK_TYPE.VIDEO;
         const label = isVideo ? "video" : "audio";
         const items = isVideo
-            ? (this.activeScene?.clips || []).filter(c => (c.track_index || 0) === laneIndex)
+            ? (this.activeScene?.clips || []).filter(c => this._isRenderClip(c) && (c.track_index || 0) === laneIndex)
             : (this.activeScene?.audio_tracks || []).filter(a => (a.lane_index || 0) === laneIndex);
         const targetLane = laneIndex > 0 ? laneIndex - 1 : 1;
         const currentCount = isVideo
@@ -4997,10 +5408,14 @@ export class EditorWidget {
 
     async _removeLaneDeleteItems(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
+        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
+            this._showToast("Motion-driver lanes are single-lane in this phase.");
+            return;
+        }
         const isVideo = trackType === TRACK_TYPE.VIDEO;
         const label = isVideo ? "video" : "audio";
         const items = isVideo
-            ? (this.activeScene?.clips || []).filter(c => (c.track_index || 0) === laneIndex)
+            ? (this.activeScene?.clips || []).filter(c => this._isRenderClip(c) && (c.track_index || 0) === laneIndex)
             : (this.activeScene?.audio_tracks || []).filter(a => (a.lane_index || 0) === laneIndex);
         if (!items.length) {
             await this._removeLane(trackType, laneIndex);
@@ -5025,6 +5440,10 @@ export class EditorWidget {
 
     async _removeLane(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
+        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
+            this._showToast("Motion-driver lanes are single-lane in this phase.");
+            return;
+        }
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const isVideo = trackType === TRACK_TYPE.VIDEO;
         const currentCount = isVideo
@@ -5049,7 +5468,7 @@ export class EditorWidget {
             // Shift items on lanes above the removed one
             if (isVideo) {
                 for (const clip of (this.activeScene.clips || [])) {
-                    if ((clip.track_index || 0) > laneIndex) {
+                    if (this._isRenderClip(clip) && (clip.track_index || 0) > laneIndex) {
                         await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips/${clip.clip_id}`), {
                             method: "PUT",
                             headers: { "Content-Type": "application/json" },
@@ -5274,17 +5693,23 @@ export class EditorWidget {
         if (!this.selectedItem) return;
 
         const { type, id, data } = this.selectedItem;
+        const isMotionDriverClip = type === "clip" && this._isMotionDriverClip(data);
+        const editorAccent = type === "clip"
+            ? (isMotionDriverClip ? COLORS.motionDriverSelected : COLORS.clipSelected)
+            : type === "audio"
+                ? COLORS.audioClipSelected
+                : COLORS.guideSelected;
 
         const editor = document.createElement("div");
         editor.style.cssText = `
             display: flex; gap: 6px; padding: 4px 6px;
-            background: ${COLORS.panel}; border-top: 1px solid ${type === "clip" ? COLORS.clipSelected : type === "audio" ? COLORS.audioClipSelected : COLORS.guideSelected};
+            background: ${COLORS.panel}; border-top: 1px solid ${editorAccent};
             align-items: center; flex-wrap: wrap;
         `;
 
         const typeLabel = document.createElement("span");
-        typeLabel.style.cssText = `font-size: 10px; color: ${type === "clip" ? COLORS.clipSelected : type === "audio" ? COLORS.audioClipSelected : COLORS.guideSelected}; white-space: nowrap; font-weight: bold;`;
-        typeLabel.textContent = type === "clip" ? "Video Clip" : type === "audio" ? "Audio Track" : "Guide Frame";
+        typeLabel.style.cssText = `font-size: 10px; color: ${editorAccent}; white-space: nowrap; font-weight: bold;`;
+        typeLabel.textContent = type === "clip" ? (isMotionDriverClip ? "Motion Driver" : "Video Clip") : type === "audio" ? "Audio Track" : "Guide Frame";
         editor.appendChild(typeLabel);
 
         if (type === "clip" || type === "audio") {
@@ -5309,25 +5734,40 @@ export class EditorWidget {
 
             // Opacity (clips) or Volume (audio)
             if (type === "clip") {
-                const opLabel = this._makeEditorLabel("Opacity:");
-                const opInput = document.createElement("input");
-                opInput.type = "range";
-                opInput.min = 0; opInput.max = 100; opInput.step = 5;
-                opInput.value = Math.round((data.opacity ?? 1.0) * 100);
-                opInput.style.cssText = `width: 60px; height: 14px; cursor: pointer; accent-color: ${COLORS.clip};`;
-                opInput.title = `Opacity: ${opInput.value}%`;
-                const opVal = this._makeEditorLabel(`${opInput.value}%`);
-                opVal.style.minWidth = "28px";
-                opInput.addEventListener("input", () => {
-                    opVal.textContent = `${opInput.value}%`;
+                if (isMotionDriverClip) {
+                    const strengthLabel = this._makeEditorLabel("Strength:");
+                    const strengthInput = this._makeEditorInput((data.strength ?? 1.0).toFixed(2), 0, 1);
+                    strengthInput.step = "0.05";
+                    strengthInput.addEventListener("change", () => {
+                        const strength = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
+                        if (Number.isFinite(strength)) {
+                            data.strength = strength;
+                            strengthInput.value = strength.toFixed(2);
+                            this._updateItemProperty(type, id, { strength });
+                        }
+                    });
+                    editor.append(strengthLabel, strengthInput);
+                } else {
+                    const opLabel = this._makeEditorLabel("Opacity:");
+                    const opInput = document.createElement("input");
+                    opInput.type = "range";
+                    opInput.min = 0; opInput.max = 100; opInput.step = 5;
+                    opInput.value = Math.round((data.opacity ?? 1.0) * 100);
+                    opInput.style.cssText = `width: 60px; height: 14px; cursor: pointer; accent-color: ${COLORS.clip};`;
                     opInput.title = `Opacity: ${opInput.value}%`;
-                    data.opacity = parseInt(opInput.value) / 100;
-                    this._renderTimeline();
-                });
-                opInput.addEventListener("change", () => {
-                    this._updateItemProperty(type, id, { opacity: parseInt(opInput.value) / 100 });
-                });
-                editor.append(opLabel, opInput, opVal);
+                    const opVal = this._makeEditorLabel(`${opInput.value}%`);
+                    opVal.style.minWidth = "28px";
+                    opInput.addEventListener("input", () => {
+                        opVal.textContent = `${opInput.value}%`;
+                        opInput.title = `Opacity: ${opInput.value}%`;
+                        data.opacity = parseInt(opInput.value) / 100;
+                        this._renderTimeline();
+                    });
+                    opInput.addEventListener("change", () => {
+                        this._updateItemProperty(type, id, { opacity: parseInt(opInput.value) / 100 });
+                    });
+                    editor.append(opLabel, opInput, opVal);
+                }
             } else {
                 // Volume slider for audio
                 const volLabel = this._makeEditorLabel("Vol:");
@@ -5362,7 +5802,7 @@ export class EditorWidget {
             }
 
             // Apply button
-            const applyBtn = this._makeBtn("Apply", "Apply position change");
+            const applyBtn = this._makeBtn("Apply", "Apply guide changes");
             applyBtn.addEventListener("click", () => {
                 const newStart = this._parsePositionInput(startInput.value);
                 if (!isNaN(newStart) && newStart >= 0) {
@@ -5400,28 +5840,38 @@ export class EditorWidget {
             }
             editor.append(frameLabel, frameInput);
 
-            // Strength display
-            const strengthLabel = this._makeEditorLabel(`Strength: ${(data.strength ?? 1.0).toFixed(2)}`);
-            strengthLabel.style.color = COLORS.textDim;
-            editor.appendChild(strengthLabel);
+            const strengthLabel = this._makeEditorLabel("Strength:");
+            const strengthInput = this._makeEditorInput((data.strength ?? 1.0).toFixed(2), 0, 1);
+            strengthInput.step = "0.05";
+            editor.append(strengthLabel, strengthInput);
+
+            const applyGuideEdit = () => {
+                const newIdx = this._parsePositionInput(frameInput.value);
+                const strength = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
+                if (!isNaN(newIdx) && newIdx >= 0 && !isNaN(strength)) {
+                    this._moveGuideToFrame(data, newIdx, strength);
+                }
+            };
 
             // Apply button
-            const applyBtn = this._makeBtn("Apply", "Apply position change");
-            applyBtn.addEventListener("click", () => {
-                const newIdx = this._parsePositionInput(frameInput.value);
-                if (!isNaN(newIdx) && newIdx >= 0 && newIdx !== data.frame_index) {
-                    this._moveGuideToFrame(data, newIdx);
-                }
-            });
+            const applyBtn = this._makeBtn("Apply", "Apply guide changes");
+            applyBtn.addEventListener("click", applyGuideEdit);
             editor.appendChild(applyBtn);
 
             // Enter key in input
             frameInput.addEventListener("keydown", (e) => {
                 if (e.key === "Enter") {
-                    const newIdx = this._parsePositionInput(frameInput.value);
-                    if (!isNaN(newIdx) && newIdx >= 0 && newIdx !== data.frame_index) {
-                        this._moveGuideToFrame(data, newIdx);
-                    }
+                    applyGuideEdit();
+                } else if (e.key === "Escape") {
+                    this._hideItemEditor();
+                    this._clearSelection();
+                    this._renderTimeline();
+                }
+                e.stopPropagation();
+            });
+            strengthInput.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    applyGuideEdit();
                 } else if (e.key === "Escape") {
                     this._hideItemEditor();
                     this._clearSelection();
@@ -5521,7 +5971,7 @@ export class EditorWidget {
         }
     }
 
-    async _moveGuideToFrame(guideData, newIdx) {
+    async _moveGuideToFrame(guideData, newIdx, strength = guideData?.strength ?? 1.0) {
         if (!this.activeScene || !this.projectDir) return;
         this._pushUndo("move guide");
         const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -5539,7 +5989,7 @@ export class EditorWidget {
                     frame_index: newIdx,
                     asset_id: guideData.asset_id,
                     source: guideData.source || "asset",
-                    strength: guideData.strength ?? 1.0,
+                    strength,
                 }),
             });
             await this._fetchScenes();
@@ -5773,7 +6223,7 @@ export class EditorWidget {
         if (hit.type !== "clip" && hit.type !== "audio") return;
         if (frame <= hit.data.timeline_start_frame || frame >= hit.data.timeline_end_frame) return;
         // Block split on locked lanes
-        if (hit.type === "clip" && this._isLaneLocked(TRACK_TYPE.VIDEO, hit.data.track_index || 0)) return;
+        if (hit.type === "clip" && this._isLaneLocked(this._clipTrackType(hit.data), hit.data.track_index || 0)) return;
         if (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0)) return;
 
         this._pushUndo(`split ${hit.type}`);
@@ -5834,25 +6284,23 @@ export class EditorWidget {
         document.body.appendChild(menu);
         this._contextMenuEl = menu;
 
-        // Close on outside click or Escape
+        // Close on outside click or Escape (Escape is owned by KeyboardOwnership
+        // OVERLAY consumer so it beats LiteGraph and the EDITOR consumer).
         const closeHandler = (e) => {
-            if (!menu.contains(e.target)) {
-                this._hideContextMenu();
-                document.removeEventListener("mousedown", closeHandler);
-                document.removeEventListener("keydown", escHandler);
-            }
+            if (!menu.contains(e.target)) this._hideContextMenu();
         };
-        const escHandler = (e) => {
-            if (e.key === "Escape") {
-                this._hideContextMenu();
-                document.removeEventListener("mousedown", closeHandler);
-                document.removeEventListener("keydown", escHandler);
-            }
-        };
+        this._contextMenuKeyOff = registerKeyboardConsumer({
+            id: this._keyboardConsumerId("ctxmenu"),
+            priority: KEY_PRIORITY.OVERLAY,
+            keydown: (e) => {
+                if (e.key === "Escape") { this._hideContextMenu(); return true; }
+                return false;
+            },
+        });
+        this._contextMenuMouseOff = () => document.removeEventListener("mousedown", closeHandler);
         // Delay listener registration to avoid catching the current right-click
         setTimeout(() => {
             document.addEventListener("mousedown", closeHandler);
-            document.addEventListener("keydown", escHandler);
         }, 10);
     }
 
@@ -5860,6 +6308,14 @@ export class EditorWidget {
         if (this._contextMenuEl) {
             this._contextMenuEl.remove();
             this._contextMenuEl = null;
+        }
+        if (this._contextMenuKeyOff) {
+            this._contextMenuKeyOff();
+            this._contextMenuKeyOff = null;
+        }
+        if (this._contextMenuMouseOff) {
+            this._contextMenuMouseOff();
+            this._contextMenuMouseOff = null;
         }
     }
 
@@ -5893,12 +6349,13 @@ export class EditorWidget {
                 ["Del / Backspace", "Delete selected items"],
                 ["Ctrl+Z", "Undo"],
                 ["Ctrl+Y", "Redo"],
+                ["Ctrl+Shift+Z", "Redo"],
             ]) +
             this._shortcutSection("Asset Gallery", [
                 ["Arrow keys", "Move asset focus / selection"],
                 ["Space", "Open inspect overlay for focused asset"],
                 ["Ctrl+A", "Select all visible assets"],
-                ["Delete", "Trash or permanently delete selection"],
+                ["Delete", "Trash or permanently delete selection (when gallery focused)"],
                 ["Esc", "Clear or reduce gallery selection"],
             ]) +
             this._shortcutSection("View", [
@@ -5906,7 +6363,7 @@ export class EditorWidget {
                 ["Ctrl+Wheel", "Horizontal timeline pan"],
                 ["Shift+Wheel", "Timeline zoom"],
                 ["+ / -", "Zoom in / out"],
-                ["Esc", "Exit fullscreen"],
+                ["Esc", "Exit fullscreen / dismiss overlay / clear selection"],
                 ["?", "Show this overlay"],
                 ["Gear", "Editor Settings (toolbar button)"],
             ]);
@@ -5916,8 +6373,14 @@ export class EditorWidget {
         this._shortcutOverlayEl = backdrop;
 
         backdrop.addEventListener("click", (e) => { if (e.target === backdrop) this._hideShortcutOverlay(); });
-        this._shortcutOverlayEscHandler = (e) => { if (e.key === "Escape") { e.stopImmediatePropagation(); this._hideShortcutOverlay(); } };
-        document.addEventListener("keydown", this._shortcutOverlayEscHandler, true);
+        this._shortcutOverlayKeyOff = registerKeyboardConsumer({
+            id: this._keyboardConsumerId("atlas"),
+            priority: KEY_PRIORITY.OVERLAY,
+            keydown: (e) => {
+                if (e.key === "Escape") { this._hideShortcutOverlay(); return true; }
+                return false;
+            },
+        });
     }
 
     _shortcutSection(title, shortcuts) {
@@ -5933,9 +6396,9 @@ export class EditorWidget {
             this._shortcutOverlayEl.remove();
             this._shortcutOverlayEl = null;
         }
-        if (this._shortcutOverlayEscHandler) {
-            document.removeEventListener("keydown", this._shortcutOverlayEscHandler, true);
-            this._shortcutOverlayEscHandler = null;
+        if (this._shortcutOverlayKeyOff) {
+            this._shortcutOverlayKeyOff();
+            this._shortcutOverlayKeyOff = null;
         }
     }
 
@@ -6353,111 +6816,134 @@ export class EditorWidget {
 
     // ── Keyboard Events ──────────────────────────────────────────────
     _setupKeyboardEvents() {
-        this._keyHandler = (e) => {
+        // EDITOR consumer (priority 10). Window-capture root in
+        // keyboard_ownership.js dispatches consumers highest-priority first;
+        // returning `true` consumes the event, returning `false` lets dispatch
+        // continue and (if no consumer claims it) the event reaches LiteGraph.
+        // Every non-consume branch must `return false` — silent fall-through
+        // would starve LiteGraph by accident.
+        this._editorKeyConsumer = (e) => {
+            const key = e.key;
+            const normalizedKey = String(key || "").toLowerCase();
+            const ctrl = e.ctrlKey || e.metaKey;
+            const shift = e.shiftKey;
+
             // Guard: don't fire when typing in inputs (except Ctrl+Z/Y for undo/redo)
             const tag = document.activeElement?.tagName;
-            const isUndo = (e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z" || e.key === "y" || e.key === "Y");
-            if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && !isUndo) return;
+            const isUndo = ctrl && (normalizedKey === "z" || normalizedKey === "y");
+            const debugUndoRouting = (message, extra = {}) => {
+                if (!ctrl || (normalizedKey !== "z" && normalizedKey !== "y")) return;
+                this._keyboardDebug(message, this._keyboardDebugSnapshot(e, extra));
+            };
+            if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && !isUndo) return false;
 
             // Guard: only handle keys when our editor is focused
             // (fullscreen always focused, node mode only when user clicked inside)
-            if (!this.isFullscreen && !this._editorFocused) return;
-            if (this.isFullscreen && this._assetGallery?.isInspectOverlayOpen?.()) return;
-
-            const ctrl = e.ctrlKey || e.metaKey;
-            const shift = e.shiftKey;
-            const key = e.key;
-
-            // Helper: stop event from reaching ComfyUI's keyboard handlers
-            const consume = () => { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); };
+            if (!this.isFullscreen && !this._editorFocused) {
+                debugUndoRouting("skip undo routing: editor not focused");
+                return false;
+            }
 
             // ── Escape ──
             if (key === "Escape") {
-                if (this.isFullscreen) { consume(); this._exitFullscreen(); }
-                return;
+                if (this.isFullscreen) { this._exitFullscreen(); return true; }
+                if (this.selectedItems.length > 0) {
+                    this.selectedItems = [];
+                    this._renderTimeline();
+                    this._updateToolbar();
+                    return true;
+                }
+                return false;
             }
 
             // ── Undo / Redo ──
-            if (ctrl && key === "z" && !shift) { consume(); this._undo(); return; }
-            if (ctrl && (key === "y" || (key === "z" && shift))) { consume(); this._redo(); return; }
+            if (ctrl && normalizedKey === "z" && !shift) {
+                debugUndoRouting("consume undo", { branch: "undo" });
+                this._activateGraphUndoSuppression("editor-undo");
+                void this._undo();
+                return true;
+            }
+            if (ctrl && (normalizedKey === "y" || (normalizedKey === "z" && shift))) {
+                debugUndoRouting("consume redo", {
+                    branch: normalizedKey === "y" ? "redo-y" : "redo-shift-z",
+                });
+                this._activateGraphUndoSuppression(
+                    normalizedKey === "y" ? "editor-redo-y" : "editor-redo-shift-z"
+                );
+                void this._redo();
+                return true;
+            }
 
             // ── Delete ──
             if (key === "Delete" || key === "Backspace") {
-                consume(); // Always consume Delete/Backspace to prevent ComfyUI node deletion
+                // Defer to gallery if it owns the current selection focus.
+                if (this._assetGallery?.hasSelectionOwnership?.()) return false;
                 if (this.selectedItems.length > 0) {
                     // Filter out locked-lane items before delete
                     this.selectedItems = this.selectedItems.filter(s => {
-                        if (s.type === "clip") return !this._isLaneLocked(TRACK_TYPE.VIDEO, s.data.track_index || 0);
+                        if (s.type === "clip") return !this._isLaneLocked(this._clipTrackType(s.data), s.data.track_index || 0);
                         if (s.type === "audio") return !this._isLaneLocked(TRACK_TYPE.AUDIO, s.data.lane_index || 0);
                         return true;
                     });
                     if (this.selectedItems.length > 0) this._deleteSelectedItems();
                 }
-                return;
+                return true; // consume even when nothing was deletable, so ComfyUI does not delete the node
             }
 
             // ── Space = play/pause ──
             if (key === " ") {
-                consume();
                 if (this.isFullscreen) this._togglePlayback();
-                return;
+                return true;
             }
 
             // ── Arrow keys: frame navigation ──
             if (key === "ArrowLeft") {
-                consume();
                 const step = shift ? 10 : 1;
                 this.playhead = Math.max(0, this.playhead - step);
                 this._onPlayheadChange();
-                return;
+                return true;
             }
             if (key === "ArrowRight") {
-                consume();
                 const step = shift ? 10 : 1;
                 this.playhead = Math.min(this.totalFrames, this.playhead + step);
                 this._onPlayheadChange();
-                return;
+                return true;
             }
 
             // ── Home / End ──
             if (key === "Home") {
-                consume();
                 this.playhead = 0;
                 this._onPlayheadChange();
-                return;
+                return true;
             }
             if (key === "End") {
-                consume();
                 this.playhead = this.totalFrames;
                 this._onPlayheadChange();
-                return;
+                return true;
             }
 
             // ── I / O = set in/out points (selection) ──
             if (key === "i" || key === "I") {
-                consume();
                 this.selectionStart = this.playhead;
                 if (this.selectionEnd < this.selectionStart) this.selectionEnd = this.selectionStart;
                 this._setWidgetValue("selection_start", this.selectionStart);
                 this._renderTimeline();
                 this._updateToolbar();
                 this._updateToolbar();
-                return;
+                return true;
             }
             if (key === "o" || key === "O") {
-                consume();
                 this.selectionEnd = this.playhead;
                 if (this.selectionStart > this.selectionEnd) this.selectionStart = this.selectionEnd;
                 this._setWidgetValue("selection_end", this.selectionEnd);
                 this._renderTimeline();
                 this._updateToolbar();
                 this._updateToolbar();
-                return;
+                return true;
             }
 
             // ── X = clear selection (in/out points) ──
             if (key === "x" || key === "X") {
-                consume();
                 this.selectionStart = 0;
                 this.selectionEnd = 0;
                 this._setWidgetValue("selection_start", 0);
@@ -6465,31 +6951,28 @@ export class EditorWidget {
                 this._renderTimeline();
                 this._updateToolbar();
                 this._updateToolbar();
-                return;
+                return true;
             }
 
             // ── C = toggle razor mode ──
             if (key === "c" || key === "C") {
-                consume();
                 this._razorMode = !this._razorMode;
                 this._updateToolbar();
-                return;
+                return true;
             }
 
             // ── S = toggle snapping ──
             if (key === "s" || key === "S") {
-                consume();
                 this._setSnappingEnabled(!this.snappingEnabled);
-                return;
+                return true;
             }
 
             // ── T = toggle timecode ──
-            if (key === "t" || key === "T") { consume(); this._toggleTimecodeMode(); this._updateToolbar(); return; }
-            if (key === "a" || key === "A") { consume(); this._toggleAnimatic(); return; }
+            if (key === "t" || key === "T") { this._toggleTimecodeMode(); this._updateToolbar(); return true; }
+            if (key === "a" || key === "A") { this._toggleAnimatic(); return true; }
 
             // ── F = fit to view, Shift+F = zoom to selection ──
             if (key === "f" || key === "F") {
-                consume();
                 if (e.shiftKey && this.selectionStart < this.selectionEnd) {
                     const canvas = this.timelineCanvas;
                     const rect = canvas.parentElement?.getBoundingClientRect();
@@ -6505,18 +6988,23 @@ export class EditorWidget {
                 } else {
                     this._fitToView();
                 }
-                return;
+                return true;
             }
 
             // ── ? = shortcut overlay ──
-            if (key === "?") { consume(); this._showShortcutOverlay(); return; }
+            if (key === "?") { this._showShortcutOverlay(); return true; }
 
             // ── Zoom: +/- ──
-            if (key === "=" || key === "+") { consume(); this._zoom(1); return; }
-            if (key === "-" || key === "_") { consume(); this._zoom(-1); return; }
+            if (key === "=" || key === "+") { this._zoom(1); return true; }
+            if (key === "-" || key === "_") { this._zoom(-1); return true; }
+
+            return false;
         };
-        // Use capture phase to intercept BEFORE ComfyUI's handlers
-        document.addEventListener("keydown", this._keyHandler, true);
+        this._editorKeyOff = registerKeyboardConsumer({
+            id: this._keyboardConsumerId("editor"),
+            priority: KEY_PRIORITY.EDITOR,
+            keydown: this._editorKeyConsumer,
+        });
 
         // Track editor focus: set when clicking inside editor, clear when clicking outside
         this._focusHandler = (e) => {
@@ -6529,6 +7017,48 @@ export class EditorWidget {
             }
         };
         document.addEventListener("mousedown", this._focusHandler, true);
+    }
+
+    _keyboardConsumerId(suffix) {
+        const nodeId = this.node?.id ?? "anon";
+        return `sonder-editor-${nodeId}:${suffix}`;
+    }
+
+    _keyboardDebugSnapshot(event, extra = {}) {
+        return {
+            key: event?.key ?? "",
+            normalizedKey: String(event?.key || "").toLowerCase(),
+            ctrl: !!(event?.ctrlKey || event?.metaKey),
+            shift: !!event?.shiftKey,
+            alt: !!event?.altKey,
+            isFullscreen: !!this.isFullscreen,
+            editorFocused: !!this._editorFocused,
+            activeElement: describeKeyboardDebugElement(document.activeElement),
+            consumers: debugKeyboardConsumers(),
+            ...extra,
+        };
+    }
+
+    _keyboardDebug(message, details) {
+        if (!isKeyboardDebugEnabled()) return;
+        if (details === undefined) {
+            console.debug(`[Sonder][EditorKeyboard][${this._keyboardConsumerId("editor")}] ${message}`);
+            return;
+        }
+        console.debug(`[Sonder][EditorKeyboard][${this._keyboardConsumerId("editor")}] ${message}`, details);
+    }
+
+    _activateGraphUndoSuppression(reason) {
+        const suppress = typeof window !== "undefined"
+            ? window.__SONDER_SUPPRESS_COMFY_GRAPH_UNDO__
+            : null;
+        if (typeof suppress !== "function") return;
+        const nodeId = this.node?.id;
+        suppress(reason, nodeId == null ? [] : [nodeId]);
+        this._keyboardDebug("requested graph undo suppression", {
+            reason,
+            nodeId: nodeId ?? null,
+        });
     }
 
     /** Called whenever the playhead changes position (arrow keys, etc.). */
@@ -7305,6 +7835,7 @@ export class EditorWidget {
         if (!this._queueContainer) return;
         this._queueContainer.innerHTML = "";
         this._updateQueueHeaderLabel();
+        this._updateQueueChromeStatus();
 
         const queue = this._renderQueue || [];
         if (queue.length === 0) {
@@ -7319,88 +7850,6 @@ export class EditorWidget {
                 continue;
             }
             this._queueContainer.appendChild(this._renderQueueBatchGroup(entry));
-        }
-    }
-
-    // ── Settings Panel ────────────────────────────────────────────────
-    _showLegacySettingsPanelUnused() {
-        if (this._settingsPanelEl) return;
-        const backdrop = document.createElement("div");
-        backdrop.style.cssText = `position:fixed;inset:0;z-index:10001;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;`;
-        const panel = document.createElement("div");
-        panel.style.cssText = `background:#1e1e1e;border:1px solid #555;border-radius:8px;padding:20px 28px;max-width:400px;width:90%;color:#ddd;font-family:sans-serif;font-size:12px;`;
-
-        panel.innerHTML = `<h3 style="margin:0 0 16px;color:#fff;font-size:14px;">Editor Settings</h3>
-            <div style="color:#aaa;font-size:11px;margin-bottom:8px;text-transform:uppercase;">UI Scale</div>`;
-
-        this._settingsLabels = {};
-        const sections = [
-            { key: "Toolbar", label: "Toolbar & Bars", desc: "Scene bar and toolbar controls" },
-            { key: "TrackHeaders", label: "Track Headers", desc: "Icons, labels, header width" },
-            { key: "Timeline", label: "Timeline", desc: "Track heights, clip text, ruler" },
-            { key: "Gallery", label: "Asset Gallery", desc: "Thumbnails, tabs, item text" },
-        ];
-
-        for (const { key, label, desc } of sections) {
-            const row = document.createElement("div");
-            row.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #333;";
-
-            const labelDiv = document.createElement("div");
-            labelDiv.innerHTML = `<div style="color:#ccc;font-size:12px;">${label}</div><div style="color:#666;font-size:9px;">${desc}</div>`;
-
-            const controls = document.createElement("div");
-            controls.style.cssText = "display:flex;align-items:center;gap:6px;";
-
-            const btnDn = document.createElement("button");
-            btnDn.textContent = "−";
-            btnDn.style.cssText = "background:#333;border:1px solid #555;color:#aaa;cursor:pointer;padding:2px 8px;border-radius:4px;font-size:14px;line-height:1;";
-            btnDn.addEventListener("click", () => this._setScale(key, this[`_scale${key}`] - 0.1));
-
-            const pctLabel = document.createElement("span");
-            pctLabel.style.cssText = "font-size:11px;color:#aaa;min-width:36px;text-align:center;";
-            pctLabel.textContent = `${Math.round(this[`_scale${key}`] * 100)}%`;
-            this._settingsLabels[key] = pctLabel;
-
-            const btnUp = document.createElement("button");
-            btnUp.textContent = "+";
-            btnUp.style.cssText = "background:#333;border:1px solid #555;color:#aaa;cursor:pointer;padding:2px 8px;border-radius:4px;font-size:14px;line-height:1;";
-            btnUp.addEventListener("click", () => this._setScale(key, this[`_scale${key}`] + 0.1));
-
-            controls.append(btnDn, pctLabel, btnUp);
-            row.append(labelDiv, controls);
-            panel.appendChild(row);
-        }
-
-        // Reset layout button
-        const resetRow = document.createElement("div");
-        resetRow.style.cssText = "margin-top:14px;text-align:center;";
-        const resetBtn = document.createElement("button");
-        resetBtn.textContent = "Reset Editor Layout";
-        resetBtn.style.cssText = "background:#333;border:1px solid #555;color:#aaa;cursor:pointer;padding:4px 16px;border-radius:4px;font-size:11px;";
-        resetBtn.addEventListener("click", () => {
-            this._resetEditorLayout();
-        });
-        resetRow.appendChild(resetBtn);
-        panel.appendChild(resetRow);
-
-        backdrop.appendChild(panel);
-        document.body.appendChild(backdrop);
-        this._settingsPanelEl = backdrop;
-
-        backdrop.addEventListener("click", (e) => { if (e.target === backdrop) this._hideSettingsPanel(); });
-        this._settingsPanelEscHandler = (e) => { if (e.key === "Escape") { e.stopImmediatePropagation(); this._hideSettingsPanel(); } };
-        document.addEventListener("keydown", this._settingsPanelEscHandler, true);
-    }
-
-    _hideLegacySettingsPanelUnused() {
-        if (this._settingsPanelEl) {
-            this._settingsPanelEl.remove();
-            this._settingsPanelEl = null;
-            this._settingsLabels = null;
-        }
-        if (this._settingsPanelEscHandler) {
-            document.removeEventListener("keydown", this._settingsPanelEscHandler, true);
-            this._settingsPanelEscHandler = null;
         }
     }
 
@@ -7478,8 +7927,24 @@ export class EditorWidget {
     }
 
     async _undo() {
-        if (this._undoStack.length === 0) return;
+        if (this._undoStack.length === 0) {
+            this._keyboardDebug("undo skipped: empty stack", {
+                activeSceneId: this.activeSceneId || "",
+                undoDepth: this._undoStack.length,
+                redoDepth: this._redoStack.length,
+            });
+            return;
+        }
         const entry = this._undoStack.pop();
+        this._keyboardDebug("undo start", {
+            entrySceneId: entry.sceneId,
+            label: entry.label,
+            activeSceneId: this.activeSceneId || "",
+            undoDepthAfterPop: this._undoStack.length,
+            redoDepthBeforePush: this._redoStack.length,
+            editorFocused: !!this._editorFocused,
+            activeElement: describeKeyboardDebugElement(document.activeElement),
+        });
 
         // Save current state to redo stack before restoring
         if (this.activeScene && this.activeSceneId === entry.sceneId) {
@@ -7491,11 +7956,34 @@ export class EditorWidget {
         }
 
         await this._restoreScene(entry.sceneId, entry.snapshot);
+        this._keyboardDebug("undo complete", {
+            activeSceneId: this.activeSceneId || "",
+            undoDepth: this._undoStack.length,
+            redoDepth: this._redoStack.length,
+            editorFocused: !!this._editorFocused,
+            activeElement: describeKeyboardDebugElement(document.activeElement),
+        });
     }
 
     async _redo() {
-        if (this._redoStack.length === 0) return;
+        if (this._redoStack.length === 0) {
+            this._keyboardDebug("redo skipped: empty stack", {
+                activeSceneId: this.activeSceneId || "",
+                undoDepth: this._undoStack.length,
+                redoDepth: this._redoStack.length,
+            });
+            return;
+        }
         const entry = this._redoStack.pop();
+        this._keyboardDebug("redo start", {
+            entrySceneId: entry.sceneId,
+            label: entry.label,
+            activeSceneId: this.activeSceneId || "",
+            undoDepthBeforePush: this._undoStack.length,
+            redoDepthAfterPop: this._redoStack.length,
+            editorFocused: !!this._editorFocused,
+            activeElement: describeKeyboardDebugElement(document.activeElement),
+        });
 
         // Save current state to undo stack before restoring
         if (this.activeScene && this.activeSceneId === entry.sceneId) {
@@ -7507,11 +7995,24 @@ export class EditorWidget {
         }
 
         await this._restoreScene(entry.sceneId, entry.snapshot);
+        this._keyboardDebug("redo complete", {
+            activeSceneId: this.activeSceneId || "",
+            undoDepth: this._undoStack.length,
+            redoDepth: this._redoStack.length,
+            editorFocused: !!this._editorFocused,
+            activeElement: describeKeyboardDebugElement(document.activeElement),
+        });
     }
 
     async _restoreScene(sceneId, snapshot) {
         if (!this.projectDir) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        this._keyboardDebug("restore start", {
+            sceneId,
+            activeSceneId: this.activeSceneId || "",
+            projectDir: dirName || "",
+            snapshotKeys: snapshot ? Object.keys(snapshot) : [],
+        });
 
         try {
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/restore`), {
@@ -7519,16 +8020,37 @@ export class EditorWidget {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(snapshot),
             });
+            this._keyboardDebug("restore response", {
+                sceneId,
+                status: resp.status,
+                ok: resp.ok,
+            });
             if (resp.ok) {
                 // If we're restoring a different scene, switch to it
                 if (this.activeSceneId !== sceneId) {
                     this.activeSceneId = sceneId;
                 }
                 await this._fetchScenes();
+                this._keyboardDebug("restore fetched scenes", {
+                    sceneId,
+                    activeSceneId: this.activeSceneId || "",
+                    sceneCount: this.scenes.length,
+                    activeElement: describeKeyboardDebugElement(document.activeElement),
+                });
                 this._renderTimeline();
                 this._renderViewportFrame();
+                this._keyboardDebug("restore render complete", {
+                    sceneId,
+                    activeSceneId: this.activeSceneId || "",
+                    editorFocused: !!this._editorFocused,
+                    activeElement: describeKeyboardDebugElement(document.activeElement),
+                });
             }
         } catch (e) {
+            this._keyboardDebug("restore failed", {
+                sceneId,
+                error: e?.message || String(e),
+            });
             console.warn("[Sonder] Undo/redo restore failed:", e);
         }
     }
@@ -7656,7 +8178,9 @@ export class EditorWidget {
             },
             getAssetForSourcePath: (sourcePath) => this._getAssetForSourcePath(sourcePath),
             getGuideAsset: (guide) => this._getGuideAsset(guide),
+            includeMotionDrivers: () => !!this._animaticMode,
             isVideoLaneHidden: (trackIndex) => this._isLaneHidden(TRACK_TYPE.VIDEO, trackIndex || 0),
+            isMotionDriverLaneHidden: (trackIndex) => this._isLaneHidden(TRACK_TYPE.MOTION_DRIVER, trackIndex || 0),
             isAudioLaneHidden: (laneIndex) => this._isLaneHidden(TRACK_TYPE.AUDIO, laneIndex || 0),
             buildViewUrl: (sourcePath) => this._buildViewURL(sourcePath),
             buildThumbnailUrl: (assetId) => this.projectDir
@@ -7733,8 +8257,24 @@ export class EditorWidget {
         if (!this.activeScene?.clips) return null;
         let best = null;
         for (const clip of this.activeScene.clips) {
+            if (!this._isRenderClip(clip)) continue;
             if (frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame) {
                 if (this._isLaneHidden(TRACK_TYPE.VIDEO, clip.track_index || 0)) continue;
+                if (!best || (clip.track_index || 0) > (best.track_index || 0)) {
+                    best = clip;
+                }
+            }
+        }
+        return best;
+    }
+
+    _getMotionDriverClipAtFrame(frame) {
+        if (!this.activeScene?.clips) return null;
+        let best = null;
+        for (const clip of this.activeScene.clips) {
+            if (!this._isMotionDriverClip(clip)) continue;
+            if (frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame) {
+                if (this._isLaneHidden(TRACK_TYPE.MOTION_DRIVER, clip.track_index || 0)) continue;
                 if (!best || (clip.track_index || 0) > (best.track_index || 0)) {
                     best = clip;
                 }
@@ -7748,12 +8288,22 @@ export class EditorWidget {
         if (!this.activeScene?.clips) return [];
         return this.activeScene.clips
             .filter(clip => frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame)
-            .filter(clip => !this._isLaneHidden(TRACK_TYPE.VIDEO, clip.track_index || 0))
+            .filter(clip => this._isRenderClip(clip) || (this._animaticMode && this._isMotionDriverClip(clip)))
+            .filter(clip => !this._isLaneHidden(this._clipTrackType(clip), clip.track_index || 0))
             .sort((a, b) => (a.track_index || 0) - (b.track_index || 0));
     }
 
     _getAssetForSourcePath(sourcePath) {
         return sourcePath ? (this._pathToAsset[sourcePath] || null) : null;
+    }
+
+    _findAssetById(assetId) {
+        if (!assetId) return null;
+        for (const type of ["video", "image", "audio", "artifact"]) {
+            const found = (this.assets?.[type] || []).find(asset => asset.asset_id === assetId);
+            if (found) return found;
+        }
+        return null;
     }
 
     _isMissingSourcePath(sourcePath) {
@@ -7763,6 +8313,16 @@ export class EditorWidget {
 
     _getGuideAsset(guide) {
         return guide ? (this.assets.image?.find((asset) => asset.asset_id === guide.asset_id) || null) : null;
+    }
+
+    _inspectAssetInGallery(asset) {
+        const assetId = typeof asset === "string" ? asset : asset?.asset_id;
+        if (!assetId) return;
+        this._assetGallery?.revealAsset?.(assetId, {
+            focusList: true,
+            scrollIntoView: true,
+            openInspector: true,
+        });
     }
 
     _getAudioAtFrame(frame) {
@@ -9238,6 +9798,32 @@ export class EditorWidget {
                 onChange: (value) => updateCategory("projectDefaults", "newSceneDuration", Math.round(value)),
             }
         );
+        createNumberInput(
+            projectDefaultsSection,
+            "defaultGuideStrength",
+            "Default Guide Strength",
+            "Applied to new guide frames created from image drops.",
+            {
+                min: 0,
+                max: 1,
+                step: 0.05,
+                getter: () => this._settings.projectDefaults.defaultGuideStrength,
+                onChange: (value) => updateCategory("projectDefaults", "defaultGuideStrength", value),
+            }
+        );
+        createNumberInput(
+            projectDefaultsSection,
+            "defaultMotionDriverStrength",
+            "Default Motion-Driver Strength",
+            "Applied when creating motion-driver clips.",
+            {
+                min: 0,
+                max: 1,
+                step: 0.05,
+                getter: () => this._settings.projectDefaults.defaultMotionDriverStrength,
+                onChange: (value) => updateCategory("projectDefaults", "defaultMotionDriverStrength", value),
+            }
+        );
         createSelect(
             projectDefaultsSection,
             "defaultTemplateId",
@@ -9297,13 +9883,14 @@ export class EditorWidget {
         backdrop.addEventListener("click", (e) => {
             if (e.target === backdrop) this._hideSettingsPanel();
         });
-        this._settingsPanelEscHandler = (e) => {
-            if (e.key === "Escape") {
-                e.stopImmediatePropagation();
-                this._hideSettingsPanel();
-            }
-        };
-        document.addEventListener("keydown", this._settingsPanelEscHandler, true);
+        this._settingsPanelKeyOff = registerKeyboardConsumer({
+            id: this._keyboardConsumerId("settings"),
+            priority: KEY_PRIORITY.OVERLAY,
+            keydown: (e) => {
+                if (e.key === "Escape") { this._hideSettingsPanel(); return true; }
+                return false;
+            },
+        });
     }
 
     _hideSettingsPanel() {
@@ -9313,9 +9900,9 @@ export class EditorWidget {
             this._settingsPanelControls = null;
             this._renderModelTemplateSettings = null;
         }
-        if (this._settingsPanelEscHandler) {
-            document.removeEventListener("keydown", this._settingsPanelEscHandler, true);
-            this._settingsPanelEscHandler = null;
+        if (this._settingsPanelKeyOff) {
+            this._settingsPanelKeyOff();
+            this._settingsPanelKeyOff = null;
         }
     }
 
@@ -9341,10 +9928,14 @@ export class EditorWidget {
             window.removeEventListener("resize", this._windowResizeHandler);
             this._windowResizeHandler = null;
         }
-        if (this._keyHandler) {
-            document.removeEventListener("keydown", this._keyHandler, true);
-            this._keyHandler = null;
-        }
+        // Unregister keyboard consumers BEFORE the rest of teardown so the
+        // KeyboardOwnership refcount can detach its window listeners cleanly.
+        if (this._editorKeyOff) { this._editorKeyOff(); this._editorKeyOff = null; }
+        this._editorKeyConsumer = null;
+        if (this._shortcutOverlayKeyOff) { this._shortcutOverlayKeyOff(); this._shortcutOverlayKeyOff = null; }
+        if (this._settingsPanelKeyOff) { this._settingsPanelKeyOff(); this._settingsPanelKeyOff = null; }
+        if (this._contextMenuKeyOff) { this._contextMenuKeyOff(); this._contextMenuKeyOff = null; }
+        if (this._contextMenuMouseOff) { this._contextMenuMouseOff(); this._contextMenuMouseOff = null; }
         if (this._focusHandler) {
             document.removeEventListener("mousedown", this._focusHandler, true);
             this._focusHandler = null;
@@ -9352,14 +9943,6 @@ export class EditorWidget {
         if (this._settingsUnsubscribe) {
             this._settingsUnsubscribe();
             this._settingsUnsubscribe = null;
-        }
-        if (this._shortcutOverlayEscHandler) {
-            document.removeEventListener("keydown", this._shortcutOverlayEscHandler, true);
-            this._shortcutOverlayEscHandler = null;
-        }
-        if (this._settingsPanelEscHandler) {
-            document.removeEventListener("keydown", this._settingsPanelEscHandler, true);
-            this._settingsPanelEscHandler = null;
         }
 
         if (this._previewEl) {

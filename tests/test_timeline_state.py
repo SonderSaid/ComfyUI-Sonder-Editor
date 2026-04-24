@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server.timeline_state import (
     Asset, GuideFrame, BatchConfig, Scene, PromptSection,
-    ClipReference, AudioTrack, GenerationJob, TimelineProject,
+    ClipReference, AudioTrack, GenerationJob, TimelineProject, LaneConfig,
 )
 
 
@@ -252,7 +252,48 @@ def test_scene_bridge():
     assert restored.is_bridge is True
 
 
-# --- ClipReference (unchanged) ---
+def test_scene_motion_driver_lane_config_roundtrip_and_autopad():
+    scene = Scene(
+        name="Motion",
+        motion_driver_lane_count=2,
+        motion_driver_lane_configs=[LaneConfig(name="Driver", color="#2a9b9e", locked=True, hidden=True)],
+    )
+
+    data = scene.to_dict()
+    restored = Scene.from_dict(data)
+
+    assert restored.motion_driver_lane_count == 2
+    assert len(restored.motion_driver_lane_configs) == 2
+    assert restored.motion_driver_lane_configs[0].name == "Driver"
+    assert restored.motion_driver_lane_configs[0].color == "#2a9b9e"
+    assert restored.motion_driver_lane_configs[0].locked is True
+    assert restored.motion_driver_lane_configs[0].hidden is True
+    assert isinstance(restored.motion_driver_lane_configs[1], LaneConfig)
+
+
+def test_scene_content_hash_changes_with_clip_role_and_strength():
+    base_clip = ClipReference(
+        source_path="media/clip.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        source_in_frame=0,
+        opacity=1.0,
+        track_index=0,
+    )
+    render_scene = Scene(name="Render")
+    render_scene.clips = [base_clip]
+
+    driver_scene = Scene(name="Render")
+    driver_scene.clips = [ClipReference.from_dict({**base_clip.to_dict(), "role": "motion_driver"})]
+
+    strength_scene = Scene(name="Render")
+    strength_scene.clips = [ClipReference.from_dict({**base_clip.to_dict(), "strength": 0.42})]
+
+    assert render_scene.content_hash() != driver_scene.content_hash()
+    assert render_scene.content_hash() != strength_scene.content_hash()
+
+
+# --- ClipReference ---
 
 def test_clip_reference_roundtrip():
     clip = ClipReference(
@@ -263,6 +304,8 @@ def test_clip_reference_roundtrip():
         source_in_frame=10,
         source_out_frame=130,
         track_index=0,
+        role="motion_driver",
+        strength=0.42,
         prompt="a cat walking",
         is_generated=True,
         generation_params={"seed": 42, "cfg": 7.5},
@@ -279,6 +322,8 @@ def test_clip_reference_roundtrip():
     assert restored.timeline_end_frame == clip.timeline_end_frame
     assert restored.source_in_frame == clip.source_in_frame
     assert restored.source_out_frame == clip.source_out_frame
+    assert restored.role == "motion_driver"
+    assert restored.strength == 0.42
     assert restored.prompt == clip.prompt
     assert restored.is_generated == clip.is_generated
     assert restored.generation_params == clip.generation_params
@@ -289,6 +334,17 @@ def test_clip_reference_roundtrip():
 def test_clip_reference_duration():
     clip = ClipReference(timeline_start_frame=10, timeline_end_frame=50)
     assert clip.duration_frames == 40
+
+
+def test_clip_reference_role_defaults_and_unknown_clamps(caplog):
+    legacy = ClipReference.from_dict({"clip_id": "legacy"})
+    assert legacy.role == "render"
+    assert legacy.strength == 1.0
+
+    unknown = ClipReference.from_dict({"clip_id": "bad", "role": "mystery", "strength": 0.7})
+    assert unknown.role == "render"
+    assert unknown.strength == 0.7
+    assert "Unknown clip role" in caplog.text
 
 
 # --- AudioTrack (unchanged) ---

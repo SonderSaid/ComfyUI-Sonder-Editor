@@ -77,6 +77,43 @@ def test_asset_payload_marks_missing_from_disk(tmp_path):
     assert routes._asset_payload(project, missing)["missing"] is True
 
 
+def test_video_has_audio_uses_extraction_fallback(tmp_path, monkeypatch):
+    video_path = tmp_path / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    class FailedProbe:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: FailedProbe())
+    monkeypatch.setitem(sys.modules, "mutagen", SimpleNamespace(File=lambda filepath: None))
+    monkeypatch.setitem(sys.modules, "torchaudio", SimpleNamespace(info=lambda filepath: (_ for _ in ()).throw(RuntimeError("probe failed"))))
+
+    def fake_extract(video_path_arg, output_path):
+        with open(output_path, "wb") as handle:
+            handle.write(b"wav")
+        return True
+
+    monkeypatch.setattr(routes, "_extract_audio_from_video", fake_extract)
+
+    assert routes._video_has_audio(str(video_path)) is True
+
+
+def test_sync_media_folder_repairs_false_video_has_audio_flags(tmp_path, monkeypatch):
+    project = _make_project(tmp_path)
+    _write_project_file(project, "media/clip.mp4", b"video")
+    project.assets = [
+        Asset(asset_id="vid-1", asset_type="video", path="media/clip.mp4", has_audio=False),
+    ]
+
+    monkeypatch.setattr(routes, "_video_has_audio", lambda filepath: True)
+
+    assert routes._sync_media_folder(project) is True
+    assert project.assets[0].has_audio is True
+
+
 def test_find_asset_usages_returns_unified_usage_list(tmp_path):
     project = _make_project(tmp_path)
     asset = Asset(asset_id="asset-1", asset_type="video", path="media/clip.mp4", name="Clip")

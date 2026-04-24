@@ -67,13 +67,12 @@ class SonderEditor:
     """
 
     CATEGORY = "Sonder"
-    RETURN_TYPES = ("SONDER_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO",
-                     "INT", "INT", "INT", "INT", "FLOAT", "FLOAT")
+    RETURN_TYPES = ("SONDER_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "IMAGE", "INT", "FLOAT",
+                    "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO", "FLOAT", "FLOAT")
     RETURN_NAMES = (
-        "project", "rendered_frames", "guide_images", "guide_indices", "prompt",
-        "frame_count", "fps", "width", "height", "audio",
-        "context_start_frame", "context_end_frame",
-        "generation_start_frame", "generation_end_frame",
+        "project", "rendered_frames", "guide_images", "guide_indices", "guide_strengths",
+        "motion_driver_images", "motion_driver_frame_index", "motion_driver_strength",
+        "prompt", "frame_count", "fps", "width", "height", "audio",
         "mask_start_time", "mask_end_time",
     )
     OUTPUT_TOOLTIPS = (
@@ -81,16 +80,16 @@ class SonderEditor:
         "Composited video frames from the timeline (all visible clips layered with opacity).",
         "Guide frame images as an IMAGE batch tensor. Connect to LTX guiders.",
         "Comma-separated frame indices for each guide image (e.g., '0,96').",
+        "Comma-separated guide strengths aligned with guide_indices.",
+        "Motion-driver video frames as an IMAGE batch tensor.",
+        "Local output frame where the motion driver begins.",
+        "Motion-driver conditioning strength.",
         "The prompt text for the selected timeline section.",
         "Number of frames in the selected section.",
         "Project FPS.",
         "Project width in pixels.",
         "Project height in pixels.",
         "Audio for the selected section (if any).",
-        "Absolute frame where context begins (includes context padding).",
-        "Absolute frame where context ends (includes context padding).",
-        "Absolute frame where new generation starts (original selection start).",
-        "Absolute frame where new generation ends (original selection end).",
         "Seconds offset within output where generation starts. Wire to temporal mask start_time.",
         "Seconds offset within output where generation ends. Wire to temporal mask end_time.",
     )
@@ -166,17 +165,17 @@ class SonderEditor:
             proj,
             empty_image,
             empty_image,
-            "0",
+            "",
+            "",
+            empty_image,
+            0,
+            1.0,
             "",
             0,
             proj_fps,
             proj_w,
             proj_h,
             silent_audio,
-            0,
-            0,
-            0,
-            0,
             0.0,
             0.0,
         )
@@ -448,9 +447,14 @@ class SonderEditor:
                 time.perf_counter() - render_started_at,
             )
 
+            motion_driver_images, motion_driver_frame_index, motion_driver_strength = self._gather_motion_driver_outputs(
+                proj, scene, render_start, render_end, proj_w, proj_h
+            )
+
             # --- Gather guide frames within render range ---
             guide_images = []
             guide_indices = []
+            guide_strengths = []
             guide_frames = scene.guide_frames
             if queue_job and snapshot_version > 0:
                 guide_frames = [
@@ -476,14 +480,16 @@ class SonderEditor:
                                 guide_images.append(img)
                                 local_idx = idx - render_start
                                 guide_indices.append(str(local_idx))
+                                guide_strengths.append(f"{getattr(guide, 'strength', 1.0):.4f}")
 
             if guide_images:
                 guide_tensor = torch.stack(guide_images, dim=0)
+                indices_str = ",".join(guide_indices)
+                strengths_str = ",".join(guide_strengths)
             else:
                 guide_tensor = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
-                guide_indices = ["0"]
-
-            indices_str = ",".join(guide_indices)
+                indices_str = ""
+                strengths_str = ""
 
             # --- Get prompt for render range ---
             if queue_job:
@@ -521,16 +527,16 @@ class SonderEditor:
                 rendered_frames,
                 guide_tensor,
                 indices_str,
+                strengths_str,
+                motion_driver_images,
+                motion_driver_frame_index,
+                motion_driver_strength,
                 prompt_text,
                 frame_count,
                 proj_fps,
                 proj_w,
                 proj_h,
                 audio,
-                context_start,
-                context_end,
-                generation_start,
-                generation_end,
                 mask_start_time,
                 mask_end_time,
             )
@@ -544,6 +550,100 @@ class SonderEditor:
             if proj is not None and queue_job is not None:
                 self._mark_queue_job_failed(proj, queue_job, str(e))
             raise
+
+    @staticmethod
+    def _empty_motion_driver_outputs(proj_w: int, proj_h: int):
+        return (
+            torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32),
+            0,
+            1.0,
+        )
+
+    def _gather_motion_driver_outputs(
+        self,
+        proj: TimelineProject,
+        scene: Scene,
+        render_start: int,
+        render_end: int,
+        proj_w: int,
+        proj_h: int,
+    ):
+        hidden_driver_lanes = {
+            i for i, cfg in enumerate(getattr(scene, "motion_driver_lane_configs", []))
+            if getattr(cfg, "hidden", False)
+        }
+        driver_clips = [
+            c for c in getattr(scene, "clips", [])
+            if getattr(c, "role", "render") == "motion_driver"
+            and getattr(c, "track_index", 0) not in hidden_driver_lanes
+            and c.timeline_start_frame < render_end
+            and c.timeline_end_frame > render_start
+        ]
+        if not driver_clips:
+            return self._empty_motion_driver_outputs(proj_w, proj_h)
+
+        driver_clips.sort(key=lambda c: (getattr(c, "track_index", 0), c.timeline_start_frame))
+        clip = driver_clips[0]
+        if len(driver_clips) > 1:
+            ignored = [
+                getattr(c, "clip_id", "") or f"{c.source_path}:{c.timeline_start_frame}"
+                for c in driver_clips[1:]
+            ]
+            logger.warning(
+                "Multiple motion-driver clips overlap %d-%d; using %s and ignoring %s",
+                render_start,
+                render_end,
+                getattr(clip, "clip_id", "") or clip.source_path,
+                ", ".join(ignored),
+            )
+
+        overlap_start = max(clip.timeline_start_frame, render_start)
+        overlap_end = min(clip.timeline_end_frame, render_end)
+        overlap_len = max(0, overlap_end - overlap_start)
+        if overlap_len <= 0:
+            return self._empty_motion_driver_outputs(proj_w, proj_h)
+
+        source_start = (getattr(clip, "source_in_frame", 0) or 0) + (overlap_start - clip.timeline_start_frame)
+        source_path = clip.source_path
+        abs_path = source_path
+        if not os.path.isfile(abs_path):
+            abs_path = os.path.join(proj.project_dir, source_path)
+
+        cap = cv2.VideoCapture(abs_path)
+        try:
+            if not cap.isOpened():
+                logger.warning("Cannot open motion-driver video: %s", abs_path)
+                return self._empty_motion_driver_outputs(proj_w, proj_h)
+
+            frames = []
+            warned_read_failure = False
+            black_rgb = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
+            for offset in range(overlap_len):
+                source_frame = source_start + offset
+                cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    if not warned_read_failure:
+                        logger.warning(
+                            "Failed to read motion-driver frames from %s; padding unreadable frames with black",
+                            abs_path,
+                        )
+                        warned_read_failure = True
+                    frames.append(black_rgb.copy())
+                    continue
+
+                placed, _bounds = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
+                frames.append(cv2.cvtColor(placed, cv2.COLOR_BGR2RGB))
+
+            tensor = torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
+        finally:
+            cap.release()
+
+        try:
+            strength = float(getattr(clip, "strength", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        return tensor, max(0, clip.timeline_start_frame - render_start), strength
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
                               render_start: int, render_end: int) -> torch.Tensor:
@@ -587,7 +687,11 @@ class SonderEditor:
             if cfg.hidden:
                 hidden_lanes.add(i)
 
-        visible_clips = [c for c in scene.clips if c.track_index not in hidden_lanes]
+        visible_clips = [
+            c for c in scene.clips
+            if c.track_index not in hidden_lanes
+            and getattr(c, "role", "render") == "render"
+        ]
 
         if not visible_clips:
             return torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
@@ -696,19 +800,17 @@ class SonderEditor:
                 cap = cv2.VideoCapture(path)
                 if not cap.isOpened():
                     return None
-                ret, frame = cap.read()
+                ret, frame_bgr = cap.read()
                 if not ret:
                     return None
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             else:
                 # Load image
-                rgb = cv2.imread(path, cv2.IMREAD_COLOR)
-                if rgb is None:
+                frame_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+                if frame_bgr is None:
                     return None
-                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
-            # Resize to project resolution
-            rgb = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            placed_bgr, _bounds = self._fit_frame_to_canvas(frame_bgr, target_w, target_h)
+            rgb = cv2.cvtColor(placed_bgr, cv2.COLOR_BGR2RGB)
 
             # Convert to float32 tensor
             tensor = torch.from_numpy(rgb.astype(np.float32) / 255.0)

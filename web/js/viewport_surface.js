@@ -137,7 +137,9 @@ export function createViewportSurface(options = {}) {
     const onPlaybackStateChange = options.onPlaybackStateChange || noop;
     const getAssetForSourcePath = options.getAssetForSourcePath || (() => null);
     const getGuideAsset = options.getGuideAsset || (() => null);
+    const includeMotionDrivers = options.includeMotionDrivers || (() => false);
     const isVideoLaneHidden = options.isVideoLaneHidden || (() => false);
+    const isMotionDriverLaneHidden = options.isMotionDriverLaneHidden || (() => false);
     const isAudioLaneHidden = options.isAudioLaneHidden || (() => false);
     const buildViewUrl = options.buildViewUrl || (() => null);
     const buildThumbnailUrl = options.buildThumbnailUrl || (() => null);
@@ -202,7 +204,16 @@ export function createViewportSurface(options = {}) {
         if (!scene?.clips?.length) return [];
         return scene.clips
             .filter((clip) => frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame)
-            .filter((clip) => !isVideoLaneHidden(clip.track_index || 0))
+            .filter((clip) => {
+                if (!clip.role || clip.role === "render") return true;
+                return clip.role === "motion_driver" && includeMotionDrivers();
+            })
+            .filter((clip) => {
+                if (clip.role === "motion_driver") {
+                    return !isMotionDriverLaneHidden(clip.track_index || 0);
+                }
+                return !isVideoLaneHidden(clip.track_index || 0);
+            })
             .sort((a, b) => (a.track_index || 0) - (b.track_index || 0))
             .map((clip) => ({
                 clip,

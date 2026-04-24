@@ -124,11 +124,9 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         post_context_frames="4",
     )
 
-    assert result[5] == 14
-    assert result[10] == 2
-    assert result[11] == 16
-    assert result[12] == 5
-    assert result[13] == 12
+    assert result[6] == 0
+    assert result[7] == 1.0
+    assert result[9] == 14
     assert result[14] == pytest.approx(3 / 24.0)
     assert result[15] == pytest.approx(10 / 24.0)
     assert project._execution_context["pre_context_frames"] == 3
@@ -174,6 +172,369 @@ def test_execution_reaches_terminal_bridge_save(tmp_path, monkeypatch):
     node = editor_node.SonderEditor()
 
     assert node._execution_reaches_terminal_save(prompt, "1") is True
+
+
+def test_empty_execute_result_matches_output_contract(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+
+    expected_names = (
+        "project", "rendered_frames", "guide_images", "guide_indices", "guide_strengths",
+        "motion_driver_images", "motion_driver_frame_index", "motion_driver_strength",
+        "prompt", "frame_count", "fps", "width", "height", "audio",
+        "mask_start_time", "mask_end_time",
+    )
+    assert editor_node.SonderEditor.RETURN_NAMES == expected_names
+    assert len(editor_node.SonderEditor.RETURN_TYPES) == 16
+    assert len(editor_node.SonderEditor.OUTPUT_TOOLTIPS) == 16
+
+    project = timeline_state.TimelineProject(project_dir=str(tmp_path), resolution=(8, 6))
+    result = editor_node.SonderEditor._empty_execute_result(project, 24.0, 8, 6)
+
+    assert len(result) == 16
+    assert result[0] is project
+    assert tuple(result[1].shape) == (1, 6, 8, 3)
+    assert tuple(result[2].shape) == (1, 6, 8, 3)
+    assert result[3] == ""
+    assert result[4] == ""
+    assert tuple(result[5].shape) == (1, 6, 8, 3)
+    assert result[6] == 0
+    assert result[7] == 1.0
+    assert result[8] == ""
+    assert result[9] == 0
+    assert result[10] == 24.0
+    assert result[11] == 8
+    assert result[12] == 6
+    assert "waveform" in result[13]
+    assert result[14] == 0.0
+    assert result[15] == 0.0
+
+
+def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "guide.png").write_bytes(b"guide")
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene", duration_frames=12)
+    scene.guide_frames = [
+        timeline_state.GuideFrame(frame_index=1, asset_id="guide-a", strength=0.25),
+        timeline_state.GuideFrame(frame_index=4, asset_id="guide-b", strength=0.9),
+    ]
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Guides", scenes=[scene])
+    project.assets = [
+        timeline_state.Asset(asset_id="guide-a", asset_type="image", path=os.path.join("media", "guide.png")),
+        timeline_state.Asset(asset_id="guide-b", asset_type="image", path=os.path.join("media", "guide.png")),
+    ]
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_guide_image",
+        lambda self, path, asset_type, target_w, target_h: torch.ones(target_h, target_w, 3, dtype=torch.float32),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=8,
+    )
+
+    assert result[3] == "1,4"
+    assert result[4] == "0.2500,0.9000"
+    assert tuple(result[5].shape) == (1, 512, 768, 3)
+    assert result[6] == 0
+    assert result[7] == pytest.approx(1.0)
+
+    scene.guide_frames = []
+    empty_result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=8,
+    )
+
+    assert empty_result[3] == ""
+    assert empty_result[4] == ""
+    assert tuple(empty_result[5].shape) == (1, 512, 768, 3)
+    assert empty_result[6] == 0
+    assert empty_result[7] == pytest.approx(1.0)
+
+
+def test_guide_image_output_letterboxes_to_project_canvas(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    cv2 = importlib.import_module("cv2")
+    np = importlib.import_module("numpy")
+
+    image_path = tmp_path / "portrait.png"
+    portrait_bgr = np.full((4, 2, 3), 255, dtype=np.uint8)
+    assert cv2.imwrite(str(image_path), portrait_bgr)
+
+    tensor = editor_node.SonderEditor()._load_guide_image(
+        str(image_path),
+        "image",
+        4,
+        4,
+    )
+
+    assert tuple(tensor.shape) == (4, 4, 3)
+    np_tensor = tensor.numpy()
+    assert np.allclose(np_tensor[:, 0, :], 0.0)
+    assert np.allclose(np_tensor[:, 3, :], 0.0)
+    assert np.allclose(np_tensor[:, 1:3, :], 1.0)
+
+
+def test_motion_driver_outputs_and_hidden_lane_fallback(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    cv2 = importlib.import_module("cv2")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "driver.mp4").write_bytes(b"driver")
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Motion")
+    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=12)
+    scene.motion_driver_lane_configs = [timeline_state.LaneConfig()]
+    scene.clips = [
+        timeline_state.ClipReference(
+            clip_id="driver-1",
+            source_path=os.path.join("media", "driver.mp4"),
+            timeline_start_frame=3,
+            timeline_end_frame=8,
+            source_in_frame=10,
+            track_index=0,
+            role="motion_driver",
+            strength=0.42,
+        ),
+    ]
+
+    class FakeCapture:
+        def __init__(self, path):
+            self.pos = 0
+            self.opened = True
+            self.released = False
+
+        def isOpened(self):
+            return self.opened
+
+        def set(self, prop, value):
+            if prop == cv2.CAP_PROP_POS_FRAMES:
+                self.pos = int(value)
+
+        def read(self):
+            import numpy as np
+            frame = np.full((2, 2, 3), self.pos, dtype=np.uint8)
+            return True, frame
+
+        def release(self):
+            self.released = True
+
+    monkeypatch.setattr(editor_node.cv2, "VideoCapture", FakeCapture)
+
+    tensor, frame_idx, strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
+        project, scene, render_start=5, render_end=9, proj_w=6, proj_h=4
+    )
+
+    assert tuple(tensor.shape) == (3, 4, 6, 3)
+    assert frame_idx == 0
+    assert strength == pytest.approx(0.42)
+    assert float(tensor[0].max()) > 0
+
+    scene.motion_driver_lane_configs[0].hidden = True
+    hidden_tensor, hidden_idx, hidden_strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
+        project, scene, render_start=5, render_end=9, proj_w=6, proj_h=4
+    )
+
+    assert tuple(hidden_tensor.shape) == (1, 4, 6, 3)
+    assert hidden_idx == 0
+    assert hidden_strength == pytest.approx(1.0)
+    assert float(hidden_tensor.max()) == 0.0
+
+
+def test_motion_driver_precedence_and_unopenable_fallback(tmp_path, monkeypatch, caplog):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "driver-a.mp4").write_bytes(b"a")
+    (project_dir / "media" / "driver-b.mp4").write_bytes(b"b")
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Motion")
+    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=12)
+    scene.clips = [
+        timeline_state.ClipReference(
+            clip_id="driver-b",
+            source_path=os.path.join("media", "driver-b.mp4"),
+            timeline_start_frame=2,
+            timeline_end_frame=7,
+            track_index=1,
+            role="motion_driver",
+            strength=0.9,
+        ),
+        timeline_state.ClipReference(
+            clip_id="driver-a",
+            source_path=os.path.join("media", "driver-a.mp4"),
+            timeline_start_frame=4,
+            timeline_end_frame=8,
+            track_index=0,
+            role="motion_driver",
+            strength=0.2,
+        ),
+    ]
+
+    class UnopenableCapture:
+        def __init__(self, path):
+            self.path = path
+
+        def isOpened(self):
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(editor_node.cv2, "VideoCapture", UnopenableCapture)
+
+    tensor, frame_idx, strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
+        project, scene, render_start=4, render_end=8, proj_w=6, proj_h=4
+    )
+
+    assert tuple(tensor.shape) == (1, 4, 6, 3)
+    assert frame_idx == 0
+    assert strength == pytest.approx(1.0)
+    assert "Multiple motion-driver clips overlap" in caplog.text
+    assert "Cannot open motion-driver video" in caplog.text
+
+
+def test_motion_driver_read_gaps_are_black_padded(tmp_path, monkeypatch, caplog):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    np = importlib.import_module("numpy")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "driver.mp4").write_bytes(b"driver")
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Motion")
+    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=12)
+    scene.clips = [
+        timeline_state.ClipReference(
+            clip_id="driver-1",
+            source_path=os.path.join("media", "driver.mp4"),
+            timeline_start_frame=5,
+            timeline_end_frame=8,
+            source_in_frame=5,
+            track_index=0,
+            role="motion_driver",
+            strength=0.5,
+        ),
+    ]
+
+    class GappedCapture:
+        def __init__(self, path):
+            self.pos = 0
+
+        def isOpened(self):
+            return True
+
+        def set(self, prop, value):
+            self.pos = int(value)
+
+        def read(self):
+            if self.pos == 6:
+                return False, None
+            return True, np.full((2, 2, 3), self.pos, dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(editor_node.cv2, "VideoCapture", GappedCapture)
+
+    tensor, frame_idx, strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
+        project, scene, render_start=5, render_end=8, proj_w=6, proj_h=4
+    )
+
+    assert tuple(tensor.shape) == (3, 4, 6, 3)
+    assert frame_idx == 0
+    assert strength == pytest.approx(0.5)
+    assert float(tensor[0].max()) > 0.0
+    assert float(tensor[1].max()) == 0.0
+    assert float(tensor[2].max()) > 0.0
+    assert "padding unreadable frames with black" in caplog.text
+
+
+def test_render_scene_frames_excludes_motion_driver_clips(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    cv2 = importlib.import_module("cv2")
+    np = importlib.import_module("numpy")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "render.mp4").write_bytes(b"render")
+    (project_dir / "media" / "driver.mp4").write_bytes(b"driver")
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Render")
+    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=1)
+    scene.video_lane_configs = [timeline_state.LaneConfig()]
+    scene.clips = [
+        timeline_state.ClipReference(
+            source_path=os.path.join("media", "render.mp4"),
+            timeline_start_frame=0,
+            timeline_end_frame=1,
+            role="render",
+        ),
+        timeline_state.ClipReference(
+            source_path=os.path.join("media", "driver.mp4"),
+            timeline_start_frame=0,
+            timeline_end_frame=1,
+            role="motion_driver",
+        ),
+    ]
+
+    class FakeCapture:
+        def __init__(self, path):
+            self.path = path
+
+        def isOpened(self):
+            return True
+
+        def set(self, prop, value):
+            pass
+
+        def read(self):
+            color = [255, 0, 0] if self.path.endswith("render.mp4") else [0, 0, 255]
+            return True, np.full((2, 2, 3), color, dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(editor_node.cv2, "VideoCapture", FakeCapture)
+
+    tensor = editor_node.SonderEditor()._render_scene_frames(project, scene, 0, 1)
+
+    # Render source is blue after BGR->RGB conversion; red would mean the driver leaked in.
+    assert float(tensor[..., 2].max()) == pytest.approx(1.0)
+    assert float(tensor[..., 0].max()) == pytest.approx(0.0)
 
 
 def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path, monkeypatch):
@@ -264,12 +625,10 @@ def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path,
 
     assert save_calls == []
     assert queue_job.status == "pending"
-    assert result[4] == "live:1-10"
-    assert result[5] == 9
-    assert result[10] == 1
-    assert result[11] == 10
-    assert result[12] == 2
-    assert result[13] == 8
+    assert result[8] == "live:1-10"
+    assert result[9] == 9
+    assert result[14] == pytest.approx(1 / 24.0)
+    assert result[15] == pytest.approx(7 / 24.0)
     assert project._execution_context["queue_job_id"] == ""
 
 
@@ -382,15 +741,14 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     assert saved_statuses == ["running"]
     assert project.generation_queue[0].status == "running"
     assert result[3] == "14"
-    assert result[4] == "queued prompt"
-    assert result[5] == 30
-    assert result[6] == 30.0
-    assert result[7] == 8
-    assert result[8] == 6
-    assert result[10] == 6
-    assert result[11] == 36
-    assert result[12] == 10
-    assert result[13] == 30
+    assert result[4] == "1.0000"
+    assert result[8] == "queued prompt"
+    assert result[9] == 30
+    assert result[10] == 30.0
+    assert result[11] == 8
+    assert result[12] == 6
+    assert result[14] == pytest.approx(4 / 30.0)
+    assert result[15] == pytest.approx(24 / 30.0)
     assert project._execution_context["queue_job_id"] == "job-1"
 
 
@@ -478,7 +836,7 @@ def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
 
     assert save_calls == ["running"]
     assert queue_job.status == "running"
-    assert result[4] == "queued prompt"
+    assert result[8] == "queued prompt"
     assert project._execution_context["queue_job_id"] == "job-1"
 
 
@@ -790,8 +1148,8 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
     )
     second_job_id = project._execution_context["queue_job_id"]
 
-    assert first_result[4] == "queued prompt"
-    assert second_result[4] == "queued prompt"
+    assert first_result[8] == "queued prompt"
+    assert second_result[8] == "queued prompt"
     assert first_job_id == "job-1"
     assert second_job_id == "job-1"
     assert queue_job.status == "running"

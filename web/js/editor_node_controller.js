@@ -444,6 +444,7 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
 
     const activeClips = (scene?.clips || [])
         .filter(clip => fallbackFrame >= clip.timeline_start_frame && fallbackFrame < clip.timeline_end_frame)
+        .filter(clip => !clip.role || clip.role === "render")
         .filter(clip => !isVideoLaneHidden(scene, clip.track_index || 0))
         .sort((a, b) => (b.track_index || 0) - (a.track_index || 0));
 
@@ -1825,6 +1826,7 @@ export class EditorNodeController {
             overflow: hidden;
         `));
         const gallery = mountSharedAssetGallery(galleryHost, {
+            ownerId: `sonder-editor-${this.node?.id ?? "anon"}:dormant-gallery`,
             getProjectDir: () => this.state.projectDir,
             initialData: data || { assets: [], folders: [] },
             onImportFiles: async (files, folder) => await this.importFiles(files, folder),

@@ -109,6 +109,16 @@ def _asset_file_size(source_path: str) -> int:
         return 0
 
 
+def _clip_source_asset_type(project: TimelineProject, clip: ClipReference) -> str:
+    asset = next(
+        (asset for asset in project.assets if asset.path == getattr(clip, "source_path", "")),
+        None,
+    )
+    if asset:
+        return getattr(asset, "asset_type", "") or ""
+    return _detect_asset_type(getattr(clip, "source_path", ""), "")
+
+
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
     return os.path.join(project.project_dir, asset.path) if getattr(asset, "path", "") else ""
 
@@ -242,6 +252,25 @@ def _video_has_audio(filepath: str) -> bool:
             return True
     except Exception:
         pass
+
+    # Method 4: extraction fallback. This is slower, so only use it after the
+    # metadata probes fail; it keeps legacy/stale assets repairable without
+    # relying on frontend heuristics.
+    temp_audio_path = ""
+    try:
+        import tempfile
+        fd, temp_audio_path = tempfile.mkstemp(prefix="sonder_audio_probe_", suffix=".wav")
+        os.close(fd)
+        if _extract_audio_from_video(filepath, temp_audio_path):
+            return os.path.isfile(temp_audio_path) and os.path.getsize(temp_audio_path) > 0
+    except Exception as e:
+        logger.debug("ffmpeg extraction audio check failed for %s: %s", filepath, e)
+    finally:
+        if temp_audio_path:
+            try:
+                os.remove(temp_audio_path)
+            except OSError:
+                pass
 
     return False
 
@@ -2083,11 +2112,17 @@ if routes is not None:
             scene.generation_params = body["generation_params"]
         if "video_lane_count" in body:
             scene.video_lane_count = max(1, int(body["video_lane_count"]))
+        if "motion_driver_lane_count" in body:
+            scene.motion_driver_lane_count = max(1, int(body["motion_driver_lane_count"]))
         if "audio_lane_count" in body:
             scene.audio_lane_count = max(1, int(body["audio_lane_count"]))
         if "video_lane_configs" in body:
             scene.video_lane_configs = [
                 LaneConfig.from_dict(c) for c in body["video_lane_configs"]
+            ]
+        if "motion_driver_lane_configs" in body:
+            scene.motion_driver_lane_configs = [
+                LaneConfig.from_dict(c) for c in body["motion_driver_lane_configs"]
             ]
         if "audio_lane_configs" in body:
             scene.audio_lane_configs = [
@@ -2102,6 +2137,8 @@ if routes is not None:
         # Auto-pad configs to match lane counts
         while len(scene.video_lane_configs) < scene.video_lane_count:
             scene.video_lane_configs.append(LaneConfig())
+        while len(scene.motion_driver_lane_configs) < scene.motion_driver_lane_count:
+            scene.motion_driver_lane_configs.append(LaneConfig())
         while len(scene.audio_lane_configs) < scene.audio_lane_count:
             scene.audio_lane_configs.append(LaneConfig())
 
@@ -2167,11 +2204,17 @@ if routes is not None:
             ]
         if "video_lane_count" in body:
             scene.video_lane_count = max(1, int(body["video_lane_count"]))
+        if "motion_driver_lane_count" in body:
+            scene.motion_driver_lane_count = max(1, int(body["motion_driver_lane_count"]))
         if "audio_lane_count" in body:
             scene.audio_lane_count = max(1, int(body["audio_lane_count"]))
         if "video_lane_configs" in body:
             scene.video_lane_configs = [
                 LaneConfig.from_dict(c) for c in body["video_lane_configs"]
+            ]
+        if "motion_driver_lane_configs" in body:
+            scene.motion_driver_lane_configs = [
+                LaneConfig.from_dict(c) for c in body["motion_driver_lane_configs"]
             ]
         if "audio_lane_configs" in body:
             scene.audio_lane_configs = [
@@ -2179,6 +2222,8 @@ if routes is not None:
             ]
         while len(scene.video_lane_configs) < scene.video_lane_count:
             scene.video_lane_configs.append(LaneConfig())
+        while len(scene.motion_driver_lane_configs) < scene.motion_driver_lane_count:
+            scene.motion_driver_lane_configs.append(LaneConfig())
         while len(scene.audio_lane_configs) < scene.audio_lane_count:
             scene.audio_lane_configs.append(LaneConfig())
 
@@ -2210,6 +2255,7 @@ if routes is not None:
             frame_index=body.get("frame_index", 0),
             asset_id=body.get("asset_id", ""),
             source=body.get("source", "asset"),
+            # Client-authored from the editor guide strength control.
             strength=body.get("strength", 1.0),
         )
 
@@ -2276,6 +2322,11 @@ if routes is not None:
         start_frame = int(body.get("timeline_start_frame", 0))
         frame_count = asset.frame_count or 1
         end_frame = start_frame + frame_count
+        role = body.get("role", "render")
+        if role not in {"render", "motion_driver"}:
+            return _json_error(f"Invalid clip role: {role}", 400)
+        if role == "motion_driver" and asset.asset_type != "video":
+            return _json_error("Motion-driver clips require video assets", 400)
 
         clip = ClipReference(
             source_path=asset.path,
@@ -2285,13 +2336,15 @@ if routes is not None:
             source_out_frame=frame_count,
             total_source_frames=frame_count,
             track_index=int(body.get("track_index", 0)),
+            role=role,
+            strength=float(body.get("strength", 1.0)),
         )
         scene.clips.append(clip)
 
         # Dual drop: also create audio track if video has audio
         # Wrapped in try/except so audio extraction failure doesn't prevent clip creation
         audio_track_dict = None
-        if body.get("dual_drop") and asset.asset_type == "video":
+        if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video":
             try:
                 video_path = os.path.join(project.project_dir, asset.path)
                 audio_filename = f"{asset.asset_id}_audio.wav"
@@ -2409,6 +2462,15 @@ if routes is not None:
             clip.opacity = float(body["opacity"])
         if "track_index" in body:
             clip.track_index = int(body["track_index"])
+        if "role" in body:
+            role = body["role"]
+            if role not in {"render", "motion_driver"}:
+                return _json_error(f"Invalid clip role: {role}", 400)
+            if role == "motion_driver" and _clip_source_asset_type(project, clip) != "video":
+                return _json_error("Motion-driver clips require video assets", 400)
+            clip.role = role
+        if "strength" in body:
+            clip.strength = float(body["strength"])
 
         save_project(project)
         return web.json_response(clip.to_dict())
@@ -2458,6 +2520,8 @@ if routes is not None:
             total_source_frames=orig_source_out - source_split,  # own range = no ghost
             source_origin_frame=source_split,                    # origin = source_in at split
             track_index=clip.track_index,
+            role=getattr(clip, "role", "render"),
+            strength=getattr(clip, "strength", 1.0),
         )
 
         # Trim first clip (left half)

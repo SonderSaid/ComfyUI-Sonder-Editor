@@ -75,6 +75,7 @@ export const RESOLUTION_TIERS = [
 export const ASPECT_RATIO_PRESETS = [
     { label: "16:9", a: 16, b: 9 },
     { label: "4:3", a: 4, b: 3 },
+    { label: "3:4", a: 3, b: 4 },
     { label: "1:1", a: 1, b: 1 },
     { label: "21:9", a: 21, b: 9 },
     { label: "9:16", a: 9, b: 16 },
@@ -135,6 +136,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
         width: 768,
         height: 512,
         newSceneDuration: 200,
+        defaultGuideStrength: 1.0,
+        defaultMotionDriverStrength: 1.0,
         defaultTemplateId: "free",
     },
     gallery: {
@@ -501,6 +504,18 @@ function normalizeEditorSettings(source = null) {
                 99999,
                 defaults.projectDefaults.newSceneDuration,
                 true,
+            ),
+            defaultGuideStrength: clampNumber(
+                stored?.projectDefaults?.defaultGuideStrength,
+                0.0,
+                1.0,
+                defaults.projectDefaults.defaultGuideStrength,
+            ),
+            defaultMotionDriverStrength: clampNumber(
+                stored?.projectDefaults?.defaultMotionDriverStrength,
+                0.0,
+                1.0,
+                defaults.projectDefaults.defaultMotionDriverStrength,
             ),
             defaultTemplateId: validTemplateIds.has(stored?.projectDefaults?.defaultTemplateId)
                 ? stored.projectDefaults.defaultTemplateId

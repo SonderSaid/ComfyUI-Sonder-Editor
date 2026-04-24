@@ -8,6 +8,7 @@ import {
     subscribeEditorSettings,
     updateEditorSettings,
 } from "./editor_settings.js";
+import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const ROOT_FOLDER_COLLAPSE_KEY = "__sonder_root__";
@@ -165,12 +166,6 @@ function shouldCaptureOverlayShortcut(event) {
         return true;
     }
     return OVERLAY_CAPTURE_KEYS.has(key);
-}
-
-function consumeOverlayShortcut(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
 }
 
 function assetKindLabel(type) {
@@ -379,6 +374,14 @@ async function collectDroppedFiles(dataTransfer) {
     return Array.from(dataTransfer?.files || []).map((file) => ({ file, folder: "" }));
 }
 
+function dataTransferHasType(dataTransfer, type) {
+    const types = dataTransfer?.types;
+    if (!types || !type) return false;
+    if (typeof types.includes === "function") return types.includes(type);
+    if (typeof types.contains === "function") return types.contains(type);
+    return Array.from(types).includes(type);
+}
+
 function makeMetaCell(label, value) {
     const cell = style(document.createElement("div"), `padding:6px;border-radius:6px;background:rgba(255,255,255,0.03);min-width:0;`);
     const title = style(document.createElement("div"), `color:#7f8b96;margin-bottom:2px;font-size:10px;`);
@@ -397,6 +400,10 @@ function makeSectionTitle(label) {
 
 export function mountSharedAssetGallery(container, options = {}) {
     const initialSettings = getEditorSettings();
+    const ownerId = typeof options.ownerId === "string" && options.ownerId
+        ? options.ownerId
+        : `sonder-gallery-${Math.random().toString(36).slice(2, 8)}`;
+    const consumerId = (suffix) => `${ownerId}:${suffix}`;
     const state = {
         type: "all",
         query: "",
@@ -422,6 +429,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         usageError: "",
         usageData: null,
         replaceAssetId: "",
+        lastInteractedAt: 0,
         overlayState: {
             open: false,
             assetId: "",
@@ -703,18 +711,22 @@ export function mountSharedAssetGallery(container, options = {}) {
         const closeHandler = (event) => {
             if (!menu.contains(event.target)) hideContextMenu();
         };
-        const escHandler = (event) => {
-            if (event.key === "Escape") hideContextMenu();
-        };
         const scrollHandler = () => hideContextMenu();
+        const escKeyOff = registerKeyboardConsumer({
+            id: consumerId("ctxmenu"),
+            priority: KEY_PRIORITY.OVERLAY,
+            keydown: (event) => {
+                if (event.key === "Escape") { hideContextMenu(); return true; }
+                return false;
+            },
+        });
         state.contextMenuCleanup = () => {
             document.removeEventListener("mousedown", closeHandler);
-            document.removeEventListener("keydown", escHandler);
             window.removeEventListener("scroll", scrollHandler, true);
+            escKeyOff();
         };
         setTimeout(() => {
             document.addEventListener("mousedown", closeHandler);
-            document.addEventListener("keydown", escHandler);
             window.addEventListener("scroll", scrollHandler, true);
         }, 10);
     }
@@ -762,6 +774,32 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         persistCollapsedFolders();
         render();
+    }
+
+    function revealAssetFolder(asset) {
+        if (!asset) return false;
+        let changed = false;
+        if (isTrashed(asset)) {
+            if (state.collapsedFolders.has(TRASH_FOLDER_COLLAPSE_KEY)) {
+                state.collapsedFolders.delete(TRASH_FOLDER_COLLAPSE_KEY);
+                changed = true;
+            }
+        } else {
+            const parts = normalizeFolderName(asset.folder || "").split("/").filter(Boolean);
+            const folderChain = [""];
+            for (let i = 1; i <= parts.length; i++) {
+                folderChain.push(parts.slice(0, i).join("/"));
+            }
+            for (const folderName of folderChain) {
+                const key = folderCollapseKey(folderName);
+                if (state.collapsedFolders.has(key)) {
+                    state.collapsedFolders.delete(key);
+                    changed = true;
+                }
+            }
+        }
+        if (changed) persistCollapsedFolders();
+        return changed;
     }
 
     function assetMatchesCurrentFilter(asset) {
@@ -919,6 +957,31 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function selectAsset(assetId, options = {}) {
         return applySelection(assetId ? [assetId] : [], assetId, options);
+    }
+
+    function revealAsset(assetId, options = {}) {
+        const asset = data.assets.find((entry) => entry.asset_id === assetId);
+        if (!asset) return null;
+
+        if (state.type !== "all" && state.type !== asset.asset_type) {
+            state.type = asset.asset_type;
+        }
+        if (!assetMatchesCurrentFilter(asset) && state.query) {
+            state.query = "";
+            searchInput.value = "";
+        }
+        if (options.openInspector && state.inspectorCollapsed) {
+            state.inspectorCollapsed = false;
+            persistInspectorCollapsed();
+        }
+        if (options.clearUsageView !== false) {
+            clearUsageView();
+        }
+        revealAssetFolder(asset);
+        return applySelection([asset.asset_id], asset.asset_id, {
+            focusList: options.focusList !== false,
+            scrollIntoView: options.scrollIntoView !== false,
+        });
     }
 
     function toggleAssetSelection(assetId, options = {}) {
@@ -2545,47 +2608,29 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         const keyDownHandler = (event) => {
-            if (!overlay.open) return;
-            if (event.target?.closest?.("input, textarea, select")) return;
-            if (event.key === "Escape") {
-                consumeOverlayShortcut(event);
-                closeInspectOverlay();
-                return;
-            }
+            if (!overlay.open) return false;
+            if (event.target?.closest?.("input, textarea, select")) return false;
+            if (event.key === "Escape") { closeInspectOverlay(); return true; }
             if (event.key === " " || event.key === "Spacebar") {
-                consumeOverlayShortcut(event);
-                if (typeof overlay.togglePlayback === "function") {
-                    overlay.togglePlayback();
-                }
-                return;
+                if (typeof overlay.togglePlayback === "function") overlay.togglePlayback();
+                return true;
             }
-            if (event.key === "ArrowLeft") {
-                consumeOverlayShortcut(event);
-                cycleOverlayAsset(-1);
-                return;
-            }
-            if (event.key === "ArrowRight") {
-                consumeOverlayShortcut(event);
-                cycleOverlayAsset(1);
-                return;
-            }
-            if (shouldCaptureOverlayShortcut(event)) {
-                consumeOverlayShortcut(event);
-            }
+            if (event.key === "ArrowLeft") { cycleOverlayAsset(-1); return true; }
+            if (event.key === "ArrowRight") { cycleOverlayAsset(1); return true; }
+            return shouldCaptureOverlayShortcut(event);
         };
         const keyUpHandler = (event) => {
-            if (!overlay.open) return;
-            if (event.target?.closest?.("input, textarea, select")) return;
-            if (shouldCaptureOverlayShortcut(event)) {
-                consumeOverlayShortcut(event);
-            }
+            if (!overlay.open) return false;
+            if (event.target?.closest?.("input, textarea, select")) return false;
+            return shouldCaptureOverlayShortcut(event);
         };
-        document.addEventListener("keydown", keyDownHandler, true);
-        document.addEventListener("keyup", keyUpHandler, true);
-        overlay.cleanupFns.push(
-            () => document.removeEventListener("keydown", keyDownHandler, true),
-            () => document.removeEventListener("keyup", keyUpHandler, true),
-        );
+        const overlayKeyOff = registerKeyboardConsumer({
+            id: consumerId("inspect"),
+            priority: KEY_PRIORITY.OVERLAY,
+            keydown: keyDownHandler,
+            keyup: keyUpHandler,
+        });
+        overlay.cleanupFns.push(overlayKeyOff);
 
         overlayEl.innerHTML = "";
         const shell = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;max-width:min(1600px,100%);width:100%;height:100%;padding:18px;border-radius:16px;background:${CHROME.panelMuted};border:1px solid ${CHROME.borderStrong};box-shadow:0 20px 80px rgba(0,0,0,0.45);box-sizing:border-box;`);
@@ -3365,7 +3410,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             showContextMenu(event.clientX, event.clientY, folderContextMenuItems(normalized));
         });
         header.addEventListener("dragover", (event) => {
-            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/x-sonder-asset-move")) return;
+            if (!options.onBulkMoveAssets || !dataTransferHasType(event.dataTransfer, "application/x-sonder-asset-move")) return;
             event.preventDefault();
             event.stopPropagation();
             event.dataTransfer.dropEffect = "move";
@@ -3377,7 +3422,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (state.dropFolder === normalized) clearDropFolderHighlight();
         });
         header.addEventListener("drop", async (event) => {
-            if (!options.onBulkMoveAssets || !event.dataTransfer?.types?.includes("application/x-sonder-asset-move")) return;
+            if (!options.onBulkMoveAssets || !dataTransferHasType(event.dataTransfer, "application/x-sonder-asset-move")) return;
             event.preventDefault();
             event.stopPropagation();
             root.style.outline = "none";
@@ -3387,8 +3432,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const rawPayload = event.dataTransfer.getData("application/x-sonder-asset-move");
                 const payload = rawPayload ? JSON.parse(rawPayload) : {};
                 const assetIds = Array.isArray(payload?.assetIds) ? payload.assetIds : [];
+                const primaryAssetId = typeof payload?.primaryAssetId === "string" ? payload.primaryAssetId : (assetIds[assetIds.length - 1] || "");
                 if (!assetIds.length) return;
                 await options.onBulkMoveAssets(assetIds, normalized);
+                applySelectionState(assetIds, primaryAssetId);
                 clearUsageView();
                 await options.onRefresh?.();
             } catch (error) {
@@ -3569,13 +3616,13 @@ export function mountSharedAssetGallery(container, options = {}) {
                             ? selectedAssetIdsList()
                             : [asset.asset_id];
                         event.dataTransfer.effectAllowed = "move";
-                        event.dataTransfer.setData("application/x-sonder-asset-move", JSON.stringify({ assetIds: moveIds }));
+                        event.dataTransfer.setData("application/x-sonder-asset-move", JSON.stringify({
+                            assetIds: moveIds,
+                            primaryAssetId: state.selectedAssetIds.has(asset.asset_id)
+                                ? (state.selectedAssetId || asset.asset_id)
+                                : asset.asset_id,
+                        }));
                         event.dataTransfer.setData("text/plain", moveIds.length > 1 ? `${moveIds.length} assets` : assetDisplayName(asset));
-                        if (!state.selectedAssetIds.has(asset.asset_id) || moveIds.length === 1) {
-                            applySelectionState(moveIds, asset.asset_id);
-                            clearUsageView();
-                            requestAnimationFrame(() => render());
-                        }
                         return;
                     }
                     const payload = JSON.stringify({ ...asset, _projectDir: projectIdFromDir(currentProjectDir()) });
@@ -3778,22 +3825,97 @@ export function mountSharedAssetGallery(container, options = {}) {
     listScroller.addEventListener("mousedown", () => {
         hideContextMenu();
     });
+    // Track last interaction inside the gallery surface so hasSelectionOwnership()
+    // can recognize gallery-owned selection even when the click cleared focus to
+    // <body> (asset rows are not tabindex-focusable).
+    const stampGalleryInteraction = () => { state.lastInteractedAt = Date.now(); };
+    root.addEventListener("mousedown", stampGalleryInteraction, true);
+    const documentMouseDownClear = (event) => {
+        if (root.contains(event.target)) return;
+        if (state.overlayState.open && state.overlayState.overlayEl?.contains(event.target)) return;
+        state.lastInteractedAt = 0;
+    };
+    document.addEventListener("mousedown", documentMouseDownClear, true);
+
+    function hasSelectionOwnership() {
+        if (state.destroyed) return false;
+        if (!selectedAssetIdsList().length) return false;
+        if (state.overlayState.open) return true;
+        const active = document.activeElement;
+        if (active && root.contains(active)) return true;
+        return state.lastInteractedAt > 0;
+    }
+
+    function handleGallerySelectionDelete() {
+        const selectionCount = selectedAssetIdsList().length;
+        if (!selectionCount) return false;
+        if (selectionCount > 1) {
+            const selection = selectedAssets();
+            const activeIds = selection.filter((asset) => !isTrashed(asset)).map((asset) => asset.asset_id);
+            const trashedIds = selection.filter((asset) => isTrashed(asset)).map((asset) => asset.asset_id);
+            if (activeIds.length) void handleBulkDelete(activeIds);
+            else if (trashedIds.length) void handleBulkPermanentDelete(trashedIds);
+            return true;
+        }
+        const asset = selectedAsset();
+        if (!asset) return false;
+        if (isTrashed(asset)) void handleAssetPermanentDelete(asset);
+        else void handleAssetDelete(asset);
+        return true;
+    }
+
+    function handleGallerySelectAll() {
+        const visibleAssetList = ensureFocusedAsset(navigableAssets());
+        const allVisibleIds = visibleAssetList.map((asset) => asset.asset_id);
+        if (!allVisibleIds.length) return false;
+        const primaryId = allVisibleIds.includes(state.selectedAssetId)
+            ? state.selectedAssetId
+            : allVisibleIds[allVisibleIds.length - 1];
+        applySelection(allVisibleIds, primaryId, { focusList: true, scrollIntoView: true });
+        return true;
+    }
+
+    function handleGalleryEscape() {
+        const selectionCount = selectedAssetIdsList().length;
+        if (!selectionCount) return false;
+        hideContextMenu();
+        if (selectionCount > 1) {
+            reduceSelectionToPrimary({ focusList: true, scrollIntoView: true });
+        } else {
+            clearSelection();
+        }
+        return true;
+    }
+
+    // GALLERY consumer (priority 50). Routes Delete, Ctrl+A, and Escape to the
+    // existing list handlers when the gallery owns the current selection. Falls
+    // through (returns false) otherwise so the EDITOR consumer or LiteGraph can
+    // claim the event. Element-level listScroller listener still owns arrow
+    // nav, Enter, and Space → inspect when the list itself has focus.
+    const galleryKeyOff = registerKeyboardConsumer({
+        id: consumerId("list"),
+        priority: KEY_PRIORITY.GALLERY,
+        keydown: (event) => {
+            if (state.destroyed) return false;
+            if (event.target?.closest?.("input, textarea, select")) return false;
+            if (!hasSelectionOwnership()) return false;
+            const key = event.key;
+            if ((event.ctrlKey || event.metaKey) && String(key || "").toLowerCase() === "a") {
+                return handleGallerySelectAll();
+            }
+            if (key === "Delete") return handleGallerySelectionDelete();
+            if (key === "Escape") return handleGalleryEscape();
+            return false;
+        },
+    });
+    // Element-level keydown handles focus-driven list navigation when the
+    // listScroller itself has DOM focus. Delete / Ctrl+A / Escape route through
+    // the GALLERY consumer (priority 50) instead, so they fire even when the
+    // user clicked an asset row that did not become activeElement.
     listScroller.addEventListener("keydown", (event) => {
         if (event.target !== listScroller) return;
 
         const visibleAssetList = ensureFocusedAsset(navigableAssets());
-        const selectionCount = selectedAssetIdsList().length;
-
-        if ((event.ctrlKey || event.metaKey) && String(event.key || "").toLowerCase() === "a") {
-            event.preventDefault();
-            const allVisibleIds = visibleAssetList.map((asset) => asset.asset_id);
-            if (!allVisibleIds.length) return;
-            const primaryId = allVisibleIds.includes(state.selectedAssetId)
-                ? state.selectedAssetId
-                : allVisibleIds[allVisibleIds.length - 1];
-            applySelection(allVisibleIds, primaryId, { focusList: true, scrollIntoView: true });
-            return;
-        }
 
         if (LIST_NAV_KEYS.has(event.key)) {
             event.preventDefault();
@@ -3825,43 +3947,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
             return;
         }
-
-        if (event.key === "Escape") {
-            event.preventDefault();
-            hideContextMenu();
-            if (selectionCount > 1) {
-                reduceSelectionToPrimary({ focusList: true, scrollIntoView: true });
-            } else {
-                clearSelection();
-            }
-            return;
-        }
-
-        if (event.key === "Delete") {
-            event.preventDefault();
-            if (selectionCount > 1) {
-                const selection = selectedAssets();
-                const activeIds = selection.filter((asset) => !isTrashed(asset)).map((asset) => asset.asset_id);
-                const trashedIds = selection.filter((asset) => isTrashed(asset)).map((asset) => asset.asset_id);
-                if (activeIds.length) {
-                    void handleBulkDelete(activeIds);
-                } else if (trashedIds.length) {
-                    void handleBulkPermanentDelete(trashedIds);
-                }
-                return;
-            }
-            const asset = selectedAsset();
-            if (asset) {
-                if (isTrashed(asset)) {
-                    void handleAssetPermanentDelete(asset);
-                } else {
-                    void handleAssetDelete(asset);
-                }
-            }
-        }
     });
     root.addEventListener("dragover", (event) => {
-        if (!event.dataTransfer?.types?.includes("Files")) return;
+        if (!dataTransferHasType(event.dataTransfer, "Files")) return;
         event.preventDefault();
         event.stopPropagation();
         event.dataTransfer.dropEffect = "copy";
@@ -3918,6 +4006,8 @@ export function mountSharedAssetGallery(container, options = {}) {
     function destroy() {
         if (state.destroyed) return;
         state.destroyed = true;
+        galleryKeyOff();
+        document.removeEventListener("mousedown", documentMouseDownClear, true);
         unsubscribeSettings();
         resizeObserver?.disconnect();
         closeInspectOverlay();
@@ -3931,5 +4021,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         setData,
         destroy,
         isInspectOverlayOpen: () => !!state.overlayState.open,
+        hasSelectionOwnership,
+        revealAsset,
     };
 }

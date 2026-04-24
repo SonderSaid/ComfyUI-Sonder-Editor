@@ -1,8 +1,11 @@
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 import os
 from typing import Any
+
+logger = logging.getLogger("sonder_editor")
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +309,10 @@ class Scene:
     asset_ids: list = field(default_factory=list)        # references to project-level Assets used
     is_bridge: bool = False                 # True if this is an auto-generated bridge between scenes
     video_lane_count: int = 1               # number of video lanes (multi-layer)
+    motion_driver_lane_count: int = 1       # single motion-driver lane in Phase 4.3
     audio_lane_count: int = 1               # number of audio lanes (multi-layer)
     video_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
+    motion_driver_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     audio_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     width: int = 0                              # 0 = inherit from project
     height: int = 0                             # 0 = inherit from project
@@ -338,7 +343,8 @@ class Scene:
         import json
         data = {
             "clips": [(c.source_path, c.timeline_start_frame, c.timeline_end_frame,
-                        c.source_in_frame, c.opacity, c.track_index)
+                        c.source_in_frame, c.opacity, c.track_index,
+                        getattr(c, "role", "render"), getattr(c, "strength", 1.0))
                        for c in self.clips],
             "audio": [(a.source_path, a.timeline_start_frame, a.timeline_end_frame,
                         a.source_in_frame, a.volume, a.muted, a.lane_index)
@@ -384,8 +390,10 @@ class Scene:
             "asset_ids": list(self.asset_ids),
             "is_bridge": self.is_bridge,
             "video_lane_count": self.video_lane_count,
+            "motion_driver_lane_count": self.motion_driver_lane_count,
             "audio_lane_count": self.audio_lane_count,
             "video_lane_configs": [c.to_dict() for c in self.video_lane_configs],
+            "motion_driver_lane_configs": [c.to_dict() for c in self.motion_driver_lane_configs],
             "audio_lane_configs": [c.to_dict() for c in self.audio_lane_configs],
             "width": self.width,
             "height": self.height,
@@ -412,6 +420,7 @@ class Scene:
             asset_ids=data.get("asset_ids", []),
             is_bridge=data.get("is_bridge", False),
             video_lane_count=data.get("video_lane_count", 1),
+            motion_driver_lane_count=data.get("motion_driver_lane_count", 1),
             audio_lane_count=data.get("audio_lane_count", 1),
             width=data.get("width", 0),
             height=data.get("height", 0),
@@ -447,6 +456,11 @@ class Scene:
         ]
         while len(scene.video_lane_configs) < scene.video_lane_count:
             scene.video_lane_configs.append(LaneConfig())
+        scene.motion_driver_lane_configs = [
+            LaneConfig.from_dict(c) for c in data.get("motion_driver_lane_configs", [])
+        ]
+        while len(scene.motion_driver_lane_configs) < scene.motion_driver_lane_count:
+            scene.motion_driver_lane_configs.append(LaneConfig())
         scene.audio_lane_configs = [
             LaneConfig.from_dict(c) for c in data.get("audio_lane_configs", [])
         ]
@@ -471,6 +485,8 @@ class ClipReference:
     source_origin_frame: int = 0   # source_in at creation/split (for trim ghost calc)
     opacity: float = 1.0
     track_index: int = 0
+    role: str = "render"                    # render | motion_driver
+    strength: float = 1.0                   # motion-driver conditioning strength
     prompt: str = ""
     is_generated: bool = False
     generation_params: dict = field(default_factory=dict)
@@ -498,6 +514,8 @@ class ClipReference:
             "source_origin_frame": self.source_origin_frame,
             "opacity": self.opacity,
             "track_index": self.track_index,
+            "role": self.role,
+            "strength": self.strength,
             "prompt": self.prompt,
             "is_generated": self.is_generated,
             "generation_params": self.generation_params,
@@ -508,6 +526,10 @@ class ClipReference:
 
     @classmethod
     def from_dict(cls, data: dict) -> "ClipReference":
+        role = data.get("role", "render")
+        if role not in {"render", "motion_driver"}:
+            logger.warning("Unknown clip role %r; defaulting to render", role)
+            role = "render"
         return cls(
             clip_id=data.get("clip_id", uuid.uuid4().hex[:8]),
             source_path=data.get("source_path", ""),
@@ -519,6 +541,8 @@ class ClipReference:
             source_origin_frame=data.get("source_origin_frame", 0),
             opacity=data.get("opacity", 1.0),
             track_index=data.get("track_index", 0),
+            role=role,
+            strength=data.get("strength", 1.0),
             prompt=data.get("prompt", ""),
             is_generated=data.get("is_generated", False),
             generation_params=data.get("generation_params", {}),

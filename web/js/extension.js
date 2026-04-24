@@ -181,6 +181,117 @@ function getActiveEditorNodes() {
     );
 }
 
+function isSonderKeyboardDebugEnabled() {
+    try {
+        return window.__SONDER_KEYBOARD_DEBUG__ === true
+            || window.localStorage?.getItem("sonder_keyboard_debug") === "1";
+    } catch {
+        return window.__SONDER_KEYBOARD_DEBUG__ === true;
+    }
+}
+
+function sonderKeyboardDebug(message, details) {
+    if (!isSonderKeyboardDebugEnabled()) return;
+    if (details === undefined) {
+        console.log("[Sonder][UndoGuard]", message);
+        return;
+    }
+    console.log("[Sonder][UndoGuard]", message, details);
+}
+
+function shouldSuppressComfyGraphUndo() {
+    return getActiveEditorNodes().some((node) => node._sonderController?.state?.isFullscreenOpen);
+}
+
+const sonderGraphUndoSuppression = {
+    untilMs: 0,
+    reason: "",
+    nodeIds: [],
+};
+
+function nowMs() {
+    if (typeof performance !== "undefined" && typeof performance.now === "function") {
+        return performance.now();
+    }
+    return Date.now();
+}
+
+function isGraphUndoSuppressed() {
+    return sonderGraphUndoSuppression.untilMs > nowMs();
+}
+
+function activateGraphUndoSuppression(reason = "unknown", nodeIds = []) {
+    sonderGraphUndoSuppression.untilMs = nowMs() + 1000;
+    sonderGraphUndoSuppression.reason = String(reason || "unknown");
+    sonderGraphUndoSuppression.nodeIds = Array.isArray(nodeIds) ? nodeIds.slice() : [];
+    sonderKeyboardDebug("activated graph undo suppression", {
+        reason: sonderGraphUndoSuppression.reason,
+        nodeIds: sonderGraphUndoSuppression.nodeIds,
+        untilMs: sonderGraphUndoSuppression.untilMs,
+    });
+}
+
+function installGraphLoadGuard() {
+    if (!app || app._sonderGraphLoadGuardInstalled) return;
+
+    const originalLoadGraphData = typeof app.loadGraphData === "function" ? app.loadGraphData.bind(app) : null;
+    if (!originalLoadGraphData) return;
+
+    app.loadGraphData = async function (...args) {
+        if (isGraphUndoSuppressed() && shouldSuppressComfyGraphUndo()) {
+            sonderKeyboardDebug("blocked app.loadGraphData during fullscreen editor undo window", {
+                reason: sonderGraphUndoSuppression.reason,
+                nodeIds: sonderGraphUndoSuppression.nodeIds,
+            });
+            return false;
+        }
+        return await originalLoadGraphData(...args);
+    };
+
+    app._sonderGraphLoadGuardInstalled = true;
+    if (typeof window !== "undefined") {
+        window.__SONDER_SUPPRESS_COMFY_GRAPH_UNDO__ = activateGraphUndoSuppression;
+        window.__SONDER_GRAPH_UNDO_GUARD__ = {
+            isSuppressed: () => isGraphUndoSuppressed(),
+            getState: () => ({
+                untilMs: sonderGraphUndoSuppression.untilMs,
+                reason: sonderGraphUndoSuppression.reason,
+                nodeIds: sonderGraphUndoSuppression.nodeIds.slice(),
+            }),
+        };
+    }
+    sonderKeyboardDebug("installed graph load guard");
+}
+
+function installComfyGraphUndoGuard() {
+    const changeTracker = app?.changeTracker;
+    if (!changeTracker || changeTracker._sonderUndoGuardInstalled) return;
+
+    const wrap = (methodName) => {
+        const original = changeTracker[methodName];
+        if (typeof original !== "function") return;
+        changeTracker[methodName] = function (...args) {
+            if (shouldSuppressComfyGraphUndo()) {
+                sonderKeyboardDebug(`blocked changeTracker.${methodName}`, {
+                    fullscreenEditorNodeIds: getActiveEditorNodes()
+                        .filter((node) => node._sonderController?.state?.isFullscreenOpen)
+                        .map((node) => node.id),
+                });
+                return;
+            }
+            return original.apply(this, args);
+        };
+    };
+
+    wrap("undoRedo");
+    wrap("undo");
+    wrap("redo");
+    changeTracker._sonderUndoGuardInstalled = true;
+    sonderKeyboardDebug("installed graph undo guard", {
+        wrapped: ["undoRedo", "undo", "redo"].filter((name) => typeof changeTracker[name] === "function"),
+    });
+}
+
 function getGraphLinks() {
     return app.graph?.links || app.graph?._links || {};
 }
@@ -716,6 +827,8 @@ app.registerExtension({
     },
 
     setup() {
+        installGraphLoadGuard();
+        installComfyGraphUndoGuard();
         if (typeof api.addEventListener === "function") {
             api.addEventListener("status", (event) => {
                 const remaining = Number(event?.detail?.exec_info?.queue_remaining);
