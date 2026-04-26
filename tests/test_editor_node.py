@@ -179,8 +179,8 @@ def test_empty_execute_result_matches_output_contract(tmp_path, monkeypatch):
     timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
 
     expected_names = (
-        "project", "rendered_frames", "guide_images", "guide_indices", "guide_strengths",
-        "motion_driver_images", "motion_driver_frame_index", "motion_driver_strength",
+        "project", "rendered_frames", "guide_images", "guide_idx", "guide_strengths",
+        "motion_driver_images", "motion_driver_idx", "motion_driver_strength",
         "prompt", "frame_count", "fps", "width", "height", "audio",
         "mask_start_time", "mask_end_time",
     )

@@ -167,7 +167,6 @@ const COLORS = {
     clip: "#3a7ca5",
     clipSelected: "#5aacd5",
     motionDriver: "#e8a030",
-    motionDriverSoft: "rgba(232, 160, 48, 0.18)",
     motionDriverSelected: "#ffcc44",
     audioClip: "#5a8a5a",
     audioClipSelected: "#7aba7a",
@@ -2982,6 +2981,8 @@ export class EditorWidget {
         const prevQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(this._settings);
         const nextQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(nextSettings);
         const prevTimecodeMode = this._timecodeMode;
+        const prevLaneTintSignature = JSON.stringify(this._settings?.appearance?.laneTintOverrides || {});
+        const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
         this._settings = nextSettings;
         const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
         const templateChanged = resolvedTemplateId !== this._templateId;
@@ -3018,6 +3019,9 @@ export class EditorWidget {
             if (this.timelineCanvas) {
                 this._renderTimeline();
             }
+        }
+        if (prevLaneTintSignature !== nextLaneTintSignature && this.timelineCanvas) {
+            this._renderTimeline();
         }
         if (this._queueContainer && prevQueueExpanded !== this._queueExpanded) {
             this._applyQueueExpandedState();
@@ -3082,6 +3086,14 @@ export class EditorWidget {
         if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
         if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
         if (controls.clipLabelMode) controls.clipLabelMode.value = this._settings.appearance.clipLabelMode;
+        for (const tintKey of ["video", "audio", "motion_driver"]) {
+            const tintInput = controls[`laneTintOverride_${tintKey}`];
+            if (tintInput) {
+                const stored = this._settings.appearance.laneTintOverrides?.[tintKey] || "";
+                tintInput.value = stored || "#000000";
+                tintInput.dataset.active = stored ? "1" : "0";
+            }
+        }
         if (controls.batchRenderMaxFramesPerChunk) controls.batchRenderMaxFramesPerChunk.value = String(this._settings.batchRender.maxFramesPerChunk);
         if (controls.defaultProjectFps) controls.defaultProjectFps.value = String(this._settings.projectDefaults.fps);
         if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
@@ -3106,6 +3118,13 @@ export class EditorWidget {
 
     _waveformAccentColor() {
         return this._settings?.appearance?.waveformAccent || DEFAULT_EDITOR_SETTINGS.appearance.waveformAccent;
+    }
+
+    _resolveLaneTint(trackType) {
+        const overrides = this._settings?.appearance?.laneTintOverrides
+            || DEFAULT_EDITOR_SETTINGS.appearance.laneTintOverrides;
+        const candidate = overrides?.[trackType];
+        return typeof candidate === "string" && /^#[0-9a-fA-F]{6}$/.test(candidate) ? candidate : null;
     }
 
     _clipLabelMode() {
@@ -3353,11 +3372,19 @@ export class EditorWidget {
             const collapsed = entry.collapsed;
             const isLane = this._isLaneTrackType(entry.type);
 
-            // Track background
-            ctx.fillStyle = entry.type === TRACK_TYPE.MOTION_DRIVER
-                ? COLORS.motionDriverSoft
-                : (i % 2 === 0 ? this._timelineColor(COLORS.track) : this._timelineColor(COLORS.bg));
+            // Track background: alternating navy base, plus optional per-type tint overlay from settings
+            ctx.fillStyle = i % 2 === 0 ? this._timelineColor(COLORS.track) : this._timelineColor(COLORS.bg);
             ctx.fillRect(0, y, width, h);
+            if (isLane) {
+                const tint = this._resolveLaneTint(entry.type);
+                if (tint) {
+                    ctx.save();
+                    ctx.globalAlpha = 0.18;
+                    ctx.fillStyle = tint;
+                    ctx.fillRect(0, y, width, h);
+                    ctx.restore();
+                }
+            }
 
             if (collapsed) {
                 // Collapsed: just arrow + short label
@@ -6357,6 +6384,15 @@ export class EditorWidget {
                 ["Ctrl+A", "Select all visible assets"],
                 ["Delete", "Trash or permanently delete selection (when gallery focused)"],
                 ["Esc", "Clear or reduce gallery selection"],
+            ]) +
+            this._shortcutSection("Inspect Overlay", [
+                ["← / →", "Cycle to previous / next asset (visual order)"],
+                ["Space", "Play / Pause (video / audio)"],
+                ["C", "Toggle Compare mode (when peers exist)"],
+                ["F / 0", "Fit (reset zoom and pan)"],
+                ["+ / -", "Zoom in / out at center (1x-16x)"],
+                ["Wheel", "Zoom (cursor-pivot in, glide-to-center out)"],
+                ["Esc", "Close overlay"],
             ]) +
             this._shortcutSection("View", [
                 ["Wheel", "Vertical lane scroll"],
@@ -9741,6 +9777,43 @@ export class EditorWidget {
             () => this._settings.appearance.clipLabelMode,
             (value) => updateCategory("appearance", "clipLabelMode", value)
         );
+
+        const laneTintSpecs = [
+            { key: "video", label: "Video Lane Tint", description: "Optional subtle color overlay on all video lane backgrounds." },
+            { key: "audio", label: "Audio Lane Tint", description: "Optional subtle color overlay on all audio lane backgrounds." },
+            { key: "motion_driver", label: "Driver Lane Tint", description: "Optional subtle color overlay on all motion-driver lane backgrounds." },
+        ];
+        for (const spec of laneTintSpecs) {
+            const row = createRow(appearanceSection, spec.label, spec.description);
+            const input = document.createElement("input");
+            input.type = "color";
+            input.style.cssText = "width:44px;height:28px;padding:0;border:none;background:none;cursor:pointer;";
+            const current = this._settings.appearance.laneTintOverrides?.[spec.key] || "";
+            const displayHex = current || "#000000";
+            input.value = displayHex;
+            input.dataset.active = current ? "1" : "0";
+            const resetBtn = document.createElement("button");
+            resetBtn.type = "button";
+            resetBtn.textContent = "Reset";
+            resetBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "3px 8px", fontSize: "10px", radius: "5px" });
+            const applyTint = (hex) => {
+                updateCategory("appearance", "laneTintOverrides", {
+                    ...(this._settings.appearance.laneTintOverrides || {}),
+                    [spec.key]: hex,
+                });
+            };
+            input.addEventListener("change", () => {
+                input.dataset.active = "1";
+                applyTint(input.value);
+            });
+            resetBtn.addEventListener("click", () => {
+                input.value = "#000000";
+                input.dataset.active = "0";
+                applyTint("");
+            });
+            row.append(input, resetBtn);
+            controls[`laneTintOverride_${spec.key}`] = input;
+        }
 
         const projectDefaultsSection = createSection(
             "Project Defaults",

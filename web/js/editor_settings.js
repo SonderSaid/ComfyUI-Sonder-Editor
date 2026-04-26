@@ -124,6 +124,11 @@ export const DEFAULT_EDITOR_SETTINGS = {
         waveformAccent: "#dcffdc",
         timelineBrightness: 100,
         clipLabelMode: "name_duration",
+        laneTintOverrides: {
+            video: "",
+            audio: "",
+            motion_driver: "",
+        },
     },
     batchRender: {
         maxFramesPerChunk: 0,
@@ -326,6 +331,17 @@ function legacyLayoutSettings() {
     };
 }
 
+function normalizeLaneTintOverrides(nextValue) {
+    const defaults = DEFAULT_EDITOR_SETTINGS.appearance.laneTintOverrides;
+    const source = nextValue && typeof nextValue === "object" ? nextValue : {};
+    const normalized = {};
+    for (const key of Object.keys(defaults)) {
+        const candidate = source[key];
+        normalized[key] = isHexColor(candidate) ? candidate : "";
+    }
+    return normalized;
+}
+
 function normalizeSnapTargets(nextValue) {
     const defaults = DEFAULT_EDITOR_SETTINGS.timelineBehavior.snapTargets;
     const source = nextValue && typeof nextValue === "object" ? nextValue : {};
@@ -481,6 +497,7 @@ function normalizeEditorSettings(source = null) {
             clipLabelMode: VALID_CLIP_LABEL_MODES.has(stored?.appearance?.clipLabelMode)
                 ? stored.appearance.clipLabelMode
                 : defaults.appearance.clipLabelMode,
+            laneTintOverrides: normalizeLaneTintOverrides(stored?.appearance?.laneTintOverrides),
         },
         batchRender: {
             maxFramesPerChunk: clampNumber(

@@ -70,8 +70,8 @@ class SonderEditor:
     RETURN_TYPES = ("SONDER_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "IMAGE", "INT", "FLOAT",
                     "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO", "FLOAT", "FLOAT")
     RETURN_NAMES = (
-        "project", "rendered_frames", "guide_images", "guide_indices", "guide_strengths",
-        "motion_driver_images", "motion_driver_frame_index", "motion_driver_strength",
+        "project", "rendered_frames", "guide_images", "guide_idx", "guide_strengths",
+        "motion_driver_images", "motion_driver_idx", "motion_driver_strength",
         "prompt", "frame_count", "fps", "width", "height", "audio",
         "mask_start_time", "mask_end_time",
     )
@@ -80,7 +80,7 @@ class SonderEditor:
         "Composited video frames from the timeline (all visible clips layered with opacity).",
         "Guide frame images as an IMAGE batch tensor. Connect to LTX guiders.",
         "Comma-separated frame indices for each guide image (e.g., '0,96').",
-        "Comma-separated guide strengths aligned with guide_indices.",
+        "Comma-separated guide strengths aligned with guide_idx.",
         "Motion-driver video frames as an IMAGE batch tensor.",
         "Local output frame where the motion driver begins.",
         "Motion-driver conditioning strength.",

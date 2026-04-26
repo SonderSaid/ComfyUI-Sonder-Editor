@@ -141,6 +141,7 @@ const OVERLAY_CAPTURE_KEYS = new Set([
     "+",
     "-",
     "_",
+    "0",
     "a",
     "A",
     "c",
@@ -1737,12 +1738,15 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function overlayAssets() {
-        return filteredAssets();
+        return navigableAssets();
     }
 
     function currentOverlayAsset() {
         const assetId = state.overlayState.assetId;
-        return overlayAssets().find((asset) => asset.asset_id === assetId) || null;
+        if (!assetId) return null;
+        const fromVisible = overlayAssets().find((asset) => asset.asset_id === assetId);
+        if (fromVisible) return fromVisible;
+        return filteredAssets().find((asset) => asset.asset_id === assetId) || null;
     }
 
     function sameTypeOverlayAssets(asset) {
@@ -1783,6 +1787,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         let lastY = 0;
         let dragStartX = 0;
         let dragStartY = 0;
+        let lastDragMouseUpAt = 0;
 
         const applyTransform = () => {
             const transform = `translate(${state.overlayState.panX}px, ${state.overlayState.panY}px) scale(${state.overlayState.zoomLevel})`;
@@ -1800,14 +1805,22 @@ export function mountSharedAssetGallery(container, options = {}) {
         const handleWheel = (event) => {
             event.preventDefault();
             const rect = surface.getBoundingClientRect();
-            const cursorX = event.clientX - rect.left - rect.width / 2;
-            const cursorY = event.clientY - rect.top - rect.height / 2;
             const previousZoom = state.overlayState.zoomLevel;
-            const nextZoom = clamp(previousZoom * (event.deltaY < 0 ? 1.12 : (1 / 1.12)), 1, 8);
+            const zoomingIn = event.deltaY < 0;
+            const nextZoom = clamp(previousZoom * (zoomingIn ? 1.12 : (1 / 1.12)), 1, 16);
             if (nextZoom === previousZoom) return;
-            const scale = nextZoom / previousZoom;
-            state.overlayState.panX -= cursorX * (scale - 1);
-            state.overlayState.panY -= cursorY * (scale - 1);
+            if (zoomingIn) {
+                const cursorX = event.clientX - rect.left - rect.width / 2;
+                const cursorY = event.clientY - rect.top - rect.height / 2;
+                const scale = nextZoom / previousZoom;
+                state.overlayState.panX -= cursorX * (scale - 1);
+                state.overlayState.panY -= cursorY * (scale - 1);
+            } else {
+                const denom = Math.max(0.0001, previousZoom - 1);
+                const factor = Math.max(0, (nextZoom - 1) / denom);
+                state.overlayState.panX *= factor;
+                state.overlayState.panY *= factor;
+            }
             state.overlayState.zoomLevel = nextZoom;
             applyTransform();
         };
@@ -1831,6 +1844,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const handleMouseUp = (event) => {
             const dragged = dragging;
+            if (dragged) lastDragMouseUpAt = performance.now();
             dragging = false;
             pendingDrag = false;
             updateCursor();
@@ -1849,6 +1863,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const handleMouseDown = (event) => {
             if (event.button !== 0) return;
+            event.preventDefault();
             pendingDrag = true;
             dragging = false;
             dragStartX = event.clientX;
@@ -1860,6 +1875,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             window.addEventListener("mouseup", handleMouseUp);
         };
 
+        const handleDragStart = (event) => {
+            event.preventDefault();
+        };
+
         const handleClickCapture = (event) => {
             if (!suppressClick) return;
             suppressClick = false;
@@ -1869,6 +1888,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
 
         const handleDoubleClick = () => {
+            if (performance.now() - lastDragMouseUpAt < 350) return;
             resetOverlayTransform();
             applyTransform();
         };
@@ -1877,6 +1897,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         surface.addEventListener("mousedown", handleMouseDown);
         surface.addEventListener("click", handleClickCapture, true);
         surface.addEventListener("dblclick", handleDoubleClick);
+        surface.addEventListener("dragstart", handleDragStart);
         updateCursor();
         applyTransform();
 
@@ -1888,6 +1909,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             surface.removeEventListener("mousedown", handleMouseDown);
             surface.removeEventListener("click", handleClickCapture, true);
             surface.removeEventListener("dblclick", handleDoubleClick);
+            surface.removeEventListener("dragstart", handleDragStart);
             window.removeEventListener("mousemove", handleMouseMove);
             window.removeEventListener("mouseup", handleMouseUp);
             surface.style.cursor = "";
@@ -1971,18 +1993,24 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function renderInteractiveWaveform(assets, mediaEls, colors, opts = {}) {
-        const { enableZoom = false } = opts;
+        const { enableZoom = false, compact = false } = opts;
         const assetList = (Array.isArray(assets) ? assets : [assets]).filter(Boolean);
         const mediaList = (Array.isArray(mediaEls) ? mediaEls : [mediaEls]).filter(Boolean);
         const primary = () => mediaList[0] || null;
 
-        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
-        const headerRow = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;`);
+        const wrapStyle = compact
+            ? `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid #343434;`
+            : `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid #343434;flex:1 1 auto;min-height:0;`;
+        const wrap = style(document.createElement("div"), wrapStyle);
+        const headerRow = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;flex:0 0 auto;`);
         const status = style(document.createElement("div"), `color:#8ea0af;font-size:10px;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         status.textContent = "Loading waveform...";
         const timeLabel = style(document.createElement("div"), `color:#a9bccb;font-size:10px;white-space:nowrap;`);
         headerRow.append(status, timeLabel);
-        const canvas = style(document.createElement("canvas"), `width:100%;height:88px;border-radius:6px;background:#0a0f13;display:block;cursor:pointer;`);
+        const canvasStyle = compact
+            ? `width:100%;height:88px;border-radius:6px;background:#0a0f13;display:block;cursor:pointer;`
+            : `width:100%;flex:1 1 0;min-height:120px;height:100%;border-radius:6px;background:#0a0f13;display:block;cursor:pointer;`;
+        const canvas = style(document.createElement("canvas"), canvasStyle);
         wrap.append(headerRow, canvas);
 
         let datasets = null;
@@ -2003,11 +2031,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         const draw = () => {
             if (!active) return;
             const rect = canvas.getBoundingClientRect();
+            const dpr = window.devicePixelRatio || 1;
             const width = Math.max(320, Math.floor(rect.width || 640));
-            const height = 88;
-            canvas.width = width;
-            canvas.height = height;
+            const height = compact ? 88 : Math.max(120, Math.floor(rect.height || 88));
+            canvas.width = Math.floor(width * dpr);
+            canvas.height = Math.floor(height * dpr);
             const ctx = canvas.getContext("2d");
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
             ctx.clearRect(0, 0, width, height);
             ctx.fillStyle = "#0a0f13";
             ctx.fillRect(0, 0, width, height);
@@ -2246,6 +2276,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (asset.asset_type === "image") {
             const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
             const img = style(document.createElement("img"), `max-width:100%;max-height:100%;display:block;user-select:none;pointer-events:none;`);
+            img.draggable = false;
             img.src = buildAssetViewUrl(projectDir, asset.path);
             img.alt = assetDisplayName(asset);
             stage.appendChild(img);
@@ -2327,7 +2358,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 if (audio.paused) void audio.play();
                 else audio.pause();
             });
-            const waveform = renderInteractiveWaveform(asset, audio, ["#7fc0ff"]);
+            const waveform = renderInteractiveWaveform(asset, audio, ["#7fc0ff"], { compact: true });
             card.append(playBtn, waveform.el);
             state.overlayState.cleanupFns.push(waveform.cleanup, blobHandle.cleanup, () => audio.pause());
             content.appendChild(card);
@@ -2441,6 +2472,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             const mediaStyle = `position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;background:#000;pointer-events:none;user-select:none;`;
             layerA.style.cssText = mediaStyle;
             layerB.style.cssText = mediaStyle;
+            layerA.draggable = false;
+            layerB.draggable = false;
             if (asset.asset_type === "image") {
                 layerA.src = buildAssetViewUrl(currentProjectDir(), compareA.path);
                 layerB.src = buildAssetViewUrl(currentProjectDir(), compareB.path);
@@ -2457,45 +2490,54 @@ export function mountSharedAssetGallery(container, options = {}) {
                 layerA.muted = state.overlayState.audioFocus !== "a";
                 layerB.muted = state.overlayState.audioFocus !== "b";
             }
-            const contentGroup = style(document.createElement("div"), `position:relative;width:100%;height:100%;`);
-            contentGroup.append(layerA, layerB);
-            const divider = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:2px;transform:translateX(-50%);background:#f1f5f8;box-shadow:0 0 0 1px rgba(0,0,0,0.35);cursor:col-resize;pointer-events:auto;z-index:2;`);
-            stage.appendChild(contentGroup);
+            const groupStyle = `position:absolute;inset:0;width:100%;height:100%;pointer-events:none;`;
+            const contentGroupA = style(document.createElement("div"), groupStyle);
+            const contentGroupB = style(document.createElement("div"), groupStyle);
+            contentGroupA.appendChild(layerA);
+            contentGroupB.appendChild(layerB);
+            const clipWrapperB = style(document.createElement("div"), `position:absolute;inset:0;pointer-events:none;`);
+            clipWrapperB.appendChild(contentGroupB);
+            const divider = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:14px;transform:translateX(-50%);cursor:col-resize;pointer-events:auto;z-index:3;`);
+            const dividerLine = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:2px;transform:translateX(-50%);background:#f1f5f8;box-shadow:0 0 0 1px rgba(0,0,0,0.35);`);
+            divider.appendChild(dividerLine);
+            stage.appendChild(contentGroupA);
+            stage.appendChild(clipWrapperB);
             stage.appendChild(divider);
             const applyDivider = () => {
-                const rect = stage.getBoundingClientRect();
-                const safeWidth = Math.max(1, rect.width);
-                const localX = clamp(state.overlayState.dividerRatio, 0, 1) * safeWidth;
-                const leftInset = `${clamp(state.overlayState.dividerRatio * 100, 0, 100)}%`;
-                const halfW = safeWidth / 2;
-                const screenX = halfW + state.overlayState.panX + ((localX - halfW) * state.overlayState.zoomLevel);
-                layerB.style.clipPath = `inset(0 0 0 ${leftInset})`;
-                divider.style.left = `${clamp(screenX, 0, safeWidth)}px`;
+                const ratio = clamp(state.overlayState.dividerRatio, 0, 1);
+                const leftPct = `${ratio * 100}%`;
+                clipWrapperB.style.clipPath = `inset(0 0 0 ${leftPct})`;
+                divider.style.left = leftPct;
+                divider.style.transform = "translateX(-50%)";
             };
             applyDivider();
 
             const handleDividerMove = (event) => {
                 const rect = stage.getBoundingClientRect();
-                const stageX = event.clientX - rect.left;
-                const halfW = rect.width / 2;
-                const localX = (stageX - halfW - state.overlayState.panX) / state.overlayState.zoomLevel + halfW;
-                state.overlayState.dividerRatio = clamp(localX / Math.max(1, rect.width), 0, 1);
+                const ratio = (event.clientX - rect.left) / Math.max(1, rect.width);
+                state.overlayState.dividerRatio = clamp(ratio, 0, 1);
                 applyDivider();
             };
-            const handleDividerUp = () => {
-                window.removeEventListener("mousemove", handleDividerMove);
-                window.removeEventListener("mouseup", handleDividerUp);
-            };
             divider.addEventListener("mousedown", (event) => {
+                event.stopPropagation();
+            }, true);
+            const handleDividerPointerDown = (event) => {
+                if (event.button !== 0) return;
                 event.preventDefault();
                 event.stopPropagation();
-                window.addEventListener("mousemove", handleDividerMove);
-                window.addEventListener("mouseup", handleDividerUp);
-            });
-            state.overlayState.cleanupFns.push(() => {
-                window.removeEventListener("mousemove", handleDividerMove);
-                window.removeEventListener("mouseup", handleDividerUp);
-            });
+                divider.setPointerCapture?.(event.pointerId);
+                const onMove = (e) => handleDividerMove(e);
+                const onUp = (e) => {
+                    divider.releasePointerCapture?.(e.pointerId);
+                    divider.removeEventListener("pointermove", onMove);
+                    divider.removeEventListener("pointerup", onUp);
+                    divider.removeEventListener("pointercancel", onUp);
+                };
+                divider.addEventListener("pointermove", onMove);
+                divider.addEventListener("pointerup", onUp);
+                divider.addEventListener("pointercancel", onUp);
+            };
+            divider.addEventListener("pointerdown", handleDividerPointerDown);
             const handleResize = () => applyDivider();
             window.addEventListener("resize", handleResize);
             state.overlayState.cleanupFns.push(() => window.removeEventListener("resize", handleResize));
@@ -2537,7 +2579,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
 
             center.appendChild(stage);
-            state.overlayState.cleanupFns.push(attachZoomPan(stage, contentGroup, { onTransform: applyDivider }));
+            state.overlayState.cleanupFns.push(attachZoomPan(stage, [contentGroupA, contentGroupB]));
 
             if (asset.asset_type === "video") {
                 const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
@@ -2607,9 +2649,25 @@ export function mountSharedAssetGallery(container, options = {}) {
             overlay.overlayEl = overlayEl;
         }
 
+        const applyCenterZoom = (factor) => {
+            const previousZoom = state.overlayState.zoomLevel;
+            const nextZoom = clamp(previousZoom * factor, 1, 16);
+            if (nextZoom === previousZoom) return;
+            if (nextZoom > previousZoom) {
+                // center pivot — no pan adjustment needed since transform-origin is center
+            } else {
+                const denom = Math.max(0.0001, previousZoom - 1);
+                const ratio = Math.max(0, (nextZoom - 1) / denom);
+                state.overlayState.panX *= ratio;
+                state.overlayState.panY *= ratio;
+            }
+            state.overlayState.zoomLevel = nextZoom;
+            renderInspectOverlay();
+        };
         const keyDownHandler = (event) => {
             if (!overlay.open) return false;
             if (event.target?.closest?.("input, textarea, select")) return false;
+            if (event.ctrlKey || event.metaKey || event.altKey) return false;
             if (event.key === "Escape") { closeInspectOverlay(); return true; }
             if (event.key === " " || event.key === "Spacebar") {
                 if (typeof overlay.togglePlayback === "function") overlay.togglePlayback();
@@ -2617,6 +2675,28 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
             if (event.key === "ArrowLeft") { cycleOverlayAsset(-1); return true; }
             if (event.key === "ArrowRight") { cycleOverlayAsset(1); return true; }
+            if (event.key === "f" || event.key === "F" || event.key === "0") {
+                resetOverlayTransform();
+                renderInspectOverlay();
+                return true;
+            }
+            if (event.key === "c" || event.key === "C") {
+                const candidates = sameTypeOverlayAssets(currentOverlayAsset());
+                if (candidates.length < 2) return true;
+                overlay.compareMode = !overlay.compareMode;
+                if (overlay.compareMode) ensureCompareDefaults(currentOverlayAsset());
+                resetOverlayTransform();
+                renderInspectOverlay();
+                return true;
+            }
+            if (event.key === "+" || event.key === "=") {
+                applyCenterZoom(1.25);
+                return true;
+            }
+            if (event.key === "-" || event.key === "_") {
+                applyCenterZoom(1 / 1.25);
+                return true;
+            }
             return shouldCaptureOverlayShortcut(event);
         };
         const keyUpHandler = (event) => {
@@ -2648,6 +2728,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const compareCandidates = sameTypeOverlayAssets(asset);
         const fitBtn = makeActionButton("subtle");
         fitBtn.textContent = "Fit";
+        fitBtn.title = "Fit (F / 0)";
         fitBtn.addEventListener("click", () => {
             resetOverlayTransform();
             renderInspectOverlay();
@@ -2655,6 +2736,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         toolbarActions.appendChild(fitBtn);
         const compareBtn = makeActionButton();
         compareBtn.textContent = overlay.compareMode ? "Compare Off" : "Compare";
+        compareBtn.title = compareCandidates.length < 2 ? "Compare needs ≥ 2 same-type visible assets" : "Compare (C)";
         compareBtn.disabled = compareCandidates.length < 2;
         compareBtn.addEventListener("click", () => {
             overlay.compareMode = !overlay.compareMode;
