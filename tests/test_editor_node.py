@@ -133,6 +133,195 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     assert project._execution_context["post_context_frames"] == 4
 
 
+class _FrameConstraintScene:
+    scene_id = "scene-1"
+    name = "Scene 1"
+    duration_frames = 601
+    width = 0
+    height = 0
+    fps = 24.0
+    guide_frames = []
+
+    @staticmethod
+    def get_prompt_for_range(start_frame, end_frame):
+        return f"prompt:{start_frame}-{end_frame}"
+
+
+class _FrameConstraintProject:
+    def __init__(self, project_dir, *, template_id="free", frame_constraint=None):
+        self.fps = 24.0
+        self.resolution = (4, 4)
+        self.project_dir = str(project_dir)
+        self.template_id = template_id
+        self.frame_constraint = frame_constraint
+        self._execution_context = None
+        self._scene = _FrameConstraintScene()
+
+    def get_scene(self, scene_id):
+        return self._scene if scene_id == self._scene.scene_id else None
+
+    @staticmethod
+    def get_asset(asset_id):
+        return None
+
+
+def _patch_render_and_audio(editor_node, monkeypatch):
+    torch = importlib.import_module("torch")
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end: torch.ones(end - start, 4, 4, 3, dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio((end - start) / 24.0),
+    )
+
+
+def _execute_constraint_test(editor_node, project, monkeypatch):
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    return editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=482,
+        selection_end=601,
+        pre_context_frames=48,
+        post_context_frames=0,
+    )
+
+
+def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    result = _execute_constraint_test(editor_node, project, monkeypatch)
+
+    audio = result[13]
+    assert result[9] == 169
+    assert tuple(result[1].shape) == (169, 4, 4, 3)
+    assert result[14] == pytest.approx(48 / 24.0)
+    assert result[15] == pytest.approx(167 / 24.0)
+    assert audio["waveform"].shape[-1] >= int((169 / 24.0) * audio["sample_rate"])
+    assert project._execution_context["source_frame_count"] == 167
+    assert project._execution_context["frame_count"] == 169
+    assert project._execution_context["frame_count_padding"] == 2
+    assert project._execution_context["template_id"] == "ltxv-2.3"
+
+
+def test_queue_job_frame_constraint_overrides_project(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    queue_job = type(
+        "DummyQueueJob",
+        (),
+        {
+            "scene_id": "scene-1",
+            "selection_start": 482,
+            "selection_end": 601,
+            "pre_context_frames": 48,
+            "post_context_frames": 0,
+            "context_frames": 48,
+            "template_id": "custom-job-wins",
+            "frame_constraint": {"step": 4, "offset": 0, "min": 1},
+            "take_placement_mode": "trimmed",
+            "params": {},
+            "prompt": "queued",
+            "scene_name": "Scene 1",
+            "status": "pending",
+            "job_id": "job-1",
+            "batch_id": "",
+            "batch_total": 0,
+            "batch_index": 0,
+            "guide_frame_snapshots": [],
+            "prompt_sections": [],
+            "scene_width": 0,
+            "scene_height": 0,
+            "scene_fps": 0.0,
+            "error": "",
+            "progress": 0.0,
+        },
+    )()
+    project.generation_queue = [queue_job]
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(editor_node, "save_project", lambda proj: None)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_execution_reaches_terminal_save",
+        lambda self, prompt, node_id: True,
+    )
+    _patch_render_and_audio(editor_node, monkeypatch)
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=0,
+        pre_context_frames=0,
+        post_context_frames=0,
+        prompt={"1": {"class_type": "SonderEditor", "inputs": {}}},
+        unique_id="1",
+    )
+
+    # 167 source frames -> next 4n is 168 (job constraint wins over project's 8n+1=169)
+    assert result[9] == 168
+    assert tuple(result[1].shape) == (168, 4, 4, 3)
+    assert project._execution_context["source_frame_count"] == 167
+    assert project._execution_context["frame_count"] == 168
+    assert project._execution_context["frame_count_padding"] == 1
+    assert project._execution_context["template_id"] == "custom-job-wins"
+
+
+def test_missing_frame_constraint_no_padding(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    project = _FrameConstraintProject(tmp_path, template_id="free", frame_constraint=None)
+    result = _execute_constraint_test(editor_node, project, monkeypatch)
+
+    assert result[9] == 167
+    assert tuple(result[1].shape) == (167, 4, 4, 3)
+    assert project._execution_context["source_frame_count"] == 167
+    assert project._execution_context["frame_count"] == 167
+    assert project._execution_context["frame_count_padding"] == 0
+
+
+def test_custom_template_constraint_pads_correctly(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="my-custom-template",
+        frame_constraint={"step": 10, "offset": 3, "min": 1},
+    )
+    result = _execute_constraint_test(editor_node, project, monkeypatch)
+
+    # 167 source -> next 10n+3 is 173
+    assert result[9] == 173
+    assert tuple(result[1].shape) == (173, 4, 4, 3)
+    assert project._execution_context["frame_count"] == 173
+    assert project._execution_context["frame_count_padding"] == 6
+    assert project._execution_context["template_id"] == "my-custom-template"
+
+
 def test_execution_reaches_terminal_save_only_for_linked_editor(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
 
@@ -537,6 +726,70 @@ def test_render_scene_frames_excludes_motion_driver_clips(tmp_path, monkeypatch)
     assert float(tensor[..., 0].max()) == pytest.approx(0.0)
 
 
+def test_render_scene_frames_uses_take_source_in_without_repeating_seam_frame(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    cv2 = importlib.import_module("cv2")
+    np = importlib.import_module("numpy")
+
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    (media_dir / "chunk1.mp4").write_bytes(b"chunk1")
+    (media_dir / "chunk2.mp4").write_bytes(b"chunk2")
+
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), resolution=(1, 1))
+    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=10)
+    scene.video_lane_configs = [timeline_state.LaneConfig(), timeline_state.LaneConfig()]
+    scene.clips = [
+        timeline_state.ClipReference(
+            source_path=os.path.join("media", "chunk1.mp4"),
+            timeline_start_frame=0,
+            timeline_end_frame=6,
+            source_in_frame=0,
+            source_out_frame=6,
+            total_source_frames=6,
+            track_index=0,
+        ),
+        timeline_state.ClipReference(
+            source_path=os.path.join("media", "chunk2.mp4"),
+            timeline_start_frame=6,
+            timeline_end_frame=10,
+            source_in_frame=2,
+            source_out_frame=6,
+            total_source_frames=6,
+            track_index=1,
+        ),
+    ]
+
+    class NumberedCapture:
+        def __init__(self, path):
+            self.path = path
+            self.pos = 0
+
+        def isOpened(self):
+            return True
+
+        def set(self, prop, value):
+            if prop == cv2.CAP_PROP_POS_FRAMES:
+                self.pos = int(value)
+
+        def read(self):
+            base = 4 if self.path.endswith("chunk2.mp4") else 0
+            value = base + self.pos
+            return True, np.full((1, 1, 3), value, dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(editor_node.cv2, "VideoCapture", NumberedCapture)
+
+    tensor = editor_node.SonderEditor()._render_scene_frames(project, scene, 4, 8)
+    values = [round(float(tensor[i, 0, 0, 0]) * 255) for i in range(tensor.shape[0])]
+
+    assert values == [4, 5, 6, 7]
+
+
 def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
@@ -621,6 +874,7 @@ def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path,
         selection_end=8,
         pre_context_frames=1,
         post_context_frames=2,
+        take_placement_mode="untrimmed",
     )
 
     assert save_calls == []
@@ -630,6 +884,7 @@ def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path,
     assert result[14] == pytest.approx(1 / 24.0)
     assert result[15] == pytest.approx(7 / 24.0)
     assert project._execution_context["queue_job_id"] == ""
+    assert project._execution_context["take_placement_mode"] == "untrimmed"
 
 
 def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
@@ -672,6 +927,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
         scene_width=8,
         scene_height=6,
         scene_fps=30.0,
+        take_placement_mode="untrimmed",
     )
 
     class DummyProject:
@@ -750,6 +1006,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     assert result[14] == pytest.approx(4 / 30.0)
     assert result[15] == pytest.approx(24 / 30.0)
     assert project._execution_context["queue_job_id"] == "job-1"
+    assert project._execution_context["take_placement_mode"] == "untrimmed"
 
 
 def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
@@ -1214,6 +1471,73 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
     assert scene.clips[0].timeline_start_frame == 4
     assert scene.clips[0].timeline_end_frame == 12
     assert result["result"][0].endswith(".mp4")
+
+
+def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True, exist_ok=True)
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=48)
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Take Placement Test",
+        scenes=[scene],
+    )
+
+    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
+        Path(cmd[-2]).write_bytes(b"video")
+        return types.SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    node = io_nodes.SonderSaveVideo()
+
+    project._execution_context = {
+        "scene_id": "scene-1",
+        "scene_name": "Scene 1",
+        "selection_start": 10,
+        "selection_end": 14,
+        "actual_pre_context_frames": 2,
+        "actual_post_context_frames": 1,
+        "frame_count_padding": 2,
+        "take_placement_mode": "trimmed",
+    }
+    node.save_video(project, torch.zeros(9, 2, 2, 3, dtype=torch.float32), filename_prefix="trimmed", fps=24.0, mode="Take")
+    trimmed = scene.clips[-1]
+
+    assert trimmed.timeline_start_frame == 10
+    assert trimmed.timeline_end_frame == 14
+    assert trimmed.source_in_frame == 2
+    assert trimmed.source_out_frame == 6
+    assert trimmed.source_origin_frame == 2
+    assert trimmed.total_source_frames == 9
+
+    project._execution_context = {
+        "scene_id": "scene-1",
+        "scene_name": "Scene 1",
+        "selection_start": 20,
+        "selection_end": 24,
+        "actual_pre_context_frames": 2,
+        "actual_post_context_frames": 1,
+        "take_placement_mode": "untrimmed",
+    }
+    node.save_video(project, torch.zeros(8, 2, 2, 3, dtype=torch.float32), filename_prefix="untrimmed", fps=24.0, mode="Take")
+    untrimmed = scene.clips[-1]
+
+    assert untrimmed.timeline_start_frame == 18
+    assert untrimmed.timeline_end_frame == 26
+    assert untrimmed.source_in_frame == 0
+    assert untrimmed.source_out_frame == 8
+    assert untrimmed.source_origin_frame == 0
+    assert untrimmed.total_source_frames == 8
 
 
 def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, monkeypatch):

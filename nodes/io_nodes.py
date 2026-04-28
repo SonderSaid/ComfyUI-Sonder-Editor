@@ -929,24 +929,53 @@ class SonderSaveVideo:
                     scene.video_lane_configs.append(LaneConfig())
 
                 # Determine clip placement — at original selection, not context-expanded range
-                sel_start = ctx.get("selection_start", 0)
-                sel_end = ctx.get("selection_end", sel_start + total_frames)
-                pre_ctx = ctx.get("pre_context_frames", ctx.get("context_frames", 0))
-                post_ctx = ctx.get("post_context_frames", ctx.get("context_frames", 0))
+                def context_int(key, default=0):
+                    try:
+                        return int(ctx.get(key, default) or 0)
+                    except (TypeError, ValueError):
+                        return default
 
-                # Source trim: if context frames exist, the video has pre+generation+post
-                # The clip should show only the generated portion
-                source_in = pre_ctx if pre_ctx > 0 else 0
-                source_out = total_frames - post_ctx if post_ctx > 0 else total_frames
+                sel_start = context_int("selection_start", 0)
+                sel_end = context_int("selection_end", sel_start + total_frames)
+                actual_pre = max(0, context_int(
+                    "actual_pre_context_frames",
+                    context_int("pre_context_frames", context_int("context_frames", 0)),
+                ))
+                actual_post = max(0, context_int(
+                    "actual_post_context_frames",
+                    context_int("post_context_frames", context_int("context_frames", 0)),
+                ))
+                frame_count_padding = max(0, context_int("frame_count_padding", 0))
+                take_placement_mode = ctx.get("take_placement_mode", "trimmed")
+
+                if take_placement_mode == "untrimmed":
+                    # Untrimmed: place full rendered source (pre+generation+post) on the timeline
+                    # so the seam is visible rather than inferred.
+                    source_in_frame = 0
+                    source_out_frame = total_frames
+                    timeline_start_frame = sel_start - actual_pre
+                    timeline_end_frame = timeline_start_frame + total_frames
+                    source_origin_frame = 0
+                    clip_total_source_frames = total_frames
+                else:
+                    # Trimmed (default): show only the generated portion on the timeline
+                    source_in_frame = min(total_frames, actual_pre if actual_pre > 0 else 0)
+                    hidden_tail_frames = actual_post + frame_count_padding
+                    source_out_frame = total_frames - hidden_tail_frames if hidden_tail_frames > 0 else total_frames
+                    source_out_frame = max(source_in_frame, min(total_frames, source_out_frame))
+                    timeline_start_frame = sel_start
+                    timeline_end_frame = sel_end
+                    source_origin_frame = source_in_frame
+                    clip_total_source_frames = total_frames
 
                 clip = ClipReference(
                     source_path=os.path.join("media", output_filename),
-                    timeline_start_frame=sel_start,
-                    timeline_end_frame=sel_end,
-                    source_in_frame=source_in,
-                    source_out_frame=source_out,
-                    total_source_frames=total_frames,
-                    source_origin_frame=source_in,
+                    timeline_start_frame=timeline_start_frame,
+                    timeline_end_frame=timeline_end_frame,
+                    source_in_frame=source_in_frame,
+                    source_out_frame=source_out_frame,
+                    total_source_frames=clip_total_source_frames,
+                    source_origin_frame=source_origin_frame,
                     track_index=new_lane,
                     is_generated=True,
                     generation_params=dict(ctx),
@@ -986,17 +1015,17 @@ class SonderSaveVideo:
 
                         scene.audio_tracks.append(AudioTrack(
                             source_path=audio_rel_path,
-                            timeline_start_frame=sel_start,
-                            timeline_end_frame=sel_end,
-                            source_in_frame=source_in,
-                            total_source_frames=total_frames,
-                            source_origin_frame=source_in,
+                            timeline_start_frame=timeline_start_frame,
+                            timeline_end_frame=timeline_end_frame,
+                            source_in_frame=source_in_frame,
+                            total_source_frames=clip_total_source_frames,
+                            source_origin_frame=source_origin_frame,
                             lane_index=new_audio_lane,
                         ))
-                        logger.info("Take audio auto-placed on lane %d at frames %d-%d", new_audio_lane, sel_start, sel_end)
+                        logger.info("Take audio auto-placed on lane %d at frames %d-%d", new_audio_lane, timeline_start_frame, timeline_end_frame)
                     except Exception as e:
                         logger.warning("Take mode audio auto-placement failed for %s: %s", output_filename, e)
-                logger.info("Take auto-placed on lane %d at frames %d-%d", new_lane, sel_start, sel_end)
+                logger.info("Take auto-placed on lane %d at frames %d-%d (mode=%s)", new_lane, timeline_start_frame, timeline_end_frame, take_placement_mode)
             else:
                 logger.warning("Take mode: scene_id '%s' not found, skipping auto-placement", ctx.get("scene_id", ""))
 

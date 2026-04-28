@@ -471,7 +471,7 @@ export function createViewportSurface(options = {}) {
 
     function clipSourceTime(layer, frame) {
         const sourceFrame = frame - layer.clip.timeline_start_frame + (layer.clip.source_in_frame || 0);
-        return Math.max(0, sourceFrame / fps());
+        return Math.max(0, (sourceFrame + 0.5) / fps());
     }
 
     function audioSourceTime(layer, frame) {

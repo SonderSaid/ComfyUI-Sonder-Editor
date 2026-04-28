@@ -119,6 +119,57 @@ def _clip_source_asset_type(project: TimelineProject, clip: ClipReference) -> st
     return _detect_asset_type(getattr(clip, "source_path", ""), "")
 
 
+def _is_render_clip(clip: ClipReference) -> bool:
+    return getattr(clip, "role", "render") in ("", "render")
+
+
+def _trim_lane_configs(configs: list, removed_index: int, target_count: int) -> None:
+    if 0 <= removed_index < len(configs):
+        configs.pop(removed_index)
+    while len(configs) > target_count:
+        configs.pop()
+    while len(configs) < target_count:
+        configs.append(LaneConfig())
+
+
+def _compact_empty_media_lane(scene: Scene, lane_type: str, lane_index: int) -> bool:
+    """Remove an empty normal video/audio lane and shift higher lanes down."""
+    try:
+        lane_index = int(lane_index)
+    except (TypeError, ValueError):
+        return False
+    if lane_index < 0:
+        return False
+
+    if lane_type == "video":
+        lane_count = max(1, int(scene.video_lane_count or 1))
+        if lane_count <= 1 or lane_index >= lane_count:
+            return False
+        if any(_is_render_clip(clip) and (clip.track_index or 0) == lane_index for clip in scene.clips):
+            return False
+        for clip in scene.clips:
+            if _is_render_clip(clip) and (clip.track_index or 0) > lane_index:
+                clip.track_index = max(0, (clip.track_index or 0) - 1)
+        scene.video_lane_count = lane_count - 1
+        _trim_lane_configs(scene.video_lane_configs, lane_index, scene.video_lane_count)
+        return True
+
+    if lane_type == "audio":
+        lane_count = max(1, int(scene.audio_lane_count or 1))
+        if lane_count <= 1 or lane_index >= lane_count:
+            return False
+        if any((track.lane_index or 0) == lane_index for track in scene.audio_tracks):
+            return False
+        for track in scene.audio_tracks:
+            if (track.lane_index or 0) > lane_index:
+                track.lane_index = max(0, (track.lane_index or 0) - 1)
+        scene.audio_lane_count = lane_count - 1
+        _trim_lane_configs(scene.audio_lane_configs, lane_index, scene.audio_lane_count)
+        return True
+
+    return False
+
+
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
     return os.path.join(project.project_dir, asset.path) if getattr(asset, "path", "") else ""
 
@@ -1289,6 +1340,8 @@ if routes is not None:
         width = body.get("width", 768)
         height = body.get("height", 512)
         template_id = body.get("template_id", "free") or "free"
+        raw_frame_constraint = body.get("frame_constraint")
+        frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
         base_dir = body.get("base_dir", "") or _get_base_dir()
 
         if not base_dir:
@@ -1296,6 +1349,9 @@ if routes is not None:
 
         try:
             project = create_project(name, fps, width, height, template_id, base_dir)
+            if frame_constraint is not None:
+                project.frame_constraint = frame_constraint
+                save_project(project)
             return web.json_response(project.to_dict(), status=201)
         except Exception as e:
             logger.exception("Failed to create project")
@@ -1321,6 +1377,9 @@ if routes is not None:
             project.resolution = tuple(body["resolution"])
         if "template_id" in body:
             project.template_id = str(body.get("template_id") or "free")
+        if "frame_constraint" in body:
+            raw = body.get("frame_constraint")
+            project.frame_constraint = raw if isinstance(raw, dict) and raw else None
         if "metadata" in body:
             project.metadata.update(body["metadata"])
 
@@ -2411,11 +2470,20 @@ if routes is not None:
             return _json_error(f"Scene not found: {scene_id}", 404)
 
         clip_id = request.match_info["clip_id"]
+        clip = next((c for c in scene.clips if c.clip_id == clip_id), None)
+        if not clip:
+            return _json_error(f"Clip not found: {clip_id}", 404)
+
+        deleted_lane = clip.track_index or 0
+        should_compact_lane = _is_render_clip(clip) and request.query.get("preserve_lane") != "1"
         original_count = len(scene.clips)
         scene.clips = [c for c in scene.clips if c.clip_id != clip_id]
 
         if len(scene.clips) == original_count:
             return _json_error(f"Clip not found: {clip_id}", 404)
+
+        if should_compact_lane:
+            _compact_empty_media_lane(scene, "video", deleted_lane)
 
         save_project(project)
         return web.json_response({"status": "deleted"})
@@ -2595,11 +2663,20 @@ if routes is not None:
             return _json_error(f"Scene not found: {scene_id}", 404)
 
         track_id = request.match_info["track_id"]
+        track = next((t for t in scene.audio_tracks if t.track_id == track_id), None)
+        if not track:
+            return _json_error(f"Audio track not found: {track_id}", 404)
+
+        deleted_lane = track.lane_index or 0
+        should_compact_lane = request.query.get("preserve_lane") != "1"
         original_count = len(scene.audio_tracks)
         scene.audio_tracks = [t for t in scene.audio_tracks if t.track_id != track_id]
 
         if len(scene.audio_tracks) == original_count:
             return _json_error(f"Audio track not found: {track_id}", 404)
+
+        if should_compact_lane:
+            _compact_empty_media_lane(scene, "audio", deleted_lane)
 
         save_project(project)
         return web.json_response({"status": "deleted"})
@@ -2939,6 +3016,12 @@ if routes is not None:
         )):
             params["snapshot_version"] = 1
 
+        raw_take_placement_mode = body.get("take_placement_mode", "trimmed")
+        take_placement_mode = raw_take_placement_mode if raw_take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
+
+        raw_frame_constraint = body.get("frame_constraint")
+        frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
+
         job = GenerationJob(
             scene_id=body.get("scene_id", ""),
             scene_name=body.get("scene_name", ""),
@@ -2957,6 +3040,8 @@ if routes is not None:
             scene_height=int(body.get("scene_height", 0)),
             scene_fps=float(body.get("scene_fps", 0.0) or 0.0),
             template_id=str(body.get("template_id", "free") or "free"),
+            frame_constraint=frame_constraint,
+            take_placement_mode=take_placement_mode,
             params=params,
         )
         project.generation_queue.append(job)
@@ -3012,23 +3097,24 @@ if routes is not None:
 
     @routes.delete("/sonder-editor/project/{project_id}/queue")
     async def api_clear_queue(request: web.Request) -> web.Response:
-        """Clear completed/failed jobs, or all if ?all=1."""
+        """Clear completed jobs, or all if ?all=1."""
         try:
             project = _load_project_from_request(request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
+        before = len(project.generation_queue)
         if request.query.get("all") == "1":
             project.generation_queue.clear()
         else:
-            # Default: clear completed and failed only
             project.generation_queue = [
                 j for j in project.generation_queue
-                if j.status not in ("completed", "failed")
+                if str(getattr(j, "status", "") or "").lower() != "completed"
             ]
+        removed = before - len(project.generation_queue)
 
         save_project(project)
-        return web.json_response({"status": "cleared"})
+        return web.json_response({"status": "cleared", "removed": removed})
 
     # -----------------------------------------------------------------------
     # WebSocket stub

@@ -23,14 +23,17 @@ import {
     PLAYBACK_RESOLUTION_OPTIONS,
     RESOLUTION_TIERS,
     SNAP_TARGET_OPTIONS,
+    TAKE_PLACEMENT_MODE_OPTIONS,
     TIMECODE_MODE_OPTIONS,
     computeResolutionFromTier,
     describeConstraintFormula,
+    frameConstraintsEqual,
     getEditorSettings,
     getAllModelTemplates,
     getTemplateById,
     previewConstraintValues,
     resolveBatchChunkSize,
+    resolveFrameConstraintForTemplate,
     snapResolution,
     snapToConstraint,
     subscribeEditorSettings,
@@ -360,6 +363,7 @@ export class EditorWidget {
         this.onWidgetValueChange = options.onWidgetValueChange || null;
         this.projectDir = "";
         this.projectId = "";
+        this._frameConstraintHealedFor = "";
         this._destroyed = false;
         this._settings = getEditorSettings();
         this._settingsUnsubscribe = null;
@@ -491,6 +495,7 @@ export class EditorWidget {
         this._buildDOM();
         this._setupKeyboardEvents();
         this._refreshContextInputs();
+        this._syncTakePlacementModeWidget();
 
         // Apply initial UI scales (bars + canvas will be scaled on first render)
         this._applyScales();
@@ -2395,14 +2400,23 @@ export class EditorWidget {
         }
     }
 
+    _resolveFrameConstraintForTemplate(templateId) {
+        return resolveFrameConstraintForTemplate(templateId, this._settings);
+    }
+
+    static _frameConstraintsEqual(a, b) {
+        return frameConstraintsEqual(a, b);
+    }
+
     async _updateProjectTemplateId(templateId) {
         if (!this.projectDir) return true;
         const dirName = this._projectDirName();
+        const frameConstraint = this._resolveFrameConstraintForTemplate(templateId);
         try {
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`), {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ template_id: templateId }),
+                body: JSON.stringify({ template_id: templateId, frame_constraint: frameConstraint }),
             });
             return !!resp.ok;
         } catch (error) {
@@ -2846,6 +2860,11 @@ export class EditorWidget {
         return updateEditorSettings(partial);
     }
 
+    _syncTakePlacementModeWidget(settings = this._settings) {
+        const mode = settings?.render?.takePlacementMode === "untrimmed" ? "untrimmed" : "trimmed";
+        this._setWidgetValue("take_placement_mode", mode);
+    }
+
     _trackCollapseSceneKey(scene = this.activeScene) {
         const projectKey = this._projectDirName();
         const sceneId = scene?.scene_id || "";
@@ -2984,6 +3003,7 @@ export class EditorWidget {
         const prevLaneTintSignature = JSON.stringify(this._settings?.appearance?.laneTintOverrides || {});
         const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
         this._settings = nextSettings;
+        this._syncTakePlacementModeWidget(nextSettings);
         const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
         const templateChanged = resolvedTemplateId !== this._templateId;
         this._templateId = resolvedTemplateId;
@@ -3094,6 +3114,7 @@ export class EditorWidget {
                 tintInput.dataset.active = stored ? "1" : "0";
             }
         }
+        if (controls.takePlacementMode) controls.takePlacementMode.value = this._settings.render?.takePlacementMode ?? "trimmed";
         if (controls.batchRenderMaxFramesPerChunk) controls.batchRenderMaxFramesPerChunk.value = String(this._settings.batchRender.maxFramesPerChunk);
         if (controls.defaultProjectFps) controls.defaultProjectFps.value = String(this._settings.projectDefaults.fps);
         if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
@@ -4786,8 +4807,8 @@ export class EditorWidget {
                             ? (this.activeScene?.clips || []).some(c => this._isRenderClip(c) && (c.track_index || 0) === entry.laneIndex)
                             : (this.activeScene?.audio_tracks || []).some(a => (a.lane_index || 0) === entry.laneIndex);
                         if (hasItems) {
-                            menuItems.push({ label: `Remove ${label} Lane (move items)`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
-                            menuItems.push({ label: `Remove ${label} Lane (delete items)`, action: () => this._removeLaneDeleteItems(entry.type, entry.laneIndex), danger: true });
+                            menuItems.push({ label: `Delete ${label} Lane and Move Items`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
+                            menuItems.push({ label: `Delete Items in ${label} Lane`, action: () => this._deleteItemsInLane(entry.type, entry.laneIndex), danger: true });
                         } else {
                             menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
                         }
@@ -5433,7 +5454,7 @@ export class EditorWidget {
         }
     }
 
-    async _removeLaneDeleteItems(trackType, laneIndex) {
+    async _deleteItemsInLane(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
         if (trackType === TRACK_TYPE.MOTION_DRIVER) {
             this._showToast("Motion-driver lanes are single-lane in this phase.");
@@ -5445,21 +5466,27 @@ export class EditorWidget {
             ? (this.activeScene?.clips || []).filter(c => this._isRenderClip(c) && (c.track_index || 0) === laneIndex)
             : (this.activeScene?.audio_tracks || []).filter(a => (a.lane_index || 0) === laneIndex);
         if (!items.length) {
-            await this._removeLane(trackType, laneIndex);
+            this._showToast("Lane is already empty.");
             return;
         }
-        if (!confirm(`Delete ${items.length} ${label} item(s) on lane ${laneIndex + 1} and remove this lane?`)) return;
+        if (!confirm(`Delete ${items.length} ${label} item(s) on lane ${laneIndex + 1}? The lane will remain.`)) return;
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
+            this._pushUndo("delete lane items");
             for (const item of items) {
                 const id = isVideo ? item.clip_id : item.track_id;
                 const endpoint = isVideo ? "clips" : "audio_tracks";
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
+                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}?preserve_lane=1`), {
                     method: "DELETE",
                 });
             }
-            await this._removeLane(trackType, laneIndex);
+            this._clearSelection();
+            this._hideItemEditor();
+            await this._fetchScenes();
+            this._buildTrackLayout();
+            this._renderTimeline();
+            this._renderViewportFrame();
         } catch (e) {
             console.warn("[Sonder] Failed to delete lane items:", e);
         }
@@ -7474,6 +7501,8 @@ export class EditorWidget {
             scene_height: Math.max(0, parseInt(this.activeScene.height, 10) || 0),
             scene_fps: Math.max(0, parseFloat(this.activeScene.fps) || 0),
             template_id: this._templateId || "free",
+            frame_constraint: this._resolveFrameConstraintForTemplate(this._templateId),
+            take_placement_mode: this._settings?.render?.takePlacementMode ?? "trimmed",
         };
     }
 
@@ -7638,6 +7667,22 @@ export class EditorWidget {
                 this._renderQueuePanel();
             }
         } catch (e) { console.error("Fetch queue failed:", e); }
+    }
+
+    async _clearCompletedRenderQueue() {
+        if (!this._projectDirName()) return;
+        try {
+            const dirName = encodeURIComponent(this._projectDirName());
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), { method: "DELETE" });
+            if (!resp.ok) {
+                const message = await this._readQueueError(resp, `Clear completed renders failed: ${resp.status}`);
+                throw new Error(message);
+            }
+            await this._fetchRenderQueue();
+        } catch (e) {
+            console.error("Clear completed renders failed:", e);
+            this._showToast(e?.message || "Clear completed renders failed.");
+        }
     }
 
     _updateQueueHeaderLabel() {
@@ -7879,6 +7924,34 @@ export class EditorWidget {
             return;
         }
 
+        const completedCount = queue.filter((job) => String(job?.status || "").toLowerCase() === "completed").length;
+        if (completedCount > 0) {
+            const actions = document.createElement("div");
+            actions.style.cssText = `
+                display: flex;
+                justify-content: flex-end;
+                align-items: center;
+                gap: 6px;
+                padding: 6px 8px;
+                border-bottom: 1px solid ${COLORS.borderSoft};
+                background: ${COLORS.panelMuted};
+            `;
+            const clearBtn = document.createElement("button");
+            clearBtn.type = "button";
+            clearBtn.textContent = "Clear Completed Renders";
+            clearBtn.title = `Remove ${completedCount} completed render${completedCount === 1 ? "" : "s"} from the queue`;
+            clearBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "4px 8px", fontSize: "10px", radius: "6px" });
+            clearBtn.addEventListener("click", async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                clearBtn.disabled = true;
+                clearBtn.style.opacity = "0.65";
+                await this._clearCompletedRenderQueue();
+            });
+            actions.appendChild(clearBtn);
+            this._queueContainer.appendChild(actions);
+        }
+
         const groups = this._groupRenderQueueJobs(queue);
         for (const entry of groups) {
             if (entry.type === "single") {
@@ -8109,6 +8182,7 @@ export class EditorWidget {
     updateProject(projectDir) {
         if (projectDir === this.projectDir) return;
         this.projectDir = projectDir;
+        this._frameConstraintHealedFor = "";
         this.activeSceneId = "";
         this.activeScene = null;
         this.scenes = [];
@@ -8168,12 +8242,35 @@ export class EditorWidget {
                     this.sceneHeight = data.resolution[1] || 512;
                 }
                 this._templateId = getTemplateById(data.template_id, this._settings).id;
+                await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 this._syncSceneResolutionControls();
                 this._updateViewportHeader();
                 this._resizeViewportCanvas();
             }
         } catch (e) {
             console.warn("[Sonder] Failed to fetch project settings:", e);
+        }
+    }
+
+    async _maybeHealFrameConstraint(projectDir, dirName, persistedConstraint) {
+        if (!projectDir || this._frameConstraintHealedFor === projectDir) return;
+        const expected = this._resolveFrameConstraintForTemplate(this._templateId);
+        if (EditorWidget._frameConstraintsEqual(expected, persistedConstraint)) {
+            this._frameConstraintHealedFor = projectDir;
+            return;
+        }
+        try {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ frame_constraint: expected }),
+            });
+            if (!resp.ok) {
+                throw new Error(`Frame-constraint self-heal failed: ${resp.status}`);
+            }
+            this._frameConstraintHealedFor = projectDir;
+        } catch (error) {
+            console.warn("[Sonder] Frame-constraint self-heal threw:", error);
         }
     }
 
@@ -8540,7 +8637,7 @@ export class EditorWidget {
         if (playableClips.length === 1) {
             const clip = playableClips[0];
             const sourceFrame = this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0);
-            const sourceTime = sourceFrame / this._effectiveFps;
+            const sourceTime = (sourceFrame + 0.5) / this._effectiveFps;
             this._viewportClipOpacity = clip.opacity ?? 1.0;
 
             const video = this._getOrCreateVideo(clip.source_path);
@@ -8610,7 +8707,7 @@ export class EditorWidget {
             const video = this._getOrCreateVideo(clip.source_path);
             if (!video || video.readyState < 2) return Promise.resolve(null);
             const sourceFrame = frame - clip.timeline_start_frame + (clip.source_in_frame || 0);
-            const targetTime = sourceFrame / this._effectiveFps;
+            const targetTime = (sourceFrame + 0.5) / this._effectiveFps;
             if (Math.abs(video.currentTime - targetTime) < 0.02) return Promise.resolve(video);
             return new Promise(resolve => {
                 const handler = () => { video.removeEventListener("seeked", handler); resolve(video); };
@@ -8881,7 +8978,7 @@ export class EditorWidget {
             const video = this._getOrCreateVideo(clip.source_path);
             if (!video) continue;
             const sourceFrame = frame - clip.timeline_start_frame + (clip.source_in_frame || 0);
-            const sourceTime = sourceFrame / this._effectiveFps;
+            const sourceTime = (sourceFrame + 0.5) / this._effectiveFps;
             video.muted = true;
 
             const startVideoPlayback = (element) => {
@@ -9021,7 +9118,7 @@ export class EditorWidget {
                 const video = this._getOrCreateVideo(clip.source_path);
                 if (video && video.readyState >= 2) {
                     const sf = newFrame - clip.timeline_start_frame + (clip.source_in_frame || 0);
-                    video.currentTime = sf / this._effectiveFps;
+                    video.currentTime = (sf + 0.5) / this._effectiveFps;
                     video.muted = true;
                     video.play().catch(() => {});
                     if (!this._activePlaybackVideos) this._activePlaybackVideos = [];
@@ -9719,15 +9816,24 @@ export class EditorWidget {
             (value) => updateCategory("playback", "resolution", value)
         );
 
-        const queueSection = createSection(
-            "Render Queue",
-            "Local defaults for chunked queueing. A value of 0 uses the active template's batch ceiling."
+        const renderSection = createSection(
+            "Render",
+            "Take placement and batch render defaults."
+        );
+        createSelect(
+            renderSection,
+            "takePlacementMode",
+            "Take Placement Mode",
+            "Trimmed places only the generated portion on the timeline. Untrimmed includes pre/post context frames for seam inspection.",
+            TAKE_PLACEMENT_MODE_OPTIONS,
+            () => this._settings.render?.takePlacementMode ?? "trimmed",
+            (value) => updateCategory("render", "takePlacementMode", value)
         );
         createNumberInput(
-            queueSection,
+            renderSection,
             "batchRenderMaxFramesPerChunk",
             "Batch Max Frames",
-            "Preferred chunk size before the active template's frame constraint snaps and clamps it.",
+            "Preferred chunk size before the active template's frame constraint snaps and clamps it. A value of 0 uses the active template's batch ceiling.",
             {
                 min: 0,
                 max: 10000,

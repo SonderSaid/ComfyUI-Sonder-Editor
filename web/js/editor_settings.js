@@ -29,6 +29,11 @@ export const CLIP_LABEL_MODE_OPTIONS = [
     { value: "hidden", label: "Hidden" },
 ];
 
+export const TAKE_PLACEMENT_MODE_OPTIONS = [
+    { value: "trimmed", label: "Trimmed (default)" },
+    { value: "untrimmed", label: "Untrimmed (show context)" },
+];
+
 export const TIMECODE_MODE_OPTIONS = [
     { value: "frames", label: "Frames" },
     { value: "timecode", label: "Timecode" },
@@ -133,6 +138,9 @@ export const DEFAULT_EDITOR_SETTINGS = {
     batchRender: {
         maxFramesPerChunk: 0,
     },
+    render: {
+        takePlacementMode: "trimmed",
+    },
     modelTemplates: {
         customTemplates: [],
     },
@@ -160,6 +168,7 @@ const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => en
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
 const BUILTIN_MODEL_TEMPLATE_IDS = new Set(BUILTIN_MODEL_TEMPLATES.map((entry) => entry.id));
+export const VALID_TAKE_PLACEMENT_MODES = new Set(TAKE_PLACEMENT_MODE_OPTIONS.map((entry) => entry.value));
 
 const listeners = new Set();
 
@@ -508,6 +517,11 @@ function normalizeEditorSettings(source = null) {
                 true,
             ),
         },
+        render: {
+            takePlacementMode: VALID_TAKE_PLACEMENT_MODES.has(stored?.render?.takePlacementMode)
+                ? stored.render.takePlacementMode
+                : defaults.render.takePlacementMode,
+        },
         modelTemplates: {
             customTemplates,
         },
@@ -617,6 +631,42 @@ export function getAllModelTemplates(settings) {
 
 export function getTemplateById(id, settings) {
     return getAllModelTemplates(settings).find((template) => template.id === id) || BUILTIN_MODEL_TEMPLATES[0];
+}
+
+export function resolveFrameConstraintForTemplate(templateId, settings) {
+    const template = getTemplateById(templateId, settings);
+    const frames = template?.constraints?.frames;
+    if (!frames || typeof frames !== "object") return null;
+    if (!Object.keys(frames).length) return null;
+    return frames;
+}
+
+export function frameConstraintsEqual(a, b) {
+    const normalize = (value) => {
+        if (!value || typeof value !== "object") return null;
+        const keys = ["step", "offset", "min", "max"];
+        const result = {};
+        let any = false;
+        for (const key of keys) {
+            if (value[key] != null) {
+                result[key] = value[key];
+                any = true;
+            }
+        }
+        return any ? result : null;
+    };
+    const left = normalize(a);
+    const right = normalize(b);
+    if (left === null && right === null) return true;
+    if (left === null || right === null) return false;
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    if (leftKeys.length !== rightKeys.length) return false;
+    for (let i = 0; i < leftKeys.length; i += 1) {
+        if (leftKeys[i] !== rightKeys[i]) return false;
+        if (left[leftKeys[i]] !== right[leftKeys[i]]) return false;
+    }
+    return true;
 }
 
 export function snapToConstraint(value, constraint) {

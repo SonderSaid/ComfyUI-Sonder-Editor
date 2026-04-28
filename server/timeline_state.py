@@ -629,6 +629,8 @@ class GenerationJob:
     scene_height: int = 0
     scene_fps: float = 0.0
     template_id: str = "free"
+    frame_constraint: dict | None = None
+    take_placement_mode: str = "trimmed"
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     completed_at: str = ""
     result_asset_id: str = ""
@@ -658,6 +660,8 @@ class GenerationJob:
             "scene_height": self.scene_height,
             "scene_fps": self.scene_fps,
             "template_id": self.template_id,
+            "frame_constraint": self.frame_constraint,
+            "take_placement_mode": self.take_placement_mode,
             "created_at": self.created_at,
             "completed_at": self.completed_at,
             "result_asset_id": self.result_asset_id,
@@ -668,6 +672,8 @@ class GenerationJob:
         legacy_context = data.get("context_frames", 0)
         pre_context = data.get("pre_context_frames", legacy_context)
         post_context = data.get("post_context_frames", legacy_context)
+        raw_mode = data.get("take_placement_mode", "trimmed")
+        take_placement_mode = raw_mode if raw_mode in ("trimmed", "untrimmed") else "trimmed"
         return cls(
             job_id=data.get("job_id", uuid.uuid4().hex[:8]),
             clip_id=data.get("clip_id", ""),
@@ -692,6 +698,8 @@ class GenerationJob:
             scene_height=data.get("scene_height", 0),
             scene_fps=data.get("scene_fps", 0.0),
             template_id=data.get("template_id", "free"),
+            frame_constraint=data.get("frame_constraint"),
+            take_placement_mode=take_placement_mode,
             created_at=data.get("created_at", ""),
             completed_at=data.get("completed_at", ""),
             result_asset_id=data.get("result_asset_id", ""),
@@ -710,6 +718,7 @@ class TimelineProject:
     fps: float = 24.0
     resolution: tuple = (768, 512)
     template_id: str = "free"
+    frame_constraint: dict | None = None
     scenes: list = field(default_factory=list)           # list[Scene] — ordered compositions
     assets: list = field(default_factory=list)           # list[Asset] — project media registry
     generation_queue: list = field(default_factory=list)  # list[GenerationJob]
@@ -833,6 +842,7 @@ class TimelineProject:
             "fps": self.fps,
             "resolution": list(self.resolution),
             "template_id": self.template_id,
+            "frame_constraint": self.frame_constraint,
             "scenes": [s.to_dict() for s in self.scenes],
             "assets": [a.to_dict() for a in self.assets],
             "generation_queue": [j.to_dict() for j in self.generation_queue],
@@ -850,6 +860,7 @@ class TimelineProject:
             fps=data.get("fps", 24.0),
             resolution=tuple(data.get("resolution", [768, 512])),
             template_id=data.get("template_id", "free"),
+            frame_constraint=data.get("frame_constraint"),
             metadata=data.get("metadata", {}),
             created_at=data.get("created_at", datetime.now().isoformat()),
             modified_at=data.get("modified_at", datetime.now().isoformat()),

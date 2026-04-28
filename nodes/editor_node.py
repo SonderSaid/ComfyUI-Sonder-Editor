@@ -5,6 +5,7 @@ guide images, frame indices, prompt, frame count, fps, resolution, audio.
 """
 
 import copy
+import math
 import os
 import logging
 import time
@@ -146,6 +147,10 @@ class SonderEditor:
                     "default": 0, "min": 0, "max": 256, "step": 1,
                     "tooltip": "Context frames AFTER selection. Included in render but not denoised (use mask outputs). Clamped to available frames.",
                 }),
+                "take_placement_mode": ("STRING", {
+                    "default": "trimmed",
+                    "tooltip": "Take placement mode for non-queued renders. Set by editor settings.",
+                }),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -179,6 +184,68 @@ class SonderEditor:
             0.0,
             0.0,
         )
+
+    @staticmethod
+    def _execution_template_id(proj: TimelineProject, queue_job=None) -> str:
+        if queue_job:
+            template_id = str(getattr(queue_job, "template_id", "") or "")
+            if template_id:
+                return template_id
+        return str(getattr(proj, "template_id", "") or "free")
+
+    @staticmethod
+    def _execution_frame_constraint(proj: TimelineProject, queue_job=None) -> dict | None:
+        if queue_job:
+            job_constraint = getattr(queue_job, "frame_constraint", None)
+            if isinstance(job_constraint, dict) and job_constraint:
+                return job_constraint
+        proj_constraint = getattr(proj, "frame_constraint", None)
+        if isinstance(proj_constraint, dict) and proj_constraint:
+            return proj_constraint
+        return None
+
+    @staticmethod
+    def _round_up_frame_count(frame_count: int, frame_constraint: dict | None) -> int:
+        count = max(0, _coerce_int(frame_count, 0))
+        if not frame_constraint or "step" not in frame_constraint or count <= 0:
+            return count
+        step = max(1, _coerce_int(frame_constraint.get("step"), 1))
+        offset = _coerce_int(frame_constraint.get("offset"), 0)
+        minimum = max(1, _coerce_int(frame_constraint.get("min"), 1))
+        count = max(count, minimum)
+        if (count - offset) % step == 0:
+            return count
+        return offset + math.ceil((count - offset) / step) * step
+
+    @staticmethod
+    def _pad_image_batch_to_frame_count(frames: torch.Tensor, target_count: int) -> torch.Tensor:
+        if not torch.is_tensor(frames) or frames.ndim < 1:
+            return frames
+        current_count = int(frames.shape[0])
+        pad_count = max(0, _coerce_int(target_count, current_count) - current_count)
+        if pad_count <= 0 or current_count <= 0:
+            return frames
+        repeat_shape = [pad_count] + [1] * (frames.ndim - 1)
+        return torch.cat([frames, frames[-1:].repeat(*repeat_shape)], dim=0)
+
+    @staticmethod
+    def _pad_audio_to_frame_count(audio: dict, target_frame_count: int, fps: float) -> dict:
+        if not isinstance(audio, dict) or fps <= 0:
+            return audio
+        waveform = audio.get("waveform")
+        sample_rate = _coerce_int(audio.get("sample_rate"), 0)
+        if not torch.is_tensor(waveform) or sample_rate <= 0:
+            return audio
+        target_samples = math.ceil((max(0, target_frame_count) / fps) * sample_rate)
+        current_samples = int(waveform.shape[-1])
+        if current_samples >= target_samples:
+            return audio
+        pad_shape = list(waveform.shape)
+        pad_shape[-1] = target_samples - current_samples
+        padded = torch.cat([waveform, waveform.new_zeros(pad_shape)], dim=-1)
+        next_audio = dict(audio)
+        next_audio["waveform"] = padded
+        return next_audio
 
     @staticmethod
     def _queue_snapshot_version(queue_job) -> int:
@@ -319,13 +386,14 @@ class SonderEditor:
     def execute(self, project, project_name, fps, width, height,
                 scene_id="", selection_start=0, selection_end=0,
                 pre_context_frames=0, post_context_frames=0,
-                prompt=None, unique_id=None):
+                prompt=None, unique_id=None, take_placement_mode="trimmed"):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
         selection_start = max(0, _coerce_int(selection_start, 0))
         selection_end = max(0, _coerce_int(selection_end, 0))
         pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
         post_context_frames = max(0, _coerce_int(post_context_frames, 0))
+        take_placement_mode = take_placement_mode if take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
         proj = None
         queue_job = None
 
@@ -430,7 +498,21 @@ class SonderEditor:
 
             context_start = render_start
             context_end = render_end
-            frame_count = render_end - render_start
+            source_frame_count = render_end - render_start
+            frame_count = source_frame_count
+            template_id = self._execution_template_id(proj, queue_job)
+            frame_constraint = self._execution_frame_constraint(proj, queue_job)
+            target_frame_count = self._round_up_frame_count(frame_count, frame_constraint)
+            frame_count_padding = max(0, target_frame_count - frame_count)
+            logger.info(
+                "render frame plan: scene_id=%s template=%s constraint=%s source_frames=%d padded_frames=%d padding=%d",
+                scene.scene_id,
+                template_id,
+                frame_constraint or "none",
+                source_frame_count,
+                target_frame_count,
+                frame_count_padding,
+            )
 
             # Mask times - seconds offset within the output tensor for downstream temporal masks
             mask_start_time = (generation_start - context_start) / proj_fps if proj_fps > 0 else 0.0
@@ -440,6 +522,9 @@ class SonderEditor:
             render_started_at = time.perf_counter()
             logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
             rendered_frames = self._render_scene_frames(proj, scene, render_start, render_end)
+            if frame_count_padding > 0:
+                rendered_frames = self._pad_image_batch_to_frame_count(rendered_frames, target_frame_count)
+                frame_count = target_frame_count
             logger.info(
                 "render end: scene_id=%s frames=%d duration=%.2fs",
                 scene.scene_id,
@@ -501,6 +586,14 @@ class SonderEditor:
 
             # --- Load audio from scene's audio tracks for the render range ---
             audio = self._load_scene_audio(proj, scene, render_start, render_end)
+            if frame_count_padding > 0:
+                audio = self._pad_audio_to_frame_count(audio, frame_count, proj_fps)
+
+            # --- Queue snapshots freeze take placement; normal renders use the hidden widget. ---
+            if queue_job:
+                raw_mode = getattr(queue_job, "take_placement_mode", None)
+                if raw_mode in ("trimmed", "untrimmed"):
+                    take_placement_mode = raw_mode
 
             # --- Attach execution context for downstream nodes (e.g., SonderSaveVideo Take mode) ---
             proj._execution_context = {
@@ -512,6 +605,13 @@ class SonderEditor:
                 "context_end": context_end,
                 "pre_context_frames": actual_pre,
                 "post_context_frames": actual_post,
+                "actual_pre_context_frames": actual_pre,
+                "actual_post_context_frames": actual_post,
+                "template_id": template_id,
+                "source_frame_count": source_frame_count,
+                "frame_count": frame_count,
+                "frame_count_padding": frame_count_padding,
+                "take_placement_mode": take_placement_mode,
                 "prompt": prompt_text,
                 "queue_job_id": queue_job.job_id if queue_job else "",
             }

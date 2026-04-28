@@ -5,12 +5,15 @@
 try:
     from .nodes.editor_node import SonderEditor
     from .nodes.io_nodes import SonderSaveBridge, SonderSaveVideo, SonderPreviewVideo
+    from .nodes.bridge_nodes import SonderGuidesBridgeStart, SonderGuidesBridgeEnd
 
     NODE_CLASS_MAPPINGS = {
         "SonderEditor": SonderEditor,
         "SonderSaveBridge": SonderSaveBridge,
         "SonderSaveVideo": SonderSaveVideo,
         "SonderPreviewVideo": SonderPreviewVideo,
+        "SonderGuidesBridgeStart": SonderGuidesBridgeStart,
+        "SonderGuidesBridgeEnd": SonderGuidesBridgeEnd,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
@@ -18,6 +21,8 @@ try:
         "SonderSaveBridge": "Sonder Save Bridge",
         "SonderSaveVideo": "Sonder Save Video",
         "SonderPreviewVideo": "Sonder Preview Video",
+        "SonderGuidesBridgeStart": "Sonder Guides Bridge Start",
+        "SonderGuidesBridgeEnd": "Sonder Guides Bridge End",
     }
 
     WEB_DIRECTORY = "./web"

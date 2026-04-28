@@ -1,6 +1,11 @@
 const { api } = window.comfyAPI.api;
 
-import { getEditorSettings, updateEditorSettings } from "./editor_settings.js";
+import {
+    frameConstraintsEqual,
+    getEditorSettings,
+    resolveFrameConstraintForTemplate,
+    updateEditorSettings,
+} from "./editor_settings.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 
@@ -416,6 +421,29 @@ function buildQueueJobUrl(projectDir, jobId) {
 
 function buildSceneUrl(projectDir, sceneId) {
     return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/scenes/${sceneId}`);
+}
+
+function buildProjectUrl(projectDir) {
+    return api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectIdFromDir(projectDir))}`);
+}
+
+async function healProjectFrameConstraint(projectDir, settings = getEditorSettings()) {
+    if (!projectDir) return;
+    const resp = await fetch(buildProjectUrl(projectDir));
+    if (!resp.ok) {
+        throw new Error(`Project fetch failed: ${resp.status}`);
+    }
+    const project = await resp.json();
+    const expected = resolveFrameConstraintForTemplate(project?.template_id, settings);
+    if (frameConstraintsEqual(expected, project?.frame_constraint)) return;
+    const updateResp = await fetch(buildProjectUrl(projectDir), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ frame_constraint: expected }),
+    });
+    if (!updateResp.ok) {
+        throw new Error(`Frame-constraint self-heal failed: ${updateResp.status}`);
+    }
 }
 
 async function fetchJson(url, signal) {
@@ -989,6 +1017,7 @@ export class EditorNodeController {
         this._destroyed = false;
         this._queueSaveCompletionCounter = 0;
         this._lastQueueSettledSaveCompletionCounter = 0;
+        this._frameConstraintHealedFor = "";
     }
 
     destroy() {
@@ -1144,6 +1173,7 @@ export class EditorNodeController {
             }
             this._queueSaveCompletionCounter = 0;
             this._lastQueueSettledSaveCompletionCounter = 0;
+            this._frameConstraintHealedFor = "";
             this.state.projectDir = "";
             this.state.dormantSummary = null;
             this._invalidateModules(["project", "assets", "scene", "queue"]);
@@ -1160,6 +1190,7 @@ export class EditorNodeController {
             }
             this._queueSaveCompletionCounter = 0;
             this._lastQueueSettledSaveCompletionCounter = 0;
+            this._frameConstraintHealedFor = "";
             this.state.projectDir = projectDir;
             this.state.sceneId = "";
             this.state.selectionStart = 0;
@@ -1170,6 +1201,15 @@ export class EditorNodeController {
             this._setWidgetValue("selection_end", 0);
             this._invalidateModules(["project", "assets", "scene", "queue"]);
             this.state.expandedModuleId = "";
+        }
+
+        if (this._frameConstraintHealedFor !== projectDir) {
+            try {
+                await healProjectFrameConstraint(projectDir);
+                this._frameConstraintHealedFor = projectDir;
+            } catch (error) {
+                console.warn("[Sonder] Failed to heal project frame constraint:", error);
+            }
         }
 
         await this.refreshSummary();
@@ -2638,7 +2678,9 @@ export class EditorNodeController {
         `);
         container.appendChild(wrap);
 
-        const jobs = Array.isArray(data) ? data.slice(0, 8) : [];
+        const allJobs = Array.isArray(data) ? data : [];
+        const completedCount = allJobs.filter((job) => String(job?.status || "").toLowerCase() === "completed").length;
+        const jobs = allJobs.slice(0, 8);
         if (!jobs.length) {
             const emptyEl = style(document.createElement("div"), `
                 padding: 10px;
@@ -2650,6 +2692,46 @@ export class EditorNodeController {
             emptyEl.textContent = "Render queue is empty.";
             wrap.appendChild(emptyEl);
             return null;
+        }
+
+        if (completedCount > 0) {
+            const actions = style(document.createElement("div"), `
+                display: flex;
+                justify-content: flex-end;
+                align-items: center;
+                gap: 6px;
+                padding-bottom: 2px;
+            `);
+            const clearCompleted = style(document.createElement("button"), buttonStyle("subtle", {
+                padding: "4px 7px",
+                radius: "6px",
+                fontSize: "10px",
+                fontWeight: "700",
+            }));
+            clearCompleted.type = "button";
+            clearCompleted.textContent = "Clear Completed Renders";
+            clearCompleted.title = `Remove ${completedCount} completed render${completedCount === 1 ? "" : "s"} from the queue`;
+            clearCompleted.addEventListener("pointerdown", (event) => consumeDormantPointer(event, { preventDefault: true }));
+            clearCompleted.addEventListener("mousedown", (event) => consumeDormantPointer(event, { preventDefault: true }));
+            clearCompleted.addEventListener("click", async (event) => {
+                consumeDormantPointer(event, { preventDefault: true });
+                clearCompleted.disabled = true;
+                clearCompleted.style.opacity = "0.65";
+                try {
+                    const response = await fetch(buildQueueUrl(this.state.projectDir), { method: "DELETE" });
+                    if (!response.ok) {
+                        throw new Error(`Clear completed renders failed: ${response.status}`);
+                    }
+                    this._invalidateModules(["queue"]);
+                    this._reloadExpandedModuleIfNeeded(["queue"]);
+                    await this.refreshSummary();
+                    this.fullscreenSession?.refresh(["queue"]);
+                } catch (error) {
+                    console.warn("[Sonder] Failed to clear completed renders:", error);
+                }
+            });
+            actions.appendChild(clearCompleted);
+            wrap.appendChild(actions);
         }
 
         const settings = getEditorSettings();

@@ -2,7 +2,7 @@ const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 import { EditorNodeController } from "./editor_node_controller.js";
-import { getEditorSettings } from "./editor_settings.js";
+import { getEditorSettings, resolveFrameConstraintForTemplate } from "./editor_settings.js";
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -104,6 +104,7 @@ async function createProjectFromNode(node, projectWidget) {
     const heightWidget = node.widgets.find((widget) => widget.name === "height");
     const settings = getEditorSettings();
     const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || 200));
+    const templateId = settings.projectDefaults.defaultTemplateId || "free";
 
     const projectName = String(projectNameWidget?.value || "").trim();
     if (!projectName) {
@@ -118,7 +119,8 @@ async function createProjectFromNode(node, projectWidget) {
             fps: Number(fpsWidget?.value || 24),
             width: Number(widthWidget?.value || 768),
             height: Number(heightWidget?.value || 512),
-            template_id: settings.projectDefaults.defaultTemplateId || "free",
+            template_id: templateId,
+            frame_constraint: resolveFrameConstraintForTemplate(templateId, settings),
         }),
     });
     if (!resp.ok) {
@@ -621,6 +623,7 @@ app.registerExtension({
                     "selection_end",
                     "pre_context_frames",
                     "post_context_frames",
+                    "take_placement_mode",
                 ];
 
                 // Store original types

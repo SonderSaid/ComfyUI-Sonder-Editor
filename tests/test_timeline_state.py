@@ -393,6 +393,9 @@ def test_generation_job_roundtrip():
         scene_width=1024,
         scene_height=576,
         scene_fps=30.0,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1, "max": 257},
+        take_placement_mode="untrimmed",
     )
 
     data = job.to_dict()
@@ -417,6 +420,9 @@ def test_generation_job_roundtrip():
     assert restored.scene_width == 1024
     assert restored.scene_height == 576
     assert restored.scene_fps == 30.0
+    assert restored.template_id == "ltxv-2.3"
+    assert restored.frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
+    assert restored.take_placement_mode == "untrimmed"
 
 
 def test_generation_job_legacy_context_frames_migrate_to_pre_and_post():
@@ -430,6 +436,15 @@ def test_generation_job_legacy_context_frames_migrate_to_pre_and_post():
     assert restored.post_context_frames == 16
 
 
+def test_generation_job_invalid_take_placement_mode_defaults_to_trimmed():
+    restored = GenerationJob.from_dict({
+        "job_id": "bad-mode",
+        "take_placement_mode": "wide-open",
+    })
+
+    assert restored.take_placement_mode == "trimmed"
+
+
 # --- TimelineProject ---
 
 def test_timeline_project_roundtrip():
@@ -439,6 +454,8 @@ def test_timeline_project_roundtrip():
         name="Test Project",
         fps=30.0,
         resolution=(1920, 1080),
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1, "max": 257},
     )
 
     scene = Scene(scene_id="sc1", name="Scene 1", order=1, duration_frames=90)
@@ -463,6 +480,8 @@ def test_timeline_project_roundtrip():
     assert restored.name == "Test Project"
     assert restored.fps == 30.0
     assert restored.resolution == (1920, 1080)
+    assert restored.template_id == "ltxv-2.3"
+    assert restored.frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert len(restored.scenes) == 1
     assert restored.scenes[0].scene_id == "sc1"
     assert len(restored.scenes[0].clips) == 1

@@ -13,13 +13,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
-from server.timeline_state import Asset, ClipReference, Scene, TimelineProject
+from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, LaneConfig, Scene, TimelineProject
 
 
 class DummyRequest:
-    def __init__(self, *, match_info=None, body=None):
+    def __init__(self, *, match_info=None, query=None, body=None):
         self.match_info = match_info or {}
-        self.query = {}
+        self.query = query or {}
         self._body = body
 
     async def json(self):
@@ -212,3 +212,173 @@ def test_clip_split_preserves_motion_driver_role_and_strength(tmp_path, monkeypa
     assert payload["right"]["role"] == "motion_driver"
     assert payload["left"]["strength"] == 0.42
     assert payload["right"]["strength"] == 0.42
+
+
+def test_clear_queue_route_removes_only_completed_jobs(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = TimelineProject(project_dir=str(project_dir), name="Project")
+    project.generation_queue = [
+        GenerationJob(job_id="pending-1", status="pending"),
+        GenerationJob(job_id="running-1", status="running"),
+        GenerationJob(job_id="completed-1", status="completed"),
+        GenerationJob(job_id="failed-1", status="failed"),
+        GenerationJob(job_id="skipped-1", status="skipped"),
+    ]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    clear_queue = _route_handler(
+        route_module,
+        "DELETE",
+        "/sonder-editor/project/{project_id}/queue",
+    )
+    response = asyncio.run(clear_queue(DummyRequest(match_info={"project_id": "project"})))
+    payload = _response_json(response)
+
+    assert payload == {"status": "cleared", "removed": 1}
+    assert [job.job_id for job in project.generation_queue] == [
+        "pending-1",
+        "running-1",
+        "failed-1",
+        "skipped-1",
+    ]
+
+
+def test_delete_last_clip_compacts_empty_video_lane(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    delete_me = ClipReference(
+        clip_id="delete-me",
+        source_path="media/a.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        track_index=1,
+        role="render",
+    )
+    higher = ClipReference(
+        clip_id="higher",
+        source_path="media/b.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        track_index=2,
+        role="render",
+    )
+    driver = ClipReference(
+        clip_id="driver",
+        source_path="media/driver.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        track_index=1,
+        role="motion_driver",
+    )
+    scene = Scene(scene_id="scene-1", name="Scene", video_lane_count=3)
+    scene.video_lane_configs = [
+        LaneConfig(name="Lane 1"),
+        LaneConfig(name="Lane 2"),
+        LaneConfig(name="Lane 3"),
+    ]
+    scene.clips = [delete_me, higher, driver]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    delete_clip = _route_handler(
+        route_module,
+        "DELETE",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}",
+    )
+    response = asyncio.run(delete_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "delete-me"},
+    )))
+
+    assert response.status == 200
+    assert scene.video_lane_count == 2
+    assert higher.track_index == 1
+    assert driver.track_index == 1
+    assert [config.name for config in scene.video_lane_configs] == ["Lane 1", "Lane 3"]
+
+
+def test_delete_clip_preserve_lane_keeps_empty_video_lane(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    clip = ClipReference(
+        clip_id="clip-1",
+        source_path="media/a.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        track_index=1,
+        role="render",
+    )
+    scene = Scene(scene_id="scene-1", name="Scene", video_lane_count=2)
+    scene.video_lane_configs = [LaneConfig(name="Lane 1"), LaneConfig(name="Lane 2")]
+    scene.clips = [clip]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    delete_clip = _route_handler(
+        route_module,
+        "DELETE",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}",
+    )
+    response = asyncio.run(delete_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "clip-1"},
+        query={"preserve_lane": "1"},
+    )))
+
+    assert response.status == 200
+    assert scene.video_lane_count == 2
+    assert scene.clips == []
+    assert [config.name for config in scene.video_lane_configs] == ["Lane 1", "Lane 2"]
+
+
+def test_delete_last_audio_track_compacts_empty_audio_lane(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    delete_me = AudioTrack(
+        track_id="delete-me",
+        source_path="media/a.wav",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        lane_index=0,
+    )
+    higher = AudioTrack(
+        track_id="higher",
+        source_path="media/b.wav",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        lane_index=2,
+    )
+    scene = Scene(scene_id="scene-1", name="Scene", audio_lane_count=3)
+    scene.audio_lane_configs = [
+        LaneConfig(name="Audio 1"),
+        LaneConfig(name="Audio 2"),
+        LaneConfig(name="Audio 3"),
+    ]
+    scene.audio_tracks = [delete_me, higher]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    delete_audio = _route_handler(
+        route_module,
+        "DELETE",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks/{track_id}",
+    )
+    response = asyncio.run(delete_audio(DummyRequest(
+        match_info={"scene_id": "scene-1", "track_id": "delete-me"},
+    )))
+
+    assert response.status == 200
+    assert scene.audio_lane_count == 2
+    assert higher.lane_index == 1
+    assert [config.name for config in scene.audio_lane_configs] == ["Audio 2", "Audio 3"]
