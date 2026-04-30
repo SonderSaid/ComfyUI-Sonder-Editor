@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import sys
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from aiohttp import web
@@ -99,6 +100,18 @@ def test_video_has_audio_uses_extraction_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr(routes, "_extract_audio_from_video", fake_extract)
 
     assert routes._video_has_audio(str(video_path)) is True
+
+
+def test_ffmpeg_stderr_summary_omits_banner():
+    stderr = "\n".join([
+        "ffmpeg version 4.2.2 Copyright (c) 2000-2019 the FFmpeg developers",
+        "  built with gcc 9.2.1",
+        "  configuration: --enable-gpl",
+        "Output file #0 does not contain any stream",
+    ])
+
+    assert routes._summarize_ffmpeg_stderr(stderr) == "Output file #0 does not contain any stream"
+    assert routes._ffmpeg_no_audio_stderr(stderr) is True
 
 
 def test_sync_media_folder_repairs_false_video_has_audio_flags(tmp_path, monkeypatch):
@@ -489,3 +502,122 @@ def test_delete_asset_folder_route_soft_deletes_contained_assets(tmp_path, monke
     assert project.get_asset("a1").folder == ""
     assert project.get_asset("a2").folder == ""
     assert project.get_asset("a3").trashed_at == ""
+
+
+def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    cache_dir = os.path.join(project.project_dir, "cache", "renders")
+    os.makedirs(cache_dir, exist_ok=True)
+    old_path = os.path.join(cache_dir, "scene-old.pt")
+    new_path = os.path.join(cache_dir, "scene-new.pt")
+    with open(old_path, "wb") as handle:
+        handle.write(b"old")
+    with open(new_path, "wb") as handle:
+        handle.write(b"newer")
+    with open(os.path.join(cache_dir, "not-render.txt"), "wb") as handle:
+        handle.write(b"ignore")
+    os.utime(old_path, (100, 100))
+    os.utime(new_path, (200, 200))
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+
+    response = asyncio.run(module.api_list_render_cache(DummyRequest(match_info={"project_id": "phase-2"})))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert [entry["filename"] for entry in payload] == ["scene-old.pt", "scene-new.pt"]
+    assert payload[0]["size_bytes"] == 3
+
+    delete_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
+        match_info={"project_id": "phase-2", "filename": "scene-old.pt"},
+    )))
+    assert delete_response.status == 200
+    assert not os.path.exists(old_path)
+    assert os.path.exists(new_path)
+
+    missing_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
+        match_info={"project_id": "phase-2", "filename": "missing.pt"},
+    )))
+    assert missing_response.status == 404
+
+    invalid_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
+        match_info={"project_id": "phase-2", "filename": "..\\escape.pt"},
+    )))
+    assert invalid_response.status == 400
+
+
+def test_trash_purge_honors_retention_days_and_decimal_mb_cap(tmp_path):
+    project = _make_project(tmp_path)
+    old_asset = Asset(
+        asset_id="old",
+        asset_type="video",
+        path="media/old.mp4",
+        trashed_at=(datetime.now() - timedelta(days=10)).isoformat(),
+    )
+    recent_oldest = Asset(
+        asset_id="recent-oldest",
+        asset_type="video",
+        path="media/recent-oldest.mp4",
+        trashed_at=(datetime.now() - timedelta(days=3)).isoformat(),
+    )
+    recent_middle = Asset(
+        asset_id="recent-middle",
+        asset_type="video",
+        path="media/recent-middle.mp4",
+        trashed_at=(datetime.now() - timedelta(days=2)).isoformat(),
+    )
+    recent_newest = Asset(
+        asset_id="recent-newest",
+        asset_type="video",
+        path="media/recent-newest.mp4",
+        trashed_at=(datetime.now() - timedelta(days=1)).isoformat(),
+    )
+    project.assets = [old_asset, recent_oldest, recent_middle, recent_newest]
+    _write_project_file(project, "media/old.mp4", b"x" * 10)
+    recent_oldest_path = _write_project_file(project, "media/recent-oldest.mp4", b"x" * 200)
+    recent_middle_path = _write_project_file(project, "media/recent-middle.mp4", b"x" * 100)
+    recent_newest_path = _write_project_file(project, "media/recent-newest.mp4", b"x" * 50)
+
+    changed = routes._purge_expired_trashed_assets(
+        project,
+        retention_days=7,
+        max_size_mb=0.00025,
+    )
+
+    assert changed is True
+    assert project.get_asset("old") is None
+    assert project.get_asset("recent-oldest") is None
+    assert project.get_asset("recent-middle") is recent_middle
+    assert project.get_asset("recent-newest") is recent_newest
+    assert not os.path.exists(recent_oldest_path)
+    assert os.path.exists(recent_middle_path)
+    assert os.path.exists(recent_newest_path)
+
+
+def test_asset_list_route_forwards_trash_retention_query_params(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    captured = {}
+
+    def fake_sync(sync_project, retention_days, max_size_mb):
+        captured["project"] = sync_project
+        captured["retention_days"] = retention_days
+        captured["max_size_mb"] = max_size_mb
+        return False
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "_sync_media_folder", fake_sync)
+
+    request = DummyRequest(
+        match_info={"project_id": "phase-2"},
+        query={"include_trashed": "true", "retention_days": "7", "max_size_mb": "1.5"},
+    )
+    response = asyncio.run(module.api_list_assets(request))
+
+    assert response.status == 200
+    assert captured == {
+        "project": project,
+        "retention_days": 7,
+        "max_size_mb": 1.5,
+    }

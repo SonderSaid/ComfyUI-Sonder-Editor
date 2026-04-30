@@ -40,6 +40,23 @@ import {
     updateEditorSettings,
 } from "./editor_settings.js";
 
+const RENDER_CACHE_ENTRY_PRESETS = [
+    { value: "3", label: "3" },
+    { value: "5", label: "5" },
+    { value: "10", label: "10" },
+    { value: "25", label: "25" },
+    { value: "unlimited", label: "Unlimited" },
+];
+
+const TRASH_SIZE_MB_PRESETS = [
+    { value: "250", label: "250 MB" },
+    { value: "500", label: "500 MB" },
+    { value: "1000", label: "1 GB" },
+    { value: "2000", label: "2 GB" },
+    { value: "5000", label: "5 GB" },
+    { value: "unlimited", label: "Unlimited" },
+];
+
 function describeKeyboardDebugElement(element) {
     if (!element) return "null";
     const tag = String(element.tagName || element.nodeName || "").toLowerCase();
@@ -1528,7 +1545,7 @@ export class EditorWidget {
 
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets?include_trashed=true`));
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets?${this._assetListQueryString()}`));
             if (resp.ok) {
                 const data = await resp.json();
                 this.assets = { video: [], image: [], audio: [], artifact: [] };
@@ -2860,6 +2877,78 @@ export class EditorWidget {
         return updateEditorSettings(partial);
     }
 
+    _renderCacheEntryLimit(settings = this._settings) {
+        const rawValue = settings?.render?.maxRenderCacheEntries;
+        if (rawValue === null) return null;
+        const numeric = Number(rawValue);
+        if (!Number.isFinite(numeric)) {
+            return DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries;
+        }
+        return Math.max(1, Math.round(numeric));
+    }
+
+    _trashRetentionDays(settings = this._settings) {
+        const numeric = Number(settings?.render?.trashRetentionDays);
+        if (!Number.isFinite(numeric)) {
+            return DEFAULT_EDITOR_SETTINGS.render.trashRetentionDays;
+        }
+        return Math.max(0, Math.round(numeric));
+    }
+
+    _trashMaxSizeMB(settings = this._settings) {
+        const rawValue = settings?.render?.trashMaxSizeMB;
+        if (rawValue === null || rawValue === undefined || rawValue === "") return null;
+        const numeric = Number(rawValue);
+        return Number.isFinite(numeric) ? Math.max(0, numeric) : null;
+    }
+
+    _assetListQueryString() {
+        const params = new URLSearchParams();
+        params.set("include_trashed", "true");
+        params.set("retention_days", String(this._trashRetentionDays()));
+        const trashMaxSizeMB = this._trashMaxSizeMB();
+        if (trashMaxSizeMB !== null) {
+            params.set("max_size_mb", String(trashMaxSizeMB));
+        }
+        return params.toString();
+    }
+
+    async _sweepRenderCache() {
+        const maxEntries = this._renderCacheEntryLimit();
+        const dirName = this._projectDirName();
+        if (maxEntries === null || !dirName) return;
+
+        try {
+            const listResp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/cache/renders`));
+            if (!listResp.ok) return;
+            const data = await listResp.json();
+            const entries = Array.isArray(data) ? data : (Array.isArray(data.entries) ? data.entries : []);
+            const sortedEntries = entries
+                .filter((entry) => typeof entry?.filename === "string" && entry.filename)
+                .sort((a, b) => {
+                    const aTime = Number.isFinite(Number(a.mtime)) ? Number(a.mtime) : 0;
+                    const bTime = Number.isFinite(Number(b.mtime)) ? Number(b.mtime) : 0;
+                    if (aTime !== bTime) return aTime - bTime;
+                    return String(a.filename).localeCompare(String(b.filename));
+                });
+            const excess = sortedEntries.length - maxEntries;
+            if (excess <= 0) return;
+
+            const staleEntries = sortedEntries.slice(0, excess);
+            await Promise.all(staleEntries.map(async (entry) => {
+                const deleteResp = await fetch(
+                    api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/cache/renders/${encodeURIComponent(entry.filename)}`),
+                    { method: "DELETE" },
+                );
+                if (!deleteResp.ok && deleteResp.status !== 404) {
+                    console.warn("[Sonder] Render cache eviction skipped:", entry.filename, deleteResp.status);
+                }
+            }));
+        } catch (error) {
+            console.warn("[Sonder] Failed to sweep render cache:", error);
+        }
+    }
+
     _syncTakePlacementModeWidget(settings = this._settings) {
         const mode = settings?.render?.takePlacementMode === "untrimmed" ? "untrimmed" : "trimmed";
         this._setWidgetValue("take_placement_mode", mode);
@@ -2999,6 +3088,8 @@ export class EditorWidget {
         const nextTrackCollapseSignature = this._activeTrackCollapseSignature(nextSettings);
         const prevQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(this._settings);
         const nextQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(nextSettings);
+        const prevRenderCacheLimit = this._renderCacheEntryLimit(this._settings);
+        const nextRenderCacheLimit = this._renderCacheEntryLimit(nextSettings);
         const prevTimecodeMode = this._timecodeMode;
         const prevLaneTintSignature = JSON.stringify(this._settings?.appearance?.laneTintOverrides || {});
         const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
@@ -3053,6 +3144,9 @@ export class EditorWidget {
             this._applyStoredQueueBatchCollapseState(nextSettings);
             this._renderQueuePanel();
         }
+        if (prevRenderCacheLimit !== nextRenderCacheLimit) {
+            this._sweepRenderCache();
+        }
         if (prevTimecodeMode !== this._timecodeMode && this._itemEditorEl && this.selectedItem) {
             this._showItemEditor();
         }
@@ -3102,6 +3196,8 @@ export class EditorWidget {
         if (controls.autoScrollPlayhead) controls.autoScrollPlayhead.checked = !!this._settings.playback.autoScrollPlayhead;
         if (controls.returnToPlaybackStart) controls.returnToPlaybackStart.checked = !!this._settings.playback.returnToPlaybackStart;
         if (controls.playbackResolution) controls.playbackResolution.value = this._settings.playback.resolution;
+        if (controls.prebufferEnabled) controls.prebufferEnabled.checked = !!this._settings.playback.prebufferEnabled;
+        if (controls.prebufferLookaheadMs) controls.prebufferLookaheadMs.value = String(this._settings.playback.prebufferLookaheadMs);
         if (controls.waveformAccent) controls.waveformAccent.value = this._settings.appearance.waveformAccent;
         if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
         if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
@@ -3115,6 +3211,10 @@ export class EditorWidget {
             }
         }
         if (controls.takePlacementMode) controls.takePlacementMode.value = this._settings.render?.takePlacementMode ?? "trimmed";
+        for (const sync of controls._syncPresetNumberControls || []) {
+            sync();
+        }
+        if (controls.trashRetentionDays) controls.trashRetentionDays.value = String(this._trashRetentionDays());
         if (controls.batchRenderMaxFramesPerChunk) controls.batchRenderMaxFramesPerChunk.value = String(this._settings.batchRender.maxFramesPerChunk);
         if (controls.defaultProjectFps) controls.defaultProjectFps.value = String(this._settings.projectDefaults.fps);
         if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
@@ -6796,6 +6896,7 @@ export class EditorWidget {
         EditorWidget._activeFullscreen = this;
         this._fullscreenBtn.textContent = "⛶";
         this._fullscreenBtn.title = "Exit fullscreen";
+        this._sweepRenderCache();
 
         this._recalcFullscreenHeights();
         this._renderTimeline();
@@ -6815,6 +6916,7 @@ export class EditorWidget {
 
         // Stop playback before exiting
         this._stopPlayback();
+        this._clearVideoCache();
 
         // Remove placeholder
         if (this._fullscreenPlaceholder) {
@@ -8192,6 +8294,7 @@ export class EditorWidget {
         // Stop playback and clear video cache on project change
         this._stopPlayback();
         this._clearVideoCache();
+        this._sweepRenderCache();
 
         // Fetch project settings (fps, resolution)
         this._fetchProjectSettings();
@@ -8291,6 +8394,8 @@ export class EditorWidget {
             getFps: () => this._effectiveFps,
             getLoopRange: () => this._resolvePlaybackLoopRange(),
             shouldReturnToPlaybackStart: () => !!this._settings?.playback?.returnToPlaybackStart,
+            isPrebufferEnabled: () => !!this._settings?.playback?.prebufferEnabled,
+            getPrebufferLookaheadMs: () => this._settings?.playback?.prebufferLookaheadMs ?? 1000,
             onFrameChange: (frame, meta = {}) => {
                 this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
                 if (meta.reason === "playback" || meta.reason === "playback-loop" || meta.reason === "playback-stop-return") {
@@ -9262,6 +9367,7 @@ export class EditorWidget {
 
         this._settingsPanelControls = {};
         const controls = this._settingsPanelControls;
+        controls._syncPresetNumberControls = [];
 
         const updateCategory = (category, key, value) => {
             this._updateSettings({
@@ -9358,6 +9464,102 @@ export class EditorWidget {
             controlWrap.appendChild(input);
             controls[key] = input;
             return input;
+        };
+
+        const createPresetNumberInput = (section, key, label, description, config) => {
+            const controlWrap = createRow(section, label, description);
+            controlWrap.style.flexDirection = "column";
+            controlWrap.style.alignItems = "flex-end";
+            const inputRow = document.createElement("div");
+            inputRow.style.cssText = "display:flex;align-items:center;gap:8px;";
+
+            const select = document.createElement("select");
+            select.style.cssText = `${chromeInputCss({ fontSize: "11px", padding: "4px 8px", textAlign: "left" })} min-width: 126px;`;
+            for (const option of config.options) {
+                const el = document.createElement("option");
+                el.value = option.value;
+                el.textContent = option.label;
+                select.appendChild(el);
+            }
+            const customOption = document.createElement("option");
+            customOption.value = "custom";
+            customOption.textContent = "Custom";
+            select.appendChild(customOption);
+
+            const input = document.createElement("input");
+            input.type = "number";
+            input.min = String(config.min);
+            input.max = String(config.max);
+            input.step = String(config.step ?? 1);
+            input.style.cssText = `${chromeInputCss({ width: "92px", fontSize: "11px", padding: "4px 8px", textAlign: "right" })}`;
+
+            const coerce = (value) => {
+                if (value === null && config.allowNull) return null;
+                const numeric = Number(value);
+                if (!Number.isFinite(numeric)) return undefined;
+                const clamped = Math.max(config.min, Math.min(config.max, numeric));
+                return config.integer ? Math.round(clamped) : clamped;
+            };
+            const formatValue = (value) => {
+                if (value === null || value === undefined) return String(config.customDefault ?? config.min);
+                return config.integer ? String(Math.round(value)) : String(value);
+            };
+            const presetValueFor = (value) => {
+                if (value === null && config.allowNull) return "unlimited";
+                const normalized = coerce(value);
+                if (normalized === undefined) return "custom";
+                const preset = config.options.find((option) => {
+                    if (option.value === "unlimited") return false;
+                    const optionValue = coerce(option.value);
+                    return optionValue !== undefined && optionValue === normalized;
+                });
+                return preset ? preset.value : "custom";
+            };
+            const currentValue = () => {
+                const value = config.getter();
+                if (value === null && config.allowNull) return null;
+                const normalized = coerce(value);
+                return normalized === undefined ? coerce(config.customDefault) : normalized;
+            };
+            const sync = () => {
+                const value = currentValue();
+                const selectedPreset = presetValueFor(value);
+                select.value = selectedPreset;
+                const showCustom = selectedPreset === "custom";
+                input.style.display = showCustom ? "" : "none";
+                input.value = formatValue(value === null ? coerce(config.customDefault) : value);
+            };
+
+            select.addEventListener("change", () => {
+                if (select.value === "custom") {
+                    config.onChange(currentValue() ?? coerce(config.customDefault));
+                    sync();
+                    return;
+                }
+                if (select.value === "unlimited") {
+                    config.onChange(null);
+                    sync();
+                    return;
+                }
+                const nextValue = coerce(select.value);
+                if (nextValue !== undefined) {
+                    config.onChange(nextValue);
+                }
+                sync();
+            });
+            input.addEventListener("change", () => {
+                const nextValue = coerce(input.value);
+                config.onChange(nextValue === undefined ? (currentValue() ?? coerce(config.customDefault)) : nextValue);
+                sync();
+            });
+
+            inputRow.append(select, input);
+            controlWrap.appendChild(inputRow);
+            controls[`${key}Preset`] = select;
+            controls[`${key}Custom`] = input;
+            controls._syncPresetNumberControls.push(sync);
+            sync();
+            return { select, input };
         };
 
         const createScaleRow = (section, key, label, description, getter) => {
@@ -9815,10 +10017,31 @@ export class EditorWidget {
             () => this._settings.playback.resolution,
             (value) => updateCategory("playback", "resolution", value)
         );
+        createCheckbox(
+            playbackSection,
+            "prebufferEnabled",
+            "Prebuffer Upcoming Clips",
+            "Warm the next viewport video before playback reaches the clip boundary.",
+            () => this._settings.playback.prebufferEnabled,
+            (checked) => updateCategory("playback", "prebufferEnabled", checked)
+        );
+        createNumberInput(
+            playbackSection,
+            "prebufferLookaheadMs",
+            "Prebuffer Lookahead",
+            "Milliseconds ahead of playback to preroll the next viewport video.",
+            {
+                min: 100,
+                max: 5000,
+                step: 100,
+                getter: () => this._settings.playback.prebufferLookaheadMs,
+                onChange: (value) => updateCategory("playback", "prebufferLookaheadMs", Math.round(value)),
+            }
+        );
 
         const renderSection = createSection(
             "Render",
-            "Take placement and batch render defaults."
+            "Take placement, cache retention, trash cleanup, and batch render defaults."
         );
         createSelect(
             renderSection,
@@ -9828,6 +10051,55 @@ export class EditorWidget {
             TAKE_PLACEMENT_MODE_OPTIONS,
             () => this._settings.render?.takePlacementMode ?? "trimmed",
             (value) => updateCategory("render", "takePlacementMode", value)
+        );
+        createPresetNumberInput(
+            renderSection,
+            "maxRenderCacheEntries",
+            "Render Cache Entries",
+            "Maximum cached render tensors to retain for this project. Older entries are evicted when the editor opens or this cap changes.",
+            {
+                options: RENDER_CACHE_ENTRY_PRESETS,
+                min: 1,
+                max: 100000,
+                step: 1,
+                integer: true,
+                allowNull: true,
+                customDefault: DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries,
+                getter: () => this._settings.render?.maxRenderCacheEntries === null
+                    ? null
+                    : (this._settings.render?.maxRenderCacheEntries ?? DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries),
+                onChange: (value) => updateCategory("render", "maxRenderCacheEntries", value),
+            }
+        );
+        createNumberInput(
+            renderSection,
+            "trashRetentionDays",
+            "Trash Retention Days",
+            "Hard-delete trashed assets after this many days during asset refresh.",
+            {
+                min: 0,
+                max: 36500,
+                step: 1,
+                getter: () => this._trashRetentionDays(),
+                onChange: (value) => updateCategory("render", "trashRetentionDays", Math.max(0, Math.round(value))),
+            }
+        );
+        createPresetNumberInput(
+            renderSection,
+            "trashMaxSizeMB",
+            "Trash Max Size",
+            "Optional decimal-MB cap for trashed asset source files. Oldest trash is purged first.",
+            {
+                options: TRASH_SIZE_MB_PRESETS,
+                min: 0,
+                max: 100000000,
+                step: 0.1,
+                integer: false,
+                allowNull: true,
+                customDefault: 250,
+                getter: () => this._settings.render?.trashMaxSizeMB ?? null,
+                onChange: (value) => updateCategory("render", "trashMaxSizeMB", value),
+            }
         );
         createNumberInput(
             renderSection,

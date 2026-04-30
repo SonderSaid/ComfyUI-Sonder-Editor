@@ -37,6 +37,81 @@ def _coerce_nonnegative_int(value, default: int = 0) -> int:
 
 
 TRASH_RETENTION_DAYS = 30
+MB_BYTES_DECIMAL = 1_000_000
+_LOGGED_WARNING_KEYS = set()
+
+
+def _query_nonnegative_int(value, default: int) -> int:
+    if value is None or value == "":
+        return default
+    return _coerce_nonnegative_int(value, default)
+
+
+def _query_optional_nonnegative_float(value, default=None):
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"", "null", "none", "unlimited"}:
+        return None
+    try:
+        return max(0.0, float(normalized))
+    except (TypeError, ValueError):
+        return default
+
+
+def _warn_once(key, message: str, *args) -> None:
+    if key in _LOGGED_WARNING_KEYS:
+        logger.debug(message, *args)
+        return
+    _LOGGED_WARNING_KEYS.add(key)
+    logger.warning(message, *args)
+
+
+def _summarize_ffmpeg_stderr(stderr: str, limit: int = 260) -> str:
+    text = str(stderr or "").replace("\r", "\n")
+    ignored_prefixes = (
+        "ffmpeg version",
+        "built with",
+        "configuration:",
+        "libavutil",
+        "libavcodec",
+        "libavformat",
+        "libavdevice",
+        "libavfilter",
+        "libswscale",
+        "libswresample",
+        "libpostproc",
+    )
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().lower().startswith(ignored_prefixes)
+    ]
+    if not lines:
+        return "no ffmpeg stderr"
+
+    preferred_markers = (
+        "error",
+        "failed",
+        "invalid",
+        "no such",
+        "does not contain",
+        "could not",
+        "unable",
+        "stream",
+    )
+    useful = [line for line in lines if any(marker in line.lower() for marker in preferred_markers)]
+    summary = " | ".join(useful[-2:] if useful else lines[-2:])
+    return summary[:limit]
+
+
+def _ffmpeg_no_audio_stderr(stderr: str) -> bool:
+    lowered = str(stderr or "").lower()
+    return (
+        "does not contain any stream" in lowered
+        or "output file #0 does not contain any stream" in lowered
+        or "stream map" in lowered and "matches no streams" in lowered
+    )
 
 
 def _resolve_source_path(source_path: str) -> str:
@@ -488,18 +563,31 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
         import subprocess
         ffmpeg = _get_ffmpeg()
         result = subprocess.run(
-            [ffmpeg, "-y", "-i", video_path, "-vn",
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-vn",
              "-acodec", "pcm_s16le", "-ar", "44100", output_path],
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode == 0 and os.path.isfile(output_path):
             logger.info("Extracted audio from video via ffmpeg: %s", os.path.basename(video_path))
             return True
+        summary = _summarize_ffmpeg_stderr(result.stderr)
+        if _ffmpeg_no_audio_stderr(result.stderr):
+            logger.debug("No embedded audio stream found in %s: %s", os.path.basename(video_path), summary)
         else:
-            logger.warning("ffmpeg returned %d for %s: %s", result.returncode,
-                           os.path.basename(video_path), result.stderr[:200] if result.stderr else "")
+            _warn_once(
+                ("ffmpeg-audio-extract", result.returncode, summary),
+                "ffmpeg audio extraction failed for %s (exit %d): %s",
+                os.path.basename(video_path),
+                result.returncode,
+                summary,
+            )
     except Exception as e:
-        logger.warning("ffmpeg audio extraction failed for %s: %s", video_path, e)
+        _warn_once(
+            ("ffmpeg-audio-extract-exception", type(e).__name__, str(e)),
+            "ffmpeg audio extraction failed for %s: %s",
+            os.path.basename(video_path),
+            e,
+        )
 
     # Method 2: torchaudio (can read audio from video containers)
     try:
@@ -515,12 +603,20 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
     return False
 
 
-def _sync_media_folder(project: TimelineProject) -> bool:
+def _sync_media_folder(
+    project: TimelineProject,
+    trash_retention_days: int = TRASH_RETENTION_DAYS,
+    trash_max_size_mb: float | None = None,
+) -> bool:
     """Scan media/ folder for files not yet in the asset registry and add them.
 
     Returns True if any changes were made (new assets discovered or repaired).
     """
-    changed = _purge_expired_trashed_assets(project)
+    changed = _purge_expired_trashed_assets(
+        project,
+        retention_days=trash_retention_days,
+        max_size_mb=trash_max_size_mb,
+    )
     media_dir = os.path.join(project.project_dir, "media")
     if not os.path.isdir(media_dir):
         return changed
@@ -1153,21 +1249,111 @@ def _delete_project_asset(project: TimelineProject, asset: Asset, usages_orphane
     }
 
 
-def _purge_expired_trashed_assets(project: TimelineProject) -> bool:
+def _parse_trashed_at(asset: Asset) -> datetime | None:
+    trashed_at = str(getattr(asset, "trashed_at", "") or "").strip()
+    if not trashed_at:
+        return None
+    try:
+        return datetime.fromisoformat(trashed_at)
+    except ValueError:
+        return None
+
+
+def _purge_expired_trashed_assets(
+    project: TimelineProject,
+    retention_days: int = TRASH_RETENTION_DAYS,
+    max_size_mb: float | None = None,
+) -> bool:
     changed = False
+    retention_days = max(0, int(retention_days if retention_days is not None else TRASH_RETENTION_DAYS))
     for asset in list(project.assets):
-        trashed_at = str(getattr(asset, "trashed_at", "") or "").strip()
-        if not trashed_at:
-            continue
-        try:
-            parsed = datetime.fromisoformat(trashed_at)
-        except ValueError:
+        parsed = _parse_trashed_at(asset)
+        if not parsed:
             continue
         compare_now = datetime.now(parsed.tzinfo) if parsed.tzinfo else datetime.now()
-        if parsed <= (compare_now - timedelta(days=TRASH_RETENTION_DAYS)):
+        if parsed <= (compare_now - timedelta(days=retention_days)):
+            try:
+                _delete_project_asset(project, asset)
+                changed = True
+            except PermissionError:
+                logger.warning("Permission denied purging trashed asset: %s", getattr(asset, "path", ""))
+
+    if max_size_mb is None:
+        return changed
+
+    max_size_bytes = int(max(0.0, float(max_size_mb)) * MB_BYTES_DECIMAL)
+    trashed_assets = [
+        asset for asset in project.assets
+        if getattr(asset, "trashed_at", "") and _parse_trashed_at(asset)
+    ]
+    sizes = {
+        asset.asset_id: _asset_file_size(_asset_abspath(project, asset))
+        for asset in trashed_assets
+    }
+    total_size = sum(sizes.values())
+    if total_size <= max_size_bytes:
+        return changed
+
+    def oldest_first(asset: Asset):
+        parsed = _parse_trashed_at(asset)
+        if parsed and parsed.tzinfo:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return (parsed or datetime.min, asset.asset_id)
+
+    for asset in sorted(trashed_assets, key=oldest_first):
+        if total_size <= max_size_bytes:
+            break
+        try:
             _delete_project_asset(project, asset)
+            total_size -= sizes.get(asset.asset_id, 0)
             changed = True
+        except PermissionError:
+            logger.warning("Permission denied purging trashed asset by size cap: %s", getattr(asset, "path", ""))
     return changed
+
+
+def _render_cache_dir(project: TimelineProject) -> str:
+    return os.path.realpath(os.path.join(project.project_dir, "cache", "renders"))
+
+
+def _resolve_render_cache_file(project: TimelineProject, filename: str) -> str:
+    filename = str(filename or "").strip()
+    if (
+        not filename
+        or "/" in filename
+        or "\\" in filename
+        or filename in {".", ".."}
+        or not filename.endswith(".pt")
+    ):
+        raise ValueError("Invalid render cache filename")
+    cache_dir = _render_cache_dir(project)
+    target_path = os.path.realpath(os.path.join(cache_dir, filename))
+    if os.path.commonpath([cache_dir, target_path]) != cache_dir:
+        raise ValueError("Invalid render cache filename")
+    return target_path
+
+
+def _list_render_cache_entries(project: TimelineProject) -> list[dict]:
+    cache_dir = _render_cache_dir(project)
+    if not os.path.isdir(cache_dir):
+        return []
+
+    entries = []
+    with os.scandir(cache_dir) as scan:
+        for entry in scan:
+            if not entry.name.endswith(".pt") or not entry.is_file():
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            entries.append({
+                "filename": entry.name,
+                "mtime": stat.st_mtime,
+                "size_bytes": stat.st_size,
+            })
+    entries.sort(key=lambda item: (item["mtime"], item["filename"]))
+    return entries
 
 
 def _trash_project_asset_folder(project: TimelineProject, folder: str) -> tuple[list[str], list[Asset]]:
@@ -1387,6 +1573,50 @@ if routes is not None:
         return web.json_response(project.to_dict())
 
     # -----------------------------------------------------------------------
+    # Render cache
+    # -----------------------------------------------------------------------
+
+    @routes.get("/sonder-editor/project/{project_id}/cache/renders")
+    async def api_list_render_cache(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        return web.json_response(_list_render_cache_entries(project))
+
+    @routes.delete("/sonder-editor/project/{project_id}/cache/renders/{filename}")
+    async def api_delete_render_cache_entry(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            cache_path = _resolve_render_cache_file(project, request.match_info.get("filename", ""))
+        except ValueError as e:
+            return _json_error(str(e), 400)
+
+        if not os.path.isfile(cache_path):
+            return _json_error("Render cache file not found", 404)
+
+        try:
+            os.remove(cache_path)
+        except FileNotFoundError:
+            return _json_error("Render cache file not found", 404)
+        except PermissionError:
+            logger.warning("Permission denied deleting render cache file: %s", cache_path)
+            return _json_error("Render cache file is locked", 409)
+        except OSError as e:
+            logger.warning("Failed to delete render cache file %s: %s", cache_path, e)
+            return _json_error("Failed to delete render cache file", 500)
+
+        return web.json_response({
+            "deleted": True,
+            "filename": os.path.basename(cache_path),
+        })
+
+    # -----------------------------------------------------------------------
     # Asset management
     # -----------------------------------------------------------------------
 
@@ -1400,9 +1630,18 @@ if routes is not None:
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
+        trash_retention_days = _query_nonnegative_int(
+            request.query.get("retention_days"),
+            TRASH_RETENTION_DAYS,
+        )
+        trash_max_size_mb = _query_optional_nonnegative_float(
+            request.query.get("max_size_mb"),
+            None,
+        )
+
         # Auto-discover untracked files in media/ folder
         # BUG-4 fix: persist newly discovered assets so IDs remain stable
-        if _sync_media_folder(project):
+        if _sync_media_folder(project, trash_retention_days, trash_max_size_mb):
             save_project(project)
 
         asset_type = request.query.get("type", "")

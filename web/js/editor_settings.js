@@ -124,6 +124,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
         autoScrollPlayhead: true,
         returnToPlaybackStart: false,
         resolution: "full",
+        prebufferEnabled: true,
+        prebufferLookaheadMs: 5000,
     },
     appearance: {
         waveformAccent: "#dcffdc",
@@ -140,6 +142,9 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     render: {
         takePlacementMode: "trimmed",
+        maxRenderCacheEntries: 3,
+        trashRetentionDays: 30,
+        trashMaxSizeMB: null,
     },
     modelTemplates: {
         customTemplates: [],
@@ -491,6 +496,16 @@ function normalizeEditorSettings(source = null) {
             resolution: VALID_PLAYBACK_RESOLUTIONS.has(stored?.playback?.resolution)
                 ? stored.playback.resolution
                 : defaults.playback.resolution,
+            prebufferEnabled: stored?.playback?.prebufferEnabled == null
+                ? defaults.playback.prebufferEnabled
+                : !!stored.playback.prebufferEnabled,
+            prebufferLookaheadMs: clampNumber(
+                stored?.playback?.prebufferLookaheadMs,
+                100,
+                5000,
+                defaults.playback.prebufferLookaheadMs,
+                true,
+            ),
         },
         appearance: {
             waveformAccent: isHexColor(stored?.appearance?.waveformAccent)
@@ -521,6 +536,30 @@ function normalizeEditorSettings(source = null) {
             takePlacementMode: VALID_TAKE_PLACEMENT_MODES.has(stored?.render?.takePlacementMode)
                 ? stored.render.takePlacementMode
                 : defaults.render.takePlacementMode,
+            maxRenderCacheEntries: stored?.render?.maxRenderCacheEntries === null
+                ? null
+                : clampNumber(
+                    stored?.render?.maxRenderCacheEntries,
+                    1,
+                    100000,
+                    defaults.render.maxRenderCacheEntries,
+                    true,
+                ),
+            trashRetentionDays: clampNumber(
+                stored?.render?.trashRetentionDays,
+                0,
+                36500,
+                defaults.render.trashRetentionDays,
+                true,
+            ),
+            trashMaxSizeMB: stored?.render?.trashMaxSizeMB === null
+                ? null
+                : clampNumber(
+                    stored?.render?.trashMaxSizeMB,
+                    0,
+                    100000000,
+                    defaults.render.trashMaxSizeMB,
+                ),
         },
         modelTemplates: {
             customTemplates,
