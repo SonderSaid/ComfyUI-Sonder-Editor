@@ -110,6 +110,41 @@ function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120) {
     });
 }
 
+function waitForDecodedVideoFrameAtTarget(mediaEl, targetTime, tolerance = 0.02, timeoutMs = 200) {
+    if (!mediaEl || typeof mediaEl.requestVideoFrameCallback !== "function") {
+        return Promise.resolve(isMediaAtTarget(mediaEl, targetTime, tolerance));
+    }
+    return new Promise((resolve) => {
+        let settled = false;
+        let callbackId = null;
+        const finish = (ok) => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            if (callbackId !== null && typeof mediaEl.cancelVideoFrameCallback === "function") {
+                try {
+                    mediaEl.cancelVideoFrameCallback(callbackId);
+                } catch (error) {}
+            }
+            resolve(!!ok);
+        };
+        const timer = window.setTimeout(() => {
+            finish(isMediaAtTarget(mediaEl, targetTime, tolerance));
+        }, timeoutMs);
+        try {
+            callbackId = mediaEl.requestVideoFrameCallback((_now, metadata = {}) => {
+                const mediaTime = Number(metadata.mediaTime);
+                const decodedAtTarget = Number.isFinite(mediaTime)
+                    ? Math.abs(mediaTime - targetTime) <= tolerance
+                    : isMediaAtTarget(mediaEl, targetTime, tolerance);
+                finish(decodedAtTarget);
+            });
+        } catch (error) {
+            finish(isMediaAtTarget(mediaEl, targetTime, tolerance));
+        }
+    });
+}
+
 function seekMedia(mediaEl, targetTime, {
     tolerance = 0.02,
     timeoutMs = 250,
@@ -645,6 +680,61 @@ export function createViewportSurface(options = {}) {
         }
         await waitForMediaReady(mediaEl, 1);
         return mediaEl;
+    }
+
+    async function captureSourceFrame(sourcePath, sourceFrame, targetLongEdge) {
+        if (!sourcePath || state.destroyed) return null;
+        if (typeof OffscreenCanvas !== "function") {
+            return null;
+        }
+        const frameIndex = Math.max(0, Math.round(Number(sourceFrame) || 0));
+        const captureFps = fps();
+        const tolerance = 0.5 / captureFps;
+        const targetTime = (frameIndex + 0.5) / captureFps;
+        const cacheKey = `snapshot:${sourcePath}`;
+        let video = state.videoCache[cacheKey];
+        if (!video) {
+            video = createMutedVideoElement();
+            video.draggable = false;
+            state.videoCache[cacheKey] = video;
+        }
+        const loaded = await ensureMediaElementSource(video, sourcePath);
+        if (!loaded || state.destroyed) return null;
+        await waitForMediaReady(video, 2, 1500);
+        const sought = await seekMedia(video, targetTime, {
+            tolerance,
+            timeoutMs: 900,
+            requireTarget: true,
+            waitForFrame: true,
+        });
+        if (!sought || (video.readyState || 0) < 2) return null;
+        const decodedAtTarget = await waitForDecodedVideoFrameAtTarget(video, targetTime, tolerance, 240);
+        if (!decodedAtTarget) return null;
+
+        const sourceWidth = Math.round(Number(video.videoWidth) || 0);
+        const sourceHeight = Math.round(Number(video.videoHeight) || 0);
+        if (sourceWidth <= 0 || sourceHeight <= 0) return null;
+        const sourceLongEdge = Math.max(sourceWidth, sourceHeight);
+        const requestedLong = Math.max(1, Math.round(Number(targetLongEdge) || sourceLongEdge));
+        const scale = requestedLong / sourceLongEdge;
+        const width = Math.max(1, Math.round(sourceWidth * scale));
+        const height = Math.max(1, Math.round(sourceHeight * scale));
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return null;
+        ctx.drawImage(video, 0, 0, width, height);
+        const blob = await canvas.convertToBlob({ type: "image/png" });
+        if (!blob) return null;
+        return {
+            blob,
+            width,
+            height,
+            sourceWidth,
+            sourceHeight,
+            sourceLongEdge,
+            targetLongEdge: requestedLong,
+            mediaTime: Number(video.currentTime) || targetTime,
+        };
     }
 
     async function loadPrebufferEntry(entry) {
@@ -1679,6 +1769,7 @@ export function createViewportSurface(options = {}) {
         togglePlayback,
         startPlayback,
         stopPlayback,
+        captureSourceFrame,
         clearMediaCache,
         destroy,
         setLiveMediaEnabled,

@@ -34,6 +34,36 @@ export const TAKE_PLACEMENT_MODE_OPTIONS = [
     { value: "untrimmed", label: "Untrimmed (show context)" },
 ];
 
+export const SAVE_PRESET_OPTIONS = [
+    { value: "Compatible MP4", label: "Compatible MP4", description: "MP4, H.264, yuv420p, AAC 192 kbps, browser preview compatible." },
+    { value: "High Quality MP4", label: "High Quality MP4", description: "MP4, H.264 CRF 14, yuv420p, AAC 256 kbps, browser preview compatible." },
+    { value: "Editing Master MP4", label: "Editing Master MP4", description: "MP4, H.264 CRF 10, yuv444p, AAC 256 kbps; browser preview may not decode it." },
+    { value: "ProRes 422 HQ", label: "ProRes 422 HQ", description: "MOV, ProRes 422 HQ, yuv422p10le, PCM audio; editing handoff file." },
+    { value: "Lossless FFV1 (RGB)", label: "Lossless FFV1 (RGB)", description: "MKV, FFV1 lossless RGB, gbrp, FLAC audio; archive/diagnostic output." },
+    { value: "Custom", label: "Custom", description: "Expose allowlisted expert controls for video files or PNG image sequences." },
+];
+
+export const DEFAULT_SAVE_PRESET = "Compatible MP4";
+
+export const CUSTOM_OUTPUT_KIND_VIDEO = "Video File";
+export const CUSTOM_OUTPUT_KIND_PNG_SEQUENCE = "PNG Sequence";
+export const CUSTOM_OUTPUT_KIND_OPTIONS = [CUSTOM_OUTPUT_KIND_VIDEO, CUSTOM_OUTPUT_KIND_PNG_SEQUENCE];
+export const CUSTOM_CONTAINER_OPTIONS = ["mp4", "mov", "mkv"];
+export const CUSTOM_VIDEO_CODEC_OPTIONS = ["libx264", "libx265", "prores_ks", "ffv1"];
+export const CUSTOM_PIX_FMT_OPTIONS = ["yuv420p", "yuv444p", "yuv422p10le", "gbrp"];
+export const CUSTOM_ENCODER_PRESET_OPTIONS = [
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+];
+export const CUSTOM_AUDIO_CODEC_OPTIONS = ["aac", "pcm_s16le", "flac", "none"];
+
 export const TIMECODE_MODE_OPTIONS = [
     { value: "frames", label: "Frames" },
     { value: "timecode", label: "Timecode" },
@@ -100,6 +130,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         queuePanelExpanded: false,
         queueBatchCollapsedByProject: {},
         trackCollapseByScene: {},
+        timelinePixelsPerFrame: 3,
         labelWidth: 0,
         labelWidthFullscreen: 0,
         fullscreenSidebarWidth: 0,
@@ -142,9 +173,13 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     render: {
         takePlacementMode: "trimmed",
+        defaultSavePreset: DEFAULT_SAVE_PRESET,
         maxRenderCacheEntries: 3,
         trashRetentionDays: 30,
         trashMaxSizeMB: null,
+    },
+    guides: {
+        guideSnapshotMaxLongEdge: 0,
     },
     modelTemplates: {
         customTemplates: [],
@@ -171,6 +206,7 @@ const VALID_THUMBNAIL_SIZES = new Set(GALLERY_THUMBNAIL_SIZE_OPTIONS.map((entry)
 const VALID_PLAYBACK_RESOLUTIONS = new Set(PLAYBACK_RESOLUTION_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
+const VALID_SAVE_PRESETS = new Set(SAVE_PRESET_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
 const BUILTIN_MODEL_TEMPLATE_IDS = new Set(BUILTIN_MODEL_TEMPLATES.map((entry) => entry.id));
 export const VALID_TAKE_PLACEMENT_MODES = new Set(TAKE_PLACEMENT_MODE_OPTIONS.map((entry) => entry.value));
@@ -438,6 +474,12 @@ function normalizeEditorSettings(source = null) {
                 : !!stored.layout.queuePanelExpanded,
             queueBatchCollapsedByProject: normalizeQueueBatchCollapsedByProject(stored?.layout?.queueBatchCollapsedByProject),
             trackCollapseByScene: normalizeTrackCollapseByScene(stored?.layout?.trackCollapseByScene),
+            timelinePixelsPerFrame: clampNumber(
+                stored?.layout?.timelinePixelsPerFrame,
+                0.2,
+                40,
+                defaults.layout.timelinePixelsPerFrame,
+            ),
             labelWidth: clampNumber(
                 pickDefined(stored?.layout?.labelWidth, legacyLayout.labelWidth),
                 0,
@@ -536,6 +578,9 @@ function normalizeEditorSettings(source = null) {
             takePlacementMode: VALID_TAKE_PLACEMENT_MODES.has(stored?.render?.takePlacementMode)
                 ? stored.render.takePlacementMode
                 : defaults.render.takePlacementMode,
+            defaultSavePreset: VALID_SAVE_PRESETS.has(stored?.render?.defaultSavePreset)
+                ? stored.render.defaultSavePreset
+                : defaults.render.defaultSavePreset,
             maxRenderCacheEntries: stored?.render?.maxRenderCacheEntries === null
                 ? null
                 : clampNumber(
@@ -560,6 +605,15 @@ function normalizeEditorSettings(source = null) {
                     100000000,
                     defaults.render.trashMaxSizeMB,
                 ),
+        },
+        guides: {
+            guideSnapshotMaxLongEdge: clampNumber(
+                stored?.guides?.guideSnapshotMaxLongEdge,
+                0,
+                8192,
+                defaults.guides.guideSnapshotMaxLongEdge,
+                true,
+            ),
         },
         modelTemplates: {
             customTemplates,

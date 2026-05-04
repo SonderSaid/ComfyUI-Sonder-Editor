@@ -16,12 +16,14 @@ import {
 import {
     ASPECT_RATIO_PRESETS,
     CLIP_LABEL_MODE_OPTIONS,
+    DEFAULT_SAVE_PRESET,
     DEFAULT_EDITOR_SETTINGS,
     GALLERY_SORT_OPTIONS,
     GALLERY_THUMBNAIL_SIZE_OPTIONS,
     MODEL_TEMPLATE_PARAM_KEYS,
     PLAYBACK_RESOLUTION_OPTIONS,
     RESOLUTION_TIERS,
+    SAVE_PRESET_OPTIONS,
     SNAP_TARGET_OPTIONS,
     TAKE_PLACEMENT_MODE_OPTIONS,
     TIMECODE_MODE_OPTIONS,
@@ -66,6 +68,17 @@ function describeKeyboardDebugElement(element) {
         ? `.${element.className.trim().split(/\s+/).slice(0, 3).join(".")}`
         : "";
     return `${tag}${id}${classes}`;
+}
+
+function coerceBoolean(value, defaultValue = false) {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (["1", "true", "yes", "on"].includes(normalized)) return true;
+        if (["0", "false", "no", "off"].includes(normalized)) return false;
+    }
+    return defaultValue;
 }
 
 export async function uploadFileToComfyInput(file) {
@@ -397,7 +410,7 @@ export class EditorWidget {
         this.playhead = 0;
         this.scrollX = 0;
         this.scrollY = 0;
-        this.pixelsPerFrame = 3;
+        this.pixelsPerFrame = this._settings.layout.timelinePixelsPerFrame;
         this.isDragging = false;
         this.dragType = null; // "selection", "playhead", "selStart", "selEnd"
 
@@ -410,6 +423,7 @@ export class EditorWidget {
         this._queueBatchExpanded = {};
         this._queueHeaderLabel = null;
         this._queueStatusWrap = null;
+        this.renderQueueActive = coerceBoolean(this._getWidgetValue("render_queue_active", true), true);
         this._savedSelDropdown = null;
 
         // Prompt section state
@@ -942,6 +956,13 @@ export class EditorWidget {
             }
         }
 
+        if (this.renderQueueActive === false) {
+            return {
+                badges: [{ text: "Inactive", background: COLORS.panelRaised, border: COLORS.borderStrong }],
+                counts,
+            };
+        }
+
         const badges = [];
         if (counts.running > 0) {
             badges.push({ text: `${counts.running} Running`, background: "#264863", border: "#5d8db5" });
@@ -989,7 +1010,13 @@ export class EditorWidget {
         const titleParts = [];
         if (counts.running > 0) titleParts.push(`${counts.running} running`);
         if (counts.pending > 0) titleParts.push(`${counts.pending} pending`);
-        this._queueStatusWrap.title = titleParts.length ? `Queue: ${titleParts.join(", ")}` : "Queue: idle";
+        if (this.renderQueueActive === false) {
+            this._queueStatusWrap.title = titleParts.length
+                ? `Queue inactive: ${titleParts.join(", ")}`
+                : "Queue inactive";
+        } else {
+            this._queueStatusWrap.title = titleParts.length ? `Queue: ${titleParts.join(", ")}` : "Queue: idle";
+        }
     }
 
     _updateToolbar() {
@@ -1489,49 +1516,15 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            // Create new scene with same duration
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/duplicate`), {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    name: `${this.activeScene.name} (copy)`,
-                    duration_frames: this.activeScene.duration_frames || 200,
-                }),
             });
 
             if (!resp.ok) return;
             const newScene = await resp.json();
             const newId = newScene.scene_id;
 
-            // Copy guide frames
-            for (const guide of (this.activeScene.guide_frames || [])) {
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${newId}/guides`), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        frame_index: guide.frame_index,
-                        asset_id: guide.asset_id,
-                        source: guide.source || "asset",
-                        strength: guide.strength ?? 1.0,
-                    }),
-                });
-            }
-
-            // Copy prompt sections
-            for (const section of (this.activeScene.prompt_sections || [])) {
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${newId}/prompt_sections`), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        start_frame: section.start_frame,
-                        end_frame: section.end_frame,
-                        prompt: section.prompt,
-                    }),
-                });
-            }
-
             await this._fetchScenes();
-            // Switch to the new scene
             const copied = this.scenes.find(s => s.scene_id === newId);
             if (copied) this._setActiveScene(copied);
         } catch (e) {
@@ -3211,6 +3204,11 @@ export class EditorWidget {
             }
         }
         if (controls.takePlacementMode) controls.takePlacementMode.value = this._settings.render?.takePlacementMode ?? "trimmed";
+        if (controls.defaultSavePreset) {
+            controls.defaultSavePreset.value = this._settings.render?.defaultSavePreset ?? DEFAULT_SAVE_PRESET;
+            controls.defaultSavePreset._sonderSyncTitle?.();
+        }
+        if (controls.guideSnapshotMaxLongEdge) controls.guideSnapshotMaxLongEdge.value = String(this._settings.guides?.guideSnapshotMaxLongEdge ?? 0);
         for (const sync of controls._syncPresetNumberControls || []) {
             sync();
         }
@@ -3360,6 +3358,7 @@ export class EditorWidget {
         const availableWidth = width - this._labelW - margin;
 
         if (maxFrame > 0 && availableWidth > 0) {
+            // pixelsPerFrame mutation here is ephemeral; persistence happens only via _zoom.
             this.pixelsPerFrame = Math.max(0.2, Math.min(40, availableWidth / maxFrame));
             this.scrollX = 0; // Frame 0 starts at label edge
         }
@@ -5107,6 +5106,7 @@ export class EditorWidget {
         };
         if (asset.asset_type === "video") {
             const assetObj = _findAsset(asset.asset_id);
+            const videoHasAudio = assetObj?.has_audio === true || asset?.has_audio === true;
             const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
             const dropEnd = frame + dropDuration;
             const hasOverlap = (this.activeScene.clips || []).some(c =>
@@ -5126,10 +5126,8 @@ export class EditorWidget {
                 this.activeScene.video_lane_count = newCount;
                 this._buildTrackLayout();
             }
-            // Also check audio overlap for dual video+audio drops (always check —
-            // server attempts dual_drop regardless, and has_audio may not be set yet)
-            {
-                const fps = this._effectiveFps;
+            // Only videos with embedded audio can create paired audio tracks.
+            if (videoHasAudio) {
                 const audioDuration = dropDuration; // video duration = audio duration
                 const audioDropEnd = frame + audioDuration;
                 const hasAudioOverlap = (this.activeScene.audio_tracks || []).some(a =>
@@ -5191,12 +5189,14 @@ export class EditorWidget {
                 console.log("[Sonder] Guide frame created at frame", frame);
             } else if (asset.asset_type === "video") {
                 // Drop video = create clip on target video lane (+ audio track if video has audio)
+                const assetObj = _findAsset(asset.asset_id);
+                const videoHasAudio = assetObj?.has_audio === true || asset?.has_audio === true;
                 const clipBody = {
                     asset_id: asset.asset_id,
                     timeline_start_frame: frame,
                     track_index: targetVideoLane,
                     audio_lane_index: targetAudioLane,
-                    dual_drop: true,  // Always attempt — server handles gracefully
+                    dual_drop: videoHasAudio,
                 };
                 resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
                     method: "POST",
@@ -6156,26 +6156,97 @@ export class EditorWidget {
     }
 
     // ── Item Delete / Move ──────────────────────────────────────────────
+    _guideSnapshotMaxLongEdge() {
+        const value = Number(this._settings?.guides?.guideSnapshotMaxLongEdge ?? 0);
+        return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+    }
+
+    _resolveGuideSnapshotTargetLongEdge(clip) {
+        const asset = this._getAssetForSourcePath(clip?.source_path || "");
+        const sourceLong = Math.max(
+            0,
+            Math.round(Number(asset?.width) || 0),
+            Math.round(Number(asset?.height) || 0)
+        );
+        const sceneLong = Math.max(
+            1,
+            Math.round(Number(this.activeScene?.width || this.sceneWidth) || 0),
+            Math.round(Number(this.activeScene?.height || this.sceneHeight) || 0)
+        );
+        let targetLong = Math.max(sourceLong, sceneLong);
+        const override = this._guideSnapshotMaxLongEdge();
+        if (override > 0) {
+            targetLong = Math.min(targetLong, override);
+        }
+        return Math.max(1, targetLong);
+    }
+
     async _addClipFrameToGuides(clip) {
         if (!this.activeScene || !this.projectDir || !clip) return;
         const dirName = this._projectDirName();
         const sourceFrame = Math.max(0, this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0));
+        const targetLongEdge = this._resolveGuideSnapshotTargetLongEdge(clip);
 
         try {
-            const extractResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/extract_frame`), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    source_path: clip.source_path,
-                    frame_index: sourceFrame,
-                }),
-            });
-            if (!extractResp.ok) {
-                console.warn("[Sonder] Extract frame failed:", await extractResp.text());
-                return;
+            let asset = null;
+            const viewportSurface = this._ensureViewportSurface();
+            if (viewportSurface?.captureSourceFrame) {
+                try {
+                    const snapshot = await viewportSurface.captureSourceFrame(clip.source_path, sourceFrame, targetLongEdge);
+                    if (snapshot?.blob) {
+                        const formData = new FormData();
+                        formData.append("file", snapshot.blob, `snapshot_f${sourceFrame}.png`);
+                        formData.append("metadata", JSON.stringify({
+                            source_path: clip.source_path,
+                            source_frame_index: sourceFrame,
+                            timeline_frame_index: this.playhead,
+                            extraction_mode: "viewport_snapshot",
+                            snapshot_long_edge: snapshot.targetLongEdge || targetLongEdge,
+                            snapshot_source_long_edge: snapshot.sourceLongEdge || Math.max(snapshot.sourceWidth || 0, snapshot.sourceHeight || 0),
+                        }));
+                        const snapshotResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/viewport_snapshot`), {
+                            method: "POST",
+                            body: formData,
+                        });
+                        if (snapshotResp.ok) {
+                            asset = await snapshotResp.json();
+                            console.debug?.("[Sonder] Guide captured via viewport snapshot", {
+                                source_path: clip.source_path,
+                                source_frame: sourceFrame,
+                                target_long_edge: snapshot.targetLongEdge || targetLongEdge,
+                            });
+                        } else {
+                            console.warn("[Sonder] Viewport snapshot registration failed:", await snapshotResp.text());
+                        }
+                    }
+                } catch (snapshotError) {
+                    console.warn("[Sonder] Viewport snapshot capture failed:", snapshotError);
+                }
             }
 
-            const asset = await extractResp.json();
+            if (!asset) {
+                const extractResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/extract_frame`), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        source_path: clip.source_path,
+                        frame_index: sourceFrame,
+                        target_long_edge: targetLongEdge,
+                    }),
+                });
+                if (!extractResp.ok) {
+                    console.warn("[Sonder] Extract frame failed:", await extractResp.text());
+                    return;
+                }
+                asset = await extractResp.json();
+                console.debug?.("[Sonder] Guide captured via backend fallback", {
+                    source_path: clip.source_path,
+                    source_frame: sourceFrame,
+                    target_long_edge: targetLongEdge,
+                });
+                this._showToast("Captured via backend (viewport snapshot unavailable)");
+            }
+
             const guideResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -7146,6 +7217,7 @@ export class EditorWidget {
                     const availableWidth = width - this._labelW - margin;
                     const range = this.selectionEnd - this.selectionStart;
                     if (range > 0 && availableWidth > 0) {
+                        // pixelsPerFrame mutation here is ephemeral; persistence happens only via _zoom.
                         this.pixelsPerFrame = Math.max(0.2, Math.min(40, availableWidth / range));
                         this.scrollX = this.selectionStart;
                     }
@@ -7259,6 +7331,7 @@ export class EditorWidget {
         const oldPPF = this.pixelsPerFrame;
         this.pixelsPerFrame = Math.max(0.2, Math.min(40, this.pixelsPerFrame + dir * 0.5));
         if (this.pixelsPerFrame !== oldPPF) {
+            updateEditorSettings({ layout: { timelinePixelsPerFrame: this.pixelsPerFrame } });
             this._renderTimeline();
         }
     }
@@ -7817,6 +7890,60 @@ export class EditorWidget {
         }
     }
 
+    _setRenderQueueActive(active, options = {}) {
+        const { syncWidget = true } = options;
+        const nextActive = !!active;
+        const changed = this.renderQueueActive !== nextActive;
+        this.renderQueueActive = nextActive;
+        if (syncWidget) {
+            this._setWidgetValue("render_queue_active", nextActive);
+        }
+        if (changed) {
+            this._updateQueueChromeStatus();
+            this._renderQueuePanel();
+        }
+    }
+
+    _createRenderQueueActiveControl() {
+        const row = document.createElement("label");
+        row.style.cssText = `
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 7px 8px;
+            border-bottom: 1px solid ${COLORS.borderSoft};
+            color: ${COLORS.textMuted};
+            font-size: 10px;
+            cursor: pointer;
+            user-select: none;
+        `;
+        row.title = "Toggle whether queued jobs drive editor execution";
+
+        const label = document.createElement("span");
+        label.textContent = "Queue Active";
+        label.style.cssText = `font-weight: 700; color: ${COLORS.text};`;
+
+        const right = document.createElement("span");
+        right.style.cssText = `display: flex; align-items: center; gap: 6px;`;
+
+        const status = document.createElement("span");
+        status.textContent = this.renderQueueActive === false ? "Off" : "On";
+        status.style.cssText = `color: ${COLORS.textDim}; font-size: 10px;`;
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = this.renderQueueActive !== false;
+        checkbox.title = row.title;
+        checkbox.style.cssText = `margin: 0;`;
+        checkbox.addEventListener("click", (event) => event.stopPropagation());
+        checkbox.addEventListener("change", () => this._setRenderQueueActive(checkbox.checked));
+
+        right.append(status, checkbox);
+        row.append(label, right);
+        return row;
+    }
+
     _groupRenderQueueJobs(queue) {
         const groups = [];
         let index = 0;
@@ -8021,8 +8148,12 @@ export class EditorWidget {
         this._updateQueueChromeStatus();
 
         const queue = this._renderQueue || [];
+        this._queueContainer.appendChild(this._createRenderQueueActiveControl());
         if (queue.length === 0) {
-            this._queueContainer.innerHTML = `<div style="padding: 10px; color: ${COLORS.textMuted}; font-style: italic; font-size: 10px;">Queue empty - use + Queue or + Batch to add jobs</div>`;
+            const emptyEl = document.createElement("div");
+            emptyEl.style.cssText = `padding: 10px; color: ${COLORS.textMuted}; font-style: italic; font-size: 10px;`;
+            emptyEl.textContent = "Queue empty - use + Queue or + Batch to add jobs";
+            this._queueContainer.appendChild(emptyEl);
             return;
         }
 
@@ -9437,10 +9568,20 @@ export class EditorWidget {
                 const el = document.createElement("option");
                 el.value = option.value;
                 el.textContent = option.label;
+                if (option.description) el.title = option.description;
                 select.appendChild(el);
             }
+            const syncTitle = () => {
+                const selected = options.find((option) => option.value === select.value);
+                select.title = selected?.description || description || "";
+            };
             select.value = getter();
-            select.addEventListener("change", () => onChange(select.value));
+            syncTitle();
+            select._sonderSyncTitle = syncTitle;
+            select.addEventListener("change", () => {
+                syncTitle();
+                onChange(select.value);
+            });
             controlWrap.appendChild(select);
             controls[key] = select;
             return select;
@@ -10052,6 +10193,15 @@ export class EditorWidget {
             () => this._settings.render?.takePlacementMode ?? "trimmed",
             (value) => updateCategory("render", "takePlacementMode", value)
         );
+        createSelect(
+            renderSection,
+            "defaultSavePreset",
+            "Default Save Preset",
+            "Applied to newly inserted Sonder Save Video nodes.",
+            SAVE_PRESET_OPTIONS,
+            () => this._settings.render?.defaultSavePreset ?? DEFAULT_SAVE_PRESET,
+            (value) => updateCategory("render", "defaultSavePreset", value)
+        );
         createPresetNumberInput(
             renderSection,
             "maxRenderCacheEntries",
@@ -10112,6 +10262,24 @@ export class EditorWidget {
                 step: 1,
                 getter: () => this._settings.batchRender.maxFramesPerChunk,
                 onChange: (value) => updateCategory("batchRender", "maxFramesPerChunk", Math.max(0, Math.round(value))),
+            }
+        );
+
+        const guidesSection = createSection(
+            "Guides",
+            "Guide capture defaults for clip-frame extraction."
+        );
+        createNumberInput(
+            guidesSection,
+            "guideSnapshotMaxLongEdge",
+            "Snapshot Max Long Edge",
+            "0 keeps the automatic source/scene long-edge rule. Values above 0 cap captured guide PNGs.",
+            {
+                min: 0,
+                max: 8192,
+                step: 64,
+                getter: () => this._settings.guides?.guideSnapshotMaxLongEdge ?? 0,
+                onChange: (value) => updateCategory("guides", "guideSnapshotMaxLongEdge", Math.max(0, Math.round(value))),
             }
         );
 

@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - tests stub these via importorskip
             return False
         return isinstance(value[0], str) and isinstance(value[1], (int, float))
 
+from ..server.media_helpers import decode_video_frame, fit_frame_to_canvas
 from ..server.timeline_state import GuideFrame
 
 logger = logging.getLogger(__name__)
@@ -54,44 +55,31 @@ _ANY = _AnyType("*")
 
 
 # ── Guide image loading (mirrors editor_node.py:793) ──────────────────
-def _fit_frame_to_canvas(frame_bgr, canvas_w: int, canvas_h: int) -> np.ndarray:
-    fh, fw = frame_bgr.shape[:2]
-    if fw <= 0 or fh <= 0:
-        return np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    scale = min(canvas_w / fw, canvas_h / fh)
-    new_w = max(1, int(fw * scale))
-    new_h = max(1, int(fh * scale))
-    resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    x_off = (canvas_w - new_w) // 2
-    y_off = (canvas_h - new_h) // 2
-    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
-    return canvas
-
-
 def _load_guide_image_bridge(path: str, asset_type: str, target_w: int, target_h: int):
-    cap = None
     try:
         if asset_type == "video":
-            cap = cv2.VideoCapture(path)
-            if not cap.isOpened():
-                return None
-            ok, frame_bgr = cap.read()
-            if not ok:
-                return None
+            frame_rgb = decode_video_frame(path, 0)
+            if frame_rgb is None:
+                cap = cv2.VideoCapture(path)
+                try:
+                    if not cap.isOpened():
+                        return None
+                    ok, frame_bgr = cap.read()
+                    if not ok:
+                        return None
+                    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                finally:
+                    cap.release()
         else:
             frame_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
             if frame_bgr is None:
                 return None
-        placed = _fit_frame_to_canvas(frame_bgr, target_w, target_h)
-        rgb = cv2.cvtColor(placed, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        rgb, _bounds = fit_frame_to_canvas(frame_rgb, target_w, target_h)
         return torch.from_numpy(rgb.astype(np.float32) / 255.0)
     except Exception as e:
         logger.warning("Sonder bridge: failed to load guide %s: %s", path, e)
         return None
-    finally:
-        if cap is not None:
-            cap.release()
 
 
 # ── Guide filtering (mirrors editor_node.py:454-492) ──────────────────

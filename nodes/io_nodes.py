@@ -19,10 +19,39 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server.project_manager import load_project, save_project
+from ..server.media_helpers import (
+    CUSTOM_AUDIO_CODEC_OPTIONS,
+    CUSTOM_CONTAINER_OPTIONS,
+    CUSTOM_ENCODER_PRESET_OPTIONS,
+    CUSTOM_OUTPUT_KIND_OPTIONS,
+    CUSTOM_OUTPUT_KIND_PNG_SEQUENCE,
+    CUSTOM_OUTPUT_KIND_VIDEO,
+    CUSTOM_PIX_FMT_OPTIONS,
+    CUSTOM_SAVE_VIDEO_PRESET,
+    CUSTOM_VIDEO_CODEC_OPTIONS,
+    DEFAULT_SAVE_VIDEO_PRESET,
+    SAVE_VIDEO_PRESET_ORDER,
+    SAVE_VIDEO_PRESETS,
+    encode_video,
+    get_ffmpeg_path,
+    metadata_for_save_preset,
+    normalize_save_preset,
+    output_extension_for_custom_options,
+    output_extension_for_preset,
+    resolve_custom_export_options,
+    save_video_encode_timeout_seconds,
+    tensor_mode_for_preset,
+    tensor_to_uint8_frames,
+    write_png,
+)
 
 logger = logging.getLogger("sonder_editor")
 
 BRIDGE_SCAN_SIDECAR = "_scan.json"
+SAVE_PRESET_TOOLTIP = "Preset choices: " + " | ".join(
+    f"{preset}: {SAVE_VIDEO_PRESETS[preset].get('description', '')}"
+    for preset in SAVE_VIDEO_PRESET_ORDER
+)
 BRIDGE_STALE_DIR_TTL_SEC = 24 * 60 * 60
 BRIDGE_POLL_INTERVAL_SEC = 0.25
 BRIDGE_IDLE_SETTLE_SEC = 1.0
@@ -288,6 +317,87 @@ def _bridge_unique_media_name(media_dir: str, basename: str) -> str:
         candidate = f"{stem}_{suffix}{ext}"
         suffix += 1
     return candidate
+
+
+def _unique_media_subfolder(media_dir: str, folder_name: str) -> str:
+    stem = _sanitize_bridge_component(folder_name) or "output"
+    candidate = stem
+    suffix = 1
+    while os.path.exists(os.path.join(media_dir, candidate)):
+        candidate = f"{stem}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _save_image_asset_thumbnail(project, asset: Asset, filepath: str) -> None:
+    try:
+        from ..server.thumbnail_service import ensure_thumbnail
+
+        thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
+        ensure_thumbnail("image", filepath, thumb_path)
+    except Exception as exc:
+        logger.warning("Failed to generate image thumbnail for %s: %s", filepath, exc)
+
+
+def _save_custom_png_sequence(project, rgb_frames: np.ndarray, filename_prefix: str, metadata: dict) -> tuple[str, list[Asset]]:
+    media_dir = os.path.join(project.project_dir, "media")
+    os.makedirs(media_dir, exist_ok=True)
+    stem = _sanitize_bridge_component(filename_prefix) or "output"
+    frame_count, h, w = rgb_frames.shape[:3]
+    compression = int(metadata.get("custom_png_compression", 0) or 0)
+    assets: list[Asset] = []
+
+    if frame_count == 1:
+        filename = _bridge_unique_media_name(media_dir, f"{stem}.png")
+        filepath = os.path.join(media_dir, filename)
+        write_png(filepath, rgb_frames[0], compression=compression)
+        asset = Asset(
+            name=filename,
+            asset_type="image",
+            path=os.path.join("media", filename),
+            width=w,
+            height=h,
+            frame_count=1,
+            generation_params={
+                **metadata,
+                "image_sequence": False,
+                "sequence_total": 1,
+                "sequence_index": 1,
+            },
+        )
+        project.add_asset(asset)
+        _save_image_asset_thumbnail(project, asset, filepath)
+        return filepath, [asset]
+
+    folder_name = _unique_media_subfolder(media_dir, stem)
+    folder_path = os.path.join(media_dir, folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+    _ensure_asset_folder_metadata(project, folder_name)
+
+    for idx, frame in enumerate(rgb_frames, start=1):
+        filename = f"{stem}_{idx:04d}.png"
+        filepath = os.path.join(folder_path, filename)
+        write_png(filepath, frame, compression=compression)
+        asset = Asset(
+            name=filename,
+            asset_type="image",
+            path=os.path.join("media", folder_name, filename),
+            width=w,
+            height=h,
+            frame_count=1,
+            folder=folder_name,
+            generation_params={
+                **metadata,
+                "image_sequence": True,
+                "sequence_folder": folder_name,
+                "sequence_total": frame_count,
+                "sequence_index": idx,
+            },
+        )
+        project.add_asset(asset)
+        _save_image_asset_thumbnail(project, asset, filepath)
+        assets.append(asset)
+    return folder_path, assets
 
 
 def _extract_bridge_asset_metadata(source_path: str, asset_type: str) -> dict:
@@ -626,7 +736,16 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     if target_folder and registered_assets:
         _ensure_asset_folder_metadata(project, target_folder)
         changed = True
-    if registered_assets and entry.get("mark_queue_complete"):
+    if entry.get("mark_queue_complete") and not queue_job_id:
+        logger.warning(
+            "Bridge mark_queue_complete=True but execution context had no queue_job_id; "
+            "queue completion skipped. prompt=%s node=%s registered=%d. "
+            "Any 'running' queue job will need to be inspected manually.",
+            entry.get("prompt_key"),
+            entry.get("bridge_node_id"),
+            len(registered_assets),
+        )
+    elif registered_assets and entry.get("mark_queue_complete"):
         first_asset = registered_assets[0][1]
         changed = _mark_queue_job_completed(project, queue_job_id, first_asset.asset_id) or changed
     elif entry.get("mark_queue_complete") and not registered_assets:
@@ -742,11 +861,7 @@ _install_bridge_prompt_queue_hooks()
 
 def _get_ffmpeg() -> str:
     """Return ffmpeg path, preferring imageio_ffmpeg if available."""
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        return "ffmpeg"
+    return get_ffmpeg_path()
 
 
 def _frames_to_tensor(frames: list[np.ndarray]) -> torch.Tensor:
@@ -758,7 +873,7 @@ def _frames_to_tensor(frames: list[np.ndarray]) -> torch.Tensor:
 
 def _tensor_to_frames(tensor: torch.Tensor) -> list[np.ndarray]:
     """Convert (N, H, W, 3) float32 RGB tensor to list of BGR uint8 frames."""
-    arr = (tensor.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    arr = tensor_to_uint8_frames(tensor, mode="truncate")
     return [cv2.cvtColor(arr[i], cv2.COLOR_RGB2BGR) for i in range(arr.shape[0])]
 
 
@@ -799,7 +914,7 @@ class SonderSaveVideo:
     RETURN_NAMES = ("output_path",)
     OUTPUT_TOOLTIPS = ("Absolute path to the saved video file.",)
     FUNCTION = "save_video"
-    DESCRIPTION = "Encodes an IMAGE tensor to an MP4 video file in the project's exports/ folder. Optionally muxes audio. Shows a thumbnail preview of the first frame."
+    DESCRIPTION = "Encodes an IMAGE tensor to a project video asset. Optionally muxes audio. Shows a thumbnail preview of the first frame."
 
     @classmethod
     def INPUT_TYPES(s):
@@ -814,58 +929,109 @@ class SonderSaveVideo:
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "Audio to mux into the video."}),
-                "codec": (["libx264", "libx265"], {"tooltip": "Video codec. H.264 is most compatible, H.265 is smaller."}),
-                "quality": ("INT", {"default": 23, "min": 0, "max": 51, "tooltip": "CRF quality (lower = better quality, larger file). 23 is a good default."}),
+                "save_preset": (SAVE_VIDEO_PRESET_ORDER, {"default": DEFAULT_SAVE_VIDEO_PRESET, "tooltip": SAVE_PRESET_TOOLTIP}),
+                "custom_output_kind": (CUSTOM_OUTPUT_KIND_OPTIONS, {"default": CUSTOM_OUTPUT_KIND_VIDEO, "tooltip": "Custom only. Video File encodes one media asset; PNG Sequence writes frame images."}),
+                "custom_container": (CUSTOM_CONTAINER_OPTIONS, {"default": "mp4", "tooltip": "Custom video only. Output container/extension."}),
+                "custom_video_codec": (CUSTOM_VIDEO_CODEC_OPTIONS, {"default": "libx264", "tooltip": "Custom video only. ffmpeg video codec."}),
+                "custom_pix_fmt": (CUSTOM_PIX_FMT_OPTIONS, {"default": "yuv420p", "tooltip": "Custom video only. ffmpeg pixel format."}),
+                "custom_crf": ("INT", {"default": 18, "min": 0, "max": 51, "tooltip": "Custom x264/x265 only. Lower means higher quality and larger files."}),
+                "custom_encoder_preset": (CUSTOM_ENCODER_PRESET_OPTIONS, {"default": "slow", "tooltip": "Custom x264/x265 only. Slower presets improve compression efficiency."}),
+                "custom_audio_codec": (CUSTOM_AUDIO_CODEC_OPTIONS, {"default": "aac", "tooltip": "Custom video only. Choose none to omit connected audio."}),
+                "custom_audio_bitrate_kbps": ("INT", {"default": 192, "min": 1, "max": 10000, "tooltip": "Custom AAC audio only. Audio bitrate in kbps."}),
+                "custom_png_compression": ("INT", {"default": 0, "min": 0, "max": 9, "tooltip": "Custom PNG Sequence only. 0 is fastest/largest; 9 is smallest/slowest."}),
             },
         }
 
     def save_video(self, project, frames, filename_prefix="output", fps=24.0,
-                   mode="Video", mark_queue_complete=False, audio=None, codec="libx264", quality=23):
+                   mode="Video", mark_queue_complete=False, audio=None,
+                   save_preset=DEFAULT_SAVE_VIDEO_PRESET,
+                   custom_output_kind=CUSTOM_OUTPUT_KIND_VIDEO,
+                   custom_container="mp4",
+                   custom_video_codec="libx264",
+                   custom_pix_fmt="yuv420p",
+                   custom_crf=18,
+                   custom_encoder_preset="slow",
+                   custom_audio_codec="aac",
+                   custom_audio_bitrate_kbps=192,
+                   custom_png_compression=0):
         # Save to media/ so it appears in the project's asset gallery
         media_dir = os.path.join(project.project_dir, "media")
         os.makedirs(media_dir, exist_ok=True)
 
-        output_filename = f"{filename_prefix}_{uuid.uuid4().hex[:6]}.mp4"
+        preset_id = normalize_save_preset(save_preset)
+        custom_options = {
+            "custom_output_kind": custom_output_kind,
+            "custom_container": custom_container,
+            "custom_video_codec": custom_video_codec,
+            "custom_pix_fmt": custom_pix_fmt,
+            "custom_crf": custom_crf,
+            "custom_encoder_preset": custom_encoder_preset,
+            "custom_audio_codec": custom_audio_codec,
+            "custom_audio_bitrate_kbps": custom_audio_bitrate_kbps,
+            "custom_png_compression": custom_png_compression,
+        }
+        custom_spec = resolve_custom_export_options(custom_options) if preset_id == CUSTOM_SAVE_VIDEO_PRESET else None
+        if preset_id == CUSTOM_SAVE_VIDEO_PRESET and custom_spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE and mode == "Take":
+            raise ValueError("Custom PNG Sequence export is not available in Take mode. Choose Video mode or a video preset.")
+        extension = output_extension_for_custom_options(custom_options) if custom_spec else output_extension_for_preset(preset_id)
+        output_filename = f"{filename_prefix}_{uuid.uuid4().hex[:6]}{extension}"
         output_path = os.path.join(media_dir, output_filename)
 
-        bgr_frames = _tensor_to_frames(frames)
-        h, w = bgr_frames[0].shape[:2]
+        tensor_mode = custom_spec["tensor_mode"] if custom_spec else tensor_mode_for_preset(preset_id)
+        rgb_frames = tensor_to_uint8_frames(frames, mode=tensor_mode)
+        h, w = rgb_frames[0].shape[:2]
 
-        ffmpeg = _get_ffmpeg()
-
-        # Build ffmpeg command
-        cmd = [
-            ffmpeg,
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{w}x{h}", "-r", str(fps),
-            "-i", "pipe:0",
-        ]
+        if custom_spec and custom_spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE:
+            encode_metadata = metadata_for_save_preset(preset_id, custom_options)
+            output_path, png_assets = _save_custom_png_sequence(project, rgb_frames, filename_prefix, encode_metadata)
+            if mark_queue_complete:
+                ctx = _copy_execution_context(project)
+                result_asset_id = png_assets[0].asset_id if png_assets else ""
+                _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), result_asset_id)
+            save_project(project)
+            preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savepng")
+            logger.info("Saved PNG sequence to %s (%d frames)", output_path, len(rgb_frames))
+            return {
+                "ui": {"images": preview_images},
+                "result": (output_path,),
+            }
 
         audio_tmp = None
         if audio is not None:
             audio_tmp = os.path.join(media_dir, f"_tmp_audio_{uuid.uuid4().hex[:6]}.wav")
             try:
                 _save_audio_waveform(audio, audio_tmp)
-                cmd += ["-i", audio_tmp]
             except Exception as e:
                 logger.warning("Failed to save temp audio: %s", e)
                 audio_tmp = None
 
-        cmd += ["-c:v", codec, "-crf", str(quality), "-pix_fmt", "yuv420p"]
-        if audio_tmp:
-            cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"]
-        cmd += [output_path, "-y"]
-
-        raw_bytes = b"".join(f.tobytes() for f in bgr_frames)
+        has_audio = bool(audio_tmp) and not (custom_spec and custom_spec["audio_codec"] == "none")
+        encode_timeout = save_video_encode_timeout_seconds(
+            preset_id,
+            len(rgb_frames),
+            w,
+            h,
+            custom_options if custom_spec else None,
+        )
         ffmpeg_started_at = time.perf_counter()
         logger.info(
-            "ffmpeg start: save_video output=%s frames=%d audio=%s",
+            "ffmpeg start: save_video output=%s preset=%s frames=%d audio=%s timeout=%ss",
             output_path,
-            len(bgr_frames),
-            bool(audio_tmp),
+            preset_id,
+            len(rgb_frames),
+            has_audio,
+            encode_timeout,
         )
         try:
-            proc = subprocess.run(cmd, input=raw_bytes, capture_output=True, timeout=90)
+            encode_metadata = encode_video(
+                rgb_frames,
+                preset_id=preset_id,
+                output_path=output_path,
+                fps=fps,
+                audio_path=audio_tmp,
+                custom_options=custom_options if custom_spec else None,
+                timeout=encode_timeout,
+            )
         except subprocess.TimeoutExpired:
             logger.warning(
                 "ffmpeg timeout: save_video output=%s duration=%.2fs",
@@ -877,17 +1043,14 @@ class SonderSaveVideo:
             if audio_tmp and os.path.isfile(audio_tmp):
                 os.remove(audio_tmp)
         logger.info(
-            "ffmpeg end: save_video output=%s returncode=%s duration=%.2fs",
+            "ffmpeg end: save_video output=%s preset=%s duration=%.2fs",
             output_path,
-            proc.returncode,
+            preset_id,
             time.perf_counter() - ffmpeg_started_at,
         )
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode(errors='replace')[:500]}")
-
         # Auto-register as a project asset
-        total_frames = len(bgr_frames)
+        total_frames = len(rgb_frames)
         asset = Asset(
             name=output_filename,
             asset_type="video",
@@ -897,7 +1060,8 @@ class SonderSaveVideo:
             frame_count=total_frames,
             fps=fps,
             duration_sec=total_frames / fps if fps > 0 else 0.0,
-            has_audio=bool(audio_tmp),
+            has_audio=has_audio,
+            generation_params=dict(encode_metadata),
         )
         project.add_asset(asset)
 
@@ -916,7 +1080,8 @@ class SonderSaveVideo:
             if scene:
                 # Organize asset into Takes folder
                 asset.folder = f"Takes/{ctx.get('scene_name', scene.name)}"
-                asset.generation_params = dict(ctx)
+                take_generation_params = {**dict(ctx), **dict(encode_metadata)}
+                asset.generation_params = dict(take_generation_params)
 
                 # Find next available video lane
                 existing_lanes = [c.track_index for c in scene.clips] if scene.clips else [-1]
@@ -978,11 +1143,11 @@ class SonderSaveVideo:
                     source_origin_frame=source_origin_frame,
                     track_index=new_lane,
                     is_generated=True,
-                    generation_params=dict(ctx),
-                    take_metadata=dict(ctx),
+                    generation_params=dict(take_generation_params),
+                    take_metadata=dict(take_generation_params),
                 )
                 scene.clips.append(clip)
-                if audio is not None:
+                if has_audio and audio is not None:
                     audio_filename = f"{os.path.splitext(output_filename)[0]}_audio.wav"
                     audio_rel_path = os.path.join("media", audio_filename)
                     audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
@@ -996,7 +1161,7 @@ class SonderSaveVideo:
                             duration_sec=audio_duration_sec,
                             sample_rate=sample_rate,
                             folder=asset.folder,
-                            generation_params=dict(ctx),
+                            generation_params=dict(take_generation_params),
                         )
                         project.add_asset(audio_asset)
 
@@ -1036,9 +1201,9 @@ class SonderSaveVideo:
         save_project(project)
 
         # Generate preview thumbnail for ComfyUI node display
-        preview_images = _save_preview_thumbnail(bgr_frames[0], "sonder_savevid")
+        preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savevid")
 
-        logger.info("Saved video to %s (%d frames, %.1f fps)", output_path, len(bgr_frames), fps)
+        logger.info("Saved video to %s (%d frames, %.1f fps, preset=%s)", output_path, len(rgb_frames), fps, preset_id)
         return {
             "ui": {"images": preview_images},
             "result": (output_path,),

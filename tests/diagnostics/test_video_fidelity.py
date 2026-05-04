@@ -31,6 +31,59 @@ def _ensure_test_package() -> None:
         sys.modules[TEST_PACKAGE] = pkg
 
 
+class _FakeStreamingStdin:
+    def __init__(self, proc):
+        self.proc = proc
+        self.closed = False
+
+    def write(self, data):
+        if self.proc.write_error is not None:
+            raise self.proc.write_error
+        payload = bytes(data)
+        self.proc.captured["writes"].append(payload)
+        return len(payload)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeStreamingProcess:
+    def __init__(self, cmd, captured, *, kwargs, returncode=0, stderr=b"", write_error=None, wait_error=None):
+        self.cmd = cmd
+        self.captured = captured
+        self.returncode = returncode
+        self.write_error = write_error
+        self.wait_error = wait_error
+        self.killed = False
+        self.stdin = _FakeStreamingStdin(self)
+        captured["cmds"].append([str(part) for part in cmd])
+        captured["kwargs"].append(kwargs)
+        captured["processes"].append(self)
+        if stderr:
+            kwargs["stderr"].write(stderr)
+            kwargs["stderr"].flush()
+
+    def wait(self, timeout=None):
+        self.captured["wait_timeouts"].append(timeout)
+        if self.wait_error is not None:
+            raise self.wait_error
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def _install_fake_streaming_popen(media_helpers, monkeypatch, **process_kwargs):
+    captured = {"cmds": [], "kwargs": [], "processes": [], "wait_timeouts": [], "writes": []}
+
+    def fake_popen(cmd, **kwargs):
+        return _FakeStreamingProcess(cmd, captured, kwargs=kwargs, **process_kwargs)
+
+    monkeypatch.setattr(media_helpers.subprocess, "Popen", fake_popen)
+    return captured
+
+
 def _install_folder_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     output_dir = tmp_path / "output"
     temp_dir = tmp_path / "temp"
@@ -105,6 +158,46 @@ class _JsonRequest:
 
     async def json(self):
         return self._body
+
+
+class _MultipartField:
+    def __init__(self, name: str, payload):
+        self.name = name
+        self._payload = payload
+
+    async def read(self, decode=False):
+        return self._payload
+
+    async def text(self):
+        if isinstance(self._payload, bytes):
+            return self._payload.decode("utf-8")
+        return str(self._payload)
+
+
+class _MultipartReader:
+    def __init__(self, fields):
+        self._fields = list(fields)
+        self._idx = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._idx >= len(self._fields):
+            raise StopAsyncIteration
+        field = self._fields[self._idx]
+        self._idx += 1
+        return field
+
+
+class _MultipartRequest:
+    def __init__(self, fields, *, match_info=None, query=None):
+        self.match_info = match_info or {}
+        self.query = query or {}
+        self._reader = _MultipartReader(fields)
+
+    async def multipart(self):
+        return self._reader
 
 
 def _require_ffmpeg(io_nodes) -> str:
@@ -444,6 +537,7 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     ffmpeg = _require_ffmpeg(io_nodes)
     torch = pytest.importorskip("torch")
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
     timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
     thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
 
@@ -452,16 +546,24 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
     project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Fidelity Diagnostics")
     frames_rgb = _make_diagnostic_rgb_frames(frame_count=4)
     frames = _rgb_to_tensor(frames_rgb)
-    captured: list[list[str]] = []
+    captured_popen: list[list[str]] = []
+    captured_run: list[list[str]] = []
     real_run = subprocess.run
+    real_popen = subprocess.Popen
+
+    def capture_popen(cmd, *args, **kwargs):
+        captured_popen.append([str(part) for part in cmd])
+        return real_popen(cmd, *args, **kwargs)
 
     def capture_run(cmd, *args, **kwargs):
-        captured.append([str(part) for part in cmd])
+        captured_run.append([str(part) for part in cmd])
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
     monkeypatch.setattr(io_nodes, "_get_ffmpeg", lambda: ffmpeg)
-    monkeypatch.setattr(io_nodes.subprocess, "run", capture_run)
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
+    monkeypatch.setattr(media_helpers.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(media_helpers.subprocess, "run", capture_run)
 
     save_result = io_nodes.SonderSaveVideo().save_video(
         project,
@@ -470,11 +572,11 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
         fps=24.0,
         mode="Video",
         mark_queue_complete=False,
-        codec="libx264",
-        quality=23,
+        save_preset="Compatible MP4",
     )
     preview_result = io_nodes.SonderPreviewVideo().preview(frames, fps=24.0)
-    monkeypatch.setattr(io_nodes.subprocess, "run", real_run)
+    monkeypatch.setattr(media_helpers.subprocess, "Popen", real_popen)
+    monkeypatch.setattr(media_helpers.subprocess, "run", real_run)
 
     save_path = Path(save_result["result"][0])
     preview_video = preview_result["ui"]["videos"][0]["filename"]
@@ -483,17 +585,407 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
     assert preview_path.is_file()
     assert len(project.assets) == 1
 
-    save_tail = captured[0][captured[0].index("-c:v") :]
-    preview_tail = captured[1][captured[1].index("-c:v") :]
-    assert save_tail[:6] == ["-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p"]
+    save_cmd = next(cmd for cmd in captured_popen if "-preset" in cmd and "slow" in cmd)
+    preview_cmd = captured_run[0]
+    save_tail = save_cmd[save_cmd.index("-c:v") :]
+    preview_tail = preview_cmd[preview_cmd.index("-c:v") :]
+    assert save_tail[:10] == ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
     assert preview_tail[:6] == ["-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p"]
+    assert project.assets[0].generation_params["save_preset"] == "Compatible MP4"
+    assert project.assets[0].generation_params["tensor_mode"] == "round"
 
     height, width = frames_rgb.shape[1:3]
     save_metrics = _metrics(frames_rgb, _decode_ffmpeg_rgb(ffmpeg, save_path, width, height))
     preview_metrics = _metrics(frames_rgb, _decode_ffmpeg_rgb(ffmpeg, preview_path, width, height))
     print("VIDEO_FIDELITY_NODE_PATHS=" + json.dumps({"save": save_metrics, "preview": preview_metrics}, sort_keys=True))
     assert save_metrics["max_delta"] > 0
-    assert preview_metrics["mae"] == pytest.approx(save_metrics["mae"], abs=0.75)
+    assert save_metrics["mae"] <= preview_metrics["mae"] + 0.75
+
+
+def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    frames = np.zeros((1, 4, 4, 3), dtype=np.uint8)
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"fake")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    assert media_helpers.SAVE_VIDEO_PRESET_ORDER[0] == "Compatible MP4"
+    assert media_helpers.SAVE_VIDEO_PRESET_ORDER[-1] == "Custom"
+    assert "Legacy" not in media_helpers.SAVE_VIDEO_PRESET_ORDER
+    assert media_helpers.normalize_save_preset("Legacy") == "Compatible MP4"
+
+    cases = [
+        ("Compatible MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "192k"]),
+        ("High Quality MP4", ".mp4", "libx264", "yuv420p", "round", ["-c:a", "aac", "-b:a", "256k"]),
+        ("Editing Master MP4", ".mp4", "libx264", "yuv444p", "round", ["-c:a", "aac", "-b:a", "256k"]),
+        ("ProRes 422 HQ", ".mov", "prores_ks", "yuv422p10le", "round", ["-c:a", "pcm_s16le"]),
+        ("Lossless FFV1 (RGB)", ".mkv", "ffv1", "gbrp", "round", ["-c:a", "flac"]),
+    ]
+    for preset, extension, codec, pix_fmt, tensor_mode, audio_args in cases:
+        meta = media_helpers.encode_video(
+            frames,
+            preset_id=preset,
+            output_path=str(tmp_path / f"out{extension}"),
+            fps=24,
+            audio_path=str(audio_path),
+        )
+        cmd = captured["cmds"][-1]
+        assert meta["save_preset"] == preset
+        assert meta["codec"] == codec
+        assert meta["pix_fmt"] == pix_fmt
+        assert meta["tensor_mode"] == tensor_mode
+        assert cmd[cmd.index("-c:v") + 1] == codec
+        assert cmd[cmd.index("-pix_fmt", cmd.index("-c:v")) + 1] == pix_fmt
+        for idx, arg in enumerate(audio_args):
+            assert cmd[cmd.index(audio_args[0]) + idx] == arg
+
+    custom_options = {
+        "custom_output_kind": "Video File",
+        "custom_container": "mp4",
+        "custom_video_codec": "libx265",
+        "custom_pix_fmt": "yuv420p",
+        "custom_crf": 21,
+        "custom_encoder_preset": "medium",
+        "custom_audio_codec": "aac",
+        "custom_audio_bitrate_kbps": 320,
+    }
+    meta = media_helpers.encode_video(
+        frames,
+        preset_id="Custom",
+        output_path=str(tmp_path / "custom.mp4"),
+        fps=24,
+        audio_path=str(audio_path),
+        custom_options=custom_options,
+    )
+    cmd = captured["cmds"][-1]
+    assert meta["save_preset"] == "Custom"
+    assert meta["codec"] == "libx265"
+    assert meta["pix_fmt"] == "yuv420p"
+    assert meta["container"] == "mp4"
+    assert meta["tensor_mode"] == "round"
+    assert meta["custom_crf"] == 21
+    assert meta["custom_audio_bitrate_kbps"] == 320
+    assert cmd[cmd.index("-c:v") + 1] == "libx265"
+    assert cmd[cmd.index("-crf") + 1] == "21"
+    assert cmd[cmd.index("-preset") + 1] == "medium"
+    assert cmd[cmd.index("-c:a") + 1] == "aac"
+    assert cmd[cmd.index("-b:a") + 1] == "320k"
+    assert cmd.count("-map") == 2
+    assert cmd[cmd.index("-map") + 1] == "0:v:0"
+    assert cmd[cmd.index("-map", cmd.index("-map") + 1) + 1] == "1:a:0"
+
+    prores_meta = media_helpers.encode_video(
+        frames,
+        preset_id="Custom",
+        output_path=str(tmp_path / "custom.mov"),
+        fps=24,
+        audio_path=str(audio_path),
+        custom_options={
+            **custom_options,
+            "custom_container": "mov",
+            "custom_video_codec": "prores_ks",
+            "custom_pix_fmt": "yuv422p10le",
+            "custom_audio_codec": "pcm_s16le",
+        },
+    )
+    prores_cmd = captured["cmds"][-1]
+    assert prores_meta["codec"] == "prores_ks"
+    assert prores_meta["audio_mode"] == "pcm_s16le"
+    assert prores_cmd[prores_cmd.index("-profile:v") + 1] == "3"
+    assert prores_cmd[prores_cmd.index("-c:a") + 1] == "pcm_s16le"
+
+    ffv1_meta = media_helpers.encode_video(
+        frames,
+        preset_id="Custom",
+        output_path=str(tmp_path / "custom.mkv"),
+        fps=24,
+        audio_path=str(audio_path),
+        custom_options={
+            **custom_options,
+            "custom_container": "mkv",
+            "custom_video_codec": "ffv1",
+            "custom_pix_fmt": "gbrp",
+            "custom_audio_codec": "flac",
+        },
+    )
+    ffv1_cmd = captured["cmds"][-1]
+    assert ffv1_meta["codec"] == "ffv1"
+    assert ffv1_meta["pix_fmt"] == "gbrp"
+    assert ffv1_cmd[ffv1_cmd.index("-slicecrc") + 1] == "1"
+    assert ffv1_cmd[ffv1_cmd.index("-c:a") + 1] == "flac"
+
+    no_audio_meta = media_helpers.encode_video(
+        frames,
+        preset_id="Custom",
+        output_path=str(tmp_path / "custom_no_audio.mp4"),
+        fps=24,
+        audio_path=str(audio_path),
+        custom_options={
+            **custom_options,
+            "custom_audio_codec": "none",
+        },
+    )
+    no_audio_cmd = captured["cmds"][-1]
+    assert no_audio_meta["audio_mode"] == "none"
+    assert no_audio_cmd.count("-i") == 1
+    assert "-map" not in no_audio_cmd
+    assert "-c:a" not in no_audio_cmd
+
+
+def test_save_video_encode_timeout_extends_large_high_cost_presets():
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+
+    tiny_timeout = media_helpers.save_video_encode_timeout_seconds(
+        "Compatible MP4",
+        frame_count=2,
+        width=2,
+        height=2,
+    )
+    large_master_timeout = media_helpers.save_video_encode_timeout_seconds(
+        "Editing Master MP4",
+        frame_count=240,
+        width=1920,
+        height=1088,
+    )
+    custom_veryslow_timeout = media_helpers.save_video_encode_timeout_seconds(
+        "Custom",
+        frame_count=240,
+        width=1920,
+        height=1088,
+        custom_options={
+            "custom_output_kind": "Video File",
+            "custom_container": "mp4",
+            "custom_video_codec": "libx264",
+            "custom_pix_fmt": "yuv444p",
+            "custom_encoder_preset": "veryslow",
+        },
+    )
+
+    assert tiny_timeout == media_helpers.MIN_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS
+    assert large_master_timeout > media_helpers.MIN_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS
+    assert custom_veryslow_timeout > media_helpers.MIN_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS
+    assert large_master_timeout <= media_helpers.MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS
+
+
+def test_encode_video_streams_frames_incrementally(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    frames = np.arange(2 * 2 * 2 * 3, dtype=np.uint8).reshape((2, 2, 2, 3))
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    media_helpers.encode_video(
+        frames,
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "streamed.mp4"),
+        fps=24,
+    )
+
+    kwargs = captured["kwargs"][0]
+    assert kwargs["stdin"] == subprocess.PIPE
+    assert kwargs["stdout"] == subprocess.DEVNULL
+    assert kwargs["stderr"] not in {subprocess.PIPE, subprocess.DEVNULL}
+    assert captured["writes"] == [frames[0].tobytes(), frames[1].tobytes()]
+
+
+def test_encode_video_streaming_nonzero_exit_includes_stderr(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    _install_fake_streaming_popen(media_helpers, monkeypatch, returncode=1, stderr=b"bad codec")
+
+    with pytest.raises(RuntimeError, match="bad codec"):
+        media_helpers.encode_video(
+            np.zeros((1, 2, 2, 3), dtype=np.uint8),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "failed.mp4"),
+            fps=24,
+        )
+
+
+def test_encode_video_streaming_timeout_kills_process(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(
+        media_helpers,
+        monkeypatch,
+        stderr=b"still encoding",
+        wait_error=subprocess.TimeoutExpired(["ffmpeg"], 90),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        media_helpers.encode_video(
+            np.zeros((1, 2, 2, 3), dtype=np.uint8),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "timeout.mp4"),
+            fps=24,
+            timeout=90,
+        )
+
+    assert captured["processes"][0].killed is True
+    assert exc_info.value.stderr == b"still encoding"
+
+
+def test_encode_video_streaming_timer_timeout_reaps_process(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    class ImmediateTimer:
+        daemon = False
+
+        def __init__(self, timeout, callback):
+            self.timeout = timeout
+            self.callback = callback
+            self.cancelled = False
+
+        def start(self):
+            self.callback()
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    monkeypatch.setattr(media_helpers.threading, "Timer", ImmediateTimer)
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch, stderr=b"timer fired")
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        media_helpers.encode_video(
+            np.zeros((2, 2, 2, 3), dtype=np.uint8),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "timer_timeout.mp4"),
+            fps=24,
+            timeout=90,
+        )
+
+    assert captured["processes"][0].killed is True
+    assert captured["wait_timeouts"] == [5]
+    assert exc_info.value.stderr == b"timer fired"
+
+
+def test_encode_video_streaming_broken_pipe_reports_ffmpeg_failure(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    _install_fake_streaming_popen(
+        media_helpers,
+        monkeypatch,
+        returncode=0,
+        stderr=b"pipe closed",
+        write_error=BrokenPipeError(),
+    )
+
+    with pytest.raises(RuntimeError, match="pipe closed"):
+        media_helpers.encode_video(
+            np.zeros((1, 2, 2, 3), dtype=np.uint8),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "pipe.mp4"),
+            fps=24,
+        )
+
+
+def test_save_video_custom_png_sequence_registers_image_assets(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+
+    single_dir = tmp_path / "single_project"
+    (single_dir / "media").mkdir(parents=True, exist_ok=True)
+    single_project = timeline_state.TimelineProject(project_dir=str(single_dir), name="Single PNG")
+    single_frames = _rgb_to_tensor(_make_diagnostic_rgb_frames(frame_count=1, width=16, height=12))
+
+    single_result = io_nodes.SonderSaveVideo().save_video(
+        single_project,
+        single_frames,
+        filename_prefix="still",
+        fps=24,
+        mode="Video",
+        save_preset="Custom",
+        custom_output_kind="PNG Sequence",
+        custom_png_compression=0,
+    )
+
+    single_path = Path(single_result["result"][0])
+    assert single_path.is_file()
+    assert single_path.name == "still.png"
+    assert len(single_project.assets) == 1
+    single_asset = single_project.assets[0]
+    assert single_asset.asset_type == "image"
+    assert single_asset.folder == ""
+    assert single_asset.generation_params["save_preset"] == "Custom"
+    assert single_asset.generation_params["custom_output_kind"] == "PNG Sequence"
+    assert single_asset.generation_params["tensor_mode"] == "round"
+    assert single_asset.generation_params["image_sequence"] is False
+    assert single_asset.generation_params["sequence_index"] == 1
+
+    multi_dir = tmp_path / "multi_project"
+    (multi_dir / "media" / "seq").mkdir(parents=True, exist_ok=True)
+    multi_project = timeline_state.TimelineProject(project_dir=str(multi_dir), name="Multi PNG")
+    multi_frames = _rgb_to_tensor(_make_diagnostic_rgb_frames(frame_count=3, width=16, height=12))
+
+    multi_result = io_nodes.SonderSaveVideo().save_video(
+        multi_project,
+        multi_frames,
+        filename_prefix="seq",
+        fps=24,
+        mode="Video",
+        save_preset="Custom",
+        custom_output_kind="PNG Sequence",
+        custom_png_compression=3,
+    )
+
+    folder_path = Path(multi_result["result"][0])
+    assert folder_path.is_dir()
+    assert folder_path.name == "seq_1"
+    assert sorted(path.name for path in folder_path.glob("*.png")) == ["seq_0001.png", "seq_0002.png", "seq_0003.png"]
+    assert len(multi_project.assets) == 3
+    assert multi_project.metadata["asset_folders"] == ["seq_1"]
+    for index, asset in enumerate(multi_project.assets, start=1):
+        assert asset.asset_type == "image"
+        assert asset.folder == "seq_1"
+        assert asset.name == f"seq_{index:04d}.png"
+        assert asset.generation_params["image_sequence"] is True
+        assert asset.generation_params["sequence_folder"] == "seq_1"
+        assert asset.generation_params["sequence_total"] == 3
+        assert asset.generation_params["sequence_index"] == index
+        assert asset.generation_params["custom_png_compression"] == 3
+
+
+def test_save_video_rejects_take_mode_png_sequence(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project_dir = tmp_path / "project"
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Reject PNG Take")
+    frames = _rgb_to_tensor(_make_diagnostic_rgb_frames(frame_count=2, width=8, height=8))
+
+    with pytest.raises(ValueError, match="PNG Sequence.*Take mode"):
+        io_nodes.SonderSaveVideo().save_video(
+            project,
+            frames,
+            filename_prefix="take_png",
+            fps=24,
+            mode="Take",
+            save_preset="Custom",
+            custom_output_kind="PNG Sequence",
+        )
 
 
 def test_guide_extraction_and_loader_paths_are_measured(tmp_path, monkeypatch):
@@ -542,9 +1034,12 @@ def test_guide_extraction_and_loader_paths_are_measured(tmp_path, monkeypatch):
 
     route_paths = [route.path for route in route_module.routes]
     extract_route = "/sonder-editor/project/{project_id}/assets/extract_frame"
+    snapshot_route = "/sonder-editor/project/{project_id}/assets/viewport_snapshot"
     wildcard_route = "/sonder-editor/project/{project_id}/assets/{asset_id}"
     assert extract_route in route_paths
+    assert snapshot_route in route_paths
     assert wildcard_route in route_paths
+    assert route_paths.index(snapshot_route) < route_paths.index(wildcard_route)
     assert route_paths.index(extract_route) < route_paths.index(wildcard_route)
 
     project_dir = tmp_path / "route_project"
@@ -566,6 +1061,56 @@ def test_guide_extraction_and_loader_paths_are_measured(tmp_path, monkeypatch):
     payload = json.loads(response.body.decode("utf-8"))
     assert payload["asset_type"] == "image"
     assert Path(project_dir / payload["path"]).is_file()
+    assert payload["generation_params"]["extraction_mode"] in {"ffmpeg", "opencv_fallback"}
+
+    response_scaled = asyncio.run(
+        handler(_JsonRequest(match_info={"project_id": "project"}, body={
+            "source_path": "media/route_source.mp4",
+            "frame_index": 0,
+            "target_long_edge": 64,
+        }))
+    )
+    assert response_scaled.status == 201
+    scaled_payload = json.loads(response_scaled.body.decode("utf-8"))
+    assert (scaled_payload["width"], scaled_payload["height"]) == (64, 36)
+    assert scaled_payload["generation_params"]["target_long_edge"] == 64
+
+    project.add_asset(route_state.Asset(
+        name="route_source.mp4",
+        asset_type="video",
+        path="media/route_source.mp4",
+        width=128,
+        height=72,
+        frame_count=3,
+        fps=24,
+    ))
+    from io import BytesIO
+
+    png_bytes = BytesIO()
+    Image.fromarray(frames_rgb[0]).save(png_bytes, format="PNG")
+    snapshot_handler = _route_handler(route_module, "POST", snapshot_route)
+    snapshot_response = asyncio.run(
+        snapshot_handler(_MultipartRequest(
+            [
+                _MultipartField("metadata", json.dumps({
+                    "source_path": "media/route_source.mp4",
+                    "source_frame_index": 0,
+                    "timeline_frame_index": 12,
+                    "extraction_mode": "viewport_snapshot",
+                    "snapshot_long_edge": 128,
+                    "snapshot_source_long_edge": 128,
+                })),
+                _MultipartField("file", png_bytes.getvalue()),
+            ],
+            match_info={"project_id": "project"},
+        ))
+    )
+    assert snapshot_response.status == 201
+    snapshot_payload = json.loads(snapshot_response.body.decode("utf-8"))
+    assert snapshot_payload["asset_type"] == "image"
+    assert snapshot_payload["generation_params"]["extraction_mode"] == "viewport_snapshot"
+    assert snapshot_payload["generation_params"]["timeline_frame_index"] == 12
+    assert Path(project_dir / snapshot_payload["path"]).is_file()
 
     summary = {
         "direct_editor_image": _metrics(frames_rgb[:1], editor_image[None, ...]),

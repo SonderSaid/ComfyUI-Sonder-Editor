@@ -7,6 +7,12 @@ from datetime import datetime, timedelta
 
 from aiohttp import web
 
+from .media_helpers import (
+    decode_video_frame,
+    get_ffmpeg_path,
+    resize_frame_to_long_edge,
+    write_png,
+)
 from .project_manager import create_project, load_project, save_project, list_projects
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
@@ -254,6 +260,25 @@ def _asset_missing(project: TimelineProject, asset: Asset) -> bool:
     return not source_path or not os.path.isfile(source_path)
 
 
+def _normalize_project_relpath(path: str) -> str:
+    return str(path or "").replace("\\", "/").strip("/")
+
+
+def _project_asset_for_source_path(project: TimelineProject, source_path: str) -> Asset | None:
+    normalized = _normalize_project_relpath(source_path)
+    abs_source = source_path if os.path.isabs(source_path) else os.path.abspath(os.path.join(project.project_dir, source_path))
+    for asset in getattr(project, "assets", []) or []:
+        asset_path = getattr(asset, "path", "") or ""
+        if _normalize_project_relpath(asset_path) == normalized:
+            return asset
+        try:
+            if os.path.abspath(os.path.join(project.project_dir, asset_path)) == abs_source:
+                return asset
+        except Exception:
+            continue
+    return None
+
+
 def _asset_payload(project: TimelineProject, asset: Asset) -> dict:
     payload = asset.to_dict()
     source_path = _asset_abspath(project, asset)
@@ -477,10 +502,7 @@ def _find_ffmpeg() -> str:
 _ffmpeg_path = None
 
 def _get_ffmpeg() -> str:
-    global _ffmpeg_path
-    if _ffmpeg_path is None:
-        _ffmpeg_path = _find_ffmpeg()
-    return _ffmpeg_path
+    return get_ffmpeg_path()
 
 
 def _read_image_size(image_path: str) -> tuple[int, int] | None:
@@ -502,38 +524,12 @@ def _read_image_size(image_path: str) -> tuple[int, int] | None:
 
 def _extract_video_frame_ffmpeg(video_path: str, frame_index: int, output_path: str) -> tuple[int, int] | None:
     try:
-        import subprocess
-
-        ffmpeg = _get_ffmpeg()
-        result = subprocess.run(
-            [
-                ffmpeg,
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                video_path,
-                "-vf",
-                f"select=eq(n\\,{frame_index})",
-                "-frames:v",
-                "1",
-                "-pix_fmt",
-                "rgb24",
-                output_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0 or not os.path.isfile(output_path):
-            logger.warning(
-                "ffmpeg frame extraction failed for %s frame %s: %s",
-                os.path.basename(video_path),
-                frame_index,
-                (result.stderr or "").strip()[:200],
-            )
+        frame_rgb = decode_video_frame(video_path, frame_index)
+        if frame_rgb is None:
             return None
-        return _read_image_size(output_path)
+        write_png(output_path, frame_rgb)
+        h, w = frame_rgb.shape[:2]
+        return (w, h)
     except Exception as e:
         logger.warning("ffmpeg frame extraction failed for %s: %s", video_path, e)
         return None
@@ -1820,6 +1816,94 @@ if routes is not None:
             "trashed_assets": len(trashed_assets),
         })
 
+    @routes.post("/sonder-editor/project/{project_id}/assets/viewport_snapshot")
+    async def api_viewport_snapshot_asset(request: web.Request) -> web.Response:
+        """Register a browser-captured viewport source-frame snapshot as an image asset."""
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            reader = await request.multipart()
+            file_bytes = None
+            metadata = {}
+            async for field in reader:
+                if field.name == "file":
+                    file_bytes = await field.read(decode=False)
+                elif field.name == "metadata":
+                    raw = await field.text()
+                    metadata = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            return _json_error("Invalid metadata JSON", 400)
+        except Exception as e:
+            return _json_error(f"Invalid multipart body: {e}", 400)
+
+        if not file_bytes:
+            return _json_error("file is required", 400)
+        if len(file_bytes) > 50 * 1024 * 1024:
+            return _json_error("Snapshot file is too large", 413)
+
+        source_path = str(metadata.get("source_path") or "")
+        if not source_path:
+            return _json_error("metadata.source_path is required", 400)
+        if _project_asset_for_source_path(project, source_path) is None:
+            return _json_error("source_path is not a project asset", 400)
+
+        source_frame_index = _coerce_nonnegative_int(metadata.get("source_frame_index"), 0)
+        timeline_frame_index = _coerce_nonnegative_int(metadata.get("timeline_frame_index"), 0)
+        snapshot_long_edge = _coerce_nonnegative_int(metadata.get("snapshot_long_edge"), 0)
+        snapshot_source_long_edge = _coerce_nonnegative_int(metadata.get("snapshot_source_long_edge"), 0)
+
+        try:
+            from io import BytesIO
+            from PIL import Image
+
+            with Image.open(BytesIO(file_bytes)) as img:
+                w, h = img.size
+                if w <= 0 or h <= 0:
+                    return _json_error("Snapshot image has invalid dimensions", 400)
+        except Exception as e:
+            return _json_error(f"Invalid snapshot image: {e}", 400)
+
+        try:
+            media_dir = os.path.join(project.project_dir, "media")
+            os.makedirs(media_dir, exist_ok=True)
+            out_filename = f"{uuid.uuid4().hex[:8]}_snapshot_f{source_frame_index}.png"
+            out_path = os.path.join(media_dir, out_filename)
+            with open(out_path, "wb") as handle:
+                handle.write(file_bytes)
+
+            generation_params = {
+                **(metadata if isinstance(metadata, dict) else {}),
+                "source_path": source_path,
+                "source_frame_index": source_frame_index,
+                "timeline_frame_index": timeline_frame_index,
+                "extraction_mode": "viewport_snapshot",
+                "snapshot_long_edge": snapshot_long_edge,
+                "snapshot_source_long_edge": snapshot_source_long_edge,
+            }
+            asset = Asset(
+                name=f"Viewport Snapshot {timeline_frame_index}",
+                asset_type="image",
+                path=os.path.join("media", out_filename),
+                width=w,
+                height=h,
+                generation_params=generation_params,
+            )
+            project.add_asset(asset)
+            save_project(project)
+
+            thumb_path = os.path.join(
+                project.project_dir, "cache", "thumbnails",
+                f"{asset.asset_id}.png"
+            )
+            ensure_thumbnail("image", out_path, thumb_path)
+            return web.json_response(_asset_payload(project, asset), status=201)
+        except Exception as e:
+            logger.warning("Failed to register viewport snapshot: %s", e)
+            return _json_error(str(e), 500)
+
     @routes.post("/sonder-editor/project/{project_id}/assets/extract_frame")
     async def api_extract_frame(request: web.Request) -> web.Response:
         """Extract a single video frame and save as an image asset."""
@@ -1830,7 +1914,8 @@ if routes is not None:
 
         body = await request.json()
         source_path = body.get("source_path", "")
-        frame_index = int(body.get("frame_index", 0))
+        frame_index = _coerce_nonnegative_int(body.get("frame_index"), 0)
+        target_long_edge = _coerce_nonnegative_int(body.get("target_long_edge"), 0)
 
         if not source_path:
             return _json_error("source_path is required", 400)
@@ -1850,24 +1935,29 @@ if routes is not None:
 
             # Prefer ffmpeg for frame extraction to preserve video decode fidelity.
             # Fall back to OpenCV if ffmpeg is unavailable or fails.
-            extracted_size = _extract_video_frame_ffmpeg(abs_path, frame_index, out_path)
-            if extracted_size is not None:
-                w, h = extracted_size
-            else:
+            frame_rgb = decode_video_frame(abs_path, frame_index)
+            extraction_mode = "ffmpeg"
+            if frame_rgb is None:
                 import cv2
                 cap = cv2.VideoCapture(abs_path)
-                if not cap.isOpened():
-                    return _json_error("Could not open video file", 500)
+                try:
+                    if not cap.isOpened():
+                        return _json_error("Could not open video file", 500)
 
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                ret, frame_bgr = cap.read()
-                cap.release()
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                    ret, frame_bgr = cap.read()
+                finally:
+                    cap.release()
 
                 if not ret:
                     return _json_error(f"Could not read frame {frame_index}", 500)
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                extraction_mode = "opencv_fallback"
 
-                h, w = frame_bgr.shape[:2]
-                cv2.imwrite(out_path, frame_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+            if target_long_edge > 0:
+                frame_rgb = resize_frame_to_long_edge(frame_rgb, target_long_edge)
+            h, w = frame_rgb.shape[:2]
+            write_png(out_path, frame_rgb)
 
             asset = Asset(
                 name=f"Frame {frame_index}",
@@ -1875,6 +1965,12 @@ if routes is not None:
                 path=os.path.join("media", out_filename),
                 width=w,
                 height=h,
+                generation_params={
+                    "source_path": source_path,
+                    "source_frame_index": frame_index,
+                    "extraction_mode": extraction_mode,
+                    "target_long_edge": target_long_edge,
+                },
             )
             project.add_asset(asset)
             save_project(project)
@@ -1886,7 +1982,7 @@ if routes is not None:
             )
             ensure_thumbnail("image", out_path, thumb_path)
 
-            return web.json_response(asset.to_dict(), status=201)
+            return web.json_response(_asset_payload(project, asset), status=201)
 
         except ImportError:
             return _json_error("cv2 (OpenCV) not available", 500)
@@ -2365,6 +2461,41 @@ if routes is not None:
 
         return web.json_response(scene.to_dict(), status=201)
 
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/duplicate")
+    async def api_duplicate_scene(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        source_scene = project.get_scene(request.match_info["scene_id"])
+        if not source_scene:
+            return _json_error(f"Scene not found: {request.match_info['scene_id']}", 404)
+
+        payload = source_scene.to_dict()
+        payload.pop("scene_id", None)
+        for clip_payload in payload.get("clips", []) or []:
+            if isinstance(clip_payload, dict):
+                clip_payload.pop("clip_id", None)
+        for track_payload in payload.get("audio_tracks", []) or []:
+            if isinstance(track_payload, dict):
+                track_payload.pop("track_id", None)
+
+        existing_names = {scene.name for scene in project.scenes}
+        copy_base = f"{source_scene.name} (copy)"
+        copy_name = copy_base
+        suffix = 2
+        while copy_name in existing_names:
+            copy_name = f"{copy_base} {suffix}"
+            suffix += 1
+        payload["name"] = copy_name
+        payload["order"] = max((getattr(scene, "order", 0) for scene in project.scenes), default=-1) + 1
+
+        new_scene = Scene.from_dict(payload)
+        project.add_scene(new_scene)
+        save_project(project)
+        return web.json_response(new_scene.to_dict(), status=201)
+
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_get_scene(request: web.Request) -> web.Response:
         try:
@@ -2642,24 +2773,33 @@ if routes is not None:
         # Dual drop: also create audio track if video has audio
         # Wrapped in try/except so audio extraction failure doesn't prevent clip creation
         audio_track_dict = None
-        if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video":
+        if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video" and asset.has_audio:
             try:
                 video_path = os.path.join(project.project_dir, asset.path)
                 audio_filename = f"{asset.asset_id}_audio.wav"
                 audio_rel_path = os.path.join("media", audio_filename)
                 audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
+                existing_audio_asset = next(
+                    (a for a in project.assets if a.path == audio_rel_path), None
+                )
 
                 # Extract audio if not already done
+                extracted = True
                 if not os.path.isfile(audio_abs_path):
-                    _extract_audio_from_video(video_path, audio_abs_path)
+                    extracted = _extract_audio_from_video(video_path, audio_abs_path)
 
-                if os.path.isfile(audio_abs_path):
+                audio_dur = 0.0
+                if (
+                    extracted
+                    and os.path.isfile(audio_abs_path)
+                    and os.path.getsize(audio_abs_path) > 1024
+                ):
+                    audio_dur = _get_audio_duration(audio_abs_path)
+
+                if audio_dur > 0:
                     # Find or create audio asset
-                    audio_asset = next(
-                        (a for a in project.assets if a.path == audio_rel_path), None
-                    )
+                    audio_asset = existing_audio_asset
                     if not audio_asset:
-                        audio_dur = _get_audio_duration(audio_abs_path)
                         audio_asset = Asset(
                             name=f"{asset.name} (audio)",
                             asset_type="audio",
@@ -2686,6 +2826,11 @@ if routes is not None:
                     )
                     scene.audio_tracks.append(audio_track)
                     audio_track_dict = audio_track.to_dict()
+                elif os.path.isfile(audio_abs_path) and not existing_audio_asset:
+                    try:
+                        os.remove(audio_abs_path)
+                    except OSError:
+                        pass
             except Exception as e:
                 logger.warning("Dual drop audio extraction failed: %s", e)
 

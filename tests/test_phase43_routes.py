@@ -13,7 +13,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
-from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, LaneConfig, Scene, TimelineProject
+from server.timeline_state import (
+    Asset,
+    AudioTrack,
+    BatchConfig,
+    ClipReference,
+    GenerationJob,
+    GuideFrame,
+    LaneConfig,
+    PromptSection,
+    Scene,
+    TimelineProject,
+)
 
 
 class DummyRequest:
@@ -132,6 +143,99 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
     assert invalid_image_update.status == 400
 
 
+def test_dual_drop_skips_audio_when_video_asset_has_no_audio(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    video_asset = Asset(
+        asset_id="asset-1",
+        name="silent.mp4",
+        asset_type="video",
+        path=os.path.join("media", "silent.mp4"),
+        frame_count=12,
+        has_audio=False,
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [video_asset]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(
+        route_module,
+        "_extract_audio_from_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no-audio assets must not extract")),
+    )
+
+    add_clip = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+    )
+    response = asyncio.run(add_clip(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"asset_id": "asset-1", "timeline_start_frame": 3, "dual_drop": True},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 201
+    assert "audio_track" not in payload
+    assert len(scene.clips) == 1
+    assert scene.audio_tracks == []
+    assert [asset.asset_id for asset in project.assets] == ["asset-1"]
+
+
+def test_dual_drop_rejects_partial_audio_extraction(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "with-audio.mp4").write_bytes(b"video")
+    scene = Scene(scene_id="scene-1", name="Scene")
+    video_asset = Asset(
+        asset_id="asset-1",
+        name="with-audio.mp4",
+        asset_type="video",
+        path=os.path.join("media", "with-audio.mp4"),
+        frame_count=12,
+        has_audio=True,
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [video_asset]
+
+    def fake_extract(_video_path, output_path):
+        with open(output_path, "wb") as handle:
+            handle.write(b"tiny")
+        return True
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "_extract_audio_from_video", fake_extract)
+    monkeypatch.setattr(
+        route_module,
+        "_get_audio_duration",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tiny WAV should not be probed")),
+    )
+
+    add_clip = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+    )
+    response = asyncio.run(add_clip(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"asset_id": "asset-1", "timeline_start_frame": 3, "dual_drop": True},
+    )))
+    payload = _response_json(response)
+    audio_path = project_dir / "media" / "asset-1_audio.wav"
+
+    assert response.status == 201
+    assert "audio_track" not in payload
+    assert len(scene.clips) == 1
+    assert scene.audio_tracks == []
+    assert [asset.asset_id for asset in project.assets] == ["asset-1"]
+    assert not audio_path.exists()
+
+
 def test_scene_put_accepts_motion_driver_lane_config(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
@@ -172,6 +276,130 @@ def test_scene_put_accepts_motion_driver_lane_config(tmp_path, monkeypatch):
         "locked": False,
         "hidden": False,
     }
+
+
+def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    source = Scene(
+        scene_id="scene-1",
+        name="Scene",
+        order=3,
+        duration_frames=48,
+        prompt="scene prompt",
+        generation_params={"seed": 123},
+        batch_config=BatchConfig(max_frames=33, context_overlap=4, frame_alignment=8),
+        asset_ids=["asset-1", "asset-2"],
+        is_bridge=True,
+        video_lane_count=2,
+        motion_driver_lane_count=1,
+        audio_lane_count=2,
+        width=1280,
+        height=720,
+        fps=30.0,
+    )
+    source.prompt_sections = [PromptSection(start_frame=0, end_frame=24, prompt="section")]
+    source.guide_frames = [GuideFrame(frame_index=8, asset_id="guide-1", source="asset", strength=0.75)]
+    source.clips = [
+        ClipReference(
+            clip_id="clip-1",
+            source_path="media/a.mp4",
+            timeline_start_frame=4,
+            timeline_end_frame=20,
+            source_in_frame=2,
+            source_out_frame=18,
+            total_source_frames=32,
+            source_origin_frame=2,
+            opacity=0.8,
+            track_index=1,
+            role="render",
+            strength=1.0,
+            prompt="clip prompt",
+            is_generated=True,
+            generation_params={"cfg": 7},
+            takes=["take-a"],
+            active_take=0,
+            take_metadata={"scene_id": "scene-1"},
+        )
+    ]
+    source.audio_tracks = [
+        AudioTrack(
+            track_id="track-1",
+            source_path="media/a.wav",
+            timeline_start_frame=6,
+            timeline_end_frame=30,
+            source_in_frame=1,
+            total_source_frames=48,
+            source_origin_frame=1,
+            volume=0.5,
+            muted=True,
+            lane_index=1,
+        )
+    ]
+    source.video_lane_configs = [LaneConfig(name="V0"), LaneConfig(name="V1", hidden=True)]
+    source.motion_driver_lane_configs = [LaneConfig(name="Driver", color="#ffaa00")]
+    source.audio_lane_configs = [LaneConfig(name="A0"), LaneConfig(name="A1", locked=True)]
+    source.saved_selections = [
+        {"name": "Sel", "start": 4, "end": 20, "pre_context_frames": 2, "post_context_frames": 3}
+    ]
+    project = TimelineProject(
+        project_dir=str(project_dir),
+        name="Project",
+        scenes=[Scene(scene_id="scene-0", name="Other", order=1), source],
+    )
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    duplicate_scene = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/duplicate",
+    )
+    response = asyncio.run(duplicate_scene(DummyRequest(match_info={"scene_id": "scene-1"})))
+    payload = _response_json(response)
+
+    assert response.status == 201
+    assert payload["scene_id"] != source.scene_id
+    assert payload["name"] == "Scene (copy)"
+    assert payload["order"] == 4
+    assert len(project.scenes) == 3
+
+    source_clip_ids = {clip.clip_id for clip in source.clips}
+    duplicate_clip_ids = {clip["clip_id"] for clip in payload["clips"]}
+    assert len(payload["clips"]) == len(source.clips)
+    assert source_clip_ids.isdisjoint(duplicate_clip_ids)
+
+    source_track_ids = {track.track_id for track in source.audio_tracks}
+    duplicate_track_ids = {track["track_id"] for track in payload["audio_tracks"]}
+    assert len(payload["audio_tracks"]) == len(source.audio_tracks)
+    assert source_track_ids.isdisjoint(duplicate_track_ids)
+
+    for key in [
+        "duration_frames",
+        "prompt",
+        "prompt_sections",
+        "generation_params",
+        "batch_config",
+        "guide_frames",
+        "asset_ids",
+        "is_bridge",
+        "video_lane_count",
+        "motion_driver_lane_count",
+        "audio_lane_count",
+        "video_lane_configs",
+        "motion_driver_lane_configs",
+        "audio_lane_configs",
+        "width",
+        "height",
+        "fps",
+        "saved_selections",
+    ]:
+        assert payload[key] == source.to_dict()[key]
+    assert payload["clips"][0]["source_path"] == source.clips[0].source_path
+    assert payload["clips"][0]["role"] == source.clips[0].role
+    assert payload["audio_tracks"][0]["source_path"] == source.audio_tracks[0].source_path
 
 
 def test_clip_split_preserves_motion_driver_role_and_strength(tmp_path, monkeypatch):

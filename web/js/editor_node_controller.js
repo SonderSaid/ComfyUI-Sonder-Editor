@@ -14,6 +14,17 @@ function style(el, cssText) {
     return el;
 }
 
+function coerceBoolean(value, defaultValue = false) {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (["1", "true", "yes", "on"].includes(normalized)) return true;
+        if (["0", "false", "no", "off"].includes(normalized)) return false;
+    }
+    return defaultValue;
+}
+
 const CHROME = {
     panelMuted: "#10161d",
     panel: "#151c24",
@@ -609,6 +620,8 @@ class FullscreenEditorSession {
         });
 
         this.editor = editor;
+        editor.renderQueueActive = coerceBoolean(state.renderQueueActive, true);
+        editor._setWidgetValue("render_queue_active", editor.renderQueueActive);
         editor.updateProject(state.projectDir);
         editor.activeSceneId = state.sceneId || "";
         editor.selectionStart = state.selectionStart || 0;
@@ -994,6 +1007,7 @@ export class EditorNodeController {
             selectionEnd: this._getWidgetValue("selection_end", 0),
             preContextFrames: this._getWidgetValue("pre_context_frames", 0),
             postContextFrames: this._getWidgetValue("post_context_frames", 0),
+            renderQueueActive: coerceBoolean(this._getWidgetValue("render_queue_active", true), true),
             dormantSummary: null,
             moduleCache: this.moduleCache,
             isFullscreenOpen: false,
@@ -1148,6 +1162,7 @@ export class EditorNodeController {
         this.state.selectionEnd = Math.max(0, parseInt(this._getWidgetValue("selection_end", 0), 10) || 0);
         this.state.preContextFrames = Math.max(0, parseInt(this._getWidgetValue("pre_context_frames", 0), 10) || 0);
         this.state.postContextFrames = Math.max(0, parseInt(this._getWidgetValue("post_context_frames", 0), 10) || 0);
+        this.state.renderQueueActive = coerceBoolean(this._getWidgetValue("render_queue_active", true), true);
     }
 
     onEditorWidgetValueChange(name, value) {
@@ -1156,6 +1171,7 @@ export class EditorNodeController {
         if (name === "selection_end") this.state.selectionEnd = Math.max(0, parseInt(value, 10) || 0);
         if (name === "pre_context_frames") this.state.preContextFrames = Math.max(0, parseInt(value, 10) || 0);
         if (name === "post_context_frames") this.state.postContextFrames = Math.max(0, parseInt(value, 10) || 0);
+        if (name === "render_queue_active") this.state.renderQueueActive = coerceBoolean(value, true);
     }
 
     async updateProject(projectDir, projectName = "") {
@@ -1240,6 +1256,12 @@ export class EditorNodeController {
                 buildDormantSummaryUrl(this.state),
                 aborter.signal,
             );
+            const activeScene = this.state.dormantSummary?.active_scene;
+            const widgetValue = this._getWidgetValue("scene_id", "") || "";
+            if (activeScene?.scene_id && !this.state.sceneId && !widgetValue) {
+                this.state.sceneId = activeScene.scene_id;
+                this._setWidgetValue("scene_id", activeScene.scene_id);
+            }
         } catch (e) {
             if (e.name !== "AbortError") {
                 console.warn("[Sonder] Failed to fetch dormant summary:", e);
@@ -1390,8 +1412,8 @@ export class EditorNodeController {
     handleNodeExecuted() {
         if (this._destroyed || !this.state.projectDir) return;
         this.syncStateFromWidgets();
-        this._invalidateModules(["assets", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "queue"]);
+        this._invalidateModules(["assets", "scene", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
         this.refreshSummary({ syncAssets: true }).finally(() => this.render());
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
     }
@@ -2677,6 +2699,54 @@ export class EditorNodeController {
             padding-right: 2px;
         `);
         container.appendChild(wrap);
+
+        const activeRow = style(document.createElement("label"), `
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 7px 8px;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid ${CHROME.borderSoft};
+            color: ${CHROME.text};
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            user-select: none;
+        `);
+        activeRow.title = "Toggle whether queued jobs drive editor execution";
+        const activeLabel = style(document.createElement("span"), `min-width: 0;`);
+        activeLabel.textContent = "Queue Active";
+        const activeRight = style(document.createElement("span"), `
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: ${CHROME.textDim};
+            font-size: 10px;
+            font-weight: 600;
+        `);
+        const activeStatus = document.createElement("span");
+        const activeCheckbox = document.createElement("input");
+        activeCheckbox.type = "checkbox";
+        activeCheckbox.checked = this.state.renderQueueActive !== false;
+        activeCheckbox.style.cssText = "margin: 0;";
+        activeStatus.textContent = activeCheckbox.checked ? "On" : "Off";
+        activeRow.addEventListener("pointerdown", (event) => consumeDormantPointer(event));
+        activeRow.addEventListener("mousedown", (event) => consumeDormantPointer(event));
+        activeRow.addEventListener("click", (event) => consumeDormantPointer(event));
+        activeCheckbox.addEventListener("click", (event) => event.stopPropagation());
+        activeCheckbox.addEventListener("change", (event) => {
+            event.stopPropagation();
+            const nextActive = activeCheckbox.checked;
+            activeStatus.textContent = nextActive ? "On" : "Off";
+            this._setWidgetValue("render_queue_active", nextActive);
+            this.state.renderQueueActive = nextActive;
+            this.fullscreenSession?.editor?._setRenderQueueActive?.(nextActive, { syncWidget: false });
+        });
+        activeRight.append(activeStatus, activeCheckbox);
+        activeRow.append(activeLabel, activeRight);
+        wrap.appendChild(activeRow);
 
         const allJobs = Array.isArray(data) ? data : [];
         const completedCount = allJobs.filter((job) => String(job?.status || "").toLowerCase() === "completed").length;

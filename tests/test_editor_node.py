@@ -65,6 +65,23 @@ def _import_io_nodes(tmp_path, monkeypatch):
     return importlib.import_module(f"{TEST_PACKAGE}.nodes.io_nodes")
 
 
+def _fake_encode_video_success(io_nodes, calls=None):
+    def fake_encode_video(frames_iter, *, preset_id, output_path, fps, audio_path=None, custom_options=None, timeout=90):
+        Path(output_path).write_bytes(b"video")
+        if calls is not None:
+            calls.append({
+                "preset_id": preset_id,
+                "output_path": output_path,
+                "fps": fps,
+                "audio_path": audio_path,
+                "custom_options": custom_options,
+                "timeout": timeout,
+            })
+        return io_nodes.metadata_for_save_preset(preset_id, custom_options)
+
+    return fake_encode_video
+
+
 def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
@@ -348,6 +365,22 @@ def test_execution_reaches_terminal_save_requires_toggle(tmp_path, monkeypatch):
     node = editor_node.SonderEditor()
 
     assert node._execution_reaches_terminal_save(prompt, "1") is False
+    assert node._execution_targets_unmarked_save(prompt, "1") is True
+
+
+def test_execution_targets_unmarked_save_only_for_linked_editor(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    prompt = _prompt_graph({
+        "1": _prompt_node("SonderEditor"),
+        "2": _prompt_node("SonderEditor"),
+        "3": _prompt_node("SonderSaveVideo", {"project": ["2", 0], "mark_queue_complete": False}),
+    })
+
+    node = editor_node.SonderEditor()
+
+    assert node._execution_targets_unmarked_save(prompt, "1") is False
+    assert node._execution_targets_unmarked_save(prompt, "2") is True
 
 
 def test_execution_reaches_terminal_bridge_save(tmp_path, monkeypatch):
@@ -1009,6 +1042,437 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     assert project._execution_context["take_placement_mode"] == "untrimmed"
 
 
+def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    class DummyScene:
+        scene_id = "scene-1"
+        name = "Scene 1"
+        duration_frames = 96
+        width = 0
+        height = 0
+        fps = 0
+        guide_frames = []
+
+        @staticmethod
+        def get_prompt_for_range(start_frame, end_frame):
+            return f"live:{start_frame}-{end_frame}"
+
+    queue_job = types.SimpleNamespace(
+        job_id="job-1",
+        scene_id="scene-1",
+        selection_start=24,
+        selection_end=48,
+        pre_context_frames=0,
+        post_context_frames=0,
+        context_frames=0,
+        prompt="queued prompt",
+        status="pending",
+        error="",
+        progress=0.0,
+        params={"snapshot_version": 1},
+        guide_frame_snapshots=[],
+        scene_width=0,
+        scene_height=0,
+        scene_fps=0.0,
+    )
+
+    class DummyProject:
+        def __init__(self):
+            self.fps = 24.0
+            self.resolution = (768, 512)
+            self.project_dir = str(tmp_path)
+            self._execution_context = None
+            self._scene = DummyScene()
+            self.generation_queue = [queue_job]
+
+        def get_scene(self, scene_id):
+            return self._scene if scene_id == self._scene.scene_id else None
+
+        @staticmethod
+        def get_asset(asset_id):
+            return None
+
+    project = DummyProject()
+    render_ranges = []
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(editor_node, "save_project", lambda proj: None)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end: (
+            render_ranges.append((start, end))
+            or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
+        ),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+        }),
+        unique_id="editor-1",
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=0,
+    )
+
+    assert render_ranges == [(24, 48)]
+    assert result[8] == "queued prompt"
+    assert result[9] == 24
+    assert project._execution_context["queue_job_id"] == "job-1"
+
+
+@pytest.mark.parametrize("queue_status", ["pending", "running"])
+def test_unmarked_save_with_active_queue_peeks_without_completion(tmp_path, monkeypatch, queue_status):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    class DummyScene:
+        scene_id = "scene-1"
+        name = "Scene 1"
+        duration_frames = 40
+        width = 0
+        height = 0
+        fps = 0
+        guide_frames = []
+
+        @staticmethod
+        def get_prompt_for_range(start_frame, end_frame):
+            return f"live:{start_frame}-{end_frame}"
+
+    queue_job = types.SimpleNamespace(
+        job_id="job-1",
+        scene_id="scene-1",
+        selection_start=10,
+        selection_end=30,
+        pre_context_frames=0,
+        post_context_frames=0,
+        context_frames=0,
+        prompt="queued prompt",
+        status=queue_status,
+        error="",
+        progress=0.0,
+        params={"snapshot_version": 1},
+        guide_frame_snapshots=[],
+        scene_width=0,
+        scene_height=0,
+        scene_fps=0.0,
+    )
+
+    class DummyProject:
+        def __init__(self):
+            self.fps = 24.0
+            self.resolution = (768, 512)
+            self.project_dir = str(tmp_path)
+            self._execution_context = None
+            self._scene = DummyScene()
+            self.generation_queue = [queue_job]
+
+        def get_scene(self, scene_id):
+            return self._scene if scene_id == self._scene.scene_id else None
+
+    project = DummyProject()
+    save_calls = []
+    render_ranges = []
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(editor_node, "save_project", lambda proj: save_calls.append(queue_job.status))
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end: (
+            render_ranges.append((start, end))
+            or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
+        ),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": False}),
+        }),
+        unique_id="editor-1",
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=0,
+    )
+
+    assert queue_job.status == queue_status
+    assert save_calls == []
+    assert render_ranges == [(10, 30)]
+    assert result[8] == "queued prompt"
+    assert result[9] == 20
+    assert project._execution_context["selection_start"] == 10
+    assert project._execution_context["selection_end"] == 30
+    assert project._execution_context["queue_job_id"] == ""
+
+
+def test_render_queue_inactive_ignores_terminal_save_queue(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    class DummyScene:
+        scene_id = "scene-1"
+        name = "Scene 1"
+        duration_frames = 40
+        width = 0
+        height = 0
+        fps = 0
+        guide_frames = []
+
+        @staticmethod
+        def get_prompt_for_range(start_frame, end_frame):
+            return f"live:{start_frame}-{end_frame}"
+
+    queue_job = types.SimpleNamespace(
+        job_id="job-1",
+        scene_id="scene-1",
+        selection_start=10,
+        selection_end=30,
+        pre_context_frames=0,
+        post_context_frames=0,
+        context_frames=0,
+        prompt="queued prompt",
+        status="pending",
+        error="",
+        progress=0.0,
+        params={"snapshot_version": 1},
+        guide_frame_snapshots=[],
+        scene_width=0,
+        scene_height=0,
+        scene_fps=0.0,
+    )
+
+    class DummyProject:
+        def __init__(self):
+            self.fps = 24.0
+            self.resolution = (768, 512)
+            self.project_dir = str(tmp_path)
+            self._execution_context = None
+            self._scene = DummyScene()
+            self.generation_queue = [queue_job]
+
+        def get_scene(self, scene_id):
+            return self._scene if scene_id == self._scene.scene_id else None
+
+        @staticmethod
+        def get_asset(asset_id):
+            return None
+
+    project = DummyProject()
+    save_calls = []
+    render_ranges = []
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(editor_node, "save_project", lambda proj: save_calls.append(queue_job.status))
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end: (
+            render_ranges.append((start, end))
+            or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
+        ),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+        }),
+        unique_id="editor-1",
+        scene_id="scene-1",
+        selection_start=2,
+        selection_end=8,
+        render_queue_active=False,
+    )
+
+    assert queue_job.status == "pending"
+    assert save_calls == []
+    assert render_ranges == [(2, 8)]
+    assert result[8] == "live:2-8"
+    assert result[9] == 6
+    assert project._execution_context["queue_job_id"] == ""
+
+
+def test_consumed_queue_job_zero_range_raises(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    class DummyScene:
+        scene_id = "scene-1"
+        name = "Scene 1"
+        duration_frames = 40
+        width = 0
+        height = 0
+        fps = 0
+        guide_frames = []
+
+    queue_job = types.SimpleNamespace(
+        job_id="job-1",
+        scene_id="scene-1",
+        selection_start=10,
+        selection_end=10,
+        pre_context_frames=0,
+        post_context_frames=0,
+        context_frames=0,
+        prompt="queued prompt",
+        status="pending",
+        error="",
+        progress=0.0,
+        params={"snapshot_version": 1},
+        guide_frame_snapshots=[],
+        scene_width=0,
+        scene_height=0,
+        scene_fps=0.0,
+        batch_id="",
+        batch_index=0,
+    )
+
+    class DummyProject:
+        def __init__(self):
+            self.fps = 24.0
+            self.resolution = (768, 512)
+            self.project_dir = str(tmp_path)
+            self._scene = DummyScene()
+            self.generation_queue = [queue_job]
+
+        def get_scene(self, scene_id):
+            return self._scene if scene_id == self._scene.scene_id else None
+
+    project = DummyProject()
+    save_states = []
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(
+        editor_node,
+        "save_project",
+        lambda proj: save_states.append((queue_job.status, queue_job.error)),
+    )
+
+    with pytest.raises(RuntimeError, match="zero or invalid range"):
+        editor_node.SonderEditor().execute(
+            project="Existing Project",
+            project_name="Ignored",
+            fps=24.0,
+            width=768,
+            height=512,
+            prompt=_prompt_graph({
+                "editor-1": _prompt_node("SonderEditor"),
+                "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+            }),
+            unique_id="editor-1",
+        )
+
+    assert save_states[0][0] == "running"
+    assert save_states[-1][0] == "failed"
+    assert "zero or invalid range" in save_states[-1][1]
+    assert queue_job.status == "failed"
+
+
+def test_no_active_queue_runs_full_scene(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    class DummyScene:
+        scene_id = "scene-1"
+        name = "Scene 1"
+        duration_frames = 18
+        width = 0
+        height = 0
+        fps = 0
+        guide_frames = []
+
+        @staticmethod
+        def get_prompt_for_range(start_frame, end_frame):
+            return f"live:{start_frame}-{end_frame}"
+
+    class DummyProject:
+        def __init__(self):
+            self.fps = 24.0
+            self.resolution = (768, 512)
+            self.project_dir = str(tmp_path)
+            self._execution_context = None
+            self._scene = DummyScene()
+            self.generation_queue = []
+
+        def get_scene(self, scene_id):
+            return self._scene if scene_id == self._scene.scene_id else None
+
+        @staticmethod
+        def get_asset(asset_id):
+            return None
+
+    project = DummyProject()
+    render_ranges = []
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(editor_node, "save_project", lambda project: None)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end: (
+            render_ranges.append((start, end))
+            or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
+        ),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+        }),
+        unique_id="editor-1",
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=0,
+    )
+
+    assert render_ranges == [(0, 18)]
+    assert result[8] == "live:0-18"
+    assert result[9] == 18
+
+
 def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
@@ -1095,6 +1559,90 @@ def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
     assert queue_job.status == "running"
     assert result[8] == "queued prompt"
     assert project._execution_context["queue_job_id"] == "job-1"
+
+
+def test_editor_to_bridge_marks_queue_complete_round_trip(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project_manager = importlib.import_module(f"{TEST_PACKAGE}.server.project_manager")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    torch = importlib.import_module("torch")
+    from PIL import Image
+
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    base_dir = tmp_path / "sonder-projects"
+    base_dir.mkdir(exist_ok=True)
+    project = project_manager.create_project("Bridge_RT", base_dir=str(base_dir))
+    project.add_scene(timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=24))
+    queue_job = timeline_state.GenerationJob(
+        job_id="job-1",
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=24,
+        status="pending",
+        prompt="queued prompt",
+    )
+    project.generation_queue.append(queue_job)
+    project_manager.save_project(project)
+    project_basename = os.path.basename(project.project_dir)
+
+    monkeypatch.setattr(editor_node, "_get_projects_base_dir", lambda: str(base_dir))
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+
+    with io_nodes._BRIDGE_REGISTRY_LOCK:
+        io_nodes._BRIDGE_REGISTRY.clear()
+        io_nodes._BRIDGE_PROMPT_WATCHERS.clear()
+        io_nodes._BRIDGE_PROMPT_KEY_BY_OBJECT_ID.clear()
+        io_nodes._BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.clear()
+    io_nodes._BRIDGE_HOOKED_PROMPT_QUEUE_ID = None
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    prompt = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "bridge-1": _prompt_node("SonderSaveBridge", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+    })
+
+    editor_result = editor_node.SonderEditor().execute(
+        project=project_basename,
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        prompt=prompt,
+        unique_id="editor-1",
+    )
+    proj_after_editor = editor_result[0]
+    assert proj_after_editor._execution_context["queue_job_id"] == "job-1"
+
+    bridge = io_nodes.SonderSaveBridge()
+    output_dir, _ = bridge.prepare_output(
+        proj_after_editor,
+        mark_queue_complete=True,
+        prompt=prompt,
+        unique_id="bridge-1",
+    )
+    output_path = Path(output_dir) / "result.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (2, 2), color=(10, 20, 30)).save(output_path)
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = project_manager.load_project(proj_after_editor.project_dir)
+    assert len(restored.assets) == 1
+    assert restored.generation_queue[0].status == "completed"
+    assert restored.generation_queue[0].result_asset_id == restored.assets[0].asset_id
 
 
 def test_execute_marks_missing_queued_scene_failed(tmp_path, monkeypatch):
@@ -1446,13 +1994,9 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
         "queue_job_id": "job-1",
     }
 
-    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
-        Path(cmd[-2]).write_bytes(b"video")
-        return types.SimpleNamespace(returncode=0, stderr=b"")
-
     save_calls = []
 
-    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
     monkeypatch.setattr(io_nodes, "save_project", lambda project: save_calls.append(project.generation_queue[0].status))
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
 
@@ -1490,11 +2034,7 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
         scenes=[scene],
     )
 
-    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
-        Path(cmd[-2]).write_bytes(b"video")
-        return types.SimpleNamespace(returncode=0, stderr=b"")
-
-    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
     monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
 
@@ -1582,15 +2122,11 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
 
     saved_audio_paths = []
 
-    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
-        Path(cmd[-2]).write_bytes(b"video")
-        return types.SimpleNamespace(returncode=0, stderr=b"")
-
     def fake_torchaudio_save(path, waveform, sample_rate, *args, **kwargs):
         Path(path).write_bytes(b"audio")
         saved_audio_paths.append(path)
 
-    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
     monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
     monkeypatch.setitem(sys.modules, "torchaudio", types.SimpleNamespace(save=fake_torchaudio_save))
@@ -1623,7 +2159,7 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
     assert any(str(path).endswith("_audio.wav") for path in saved_audio_paths)
 
 
-def test_save_video_maps_audio_and_uses_shorter_timeout(tmp_path, monkeypatch):
+def test_save_video_passes_audio_and_computed_timeout_to_encoder(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
     thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
@@ -1636,18 +2172,13 @@ def test_save_video_maps_audio_and_uses_shorter_timeout(tmp_path, monkeypatch):
         def add_asset(self, asset):
             self.assets.append(asset)
 
-    captured = {}
-
-    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
-        captured["cmd"] = cmd
-        captured["timeout"] = timeout
-        Path(cmd[-2]).write_bytes(b"video")
-        return types.SimpleNamespace(returncode=0, stderr=b"")
+    captured = []
 
     fake_torchaudio = types.SimpleNamespace(save=lambda *args, **kwargs: None)
 
     monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
-    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes, captured))
+    monkeypatch.setattr(io_nodes, "save_video_encode_timeout_seconds", lambda *args, **kwargs: 1234)
     monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
 
@@ -1660,12 +2191,9 @@ def test_save_video_maps_audio_and_uses_shorter_timeout(tmp_path, monkeypatch):
 
     node.save_video(DummyProject(), frames, filename_prefix="audio", fps=24.0, audio=audio)
 
-    assert captured["timeout"] == 90
-    assert captured["cmd"].count("-map") == 2
-    assert "0:v:0" in captured["cmd"]
-    assert "1:a:0" in captured["cmd"]
-    assert "-c:a" in captured["cmd"]
-    assert "aac" in captured["cmd"]
+    assert captured[-1]["timeout"] == 1234
+    assert captured[-1]["audio_path"]
+    assert captured[-1]["preset_id"] == "Compatible MP4"
 
 
 def test_preview_uses_shorter_timeout(tmp_path, monkeypatch):

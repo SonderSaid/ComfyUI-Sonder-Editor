@@ -17,6 +17,7 @@ import folder_paths
 
 from ..server.project_manager import load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
+from ..server.media_helpers import decode_video_frame, decode_video_range, fit_frame_to_canvas
 
 logger = logging.getLogger("sonder_editor")
 
@@ -151,6 +152,10 @@ class SonderEditor:
                     "default": "trimmed",
                     "tooltip": "Take placement mode for non-queued renders. Set by editor settings.",
                 }),
+                "render_queue_active": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "When enabled, queue jobs drive editor execution. Disable to render the live selection without consuming queue jobs.",
+                }),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -275,6 +280,20 @@ class SonderEditor:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return False
 
+    @staticmethod
+    def _coerce_bool(value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return default
+
     @classmethod
     def _prompt_node_inputs(cls, prompt, node_id):
         if not isinstance(prompt, dict):
@@ -288,7 +307,7 @@ class SonderEditor:
         return inputs if isinstance(inputs, dict) else {}
 
     @classmethod
-    def _execution_reaches_terminal_save(cls, prompt, unique_id) -> bool:
+    def _execution_reaches_save_with_mark(cls, prompt, unique_id, expected_mark_queue_complete: bool) -> bool:
         if not isinstance(prompt, dict) or unique_id in {None, ""}:
             return False
         target_id = str(unique_id)
@@ -300,7 +319,7 @@ class SonderEditor:
             inputs = node.get("inputs", {})
             if not isinstance(inputs, dict):
                 continue
-            if not cls._prompt_bool(inputs.get("mark_queue_complete")):
+            if cls._prompt_bool(inputs.get("mark_queue_complete")) is not expected_mark_queue_complete:
                 continue
             project_source = cls._prompt_linked_node_id(inputs.get("project"))
             if project_source is None:
@@ -319,6 +338,23 @@ class SonderEditor:
                     if upstream_id and upstream_id not in seen:
                         stack.append(upstream_id)
         return False
+
+    @classmethod
+    def _execution_reaches_terminal_save(cls, prompt, unique_id) -> bool:
+        return cls._execution_reaches_save_with_mark(prompt, unique_id, True)
+
+    @classmethod
+    def _execution_targets_unmarked_save(cls, prompt, unique_id) -> bool:
+        return cls._execution_reaches_save_with_mark(prompt, unique_id, False)
+
+    @staticmethod
+    def _peek_queue_job(proj: TimelineProject):
+        queue = getattr(proj, "generation_queue", []) or []
+        for desired_status in ("running", "pending"):
+            for job in queue:
+                if (getattr(job, "status", "pending") or "pending").lower() == desired_status:
+                    return job
+        return None
 
     def _consume_queue_job(self, proj: TimelineProject):
         queue = getattr(proj, "generation_queue", []) or []
@@ -386,7 +422,8 @@ class SonderEditor:
     def execute(self, project, project_name, fps, width, height,
                 scene_id="", selection_start=0, selection_end=0,
                 pre_context_frames=0, post_context_frames=0,
-                prompt=None, unique_id=None, take_placement_mode="trimmed"):
+                prompt=None, unique_id=None, take_placement_mode="trimmed",
+                render_queue_active=True):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
         selection_start = max(0, _coerce_int(selection_start, 0))
@@ -394,8 +431,10 @@ class SonderEditor:
         pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
         post_context_frames = max(0, _coerce_int(post_context_frames, 0))
         take_placement_mode = take_placement_mode if take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
+        render_queue_active = self._coerce_bool(render_queue_active, True)
         proj = None
         queue_job = None
+        queue_job_consumed = False
 
         try:
             # --- Load or create project ---
@@ -414,8 +453,17 @@ class SonderEditor:
             proj_fps = proj.fps
             proj_w, proj_h = proj.resolution
 
-            if self._execution_reaches_terminal_save(prompt, unique_id):
+            terminal_save_reached = self._execution_reaches_terminal_save(prompt, unique_id)
+            unmarked_save_reached = self._execution_targets_unmarked_save(prompt, unique_id)
+            queue_length = len(getattr(proj, "generation_queue", []) or [])
+            queue_job_mode = ""
+            if render_queue_active and terminal_save_reached:
                 queue_job = self._consume_queue_job(proj)
+                queue_job_consumed = queue_job is not None
+                queue_job_mode = "consume" if queue_job else ""
+            elif render_queue_active and unmarked_save_reached:
+                queue_job = self._peek_queue_job(proj)
+                queue_job_mode = "peek" if queue_job else ""
             snapshot_version = self._queue_snapshot_version(queue_job)
             if queue_job:
                 scene_id = queue_job.scene_id or scene_id
@@ -424,10 +472,18 @@ class SonderEditor:
                 pre_context_frames = max(0, _coerce_int(getattr(queue_job, "pre_context_frames", 0), 0))
                 post_context_frames = max(0, _coerce_int(getattr(queue_job, "post_context_frames", 0), 0))
             logger.info(
-                "execute begin: scene_id=%s selection=%d-%d",
+                "execute begin: scene_id=%s selection=%d-%d terminal_save=%s unmarked_save=%s render_queue_active=%s queue_length=%d queue_job_mode=%s queue_job_id=%s snapshot_range=%s-%s",
                 scene_id or "",
                 selection_start,
                 selection_end,
+                terminal_save_reached,
+                unmarked_save_reached,
+                render_queue_active,
+                queue_length,
+                queue_job_mode,
+                getattr(queue_job, "job_id", "") if queue_job else "",
+                getattr(queue_job, "selection_start", "") if queue_job else "",
+                getattr(queue_job, "selection_end", "") if queue_job else "",
             )
 
             # --- Find active scene ---
@@ -478,11 +534,13 @@ class SonderEditor:
                             f"Queued selection is outside scene bounds: {selection_start}-{selection_end}"
                         )
             else:
+                if queue_job:
+                    raise RuntimeError(
+                        f"Queued selection has zero or invalid range: {selection_start}-{selection_end}"
+                    )
                 render_start = 0
                 render_end = scene.duration_frames
                 if render_end <= 0:
-                    if queue_job:
-                        raise RuntimeError(f"Queued scene has no renderable duration: {scene.name}")
                     return self._empty_execute_result(proj, proj_fps, proj_w, proj_h)
 
             # --- Context frame expansion (asymmetric pre/post) ---
@@ -613,7 +671,7 @@ class SonderEditor:
                 "frame_count_padding": frame_count_padding,
                 "take_placement_mode": take_placement_mode,
                 "prompt": prompt_text,
-                "queue_job_id": queue_job.job_id if queue_job else "",
+                "queue_job_id": queue_job.job_id if queue_job and queue_job_consumed else "",
             }
             logger.info(
                 "execute end: scene_id=%s frames=%d duration=%.2fs",
@@ -647,7 +705,7 @@ class SonderEditor:
                 time.perf_counter() - execute_started_at,
                 e,
             )
-            if proj is not None and queue_job is not None:
+            if proj is not None and queue_job is not None and queue_job_consumed:
                 self._mark_queue_job_failed(proj, queue_job, str(e))
             raise
 
@@ -709,35 +767,60 @@ class SonderEditor:
         if not os.path.isfile(abs_path):
             abs_path = os.path.join(proj.project_dir, source_path)
 
-        cap = cv2.VideoCapture(abs_path)
+        black_rgb = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
         try:
-            if not cap.isOpened():
-                logger.warning("Cannot open motion-driver video: %s", abs_path)
-                return self._empty_motion_driver_outputs(proj_w, proj_h)
-
+            decoded = decode_video_range(abs_path, source_start, source_start + overlap_len)
             frames = []
             warned_read_failure = False
-            black_rgb = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
-            for offset in range(overlap_len):
-                source_frame = source_start + offset
-                cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
-                ret, frame_bgr = cap.read()
-                if not ret:
+            for _offset in range(overlap_len):
+                try:
+                    frame_rgb = next(decoded)
+                except StopIteration:
                     if not warned_read_failure:
                         logger.warning(
-                            "Failed to read motion-driver frames from %s; padding unreadable frames with black",
+                            "Failed to read all motion-driver frames from %s; padding unreadable frames with black",
                             abs_path,
                         )
                         warned_read_failure = True
                     frames.append(black_rgb.copy())
                     continue
-
-                placed, _bounds = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
-                frames.append(cv2.cvtColor(placed, cv2.COLOR_BGR2RGB))
-
+                placed, _bounds = fit_frame_to_canvas(frame_rgb, proj_w, proj_h)
+                frames.append(placed)
             tensor = torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
-        finally:
-            cap.release()
+        except Exception as ffmpeg_error:
+            logger.warning(
+                "ffmpeg motion-driver decode failed for %s; falling back to OpenCV: %s",
+                abs_path,
+                ffmpeg_error,
+            )
+            cap = cv2.VideoCapture(abs_path)
+            try:
+                if not cap.isOpened():
+                    logger.warning("Cannot open motion-driver video: %s", abs_path)
+                    return self._empty_motion_driver_outputs(proj_w, proj_h)
+
+                frames = []
+                warned_read_failure = False
+                for offset in range(overlap_len):
+                    source_frame = source_start + offset
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
+                    ret, frame_bgr = cap.read()
+                    if not ret:
+                        if not warned_read_failure:
+                            logger.warning(
+                                "Failed to read motion-driver frames from %s; padding unreadable frames with black",
+                                abs_path,
+                            )
+                            warned_read_failure = True
+                        frames.append(black_rgb.copy())
+                        continue
+
+                    placed, _bounds = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
+                    frames.append(cv2.cvtColor(placed, cv2.COLOR_BGR2RGB))
+
+                tensor = torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
+            finally:
+                cap.release()
 
         try:
             strength = float(getattr(clip, "strength", 1.0))
@@ -878,39 +961,35 @@ class SonderEditor:
         Returns:
             tuple: (canvas, (x_off, y_off, new_w, new_h)) — placed frame and content bounds.
         """
-        fh, fw = frame_bgr.shape[:2]
-        scale = min(canvas_w / fw, canvas_h / fh)
-        new_w = int(fw * scale)
-        new_h = int(fh * scale)
-        resized = cv2.resize(frame_bgr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-
-        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-        x_off = (canvas_w - new_w) // 2
-        y_off = (canvas_h - new_h) // 2
-        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
-        return canvas, (x_off, y_off, new_w, new_h)
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        placed_rgb, bounds = fit_frame_to_canvas(frame_rgb, canvas_w, canvas_h)
+        return cv2.cvtColor(placed_rgb, cv2.COLOR_RGB2BGR), bounds
 
     def _load_guide_image(self, path: str, asset_type: str,
                           target_w: int, target_h: int) -> torch.Tensor | None:
         """Load an image file and return as (H, W, 3) float32 RGB tensor."""
-        cap = None
         try:
             if asset_type == "video":
-                # Extract first frame from video
-                cap = cv2.VideoCapture(path)
-                if not cap.isOpened():
-                    return None
-                ret, frame_bgr = cap.read()
-                if not ret:
-                    return None
+                frame_rgb = decode_video_frame(path, 0)
+                if frame_rgb is None:
+                    cap = cv2.VideoCapture(path)
+                    try:
+                        if not cap.isOpened():
+                            return None
+                        ret, frame_bgr = cap.read()
+                        if not ret:
+                            return None
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    finally:
+                        cap.release()
             else:
                 # Load image
                 frame_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
                 if frame_bgr is None:
                     return None
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-            placed_bgr, _bounds = self._fit_frame_to_canvas(frame_bgr, target_w, target_h)
-            rgb = cv2.cvtColor(placed_bgr, cv2.COLOR_BGR2RGB)
+            rgb, _bounds = fit_frame_to_canvas(frame_rgb, target_w, target_h)
 
             # Convert to float32 tensor
             tensor = torch.from_numpy(rgb.astype(np.float32) / 255.0)
@@ -919,9 +998,6 @@ class SonderEditor:
         except Exception as e:
             logger.warning("Failed to load guide image %s: %s", path, e)
             return None
-        finally:
-            if cap is not None:
-                cap.release()
 
     def _load_scene_audio(self, proj: TimelineProject, scene: Scene,
                           sel_start: int, sel_end: int) -> dict:

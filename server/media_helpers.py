@@ -1,0 +1,787 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+from typing import Iterable, Iterator
+
+import cv2
+import numpy as np
+
+logger = logging.getLogger("sonder_editor")
+
+DEFAULT_SAVE_VIDEO_PRESET = "Compatible MP4"
+CUSTOM_SAVE_VIDEO_PRESET = "Custom"
+CUSTOM_OUTPUT_KIND_VIDEO = "Video File"
+CUSTOM_OUTPUT_KIND_PNG_SEQUENCE = "PNG Sequence"
+CUSTOM_OUTPUT_KIND_OPTIONS = [CUSTOM_OUTPUT_KIND_VIDEO, CUSTOM_OUTPUT_KIND_PNG_SEQUENCE]
+CUSTOM_CONTAINER_OPTIONS = ["mp4", "mov", "mkv"]
+CUSTOM_VIDEO_CODEC_OPTIONS = ["libx264", "libx265", "prores_ks", "ffv1"]
+CUSTOM_PIX_FMT_OPTIONS = ["yuv420p", "yuv444p", "yuv422p10le", "gbrp"]
+CUSTOM_ENCODER_PRESET_OPTIONS = [
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+]
+CUSTOM_AUDIO_CODEC_OPTIONS = ["aac", "pcm_s16le", "flac", "none"]
+DEFAULT_TENSOR_MODE = "round"
+MIN_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS = 90
+MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS = 60 * 60
+
+_PRESET_TIMEOUT_SECONDS_PER_MEGAPIXEL_FRAME = {
+    "Compatible MP4": 0.35,
+    "High Quality MP4": 0.5,
+    "Editing Master MP4": 1.5,
+    "ProRes 422 HQ": 0.6,
+    "Lossless FFV1 (RGB)": 1.0,
+}
+
+_CUSTOM_ENCODER_PRESET_TIMEOUT_MULTIPLIER = {
+    "ultrafast": 0.2,
+    "superfast": 0.25,
+    "veryfast": 0.35,
+    "faster": 0.5,
+    "fast": 0.65,
+    "medium": 0.85,
+    "slow": 1.0,
+    "slower": 1.25,
+    "veryslow": 1.5,
+}
+
+_CUSTOM_CODEC_TIMEOUT_BASE = {
+    "libx264": 0.55,
+    "libx265": 0.9,
+    "prores_ks": 0.6,
+    "ffv1": 1.0,
+}
+
+_PIX_FMT_TIMEOUT_MULTIPLIER = {
+    "yuv420p": 1.0,
+    "yuv444p": 1.25,
+    "yuv422p10le": 1.2,
+    "gbrp": 1.3,
+}
+
+SAVE_VIDEO_PRESET_ORDER = [
+    "Compatible MP4",
+    "High Quality MP4",
+    "Editing Master MP4",
+    "ProRes 422 HQ",
+    "Lossless FFV1 (RGB)",
+    CUSTOM_SAVE_VIDEO_PRESET,
+]
+
+SAVE_VIDEO_PRESETS = {
+    "Compatible MP4": {
+        "extension": ".mp4",
+        "tensor_mode": DEFAULT_TENSOR_MODE,
+        "video_args": ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        "audio_args": ["-c:a", "aac", "-b:a", "192k"],
+        "codec": "libx264",
+        "pix_fmt": "yuv420p",
+        "browser_preview_compatible": True,
+        "description": "Browser-safe MP4 for everyday review and sharing.",
+    },
+    "High Quality MP4": {
+        "extension": ".mp4",
+        "tensor_mode": DEFAULT_TENSOR_MODE,
+        "video_args": ["-c:v", "libx264", "-preset", "slow", "-crf", "14", "-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        "audio_args": ["-c:a", "aac", "-b:a", "256k"],
+        "codec": "libx264",
+        "pix_fmt": "yuv420p",
+        "browser_preview_compatible": True,
+        "description": "Browser-safe MP4 with higher visual quality and larger files.",
+    },
+    "Editing Master MP4": {
+        "extension": ".mp4",
+        "tensor_mode": "round",
+        "video_args": ["-c:v", "libx264", "-preset", "veryslow", "-crf", "10", "-pix_fmt", "yuv444p", "-movflags", "+faststart"],
+        "audio_args": ["-c:a", "aac", "-b:a", "256k"],
+        "codec": "libx264",
+        "pix_fmt": "yuv444p",
+        "browser_preview_compatible": False,
+        "description": "High-fidelity 4:4:4 MP4 for internal round trips; browser preview may not decode it.",
+    },
+    "ProRes 422 HQ": {
+        "extension": ".mov",
+        "tensor_mode": "round",
+        "video_args": ["-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv422p10le", "-vendor", "apl0", "-bits_per_mb", "8000"],
+        "audio_args": ["-c:a", "pcm_s16le"],
+        "codec": "prores_ks",
+        "pix_fmt": "yuv422p10le",
+        "browser_preview_compatible": False,
+        "description": "Large editing handoff file with 10-bit ProRes video and PCM audio.",
+    },
+    "Lossless FFV1 (RGB)": {
+        "extension": ".mkv",
+        "tensor_mode": "round",
+        "video_args": ["-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1", "-g", "1", "-slices", "24", "-slicecrc", "1", "-pix_fmt", "gbrp"],
+        "audio_args": ["-c:a", "flac"],
+        "codec": "ffv1",
+        "pix_fmt": "gbrp",
+        "browser_preview_compatible": False,
+        "description": "Lossless RGB archive/diagnostic output with FLAC audio; very large files.",
+    },
+    CUSTOM_SAVE_VIDEO_PRESET: {
+        "extension": ".mp4",
+        "tensor_mode": DEFAULT_TENSOR_MODE,
+        "codec": "",
+        "pix_fmt": "",
+        "browser_preview_compatible": False,
+        "description": "Expert export controls for allowlisted video settings or PNG image sequences.",
+    },
+}
+
+_FFMPEG_PATH: str | None = None
+_FFPROBE_PATH: str | None = None
+
+
+def _first_existing_path(candidates: Iterable[str]) -> str:
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _find_ffmpeg() -> str:
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+
+    try:
+        import imageio_ffmpeg
+
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        if path and os.path.isfile(path):
+            return path
+    except ImportError:
+        logger.info("imageio-ffmpeg not found, attempting to install...")
+        try:
+            import sys
+
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
+            import imageio_ffmpeg
+
+            path = imageio_ffmpeg.get_ffmpeg_exe()
+            if path and os.path.isfile(path):
+                return path
+        except Exception as exc:
+            logger.warning("Failed to install imageio-ffmpeg: %s", exc)
+    except Exception:
+        pass
+
+    import sys
+
+    python_dir = os.path.dirname(sys.executable)
+    candidates = [
+        os.path.join(python_dir, "ffmpeg.exe"),
+        os.path.join(python_dir, "Scripts", "ffmpeg.exe"),
+        os.path.join(python_dir, "..", "ffmpeg.exe"),
+    ]
+    try:
+        import folder_paths
+
+        comfy_base = folder_paths.base_path
+        sm_data = os.path.dirname(os.path.dirname(comfy_base))
+        candidates.extend([
+            os.path.join(comfy_base, "ffmpeg.exe"),
+            os.path.join(comfy_base, "ffmpeg", "ffmpeg.exe"),
+            os.path.join(sm_data, "Assets", "ffmpeg", "ffmpeg.exe"),
+            os.path.join(sm_data, "Assets", "ffmpeg", "bin", "ffmpeg.exe"),
+        ])
+    except Exception:
+        pass
+
+    site_binaries = os.path.join(python_dir, "Lib", "site-packages", "imageio_ffmpeg", "binaries")
+    if os.path.isdir(site_binaries):
+        for filename in os.listdir(site_binaries):
+            lowered = filename.lower()
+            if "ffmpeg" in lowered and "ffprobe" not in lowered:
+                candidates.append(os.path.join(site_binaries, filename))
+    candidates.extend([
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        os.path.expanduser(r"~\ffmpeg\bin\ffmpeg.exe"),
+    ])
+    return _first_existing_path(candidates) or "ffmpeg"
+
+
+def get_ffmpeg_path() -> str:
+    global _FFMPEG_PATH
+    if _FFMPEG_PATH is None:
+        _FFMPEG_PATH = _find_ffmpeg()
+    return _FFMPEG_PATH
+
+
+def _find_ffprobe() -> str:
+    path = shutil.which("ffprobe")
+    if path:
+        return path
+    ffmpeg = get_ffmpeg_path()
+    candidates = []
+    if ffmpeg and ffmpeg != "ffmpeg":
+        suffix = ".exe" if os.name == "nt" else ""
+        candidates.append(os.path.join(os.path.dirname(ffmpeg), f"ffprobe{suffix}"))
+    return _first_existing_path(candidates) or "ffprobe"
+
+
+def get_ffprobe_path() -> str:
+    global _FFPROBE_PATH
+    if _FFPROBE_PATH is None:
+        _FFPROBE_PATH = _find_ffprobe()
+    return _FFPROBE_PATH
+
+
+def normalize_save_preset(preset_id: str | None) -> str:
+    candidate = str(preset_id or "").strip()
+    return candidate if candidate in SAVE_VIDEO_PRESETS else DEFAULT_SAVE_VIDEO_PRESET
+
+
+def output_extension_for_preset(preset_id: str | None) -> str:
+    preset = SAVE_VIDEO_PRESETS[normalize_save_preset(preset_id)]
+    return str(preset["extension"])
+
+
+def tensor_mode_for_preset(preset_id: str | None) -> str:
+    preset = SAVE_VIDEO_PRESETS[normalize_save_preset(preset_id)]
+    return str(preset["tensor_mode"])
+
+
+def _pick_allowed(value, allowed: list[str], default: str) -> str:
+    candidate = str(value or "").strip()
+    return candidate if candidate in allowed else default
+
+
+def _clamp_int(value, min_value: int, max_value: int, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(min_value, min(max_value, parsed))
+
+
+def resolve_custom_export_options(options: dict | None = None) -> dict:
+    source = options if isinstance(options, dict) else {}
+    output_kind = _pick_allowed(
+        source.get("custom_output_kind"),
+        CUSTOM_OUTPUT_KIND_OPTIONS,
+        CUSTOM_OUTPUT_KIND_VIDEO,
+    )
+    container = _pick_allowed(source.get("custom_container"), CUSTOM_CONTAINER_OPTIONS, "mp4")
+    video_codec = _pick_allowed(source.get("custom_video_codec"), CUSTOM_VIDEO_CODEC_OPTIONS, "libx264")
+    pix_fmt = _pick_allowed(source.get("custom_pix_fmt"), CUSTOM_PIX_FMT_OPTIONS, "yuv420p")
+    encoder_preset = _pick_allowed(source.get("custom_encoder_preset"), CUSTOM_ENCODER_PRESET_OPTIONS, "slow")
+    audio_codec = _pick_allowed(source.get("custom_audio_codec"), CUSTOM_AUDIO_CODEC_OPTIONS, "aac")
+    tensor_mode = DEFAULT_TENSOR_MODE
+    crf = _clamp_int(source.get("custom_crf"), 0, 51, 18)
+    audio_bitrate_kbps = _clamp_int(source.get("custom_audio_bitrate_kbps"), 1, 10000, 192)
+    png_compression = _clamp_int(source.get("custom_png_compression"), 0, 9, 0)
+    return {
+        "output_kind": output_kind,
+        "container": container,
+        "extension": ".png" if output_kind == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE else f".{container}",
+        "video_codec": video_codec,
+        "pix_fmt": pix_fmt,
+        "crf": crf,
+        "encoder_preset": encoder_preset,
+        "audio_codec": audio_codec,
+        "audio_bitrate_kbps": audio_bitrate_kbps,
+        "tensor_mode": tensor_mode,
+        "png_compression": png_compression,
+        "browser_preview_compatible": (
+            output_kind == CUSTOM_OUTPUT_KIND_VIDEO
+            and container == "mp4"
+            and video_codec == "libx264"
+            and pix_fmt == "yuv420p"
+        ),
+    }
+
+
+def output_extension_for_custom_options(options: dict | None = None) -> str:
+    return str(resolve_custom_export_options(options)["extension"])
+
+
+def save_video_encode_timeout_seconds(
+    preset_id: str | None,
+    frame_count: int,
+    width: int,
+    height: int,
+    custom_options: dict | None = None,
+) -> int:
+    preset_id = normalize_save_preset(preset_id)
+    frame_count = max(1, int(frame_count or 1))
+    width = max(1, int(width or 1))
+    height = max(1, int(height or 1))
+    megapixel_frames = (frame_count * width * height) / 1_000_000
+
+    if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
+        spec = resolve_custom_export_options(custom_options)
+        if spec["output_kind"] != CUSTOM_OUTPUT_KIND_VIDEO:
+            return MIN_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS
+        seconds_per_mpf = _CUSTOM_CODEC_TIMEOUT_BASE.get(str(spec["video_codec"]), 0.6)
+        seconds_per_mpf *= _CUSTOM_ENCODER_PRESET_TIMEOUT_MULTIPLIER.get(str(spec["encoder_preset"]), 1.0)
+        seconds_per_mpf *= _PIX_FMT_TIMEOUT_MULTIPLIER.get(str(spec["pix_fmt"]), 1.0)
+    else:
+        seconds_per_mpf = _PRESET_TIMEOUT_SECONDS_PER_MEGAPIXEL_FRAME.get(
+            preset_id,
+            _PRESET_TIMEOUT_SECONDS_PER_MEGAPIXEL_FRAME[DEFAULT_SAVE_VIDEO_PRESET],
+        )
+
+    estimate = int(math.ceil(megapixel_frames * seconds_per_mpf))
+    return max(
+        MIN_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS,
+        min(MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS, estimate),
+    )
+
+
+def tensor_to_uint8_frames(tensor, *, mode: str = "truncate") -> np.ndarray:
+    arr = tensor.detach().cpu().numpy() if hasattr(tensor, "detach") else np.asarray(tensor)
+    scaled = np.asarray(arr, dtype=np.float32) * 255.0
+    if mode == "round":
+        scaled = np.rint(scaled)
+    elif mode != "truncate":
+        raise ValueError(f"Unknown tensor conversion mode: {mode}")
+    return scaled.clip(0, 255).astype(np.uint8)
+
+
+def fit_frame_to_canvas(frame_rgb: np.ndarray, canvas_w: int, canvas_h: int) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    fh, fw = frame_rgb.shape[:2]
+    canvas_w = max(1, int(canvas_w))
+    canvas_h = max(1, int(canvas_h))
+    if fw <= 0 or fh <= 0:
+        return np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8), (0, 0, 0, 0)
+    scale = min(canvas_w / fw, canvas_h / fh)
+    new_w = max(1, int(fw * scale))
+    new_h = max(1, int(fh * scale))
+    resized = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    x_off = (canvas_w - new_w) // 2
+    y_off = (canvas_h - new_h) // 2
+    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return canvas, (x_off, y_off, new_w, new_h)
+
+
+def resize_frame_to_long_edge(frame_rgb: np.ndarray, target_long_edge: int) -> np.ndarray:
+    target = int(target_long_edge or 0)
+    if target <= 0:
+        return frame_rgb
+    h, w = frame_rgb.shape[:2]
+    source_long = max(w, h)
+    if source_long <= 0 or source_long == target:
+        return frame_rgb
+    scale = target / source_long
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+
+def probe_video_size(path: str) -> tuple[int, int]:
+    ffprobe = get_ffprobe_path()
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout or "{}")
+            stream = next(iter(data.get("streams", []) or []), {})
+            width = int(stream.get("width") or 0)
+            height = int(stream.get("height") or 0)
+            if width > 0 and height > 0:
+                return width, height
+        logger.debug("ffprobe size probe failed for %s: %s", path, (result.stderr or "").strip()[:240])
+    except Exception as exc:
+        logger.debug("ffprobe size probe unavailable for %s: %s", path, exc)
+
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if width > 0 and height > 0:
+                return width, height
+    finally:
+        cap.release()
+    raise RuntimeError(f"Could not probe video size for {path}")
+
+
+def decode_video_range(
+    path: str,
+    start: int,
+    end_exclusive: int,
+    *,
+    target_w: int | None = None,
+    target_h: int | None = None,
+) -> Iterator[np.ndarray]:
+    start_frame = max(0, int(start or 0))
+    end_frame = max(start_frame, int(end_exclusive or 0))
+    frame_count = end_frame - start_frame
+    if frame_count <= 0:
+        return
+
+    if target_w and target_h:
+        width = max(1, int(target_w))
+        height = max(1, int(target_h))
+    else:
+        width, height = probe_video_size(path)
+
+    filters = [f"select=between(n\\,{start_frame}\\,{end_frame - 1})"]
+    if target_w and target_h:
+        filters.append(f"scale={width}:{height}")
+    cmd = [
+        get_ffmpeg_path(),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-vf",
+        ",".join(filters),
+        "-vsync",
+        "0",
+        "-frames:v",
+        str(frame_count),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    timeout = max(30, min(600, frame_count * 5))
+    result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace")[:500])
+
+    frame_size = width * height * 3
+    decoded_count = len(result.stdout) // frame_size
+    for idx in range(min(decoded_count, frame_count)):
+        offset = idx * frame_size
+        frame = np.frombuffer(result.stdout[offset:offset + frame_size], dtype=np.uint8)
+        yield frame.reshape((height, width, 3)).copy()
+
+
+def decode_video_frame(path: str, frame_index: int) -> np.ndarray | None:
+    try:
+        return next(decode_video_range(path, frame_index, int(frame_index) + 1), None)
+    except Exception as exc:
+        logger.warning("ffmpeg frame decode failed for %s frame %s: %s", path, frame_index, exc)
+        return None
+
+
+def write_png(path: str, frame_rgb: np.ndarray, *, compression: int = 0) -> None:
+    from PIL import Image
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    Image.fromarray(np.asarray(frame_rgb, dtype=np.uint8), mode="RGB").save(
+        path,
+        compress_level=_clamp_int(compression, 0, 9, 0),
+    )
+
+
+def _coerce_frames_array(frames_iter: Iterable[np.ndarray]) -> np.ndarray:
+    if isinstance(frames_iter, np.ndarray):
+        frames = frames_iter
+    else:
+        frames = np.stack([np.asarray(frame) for frame in frames_iter], axis=0)
+    if frames.ndim != 4 or frames.shape[-1] != 3 or frames.shape[0] <= 0:
+        raise ValueError("frames_iter must provide one or more RGB frames shaped (H, W, 3)")
+    if frames.dtype != np.uint8:
+        frames = np.asarray(frames).clip(0, 255).astype(np.uint8)
+    return np.ascontiguousarray(frames)
+
+
+def _read_process_stderr(stderr_file) -> bytes:
+    try:
+        stderr_file.flush()
+        stderr_file.seek(0)
+        return stderr_file.read()
+    except Exception:
+        return b""
+
+
+def _ffmpeg_failed_message(stderr: bytes) -> str:
+    return f"ffmpeg failed: {stderr.decode(errors='replace')[:500]}"
+
+
+def _timeout_expired(cmd: list, timeout: int | float | None, stderr_file) -> subprocess.TimeoutExpired:
+    return subprocess.TimeoutExpired(cmd, timeout, stderr=_read_process_stderr(stderr_file))
+
+
+def _raise_stream_timeout(proc, cmd: list, timeout: int | float | None, stderr_file) -> None:
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+    raise _timeout_expired(cmd, timeout, stderr_file)
+
+
+def _run_ffmpeg_streaming_frames(cmd: list, frames: np.ndarray, *, timeout: int | float | None) -> None:
+    deadline = time.perf_counter() + float(timeout) if timeout is not None else None
+    with tempfile.TemporaryFile() as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
+        timed_out = threading.Event()
+
+        def kill_on_timeout() -> None:
+            timed_out.set()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        timer = threading.Timer(float(timeout), kill_on_timeout) if timeout is not None else None
+        if timer is not None:
+            timer.daemon = True
+            timer.start()
+
+        broken_pipe = False
+        try:
+            if proc.stdin is None:
+                raise RuntimeError("ffmpeg failed: stdin pipe was not available")
+
+            for frame in frames:
+                if timed_out.is_set():
+                    _raise_stream_timeout(proc, cmd, timeout, stderr_file)
+                try:
+                    proc.stdin.write(memoryview(frame).cast("B"))
+                except (BrokenPipeError, OSError):
+                    broken_pipe = True
+                    break
+
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                broken_pipe = True
+
+            if timed_out.is_set():
+                _raise_stream_timeout(proc, cmd, timeout, stderr_file)
+
+            wait_timeout = None
+            if deadline is not None:
+                wait_timeout = max(0.0, deadline - time.perf_counter())
+            try:
+                returncode = proc.wait(timeout=wait_timeout)
+            except subprocess.TimeoutExpired:
+                _raise_stream_timeout(proc, cmd, timeout, stderr_file)
+            if timer is not None:
+                timer.cancel()
+
+            if timed_out.is_set():
+                _raise_stream_timeout(proc, cmd, timeout, stderr_file)
+
+            stderr = _read_process_stderr(stderr_file)
+            if broken_pipe or returncode != 0:
+                raise RuntimeError(_ffmpeg_failed_message(stderr))
+        finally:
+            if timer is not None:
+                timer.cancel()
+
+
+def _custom_video_args(spec: dict) -> list[str]:
+    codec = str(spec["video_codec"])
+    pix_fmt = str(spec["pix_fmt"])
+    if codec in {"libx264", "libx265"}:
+        args = [
+            "-c:v", codec,
+            "-preset", str(spec["encoder_preset"]),
+            "-crf", str(int(spec["crf"])),
+            "-pix_fmt", pix_fmt,
+        ]
+    elif codec == "prores_ks":
+        args = [
+            "-c:v", "prores_ks",
+            "-profile:v", "3",
+            "-pix_fmt", pix_fmt,
+            "-vendor", "apl0",
+            "-bits_per_mb", "8000",
+        ]
+    else:
+        args = [
+            "-c:v", "ffv1",
+            "-level", "3",
+            "-coder", "1",
+            "-context", "1",
+            "-g", "1",
+            "-slices", "24",
+            "-slicecrc", "1",
+            "-pix_fmt", pix_fmt,
+        ]
+    if spec["container"] == "mp4":
+        args += ["-movflags", "+faststart"]
+    return args
+
+
+def _custom_audio_args(spec: dict) -> list[str]:
+    codec = str(spec["audio_codec"])
+    if codec == "none":
+        return []
+    if codec == "aac":
+        return ["-c:a", "aac", "-b:a", f"{int(spec['audio_bitrate_kbps'])}k"]
+    return ["-c:a", codec]
+
+
+def _audio_mode_from_args(args: list[str]) -> str:
+    if not args:
+        return "none"
+    codec = ""
+    bitrate = ""
+    for idx, value in enumerate(args):
+        if value == "-c:a" and idx + 1 < len(args):
+            codec = str(args[idx + 1])
+        elif value == "-b:a" and idx + 1 < len(args):
+            bitrate = str(args[idx + 1])
+    return f"{codec} {bitrate}".strip() or "none"
+
+
+def _preset_video_args(preset_id: str, custom_options: dict | None = None) -> list[str]:
+    if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
+        spec = resolve_custom_export_options(custom_options)
+        if spec["output_kind"] != CUSTOM_OUTPUT_KIND_VIDEO:
+            raise ValueError("Custom PNG Sequence is not a video encode preset")
+        return _custom_video_args(spec)
+    return list(SAVE_VIDEO_PRESETS[preset_id]["video_args"])
+
+
+def _preset_audio_args(preset_id: str, custom_options: dict | None = None) -> list[str]:
+    if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
+        spec = resolve_custom_export_options(custom_options)
+        return _custom_audio_args(spec)
+    return list(SAVE_VIDEO_PRESETS[preset_id]["audio_args"])
+
+
+def _preset_metadata(preset_id: str, custom_options: dict | None = None) -> dict:
+    preset = SAVE_VIDEO_PRESETS[preset_id]
+    if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
+        spec = resolve_custom_export_options(custom_options)
+        extension = str(spec["extension"])
+        description = str(preset.get("description") or "")
+        audio_mode = "none"
+        if spec["output_kind"] == CUSTOM_OUTPUT_KIND_VIDEO:
+            audio_mode = _audio_mode_from_args(_custom_audio_args(spec))
+        metadata = {
+            "label": CUSTOM_SAVE_VIDEO_PRESET,
+            "description": description,
+            "extension": extension,
+            "save_preset": CUSTOM_SAVE_VIDEO_PRESET,
+            "codec": "png" if spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE else str(spec["video_codec"]),
+            "pix_fmt": "rgb24" if spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE else str(spec["pix_fmt"]),
+            "container": "png" if spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE else str(spec["container"]),
+            "tensor_mode": str(spec["tensor_mode"]),
+            "audio_mode": audio_mode,
+            "browser_preview_compatible": bool(spec["browser_preview_compatible"]),
+            "custom_output_kind": str(spec["output_kind"]),
+            "custom_container": str(spec["container"]),
+            "custom_video_codec": str(spec["video_codec"]),
+            "custom_pix_fmt": str(spec["pix_fmt"]),
+            "custom_crf": int(spec["crf"]),
+            "custom_encoder_preset": str(spec["encoder_preset"]),
+            "custom_audio_codec": str(spec["audio_codec"]),
+            "custom_audio_bitrate_kbps": int(spec["audio_bitrate_kbps"]),
+            "custom_png_compression": int(spec["png_compression"]),
+        }
+        return metadata
+    return {
+        "label": preset_id,
+        "description": str(preset.get("description") or ""),
+        "extension": str(preset["extension"]),
+        "save_preset": preset_id,
+        "codec": str(preset.get("codec") or ""),
+        "pix_fmt": str(preset.get("pix_fmt") or ""),
+        "container": str(preset["extension"]).lstrip("."),
+        "tensor_mode": str(preset["tensor_mode"]),
+        "audio_mode": _audio_mode_from_args(list(preset.get("audio_args") or [])),
+        "browser_preview_compatible": bool(preset.get("browser_preview_compatible", True)),
+    }
+
+
+def metadata_for_save_preset(preset_id: str | None, custom_options: dict | None = None) -> dict:
+    return _preset_metadata(normalize_save_preset(preset_id), custom_options)
+
+
+def encode_video(
+    frames_iter: Iterable[np.ndarray],
+    *,
+    preset_id: str,
+    output_path: str,
+    fps: float,
+    audio_path: str | None = None,
+    custom_options: dict | None = None,
+    timeout: int = 90,
+) -> dict:
+    preset_id = normalize_save_preset(preset_id)
+    if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
+        custom_spec = resolve_custom_export_options(custom_options)
+        if custom_spec["output_kind"] != CUSTOM_OUTPUT_KIND_VIDEO:
+            raise ValueError("Custom PNG Sequence must be saved through the PNG sequence path")
+    audio_args = _preset_audio_args(preset_id, custom_options)
+    frames = _coerce_frames_array(frames_iter)
+    frame_count, h, w = frames.shape[:3]
+    fps_value = max(0.001, float(fps or 24.0))
+    cmd = [
+        get_ffmpeg_path(),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{w}x{h}",
+        "-r",
+        str(fps_value),
+        "-i",
+        "pipe:0",
+    ]
+
+    has_audio = bool(audio_path) and bool(audio_args)
+    if has_audio:
+        cmd += ["-i", str(audio_path)]
+
+    cmd += _preset_video_args(preset_id, custom_options)
+    if has_audio:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", *audio_args, "-shortest"]
+    cmd += [str(output_path), "-y"]
+
+    started_at = time.perf_counter()
+    try:
+        _run_ffmpeg_streaming_frames(cmd, frames, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg timeout: encode_video output=%s", output_path)
+        raise
+    logger.debug("ffmpeg encode complete output=%s frames=%d duration=%.2fs", output_path, frame_count, time.perf_counter() - started_at)
+    return _preset_metadata(preset_id, custom_options)

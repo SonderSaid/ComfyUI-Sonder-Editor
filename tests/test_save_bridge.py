@@ -273,6 +273,32 @@ def test_bridge_terminal_marks_queue_complete_after_registration(tmp_path, monke
     assert observed[-1][2] == restored.assets[0].asset_id
 
 
+def test_bridge_mark_complete_with_empty_queue_job_id_logs_warning(tmp_path, monkeypatch, caplog):
+    io_nodes, timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    queue_job = timeline_state.GenerationJob(job_id="job-1", scene_id="scene-1", status="running")
+    project.generation_queue.append(queue_job)
+    project._execution_context = {"queue_job_id": ""}
+    project_manager.save_project(project)
+
+    bridge = io_nodes.SonderSaveBridge()
+    output_dir, _ = bridge.prepare_output(project, mark_queue_complete=True, prompt={}, unique_id="bridge-1")
+    _write_png(Path(output_dir) / "orphan.png")
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    caplog.set_level("WARNING", logger="sonder_editor")
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    assert len(restored.assets) == 1
+    assert restored.generation_queue[0].status == "running"
+    assert restored.generation_queue[0].result_asset_id == ""
+    assert "no queue_job_id" in caplog.text
+    assert "registered=1" in caplog.text
+
+
 def test_bridge_not_terminal_does_not_mark_queue_complete(tmp_path, monkeypatch):
     io_nodes, timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
     _clear_bridge_state(io_nodes)

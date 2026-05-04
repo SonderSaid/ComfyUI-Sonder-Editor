@@ -2,7 +2,20 @@ const { app } = window.comfyAPI.app;
 const { api } = window.comfyAPI.api;
 
 import { EditorNodeController } from "./editor_node_controller.js";
-import { getEditorSettings, resolveFrameConstraintForTemplate } from "./editor_settings.js";
+import {
+    CUSTOM_AUDIO_CODEC_OPTIONS,
+    CUSTOM_CONTAINER_OPTIONS,
+    CUSTOM_ENCODER_PRESET_OPTIONS,
+    CUSTOM_OUTPUT_KIND_OPTIONS,
+    CUSTOM_OUTPUT_KIND_PNG_SEQUENCE,
+    CUSTOM_OUTPUT_KIND_VIDEO,
+    CUSTOM_PIX_FMT_OPTIONS,
+    CUSTOM_VIDEO_CODEC_OPTIONS,
+    DEFAULT_SAVE_PRESET,
+    SAVE_PRESET_OPTIONS,
+    getEditorSettings,
+    resolveFrameConstraintForTemplate,
+} from "./editor_settings.js";
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -175,6 +188,232 @@ function applyProjectCreationDefaults(node) {
     if (fpsWidget) fpsWidget.value = settings.projectDefaults.fps;
     if (widthWidget) widthWidget.value = settings.projectDefaults.width;
     if (heightWidget) heightWidget.value = settings.projectDefaults.height;
+}
+
+function applySaveVideoDefaults(node) {
+    if (!node?.widgets) return;
+    const presetWidget = node.widgets.find((widget) => widget.name === "save_preset");
+    if (!presetWidget) return;
+    const defaultPreset = getEditorSettings()?.render?.defaultSavePreset || DEFAULT_SAVE_PRESET;
+    const validPresets = new Set(SAVE_PRESET_OPTIONS.map((option) => option.value));
+    if (!validPresets.has(defaultPreset)) return;
+    if (presetWidget.value && validPresets.has(presetWidget.value) && presetWidget.value !== DEFAULT_SAVE_PRESET) return;
+    presetWidget.value = defaultPreset;
+    presetWidget.callback?.(defaultPreset);
+}
+
+const CUSTOM_SAVE_PRESET = "Custom";
+const SAVE_VIDEO_CUSTOM_WIDGET_NAMES = [
+    "custom_output_kind",
+    "custom_container",
+    "custom_video_codec",
+    "custom_pix_fmt",
+    "custom_crf",
+    "custom_encoder_preset",
+    "custom_audio_codec",
+    "custom_audio_bitrate_kbps",
+    "custom_png_compression",
+];
+const CUSTOM_COMBO_OPTIONS = {
+    custom_container: CUSTOM_CONTAINER_OPTIONS,
+    custom_video_codec: CUSTOM_VIDEO_CODEC_OPTIONS,
+    custom_pix_fmt: CUSTOM_PIX_FMT_OPTIONS,
+    custom_encoder_preset: CUSTOM_ENCODER_PRESET_OPTIONS,
+    custom_audio_codec: CUSTOM_AUDIO_CODEC_OPTIONS,
+};
+
+function findWidget(node, name) {
+    return node?.widgets?.find((widget) => widget.name === name);
+}
+
+function widgetValue(node, name, fallback = "") {
+    const widget = findWidget(node, name);
+    return widget?.value ?? fallback;
+}
+
+function coerceWidgetValue(widget, allowed, fallback) {
+    if (!widget || !Array.isArray(allowed) || !allowed.length) return false;
+    const nextFallback = allowed.includes(fallback) ? fallback : allowed[0];
+    if (allowed.includes(widget.value)) return false;
+    widget.value = nextFallback;
+    return true;
+}
+
+function setComboValues(widget, values) {
+    if (!widget || !Array.isArray(values) || !values.length) return false;
+    widget.options = widget.options || {};
+    const previousValues = Array.isArray(widget.options.values) ? widget.options.values : [];
+    const changed = previousValues.length !== values.length || previousValues.some((value, index) => value !== values[index]);
+    widget.options.values = values.slice();
+    return coerceWidgetValue(widget, values, values[0]) || changed;
+}
+
+function setWidgetVisible(node, widget, visible) {
+    if (!widget) return false;
+    const wasHidden = !!widget.hidden;
+    if (visible) {
+        showWidget(node, widget);
+    } else {
+        hideWidget(node, widget);
+    }
+    return wasHidden === !!visible;
+}
+
+function savePresetOption(value) {
+    return SAVE_PRESET_OPTIONS.find((option) => option.value === value) || SAVE_PRESET_OPTIONS[0];
+}
+
+function customPresetDescription(node) {
+    const outputKind = widgetValue(node, "custom_output_kind", CUSTOM_OUTPUT_KIND_VIDEO);
+    if (outputKind === CUSTOM_OUTPUT_KIND_PNG_SEQUENCE) {
+        const compression = widgetValue(node, "custom_png_compression", 0);
+        return `PNG sequence, RGB PNG files, compression ${compression}. Video mode only.`;
+    }
+
+    const container = String(widgetValue(node, "custom_container", "mp4")).toUpperCase();
+    const codec = widgetValue(node, "custom_video_codec", "libx264");
+    const pixFmt = widgetValue(node, "custom_pix_fmt", "yuv420p");
+    const audioCodec = widgetValue(node, "custom_audio_codec", "aac");
+    const audioBitrate = widgetValue(node, "custom_audio_bitrate_kbps", 192);
+    const crf = widgetValue(node, "custom_crf", 18);
+    const encoderPreset = widgetValue(node, "custom_encoder_preset", "slow");
+    const quality = codec === "libx264" || codec === "libx265"
+        ? `, CRF ${crf}, ${encoderPreset} preset`
+        : "";
+    const audio = audioCodec === "aac" ? `AAC ${audioBitrate} kbps` : audioCodec;
+    return `${container}, ${codec}, ${pixFmt}${quality}, ${audio} audio.`;
+}
+
+function updateSavePresetHelp(node, helpEl) {
+    if (!helpEl) return;
+    const presetWidget = findWidget(node, "save_preset");
+    const preset = savePresetOption(presetWidget?.value || DEFAULT_SAVE_PRESET);
+    const description = preset.value === CUSTOM_SAVE_PRESET ? customPresetDescription(node) : preset.description;
+    helpEl.textContent = description || "";
+    helpEl.title = description || "";
+}
+
+function resizeSaveVideoNode(node) {
+    try {
+        const nextSize = node.computeSize?.();
+        if (Array.isArray(nextSize) && nextSize.length >= 2) {
+            const currentWidth = Number(node.size?.[0] || 0);
+            node.setSize?.([Math.max(currentWidth, Number(nextSize[0] || 0)), Number(nextSize[1] || 0)]);
+        }
+    } catch (error) {
+        console.warn("[Sonder] Failed to resize save-video node:", error);
+    }
+    app.graph.setDirtyCanvas?.(true, true);
+}
+
+function installSaveVideoPresetUi(node) {
+    if (!node?.widgets) return;
+    applySaveVideoDefaults(node);
+
+    if (node._sonderSavePresetUiInstalled) {
+        node._sonderSyncSavePresetUi?.();
+        return;
+    }
+    node._sonderSavePresetUiInstalled = true;
+
+    const helpEl = document.createElement("div");
+    helpEl.style.cssText = `
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 30px;
+        padding: 5px 8px;
+        color: #b8c2cc;
+        font-size: 10px;
+        line-height: 1.35;
+        white-space: normal;
+    `;
+    const helpWidget = node.addDOMWidget("sonder_save_preset_help", "SonderSavePresetHelp", helpEl, {
+        serialize: false,
+        hideOnZoom: false,
+        getMinHeight: () => 30,
+        getMaxHeight: () => 54,
+        getHeight: () => 40,
+    });
+    helpWidget.computeSize = (width) => [width, 40];
+
+    const presetIndex = node.widgets.findIndex((widget) => widget.name === "save_preset");
+    const helpIndex = node.widgets.indexOf(helpWidget);
+    if (presetIndex >= 0 && helpIndex >= 0 && helpIndex !== presetIndex + 1) {
+        node.widgets.splice(helpIndex, 1);
+        node.widgets.splice(presetIndex + 1, 0, helpWidget);
+    }
+
+    const sync = () => {
+        let changed = false;
+        const presetWidget = findWidget(node, "save_preset");
+        const modeWidget = findWidget(node, "mode");
+        const outputKindWidget = findWidget(node, "custom_output_kind");
+        const validPresets = SAVE_PRESET_OPTIONS.map((option) => option.value);
+
+        changed = coerceWidgetValue(presetWidget, validPresets, DEFAULT_SAVE_PRESET) || changed;
+        for (const [name, values] of Object.entries(CUSTOM_COMBO_OPTIONS)) {
+            changed = setComboValues(findWidget(node, name), values) || changed;
+        }
+
+        const isCustom = presetWidget?.value === CUSTOM_SAVE_PRESET;
+        const isTake = modeWidget?.value === "Take";
+        const outputKindValues = isTake ? [CUSTOM_OUTPUT_KIND_VIDEO] : CUSTOM_OUTPUT_KIND_OPTIONS;
+        changed = setComboValues(outputKindWidget, outputKindValues) || changed;
+
+        const outputKind = outputKindWidget?.value || CUSTOM_OUTPUT_KIND_VIDEO;
+        const codec = widgetValue(node, "custom_video_codec", "libx264");
+        const audioCodec = widgetValue(node, "custom_audio_codec", "aac");
+        const isPngSequence = outputKind === CUSTOM_OUTPUT_KIND_PNG_SEQUENCE;
+        const isCrfCodec = codec === "libx264" || codec === "libx265";
+
+        const visibleNames = new Set();
+        if (isCustom) {
+            visibleNames.add("custom_output_kind");
+            if (isPngSequence) {
+                visibleNames.add("custom_png_compression");
+            } else {
+                visibleNames.add("custom_container");
+                visibleNames.add("custom_video_codec");
+                visibleNames.add("custom_pix_fmt");
+                visibleNames.add("custom_audio_codec");
+                if (isCrfCodec) {
+                    visibleNames.add("custom_crf");
+                    visibleNames.add("custom_encoder_preset");
+                }
+                if (audioCodec === "aac") {
+                    visibleNames.add("custom_audio_bitrate_kbps");
+                }
+            }
+        }
+
+        for (const name of SAVE_VIDEO_CUSTOM_WIDGET_NAMES) {
+            changed = setWidgetVisible(node, findWidget(node, name), visibleNames.has(name)) || changed;
+        }
+        updateSavePresetHelp(node, helpEl);
+        if (changed) resizeSaveVideoNode(node);
+    };
+
+    node._sonderSyncSavePresetUi = sync;
+    for (const name of ["save_preset", "mode", ...SAVE_VIDEO_CUSTOM_WIDGET_NAMES]) {
+        const widget = findWidget(node, name);
+        if (!widget || widget._sonderSavePresetCallbackWrapped) continue;
+        const originalCallback = widget.callback;
+        widget.callback = function (...args) {
+            const result = originalCallback?.apply(this, args);
+            sync();
+            return result;
+        };
+        widget._sonderSavePresetCallbackWrapped = true;
+    }
+
+    const originalOnConfigure = node.onConfigure;
+    node.onConfigure = function (...args) {
+        const result = originalOnConfigure?.apply(this, args);
+        window.setTimeout?.(() => this._sonderSyncSavePresetUi?.(), 0);
+        return result;
+    };
+
+    sync();
 }
 
 function getActiveEditorNodes() {
@@ -624,6 +863,7 @@ app.registerExtension({
                     "pre_context_frames",
                     "post_context_frames",
                     "take_placement_mode",
+                    "render_queue_active",
                 ];
 
                 // Store original types
@@ -801,6 +1041,16 @@ app.registerExtension({
 
         // ── Sonder Save Video — notify editor nodes to refresh ───────────
         if (nodeData.name === "SonderSaveVideo") {
+            const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                origOnNodeCreated?.apply(this, arguments);
+                try {
+                    installSaveVideoPresetUi(this);
+                } catch (error) {
+                    console.warn("[Sonder] Failed to install save-video preset UI:", error);
+                }
+            };
+
             const origOnExecuted = nodeType.prototype.onExecuted;
             nodeType.prototype.onExecuted = function () {
                 origOnExecuted?.apply(this, arguments);
