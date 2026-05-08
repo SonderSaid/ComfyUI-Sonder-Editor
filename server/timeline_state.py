@@ -119,6 +119,7 @@ class GuideFrame:
     asset_id: str = ""                      # points to an Asset in the project registry
     source: str = ""                        # "asset" | "scene_boundary" (auto from adjacent scene)
     strength: float = 1.0                   # conditioning strength 0.0-1.0
+    muted: bool = False                     # hidden from editor/conditioning without deleting
 
     def to_dict(self) -> dict:
         return {
@@ -126,6 +127,7 @@ class GuideFrame:
             "asset_id": self.asset_id,
             "source": self.source,
             "strength": self.strength,
+            "muted": self.muted,
         }
 
     @classmethod
@@ -135,6 +137,7 @@ class GuideFrame:
             asset_id=data.get("asset_id", ""),
             source=data.get("source", ""),
             strength=data.get("strength", 1.0),
+            muted=bool(data.get("muted", False)),
         )
 
 
@@ -257,6 +260,8 @@ class LaneConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "LaneConfig":
+        if not isinstance(data, dict):
+            data = {}
         return cls(
             name=data.get("name", ""),
             color=data.get("color", ""),
@@ -314,6 +319,8 @@ class Scene:
     video_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     motion_driver_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     audio_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
+    guide_track_config: LaneConfig = field(default_factory=LaneConfig)
+    prompt_track_config: LaneConfig = field(default_factory=LaneConfig)
     width: int = 0                              # 0 = inherit from project
     height: int = 0                             # 0 = inherit from project
     fps: float = 0.0                            # 0 = inherit from project
@@ -344,13 +351,19 @@ class Scene:
         data = {
             "clips": [(c.source_path, c.timeline_start_frame, c.timeline_end_frame,
                         c.source_in_frame, c.opacity, c.track_index,
-                        getattr(c, "role", "render"), getattr(c, "strength", 1.0))
+                        getattr(c, "role", "render"), getattr(c, "strength", 1.0),
+                        getattr(c, "muted", False))
                        for c in self.clips],
+            "guides": [(g.frame_index, g.asset_id, g.source,
+                        getattr(g, "strength", 1.0), getattr(g, "muted", False))
+                       for g in self.guide_frames],
             "audio": [(a.source_path, a.timeline_start_frame, a.timeline_end_frame,
                         a.source_in_frame, a.volume, a.muted, a.lane_index)
                        for a in self.audio_tracks],
             "hidden_video": [i for i, c in enumerate(self.video_lane_configs) if c.hidden],
+            "hidden_motion_driver": [i for i, c in enumerate(self.motion_driver_lane_configs) if c.hidden],
             "hidden_audio": [i for i, c in enumerate(self.audio_lane_configs) if c.hidden],
+            "hidden_guides": bool(getattr(self.guide_track_config, "hidden", False)),
             "sel": (selection_start, selection_end),
             "res": resolution,
             "scene_res": (self.width, self.height),
@@ -360,6 +373,8 @@ class Scene:
 
     def get_prompt_at_frame(self, frame: int) -> str:
         """Return the prompt for a given frame. Falls back to scene-level prompt."""
+        if getattr(self.prompt_track_config, "hidden", False):
+            return ""
         for section in self.prompt_sections:
             if section.start_frame <= frame < section.end_frame:
                 return section.prompt
@@ -367,6 +382,8 @@ class Scene:
 
     def get_prompt_for_range(self, start: int, end: int) -> str:
         """Return the prompt covering a frame range. Uses first matching section."""
+        if getattr(self.prompt_track_config, "hidden", False):
+            return ""
         for section in self.prompt_sections:
             if section.start_frame <= start and section.end_frame >= end:
                 return section.prompt
@@ -395,6 +412,8 @@ class Scene:
             "video_lane_configs": [c.to_dict() for c in self.video_lane_configs],
             "motion_driver_lane_configs": [c.to_dict() for c in self.motion_driver_lane_configs],
             "audio_lane_configs": [c.to_dict() for c in self.audio_lane_configs],
+            "guide_track_config": self.guide_track_config.to_dict(),
+            "prompt_track_config": self.prompt_track_config.to_dict(),
             "width": self.width,
             "height": self.height,
             "fps": self.fps,
@@ -466,6 +485,8 @@ class Scene:
         ]
         while len(scene.audio_lane_configs) < scene.audio_lane_count:
             scene.audio_lane_configs.append(LaneConfig())
+        scene.guide_track_config = LaneConfig.from_dict(data.get("guide_track_config", {}))
+        scene.prompt_track_config = LaneConfig.from_dict(data.get("prompt_track_config", {}))
         return scene
 
 
@@ -487,6 +508,7 @@ class ClipReference:
     track_index: int = 0
     role: str = "render"                    # render | motion_driver
     strength: float = 1.0                   # motion-driver conditioning strength
+    muted: bool = False                     # hidden from viewport/render/motion output
     prompt: str = ""
     is_generated: bool = False
     generation_params: dict = field(default_factory=dict)
@@ -516,6 +538,7 @@ class ClipReference:
             "track_index": self.track_index,
             "role": self.role,
             "strength": self.strength,
+            "muted": self.muted,
             "prompt": self.prompt,
             "is_generated": self.is_generated,
             "generation_params": self.generation_params,
@@ -543,6 +566,7 @@ class ClipReference:
             track_index=data.get("track_index", 0),
             role=role,
             strength=data.get("strength", 1.0),
+            muted=bool(data.get("muted", False)),
             prompt=data.get("prompt", ""),
             is_generated=data.get("is_generated", False),
             generation_params=data.get("generation_params", {}),
@@ -623,6 +647,8 @@ class GenerationJob:
     context_frames: int = 0
     pre_context_frames: int = 0
     post_context_frames: int = 0
+    mask_pre_offset: int = 0
+    mask_post_offset: int = 0
     guide_frame_snapshots: list = field(default_factory=list)
     prompt_sections: list = field(default_factory=list)
     scene_width: int = 0
@@ -654,6 +680,8 @@ class GenerationJob:
             "context_frames": self.context_frames,
             "pre_context_frames": self.pre_context_frames,
             "post_context_frames": self.post_context_frames,
+            "mask_pre_offset": self.mask_pre_offset,
+            "mask_post_offset": self.mask_post_offset,
             "guide_frame_snapshots": list(self.guide_frame_snapshots),
             "prompt_sections": list(self.prompt_sections),
             "scene_width": self.scene_width,
@@ -692,6 +720,8 @@ class GenerationJob:
             context_frames=legacy_context,
             pre_context_frames=pre_context,
             post_context_frames=post_context,
+            mask_pre_offset=data.get("mask_pre_offset", 0),
+            mask_post_offset=data.get("mask_post_offset", 0),
             guide_frame_snapshots=list(data.get("guide_frame_snapshots", []) or []),
             prompt_sections=list(data.get("prompt_sections", []) or []),
             scene_width=data.get("scene_width", 0),

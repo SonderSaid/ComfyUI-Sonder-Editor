@@ -258,6 +258,8 @@ def test_scene_put_accepts_motion_driver_lane_config(tmp_path, monkeypatch):
             "motion_driver_lane_configs": [
                 {"name": "Driver", "color": "#2a9b9e", "locked": True, "hidden": True},
             ],
+            "guide_track_config": {"locked": True, "hidden": True},
+            "prompt_track_config": {"locked": True, "hidden": False},
         },
     )))
     payload = _response_json(response)
@@ -276,6 +278,51 @@ def test_scene_put_accepts_motion_driver_lane_config(tmp_path, monkeypatch):
         "locked": False,
         "hidden": False,
     }
+    assert payload["guide_track_config"] == {
+        "name": "",
+        "color": "",
+        "locked": True,
+        "hidden": True,
+    }
+    assert payload["prompt_track_config"] == {
+        "name": "",
+        "color": "",
+        "locked": True,
+        "hidden": False,
+    }
+
+
+def test_scene_restore_accepts_guide_and_prompt_track_config(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene")
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    restore_scene = _route_handler(
+        route_module,
+        "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore",
+    )
+    response = asyncio.run(restore_scene(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={
+            "name": "Restored",
+            "guide_track_config": {"locked": True, "hidden": False},
+            "prompt_track_config": {"locked": False, "hidden": True},
+        },
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["name"] == "Restored"
+    assert payload["guide_track_config"]["locked"] is True
+    assert payload["guide_track_config"]["hidden"] is False
+    assert payload["prompt_track_config"]["locked"] is False
+    assert payload["prompt_track_config"]["hidden"] is True
 
 
 def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_path, monkeypatch):
@@ -340,6 +387,8 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
     source.video_lane_configs = [LaneConfig(name="V0"), LaneConfig(name="V1", hidden=True)]
     source.motion_driver_lane_configs = [LaneConfig(name="Driver", color="#ffaa00")]
     source.audio_lane_configs = [LaneConfig(name="A0"), LaneConfig(name="A1", locked=True)]
+    source.guide_track_config = LaneConfig(locked=True, hidden=True)
+    source.prompt_track_config = LaneConfig(locked=True, hidden=False)
     source.saved_selections = [
         {"name": "Sel", "start": 4, "end": 20, "pre_context_frames": 2, "post_context_frames": 3}
     ]
@@ -391,6 +440,8 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
         "video_lane_configs",
         "motion_driver_lane_configs",
         "audio_lane_configs",
+        "guide_track_config",
+        "prompt_track_config",
         "width",
         "height",
         "fps",
@@ -400,6 +451,47 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
     assert payload["clips"][0]["source_path"] == source.clips[0].source_path
     assert payload["clips"][0]["role"] == source.clips[0].role
     assert payload["audio_tracks"][0]["source_path"] == source.audio_tracks[0].source_path
+
+
+def test_guide_swap_route_swaps_frames_and_respects_lock(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(
+        scene_id="scene-1",
+        name="Scene",
+        guide_frames=[
+            GuideFrame(frame_index=10, asset_id="guide-a", strength=0.4),
+            GuideFrame(frame_index=20, asset_id="guide-b", strength=0.8),
+        ],
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    swap_guides = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap",
+    )
+    response = asyncio.run(swap_guides(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"frame_a": 10, "frame_b": 20},
+    )))
+
+    assert response.status == 200
+    assert [(guide.frame_index, guide.asset_id) for guide in scene.guide_frames] == [
+        (10, "guide-b"),
+        (20, "guide-a"),
+    ]
+
+    scene.guide_track_config = LaneConfig(locked=True)
+    locked = asyncio.run(swap_guides(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"frame_a": 10, "frame_b": 20},
+    )))
+    assert locked.status == 409
 
 
 def test_clip_split_preserves_motion_driver_role_and_strength(tmp_path, monkeypatch):
@@ -610,3 +702,108 @@ def test_delete_last_audio_track_compacts_empty_audio_lane(tmp_path, monkeypatch
     assert scene.audio_lane_count == 2
     assert higher.lane_index == 1
     assert [config.name for config in scene.audio_lane_configs] == ["Audio 2", "Audio 3"]
+
+
+def test_bridge_guides_route_returns_live_guides_in_window(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(
+        scene_id="scene-1",
+        name="Scene",
+        duration_frames=120,
+        guide_frames=[
+            GuideFrame(frame_index=10, asset_id="asset-1", strength=0.7, muted=False),
+            GuideFrame(frame_index=50, asset_id="asset-1", strength=1.0, muted=True),
+            GuideFrame(frame_index=110, asset_id="asset-1", strength=0.5, muted=False),
+        ],
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [Asset(asset_id="asset-1", asset_type="image", path="media/g.png", name="GuideRef")]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+
+    handler = _route_handler(
+        route_module,
+        "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides",
+    )
+
+    # No selection -> full-scene window: all three guides visible.
+    response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
+    assert response.status == 200
+    payload = _response_json(response)
+    assert payload["source"] == "live"
+    assert len(payload["guides"]) == 3
+    keys = [row["guide_key"] for row in payload["guides"]]
+    assert keys == ["asset-1:10", "asset-1:50", "asset-1:110"]
+    muted_row = next(row for row in payload["guides"] if row["frame_index"] == 50)
+    assert muted_row["editor_muted"] is True
+    assert muted_row["asset_name"] == "GuideRef"
+
+    # Selection [40, 60) with no context -> only the muted guide at 50 in range.
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        query={"selection_start": "40", "selection_end": "60", "pre_context": "0", "post_context": "0"},
+    )))
+    payload = _response_json(response)
+    assert [row["frame_index"] for row in payload["guides"]] == [50]
+
+    scene.guide_track_config = LaneConfig(hidden=True)
+    response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
+    payload = _response_json(response)
+    assert all(row["editor_muted"] is True for row in payload["guides"])
+
+
+def test_bridge_guides_route_uses_running_job_snapshot(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(
+        scene_id="scene-1",
+        name="Scene",
+        duration_frames=120,
+        guide_frames=[
+            GuideFrame(frame_index=10, asset_id="asset-1", strength=1.0, muted=False),
+        ],
+    )
+    snapshot_dicts = [
+        {"frame_index": 30, "asset_id": "asset-1", "source": "asset", "strength": 0.8, "muted": False},
+        {"frame_index": 70, "asset_id": "asset-1", "source": "asset", "strength": 1.0, "muted": True},
+    ]
+    running_job = GenerationJob(
+        job_id="job-running",
+        scene_id="scene-1",
+        status="running",
+        guide_frame_snapshots=snapshot_dicts,
+        params={"snapshot_version": 1},
+    )
+    project = TimelineProject(
+        project_dir=str(project_dir),
+        name="Project",
+        scenes=[scene],
+        generation_queue=[running_job],
+    )
+    project.assets = [Asset(asset_id="asset-1", asset_type="image", path="media/g.png", name="Snap")]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    handler = _route_handler(
+        route_module,
+        "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides",
+    )
+
+    response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
+    payload = _response_json(response)
+    assert response.status == 200
+    assert payload["source"] == "snapshot"
+    keys = [row["guide_key"] for row in payload["guides"]]
+    assert keys == ["asset-1:30", "asset-1:70"]
+    # Live guide at frame 10 is NOT included while a running job is active.
+    assert "asset-1:10" not in keys
+
+    scene.guide_track_config = LaneConfig(hidden=True)
+    response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
+    payload = _response_json(response)
+    # Snapshot rows use their frozen muted flags, not the live guide-track hidden flag.
+    assert [row["editor_muted"] for row in payload["guides"]] == [False, True]

@@ -77,6 +77,7 @@ def _make_project_with_guides(tmp_path, monkeypatch, guide_frames):
             frame_index=g["frame_index"],
             asset_id=g["asset_id"],
             strength=g.get("strength", 1.0),
+            muted=g.get("muted", False),
         )
         for g in guide_frames
     ]
@@ -180,6 +181,49 @@ def test_missing_asset_skipped_gracefully(tmp_path, monkeypatch):
     guides = bridge._filtered_guides(project)
     assert len(guides) == 1
     assert guides[0]["local_idx"] == 5
+
+
+def test_bridge_editor_muted_guides_skip_unless_overridden(tmp_path, monkeypatch):
+    bridge, _ts, project, scene = _make_project_with_guides(
+        tmp_path, monkeypatch,
+        [
+            {"frame_index": 3, "asset_id": "a", "strength": 0.5, "muted": True},
+            {"frame_index": 6, "asset_id": "b", "strength": 0.9},
+        ],
+    )
+    _set_render_window(project, 0, scene.duration_frames)
+
+    guides = bridge._filtered_guides(project)
+    assert [g["editor_muted"] for g in guides] == [True, False]
+    assert [g["local_idx"] for g in bridge._apply_bridge_overrides(guides)] == [6]
+
+    override_json = '{"a:3":{"muted":false},"b:6":{"muted":true}}'
+    assert [g["local_idx"] for g in bridge._apply_bridge_overrides(guides, override_json)] == [3]
+
+    node = bridge.SonderGuidesBridgeStart()
+    result = node.execute(project, iteration_index=0, bridge_overrides_json=override_json)
+    _flow, _image, frame_idx, strength = result[:4]
+    assert frame_idx == 3
+    assert abs(strength - 0.5) < 1e-6
+
+
+def test_bridge_guide_track_hidden_skips_unless_overridden(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project_with_guides(
+        tmp_path, monkeypatch,
+        [
+            {"frame_index": 3, "asset_id": "a", "strength": 0.5},
+            {"frame_index": 6, "asset_id": "b", "strength": 0.9},
+        ],
+    )
+    scene.guide_track_config = timeline_state.LaneConfig(hidden=True)
+    _set_render_window(project, 0, scene.duration_frames)
+
+    guides = bridge._filtered_guides(project)
+    assert [g["editor_muted"] for g in guides] == [True, True]
+    assert bridge._apply_bridge_overrides(guides) == []
+
+    override_json = '{"a:3":{"muted":false}}'
+    assert [g["local_idx"] for g in bridge._apply_bridge_overrides(guides, override_json)] == [3]
 
 
 # ── End: empty guide list returns Start.value_i passthrough refs ──────

@@ -9,6 +9,7 @@
 //   slot type stays literally "*" so any wire still connects.
 
 import { app } from "/scripts/app.js";
+const { api } = window.comfyAPI.api;
 
 const EXT_NAME = "sonder.bridge";
 const TARGET_START = "SonderGuidesBridgeStart";
@@ -16,6 +17,7 @@ const TARGET_END = "SonderGuidesBridgeEnd";
 const MAX_PASSTHROUGH = 8; // mirror SONDER_BRIDGE_MAX_PASSTHROUGH default
 const VALUE_RE = /^value_(\d+)$/;
 const NODE_STATE = Symbol("sonderBridgeState");
+const OVERRIDES_WIDGET = "bridge_overrides_json";
 
 const isStart = (node) => node?.comfyClass === TARGET_START;
 const isEnd = (node) => node?.comfyClass === TARGET_END;
@@ -79,6 +81,51 @@ const getLink = (node, linkId) => {
     if (typeof links.get === "function") return links.get(linkId) || null;
     return links[linkId] || null;
 };
+
+const style = (element, cssText) => {
+    element.style.cssText = cssText;
+    return element;
+};
+
+const projectIdFromDir = (projectDir) =>
+    String(projectDir || "").split(/[/\\]/).pop() || "";
+
+const findWidget = (node, name) =>
+    (node?.widgets || []).find((widget) => widget?.name === name) || null;
+
+const readGuideOverrides = (node) => {
+    const widget = findWidget(node, OVERRIDES_WIDGET);
+    const raw = widget?.value || "{}";
+    try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw || "{}") : raw;
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+        return {};
+    }
+};
+
+const writeGuideOverrides = (node, overrides) => {
+    const widget = findWidget(node, OVERRIDES_WIDGET);
+    if (!widget) return;
+    const compact = {};
+    for (const [key, value] of Object.entries(overrides || {})) {
+        if (!key || !value || typeof value !== "object" || typeof value.muted !== "boolean") continue;
+        compact[key] = { muted: value.muted };
+    }
+    const serialized = JSON.stringify(compact);
+    widget.value = serialized;
+    widget.callback?.call(widget, serialized);
+    app.graph.setDirtyCanvas?.(true, true);
+};
+
+const linkedNodeFromInput = (node, inputName) => {
+    const input = findInputByName(node, inputName);
+    if (!input || input.link == null) return null;
+    const link = getLink(node, input.link);
+    return getGraph(node)?.getNodeById?.(link?.origin_id) || null;
+};
+
+const guideKey = (assetId, frameIndex) => `${assetId || ""}:${frameIndex}`;
 
 // ── Peer detection (Start.flow_control output ↔ End.flow_control input) ─
 const findPeer = (node) => {
@@ -220,6 +267,10 @@ const ensureNodeState = (node) => {
         inputMeta,
         outputMeta,
         initialized: false,
+        guidePanel: null,
+        guideList: null,
+        guideStatus: null,
+        guideRefreshToken: 0,
     };
     node[NODE_STATE] = state;
     return state;
@@ -396,6 +447,213 @@ const mirrorProjectWire = (start) => {
     }
 };
 
+async function loadLinkedEditorGuides(node) {
+    const editorNode = linkedNodeFromInput(node, "project");
+    const controllerState = editorNode?._sonderController?.state || null;
+    const projectDir = controllerState?.projectDir || "";
+    const projectId = projectIdFromDir(projectDir);
+    if (!projectId) {
+        return { status: "Connect a Sonder Editor project.", guides: [] };
+    }
+
+    const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
+    if (!sceneId) {
+        return { status: "No active scene.", guides: [] };
+    }
+
+    const params = new URLSearchParams();
+    const selStart = Math.max(0, parseInt(controllerState?.selectionStart, 10) || 0);
+    const selEnd = Math.max(selStart, parseInt(controllerState?.selectionEnd, 10) || 0);
+    if (selEnd > selStart) {
+        params.set("selection_start", String(selStart));
+        params.set("selection_end", String(selEnd));
+        params.set("pre_context", String(Math.max(0, parseInt(controllerState?.preContextFrames, 10) || 0)));
+        params.set("post_context", String(Math.max(0, parseInt(controllerState?.postContextFrames, 10) || 0)));
+    }
+    const query = params.toString();
+    const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-guides${query ? `?${query}` : ""}`;
+    const resp = await fetch(api.apiURL(url));
+    if (!resp.ok) {
+        throw new Error(`Bridge guide fetch failed: ${resp.status}`);
+    }
+    const payload = await resp.json();
+    const rows = Array.isArray(payload?.guides) ? payload.guides : [];
+    const guides = rows.map((row) => ({
+        ...row,
+        resolved_frame_index: Math.max(0, parseInt(row.frame_index, 10) || 0),
+        muted: !!row.editor_muted,
+    }));
+    const sourceLabel = payload?.source === "snapshot" ? "Snapshot guides for running job" : "Live editor guides";
+    const sceneName = payload?.scene_name || "Scene";
+    const ws = payload?.window_start ?? 0;
+    const we = payload?.window_end ?? 0;
+    return {
+        status: `${sourceLabel} - ${sceneName} f${ws}-${we}`,
+        guides,
+    };
+}
+
+function renderGuidePanel(node, payload = { status: "", guides: [] }) {
+    const state = ensureNodeState(node);
+    if (!state.guideList || !state.guideStatus) return;
+    state.guideStatus.textContent = payload.status || "";
+    state.guideList.innerHTML = "";
+    const guides = payload.guides || [];
+
+    // Prune stale override entries to the currently-visible guide set.
+    // Visible set = whatever the panel is showing right now (live OR snapshot).
+    // Backend ignores unmatched keys at runtime, but pruning prevents a deleted
+    // guide's override from re-applying if the same key is reused later.
+    const visibleKeys = new Set(guides.map((g) => g.guide_key).filter(Boolean));
+    const overrides = readGuideOverrides(node);
+    if (visibleKeys.size > 0) {
+        const stale = Object.keys(overrides).filter((k) => !visibleKeys.has(k));
+        if (stale.length) {
+            const cleaned = { ...overrides };
+            for (const k of stale) delete cleaned[k];
+            writeGuideOverrides(node, cleaned);
+            for (const k of stale) delete overrides[k];
+        }
+    }
+
+    if (!guides.length) {
+        const empty = style(document.createElement("div"), "color:#8b96a3;font-size:10px;padding:3px 0;");
+        empty.textContent = "No guide rows for this render window.";
+        state.guideList.appendChild(empty);
+        return;
+    }
+    for (const guide of guides) {
+        const row = style(document.createElement("div"), `
+            display:grid;
+            grid-template-columns:44px 1fr 88px;
+            gap:6px;
+            align-items:center;
+            padding:3px 0;
+            border-top:1px solid rgba(255,255,255,0.06);
+        `);
+        const frame = style(document.createElement("span"), "color:#9db5cf;font-size:10px;font-family:monospace;");
+        frame.textContent = `f${guide.resolved_frame_index}`;
+        const name = style(document.createElement("span"), "color:#dbe4ed;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+        name.textContent = guide.asset_name || guide.asset_id || "Guide";
+        name.title = name.textContent;
+        const key = guide.guide_key;
+        const override = overrides[key];
+        // Tri-state: inherit (auto) | mute (off) | unmute (on). Cycle is independent of editor mute.
+        const mode = override && typeof override.muted === "boolean"
+            ? (override.muted ? "off" : "on")
+            : "auto";
+        const inheritedMuted = !!guide.muted;
+        const bg = mode === "off"
+            ? "rgba(135,52,60,0.85)"
+            : mode === "on"
+                ? "rgba(38,99,66,0.85)"
+                : (inheritedMuted ? "rgba(70,55,60,0.7)" : "rgba(45,70,58,0.7)");
+        const btn = style(document.createElement("button"), `
+            border:1px solid rgba(126,168,201,0.35);
+            border-radius:5px;
+            background:${bg};
+            color:#f2f7fb;
+            font-size:10px;
+            padding:2px 5px;
+            cursor:pointer;
+        `);
+        const labels = {
+            auto: inheritedMuted ? "Inherit (off)" : "Inherit (on)",
+            off: "Bridge mute",
+            on: "Bridge on",
+        };
+        btn.textContent = labels[mode];
+        btn.title = "Click to cycle Inherit / Bridge mute / Bridge on for this bridge only";
+        btn.addEventListener("click", () => {
+            const nextOverrides = readGuideOverrides(node);
+            // Cycle: auto -> off -> on -> auto (independent of editor mute)
+            if (mode === "auto") {
+                nextOverrides[key] = { muted: true };       // Bridge mute
+            } else if (mode === "off") {
+                nextOverrides[key] = { muted: false };      // Bridge on (force inject)
+            } else {
+                delete nextOverrides[key];                  // Inherit
+            }
+            writeGuideOverrides(node, nextOverrides);
+            renderGuidePanel(node, payload);
+        });
+        row.append(frame, name, btn);
+        state.guideList.appendChild(row);
+    }
+}
+
+function refreshBridgeGuidePanel(node) {
+    if (!isStart(node)) return;
+    const state = ensureNodeState(node);
+    if (!state.guidePanel) return;
+    const token = ++state.guideRefreshToken;
+    state.guideStatus.textContent = "Loading guides...";
+    loadLinkedEditorGuides(node)
+        .then((payload) => {
+            if (token !== state.guideRefreshToken) return;
+            renderGuidePanel(node, payload);
+        })
+        .catch((error) => {
+            if (token !== state.guideRefreshToken) return;
+            renderGuidePanel(node, {
+                status: error?.message || "Guide panel failed.",
+                guides: [],
+            });
+        });
+}
+
+function installGuidePanel(node) {
+    if (!isStart(node) || typeof node.addDOMWidget !== "function") return;
+    const state = ensureNodeState(node);
+    if (state.guidePanel) return;
+    const wrapper = style(document.createElement("div"), `
+        display:flex;
+        flex-direction:column;
+        gap:4px;
+        width:100%;
+        box-sizing:border-box;
+        padding-top:2px;
+    `);
+    const header = style(document.createElement("div"), `
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        gap:6px;
+        color:#cfd7df;
+        font-size:10px;
+        font-weight:700;
+    `);
+    const title = document.createElement("span");
+    title.textContent = "Bridge Guide Overrides";
+    const refreshBtn = style(document.createElement("button"), `
+        border:1px solid rgba(126,168,201,0.35);
+        border-radius:5px;
+        background:rgba(14,19,25,0.92);
+        color:#dbe4ed;
+        font-size:10px;
+        padding:2px 6px;
+        cursor:pointer;
+    `);
+    refreshBtn.textContent = "Refresh";
+    refreshBtn.addEventListener("click", () => refreshBridgeGuidePanel(node));
+    header.append(title, refreshBtn);
+    const status = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;");
+    const list = style(document.createElement("div"), "display:flex;flex-direction:column;max-height:138px;overflow:auto;");
+    wrapper.append(header, status, list);
+    const domWidget = node.addDOMWidget("sonder_bridge_guide_overrides", "SonderBridgeGuideOverrides", wrapper, {
+        serialize: false,
+        hideOnZoom: false,
+        getMinHeight: () => 84,
+        getMaxHeight: () => 188,
+        getHeight: () => 164,
+    });
+    domWidget.computeSize = (width) => [width, 164];
+    state.guidePanel = wrapper;
+    state.guideStatus = status;
+    state.guideList = list;
+    refreshBridgeGuidePanel(node);
+}
+
 // ── Per-node install ─────────────────────────────────────────────────
 const installNode = (node) => {
     if (!isBridge(node)) return;
@@ -406,6 +664,9 @@ const installNode = (node) => {
     if (isStart(node)) {
         const widget = (node.widgets || []).find((w) => w?.name === "iteration_index");
         if (widget) hideWidget(widget);
+        const overridesWidget = (node.widgets || []).find((w) => w?.name === OVERRIDES_WIDGET);
+        if (overridesWidget) hideWidget(overridesWidget);
+        installGuidePanel(node);
     }
 
     const original = node.onConnectionsChange;
@@ -415,6 +676,7 @@ const installNode = (node) => {
             refreshNodeShape(this);
             if (isStart(this)) {
                 mirrorProjectWire(this);
+                refreshBridgeGuidePanel(this);
             }
         } catch (e) {
             console.warn("[Sonder Bridge] connection-change handler error:", e);
@@ -427,7 +689,10 @@ const installNode = (node) => {
         if (!isBridge(node)) return;
         try {
             refreshNodeShape(node);
-            if (isStart(node)) mirrorProjectWire(node);
+            if (isStart(node)) {
+                mirrorProjectWire(node);
+                refreshBridgeGuidePanel(node);
+            }
         } catch (e) {
             console.warn("[Sonder Bridge] initial-shape error:", e);
         }

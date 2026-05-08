@@ -332,8 +332,10 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
         "context_frames": 12,
         "pre_context_frames": 8,
         "post_context_frames": 12,
+        "mask_pre_offset": 2,
+        "mask_post_offset": 3,
         "guide_frame_snapshots": [
-            {"frame_index": 20, "asset_id": "guide-1", "source": "asset", "strength": 0.7},
+            {"frame_index": 20, "asset_id": "guide-1", "source": "asset", "strength": 0.7, "muted": True},
         ],
         "prompt_sections": [
             {"start_frame": 0, "end_frame": 96, "prompt": "section prompt"},
@@ -355,7 +357,10 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     assert payload["batch_index"] == 1
     assert payload["pre_context_frames"] == 8
     assert payload["post_context_frames"] == 12
+    assert payload["mask_pre_offset"] == 2
+    assert payload["mask_post_offset"] == 3
     assert payload["guide_frame_snapshots"][0]["asset_id"] == "guide-1"
+    assert payload["guide_frame_snapshots"][0]["muted"] is True
     assert payload["prompt_sections"][0]["prompt"] == "section prompt"
     assert payload["scene_width"] == 1024
     assert payload["scene_height"] == 576
@@ -365,6 +370,8 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     assert payload["take_placement_mode"] == "untrimmed"
     assert project.generation_queue[0].frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert project.generation_queue[0].take_placement_mode == "untrimmed"
+    assert project.generation_queue[0].mask_pre_offset == 2
+    assert project.generation_queue[0].mask_post_offset == 3
     assert payload["params"]["snapshot_version"] == 1
 
 

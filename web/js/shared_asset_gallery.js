@@ -11,15 +11,33 @@ import {
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
+const DEFAULT_INSPECTOR_SETTINGS = DEFAULT_EDITOR_SETTINGS.inspector;
 const ROOT_FOLDER_COLLAPSE_KEY = "__sonder_root__";
 const TRASH_FOLDER_COLLAPSE_KEY = "__sonder_trash__";
 const SORT_OPTIONS = GALLERY_SORT_OPTIONS;
+const COMPARE_SORT_OPTIONS = GALLERY_SORT_OPTIONS.filter((entry) => entry.value !== "type");
+const AUDIO_DUCK_VOLUME = Math.pow(10, -3 / 20);
 const LIST_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
 const THUMBNAIL_SIZE_CONFIG = {
     small: { thumbWidth: 60, thumbHeight: 44, gap: 6, padding: 5, nameFont: 10, metaFont: 9 },
     medium: { thumbWidth: 72, thumbHeight: 54, gap: 8, padding: 6, nameFont: 11, metaFont: 10 },
     large: { thumbWidth: 88, thumbHeight: 66, gap: 10, padding: 8, nameFont: 12, metaFont: 10 },
 };
+
+export const INSPECT_OVERLAY_SHORTCUTS = Object.freeze([
+    ["ArrowLeft / ArrowRight", "Cycle assets; step one frame in video compare"],
+    ["Shift + ArrowLeft / ArrowRight", "Step -/+10 frames in video compare"],
+    ["Ctrl + ArrowLeft / ArrowRight", "Step -/+1 second in video compare"],
+    ["Space", "Play / Pause"],
+    ["Right-drag video", "Scrub from current playhead"],
+    ["1 / 2 / 3 / 0", "Monitor A / B / Both / Mute in audio compare"],
+    ["Shift hold", "Temporarily flip A/B monitor in audio compare"],
+    ["C", "Toggle Compare"],
+    ["F / 0", "Fit"],
+    ["+ / -", "Zoom"],
+    ["Wheel", "Zoom / waveform zoom"],
+    ["Esc", "Close overlay"],
+]);
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -142,6 +160,9 @@ const OVERLAY_CAPTURE_KEYS = new Set([
     "-",
     "_",
     "0",
+    "1",
+    "2",
+    "3",
     "a",
     "A",
     "c",
@@ -401,6 +422,7 @@ function makeSectionTitle(label) {
 
 export function mountSharedAssetGallery(container, options = {}) {
     const initialSettings = getEditorSettings();
+    const initialInspectorSettings = initialSettings.inspector || DEFAULT_INSPECTOR_SETTINGS;
     const ownerId = typeof options.ownerId === "string" && options.ownerId
         ? options.ownerId
         : `sonder-gallery-${Math.random().toString(36).slice(2, 8)}`;
@@ -442,10 +464,24 @@ export function mountSharedAssetGallery(container, options = {}) {
             compareMode: false,
             compareLeftAssetId: "",
             compareRightAssetId: "",
+            comparePickerQuery: "",
+            comparePickerSortMode: DEFAULT_SORT_MODE,
+            compareLayout: initialInspectorSettings.compareLayout || DEFAULT_INSPECTOR_SETTINGS.compareLayout,
+            sideBySideLinkZoom: initialInspectorSettings.sideBySideLinkZoom !== false,
+            audioCompareWaveformLayout: initialInspectorSettings.audioCompareWaveformLayout || DEFAULT_INSPECTOR_SETTINGS.audioCompareWaveformLayout,
+            audioCompareMonitor: initialInspectorSettings.audioCompareMonitor || DEFAULT_INSPECTOR_SETTINGS.audioCompareMonitor,
+            audioTempFlip: false,
             dividerRatio: 0.5,
             audioFocus: "none",
             showWaveform: false,
             togglePlayback: null,
+            stepVideoCompare: null,
+            videoCompareFps: 30,
+            applyAudioMonitor: null,
+            sideBySideTransforms: {
+                a: { zoomLevel: 1, panX: 0, panY: 0 },
+                b: { zoomLevel: 1, panX: 0, panY: 0 },
+            },
         },
     };
     const data = { assets: [], folders: [] };
@@ -584,6 +620,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
     }
 
+    function persistInspectorSetting(key, value) {
+        updateEditorSettings({
+            inspector: {
+                [key]: value,
+            },
+        });
+    }
+
     function applyGallerySettings(settings, { skipRender = false } = {}) {
         const nextSettings = settings || getEditorSettings();
         const nextSort = SORT_OPTIONS.some((entry) => entry.value === nextSettings?.gallery?.sortMode)
@@ -593,6 +637,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.inspectorCollapsed = !!nextSettings?.gallery?.inspectorCollapsed;
         state.artifactInspectorExpanded = !!nextSettings?.gallery?.artifactInspectorExpanded;
         state.thumbnailSize = nextSettings?.gallery?.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize;
+        const inspector = nextSettings?.inspector || DEFAULT_INSPECTOR_SETTINGS;
+        state.overlayState.compareLayout = inspector.compareLayout || DEFAULT_INSPECTOR_SETTINGS.compareLayout;
+        state.overlayState.sideBySideLinkZoom = inspector.sideBySideLinkZoom !== false;
+        state.overlayState.audioCompareWaveformLayout = inspector.audioCompareWaveformLayout || DEFAULT_INSPECTOR_SETTINGS.audioCompareWaveformLayout;
+        state.overlayState.audioCompareMonitor = inspector.audioCompareMonitor || DEFAULT_INSPECTOR_SETTINGS.audioCompareMonitor;
         updateControlState();
         if (!skipRender && !state.destroyed) {
             render();
@@ -807,6 +856,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!asset) return false;
         if (state.type !== "all" && asset.asset_type !== state.type) return false;
         const query = parseAssetSearchQuery(state.query);
+        return assetMatchesParsedQuery(asset, query);
+    }
+
+    function assetMatchesParsedQuery(asset, query) {
         if (query.kindTerms.length) {
             if (asset.asset_type !== "artifact") return false;
             const artifactKind = String(asset.artifact_kind || "").toLowerCase();
@@ -821,25 +874,29 @@ export function mountSharedAssetGallery(container, options = {}) {
         return query.nameTerms.every((term) => name.includes(term));
     }
 
-    function sortAssets(assets) {
+    function sortAssetsByMode(assets, sortMode) {
         return [...assets].sort((left, right) => {
-            if (state.sortMode === "oldest") {
+            if (sortMode === "oldest") {
                 return assetImportedAt(left) - assetImportedAt(right) || compareStrings(assetDisplayName(left), assetDisplayName(right));
             }
-            if (state.sortMode === "name") {
+            if (sortMode === "name") {
                 return compareStrings(assetDisplayName(left), assetDisplayName(right)) || (assetImportedAt(right) - assetImportedAt(left));
             }
-            if (state.sortMode === "type") {
+            if (sortMode === "type") {
                 return compareStrings(left.asset_type, right.asset_type) || compareStrings(assetDisplayName(left), assetDisplayName(right));
             }
-            if (state.sortMode === "duration") {
+            if (sortMode === "duration") {
                 return assetDurationSortValue(right) - assetDurationSortValue(left) || compareStrings(assetDisplayName(left), assetDisplayName(right));
             }
-            if (state.sortMode === "resolution") {
+            if (sortMode === "resolution") {
                 return assetResolutionSortValue(right) - assetResolutionSortValue(left) || compareStrings(assetDisplayName(left), assetDisplayName(right));
             }
             return assetImportedAt(right) - assetImportedAt(left) || compareStrings(assetDisplayName(left), assetDisplayName(right));
         });
+    }
+
+    function sortAssets(assets) {
+        return sortAssetsByMode(assets, state.sortMode);
     }
 
     function filteredAssets() {
@@ -1644,8 +1701,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
     }
 
-    function renderSynchronizedScrubBar(mediaEls) {
+    function renderSynchronizedScrubBar(mediaEls, opts = {}) {
         const mediaList = (mediaEls || []).filter(Boolean);
+        const { transport = null } = opts;
         const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
         const track = style(document.createElement("div"), `position:relative;flex:1 1 auto;height:10px;border-radius:999px;background:#1a2631;cursor:pointer;overflow:hidden;`);
         const fill = style(document.createElement("div"), `position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#6fa7d8,#8fc0f0);`);
@@ -1656,12 +1714,16 @@ export function mountSharedAssetGallery(container, options = {}) {
         let dragging = false;
         const primary = () => mediaList[0] || null;
         const duration = () => {
+            if (transport) return transport.duration();
             const values = mediaList
                 .map((media) => Number(media?.duration))
                 .filter((value) => Number.isFinite(value) && value > 0);
             return values.length ? Math.max(...values) : 0;
         };
-        const currentTime = () => clamp(Number(primary()?.currentTime) || 0, 0, duration() || Number.MAX_SAFE_INTEGER);
+        const currentTime = () => {
+            if (transport) return clamp(transport.getPlayhead(), 0, duration() || Number.MAX_SAFE_INTEGER);
+            return clamp(Number(primary()?.currentTime) || 0, 0, duration() || Number.MAX_SAFE_INTEGER);
+        };
         const updateUI = () => {
             const total = duration();
             const current = currentTime();
@@ -1675,8 +1737,12 @@ export function mountSharedAssetGallery(container, options = {}) {
             const rect = track.getBoundingClientRect();
             const ratio = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
             const nextTime = ratio * total;
-            for (const media of mediaList) {
-                media.currentTime = nextTime;
+            if (transport) {
+                transport.seek(nextTime);
+            } else {
+                for (const media of mediaList) {
+                    media.currentTime = nextTime;
+                }
             }
             updateUI();
         };
@@ -1700,6 +1766,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
 
         track.addEventListener("mousedown", handlePointerDown);
+        const unsubscribeTransport = transport?.subscribe?.(updateUI) || null;
         for (const media of mediaList) {
             media.addEventListener?.("timeupdate", updateUI);
             media.addEventListener?.("loadedmetadata", updateUI);
@@ -1715,6 +1782,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 window.removeEventListener("mousemove", handlePointerMove);
                 window.removeEventListener("mouseup", handlePointerUp);
                 track.removeEventListener("mousedown", handlePointerDown);
+                unsubscribeTransport?.();
                 for (const media of mediaList) {
                     media.removeEventListener?.("timeupdate", updateUI);
                     media.removeEventListener?.("loadedmetadata", updateUI);
@@ -1723,6 +1791,334 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
             },
         };
+    }
+
+    function mediaDurationSeconds(media, fallback = 0) {
+        const value = Number(media?.duration);
+        if (Number.isFinite(value) && value > 0) return value;
+        const safeFallback = Number(fallback);
+        return Number.isFinite(safeFallback) && safeFallback > 0 ? safeFallback : 0;
+    }
+
+    function assetDurationSeconds(asset) {
+        const value = Number(asset?.duration_sec);
+        if (Number.isFinite(value) && value > 0) return value;
+        const frames = Number(asset?.frame_count);
+        const fps = assetFps(asset);
+        return Number.isFinite(frames) && frames > 0 ? frames / fps : 0;
+    }
+
+    function assetFps(asset) {
+        const candidates = [
+            asset?.metadata?.fps,
+            asset?.generation_params?.fps,
+            asset?.fps,
+        ];
+        for (const value of candidates) {
+            const fps = Number(value);
+            if (Number.isFinite(fps) && fps > 0) return fps;
+        }
+        return 30;
+    }
+
+    function createLinkedMediaTransport(mediaEls, options = {}) {
+        const mediaList = (mediaEls || []).filter(Boolean);
+        const fallbackDurations = Array.isArray(options.fallbackDurations) ? options.fallbackDurations : [];
+        const listeners = new Set();
+        let playhead = 0;
+        let playing = false;
+        let rafId = 0;
+        let lastDriftCorrectionAt = 0;
+
+        const duration = () => {
+            const values = mediaList.map((media, index) => mediaDurationSeconds(media, fallbackDurations[index] || 0));
+            return values.length ? Math.max(...values) : 0;
+        };
+        const snapshot = () => ({ playhead, duration: duration(), playing });
+        const notify = () => {
+            const value = snapshot();
+            for (const listener of listeners) {
+                listener(value);
+            }
+        };
+        const mediaTargetTime = (media, index, nextTime) => {
+            const mediaDuration = mediaDurationSeconds(media, fallbackDurations[index] || duration());
+            return mediaDuration > 0 ? clamp(nextTime, 0, mediaDuration) : Math.max(0, nextTime);
+        };
+        const primaryReferenceTime = () => {
+            const primary = mediaList[0];
+            const primaryTime = Number(primary?.currentTime);
+            if (!Number.isFinite(primaryTime)) return null;
+            const total = duration();
+            const primaryDuration = mediaDurationSeconds(primary, fallbackDurations[0] || total);
+            if (primaryDuration > 0 && total > primaryDuration + 0.05 && primaryTime >= primaryDuration - 0.05) {
+                return null;
+            }
+            return primaryTime;
+        };
+        const playbackClockTime = () => {
+            const primaryTime = primaryReferenceTime();
+            if (Number.isFinite(primaryTime)) return primaryTime;
+            const values = mediaList
+                .map((media) => Number(media?.currentTime))
+                .filter((value) => Number.isFinite(value));
+            return values.length ? Math.max(...values) : playhead;
+        };
+        const syncMediaTimes = (force = false) => {
+            mediaList.forEach((media, index) => {
+                const target = mediaTargetTime(media, index, playhead);
+                if (force || Math.abs((Number(media.currentTime) || 0) - target) > 0.04) {
+                    try {
+                        media.currentTime = target;
+                    } catch {
+                        // Some browsers reject currentTime before metadata is loaded.
+                    }
+                }
+            });
+        };
+        const recoverSecondaryDrift = (timestamp) => {
+            if (!playing || mediaList.length < 2) return;
+            if (timestamp - lastDriftCorrectionAt < 1000) return;
+            const primaryTime = primaryReferenceTime();
+            if (!Number.isFinite(primaryTime)) return;
+            for (let index = 1; index < mediaList.length; index++) {
+                const media = mediaList[index];
+                if (!media || media.seeking || media.readyState < 2) continue;
+                const target = mediaTargetTime(media, index, primaryTime);
+                const drift = Math.abs((Number(media.currentTime) || 0) - target);
+                if (drift < 0.25) continue;
+                try {
+                    media.currentTime = target;
+                    lastDriftCorrectionAt = timestamp;
+                } catch {
+                    // Some browsers reject currentTime before metadata is loaded.
+                }
+            }
+        };
+        const stopRaf = () => {
+            if (rafId) {
+                cancelAnimationFrame(rafId);
+                rafId = 0;
+            }
+        };
+        const pause = () => {
+            const wasPlaying = playing;
+            playing = false;
+            stopRaf();
+            for (const media of mediaList) {
+                media.pause?.();
+            }
+            if (wasPlaying) notify();
+        };
+        const tick = (timestamp) => {
+            if (!playing) return;
+            const total = duration();
+            playhead = clamp(playbackClockTime(), 0, total || Number.MAX_SAFE_INTEGER);
+            recoverSecondaryDrift(timestamp);
+            notify();
+            if (total > 0 && playhead >= total - 0.001) {
+                pause();
+                return;
+            }
+            rafId = requestAnimationFrame(tick);
+        };
+        const play = () => {
+            const total = duration();
+            if (total > 0 && playhead >= total - 0.001) {
+                playhead = 0;
+            }
+            syncMediaTimes(true);
+            playing = true;
+            for (const [index, media] of mediaList.entries()) {
+                const mediaDuration = mediaDurationSeconds(media, fallbackDurations[index] || total);
+                if (mediaDuration > 0 && playhead >= mediaDuration - 0.001) continue;
+                void media.play?.().catch?.(() => {});
+            }
+            stopRaf();
+            rafId = requestAnimationFrame(tick);
+            notify();
+        };
+        const seek = (nextTime) => {
+            playhead = clamp(Number(nextTime) || 0, 0, duration() || Number.MAX_SAFE_INTEGER);
+            syncMediaTimes(true);
+            notify();
+        };
+        const step = (deltaSeconds) => {
+            pause();
+            seek(playhead + deltaSeconds);
+        };
+
+        const metadataHandler = () => {
+            if (!playing) syncMediaTimes(false);
+            notify();
+        };
+        for (const media of mediaList) {
+            media.addEventListener?.("loadedmetadata", metadataHandler);
+            media.addEventListener?.("durationchange", metadataHandler);
+        }
+
+        return {
+            duration,
+            getPlayhead: () => playhead,
+            isPlaying: () => playing,
+            play,
+            pause,
+            toggle: () => (playing ? pause() : play()),
+            seek,
+            step,
+            subscribe(listener) {
+                listeners.add(listener);
+                listener(snapshot());
+                return () => listeners.delete(listener);
+            },
+            cleanup() {
+                pause();
+                stopRaf();
+                listeners.clear();
+                for (const media of mediaList) {
+                    media.removeEventListener?.("loadedmetadata", metadataHandler);
+                    media.removeEventListener?.("durationchange", metadataHandler);
+                }
+            },
+        };
+    }
+
+    function attachRightClickVideoScrub(surface, transport, mediaEls, options = {}) {
+        if (!surface || !transport) return () => {};
+        const mediaList = (mediaEls || []).filter(Boolean);
+        const readout = style(document.createElement("div"), `position:fixed;z-index:100002;padding:4px 7px;border-radius:6px;background:rgba(5,10,15,0.92);border:1px solid ${CHROME.borderStrong};color:${CHROME.text};font-size:10px;pointer-events:none;opacity:0;transition:opacity 140ms ease;`);
+        document.body.appendChild(readout);
+        let pending = false;
+        let dragging = false;
+        let startX = 0;
+        let startY = 0;
+        let startTime = 0;
+        let previousMuted = [];
+
+        const setReadout = (event, nextTime) => {
+            const fps = Number(options.fps) || 30;
+            const frame = Math.max(0, Math.round(nextTime * fps));
+            readout.textContent = `${formatClockTime(nextTime)} | f${frame}`;
+            readout.style.left = `${event.clientX + 12}px`;
+            readout.style.top = `${event.clientY + 12}px`;
+            readout.style.opacity = "1";
+        };
+        const timeFromDeltaX = (clientX) => {
+            const total = transport.duration();
+            if (!total) return 0;
+            const rect = surface.getBoundingClientRect();
+            const deltaRatio = (clientX - startX) / Math.max(1, rect.width);
+            return clamp(startTime + deltaRatio * total, 0, total);
+        };
+        const beginMute = () => {
+            previousMuted = mediaList.map((media) => media.muted);
+            for (const media of mediaList) {
+                media.muted = true;
+            }
+        };
+        const endMute = () => {
+            mediaList.forEach((media, index) => {
+                media.muted = previousMuted[index] ?? media.muted;
+            });
+            previousMuted = [];
+        };
+        const scrubToEvent = (event) => {
+            const nextTime = timeFromDeltaX(event.clientX);
+            transport.seek(nextTime);
+            setReadout(event, nextTime);
+        };
+        const handleMouseMove = (event) => {
+            if (!pending) return;
+            if (!dragging) {
+                const distance = Math.hypot(event.clientX - startX, event.clientY - startY);
+                if (distance < 5) return;
+                dragging = true;
+            }
+            event.preventDefault();
+            scrubToEvent(event);
+        };
+        const handleMouseUp = (event) => {
+            if (!pending) return;
+            if (dragging) {
+                scrubToEvent(event);
+            }
+            pending = false;
+            dragging = false;
+            endMute();
+            window.removeEventListener("mousemove", handleMouseMove);
+            window.removeEventListener("mouseup", handleMouseUp);
+            setTimeout(() => {
+                readout.style.opacity = "0";
+            }, 180);
+        };
+        const handleMouseDown = (event) => {
+            if (event.button !== 2) return;
+            event.preventDefault();
+            event.stopPropagation();
+            pending = true;
+            dragging = false;
+            startX = event.clientX;
+            startY = event.clientY;
+            startTime = transport.getPlayhead();
+            beginMute();
+            window.addEventListener("mousemove", handleMouseMove);
+            window.addEventListener("mouseup", handleMouseUp);
+        };
+        const handleContextMenu = (event) => {
+            event.preventDefault();
+        };
+
+        surface.addEventListener("mousedown", handleMouseDown);
+        surface.addEventListener("contextmenu", handleContextMenu);
+
+        return () => {
+            pending = false;
+            dragging = false;
+            endMute();
+            window.removeEventListener("mousemove", handleMouseMove);
+            window.removeEventListener("mouseup", handleMouseUp);
+            surface.removeEventListener("mousedown", handleMouseDown);
+            surface.removeEventListener("contextmenu", handleContextMenu);
+            readout.remove();
+        };
+    }
+
+    function showInspectOverlayShortcutHelp() {
+        const overlayEl = state.overlayState.overlayEl;
+        if (!overlayEl) return;
+        const existing = overlayEl.querySelector("[data-sonder-inspect-help='1']");
+        if (existing) {
+            existing.remove();
+            return;
+        }
+        const backdrop = style(document.createElement("div"), `position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,0.46);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;`);
+        backdrop.dataset.sonderInspectHelp = "1";
+        const panel = style(document.createElement("div"), `width:min(520px,100%);max-height:min(680px,90vh);overflow:auto;border-radius:12px;background:${CHROME.panelRaised};border:1px solid ${CHROME.borderStrong};box-shadow:0 18px 60px rgba(0,0,0,0.48);padding:16px;box-sizing:border-box;`);
+        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;`);
+        const title = style(document.createElement("div"), `color:${CHROME.text};font-size:13px;font-weight:700;`);
+        title.textContent = "Inspect Overlay Shortcuts";
+        const closeBtn = makeActionButton("subtle");
+        closeBtn.textContent = "Close";
+        header.append(title, closeBtn);
+        const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:4px;`);
+        for (const [key, desc] of INSPECT_OVERLAY_SHORTCUTS) {
+            const row = style(document.createElement("div"), `display:grid;grid-template-columns:minmax(116px,auto) minmax(0,1fr);gap:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05);`);
+            const keyEl = style(document.createElement("div"), `color:#9fc9ec;font-size:11px;font-family:monospace;white-space:nowrap;`);
+            keyEl.textContent = key;
+            const descEl = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;min-width:0;`);
+            descEl.textContent = desc;
+            row.append(keyEl, descEl);
+            list.appendChild(row);
+        }
+        panel.append(header, list);
+        backdrop.appendChild(panel);
+        overlayEl.appendChild(backdrop);
+        const close = () => backdrop.remove();
+        closeBtn.addEventListener("click", close);
+        backdrop.addEventListener("mousedown", (event) => {
+            if (event.target === backdrop) close();
+        });
+        state.overlayState.cleanupFns.push(() => backdrop.remove());
     }
 
     function clearOverlayRuntime() {
@@ -1735,6 +2131,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
         }
         overlay.togglePlayback = null;
+        overlay.stepVideoCompare = null;
+        overlay.videoCompareFps = 30;
+        overlay.applyAudioMonitor = null;
     }
 
     function overlayAssets() {
@@ -1757,6 +2156,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.zoomLevel = 1;
         state.overlayState.panX = 0;
         state.overlayState.panY = 0;
+        state.overlayState.sideBySideTransforms = {
+            a: { zoomLevel: 1, panX: 0, panY: 0 },
+            b: { zoomLevel: 1, panX: 0, panY: 0 },
+        };
     }
 
     function closeInspectOverlay() {
@@ -1767,9 +2170,15 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.compareMode = false;
         state.overlayState.compareLeftAssetId = "";
         state.overlayState.compareRightAssetId = "";
+        state.overlayState.comparePickerQuery = "";
+        state.overlayState.comparePickerSortMode = DEFAULT_SORT_MODE;
         state.overlayState.showWaveform = false;
         state.overlayState.audioFocus = "none";
+        state.overlayState.audioTempFlip = false;
         state.overlayState.togglePlayback = null;
+        state.overlayState.stepVideoCompare = null;
+        state.overlayState.videoCompareFps = 30;
+        state.overlayState.applyAudioMonitor = null;
         state.overlayState.overlayEl?.remove();
         state.overlayState.overlayEl = null;
     }
@@ -1778,7 +2187,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const normalizedOptions = typeof options === "function"
             ? { onTransform: options }
             : (options && typeof options === "object" ? options : {});
-        const { onTransform = null, onClick = null } = normalizedOptions;
+        const { onTransform = null, onClick = null, transformState = state.overlayState } = normalizedOptions;
         const targetList = (Array.isArray(targets) ? targets : [targets]).filter(Boolean);
         let dragging = false;
         let pendingDrag = false;
@@ -1790,7 +2199,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         let lastDragMouseUpAt = 0;
 
         const applyTransform = () => {
-            const transform = `translate(${state.overlayState.panX}px, ${state.overlayState.panY}px) scale(${state.overlayState.zoomLevel})`;
+            const transform = `translate(${transformState.panX}px, ${transformState.panY}px) scale(${transformState.zoomLevel})`;
             for (const target of targetList) {
                 target.style.transformOrigin = "center center";
                 target.style.transform = transform;
@@ -1805,7 +2214,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const handleWheel = (event) => {
             event.preventDefault();
             const rect = surface.getBoundingClientRect();
-            const previousZoom = state.overlayState.zoomLevel;
+            const previousZoom = transformState.zoomLevel;
             const zoomingIn = event.deltaY < 0;
             const nextZoom = clamp(previousZoom * (zoomingIn ? 1.12 : (1 / 1.12)), 1, 16);
             if (nextZoom === previousZoom) return;
@@ -1813,15 +2222,15 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const cursorX = event.clientX - rect.left - rect.width / 2;
                 const cursorY = event.clientY - rect.top - rect.height / 2;
                 const scale = nextZoom / previousZoom;
-                state.overlayState.panX -= cursorX * (scale - 1);
-                state.overlayState.panY -= cursorY * (scale - 1);
+                transformState.panX -= cursorX * (scale - 1);
+                transformState.panY -= cursorY * (scale - 1);
             } else {
                 const denom = Math.max(0.0001, previousZoom - 1);
                 const factor = Math.max(0, (nextZoom - 1) / denom);
-                state.overlayState.panX *= factor;
-                state.overlayState.panY *= factor;
+                transformState.panX *= factor;
+                transformState.panY *= factor;
             }
-            state.overlayState.zoomLevel = nextZoom;
+            transformState.zoomLevel = nextZoom;
             applyTransform();
         };
 
@@ -1835,8 +2244,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                 lastY = event.clientY;
                 event.preventDefault();
             }
-            state.overlayState.panX += event.clientX - lastX;
-            state.overlayState.panY += event.clientY - lastY;
+            transformState.panX += event.clientX - lastX;
+            transformState.panY += event.clientY - lastY;
             lastX = event.clientX;
             lastY = event.clientY;
             applyTransform();
@@ -1889,7 +2298,9 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const handleDoubleClick = () => {
             if (performance.now() - lastDragMouseUpAt < 350) return;
-            resetOverlayTransform();
+            transformState.zoomLevel = 1;
+            transformState.panX = 0;
+            transformState.panY = 0;
             applyTransform();
         };
 
@@ -1993,10 +2404,11 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function renderInteractiveWaveform(assets, mediaEls, colors, opts = {}) {
-        const { enableZoom = false, compact = false } = opts;
+        const { enableZoom = false, compact = false, layout = "overlay", transport = null } = opts;
         const assetList = (Array.isArray(assets) ? assets : [assets]).filter(Boolean);
         const mediaList = (Array.isArray(mediaEls) ? mediaEls : [mediaEls]).filter(Boolean);
         const primary = () => mediaList[0] || null;
+        const stackedLayout = assetList.length > 1 && layout === "stacked";
 
         const wrapStyle = compact
             ? `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid #343434;`
@@ -2009,7 +2421,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         headerRow.append(status, timeLabel);
         const canvasStyle = compact
             ? `width:100%;height:88px;border-radius:6px;background:#0a0f13;display:block;cursor:pointer;`
-            : `width:100%;flex:1 1 0;min-height:120px;height:100%;border-radius:6px;background:#0a0f13;display:block;cursor:pointer;`;
+            : `width:100%;flex:1 1 0;min-height:${stackedLayout ? 180 : 120}px;height:100%;border-radius:6px;background:#0a0f13;display:block;cursor:pointer;`;
         const canvas = style(document.createElement("canvas"), canvasStyle);
         wrap.append(headerRow, canvas);
 
@@ -2020,11 +2432,26 @@ export function mountSharedAssetGallery(container, options = {}) {
         let viewOffset = 0;
 
         const duration = () => {
+            if (transport) return transport.duration();
             const values = mediaList.map((m) => Number(m?.duration)).filter((v) => Number.isFinite(v) && v > 0);
-            return values.length ? Math.max(...values) : 0;
+            if (values.length) return Math.max(...values);
+            const assetValues = assetList.map(assetDurationSeconds).filter((v) => Number.isFinite(v) && v > 0);
+            return assetValues.length ? Math.max(...assetValues) : 0;
         };
-        const currentTime = () => clamp(Number(primary()?.currentTime) || 0, 0, duration() || Number.MAX_SAFE_INTEGER);
+        const currentTime = () => {
+            if (transport) return clamp(transport.getPlayhead(), 0, duration() || Number.MAX_SAFE_INTEGER);
+            return clamp(Number(primary()?.currentTime) || 0, 0, duration() || Number.MAX_SAFE_INTEGER);
+        };
         const updateTimeLabel = () => {
+            if (assetList.length > 1) {
+                const parts = assetList.slice(0, 2).map((asset, index) => {
+                    const letter = index === 0 ? "A" : "B";
+                    const seconds = assetDurationSeconds(asset) || mediaDurationSeconds(mediaList[index], 0);
+                    return `${letter}: ${seconds ? seconds.toFixed(1) : "0.0"}s`;
+                });
+                timeLabel.textContent = `${formatClockTime(currentTime())} / ${formatClockTime(duration())} (${parts.join(" | ")})`;
+                return;
+            }
             timeLabel.textContent = `${formatClockTime(currentTime())} / ${formatClockTime(duration())}`;
         };
 
@@ -2033,7 +2460,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const rect = canvas.getBoundingClientRect();
             const dpr = window.devicePixelRatio || 1;
             const width = Math.max(320, Math.floor(rect.width || 640));
-            const height = compact ? 88 : Math.max(120, Math.floor(rect.height || 88));
+            const height = compact ? 88 : Math.max(stackedLayout ? 180 : 120, Math.floor(rect.height || 88));
             canvas.width = Math.floor(width * dpr);
             canvas.height = Math.floor(height * dpr);
             const ctx = canvas.getContext("2d");
@@ -2059,38 +2486,81 @@ export function mountSharedAssetGallery(container, options = {}) {
             const progressRatio = total > 0 ? currentTime() / total : 0;
             const progressCanvasX = total > 0 ? ((progressRatio - viewStart) / visibleRange) * width : 0;
 
-            const drawPass = (clipStartX, clipEndX, bright) => {
+            const rowForDataset = (datasetIndex) => {
+                if (!stackedLayout) return { y: 0, height, label: "" };
+                const gap = 8;
+                const rowCount = Math.max(1, datasets.length);
+                const rowHeight = Math.max(44, (height - gap * (rowCount - 1)) / rowCount);
+                return {
+                    y: datasetIndex * (rowHeight + gap),
+                    height: rowHeight,
+                    label: `${datasetIndex === 0 ? "A" : "B"} ${assetDisplayName(assetList[datasetIndex])}`,
+                };
+            };
+            const drawDataset = (dataset, datasetIndex, row, bright, clipStartX = 0, clipEndX = width) => {
+                if (!dataset?.peaks?.length || !total) return;
                 ctx.save();
                 if (clipStartX !== 0 || clipEndX !== width) {
                     ctx.beginPath();
-                    ctx.rect(clipStartX, 0, clipEndX - clipStartX, height);
+                    ctx.rect(clipStartX, row.y, clipEndX - clipStartX, row.height);
                     ctx.clip();
                 }
-                datasets.forEach((dataset, datasetIndex) => {
-                    if (!dataset?.peaks?.length) return;
-                    ctx.strokeStyle = colors?.[datasetIndex] || "#7fc0ff";
-                    ctx.globalAlpha = bright
-                        ? (datasetIndex === 0 ? 0.95 : 0.8)
-                        : (datasetIndex === 0 ? 0.3 : 0.2);
-                    const peaks = dataset.peaks;
-                    const totalPeaks = peaks.length;
-                    const peakStart = Math.floor(viewStart * totalPeaks);
-                    const peakEnd = Math.ceil(viewEnd * totalPeaks);
-                    const visiblePeaks = Math.max(1, peakEnd - peakStart);
-                    const step = width / visiblePeaks;
-                    for (let i = peakStart; i < peakEnd && i < totalPeaks; i++) {
-                        const [minVal, maxVal] = peaks[i];
-                        const x = (i - peakStart) * step;
-                        const y1 = clamp((1 - ((maxVal + 1) / 2)) * height, 0, height);
-                        const y2 = clamp((1 - ((minVal + 1) / 2)) * height, 0, height);
+                ctx.strokeStyle = colors?.[datasetIndex] || "#7fc0ff";
+                ctx.globalAlpha = bright
+                    ? (datasetIndex === 0 ? 0.95 : 0.82)
+                    : (datasetIndex === 0 ? 0.32 : 0.24);
+                const peaks = dataset.peaks;
+                const datasetDuration = assetDurationSeconds(assetList[datasetIndex])
+                    || mediaDurationSeconds(mediaList[datasetIndex], total)
+                    || total;
+                const visibleStartTime = viewStart * total;
+                const visibleEndTime = viewEnd * total;
+                const peakStart = Math.max(0, Math.floor((visibleStartTime / datasetDuration) * peaks.length));
+                const peakEnd = Math.min(peaks.length, Math.ceil((visibleEndTime / datasetDuration) * peaks.length));
+                const midY = row.y + row.height / 2;
+                for (let i = peakStart; i < peakEnd; i++) {
+                    const [minVal, maxVal] = peaks[i];
+                    const time = (i / Math.max(1, peaks.length - 1)) * datasetDuration;
+                    const x = ((time / total - viewStart) / visibleRange) * width;
+                    if (x < -2 || x > width + 2) continue;
+                    const y1 = clamp(row.y + (1 - ((maxVal + 1) / 2)) * row.height, row.y, row.y + row.height);
+                    const y2 = clamp(row.y + (1 - ((minVal + 1) / 2)) * row.height, row.y, row.y + row.height);
+                    ctx.beginPath();
+                    ctx.moveTo(x, y1);
+                    ctx.lineTo(x, y2);
+                    ctx.stroke();
+                }
+                if (stackedLayout) {
+                    ctx.globalAlpha = 0.8;
+                    ctx.fillStyle = colors?.[datasetIndex] || "#7fc0ff";
+                    ctx.font = "10px sans-serif";
+                    ctx.fillText(row.label, 8, row.y + 14);
+                    ctx.globalAlpha = 0.22;
+                    ctx.strokeStyle = "#ffffff";
+                    ctx.beginPath();
+                    ctx.moveTo(0, midY);
+                    ctx.lineTo(width, midY);
+                    ctx.stroke();
+                    const endRatio = datasetDuration / total;
+                    const endX = ((endRatio - viewStart) / visibleRange) * width;
+                    if (endX > 0 && endX < width) {
+                        ctx.fillStyle = "rgba(255,255,255,0.06)";
+                        ctx.fillRect(endX, row.y, width - endX, row.height);
+                        ctx.globalAlpha = 0.55;
+                        ctx.strokeStyle = colors?.[datasetIndex] || "#7fc0ff";
                         ctx.beginPath();
-                        ctx.moveTo(x, y1);
-                        ctx.lineTo(x, y2);
+                        ctx.moveTo(endX, row.y);
+                        ctx.lineTo(endX, row.y + row.height);
                         ctx.stroke();
                     }
-                });
+                }
                 ctx.globalAlpha = 1;
                 ctx.restore();
+            };
+            const drawPass = (clipStartX, clipEndX, bright) => {
+                datasets.forEach((dataset, datasetIndex) => {
+                    drawDataset(dataset, datasetIndex, rowForDataset(datasetIndex), bright, clipStartX, clipEndX);
+                });
             };
 
             drawPass(0, width, false);
@@ -2120,8 +2590,13 @@ export function mountSharedAssetGallery(container, options = {}) {
             const canvasRatio = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
             const visibleRange = 1 / zoomLevel;
             const timeRatio = clamp(viewOffset + canvasRatio * visibleRange, 0, 1);
-            for (const media of mediaList) {
-                media.currentTime = timeRatio * total;
+            const nextTime = timeRatio * total;
+            if (transport) {
+                transport.seek(nextTime);
+            } else {
+                for (const media of mediaList) {
+                    media.currentTime = nextTime;
+                }
             }
             draw();
         };
@@ -2141,7 +2616,11 @@ export function mountSharedAssetGallery(container, options = {}) {
             window.addEventListener("mousemove", handlePointerMove);
             window.addEventListener("mouseup", handlePointerUp);
         };
+        const handleContextMenu = (event) => {
+            event.preventDefault();
+        };
         canvas.addEventListener("mousedown", handlePointerDown);
+        wrap.addEventListener("contextmenu", handleContextMenu);
 
         const handleWheel = enableZoom ? (event) => {
             event.preventDefault();
@@ -2182,6 +2661,12 @@ export function mountSharedAssetGallery(container, options = {}) {
             media.addEventListener?.("seeked", draw);
             media.addEventListener?.("ended", draw);
         }
+        const unsubscribeTransport = transport?.subscribe?.(() => {
+            if (!dragging) {
+                ensurePlayheadVisible();
+                draw();
+            }
+        }) || null;
 
         Promise.all(assetList.map(async (asset) => {
             try {
@@ -2213,7 +2698,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 window.removeEventListener("mousemove", handlePointerMove);
                 window.removeEventListener("mouseup", handlePointerUp);
                 canvas.removeEventListener("mousedown", handlePointerDown);
+                wrap.removeEventListener("contextmenu", handleContextMenu);
                 if (handleWheel) canvas.removeEventListener("wheel", handleWheel);
+                unsubscribeTransport?.();
                 for (const media of mediaList) {
                     media.removeEventListener?.("timeupdate", handleTimeUpdate);
                     media.removeEventListener?.("loadedmetadata", draw);
@@ -2254,8 +2741,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.compareMode = false;
         state.overlayState.compareLeftAssetId = asset.asset_id;
         state.overlayState.compareRightAssetId = "";
+        state.overlayState.comparePickerQuery = "";
+        state.overlayState.comparePickerSortMode = DEFAULT_SORT_MODE;
         state.overlayState.dividerRatio = 0.5;
         state.overlayState.audioFocus = "none";
+        state.overlayState.audioTempFlip = false;
         state.overlayState.showWaveform = false;
         resetOverlayTransform();
         renderInspectOverlay();
@@ -2352,52 +2842,130 @@ export function mountSharedAssetGallery(container, options = {}) {
             const audio = document.createElement("audio");
             audio.preload = "auto";
             const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), audio);
-            const playBtn = makeActionButton();
-            playBtn.textContent = "Play / Pause";
-            playBtn.addEventListener("click", () => {
+            const toggleAudio = () => {
                 if (audio.paused) void audio.play();
                 else audio.pause();
-            });
+            };
+            state.overlayState.togglePlayback = toggleAudio;
+            const playBtn = makeActionButton();
+            playBtn.textContent = "Play / Pause";
+            playBtn.addEventListener("click", toggleAudio);
             const waveform = renderInteractiveWaveform(asset, audio, ["#7fc0ff"], { compact: true });
             card.append(playBtn, waveform.el);
-            state.overlayState.cleanupFns.push(waveform.cleanup, blobHandle.cleanup, () => audio.pause());
+            state.overlayState.cleanupFns.push(
+                waveform.cleanup,
+                blobHandle.cleanup,
+                () => {
+                    playBtn.removeEventListener("click", toggleAudio);
+                    audio.pause();
+                },
+            );
             content.appendChild(card);
         }
     }
 
-    function renderCompareChooser(assets, slotLabel, selectedId, onAssign) {
+    function renderCompareChooser(assets, slotLabel, selectedId, onAssign, requestRefresh = () => {}) {
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;height:100%;padding:10px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);overflow:hidden;`);
         const title = style(document.createElement("div"), `color:#d7e5f1;font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;`);
         title.textContent = slotLabel;
         const hint = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.45;`);
         hint.textContent = "Left click assigns A. Right click assigns B.";
-        const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;`);
-        for (const asset of assets) {
-            const row = style(document.createElement("div"), `display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:center;padding:6px;border-radius:8px;border:1px solid ${selectedId === asset.asset_id ? "#7fc0ff" : "#35414c"};background:${selectedId === asset.asset_id ? "rgba(78,121,160,0.18)" : "rgba(255,255,255,0.02)"};cursor:pointer;`);
-            const thumb = style(document.createElement("div"), `height:40px;border-radius:6px;background:#111;border:1px solid #293542;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#7f93a5;font-size:10px;`);
-            if (asset.has_thumbnail) {
-                const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
-                img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
-                thumb.appendChild(img);
-            } else {
-                thumb.textContent = assetFallbackGlyph(asset.asset_type);
-            }
-            const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
-            const name = style(document.createElement("div"), `color:#edf3f8;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-            name.textContent = assetDisplayName(asset);
-            const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-            meta.textContent = `${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
-            text.append(name, meta);
-            row.append(thumb, text);
-            row.addEventListener("click", () => onAssign("left", asset.asset_id));
-            row.addEventListener("contextmenu", (event) => {
-                event.preventDefault();
-                onAssign("right", asset.asset_id);
-            });
-            list.appendChild(row);
+        const controls = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
+        const search = style(document.createElement("input"), `width:100%;box-sizing:border-box;${inputChromeCss()}`);
+        search.type = "search";
+        search.placeholder = "Search assets (kind:/ext:)";
+        search.value = state.overlayState.comparePickerQuery || "";
+        const sort = style(document.createElement("select"), `width:100%;box-sizing:border-box;${inputChromeCss()}`);
+        for (const option of COMPARE_SORT_OPTIONS) {
+            const optionEl = document.createElement("option");
+            optionEl.value = option.value;
+            optionEl.textContent = option.label;
+            sort.appendChild(optionEl);
         }
-        wrap.append(title, hint, list);
-        return wrap;
+        sort.value = COMPARE_SORT_OPTIONS.some((entry) => entry.value === state.overlayState.comparePickerSortMode)
+            ? state.overlayState.comparePickerSortMode
+            : DEFAULT_SORT_MODE;
+        controls.append(search, sort);
+        const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;`);
+
+        const chooserAssets = () => {
+            const query = parseAssetSearchQuery(state.overlayState.comparePickerQuery || "");
+            const filtered = sortAssetsByMode(
+                assets.filter((entry) => assetMatchesParsedQuery(entry, query)),
+                state.overlayState.comparePickerSortMode || DEFAULT_SORT_MODE,
+            );
+            const pinnedIds = [
+                state.overlayState.compareLeftAssetId,
+                state.overlayState.compareRightAssetId,
+            ].filter(Boolean);
+            const result = [];
+            const seen = new Set();
+            for (const assetId of pinnedIds) {
+                const pinned = assets.find((entry) => entry.asset_id === assetId);
+                if (pinned && !seen.has(pinned.asset_id)) {
+                    result.push(pinned);
+                    seen.add(pinned.asset_id);
+                }
+            }
+            for (const entry of filtered) {
+                if (!seen.has(entry.asset_id)) {
+                    result.push(entry);
+                    seen.add(entry.asset_id);
+                }
+            }
+            return result;
+        };
+
+        const renderRows = () => {
+            list.innerHTML = "";
+            search.value = state.overlayState.comparePickerQuery || "";
+            sort.value = COMPARE_SORT_OPTIONS.some((entry) => entry.value === state.overlayState.comparePickerSortMode)
+                ? state.overlayState.comparePickerSortMode
+                : DEFAULT_SORT_MODE;
+            for (const asset of chooserAssets()) {
+                const pinned = asset.asset_id === state.overlayState.compareLeftAssetId || asset.asset_id === state.overlayState.compareRightAssetId;
+                const row = style(document.createElement("div"), `display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:center;padding:6px;border-radius:8px;border:1px solid ${selectedId === asset.asset_id ? "#7fc0ff" : "#35414c"};background:${selectedId === asset.asset_id ? "rgba(78,121,160,0.18)" : "rgba(255,255,255,0.02)"};cursor:pointer;`);
+                const thumb = style(document.createElement("div"), `height:40px;border-radius:6px;background:#111;border:1px solid #293542;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#7f93a5;font-size:10px;`);
+                if (asset.has_thumbnail) {
+                    const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+                    img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
+                    thumb.appendChild(img);
+                } else {
+                    thumb.textContent = assetFallbackGlyph(asset.asset_type);
+                }
+                const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
+                const name = style(document.createElement("div"), `color:#edf3f8;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                name.textContent = assetDisplayName(asset);
+                const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                const pinLabel = pinned ? "Pinned | " : "";
+                meta.textContent = `${pinLabel}${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
+                text.append(name, meta);
+                row.append(thumb, text);
+                row.addEventListener("click", () => onAssign("left", asset.asset_id));
+                row.addEventListener("contextmenu", (event) => {
+                    event.preventDefault();
+                    onAssign("right", asset.asset_id);
+                });
+                list.appendChild(row);
+            }
+            if (!list.children.length) {
+                const empty = style(document.createElement("div"), `color:${CHROME.textDim};font-size:11px;padding:8px;`);
+                empty.textContent = "No matching assets.";
+                list.appendChild(empty);
+            }
+        };
+
+        search.addEventListener("input", () => {
+            state.overlayState.comparePickerQuery = search.value || "";
+            requestRefresh();
+        });
+        sort.addEventListener("change", () => {
+            state.overlayState.comparePickerSortMode = sort.value || DEFAULT_SORT_MODE;
+            requestRefresh();
+        });
+        renderRows();
+        wrap.append(title, hint, controls, list);
+        return { el: wrap, refresh: renderRows };
     }
 
     function renderCompareOverlay(asset, host) {
@@ -2414,13 +2982,33 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
             renderInspectOverlay();
         };
+        let refreshCompareChoosers = () => {};
+        const chooserA = renderCompareChooser(candidates, "Gallery A", compareA.asset_id, assignSlot, () => refreshCompareChoosers());
+        const chooserB = renderCompareChooser(candidates, "Gallery B", compareB.asset_id, assignSlot, () => refreshCompareChoosers());
+        refreshCompareChoosers = () => {
+            chooserA.refresh();
+            chooserB.refresh();
+        };
 
-        layout.appendChild(renderCompareChooser(candidates, "Gallery A", compareA.asset_id, assignSlot));
+        layout.appendChild(chooserA.el);
 
         const center = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;`);
-        const hint = style(document.createElement("div"), `color:#8ea0af;font-size:11px;`);
+        const hint = style(document.createElement("div"), `color:#8ea0af;font-size:11px;flex:0 0 auto;`);
         hint.textContent = "Left click = A | Right click = B";
         center.appendChild(hint);
+
+        const makeSegmentButton = (label, active, onClick, title = "") => {
+            const btn = makeActionButton(active ? "active" : "subtle");
+            btn.textContent = label;
+            if (title) btn.title = title;
+            btn.addEventListener("click", onClick);
+            return btn;
+        };
+        const setInspectorSettingAndRender = (key, value) => {
+            state.overlayState[key] = value;
+            persistInspectorSetting(key, value);
+            renderInspectOverlay();
+        };
 
         if (asset.asset_type === "audio") {
             const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
@@ -2430,43 +3018,84 @@ export function mountSharedAssetGallery(container, options = {}) {
             const blobHandleB = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareB.path), audioB);
             audioA.preload = "auto";
             audioB.preload = "auto";
-            audioA.muted = state.overlayState.audioFocus !== "a";
-            audioB.muted = state.overlayState.audioFocus !== "b";
-            const playBtn = makeActionButton();
-            playBtn.textContent = "Play / Pause";
-            playBtn.addEventListener("click", () => {
-                const focus = state.overlayState.audioFocus;
-                const activeAudio = focus === "b" ? audioB : (focus === "a" ? audioA : null);
-                if (!activeAudio) return;
-                if (activeAudio.paused) {
-                    void activeAudio.play();
-                } else {
-                    activeAudio.pause();
-                }
+            const transport = createLinkedMediaTransport([audioA, audioB], {
+                fallbackDurations: [assetDurationSeconds(compareA), assetDurationSeconds(compareB)],
             });
+            state.overlayState.togglePlayback = () => transport.toggle();
+            const playBtn = makeActionButton("subtle");
+            playBtn.textContent = "Play";
+            playBtn.addEventListener("click", () => transport.toggle());
             controls.appendChild(playBtn);
-            for (const [labelText, value] of [["A", "a"], ["B", "b"], ["None", "none"]]) {
-                const btn = makeActionButton();
+            const monitorButtons = [];
+            const effectiveMonitor = () => {
+                const monitor = state.overlayState.audioCompareMonitor || DEFAULT_INSPECTOR_SETTINGS.audioCompareMonitor;
+                if (state.overlayState.audioTempFlip && monitor === "a") return "b";
+                if (state.overlayState.audioTempFlip && monitor === "b") return "a";
+                return monitor;
+            };
+            const applyAudioMonitor = () => {
+                const monitor = effectiveMonitor();
+                const both = monitor === "both";
+                audioA.muted = !(monitor === "a" || both);
+                audioB.muted = !(monitor === "b" || both);
+                audioA.volume = both ? AUDIO_DUCK_VOLUME : 1;
+                audioB.volume = both ? AUDIO_DUCK_VOLUME : 1;
+                for (const [btn, value] of monitorButtons) {
+                    btn.style.cssText = actionButtonCss(state.overlayState.audioCompareMonitor === value ? "active" : "subtle");
+                }
+            };
+            state.overlayState.applyAudioMonitor = applyAudioMonitor;
+            for (const [labelText, value] of [["A", "a"], ["B", "b"], ["Both", "both"], ["Mute", "mute"]]) {
+                const btn = makeActionButton(state.overlayState.audioCompareMonitor === value ? "active" : "subtle");
                 btn.textContent = labelText;
-                btn.style.background = state.overlayState.audioFocus === value ? "#4a5c6b" : "#1d2630";
-                btn.style.borderColor = state.overlayState.audioFocus === value ? "#7fa2bf" : "#364655";
+                btn.title = `Monitor ${labelText}`;
                 btn.addEventListener("click", () => {
-                    state.overlayState.audioFocus = value;
-                    audioA.muted = value !== "a";
-                    audioB.muted = value !== "b";
-                    if (value === "none") {
-                        audioA.pause();
-                        audioB.pause();
-                    }
-                    renderInspectOverlay();
+                    state.overlayState.audioCompareMonitor = value;
+                    persistInspectorSetting("audioCompareMonitor", value);
+                    applyAudioMonitor();
                 });
+                monitorButtons.push([btn, value]);
                 controls.appendChild(btn);
             }
-            const waveform = renderInteractiveWaveform([compareA, compareB], [audioA, audioB], ["#7fc0ff", "#f5a97a"], { enableZoom: true });
-            state.overlayState.cleanupFns.push(waveform.cleanup, blobHandleA.cleanup, blobHandleB.cleanup, () => { audioA.pause(); audioB.pause(); });
+            controls.append(
+                makeSegmentButton("Stacked", state.overlayState.audioCompareWaveformLayout === "stacked", () => setInspectorSettingAndRender("audioCompareWaveformLayout", "stacked")),
+                makeSegmentButton("Overlay", state.overlayState.audioCompareWaveformLayout === "overlay", () => setInspectorSettingAndRender("audioCompareWaveformLayout", "overlay")),
+            );
+            const syncPlayPauseLabel = ({ playing }) => {
+                playBtn.textContent = playing ? "Pause" : "Play";
+            };
+            const transportOff = transport.subscribe(syncPlayPauseLabel);
+            applyAudioMonitor();
+            const waveform = renderInteractiveWaveform([compareA, compareB], [audioA, audioB], ["#7fc0ff", "#f5a97a"], {
+                enableZoom: true,
+                layout: state.overlayState.audioCompareWaveformLayout,
+                transport,
+            });
+            state.overlayState.cleanupFns.push(
+                waveform.cleanup,
+                transportOff,
+                transport.cleanup,
+                blobHandleA.cleanup,
+                blobHandleB.cleanup,
+                () => { audioA.pause(); audioB.pause(); },
+            );
             center.append(controls, waveform.el);
         } else {
-            const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;overflow:hidden;display:flex;align-items:center;justify-content:center;`);
+            const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
+            controls.append(
+                makeSegmentButton("Divider", state.overlayState.compareLayout === "divider", () => setInspectorSettingAndRender("compareLayout", "divider")),
+                makeSegmentButton("Side by Side", state.overlayState.compareLayout === "sideBySide", () => setInspectorSettingAndRender("compareLayout", "sideBySide")),
+            );
+            if (state.overlayState.compareLayout === "sideBySide") {
+                controls.appendChild(makeSegmentButton(
+                    state.overlayState.sideBySideLinkZoom ? "Linked Zoom" : "Independent Zoom",
+                    state.overlayState.sideBySideLinkZoom,
+                    () => setInspectorSettingAndRender("sideBySideLinkZoom", !state.overlayState.sideBySideLinkZoom),
+                    "Toggle side-by-side zoom/pan linking",
+                ));
+            }
+            center.appendChild(controls);
+
             const layerA = asset.asset_type === "image" ? document.createElement("img") : document.createElement("video");
             const layerB = asset.asset_type === "image" ? document.createElement("img") : document.createElement("video");
             const mediaStyle = `position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;background:#000;pointer-events:none;user-select:none;`;
@@ -2495,136 +3124,143 @@ export function mountSharedAssetGallery(container, options = {}) {
             const contentGroupB = style(document.createElement("div"), groupStyle);
             contentGroupA.appendChild(layerA);
             contentGroupB.appendChild(layerB);
-            const clipWrapperB = style(document.createElement("div"), `position:absolute;inset:0;pointer-events:none;`);
-            clipWrapperB.appendChild(contentGroupB);
-            const divider = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:14px;transform:translateX(-50%);cursor:col-resize;pointer-events:auto;z-index:3;`);
-            const dividerLine = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:2px;transform:translateX(-50%);background:#f1f5f8;box-shadow:0 0 0 1px rgba(0,0,0,0.35);`);
-            divider.appendChild(dividerLine);
-            stage.appendChild(contentGroupA);
-            stage.appendChild(clipWrapperB);
-            stage.appendChild(divider);
-            const applyDivider = () => {
-                const ratio = clamp(state.overlayState.dividerRatio, 0, 1);
-                const leftPct = `${ratio * 100}%`;
-                clipWrapperB.style.clipPath = `inset(0 0 0 ${leftPct})`;
-                divider.style.left = leftPct;
-                divider.style.transform = "translateX(-50%)";
-            };
-            applyDivider();
-
-            const handleDividerMove = (event) => {
-                const rect = stage.getBoundingClientRect();
-                const ratio = (event.clientX - rect.left) / Math.max(1, rect.width);
-                state.overlayState.dividerRatio = clamp(ratio, 0, 1);
-                applyDivider();
-            };
-            divider.addEventListener("mousedown", (event) => {
-                event.stopPropagation();
-            }, true);
-            const handleDividerPointerDown = (event) => {
-                if (event.button !== 0) return;
-                event.preventDefault();
-                event.stopPropagation();
-                divider.setPointerCapture?.(event.pointerId);
-                const onMove = (e) => handleDividerMove(e);
-                const onUp = (e) => {
-                    divider.releasePointerCapture?.(e.pointerId);
-                    divider.removeEventListener("pointermove", onMove);
-                    divider.removeEventListener("pointerup", onUp);
-                    divider.removeEventListener("pointercancel", onUp);
-                };
-                divider.addEventListener("pointermove", onMove);
-                divider.addEventListener("pointerup", onUp);
-                divider.addEventListener("pointercancel", onUp);
-            };
-            divider.addEventListener("pointerdown", handleDividerPointerDown);
-            const handleResize = () => applyDivider();
-            window.addEventListener("resize", handleResize);
-            state.overlayState.cleanupFns.push(() => window.removeEventListener("resize", handleResize));
-
+            let transport = null;
             if (asset.asset_type === "video") {
-                const syncSecondary = () => {
-                    if (Math.abs((layerB.currentTime || 0) - (layerA.currentTime || 0)) > 0.15) {
-                        layerB.currentTime = layerA.currentTime || 0;
-                    }
-                };
-                const togglePlayback = () => {
-                    if (layerA.paused) {
-                        void layerA.play();
-                    } else {
-                        layerA.pause();
-                    }
-                };
-                state.overlayState.togglePlayback = togglePlayback;
-                const handlePlay = () => {
-                    layerB.currentTime = layerA.currentTime || 0;
-                    void layerB.play().catch(() => {});
-                };
-                const handlePause = () => layerB.pause();
-                const handleSeek = () => {
-                    layerB.currentTime = layerA.currentTime || 0;
-                };
-                layerA.addEventListener("play", handlePlay);
-                layerA.addEventListener("pause", handlePause);
-                layerA.addEventListener("seeked", handleSeek);
-                layerA.addEventListener("timeupdate", syncSecondary);
-                state.overlayState.cleanupFns.push(() => {
-                    layerA.removeEventListener("play", handlePlay);
-                    layerA.removeEventListener("pause", handlePause);
-                    layerA.removeEventListener("seeked", handleSeek);
-                    layerA.removeEventListener("timeupdate", syncSecondary);
-                    layerA.pause();
-                    layerB.pause();
+                state.overlayState.videoCompareFps = assetFps(compareA);
+                transport = createLinkedMediaTransport([layerA, layerB], {
+                    fallbackDurations: [assetDurationSeconds(compareA), assetDurationSeconds(compareB)],
                 });
+                state.overlayState.togglePlayback = () => transport.toggle();
+                state.overlayState.stepVideoCompare = (deltaSeconds) => transport.step(deltaSeconds);
+                state.overlayState.cleanupFns.push(transport.cleanup);
             }
 
-            center.appendChild(stage);
-            state.overlayState.cleanupFns.push(attachZoomPan(stage, [contentGroupA, contentGroupB]));
+            if (state.overlayState.compareLayout === "sideBySide") {
+                const stage = style(document.createElement("div"), `display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;flex:1 1 auto;min-height:0;`);
+                const makePane = (label, group, slot) => {
+                    const pane = style(document.createElement("div"), `position:relative;min-width:0;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;overflow:hidden;display:flex;align-items:center;justify-content:center;`);
+                    const badge = style(document.createElement("div"), `position:absolute;left:10px;top:10px;z-index:2;padding:3px 6px;border-radius:5px;background:rgba(0,0,0,0.58);color:${CHROME.text};font-size:10px;pointer-events:none;`);
+                    badge.textContent = label;
+                    pane.append(group, badge);
+                    if (asset.asset_type === "video") {
+                        state.overlayState.cleanupFns.push(attachRightClickVideoScrub(pane, transport, [layerA, layerB], { fps: assetFps(compareA) }));
+                    }
+                    return pane;
+                };
+                const paneA = makePane("A", contentGroupA, "a");
+                const paneB = makePane("B", contentGroupB, "b");
+                stage.append(paneA, paneB);
+                center.appendChild(stage);
+                if (state.overlayState.sideBySideLinkZoom) {
+                    state.overlayState.cleanupFns.push(
+                        attachZoomPan(paneA, [contentGroupA, contentGroupB], { transformState: state.overlayState }),
+                        attachZoomPan(paneB, [contentGroupA, contentGroupB], { transformState: state.overlayState }),
+                    );
+                } else {
+                    state.overlayState.cleanupFns.push(
+                        attachZoomPan(paneA, contentGroupA, { transformState: state.overlayState.sideBySideTransforms.a }),
+                        attachZoomPan(paneB, contentGroupB, { transformState: state.overlayState.sideBySideTransforms.b }),
+                    );
+                }
+            } else {
+                const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;overflow:hidden;display:flex;align-items:center;justify-content:center;`);
+                const clipWrapperB = style(document.createElement("div"), `position:absolute;inset:0;pointer-events:none;`);
+                clipWrapperB.appendChild(contentGroupB);
+                const divider = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:14px;transform:translateX(-50%);cursor:col-resize;pointer-events:auto;z-index:3;`);
+                const dividerLine = style(document.createElement("div"), `position:absolute;top:0;bottom:0;left:50%;width:2px;transform:translateX(-50%);background:#f1f5f8;box-shadow:0 0 0 1px rgba(0,0,0,0.35);`);
+                divider.appendChild(dividerLine);
+                stage.appendChild(contentGroupA);
+                stage.appendChild(clipWrapperB);
+                stage.appendChild(divider);
+                const applyDivider = () => {
+                    const ratio = clamp(state.overlayState.dividerRatio, 0, 1);
+                    const leftPct = `${ratio * 100}%`;
+                    clipWrapperB.style.clipPath = `inset(0 0 0 ${leftPct})`;
+                    divider.style.left = leftPct;
+                    divider.style.transform = "translateX(-50%)";
+                };
+                applyDivider();
+                const handleDividerMove = (event) => {
+                    const rect = stage.getBoundingClientRect();
+                    const ratio = (event.clientX - rect.left) / Math.max(1, rect.width);
+                    state.overlayState.dividerRatio = clamp(ratio, 0, 1);
+                    applyDivider();
+                };
+                divider.addEventListener("mousedown", (event) => {
+                    event.stopPropagation();
+                }, true);
+                const handleDividerPointerDown = (event) => {
+                    if (event.button !== 0) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    divider.setPointerCapture?.(event.pointerId);
+                    const onMove = (e) => handleDividerMove(e);
+                    const onUp = (e) => {
+                        divider.releasePointerCapture?.(e.pointerId);
+                        divider.removeEventListener("pointermove", onMove);
+                        divider.removeEventListener("pointerup", onUp);
+                        divider.removeEventListener("pointercancel", onUp);
+                    };
+                    divider.addEventListener("pointermove", onMove);
+                    divider.addEventListener("pointerup", onUp);
+                    divider.addEventListener("pointercancel", onUp);
+                };
+                divider.addEventListener("pointerdown", handleDividerPointerDown);
+                const handleResize = () => applyDivider();
+                window.addEventListener("resize", handleResize);
+                state.overlayState.cleanupFns.push(
+                    () => window.removeEventListener("resize", handleResize),
+                    attachZoomPan(stage, [contentGroupA, contentGroupB]),
+                );
+                if (asset.asset_type === "video") {
+                    state.overlayState.cleanupFns.push(attachRightClickVideoScrub(stage, transport, [layerA, layerB], { fps: assetFps(compareA) }));
+                }
+                center.appendChild(stage);
+            }
 
             if (asset.asset_type === "video") {
-                const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
+                const videoControls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
                 const playPauseBtn = makeActionButton("subtle");
                 const playbackHint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
-                playbackHint.textContent = "Space = Play / Pause";
-                const syncPlayPauseLabel = () => {
-                    playPauseBtn.textContent = layerA.paused ? "Play" : "Pause";
+                playbackHint.textContent = "Space = Play / Pause | Right-drag = scrub";
+                const handlePlayPauseClick = () => transport.toggle();
+                const syncPlayPauseLabel = ({ playing }) => {
+                    playPauseBtn.textContent = playing ? "Pause" : "Play";
                 };
-                const handlePlayPauseClick = () => {
-                    state.overlayState.togglePlayback?.();
-                };
-                syncPlayPauseLabel();
+                const transportOff = transport.subscribe(syncPlayPauseLabel);
                 playPauseBtn.addEventListener("click", handlePlayPauseClick);
-                layerA.addEventListener("play", syncPlayPauseLabel);
-                layerA.addEventListener("pause", syncPlayPauseLabel);
-                layerA.addEventListener("ended", syncPlayPauseLabel);
-                controls.append(playPauseBtn, playbackHint);
+                videoControls.append(playPauseBtn, playbackHint);
+                const applyVideoAudioFocus = () => {
+                    layerA.muted = state.overlayState.audioFocus !== "a";
+                    layerB.muted = state.overlayState.audioFocus !== "b";
+                };
                 for (const [labelText, value] of [["A", "a"], ["B", "b"], ["None", "none"]]) {
-                    const btn = makeActionButton();
+                    const btn = makeActionButton(state.overlayState.audioFocus === value ? "active" : "subtle");
                     btn.textContent = labelText;
-                    btn.style.background = state.overlayState.audioFocus === value ? "#4a5c6b" : "#1d2630";
-                    btn.style.borderColor = state.overlayState.audioFocus === value ? "#7fa2bf" : "#364655";
                     btn.addEventListener("click", () => {
                         state.overlayState.audioFocus = value;
+                        applyVideoAudioFocus();
                         renderInspectOverlay();
                     });
-                    controls.appendChild(btn);
+                    videoControls.appendChild(btn);
                 }
-                const scrub = renderSynchronizedScrubBar([layerA, layerB]);
+                applyVideoAudioFocus();
+                const scrub = renderSynchronizedScrubBar([layerA, layerB], { transport });
                 state.overlayState.cleanupFns.push(
+                    transportOff,
                     scrub.cleanup,
                     () => {
                         playPauseBtn.removeEventListener("click", handlePlayPauseClick);
-                        layerA.removeEventListener("play", syncPlayPauseLabel);
-                        layerA.removeEventListener("pause", syncPlayPauseLabel);
-                        layerA.removeEventListener("ended", syncPlayPauseLabel);
+                        layerA.pause();
+                        layerB.pause();
                     },
                 );
-                center.append(controls, scrub.el);
+                center.append(videoControls, scrub.el);
             }
         }
 
         layout.appendChild(center);
-        layout.appendChild(renderCompareChooser(candidates, "Gallery B", compareB.asset_id, assignSlot));
+        layout.appendChild(chooserB.el);
         host.appendChild(layout);
     }
 
@@ -2648,8 +3284,27 @@ export function mountSharedAssetGallery(container, options = {}) {
             document.body.appendChild(overlayEl);
             overlay.overlayEl = overlayEl;
         }
+        overlayEl.dataset.sonderInspectOverlay = "1";
 
         const applyCenterZoom = (factor) => {
+            if (state.overlayState.compareMode && state.overlayState.compareLayout === "sideBySide" && !state.overlayState.sideBySideLinkZoom) {
+                let changed = false;
+                for (const transformState of [state.overlayState.sideBySideTransforms.a, state.overlayState.sideBySideTransforms.b]) {
+                    const previousZoom = transformState.zoomLevel;
+                    const nextZoom = clamp(previousZoom * factor, 1, 16);
+                    if (nextZoom === previousZoom) continue;
+                    if (nextZoom < previousZoom) {
+                        const denom = Math.max(0.0001, previousZoom - 1);
+                        const ratio = Math.max(0, (nextZoom - 1) / denom);
+                        transformState.panX *= ratio;
+                        transformState.panY *= ratio;
+                    }
+                    transformState.zoomLevel = nextZoom;
+                    changed = true;
+                }
+                if (changed) renderInspectOverlay();
+                return;
+            }
             const previousZoom = state.overlayState.zoomLevel;
             const nextZoom = clamp(previousZoom * factor, 1, 16);
             if (nextZoom === previousZoom) return;
@@ -2667,10 +3322,44 @@ export function mountSharedAssetGallery(container, options = {}) {
         const keyDownHandler = (event) => {
             if (!overlay.open) return false;
             if (event.target?.closest?.("input, textarea, select")) return false;
-            if (event.ctrlKey || event.metaKey || event.altKey) return false;
+            const activeAsset = currentOverlayAsset();
+            const compareVideo = overlay.compareMode && activeAsset?.asset_type === "video";
+            const compareAudio = overlay.compareMode && activeAsset?.asset_type === "audio";
+            if (compareVideo && (event.key === "ArrowLeft" || event.key === "ArrowRight") && typeof overlay.stepVideoCompare === "function") {
+                const direction = event.key === "ArrowLeft" ? -1 : 1;
+                const fps = Number(overlay.videoCompareFps) || assetFps(activeAsset);
+                const seconds = event.ctrlKey || event.metaKey
+                    ? 1
+                    : (event.shiftKey ? 10 / fps : 1 / fps);
+                overlay.stepVideoCompare(direction * seconds);
+                return true;
+            }
+            if (compareAudio && event.key === "Shift") {
+                const monitor = overlay.audioCompareMonitor;
+                if (monitor === "a" || monitor === "b") {
+                    overlay.audioTempFlip = true;
+                    overlay.applyAudioMonitor?.();
+                    return true;
+                }
+            }
+            if (compareAudio) {
+                const monitorKeyMap = { "1": "a", "2": "b", "3": "both", "0": "mute" };
+                const nextMonitor = monitorKeyMap[event.key];
+                if (nextMonitor) {
+                    overlay.audioCompareMonitor = nextMonitor;
+                    persistInspectorSetting("audioCompareMonitor", nextMonitor);
+                    overlay.applyAudioMonitor?.();
+                    return true;
+                }
+            }
+            if (event.ctrlKey || event.metaKey || event.altKey) return shouldCaptureOverlayShortcut(event);
             if (event.key === "Escape") { closeInspectOverlay(); return true; }
             if (event.key === " " || event.key === "Spacebar") {
                 if (typeof overlay.togglePlayback === "function") overlay.togglePlayback();
+                return true;
+            }
+            if (event.key === "?") {
+                showInspectOverlayShortcutHelp();
                 return true;
             }
             if (event.key === "ArrowLeft") { cycleOverlayAsset(-1); return true; }
@@ -2701,6 +3390,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
         const keyUpHandler = (event) => {
             if (!overlay.open) return false;
+            const activeAsset = currentOverlayAsset();
+            if (overlay.compareMode && activeAsset?.asset_type === "audio" && event.key === "Shift") {
+                if (overlay.audioTempFlip) {
+                    overlay.audioTempFlip = false;
+                    overlay.applyAudioMonitor?.();
+                    return true;
+                }
+            }
             if (event.target?.closest?.("input, textarea, select")) return false;
             return shouldCaptureOverlayShortcut(event);
         };
@@ -2745,6 +3442,12 @@ export function mountSharedAssetGallery(container, options = {}) {
             renderInspectOverlay();
         });
         toolbarActions.appendChild(compareBtn);
+
+        const helpBtn = makeActionButton("subtle");
+        helpBtn.textContent = "?";
+        helpBtn.title = "Inspect shortcuts (?)";
+        helpBtn.addEventListener("click", () => showInspectOverlayShortcutHelp());
+        toolbarActions.appendChild(helpBtn);
 
         const closeBtn = makeActionButton();
         closeBtn.textContent = "Close";

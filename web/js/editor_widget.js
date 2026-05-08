@@ -5,7 +5,7 @@
 
 const { api } = window.comfyAPI.api;
 
-import { mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     _debugListConsumers as debugKeyboardConsumers,
@@ -209,6 +209,8 @@ const COLORS = {
     selectionBorder: "rgba(100, 180, 255, 0.58)",
     selectionContext: "rgba(100, 180, 255, 0.07)",
     selectionContextBorder: "rgba(100, 180, 255, 0.24)",
+    maskOffset: "rgba(255, 190, 80, 0.11)",
+    maskOffsetBorder: "rgba(255, 190, 80, 0.34)",
     playhead: "#ff4444",
     promptSection: "rgba(180, 120, 255, 0.2)",
     promptBorder: "rgba(180, 120, 255, 0.5)",
@@ -444,6 +446,7 @@ export class EditorWidget {
 
         // Context menu
         this._contextMenuEl = null;
+        this._guidePreviewEl = null;
 
         // Project settings (fetched from server)
         this.fps = 24;
@@ -693,6 +696,38 @@ export class EditorWidget {
         this._postContextInput.style.cssText = ctxInputStyle;
         this._postContextInput.addEventListener("change", () => this._updateContextFrameWidgets());
 
+        const maskLabel = document.createElement("span");
+        maskLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 4px;`;
+        maskLabel.textContent = "Mask Offset:";
+
+        const maskPreLabel = document.createElement("span");
+        maskPreLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
+        maskPreLabel.textContent = "-";
+
+        this._maskPreOffsetInput = document.createElement("input");
+        this._maskPreOffsetInput.type = "number";
+        this._maskPreOffsetInput.min = 0;
+        this._maskPreOffsetInput.max = 256;
+        this._maskPreOffsetInput.step = 1;
+        this._maskPreOffsetInput.value = 0;
+        this._maskPreOffsetInput.title = "Extra pre-context frames excluded from denoise mask start";
+        this._maskPreOffsetInput.style.cssText = ctxInputStyle;
+        this._maskPreOffsetInput.addEventListener("change", () => this._updateContextFrameWidgets());
+
+        const maskPostLabel = document.createElement("span");
+        maskPostLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
+        maskPostLabel.textContent = "+";
+
+        this._maskPostOffsetInput = document.createElement("input");
+        this._maskPostOffsetInput.type = "number";
+        this._maskPostOffsetInput.min = 0;
+        this._maskPostOffsetInput.max = 256;
+        this._maskPostOffsetInput.step = 1;
+        this._maskPostOffsetInput.value = 0;
+        this._maskPostOffsetInput.title = "Extra post-context frames included in denoise mask end";
+        this._maskPostOffsetInput.style.cssText = ctxInputStyle;
+        this._maskPostOffsetInput.addEventListener("change", () => this._updateContextFrameWidgets());
+
         // Resolution inputs
         const resLabel = document.createElement("span");
         resLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
@@ -769,6 +804,7 @@ export class EditorWidget {
         bar.append(prevBtn, this.sceneLabel, nextBtn, addBtn,
             this._durLabel, this.durationInput,
             ctxLabel, preCtxLabel, this._preContextInput, postCtxLabel, this._postContextInput,
+            maskLabel, maskPreLabel, this._maskPreOffsetInput, maskPostLabel, this._maskPostOffsetInput,
             resLabel, this._resWInput, xLabel, this._resHInput, this._aspectRatioSelect, this._resTierSelect, this._templateSelect,
             fpsLabel, this._fpsInput);
         this._sceneBar = bar;
@@ -829,19 +865,80 @@ export class EditorWidget {
         const sep1 = document.createElement("span");
         sep1.style.cssText = chromeDividerCss();
 
-        // Selection (In/Out) display
-        this._selectionLabel = document.createElement("span");
-        this._selectionLabel.style.cssText = `color: ${COLORS.textMuted}; font-size: 9px; white-space: nowrap; min-width: 80px;`;
-        this._selectionLabel.textContent = "In/Out: —";
+        // Playhead Frame box (navigation only; clamp to scene bounds)
+        const frameLabel = document.createElement("span");
+        frameLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px; margin-left: 2px;`;
+        frameLabel.textContent = "F";
+        const playheadInputCss = `${chromeInputCss({ width: "58px", fontSize: "10px", padding: "2px 4px", textAlign: "right" })} min-width: 0;`;
+        this._playheadFrameInput = document.createElement("input");
+        this._playheadFrameInput.type = "text";
+        this._playheadFrameInput.inputMode = "decimal";
+        this._playheadFrameInput.title = "Playhead frame";
+        this._playheadFrameInput.style.cssText = playheadInputCss;
+        const applyPlayhead = (value) => {
+            const parsed = this._parsePositionInput(value);
+            if (!Number.isFinite(parsed)) { this._refreshPlayheadInput(); return; }
+            const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
+            this.playhead = Math.max(0, Math.min(maxFrame, Math.round(parsed)));
+            if (this.isPlaying) this._stopPlayback();
+            this._renderTimeline();
+            this._renderViewportFrame();
+            this._updateToolbar();
+        };
+        this._playheadFrameInput.addEventListener("change", () => applyPlayhead(this._playheadFrameInput.value));
+        this._playheadFrameInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                applyPlayhead(this._playheadFrameInput.value);
+                e.preventDefault();
+            } else if (e.key === "Escape") {
+                this._refreshPlayheadInput();
+            }
+            e.stopPropagation();
+        });
+
+        // Editable selection (In/Out) controls.
+        const inLabel = document.createElement("span");
+        inLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px; margin-left: 2px;`;
+        inLabel.textContent = "In";
+        const outLabel = document.createElement("span");
+        outLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
+        outLabel.textContent = "Out";
+        const selectionInputCss = `${chromeInputCss({ width: "58px", fontSize: "10px", padding: "2px 4px", textAlign: "right" })} min-width: 0;`;
+        const makeSelectionInput = (title, apply) => {
+            const input = document.createElement("input");
+            input.type = "text";
+            input.inputMode = "decimal";
+            input.title = title;
+            input.style.cssText = selectionInputCss;
+            input.addEventListener("change", () => apply(input.value));
+            input.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    apply(input.value);
+                    e.preventDefault();
+                } else if (e.key === "Escape") {
+                    this._refreshSelectionInputs();
+                }
+                e.stopPropagation();
+            });
+            return input;
+        };
+        this._selectionStartInput = makeSelectionInput("Selection in-point", (value) => {
+            const frame = this._parsePositionInput(value);
+            if (Number.isFinite(frame)) {
+                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
+                this._setSelectionStartFrame(this._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
+            } else this._refreshSelectionInputs();
+        });
+        this._selectionEndInput = makeSelectionInput("Selection out-point", (value) => {
+            const frame = this._parsePositionInput(value);
+            if (Number.isFinite(frame)) {
+                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
+                this._setSelectionEndFrame(this._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
+            } else this._refreshSelectionInputs();
+        });
 
         const clearSelBtn = makeToolBtn("✕", "X", "Clear selection", () => false, () => {
-            this.selectionStart = 0;
-            this.selectionEnd = 0;
-            this._setWidgetValue("selection_start", 0);
-            this._setWidgetValue("selection_end", 0);
-            this._renderTimeline();
-            this._updateToolbar();
-            this._updateToolbar();
+            this._clearTimelineSelection();
         });
         clearSelBtn.style.padding = "2px 4px";
         clearSelBtn.style.fontSize = "9px";
@@ -940,7 +1037,7 @@ export class EditorWidget {
         this._fullscreenBtn.style.fontSize = "14px";
         this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
 
-        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, this._selectionLabel, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, this._batchQueueBtn, this._queueStatusWrap, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
+        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, frameLabel, this._playheadFrameInput, inLabel, this._selectionStartInput, outLabel, this._selectionEndInput, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, this._batchQueueBtn, this._queueStatusWrap, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
         this.container.appendChild(this._toolbar);
         this._updateToolbar();
     }
@@ -1028,20 +1125,7 @@ export class EditorWidget {
             setButtonVariant(this._toolBtnTimecode, isTc ? "warning" : "muted");
         }
 
-        // Update selection display
-        if (this._selectionLabel) {
-            const preCtx = this._contextFrameValue("pre_context_frames");
-            const postCtx = this._contextFrameValue("post_context_frames");
-            const ctxSuffix = (preCtx > 0 || postCtx > 0) ? ` | Ctx: -${preCtx}/+${postCtx}` : "";
-            if (this.selectionStart < this.selectionEnd) {
-                const dur = this.selectionEnd - this.selectionStart;
-                this._selectionLabel.textContent = `In: ${this._frameToTimecode(this.selectionStart)} Out: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(dur)})${ctxSuffix}`;
-                this._selectionLabel.style.color = lightenColor(COLORS.sceneBtnActive, 0.28);
-            } else {
-                this._selectionLabel.textContent = `Playhead: ${this._frameToTimecode(this.playhead)} | Total: ${this._frameToTimecode(this.totalFrames)}${ctxSuffix}`;
-                this._selectionLabel.style.color = COLORS.textMuted;
-            }
-        }
+        this._refreshSelectionInputs();
 
         // Animatic toggle state
         if (this._toolBtnAnimatic) {
@@ -1229,6 +1313,12 @@ export class EditorWidget {
         const hasActiveScene = !!this.activeScene;
         const preservePendingFrameSelection = !hasActiveScene && this.activeSceneId === scene.scene_id;
         const isSameScene = hasActiveScene && this.activeSceneId === scene.scene_id;
+        if (!isSameScene && hasActiveScene) {
+            this._persistActiveTimelineSelection();
+        }
+        const storedSelection = (!isSameScene && !preservePendingFrameSelection)
+            ? this._readStoredTimelineSelection(scene)
+            : null;
 
         if (!isSameScene) {
             if (this._animaticMode && this._restoreAnimaticState()) {
@@ -1246,11 +1336,11 @@ export class EditorWidget {
             this._clearSelection();
             this._hideItemEditor();
             if (!preservePendingFrameSelection) {
-                this.selectionStart = 0;
-                this.selectionEnd = 0;
-                this.playhead = 0;
-                this._setWidgetValue("selection_start", 0);
-                this._setWidgetValue("selection_end", 0);
+                this.selectionStart = storedSelection?.start ?? 0;
+                this.selectionEnd = storedSelection?.end ?? 0;
+                this.playhead = this.selectionStart < this.selectionEnd ? this.selectionStart : 0;
+                this._setWidgetValue("selection_start", this.selectionStart);
+                this._setWidgetValue("selection_end", this.selectionEnd);
             }
         }
 
@@ -1314,6 +1404,7 @@ export class EditorWidget {
         this.selectionEnd = Math.min(this.selectionEnd, maxFrame);
         this._setWidgetValue("selection_start", this.selectionStart);
         this._setWidgetValue("selection_end", this.selectionEnd);
+        this._persistActiveTimelineSelection();
     }
 
     _onResolutionChange(axis = "w") {
@@ -2150,6 +2241,21 @@ export class EditorWidget {
         return Math.max(1, Math.round(snapToConstraint(numeric, durationConstraint)));
     }
 
+    _snapSelectionFrame(value, { direction = "up", clampMax = null } = {}) {
+        const numeric = Math.max(0, Math.round(Number(value) || 0));
+        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        if (!constraint?.step) return clampMax != null ? Math.min(numeric, Math.max(0, clampMax)) : numeric;
+        const step = constraint.step;
+        const offset = constraint.offset || 0;
+        const k = (numeric - offset) / step;
+        const rounded = direction === "up" ? Math.ceil(k) : Math.floor(k);
+        let snapped = rounded * step + offset;
+        if (clampMax != null && snapped > clampMax) {
+            snapped = Math.floor((clampMax - offset) / step) * step + offset;
+        }
+        return Math.max(0, snapped);
+    }
+
     _getActiveTemplate() {
         return getTemplateById(this._templateId, this._settings);
     }
@@ -2553,17 +2659,115 @@ export class EditorWidget {
         if (this._postContextInput) {
             this._postContextInput.value = this._contextFrameValue("post_context_frames");
         }
+        if (this._maskPreOffsetInput) {
+            this._maskPreOffsetInput.value = this._contextFrameValue("mask_pre_offset");
+        }
+        if (this._maskPostOffsetInput) {
+            this._maskPostOffsetInput.value = this._contextFrameValue("mask_post_offset");
+        }
         this._updateToolbar();
     }
 
     _updateContextFrameWidgets() {
         const pre = Math.max(0, parseInt(this._preContextInput?.value, 10) || 0);
         const post = Math.max(0, parseInt(this._postContextInput?.value, 10) || 0);
+        const maskPre = Math.max(0, parseInt(this._maskPreOffsetInput?.value, 10) || 0);
+        const maskPost = Math.max(0, parseInt(this._maskPostOffsetInput?.value, 10) || 0);
         if (this._preContextInput) this._preContextInput.value = pre;
         if (this._postContextInput) this._postContextInput.value = post;
+        if (this._maskPreOffsetInput) this._maskPreOffsetInput.value = maskPre;
+        if (this._maskPostOffsetInput) this._maskPostOffsetInput.value = maskPost;
         this._setWidgetValue("pre_context_frames", pre);
         this._setWidgetValue("post_context_frames", post);
+        this._setWidgetValue("mask_pre_offset", maskPre);
+        this._setWidgetValue("mask_post_offset", maskPost);
         this._updateToolbar();
+    }
+
+    _refreshSelectionInputs() {
+        if (this._selectionStartInput && document.activeElement !== this._selectionStartInput) {
+            this._selectionStartInput.value = this._formatPositionInput(this.selectionStart);
+            this._selectionStartInput.title = `Selection in-point: ${this._frameToTimecode(this.selectionStart)}`;
+        }
+        if (this._selectionEndInput && document.activeElement !== this._selectionEndInput) {
+            this._selectionEndInput.value = this._formatPositionInput(this.selectionEnd);
+            const duration = Math.max(0, this.selectionEnd - this.selectionStart);
+            this._selectionEndInput.title = `Selection out-point: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(duration)})`;
+        }
+        this._refreshPlayheadInput();
+    }
+
+    _refreshPlayheadInput() {
+        if (!this._playheadFrameInput) return;
+        if (document.activeElement === this._playheadFrameInput) return;
+        this._playheadFrameInput.value = this._formatPositionInput(this.playhead);
+        this._playheadFrameInput.title = `Playhead frame: ${this._frameToTimecode(this.playhead)}`;
+    }
+
+    _readStoredTimelineSelection(scene = this.activeScene, settings = this._settings) {
+        const projectKey = this._projectDirName();
+        const sceneId = scene?.scene_id || "";
+        const selection = projectKey && sceneId
+            ? settings?.layout?.activeSelectionByProjectScene?.[projectKey]?.[sceneId]
+            : null;
+        if (!selection || typeof selection !== "object") return null;
+        const maxFrame = Math.max(0, parseInt(scene?.duration_frames, 10) || this.totalFrames || 0);
+        const start = Math.max(0, Math.min(maxFrame, Math.round(Number(selection.start) || 0)));
+        const end = Math.max(start, Math.min(maxFrame, Math.round(Number(selection.end) || 0)));
+        return { start, end };
+    }
+
+    _persistActiveTimelineSelection() {
+        const projectKey = this._projectDirName();
+        const sceneId = this.activeScene?.scene_id || this.activeSceneId || "";
+        if (!projectKey || !sceneId) return;
+        const byProject = this._settings?.layout?.activeSelectionByProjectScene || {};
+        this._updateSettings({
+            layout: {
+                activeSelectionByProjectScene: {
+                    ...byProject,
+                    [projectKey]: {
+                        ...(byProject[projectKey] || {}),
+                        [sceneId]: {
+                            start: Math.max(0, Math.round(Number(this.selectionStart) || 0)),
+                            end: Math.max(0, Math.round(Number(this.selectionEnd) || 0)),
+                        },
+                    },
+                },
+            },
+        });
+    }
+
+    _setTimelineSelection(start, end, { persist = true, render = true } = {}) {
+        const maxFrame = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
+        const nextStart = Math.max(0, Math.min(maxFrame, Math.round(Number(start) || 0)));
+        const nextEnd = Math.max(0, Math.min(maxFrame, Math.round(Number(end) || 0)));
+        this.selectionStart = Math.min(nextStart, nextEnd);
+        this.selectionEnd = Math.max(nextStart, nextEnd);
+        this._setWidgetValue("selection_start", this.selectionStart);
+        this._setWidgetValue("selection_end", this.selectionEnd);
+        if (persist) this._persistActiveTimelineSelection();
+        this._refreshSelectionInputs();
+        if (render) {
+            this._renderTimeline();
+            this._updateToolbar();
+        }
+    }
+
+    _setSelectionStartFrame(frame) {
+        this._setTimelineSelection(frame, Math.max(frame, this.selectionEnd));
+    }
+
+    _setSelectionEndFrame(frame) {
+        this._setTimelineSelection(Math.min(frame, this.selectionStart), frame);
+    }
+
+    _clearTimelineSelection() {
+        this._setTimelineSelection(0, 0);
+    }
+
+    _setSelectionToFrameRange(start, end) {
+        this._setTimelineSelection(start, end);
     }
 
     _restoreAnimaticState() {
@@ -2614,6 +2818,78 @@ export class EditorWidget {
 
     _isLaneTrackType(type) {
         return type === TRACK_TYPE.VIDEO || type === TRACK_TYPE.AUDIO || type === TRACK_TYPE.MOTION_DRIVER;
+    }
+
+    _isHeaderControllableTrackType(type) {
+        return this._isLaneTrackType(type) || type === TRACK_TYPE.GUIDES || type === TRACK_TYPE.PROMPT;
+    }
+
+    _defaultLaneConfig(overrides = {}) {
+        return { name: "", color: "", locked: false, hidden: false, ...overrides };
+    }
+
+    _trackConfigForFixedType(type) {
+        if (type === TRACK_TYPE.GUIDES) return this.activeScene?.guide_track_config || this._defaultLaneConfig();
+        if (type === TRACK_TYPE.PROMPT) return this.activeScene?.prompt_track_config || this._defaultLaneConfig();
+        return this._defaultLaneConfig();
+    }
+
+    _trackItemsForEntry(entry) {
+        if (!this.activeScene || !entry) return [];
+        if (entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.MOTION_DRIVER) {
+            return (this.activeScene.clips || []).filter((clip) => this._clipMatchesTrackEntry(clip, entry));
+        }
+        if (entry.type === TRACK_TYPE.AUDIO) {
+            return (this.activeScene.audio_tracks || []).filter((track) => (track.lane_index || 0) === entry.laneIndex);
+        }
+        if (entry.type === TRACK_TYPE.GUIDES) {
+            return this.activeScene.guide_frames || [];
+        }
+        if (entry.type === TRACK_TYPE.PROMPT) {
+            return this.activeScene.prompt_sections || [];
+        }
+        return [];
+    }
+
+    _trackVisibilityState(entry) {
+        if (!entry) return "visible";
+        const items = this._trackItemsForEntry(entry);
+        if (entry.type === TRACK_TYPE.PROMPT) {
+            return entry.hidden ? "hidden" : "visible";
+        }
+        const mutedCount = items.filter((item) => !!item.muted).length;
+        if (entry.hidden || (items.length > 0 && mutedCount === items.length)) return "hidden";
+        if (mutedCount > 0) return "partial";
+        return "visible";
+    }
+
+    _isGuideTrackLocked() {
+        const idx = this._guidesLayoutIdx();
+        return idx >= 0 && !!this._trackLayout[idx]?.locked;
+    }
+
+    _isGuideTrackHidden() {
+        const idx = this._guidesLayoutIdx();
+        return idx >= 0 && !!this._trackLayout[idx]?.hidden;
+    }
+
+    _isPromptTrackLocked() {
+        const idx = this._promptLayoutIdx();
+        return idx >= 0 && !!this._trackLayout[idx]?.locked;
+    }
+
+    _isPromptTrackHidden() {
+        const idx = this._promptLayoutIdx();
+        return idx >= 0 && !!this._trackLayout[idx]?.hidden;
+    }
+
+    _isItemLocked(item) {
+        if (!item) return false;
+        if (item.type === "clip") return this._isLaneLocked(this._clipTrackType(item.data), item.data.track_index || 0);
+        if (item.type === "audio") return this._isLaneLocked(TRACK_TYPE.AUDIO, item.data.lane_index || 0);
+        if (item.type === "guide") return this._isGuideTrackLocked();
+        if (item.type === "prompt") return this._isPromptTrackLocked();
+        return false;
     }
 
     _isRenderClip(clip) {
@@ -2730,7 +3006,8 @@ export class EditorWidget {
             });
         }
 
-        // Fixed rows (no lock/hide/color)
+        // Fixed rows share LaneConfig shape for header lock/hide.
+        const guideCfg = this._trackConfigForFixedType(TRACK_TYPE.GUIDES);
         layout.push({
             type: TRACK_TYPE.GUIDES,
             label: "Guides",
@@ -2738,9 +3015,10 @@ export class EditorWidget {
             laneIndex: 0,
             collapsed: isStored ? storedCollapsed.has(TRACK_TYPE.GUIDES + ":0") : false,
             color: "",
-            locked: false,
-            hidden: false,
+            locked: !!guideCfg.locked,
+            hidden: !!guideCfg.hidden,
         });
+        const promptCfg = this._trackConfigForFixedType(TRACK_TYPE.PROMPT);
         layout.push({
             type: TRACK_TYPE.PROMPT,
             label: "Prompt",
@@ -2748,8 +3026,8 @@ export class EditorWidget {
             laneIndex: 0,
             collapsed: isStored ? storedCollapsed.has(TRACK_TYPE.PROMPT + ":0") : false,
             color: "",
-            locked: false,
-            hidden: false,
+            locked: !!promptCfg.locked,
+            hidden: !!promptCfg.hidden,
         });
 
         this._trackLayout = layout;
@@ -2831,13 +3109,21 @@ export class EditorWidget {
         const postContext = this._contextFrameValue("post_context_frames");
         const contextStart = Math.max(0, this.selectionStart - preContext);
         const contextEnd = Math.min(sceneEnd, this.selectionEnd + postContext);
+        const maskPre = Math.min(this._contextFrameValue("mask_pre_offset"), this.selectionStart - contextStart);
+        const maskPost = Math.min(this._contextFrameValue("mask_post_offset"), contextEnd - this.selectionEnd);
+        const maskStart = Math.max(contextStart, this.selectionStart - maskPre);
+        const maskEnd = Math.min(contextEnd, this.selectionEnd + maskPost);
         return {
             selectionStart: this.selectionStart,
             selectionEnd: this.selectionEnd,
             contextStart,
             contextEnd,
+            maskStart,
+            maskEnd,
             hasPreContext: contextStart < this.selectionStart,
             hasPostContext: contextEnd > this.selectionEnd,
+            hasMaskPre: maskStart < this.selectionStart,
+            hasMaskPost: maskEnd > this.selectionEnd,
         };
     }
 
@@ -3209,6 +3495,8 @@ export class EditorWidget {
             controls.defaultSavePreset._sonderSyncTitle?.();
         }
         if (controls.guideSnapshotMaxLongEdge) controls.guideSnapshotMaxLongEdge.value = String(this._settings.guides?.guideSnapshotMaxLongEdge ?? 0);
+        if (controls.hoverPreviewEnabled) controls.hoverPreviewEnabled.checked = this._settings.guides?.hoverPreviewEnabled ?? true;
+        if (controls.hoverPreviewSize) controls.hoverPreviewSize.value = String(this._guideHoverPreviewSize());
         for (const sync of controls._syncPresetNumberControls || []) {
             sync();
         }
@@ -3374,6 +3662,7 @@ export class EditorWidget {
         const canvasH = Math.max(rulerH + 1, this._timelineHeight);
         this._clampScrollX();
         this._clampScrollY();
+        this._refreshPlayheadInput?.();
 
         // Canvas at 1:1 — per-section scales handle individual elements
         canvas.width = width;
@@ -3491,6 +3780,7 @@ export class EditorWidget {
             const h = this._trackH(i);
             const collapsed = entry.collapsed;
             const isLane = this._isLaneTrackType(entry.type);
+            const hasHeaderControls = this._isHeaderControllableTrackType(entry.type);
 
             // Track background: alternating navy base, plus optional per-type tint overlay from settings
             ctx.fillStyle = i % 2 === 0 ? this._timelineColor(COLORS.track) : this._timelineColor(COLORS.bg);
@@ -3526,7 +3816,7 @@ export class EditorWidget {
                 ctx.fillText("▾", curX, y + h / 2 + Math.round((fs ? 5 : 4) * hs));
                 curX += iconSize + Math.round(2 * hs);
 
-                if (isLane) {
+                if (hasHeaderControls) {
                     // 2. Lock icon — bright red-orange when locked, dim when unlocked
                     if (entry.locked) {
                         // Draw bright background indicator for locked state
@@ -3539,17 +3829,24 @@ export class EditorWidget {
                     curX += iconSize + Math.round(1 * hs);
 
                     // 3. Hide/Mute icon
-                    if (entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.MOTION_DRIVER) {
-                        ctx.fillStyle = entry.hidden ? "#e05050" : "#555";
-                        ctx.fillText(entry.hidden ? "🚫" : "👁", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
-                    } else {
-                        ctx.fillStyle = entry.hidden ? "#e05050" : "#555";
-                        ctx.fillText(entry.hidden ? "🔇" : "🔊", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
-                    }
+                    const visibilityState = this._trackVisibilityState(entry);
+                    const isAudioLike = entry.type === TRACK_TYPE.AUDIO || entry.type === TRACK_TYPE.PROMPT;
+                    ctx.fillStyle = visibilityState === "hidden"
+                        ? "#e05050"
+                        : visibilityState === "partial"
+                            ? COLORS.warningText
+                            : "#555";
+                    const visibleIcon = isAudioLike ? "🔊" : "👁";
+                    const hiddenIcon = isAudioLike ? "🔇" : "🚫";
+                    ctx.fillText(
+                        visibilityState === "partial" ? "◐" : (visibilityState === "hidden" ? hiddenIcon : visibleIcon),
+                        curX,
+                        y + h / 2 + Math.round((fs ? 4 : 3) * hs)
+                    );
                     curX += iconSize + Math.round(1 * hs);
 
                     // 4. Color bar
-                    if (entry.color) {
+                    if (isLane && entry.color) {
                         ctx.fillStyle = entry.color;
                         ctx.fillRect(curX, y + 2, Math.round(4 * hs), h - 4);
                     }
@@ -3557,7 +3854,7 @@ export class EditorWidget {
                 }
 
                 // 5. Label
-                ctx.fillStyle = isLane && entry.hidden ? "#666" : COLORS.textDim;
+                ctx.fillStyle = hasHeaderControls && this._trackVisibilityState(entry) === "hidden" ? "#666" : COLORS.textDim;
                 ctx.font = `${Math.round((fs ? 10 : 8) * hs)}px sans-serif`;
                 ctx.textAlign = "left";
                 const labelText = entry.label;
@@ -3621,6 +3918,30 @@ export class EditorWidget {
             ctx.stroke();
         }
 
+        if (range.hasMaskPre) {
+            const maskX1 = this._frameToX(range.maskStart);
+            ctx.fillStyle = COLORS.maskOffset;
+            ctx.fillRect(maskX1, y, x1 - maskX1, h);
+            ctx.strokeStyle = COLORS.maskOffsetBorder;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(maskX1, y);
+            ctx.lineTo(maskX1, y + h);
+            ctx.stroke();
+        }
+
+        if (range.hasMaskPost) {
+            const maskX2 = this._frameToX(range.maskEnd);
+            ctx.fillStyle = COLORS.maskOffset;
+            ctx.fillRect(x2, y, maskX2 - x2, h);
+            ctx.strokeStyle = COLORS.maskOffsetBorder;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(maskX2, y);
+            ctx.lineTo(maskX2, y + h);
+            ctx.stroke();
+        }
+
         // Fill
         ctx.fillStyle = COLORS.selection;
         ctx.fillRect(x1, y, x2 - x1, h);
@@ -3636,6 +3957,35 @@ export class EditorWidget {
         ctx.fillRect(x2 - 2, y, 4, h);
     }
 
+    _drawMutedOverlay(ctx, x, y, w, h, label = "Hidden") {
+        if (w <= 1 || h <= 1) return;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x, y, w, h);
+        ctx.clip();
+        ctx.fillStyle = "rgba(0, 0, 0, 0.28)";
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeStyle = "rgba(230, 230, 230, 0.26)";
+        ctx.lineWidth = 1;
+        for (let lx = x - h; lx < x + w + h; lx += 8) {
+            ctx.beginPath();
+            ctx.moveTo(lx, y + h);
+            ctx.lineTo(lx + h, y);
+            ctx.stroke();
+        }
+        if (w > 28) {
+            ctx.fillStyle = "rgba(0, 0, 0, 0.56)";
+            const badgeW = Math.min(w - 4, Math.max(24, label.length * 6 + 8));
+            const badgeH = Math.min(14, h - 4);
+            ctx.fillRect(x + 3, y + 3, badgeW, badgeH);
+            ctx.fillStyle = "#e8edf2";
+            ctx.font = `${Math.max(8, Math.round(8 * this._scaleTimeline))}px sans-serif`;
+            ctx.textAlign = "left";
+            ctx.fillText(label, x + 7, y + 3 + badgeH - 4);
+        }
+        ctx.restore();
+    }
+
     _drawGuideMarkers(ctx, width) {
         if (!this.activeScene) return;
         const gi = this._guidesLayoutIdx();
@@ -3644,6 +3994,7 @@ export class EditorWidget {
         const guides = this.activeScene.guide_frames || [];
         const y = this._trackY(gi);
         const h = this._trackH(gi);
+        const trackHidden = !!this._trackLayout[gi]?.hidden;
 
         for (const guide of guides) {
             let idx = guide._previewFrameIndex ?? guide.frame_index;
@@ -3656,6 +4007,8 @@ export class EditorWidget {
 
             // Diamond marker
             const isSelectedGuide = this._isSelected("guide", guide.frame_index);
+            const guideHidden = trackHidden || !!guide.muted;
+            ctx.globalAlpha = guideHidden ? 0.42 : 1.0;
             ctx.fillStyle = isMissingGuide
                 ? (isSelectedGuide ? "#ffb18c" : "#c97a59")
                 : (isSelectedGuide ? COLORS.guideSelected : COLORS.guide);
@@ -3666,9 +4019,15 @@ export class EditorWidget {
             ctx.lineTo(x - 8, y + h / 2);
             ctx.closePath();
             ctx.fill();
+            if (guideHidden) {
+                ctx.strokeStyle = "rgba(255,255,255,0.45)";
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            }
+            ctx.globalAlpha = 1.0;
 
             // Label
-            ctx.fillStyle = COLORS.text;
+            ctx.fillStyle = guideHidden ? COLORS.textDim : COLORS.text;
             ctx.font = `${Math.round(8 * this._scaleTimeline)}px monospace`;
             ctx.textAlign = "center";
             ctx.fillText(`f${idx}`, x, y + h + Math.round(10 * this._scaleTimeline));
@@ -3717,7 +4076,8 @@ export class EditorWidget {
 
                 const isSelectedClip = this._isSelected("clip", clip.clip_id);
                 const opacity = clip.opacity ?? 1.0;
-                const baseAlpha = laneHidden ? 0.3 : (opacity < 1.0 ? Math.max(0.3, opacity) : 1.0);
+                const clipMuted = !!clip.muted;
+                const baseAlpha = (laneHidden || clipMuted) ? 0.3 : (opacity < 1.0 ? Math.max(0.3, opacity) : 1.0);
                 const clipAsset = this._getAssetForSourcePath(clip.source_path);
                 const isMissingClip = !clipAsset || !!clipAsset.missing;
                 const laneBaseColor = _vlEntry.color || (isMotionDriverLane ? COLORS.motionDriver : COLORS.clip);
@@ -3833,6 +4193,10 @@ export class EditorWidget {
                     ctx.restore();
                 }
 
+                if (clipMuted) {
+                    this._drawMutedOverlay(ctx, x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4, "Hidden");
+                }
+
                 // Permanent trim ghost
                 const clipOrigin = clip.source_origin_frame || 0;
                 const clipTotal = clip.total_source_frames || 0;
@@ -3880,9 +4244,10 @@ export class EditorWidget {
                 const vol = track.volume ?? 1.0;
                 const audioAsset = this._getAssetForSourcePath(track.source_path);
                 const isMissingAudio = !audioAsset || !!audioAsset.missing;
+                const audioMuted = audioLaneHidden || !!track.muted;
                 const laneBaseColor = _alEntry.color || COLORS.audioClip;
                 const audioFillColor = isSelectedAudio ? lightenColor(laneBaseColor, 0.3) : laneBaseColor;
-                ctx.globalAlpha = audioLaneHidden ? 0.3 : 1.0;
+                ctx.globalAlpha = audioMuted ? 0.3 : 1.0;
                 ctx.fillStyle = isMissingAudio
                     ? (isSelectedAudio ? "#c97a59" : "#5f4038")
                     : audioFillColor;
@@ -3968,6 +4333,10 @@ export class EditorWidget {
                     ctx.restore();
                 }
 
+                if (track.muted) {
+                    this._drawMutedOverlay(ctx, x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4, "Muted");
+                }
+
                 // Permanent trim ghost for audio
                 const audioOrigin = track.source_origin_frame || 0;
                 const audioTotal = track.total_source_frames || 0;
@@ -4003,6 +4372,7 @@ export class EditorWidget {
             const sections = this.activeScene.prompt_sections || [];
             const promptY = this._trackY(pi);
             const promptH = this._trackH(pi);
+            const promptHidden = !!this._trackLayout[pi]?.hidden;
             for (let si = 0; si < sections.length; si++) {
                 const section = sections[si];
                 const x1 = this._frameToX(section.start_frame);
@@ -4014,6 +4384,7 @@ export class EditorWidget {
                     this._selectedPromptIdx < sections.length &&
                     sections[this._selectedPromptIdx] === section);
 
+                ctx.globalAlpha = promptHidden ? 0.42 : 1.0;
                 ctx.fillStyle = isSelected ? "rgba(180, 120, 255, 0.4)" : COLORS.promptSection;
                 ctx.fillRect(x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4);
 
@@ -4032,6 +4403,10 @@ export class EditorWidget {
                     ctx.clip();
                     ctx.fillText(section.prompt, x1 + 4, promptY + promptH / 2 + Math.round(3 * this._scaleTimeline));
                     ctx.restore();
+                }
+                ctx.globalAlpha = 1.0;
+                if (promptHidden) {
+                    this._drawMutedOverlay(ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, "Hidden");
                 }
 
                 // Trim ghost
@@ -4116,8 +4491,8 @@ export class EditorWidget {
         const layoutIdx = this._layoutIndexFromRawY(rawY);
         if (layoutIdx < 0) return null;
         const entry = this._trackLayout[layoutIdx];
-        const isLane = this._isLaneTrackType(entry.type);
-        if (entry.collapsed || !isLane) {
+        const hasHeaderControls = this._isHeaderControllableTrackType(entry.type);
+        if (entry.collapsed || !hasHeaderControls) {
             return { layoutIdx, zone: "collapse" };
         }
         // Zone detection (left to right) matching _drawTracks layout
@@ -4464,12 +4839,13 @@ export class EditorWidget {
                         this._persistTrackCollapseState();
                         break;
                     case "lock":
+                        this._pushUndo("toggle track lock");
                         entry.locked = !entry.locked;
                         this._saveLaneConfig();
                         break;
                     case "hide":
-                        entry.hidden = !entry.hidden;
-                        this._saveLaneConfig();
+                        this._pushUndo("toggle track visibility");
+                        void this._toggleHeaderVisibility(entry);
                         break;
                 }
                 this._renderTimeline();
@@ -4490,6 +4866,7 @@ export class EditorWidget {
                         // Block trim on locked lanes
                         if (edgeHit.type === "clip" && this._isLaneLocked(this._clipTrackType(edgeHit.data), edgeHit.data.track_index || 0)) return;
                         if (edgeHit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, edgeHit.data.lane_index || 0)) return;
+                        if (edgeHit.type === "prompt" && this._isPromptTrackLocked()) return;
                         this._pushUndo("trim");
                         const isPrompt = edgeHit.type === "prompt";
                         this._trimItem = {
@@ -4525,11 +4902,7 @@ export class EditorWidget {
                         }
                         this._hideItemEditor(); // Will show on mouseup if no drag
                         // Block drag if any selected item is on a locked lane
-                        const anyLocked = this.selectedItems.some(s => {
-                            if (s.type === "clip") return this._isLaneLocked(this._clipTrackType(s.data), s.data.track_index || 0);
-                            if (s.type === "audio") return this._isLaneLocked(TRACK_TYPE.AUDIO, s.data.lane_index || 0);
-                            return false;
-                        });
+                        const anyLocked = this.selectedItems.some(s => this._isItemLocked(s));
                         if (anyLocked) return;
                         this._pushUndo("move items"); // Capture BEFORE drag modifies data
                         this.isDragging = true;
@@ -4570,6 +4943,12 @@ export class EditorWidget {
             const { x, y, rawY } = this._canvasMouseCoords(e);
 
             if (!this.isDragging) {
+                const guideHit = this._hitTestGuide(x, rawY);
+                if (guideHit) {
+                    this._showGuideHoverPreview(guideHit.data, e.clientX, e.clientY);
+                } else {
+                    this._hideGuideHoverPreview();
+                }
                 // Update cursor based on position
                 if (this._hitTestHeaderEdge(x, y)) {
                     canvas.style.cursor = "col-resize";
@@ -4584,6 +4963,7 @@ export class EditorWidget {
                 }
                 return;
             }
+            this._hideGuideHoverPreview();
 
             // Header resize drag
             if (this.dragType === "headerResize") {
@@ -4794,9 +5174,8 @@ export class EditorWidget {
                     [this.selectionStart, this.selectionEnd] = [this.selectionEnd, this.selectionStart];
                 }
 
-                // Update hidden widgets
-                this._setWidgetValue("selection_start", this.selectionStart);
-                this._setWidgetValue("selection_end", this.selectionEnd);
+                // Update hidden widgets and browser-local selection memory.
+                this._setTimelineSelection(this.selectionStart, this.selectionEnd, { render: false });
             }
 
             this._renderTimeline();
@@ -4804,6 +5183,7 @@ export class EditorWidget {
 
         canvas.addEventListener("mouseup", onMouseUp);
         canvas.addEventListener("mouseleave", onMouseUp);
+        canvas.addEventListener("mouseleave", () => this._hideGuideHoverPreview());
 
         // Scroll to pan
         canvas.addEventListener("wheel", (e) => {
@@ -4853,6 +5233,7 @@ export class EditorWidget {
             const { x, rawY } = this._canvasMouseCoords(e);
             const promptLayoutIdx = this._promptLayoutIdx();
             if (promptLayoutIdx >= 0 && this._layoutIndexFromRawY(rawY) === promptLayoutIdx) {
+                if (this._isPromptTrackLocked()) return;
                 const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
                 this._createPromptSection(frame);
             }
@@ -4887,6 +5268,10 @@ export class EditorWidget {
             const headerHit = this._hitTestTrackHeader(x, rawY);
             if (headerHit) {
                 const entry = this._trackLayout[headerHit.layoutIdx];
+                if (entry.type === TRACK_TYPE.GUIDES) {
+                    this._showGuideManagementPopup(e.clientX, e.clientY);
+                    return;
+                }
                 if (this._isLaneTrackType(entry.type)) {
                     const isVideo = entry.type === TRACK_TYPE.VIDEO;
                     const isMotionDriver = entry.type === TRACK_TYPE.MOTION_DRIVER;
@@ -4930,8 +5315,7 @@ export class EditorWidget {
                 this._renderTimeline();
 
                 const count = this.selectedItems.length;
-                const itemLocked = (hit.type === "clip" && this._isLaneLocked(this._clipTrackType(hit.data), hit.data.track_index || 0))
-                    || (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0));
+                const itemLocked = this._isItemLocked(hit);
                 if (count > 1) {
                     menuItems.push({ label: `Delete ${count} items`, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "clip") {
@@ -4950,7 +5334,12 @@ export class EditorWidget {
                             : () => this._convertClipRole(hit.data.clip_id, isMotionDriverClip ? "render" : "motion_driver"),
                         disabled: itemLocked || !canConvertRole,
                     });
-                    menuItems.push({ label: "Add Frame to Guides", action: () => this._addClipFrameToGuides(hit.data) });
+                    menuItems.push({
+                        label: "Set Selection to Clip",
+                        action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
+                    });
+                    const guidesLocked = this._isGuideTrackLocked();
+                    menuItems.push({ label: guidesLocked ? "Add Frame to Guides (locked)" : "Add Frame to Guides", action: guidesLocked ? () => {} : () => this._addClipFrameToGuides(hit.data), disabled: guidesLocked });
                     if (clipAsset?.asset_id) {
                         menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(clipAsset) });
                     }
@@ -4991,7 +5380,7 @@ export class EditorWidget {
                             action: () => this._setSceneAspectRatioFromDimensions(guideAsset.width, guideAsset.height),
                         });
                     }
-                    menuItems.push({ label: "Delete Guide", action: () => this._deleteSelectedItems(), danger: true });
+                    menuItems.push({ label: itemLocked ? "Delete Guide (locked)" : "Delete Guide", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 }
             }
 
@@ -5006,9 +5395,10 @@ export class EditorWidget {
                         this._showPromptEditor(sections[idx], idx);
                         this._renderTimeline();
                     }});
-                    menuItems.push({ label: "Delete Prompt", action: () => {
+                    const promptLocked = this._isPromptTrackLocked();
+                    menuItems.push({ label: promptLocked ? "Delete Prompt (locked)" : "Delete Prompt", action: promptLocked ? () => {} : () => {
                         if (confirm("Delete this prompt section?")) this._deletePromptSection(idx);
-                    }, danger: true });
+                    }, danger: true, disabled: promptLocked });
                 }
             }
 
@@ -5028,6 +5418,11 @@ export class EditorWidget {
         // Take-aware drop: if asset has take_metadata, auto-place at original position
         if (asset.generation_params?.selection_start !== undefined && asset.generation_params?.scene_id === this.activeScene.scene_id) {
             frame = asset.generation_params.selection_start;
+        }
+
+        if (asset.asset_type === "image" && this._isGuideTrackLocked()) {
+            this._showToast("Guides track is locked");
+            return;
         }
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -5374,6 +5769,47 @@ export class EditorWidget {
         return idx >= 0 && this._trackLayout[idx]?.hidden;
     }
 
+    async _setTrackItemsMuted(entry, muted) {
+        const items = this._trackItemsForEntry(entry).filter((item) => "muted" in item);
+        for (const item of items) {
+            if (!!item.muted === !!muted) continue;
+            item.muted = !!muted;
+            const type = entry.type === TRACK_TYPE.AUDIO
+                ? "audio"
+                : entry.type === TRACK_TYPE.GUIDES
+                    ? "guide"
+                    : "clip";
+            const id = type === "audio"
+                ? item.track_id
+                : type === "guide"
+                    ? item.frame_index
+                    : item.clip_id;
+            await this._updateItemProperty(type, id, { muted: !!muted }, { refresh: false });
+        }
+    }
+
+    async _toggleHeaderVisibility(entry) {
+        if (!entry) return;
+        const state = this._trackVisibilityState(entry);
+        if (state === "visible") {
+            entry.hidden = true;
+            await this._saveLaneConfig();
+        } else {
+            const itemsMuted = this._trackItemsForEntry(entry).some((item) => !!item.muted);
+            entry.hidden = false;
+            await this._saveLaneConfig();
+            if (itemsMuted && !entry.locked) {
+                await this._setTrackItemsMuted(entry, false);
+                await this._fetchScenes();
+                this._reconcileSelection();
+                this._buildTrackLayout();
+            }
+        }
+        this._renderTimeline();
+        this._renderViewportFrame();
+        this._updateToolbar();
+    }
+
     /** Start inline rename for a lane header */
     _startLaneRename(layoutIdx) {
         const entry = this._trackLayout[layoutIdx];
@@ -5439,6 +5875,8 @@ export class EditorWidget {
         const videoConfigs = [];
         const motionDriverConfigs = [];
         const audioConfigs = [];
+        let guideTrackConfig = this._defaultLaneConfig();
+        let promptTrackConfig = this._defaultLaneConfig();
         for (const e of this._trackLayout) {
             if (e.type === TRACK_TYPE.VIDEO) {
                 videoConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
@@ -5446,6 +5884,10 @@ export class EditorWidget {
                 motionDriverConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
             } else if (e.type === TRACK_TYPE.AUDIO) {
                 audioConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
+            } else if (e.type === TRACK_TYPE.GUIDES) {
+                guideTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
+            } else if (e.type === TRACK_TYPE.PROMPT) {
+                promptTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
             }
         }
         // Fill any sparse gaps
@@ -5460,6 +5902,8 @@ export class EditorWidget {
                     video_lane_configs: videoConfigs,
                     motion_driver_lane_configs: motionDriverConfigs,
                     audio_lane_configs: audioConfigs,
+                    guide_track_config: guideTrackConfig,
+                    prompt_track_config: promptTrackConfig,
                 }),
             });
             // Update local scene data
@@ -5467,6 +5911,8 @@ export class EditorWidget {
                 sceneRef.video_lane_configs = videoConfigs;
                 sceneRef.motion_driver_lane_configs = motionDriverConfigs;
                 sceneRef.audio_lane_configs = audioConfigs;
+                sceneRef.guide_track_config = guideTrackConfig;
+                sceneRef.prompt_track_config = promptTrackConfig;
             }
         } catch (e) {
             console.warn("[Sonder] Failed to save lane config:", e);
@@ -5668,6 +6114,7 @@ export class EditorWidget {
     }
 
     _showPromptCreator(startFrame, endFrame) {
+        if (this._isPromptTrackLocked()) return;
         this._hidePromptEditor();
 
         const editor = document.createElement("div");
@@ -5718,6 +6165,7 @@ export class EditorWidget {
 
     async _saveNewPromptSection(startFrame, endFrame, promptText) {
         if (!this.activeScene || !this.projectDir) return;
+        if (this._isPromptTrackLocked()) return;
         this._pushUndo("add prompt");
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
@@ -5740,6 +6188,7 @@ export class EditorWidget {
     }
 
     _showPromptEditor(section, idx) {
+        if (this._isPromptTrackLocked()) return;
         this._hidePromptEditor();
 
         const editor = document.createElement("div");
@@ -5806,6 +6255,7 @@ export class EditorWidget {
 
     async _updatePromptSection(idx, updates) {
         if (!this.activeScene || !this.projectDir) return;
+        if (this._isPromptTrackLocked()) return;
         this._pushUndo("edit prompt");
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
@@ -5825,6 +6275,7 @@ export class EditorWidget {
 
     async _deletePromptSection(idx) {
         if (!this.activeScene || !this.projectDir) return;
+        if (this._isPromptTrackLocked()) return;
         this._pushUndo("delete prompt");
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
@@ -5922,6 +6373,16 @@ export class EditorWidget {
                     });
                     editor.append(opLabel, opInput, opVal);
                 }
+                const clipMuteBtn = this._makeBtn(data.muted ? "Hidden" : "Visible", "Toggle clip visibility");
+                clipMuteBtn.addEventListener("click", () => {
+                    this._pushUndo("toggle clip mute");
+                    data.muted = !data.muted;
+                    clipMuteBtn.textContent = data.muted ? "Hidden" : "Visible";
+                    this._updateItemProperty(type, id, { muted: data.muted });
+                    this._renderTimeline();
+                    this._renderViewportFrame();
+                });
+                editor.appendChild(clipMuteBtn);
             } else {
                 // Volume slider for audio
                 const volLabel = this._makeEditorLabel("Vol:");
@@ -5951,6 +6412,7 @@ export class EditorWidget {
                     muteBtn.textContent = data.muted ? "🔇" : "🔊";
                     this._updateItemProperty(type, id, { muted: data.muted });
                     this._renderTimeline();
+                    this._renderViewportFrame();
                 });
                 editor.append(volLabel, volInput, volVal, muteBtn);
             }
@@ -5998,6 +6460,28 @@ export class EditorWidget {
             const strengthInput = this._makeEditorInput((data.strength ?? 1.0).toFixed(2), 0, 1);
             strengthInput.step = "0.05";
             editor.append(strengthLabel, strengthInput);
+
+            const guideAsset = this._getGuideAsset(data);
+            const thumbUrl = guideAsset && !guideAsset.missing ? this._buildViewURL(guideAsset.path) : null;
+            if (thumbUrl) {
+                const thumb = document.createElement("img");
+                thumb.src = thumbUrl;
+                thumb.alt = "";
+                thumb.title = guideAsset.name || "Guide asset";
+                thumb.style.cssText = "width:32px;height:20px;object-fit:cover;border-radius:3px;border:1px solid rgba(255,255,255,0.18);background:#000;";
+                editor.appendChild(thumb);
+            }
+
+            const guideMuteBtn = this._makeBtn(data.muted ? "Hidden" : "Visible", "Toggle guide visibility");
+            guideMuteBtn.addEventListener("click", () => {
+                this._pushUndo("toggle guide mute");
+                data.muted = !data.muted;
+                guideMuteBtn.textContent = data.muted ? "Hidden" : "Visible";
+                this._updateItemProperty(type, id, { muted: data.muted });
+                this._renderTimeline();
+                this._renderViewportFrame();
+            });
+            editor.appendChild(guideMuteBtn);
 
             const applyGuideEdit = () => {
                 const newIdx = this._parsePositionInput(frameInput.value);
@@ -6104,29 +6588,58 @@ export class EditorWidget {
         }
     }
 
-    async _updateItemProperty(type, id, props) {
+    async _updateItemProperty(type, id, props, { refresh = true } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
         const endpoint = type === "clip"
             ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`
-            : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
+            : type === "guide"
+                ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${id}`
+                : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
+        const method = type === "guide" ? "PATCH" : "PUT";
 
         try {
             await fetch(api.apiURL(endpoint), {
-                method: "PUT",
+                method,
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(props),
             });
-            await this._fetchScenes();
-            this._renderTimeline();
+            if (refresh) {
+                await this._fetchScenes();
+                this._renderTimeline();
+                this._renderViewportFrame();
+            }
         } catch (e) {
             console.warn("[Sonder] Failed to update item property:", e);
         }
     }
 
+    async _toggleSelectedMute() {
+        const targets = this.selectedItems
+            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide")
+            .filter((item) => !this._isItemLocked(item));
+        if (!targets.length) return;
+
+        const nextMuted = !targets.every((item) => !!item.data?.muted);
+        this._pushUndo(nextMuted ? "mute items" : "unmute items");
+        for (const item of targets) {
+            item.data.muted = nextMuted;
+            await this._updateItemProperty(item.type, item.id, { muted: nextMuted }, { refresh: false });
+        }
+        await this._fetchScenes();
+        this._reconcileSelection();
+        if (this._itemEditorEl && this.selectedItem) {
+            this._showItemEditor();
+        }
+        this._renderTimeline();
+        this._renderViewportFrame();
+        this._updateToolbar();
+    }
+
     async _moveGuideToFrame(guideData, newIdx, strength = guideData?.strength ?? 1.0) {
         if (!this.activeScene || !this.projectDir) return;
+        if (this._isGuideTrackLocked()) return;
         this._pushUndo("move guide");
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
@@ -6144,6 +6657,7 @@ export class EditorWidget {
                     asset_id: guideData.asset_id,
                     source: guideData.source || "asset",
                     strength,
+                    muted: !!guideData.muted,
                 }),
             });
             await this._fetchScenes();
@@ -6159,6 +6673,108 @@ export class EditorWidget {
     _guideSnapshotMaxLongEdge() {
         const value = Number(this._settings?.guides?.guideSnapshotMaxLongEdge ?? 0);
         return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+    }
+
+    _guideHoverPreviewEnabled() {
+        return this._settings?.guides?.hoverPreviewEnabled ?? true;
+    }
+
+    _guideHoverPreviewSize() {
+        const value = Number(this._settings?.guides?.hoverPreviewSize ?? DEFAULT_EDITOR_SETTINGS.guides.hoverPreviewSize);
+        if (!Number.isFinite(value)) return DEFAULT_EDITOR_SETTINGS.guides.hoverPreviewSize;
+        return Math.max(96, Math.min(360, Math.round(value)));
+    }
+
+    _hideGuideHoverPreview() {
+        if (this._guidePreviewEl) {
+            this._guidePreviewEl.remove();
+            this._guidePreviewEl = null;
+        }
+    }
+
+    _showGuideHoverPreview(guide, clientX, clientY) {
+        if (!guide || !this._guideHoverPreviewEnabled()) {
+            this._hideGuideHoverPreview();
+            return;
+        }
+
+        const size = this._guideHoverPreviewSize();
+        const frame = guide.frame_index === -1 ? Math.max(0, this.totalFrames - 1) : guide.frame_index;
+        const asset = this._getGuideAsset(guide);
+        const hidden = this._isGuideTrackHidden() || !!guide.muted;
+        const url = asset && !asset.missing && asset.path ? this._buildViewURL(asset.path) : "";
+        const name = asset?.name || asset?.path?.split(/[/\\]/).pop() || guide.asset_id || "Guide";
+
+        let preview = this._guidePreviewEl;
+        if (!preview) {
+            preview = document.createElement("div");
+            preview.style.cssText = `
+                position: fixed; z-index: 10030; pointer-events: none;
+                border-radius: 8px; overflow: hidden;
+                box-shadow: 0 18px 42px rgba(0,0,0,0.52);
+                font-family: 'Segoe UI', Arial, sans-serif;
+            `;
+            document.body.appendChild(preview);
+            this._guidePreviewEl = preview;
+        }
+
+        preview.innerHTML = "";
+        preview.style.width = `${size}px`;
+        preview.style.background = hidden ? "rgba(31, 25, 20, 0.98)" : "rgba(15, 19, 24, 0.98)";
+        preview.style.border = hidden ? `1px solid ${COLORS.warningBorder}` : `1px solid ${COLORS.borderStrong}`;
+        preview.style.opacity = hidden ? "0.88" : "1";
+
+        const imageWrap = document.createElement("div");
+        imageWrap.style.cssText = `
+            width: ${size}px; height: ${Math.round(size * 0.62)}px;
+            background: #05070a; display: flex; align-items: center; justify-content: center;
+            position: relative;
+        `;
+        if (url) {
+            const img = document.createElement("img");
+            img.src = url;
+            img.alt = "";
+            img.style.cssText = "max-width:100%;max-height:100%;object-fit:contain;display:block;";
+            imageWrap.appendChild(img);
+        } else {
+            const missing = document.createElement("div");
+            missing.textContent = asset?.missing ? "Missing asset" : "No thumbnail";
+            missing.style.cssText = `font-size:11px;color:${COLORS.textMuted};`;
+            imageWrap.appendChild(missing);
+        }
+        if (hidden) {
+            const badge = document.createElement("div");
+            badge.textContent = "Hidden";
+            badge.style.cssText = `
+                position:absolute;left:8px;top:8px;padding:3px 7px;border-radius:999px;
+                background:rgba(0,0,0,0.68);border:1px solid ${COLORS.warningBorder};
+                color:${COLORS.warningText};font-size:10px;font-weight:700;
+            `;
+            imageWrap.appendChild(badge);
+        }
+
+        const meta = document.createElement("div");
+        meta.style.cssText = "padding:8px 10px;display:flex;align-items:center;justify-content:space-between;gap:10px;";
+        const label = document.createElement("div");
+        label.textContent = name;
+        label.style.cssText = `min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:${COLORS.text};`;
+        const frameLabel = document.createElement("div");
+        frameLabel.textContent = `f${frame}`;
+        frameLabel.style.cssText = `flex-shrink:0;font-size:11px;color:${COLORS.guideSelected};font-family:monospace;`;
+        meta.append(label, frameLabel);
+
+        preview.append(imageWrap, meta);
+
+        const margin = 12;
+        const estimatedHeight = Math.round(size * 0.62) + 38;
+        let left = clientX + 18;
+        let top = clientY - estimatedHeight - 14;
+        if (left + size + margin > window.innerWidth) left = clientX - size - 18;
+        if (top < margin) top = clientY + 18;
+        left = Math.max(margin, Math.min(window.innerWidth - size - margin, left));
+        top = Math.max(margin, Math.min(window.innerHeight - estimatedHeight - margin, top));
+        preview.style.left = `${left}px`;
+        preview.style.top = `${top}px`;
     }
 
     _resolveGuideSnapshotTargetLongEdge(clip) {
@@ -6183,6 +6799,10 @@ export class EditorWidget {
 
     async _addClipFrameToGuides(clip) {
         if (!this.activeScene || !this.projectDir || !clip) return;
+        if (this._isGuideTrackLocked()) {
+            this._showToast("Guides track is locked");
+            return;
+        }
         const dirName = this._projectDirName();
         const sourceFrame = Math.max(0, this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0));
         const targetLongEdge = this._resolveGuideSnapshotTargetLongEdge(clip);
@@ -6270,6 +6890,8 @@ export class EditorWidget {
 
     async _deleteSelectedItems() {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
+        this.selectedItems = this.selectedItems.filter((item) => !this._isItemLocked(item));
+        if (this.selectedItems.length === 0) return;
         this._pushUndo("delete items");
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
@@ -6355,6 +6977,7 @@ export class EditorWidget {
                     continue;
                 }
                 if (type === "guide") {
+                    if (this._isGuideTrackLocked()) continue;
                     const oldIdx = orig.origStart;
                     const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
                     const newIdx = previewIdx ?? Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
@@ -6370,10 +6993,12 @@ export class EditorWidget {
                             asset_id: data.asset_id,
                             source: data.source || "asset",
                             strength: data.strength ?? 1.0,
+                            muted: !!data.muted,
                         }),
                     });
                     delete data._previewFrameIndex;
                 } else if (type === "prompt") {
+                    if (this._isPromptTrackLocked()) continue;
                     await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
                         method: "PUT",
                         headers: { "Content-Type": "application/json" },
@@ -6424,6 +7049,7 @@ export class EditorWidget {
                     }),
                 });
             } else if (type === "prompt") {
+                if (this._isPromptTrackLocked()) return;
                 await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
@@ -6472,6 +7098,407 @@ export class EditorWidget {
     }
 
     // ── Context Menu ──────────────────────────────────────────────────
+    _showGuideManagementPopupLegacy(x, y) {
+        this._hideGuideManagementPopup();
+        const popup = document.createElement("div");
+        popup.style.cssText = `
+            position: fixed; left: ${x}px; top: ${y}px; z-index: 10000;
+            min-width: 320px; max-width: 420px; max-height: 360px; overflow: auto;
+            background: ${COLORS.panel}; border: 1px solid ${COLORS.borderStrong};
+            border-radius: 6px; box-shadow: 0 12px 28px rgba(0,0,0,0.45);
+            padding: 8px; color: ${COLORS.text}; font-size: 11px;
+        `;
+        const title = document.createElement("div");
+        title.textContent = "Guides";
+        title.style.cssText = `font-weight: 700; color: ${COLORS.guideSelected}; margin-bottom: 6px;`;
+        popup.appendChild(title);
+
+        const guides = (this.activeScene?.guide_frames || [])
+            .slice()
+            .sort((a, b) => {
+                const af = a.frame_index === -1 ? this.totalFrames - 1 : a.frame_index;
+                const bf = b.frame_index === -1 ? this.totalFrames - 1 : b.frame_index;
+                return af - bf;
+            });
+        if (!guides.length) {
+            const empty = document.createElement("div");
+            empty.textContent = "No guides in this scene.";
+            empty.style.cssText = `color:${COLORS.textMuted}; padding:4px 0;`;
+            popup.appendChild(empty);
+        }
+        for (const guide of guides) {
+            const frame = guide.frame_index === -1 ? this.totalFrames - 1 : guide.frame_index;
+            const asset = this._getGuideAsset(guide);
+            const row = document.createElement("div");
+            row.style.cssText = "display:flex;align-items:center;gap:6px;padding:4px 0;border-top:1px solid rgba(255,255,255,0.06);";
+
+            // Thumbnail (cached only)
+            const thumbUrl = asset && !asset.missing && asset.path ? this._buildViewURL(asset.path) : null;
+            const thumb = document.createElement("div");
+            thumb.style.cssText = "width:36px;height:22px;flex-shrink:0;border-radius:3px;border:1px solid rgba(255,255,255,0.18);background:#000;overflow:hidden;";
+            if (thumbUrl) {
+                const img = document.createElement("img");
+                img.src = thumbUrl;
+                img.alt = "";
+                img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+                img.title = asset?.name || asset?.path || "Guide asset";
+                thumb.appendChild(img);
+            }
+
+            // Frame index input
+            const frameInput = document.createElement("input");
+            frameInput.type = "number";
+            frameInput.min = "0";
+            frameInput.max = String(Math.max(0, this.totalFrames - 1));
+            frameInput.value = String(frame);
+            frameInput.title = "Guide frame index (re-keys on commit)";
+            frameInput.style.cssText = `width:54px;${chromeInputCss({ fontSize: "10px", padding: "2px 4px" })}`;
+            const commitFrameInput = () => {
+                const newIdx = parseInt(frameInput.value, 10);
+                if (!Number.isFinite(newIdx) || newIdx === frame) return;
+                const clamped = Math.max(0, Math.min(this.totalFrames - 1, newIdx));
+                this._moveGuideToFrame(guide, clamped, guide.strength);
+                this._hideGuideManagementPopup();
+            };
+            frameInput.addEventListener("change", commitFrameInput);
+            frameInput.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") { commitFrameInput(); e.preventDefault(); }
+                e.stopPropagation();
+            });
+
+            // Strength input
+            const strengthInput = document.createElement("input");
+            strengthInput.type = "number";
+            strengthInput.min = "0";
+            strengthInput.max = "1";
+            strengthInput.step = "0.05";
+            strengthInput.value = (Number(guide.strength ?? 1.0)).toFixed(2);
+            strengthInput.title = "Guide strength (0.0-1.0)";
+            strengthInput.style.cssText = `width:50px;${chromeInputCss({ fontSize: "10px", padding: "2px 4px" })}`;
+            const commitStrength = () => {
+                const next = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
+                if (!Number.isFinite(next) || next === guide.strength) return;
+                guide.strength = next;
+                this._updateItemProperty("guide", guide.frame_index, { strength: next });
+            };
+            strengthInput.addEventListener("change", commitStrength);
+            strengthInput.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") { commitStrength(); e.preventDefault(); }
+                e.stopPropagation();
+            });
+
+            // Asset name label (truncated)
+            const label = document.createElement("div");
+            label.style.cssText = "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+            const name = asset?.name || asset?.path?.split(/[/\\]/).pop() || guide.asset_id || "Guide";
+            label.textContent = name;
+            label.title = name;
+
+            const muteBtn = this._makeBtn(guide.muted ? "Hidden" : "Visible", "Toggle guide visibility");
+            muteBtn.addEventListener("click", async (event) => {
+                event.stopPropagation();
+                this._pushUndo("toggle guide mute");
+                guide.muted = !guide.muted;
+                await this._updateItemProperty("guide", guide.frame_index, { muted: guide.muted });
+                this._showGuideManagementPopup(x, y);
+            });
+
+            const deleteBtn = this._makeBtn("✕", "Delete guide");
+            deleteBtn.style.color = COLORS.dangerText;
+            deleteBtn.addEventListener("click", async (event) => {
+                event.stopPropagation();
+                this._pushUndo("delete guide");
+                const dirName = this._projectDirName();
+                const sceneId = this.activeSceneId;
+                try {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${guide.frame_index}`), {
+                        method: "DELETE",
+                    });
+                    await this._fetchScenes();
+                    this._renderTimeline();
+                    this._showGuideManagementPopup(x, y);
+                } catch (e) {
+                    console.warn("[Sonder] Failed to delete guide:", e);
+                }
+            });
+
+            row.append(thumb, frameInput, strengthInput, label, muteBtn, deleteBtn);
+            popup.appendChild(row);
+        }
+
+        document.body.appendChild(popup);
+        this._guideManagerEl = popup;
+        this._guideManagerMouseOff = (event) => {
+            if (!popup.contains(event.target)) this._hideGuideManagementPopup();
+        };
+        window.setTimeout(() => document.addEventListener("mousedown", this._guideManagerMouseOff, true), 0);
+    }
+
+    _showGuideManagementPopup(x, y) {
+        this._hideGuideManagementPopup();
+        this._hideGuideHoverPreview();
+
+        const backdrop = document.createElement("div");
+        backdrop.style.cssText = `
+            position: fixed; inset: 0; z-index: 10000;
+            background: rgba(7,10,14,0.70);
+            display: flex; align-items: center; justify-content: center;
+            padding: 24px;
+        `;
+
+        const panel = document.createElement("div");
+        panel.style.cssText = `${chromeOverlayPanelCss({
+            width: "min(900px, calc(100vw - 48px))",
+            maxWidth: "900px",
+            maxHeight: "min(720px, calc(100vh - 48px))",
+            padding: "0",
+            fontFamily: "'Segoe UI', Arial, sans-serif",
+        })}`;
+
+        const locked = this._isGuideTrackLocked();
+        const header = document.createElement("div");
+        header.style.cssText = `
+            position: sticky; top: 0; z-index: 1;
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; padding: 16px 18px 12px;
+            background: ${COLORS.panel}; border-bottom: 1px solid ${COLORS.border};
+        `;
+        const titleWrap = document.createElement("div");
+        titleWrap.innerHTML = `
+            <div style="font-size:15px;font-weight:700;color:#fff;">Guides</div>
+            <div style="font-size:11px;color:${locked ? COLORS.warningText : COLORS.textMuted};margin-top:3px;">${locked ? "Guide track locked" : "Frame guides and bridge visibility"}</div>
+        `;
+        const closeBtn = document.createElement("button");
+        closeBtn.textContent = "Close";
+        closeBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "6px 12px", fontSize: "11px", radius: "7px" });
+        closeBtn.addEventListener("click", () => this._hideGuideManagementPopup());
+        header.append(titleWrap, closeBtn);
+        panel.appendChild(header);
+
+        const body = document.createElement("div");
+        body.style.cssText = "padding:14px 18px 18px;display:flex;flex-direction:column;gap:10px;";
+
+        const guides = (this.activeScene?.guide_frames || [])
+            .slice()
+            .sort((a, b) => {
+                const af = a.frame_index === -1 ? this.totalFrames - 1 : a.frame_index;
+                const bf = b.frame_index === -1 ? this.totalFrames - 1 : b.frame_index;
+                return af - bf;
+            });
+
+        const refreshPanel = async () => {
+            await this._fetchScenes();
+            this._renderTimeline();
+            this._renderViewportFrame();
+            this._showGuideManagementPopup(x, y);
+        };
+
+        if (!guides.length) {
+            const empty = document.createElement("div");
+            empty.textContent = "No guides in this scene.";
+            empty.style.cssText = `color:${COLORS.textMuted}; padding:18px 0; text-align:center;`;
+            body.appendChild(empty);
+        }
+
+        for (const guide of guides) {
+            const frame = guide.frame_index === -1 ? this.totalFrames - 1 : guide.frame_index;
+            const asset = this._getGuideAsset(guide);
+            const rowHidden = this._isGuideTrackHidden() || !!guide.muted;
+            const row = document.createElement("div");
+            row.style.cssText = `
+                display:grid;
+                grid-template-columns: 112px 70px 72px minmax(140px, 1fr) 82px minmax(150px, 188px) 58px;
+                align-items:center; gap:10px;
+                padding:10px; border:1px solid ${rowHidden ? COLORS.warningBorder : COLORS.borderSoft};
+                border-radius:8px; background:${rowHidden ? "rgba(48,36,20,0.28)" : COLORS.panelMuted};
+                opacity:${rowHidden ? "0.78" : "1"};
+            `;
+            row.addEventListener("mousemove", (event) => this._showGuideHoverPreview(guide, event.clientX, event.clientY));
+            row.addEventListener("mouseleave", () => this._hideGuideHoverPreview());
+
+            const thumbUrl = asset && !asset.missing && asset.path ? this._buildViewURL(asset.path) : null;
+            const thumb = document.createElement("div");
+            thumb.style.cssText = `
+                width:96px;height:54px;flex-shrink:0;border-radius:5px;
+                border:1px solid rgba(255,255,255,0.18);background:#000;
+                overflow:hidden;display:flex;align-items:center;justify-content:center;
+                position:relative;
+            `;
+            if (thumbUrl) {
+                const img = document.createElement("img");
+                img.src = thumbUrl;
+                img.alt = "";
+                img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+                img.title = asset?.name || asset?.path || "Guide asset";
+                thumb.appendChild(img);
+            } else {
+                const missing = document.createElement("span");
+                missing.textContent = asset?.missing ? "Missing" : "No image";
+                missing.style.cssText = `font-size:10px;color:${COLORS.textMuted};`;
+                thumb.appendChild(missing);
+            }
+            if (rowHidden) {
+                const hiddenBadge = document.createElement("div");
+                hiddenBadge.textContent = "Hidden";
+                hiddenBadge.style.cssText = `
+                    position:absolute;left:6px;top:6px;padding:2px 6px;border-radius:999px;
+                    background:rgba(0,0,0,0.68);border:1px solid ${COLORS.warningBorder};
+                    color:${COLORS.warningText};font-size:9px;font-weight:700;
+                `;
+                thumb.appendChild(hiddenBadge);
+            }
+
+            const frameInput = document.createElement("input");
+            frameInput.type = "number";
+            frameInput.min = "0";
+            frameInput.max = String(Math.max(0, this.totalFrames - 1));
+            frameInput.value = String(frame);
+            frameInput.title = "Guide frame index";
+            frameInput.disabled = locked;
+            frameInput.style.cssText = `${chromeInputCss({ width: "66px", fontSize: "11px", padding: "5px 7px" })}`;
+            const commitFrameInput = () => {
+                if (locked) return;
+                const newIdx = parseInt(frameInput.value, 10);
+                if (!Number.isFinite(newIdx) || newIdx === frame) return;
+                const clamped = Math.max(0, Math.min(this.totalFrames - 1, newIdx));
+                this._moveGuideToFrame(guide, clamped, guide.strength);
+                this._hideGuideManagementPopup();
+            };
+            frameInput.addEventListener("change", commitFrameInput);
+            frameInput.addEventListener("keydown", (event) => {
+                if (event.key === "Enter") { commitFrameInput(); event.preventDefault(); }
+                event.stopPropagation();
+            });
+
+            const strengthInput = document.createElement("input");
+            strengthInput.type = "number";
+            strengthInput.min = "0";
+            strengthInput.max = "1";
+            strengthInput.step = "0.05";
+            strengthInput.value = (Number(guide.strength ?? 1.0)).toFixed(2);
+            strengthInput.title = "Guide strength";
+            strengthInput.disabled = locked;
+            strengthInput.style.cssText = `${chromeInputCss({ width: "68px", fontSize: "11px", padding: "5px 7px" })}`;
+            const commitStrength = async () => {
+                if (locked) return;
+                const next = Math.max(0, Math.min(1, parseFloat(strengthInput.value)));
+                if (!Number.isFinite(next) || next === guide.strength) return;
+                this._pushUndo("change guide strength");
+                guide.strength = next;
+                await this._updateItemProperty("guide", guide.frame_index, { strength: next }, { refresh: false });
+                await refreshPanel();
+            };
+            strengthInput.addEventListener("change", commitStrength);
+            strengthInput.addEventListener("keydown", (event) => {
+                if (event.key === "Enter") { commitStrength(); event.preventDefault(); }
+                event.stopPropagation();
+            });
+
+            const label = document.createElement("div");
+            label.style.cssText = "min-width:0;display:flex;flex-direction:column;gap:3px;overflow:hidden;";
+            const name = asset?.name || asset?.path?.split(/[/\\]/).pop() || guide.asset_id || "Guide";
+            label.title = name;
+            const nameLine = document.createElement("div");
+            nameLine.textContent = name;
+            nameLine.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e5e9ee;font-size:12px;font-weight:600;";
+            const metaLine = document.createElement("div");
+            metaLine.textContent = `${guide.source || "asset"} | f${frame}`;
+            metaLine.style.cssText = `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${COLORS.textMuted};font-size:10px;`;
+            label.append(nameLine, metaLine);
+
+            const muteBtn = this._makeBtn(guide.muted ? "Show" : "Hide", "Toggle guide visibility");
+            muteBtn.disabled = locked;
+            muteBtn.addEventListener("click", async (event) => {
+                event.stopPropagation();
+                if (locked) return;
+                this._pushUndo("toggle guide mute");
+                guide.muted = !guide.muted;
+                await this._updateItemProperty("guide", guide.frame_index, { muted: guide.muted }, { refresh: false });
+                await refreshPanel();
+            });
+
+            const swapWrap = document.createElement("div");
+            swapWrap.style.cssText = "display:flex;align-items:center;gap:6px;min-width:0;";
+            const swapSelect = document.createElement("select");
+            swapSelect.disabled = locked || guides.length < 2;
+            swapSelect.style.cssText = `${chromeInputCss({ fontSize: "11px", padding: "5px 7px", textAlign: "left" })} min-width:0;flex:1;`;
+            for (const other of guides) {
+                if (other === guide) continue;
+                const otherFrame = other.frame_index === -1 ? this.totalFrames - 1 : other.frame_index;
+                const option = document.createElement("option");
+                option.value = String(other.frame_index);
+                option.textContent = `f${otherFrame}`;
+                swapSelect.appendChild(option);
+            }
+            const swapBtn = this._makeBtn("Swap", "Swap guide frames");
+            swapBtn.disabled = locked || guides.length < 2;
+            swapBtn.addEventListener("click", async (event) => {
+                event.stopPropagation();
+                if (locked || !swapSelect.value) return;
+                this._pushUndo("swap guides");
+                const dirName = this._projectDirName();
+                const sceneId = this.activeSceneId;
+                try {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/swap`), {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            frame_a: guide.frame_index,
+                            frame_b: Number(swapSelect.value),
+                        }),
+                    });
+                    await refreshPanel();
+                } catch (e) {
+                    console.warn("[Sonder] Failed to swap guides:", e);
+                }
+            });
+            swapWrap.append(swapSelect, swapBtn);
+
+            const deleteBtn = this._makeBtn("Del", "Delete guide");
+            deleteBtn.disabled = locked;
+            deleteBtn.style.color = COLORS.dangerText;
+            deleteBtn.addEventListener("click", async (event) => {
+                event.stopPropagation();
+                if (locked) return;
+                this._pushUndo("delete guide");
+                const dirName = this._projectDirName();
+                const sceneId = this.activeSceneId;
+                try {
+                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${guide.frame_index}`), {
+                        method: "DELETE",
+                    });
+                    await refreshPanel();
+                } catch (e) {
+                    console.warn("[Sonder] Failed to delete guide:", e);
+                }
+            });
+
+            row.append(thumb, frameInput, strengthInput, label, muteBtn, swapWrap, deleteBtn);
+            body.appendChild(row);
+        }
+
+        panel.appendChild(body);
+        backdrop.appendChild(panel);
+        backdrop.addEventListener("click", (event) => {
+            if (event.target === backdrop) this._hideGuideManagementPopup();
+        });
+        document.body.appendChild(backdrop);
+        this._guideManagerEl = backdrop;
+        this._guideManagerMouseOff = null;
+    }
+
+    _hideGuideManagementPopup() {
+        this._hideGuideHoverPreview();
+        if (this._guideManagerEl) {
+            this._guideManagerEl.remove();
+            this._guideManagerEl = null;
+        }
+        if (this._guideManagerMouseOff) {
+            document.removeEventListener("mousedown", this._guideManagerMouseOff, true);
+            this._guideManagerMouseOff = null;
+        }
+    }
+
     _showContextMenu(x, y, items) {
         this._hideContextMenu();
 
@@ -6565,6 +7592,7 @@ export class EditorWidget {
             ]) +
             this._shortcutSection("Tools", [
                 ["C", "Toggle razor / cut mode"],
+                ["M", "Mute / Hide selected asset(s)"],
                 ["S", "Toggle snapping"],
                 ["T", "Toggle timecode display"],
                 ["F", "Fit timeline to view"],
@@ -6583,15 +7611,7 @@ export class EditorWidget {
                 ["Delete", "Trash or permanently delete selection (when gallery focused)"],
                 ["Esc", "Clear or reduce gallery selection"],
             ]) +
-            this._shortcutSection("Inspect Overlay", [
-                ["← / →", "Cycle to previous / next asset (visual order)"],
-                ["Space", "Play / Pause (video / audio)"],
-                ["C", "Toggle Compare mode (when peers exist)"],
-                ["F / 0", "Fit (reset zoom and pan)"],
-                ["+ / -", "Zoom in / out at center (1x-16x)"],
-                ["Wheel", "Zoom (cursor-pivot in, glide-to-center out)"],
-                ["Esc", "Close overlay"],
-            ]) +
+            this._shortcutSection("Inspect Overlay", INSPECT_OVERLAY_SHORTCUTS) +
             this._shortcutSection("View", [
                 ["Wheel", "Vertical lane scroll"],
                 ["Ctrl+Wheel", "Horizontal timeline pan"],
@@ -7067,10 +8087,12 @@ export class EditorWidget {
             // Guard: don't fire when typing in inputs (except Ctrl+Z/Y for undo/redo)
             const tag = document.activeElement?.tagName;
             const isUndo = ctrl && (normalizedKey === "z" || normalizedKey === "y");
+            const isInspectOverlayInput = !!document.activeElement?.closest?.("[data-sonder-inspect-overlay='1']");
             const debugUndoRouting = (message, extra = {}) => {
                 if (!ctrl || (normalizedKey !== "z" && normalizedKey !== "y")) return;
                 this._keyboardDebug(message, this._keyboardDebugSnapshot(e, extra));
             };
+            if (isInspectOverlayInput) return false;
             if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && !isUndo) return false;
 
             // Guard: only handle keys when our editor is focused
@@ -7116,11 +8138,7 @@ export class EditorWidget {
                 if (this._assetGallery?.hasSelectionOwnership?.()) return false;
                 if (this.selectedItems.length > 0) {
                     // Filter out locked-lane items before delete
-                    this.selectedItems = this.selectedItems.filter(s => {
-                        if (s.type === "clip") return !this._isLaneLocked(this._clipTrackType(s.data), s.data.track_index || 0);
-                        if (s.type === "audio") return !this._isLaneLocked(TRACK_TYPE.AUDIO, s.data.lane_index || 0);
-                        return true;
-                    });
+                    this.selectedItems = this.selectedItems.filter(s => !this._isItemLocked(s));
                     if (this.selectedItems.length > 0) this._deleteSelectedItems();
                 }
                 return true; // consume even when nothing was deletable, so ComfyUI does not delete the node
@@ -7160,33 +8178,19 @@ export class EditorWidget {
 
             // ── I / O = set in/out points (selection) ──
             if (key === "i" || key === "I") {
-                this.selectionStart = this.playhead;
-                if (this.selectionEnd < this.selectionStart) this.selectionEnd = this.selectionStart;
-                this._setWidgetValue("selection_start", this.selectionStart);
-                this._renderTimeline();
-                this._updateToolbar();
-                this._updateToolbar();
+                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
+                this._setSelectionStartFrame(this._snapSelectionFrame(this.playhead, { direction: "up", clampMax: maxFrame }));
                 return true;
             }
             if (key === "o" || key === "O") {
-                this.selectionEnd = this.playhead;
-                if (this.selectionStart > this.selectionEnd) this.selectionStart = this.selectionEnd;
-                this._setWidgetValue("selection_end", this.selectionEnd);
-                this._renderTimeline();
-                this._updateToolbar();
-                this._updateToolbar();
+                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
+                this._setSelectionEndFrame(this._snapSelectionFrame(this.playhead, { direction: "up", clampMax: maxFrame }));
                 return true;
             }
 
             // ── X = clear selection (in/out points) ──
             if (key === "x" || key === "X") {
-                this.selectionStart = 0;
-                this.selectionEnd = 0;
-                this._setWidgetValue("selection_start", 0);
-                this._setWidgetValue("selection_end", 0);
-                this._renderTimeline();
-                this._updateToolbar();
-                this._updateToolbar();
+                this._clearTimelineSelection();
                 return true;
             }
 
@@ -7200,6 +8204,10 @@ export class EditorWidget {
             // ── S = toggle snapping ──
             if (key === "s" || key === "S") {
                 this._setSnappingEnabled(!this.snappingEnabled);
+                return true;
+            }
+            if (key === "m" || key === "M") {
+                void this._toggleSelectedMute();
                 return true;
             }
 
@@ -7569,15 +8577,11 @@ export class EditorWidget {
     }
 
     _recallSavedSelection(sel) {
-        this.selectionStart = sel.start;
-        this.selectionEnd = sel.end;
-        this._setWidgetValue("selection_start", sel.start);
-        this._setWidgetValue("selection_end", sel.end);
+        this._setTimelineSelection(sel.start, sel.end, { render: false });
         this._setWidgetValue("pre_context_frames", Math.max(0, parseInt(sel.pre_context_frames, 10) || 0));
         this._setWidgetValue("post_context_frames", Math.max(0, parseInt(sel.post_context_frames, 10) || 0));
         this._refreshContextInputs();
         this._renderTimeline();
-        this._updateToolbar();
         this._updateToolbar();
     }
 
@@ -7629,11 +8633,14 @@ export class EditorWidget {
         const clampedEnd = Math.max(clampedStart, Math.min(sceneDuration, parseInt(selEnd, 10) || 0));
         const preContextFrames = this._contextFrameValue("pre_context_frames");
         const postContextFrames = this._contextFrameValue("post_context_frames");
+        const maskPreOffset = this._contextFrameValue("mask_pre_offset");
+        const maskPostOffset = this._contextFrameValue("mask_post_offset");
         const snapshotStart = Math.max(0, clampedStart - preContextFrames);
         const snapshotEnd = Math.min(sceneDuration, clampedEnd + postContextFrames);
 
-        let prompt = this.activeScene.prompt || "";
-        const sections = this.activeScene.prompt_sections || [];
+        const promptHidden = !!this.activeScene.prompt_track_config?.hidden;
+        let prompt = promptHidden ? "" : (this.activeScene.prompt || "");
+        const sections = promptHidden ? [] : (this.activeScene.prompt_sections || []);
         const promptSections = [];
         for (const s of sections) {
             if (s.start_frame < snapshotEnd && s.end_frame > snapshotStart) {
@@ -7648,6 +8655,7 @@ export class EditorWidget {
         }
 
         const guideFrameSnapshots = [];
+        const guideTrackHidden = !!this.activeScene.guide_track_config?.hidden;
         for (const guide of (this.activeScene.guide_frames || [])) {
             let frameIndex = parseInt(guide.frame_index, 10) || 0;
             if (frameIndex === -1) frameIndex = Math.max(0, sceneDuration - 1);
@@ -7657,6 +8665,7 @@ export class EditorWidget {
                     asset_id: guide.asset_id,
                     source: guide.source || "asset",
                     strength: guide.strength ?? 1.0,
+                    muted: guideTrackHidden || !!guide.muted,
                 });
             }
         }
@@ -7670,6 +8679,8 @@ export class EditorWidget {
             context_frames: Math.max(preContextFrames, postContextFrames),
             pre_context_frames: preContextFrames,
             post_context_frames: postContextFrames,
+            mask_pre_offset: maskPreOffset,
+            mask_post_offset: maskPostOffset,
             guide_frame_snapshots: guideFrameSnapshots,
             prompt_sections: promptSections,
             scene_width: Math.max(0, parseInt(this.activeScene.width, 10) || 0),
@@ -7984,7 +8995,9 @@ export class EditorWidget {
         const duration = end - start;
         const preContext = Math.max(0, parseInt(job?.pre_context_frames, 10) || 0);
         const postContext = Math.max(0, parseInt(job?.post_context_frames, 10) || 0);
-        return `In: ${this._frameToTimecode(start)} Out: ${this._frameToTimecode(end)} (${this._frameToTimecode(duration)}) | Ctx: -${preContext}/+${postContext}`;
+        const maskPre = Math.max(0, parseInt(job?.mask_pre_offset, 10) || 0);
+        const maskPost = Math.max(0, parseInt(job?.mask_post_offset, 10) || 0);
+        return `In: ${this._frameToTimecode(start)} Out: ${this._frameToTimecode(end)} (${this._frameToTimecode(duration)}) | Ctx: -${preContext}/+${postContext} | Mask Offset: -${maskPre}/+${maskPost}`;
     }
 
     _createQueueRow(job, { title = "", nested = false } = {}) {
@@ -8551,6 +9564,7 @@ export class EditorWidget {
             isVideoLaneHidden: (trackIndex) => this._isLaneHidden(TRACK_TYPE.VIDEO, trackIndex || 0),
             isMotionDriverLaneHidden: (trackIndex) => this._isLaneHidden(TRACK_TYPE.MOTION_DRIVER, trackIndex || 0),
             isAudioLaneHidden: (laneIndex) => this._isLaneHidden(TRACK_TYPE.AUDIO, laneIndex || 0),
+            isGuideTrackHidden: () => this._isGuideTrackHidden(),
             buildViewUrl: (sourcePath) => this._buildViewURL(sourcePath),
             buildThumbnailUrl: (assetId) => this.projectDir
                 ? api.apiURL(`/sonder-editor/project/${this.projectDir.split(/[/\\]/).pop()}/thumbnail/${assetId}`)
@@ -8657,6 +9671,7 @@ export class EditorWidget {
         if (!this.activeScene?.clips) return [];
         return this.activeScene.clips
             .filter(clip => frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame)
+            .filter(clip => !clip.muted)
             .filter(clip => this._isRenderClip(clip) || (this._animaticMode && this._isMotionDriverClip(clip)))
             .filter(clip => !this._isLaneHidden(this._clipTrackType(clip), clip.track_index || 0))
             .sort((a, b) => (a.track_index || 0) - (b.track_index || 0));
@@ -8709,6 +9724,7 @@ export class EditorWidget {
         return this.activeScene.audio_tracks.filter(
             a => frame >= a.timeline_start_frame && frame < a.timeline_end_frame
                 && !this._isLaneHidden(TRACK_TYPE.AUDIO, a.lane_index || 0)
+                && !a.muted
                 && !this._isMissingSourcePath(a.source_path)
         );
     }
@@ -9019,10 +10035,12 @@ export class EditorWidget {
 
     _getGuideAtFrame(frame) {
         if (!this.activeScene?.guide_frames) return null;
+        if (this._isGuideTrackHidden()) return null;
         // Animatic behavior: find the latest guide at or before this frame (holds until next guide)
         let closest = null;
         let closestIdx = -1;
         for (const g of this.activeScene.guide_frames) {
+            if (g.muted) continue;
             const idx = g.frame_index === -1 ? this.totalFrames - 1 : g.frame_index;
             if (idx <= frame && idx > closestIdx) {
                 closest = g;
@@ -10282,6 +11300,30 @@ export class EditorWidget {
                 onChange: (value) => updateCategory("guides", "guideSnapshotMaxLongEdge", Math.max(0, Math.round(value))),
             }
         );
+        createCheckbox(
+            guidesSection,
+            "hoverPreviewEnabled",
+            "Guide Hover Preview",
+            "Show a larger guide thumbnail when hovering guide markers or guide rows.",
+            () => this._settings.guides?.hoverPreviewEnabled ?? true,
+            (checked) => {
+                updateCategory("guides", "hoverPreviewEnabled", checked);
+                if (!checked) this._hideGuideHoverPreview();
+            }
+        );
+        createNumberInput(
+            guidesSection,
+            "hoverPreviewSize",
+            "Hover Preview Size",
+            "Maximum preview edge in pixels.",
+            {
+                min: 96,
+                max: 360,
+                step: 12,
+                getter: () => this._guideHoverPreviewSize(),
+                onChange: (value) => updateCategory("guides", "hoverPreviewSize", Math.max(96, Math.min(360, Math.round(value)))),
+            }
+        );
 
         const appearanceSection = createSection(
             "Appearance",
@@ -10554,6 +11596,8 @@ export class EditorWidget {
         if (this._shortcutOverlayKeyOff) { this._shortcutOverlayKeyOff(); this._shortcutOverlayKeyOff = null; }
         if (this._settingsPanelKeyOff) { this._settingsPanelKeyOff(); this._settingsPanelKeyOff = null; }
         if (this._contextMenuKeyOff) { this._contextMenuKeyOff(); this._contextMenuKeyOff = null; }
+        this._hideGuideManagementPopup();
+        this._hideGuideHoverPreview();
         if (this._contextMenuMouseOff) { this._contextMenuMouseOff(); this._contextMenuMouseOff = null; }
         if (this._focusHandler) {
             document.removeEventListener("mousedown", this._focusHandler, true);

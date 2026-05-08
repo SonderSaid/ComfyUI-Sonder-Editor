@@ -258,6 +258,7 @@ export function createViewportSurface(options = {}) {
     const isVideoLaneHidden = options.isVideoLaneHidden || (() => false);
     const isMotionDriverLaneHidden = options.isMotionDriverLaneHidden || (() => false);
     const isAudioLaneHidden = options.isAudioLaneHidden || (() => false);
+    const isGuideTrackHidden = options.isGuideTrackHidden || (() => false);
     const buildViewUrl = options.buildViewUrl || (() => null);
     const buildThumbnailUrl = options.buildThumbnailUrl || (() => null);
     const isPrebufferEnabled = options.isPrebufferEnabled || (() => true);
@@ -343,10 +344,12 @@ export function createViewportSurface(options = {}) {
     function getGuideAtFrame(frame) {
         const scene = getScene();
         if (!scene?.guide_frames?.length) return null;
+        if (isGuideTrackHidden()) return null;
         const lastFrame = Math.max(0, totalFrames() - 1);
         let best = null;
         let bestFrame = -1;
         for (const guide of scene.guide_frames) {
+            if (guide.muted) continue;
             const frameIndex = guide.frame_index === -1 ? lastFrame : Math.max(0, parseInt(guide.frame_index, 10) || 0);
             if (frameIndex <= frame && frameIndex >= bestFrame) {
                 best = guide;
@@ -361,6 +364,7 @@ export function createViewportSurface(options = {}) {
         if (!scene?.clips?.length) return [];
         return scene.clips
             .filter((clip) => frame >= clip.timeline_start_frame && frame < clip.timeline_end_frame)
+            .filter((clip) => !clip.muted)
             .filter((clip) => {
                 if (!clip.role || clip.role === "render") return true;
                 return clip.role === "motion_driver" && includeMotionDrivers();

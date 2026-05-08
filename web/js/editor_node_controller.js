@@ -473,6 +473,10 @@ function isAudioLaneHidden(scene, laneIndex) {
     return !!scene?.audio_lane_configs?.[laneIndex || 0]?.hidden;
 }
 
+function isGuideTrackHidden(scene) {
+    return !!scene?.guide_track_config?.hidden;
+}
+
 function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDimensions = {}) {
     const fallbackFrame = Math.max(0, parseInt(frame, 10) || 0);
     const frameWidth = Math.max(0, parseInt(scene?.width, 10) || parseInt(fallbackDimensions.width, 10) || 0);
@@ -483,19 +487,23 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
 
     const activeClips = (scene?.clips || [])
         .filter(clip => fallbackFrame >= clip.timeline_start_frame && fallbackFrame < clip.timeline_end_frame)
+        .filter(clip => !clip.muted)
         .filter(clip => !clip.role || clip.role === "render")
         .filter(clip => !isVideoLaneHidden(scene, clip.track_index || 0))
         .sort((a, b) => (b.track_index || 0) - (a.track_index || 0));
 
     let guide = null;
     let guideFrame = -1;
-    for (const item of (scene?.guide_frames || [])) {
-        const frameIndex = item.frame_index === -1
-            ? Math.max(0, (scene?.duration_frames || 1) - 1)
-            : item.frame_index;
-        if (frameIndex <= fallbackFrame && frameIndex >= guideFrame) {
-            guide = item;
-            guideFrame = frameIndex;
+    if (!isGuideTrackHidden(scene)) {
+        for (const item of (scene?.guide_frames || [])) {
+            if (item.muted) continue;
+            const frameIndex = item.frame_index === -1
+                ? Math.max(0, (scene?.duration_frames || 1) - 1)
+                : item.frame_index;
+            if (frameIndex <= fallbackFrame && frameIndex >= guideFrame) {
+                guide = item;
+                guideFrame = frameIndex;
+            }
         }
     }
     const guideAsset = guide ? assetsById.get(guide.asset_id) : null;
@@ -629,6 +637,8 @@ class FullscreenEditorSession {
         editor.playhead = state.selectionStart || 0;
         this.controller._setWidgetValue("pre_context_frames", state.preContextFrames || 0);
         this.controller._setWidgetValue("post_context_frames", state.postContextFrames || 0);
+        this.controller._setWidgetValue("mask_pre_offset", state.maskPreOffset || 0);
+        this.controller._setWidgetValue("mask_post_offset", state.maskPostOffset || 0);
         editor._refreshContextInputs();
         editor.refresh(["queue"]);
         editor._enterFullscreen();
@@ -1007,6 +1017,8 @@ export class EditorNodeController {
             selectionEnd: this._getWidgetValue("selection_end", 0),
             preContextFrames: this._getWidgetValue("pre_context_frames", 0),
             postContextFrames: this._getWidgetValue("post_context_frames", 0),
+            maskPreOffset: this._getWidgetValue("mask_pre_offset", 0),
+            maskPostOffset: this._getWidgetValue("mask_post_offset", 0),
             renderQueueActive: coerceBoolean(this._getWidgetValue("render_queue_active", true), true),
             dormantSummary: null,
             moduleCache: this.moduleCache,
@@ -1162,6 +1174,8 @@ export class EditorNodeController {
         this.state.selectionEnd = Math.max(0, parseInt(this._getWidgetValue("selection_end", 0), 10) || 0);
         this.state.preContextFrames = Math.max(0, parseInt(this._getWidgetValue("pre_context_frames", 0), 10) || 0);
         this.state.postContextFrames = Math.max(0, parseInt(this._getWidgetValue("post_context_frames", 0), 10) || 0);
+        this.state.maskPreOffset = Math.max(0, parseInt(this._getWidgetValue("mask_pre_offset", 0), 10) || 0);
+        this.state.maskPostOffset = Math.max(0, parseInt(this._getWidgetValue("mask_post_offset", 0), 10) || 0);
         this.state.renderQueueActive = coerceBoolean(this._getWidgetValue("render_queue_active", true), true);
     }
 
@@ -1171,6 +1185,8 @@ export class EditorNodeController {
         if (name === "selection_end") this.state.selectionEnd = Math.max(0, parseInt(value, 10) || 0);
         if (name === "pre_context_frames") this.state.preContextFrames = Math.max(0, parseInt(value, 10) || 0);
         if (name === "post_context_frames") this.state.postContextFrames = Math.max(0, parseInt(value, 10) || 0);
+        if (name === "mask_pre_offset") this.state.maskPreOffset = Math.max(0, parseInt(value, 10) || 0);
+        if (name === "mask_post_offset") this.state.maskPostOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "render_queue_active") this.state.renderQueueActive = coerceBoolean(value, true);
     }
 

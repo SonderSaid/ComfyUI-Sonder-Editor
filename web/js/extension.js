@@ -862,6 +862,8 @@ app.registerExtension({
                     "selection_end",
                     "pre_context_frames",
                     "post_context_frames",
+                    "mask_pre_offset",
+                    "mask_post_offset",
                     "take_placement_mode",
                     "render_queue_active",
                 ];

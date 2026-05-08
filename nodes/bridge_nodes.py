@@ -10,6 +10,7 @@ Reference: BadCafeCode/execution-inversion-demo-comfyui (`flow_control.py`).
 from __future__ import annotations
 
 import logging
+import json
 import os
 
 import cv2
@@ -110,8 +111,66 @@ def _resolve_render_window(project, scene):
     return int(render_start), int(render_end), int(proj_w), int(proj_h)
 
 
+def _queue_snapshot_version(queue_job) -> int:
+    params = getattr(queue_job, "params", {}) or {}
+    if not isinstance(params, dict):
+        return 0
+    try:
+        return max(0, int(params.get("snapshot_version", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bridge_guide_key(asset_id: str, frame_index: int) -> str:
+    return f"{asset_id}:{frame_index}"
+
+
+def _parse_bridge_overrides(raw):
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        data = raw
+    elif isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    else:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    guides = data.get("guides")
+    return guides if isinstance(guides, dict) else data
+
+
+def _override_muted_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict) and "muted" in value:
+        return bool(value.get("muted"))
+    return None
+
+
+def _apply_bridge_overrides(guides, overrides_json=""):
+    overrides = _parse_bridge_overrides(overrides_json)
+    out = []
+    for guide in guides or []:
+        if not isinstance(guide, dict):
+            continue
+        muted = bool(guide.get("editor_muted", False))
+        override_value = _override_muted_value(overrides.get(guide.get("guide_key", "")))
+        if override_value is not None:
+            muted = override_value
+        if muted:
+            continue
+        next_guide = dict(guide)
+        next_guide["effective_muted"] = False
+        out.append(next_guide)
+    return out
+
+
 def _filtered_guides(project):
-    """List of {local_idx, asset_path, asset_type, strength} for guides in render window."""
+    """List guides in render window, preserving editor mute state for overrides."""
     if project is None:
         return []
     scene = _resolve_active_scene(project)
@@ -131,14 +190,16 @@ def _filtered_guides(project):
                 queue_job = job
                 break
 
-    snapshot_version = int(getattr(queue_job, "snapshot_version", 0) or 0) if queue_job else 0
+    snapshot_version = _queue_snapshot_version(queue_job) if queue_job else 0
     if queue_job and snapshot_version > 0:
         guides_src = [
             GuideFrame.from_dict(g) for g in getattr(queue_job, "guide_frame_snapshots", [])
             if isinstance(g, dict)
         ]
+        live_guide_track_hidden = False
     else:
         guides_src = list(getattr(scene, "guide_frames", []) or [])
+        live_guide_track_hidden = bool(getattr(getattr(scene, "guide_track_config", None), "hidden", False))
 
     out = []
     for guide in guides_src:
@@ -154,10 +215,14 @@ def _filtered_guides(project):
         if not os.path.isfile(asset_path):
             continue
         out.append({
+            "guide_key": _bridge_guide_key(getattr(guide, "asset_id", ""), idx),
             "local_idx": idx - render_start,
+            "frame_index": idx,
+            "asset_id": getattr(guide, "asset_id", ""),
             "asset_path": asset_path,
             "asset_type": asset.asset_type,
             "strength": float(getattr(guide, "strength", 1.0)),
+            "editor_muted": live_guide_track_hidden or bool(getattr(guide, "muted", False)),
         })
     return out
 
@@ -212,7 +277,10 @@ class SonderGuidesBridgeStart:
 
     @classmethod
     def INPUT_TYPES(cls):
-        optional = {f"value_{i}": (_ANY,) for i in range(MAX_PASSTHROUGH)}
+        optional = {
+            "bridge_overrides_json": ("STRING", {"default": "{}"}),
+            **{f"value_{i}": (_ANY,) for i in range(MAX_PASSTHROUGH)},
+        }
         return {
             "required": {
                 "project": ("SONDER_PROJECT",),
@@ -226,7 +294,10 @@ class SonderGuidesBridgeStart:
         return True
 
     def execute(self, project, iteration_index=0, **kwargs):
-        guides = _filtered_guides(project)
+        guides = _apply_bridge_overrides(
+            _filtered_guides(project),
+            kwargs.get("bridge_overrides_json", "{}"),
+        )
         scene = _resolve_active_scene(project)
         _rs, _re, proj_w, proj_h = _resolve_render_window(project, scene)
         passthrough = tuple(kwargs.get(f"value_{i}") for i in range(MAX_PASSTHROUGH))
@@ -310,7 +381,10 @@ class SonderGuidesBridgeEnd:
             return self._kwargs_passthrough(kwargs)
         start_inputs = start_node.get("inputs", {}) or {}
 
-        guides = _filtered_guides(project) if project is not None else []
+        guides = _apply_bridge_overrides(
+            _filtered_guides(project) if project is not None else [],
+            start_inputs.get("bridge_overrides_json", "{}"),
+        )
 
         if not guides:
             result = self._start_input_passthrough(start_inputs)
@@ -365,6 +439,8 @@ class SonderGuidesBridgeEnd:
         new_open = graph.lookup_node(start_node_id)
         if new_open is not None:
             new_open.set_input("iteration_index", current_iter + 1)
+            if "bridge_overrides_json" in start_inputs:
+                new_open.set_input("bridge_overrides_json", start_inputs.get("bridge_overrides_json"))
             for i in range(MAX_PASSTHROUGH):
                 key = f"value_{i}"
                 if key in kwargs:

@@ -130,6 +130,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         queuePanelExpanded: false,
         queueBatchCollapsedByProject: {},
         trackCollapseByScene: {},
+        activeSelectionByProjectScene: {},
         timelinePixelsPerFrame: 3,
         labelWidth: 0,
         labelWidthFullscreen: 0,
@@ -180,6 +181,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     guides: {
         guideSnapshotMaxLongEdge: 0,
+        hoverPreviewEnabled: true,
+        hoverPreviewSize: 180,
     },
     modelTemplates: {
         customTemplates: [],
@@ -199,6 +202,12 @@ export const DEFAULT_EDITOR_SETTINGS = {
         thumbnailSize: "medium",
         artifactInspectorExpanded: false,
     },
+    inspector: {
+        compareLayout: "divider",
+        sideBySideLinkZoom: true,
+        audioCompareWaveformLayout: "stacked",
+        audioCompareMonitor: "a",
+    },
 };
 
 const VALID_SORT_MODES = new Set(GALLERY_SORT_OPTIONS.map((entry) => entry.value));
@@ -209,6 +218,9 @@ const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.
 const VALID_SAVE_PRESETS = new Set(SAVE_PRESET_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
 const BUILTIN_MODEL_TEMPLATE_IDS = new Set(BUILTIN_MODEL_TEMPLATES.map((entry) => entry.id));
+const VALID_COMPARE_LAYOUTS = new Set(["divider", "sideBySide"]);
+const VALID_AUDIO_COMPARE_WAVEFORM_LAYOUTS = new Set(["stacked", "overlay"]);
+const VALID_AUDIO_COMPARE_MONITORS = new Set(["a", "b", "both", "mute"]);
 export const VALID_TAKE_PLACEMENT_MODES = new Set(TAKE_PLACEMENT_MODE_OPTIONS.map((entry) => entry.value));
 
 const listeners = new Set();
@@ -416,6 +428,30 @@ function normalizeTrackCollapseByScene(nextValue) {
     return normalized;
 }
 
+function normalizeActiveSelectionByProjectScene(nextValue) {
+    if (!nextValue || typeof nextValue !== "object" || Array.isArray(nextValue)) {
+        return {};
+    }
+    const normalized = {};
+    for (const [projectKey, sceneMap] of Object.entries(nextValue)) {
+        if (!projectKey || !sceneMap || typeof sceneMap !== "object" || Array.isArray(sceneMap)) continue;
+        const normalizedScenes = {};
+        for (const [sceneId, selection] of Object.entries(sceneMap)) {
+            if (!sceneId || !selection || typeof selection !== "object" || Array.isArray(selection)) continue;
+            const start = clampNumber(selection.start, 0, 999999, 0, true);
+            const end = clampNumber(selection.end, 0, 999999, 0, true);
+            normalizedScenes[sceneId] = {
+                start: Math.min(start, end),
+                end: Math.max(start, end),
+            };
+        }
+        if (Object.keys(normalizedScenes).length) {
+            normalized[projectKey] = normalizedScenes;
+        }
+    }
+    return normalized;
+}
+
 function normalizeQueueBatchCollapsedByProject(nextValue) {
     if (!nextValue || typeof nextValue !== "object" || Array.isArray(nextValue)) {
         return {};
@@ -474,6 +510,7 @@ function normalizeEditorSettings(source = null) {
                 : !!stored.layout.queuePanelExpanded,
             queueBatchCollapsedByProject: normalizeQueueBatchCollapsedByProject(stored?.layout?.queueBatchCollapsedByProject),
             trackCollapseByScene: normalizeTrackCollapseByScene(stored?.layout?.trackCollapseByScene),
+            activeSelectionByProjectScene: normalizeActiveSelectionByProjectScene(stored?.layout?.activeSelectionByProjectScene),
             timelinePixelsPerFrame: clampNumber(
                 stored?.layout?.timelinePixelsPerFrame,
                 0.2,
@@ -614,6 +651,16 @@ function normalizeEditorSettings(source = null) {
                 defaults.guides.guideSnapshotMaxLongEdge,
                 true,
             ),
+            hoverPreviewEnabled: stored?.guides?.hoverPreviewEnabled == null
+                ? defaults.guides.hoverPreviewEnabled
+                : !!stored.guides.hoverPreviewEnabled,
+            hoverPreviewSize: clampNumber(
+                stored?.guides?.hoverPreviewSize,
+                96,
+                360,
+                defaults.guides.hoverPreviewSize,
+                true,
+            ),
         },
         modelTemplates: {
             customTemplates,
@@ -658,6 +705,20 @@ function normalizeEditorSettings(source = null) {
             artifactInspectorExpanded: stored?.gallery?.artifactInspectorExpanded == null
                 ? defaults.gallery.artifactInspectorExpanded
                 : !!stored.gallery.artifactInspectorExpanded,
+        },
+        inspector: {
+            compareLayout: VALID_COMPARE_LAYOUTS.has(stored?.inspector?.compareLayout)
+                ? stored.inspector.compareLayout
+                : defaults.inspector.compareLayout,
+            sideBySideLinkZoom: stored?.inspector?.sideBySideLinkZoom == null
+                ? defaults.inspector.sideBySideLinkZoom
+                : !!stored.inspector.sideBySideLinkZoom,
+            audioCompareWaveformLayout: VALID_AUDIO_COMPARE_WAVEFORM_LAYOUTS.has(stored?.inspector?.audioCompareWaveformLayout)
+                ? stored.inspector.audioCompareWaveformLayout
+                : defaults.inspector.audioCompareWaveformLayout,
+            audioCompareMonitor: VALID_AUDIO_COMPARE_MONITORS.has(stored?.inspector?.audioCompareMonitor)
+                ? stored.inspector.audioCompareMonitor
+                : defaults.inspector.audioCompareMonitor,
         },
     };
 }

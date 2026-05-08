@@ -139,15 +139,19 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         selection_end="12",
         pre_context_frames="3",
         post_context_frames="4",
+        mask_pre_offset="2",
+        mask_post_offset="1",
     )
 
     assert result[6] == 0
     assert result[7] == 1.0
     assert result[9] == 14
-    assert result[14] == pytest.approx(3 / 24.0)
-    assert result[15] == pytest.approx(10 / 24.0)
+    assert result[14] == pytest.approx(1 / 24.0)
+    assert result[15] == pytest.approx(11 / 24.0)
     assert project._execution_context["pre_context_frames"] == 3
     assert project._execution_context["post_context_frames"] == 4
+    assert project._execution_context["mask_pre_offset"] == 2
+    assert project._execution_context["mask_post_offset"] == 1
 
 
 class _FrameConstraintScene:
@@ -227,7 +231,7 @@ def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, mo
     assert result[9] == 169
     assert tuple(result[1].shape) == (169, 4, 4, 3)
     assert result[14] == pytest.approx(48 / 24.0)
-    assert result[15] == pytest.approx(167 / 24.0)
+    assert result[15] == pytest.approx(169 / 24.0)
     assert audio["waveform"].shape[-1] >= int((169 / 24.0) * audio["sample_rate"])
     assert project._execution_context["source_frame_count"] == 167
     assert project._execution_context["frame_count"] == 169
@@ -444,7 +448,7 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
     scene = timeline_state.Scene(scene_id="scene-1", name="Scene", duration_frames=12)
     scene.guide_frames = [
         timeline_state.GuideFrame(frame_index=1, asset_id="guide-a", strength=0.25),
-        timeline_state.GuideFrame(frame_index=4, asset_id="guide-b", strength=0.9),
+        timeline_state.GuideFrame(frame_index=4, asset_id="guide-b", strength=0.9, muted=True),
     ]
     project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Guides", scenes=[scene])
     project.assets = [
@@ -480,12 +484,29 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
         selection_end=8,
     )
 
-    assert result[3] == "1,4"
-    assert result[4] == "0.2500,0.9000"
+    assert result[3] == "1"
+    assert result[4] == "0.2500"
     assert tuple(result[5].shape) == (1, 512, 768, 3)
     assert result[6] == 0
     assert result[7] == pytest.approx(1.0)
 
+    scene.guide_track_config = timeline_state.LaneConfig(hidden=True)
+    hidden_track_result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=8,
+    )
+
+    assert hidden_track_result[3] == ""
+    assert hidden_track_result[4] == ""
+    assert tuple(hidden_track_result[5].shape) == (1, 512, 768, 3)
+
+    scene.guide_track_config = timeline_state.LaneConfig()
     scene.guide_frames = []
     empty_result = editor_node.SonderEditor().execute(
         project="Existing Project",

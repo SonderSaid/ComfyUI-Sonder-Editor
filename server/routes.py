@@ -2557,6 +2557,10 @@ if routes is not None:
             scene.audio_lane_configs = [
                 LaneConfig.from_dict(c) for c in body["audio_lane_configs"]
             ]
+        if "guide_track_config" in body:
+            scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
+        if "prompt_track_config" in body:
+            scene.prompt_track_config = LaneConfig.from_dict(body["prompt_track_config"])
         if "width" in body:
             scene.width = int(body["width"])
         if "height" in body:
@@ -2649,6 +2653,10 @@ if routes is not None:
             scene.audio_lane_configs = [
                 LaneConfig.from_dict(c) for c in body["audio_lane_configs"]
             ]
+        if "guide_track_config" in body:
+            scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
+        if "prompt_track_config" in body:
+            scene.prompt_track_config = LaneConfig.from_dict(body["prompt_track_config"])
         while len(scene.video_lane_configs) < scene.video_lane_count:
             scene.video_lane_configs.append(LaneConfig())
         while len(scene.motion_driver_lane_configs) < scene.motion_driver_lane_count:
@@ -2674,6 +2682,8 @@ if routes is not None:
         scene = project.get_scene(scene_id)
         if not scene:
             return _json_error(f"Scene not found: {scene_id}", 404)
+        if getattr(scene.guide_track_config, "locked", False):
+            return _json_error("Guide track is locked", 409)
 
         try:
             body = await request.json()
@@ -2686,6 +2696,7 @@ if routes is not None:
             source=body.get("source", "asset"),
             # Client-authored from the editor guide strength control.
             strength=body.get("strength", 1.0),
+            muted=bool(body.get("muted", False)),
         )
 
         # Replace existing guide at the same frame index
@@ -2698,6 +2709,195 @@ if routes is not None:
         save_project(project)
         return web.json_response(guide.to_dict(), status=201)
 
+    @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides")
+    async def api_bridge_guides(request: web.Request) -> web.Response:
+        """Return guides the Sonder Guides Bridge would inject for the given window.
+
+        Mirrors `_filtered_guides()` semantics from `nodes/bridge_nodes.py`:
+        - If an in-flight queue job exists for this scene with `snapshot_version > 0`,
+          read guides from that job's snapshot. Else read live `scene.guide_frames`.
+        - Filter to the render window resolved from optional query params:
+          `selection_start`, `selection_end`, `pre_context`, `post_context`.
+        - Return rows tagged with `editor_muted` and `source` so the frontend
+          panel can apply per-bridge override toggles without re-deriving keys.
+        """
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene_id = request.match_info["scene_id"]
+        scene = project.get_scene(scene_id)
+        if not scene:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+
+        def _q_int(name: str, default: int) -> int:
+            raw = request.query.get(name)
+            if raw is None or raw == "":
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return default
+
+        duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+        sel_start = max(0, _q_int("selection_start", 0))
+        sel_end = max(sel_start, _q_int("selection_end", 0))
+        pre = max(0, _q_int("pre_context", 0))
+        post = max(0, _q_int("post_context", 0))
+        has_selection = sel_end > sel_start
+        if has_selection:
+            window_start = max(0, sel_start - pre)
+            window_end = min(duration, sel_end + post)
+        else:
+            window_start = 0
+            window_end = duration
+
+        # Pick snapshot from a running job for this scene if one exists.
+        active_job = None
+        for job in getattr(project, "generation_queue", []) or []:
+            if getattr(job, "scene_id", "") != scene_id:
+                continue
+            status = str(getattr(job, "status", "") or "").lower()
+            if status != "running":
+                continue
+            params = getattr(job, "params", {}) or {}
+            try:
+                snap_ver = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
+            except (TypeError, ValueError):
+                snap_ver = 0
+            if snap_ver > 0:
+                active_job = job
+                break
+
+        if active_job is not None:
+            guides_src = [
+                GuideFrame.from_dict(g)
+                for g in getattr(active_job, "guide_frame_snapshots", []) or []
+                if isinstance(g, dict)
+            ]
+            source_label = "snapshot"
+        else:
+            guides_src = list(getattr(scene, "guide_frames", []) or [])
+            source_label = "live"
+        live_guide_track_hidden = source_label == "live" and bool(getattr(scene.guide_track_config, "hidden", False))
+
+        rows = []
+        for guide in guides_src:
+            try:
+                idx = int(getattr(guide, "frame_index", 0))
+            except (TypeError, ValueError):
+                continue
+            if idx == -1:
+                idx = max(0, duration - 1)
+            if not (window_start <= idx < window_end):
+                continue
+            asset_id = getattr(guide, "asset_id", "")
+            asset = project.get_asset(asset_id)
+            asset_name = ""
+            if asset is not None:
+                asset_name = getattr(asset, "name", "") or ""
+                if not asset_name:
+                    path = getattr(asset, "path", "") or ""
+                    asset_name = path.replace("\\", "/").split("/")[-1] if path else asset_id
+            rows.append({
+                "guide_key": f"{asset_id}:{idx}",
+                "frame_index": idx,
+                "asset_id": asset_id,
+                "asset_name": asset_name or asset_id or "Guide",
+                "strength": float(getattr(guide, "strength", 1.0) or 0.0),
+                "editor_muted": live_guide_track_hidden or bool(getattr(guide, "muted", False)),
+                "source": source_label,
+            })
+
+        rows.sort(key=lambda r: r["frame_index"])
+        return web.json_response({
+            "window_start": window_start,
+            "window_end": window_end,
+            "scene_name": getattr(scene, "name", "") or scene_id,
+            "source": source_label,
+            "guides": rows,
+        })
+
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap")
+    async def api_swap_guides(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene_id = request.match_info["scene_id"]
+        scene = project.get_scene(scene_id)
+        if not scene:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+        if getattr(scene.guide_track_config, "locked", False):
+            return _json_error("Guide track is locked", 409)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        try:
+            frame_a = int(body.get("frame_a"))
+            frame_b = int(body.get("frame_b"))
+        except (TypeError, ValueError):
+            return _json_error("Invalid guide frame index", 400)
+
+        if frame_a == frame_b:
+            guide = next((g for g in scene.guide_frames if g.frame_index == frame_a), None)
+            if not guide:
+                return _json_error(f"No guide at frame {frame_a}", 404)
+            return web.json_response({"guides": [guide.to_dict()]})
+
+        guide_a = next((g for g in scene.guide_frames if g.frame_index == frame_a), None)
+        guide_b = next((g for g in scene.guide_frames if g.frame_index == frame_b), None)
+        if not guide_a:
+            return _json_error(f"No guide at frame {frame_a}", 404)
+        if not guide_b:
+            return _json_error(f"No guide at frame {frame_b}", 404)
+
+        guide_a.frame_index, guide_b.frame_index = frame_b, frame_a
+        scene.guide_frames.sort(key=lambda g: g.frame_index)
+        save_project(project)
+        return web.json_response({"guides": [guide_a.to_dict(), guide_b.to_dict()]})
+
+    @routes.patch("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
+    async def api_update_guide(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene_id = request.match_info["scene_id"]
+        scene = project.get_scene(scene_id)
+        if not scene:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+        if getattr(scene.guide_track_config, "locked", False):
+            return _json_error("Guide track is locked", 409)
+
+        try:
+            frame_index = int(request.match_info["frame_index"])
+        except (TypeError, ValueError):
+            return _json_error("Invalid guide frame index", 400)
+
+        guide = next((g for g in scene.guide_frames if g.frame_index == frame_index), None)
+        if not guide:
+            return _json_error(f"No guide at frame {frame_index}", 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        if "strength" in body:
+            guide.strength = float(body["strength"])
+        if "muted" in body:
+            guide.muted = bool(body["muted"])
+
+        save_project(project)
+        return web.json_response(guide.to_dict())
+
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/{frame_index}")
     async def api_delete_guide(request: web.Request) -> web.Response:
         try:
@@ -2709,6 +2909,8 @@ if routes is not None:
         scene = project.get_scene(scene_id)
         if not scene:
             return _json_error(f"Scene not found: {scene_id}", 404)
+        if getattr(scene.guide_track_config, "locked", False):
+            return _json_error("Guide track is locked", 409)
 
         frame_index = int(request.match_info["frame_index"])
         original_count = len(scene.guide_frames)
@@ -2767,6 +2969,7 @@ if routes is not None:
             track_index=int(body.get("track_index", 0)),
             role=role,
             strength=float(body.get("strength", 1.0)),
+            muted=bool(body.get("muted", False)),
         )
         scene.clips.append(clip)
 
@@ -2923,6 +3126,8 @@ if routes is not None:
             clip.role = role
         if "strength" in body:
             clip.strength = float(body["strength"])
+        if "muted" in body:
+            clip.muted = bool(body["muted"])
 
         save_project(project)
         return web.json_response(clip.to_dict())
@@ -2974,6 +3179,7 @@ if routes is not None:
             track_index=clip.track_index,
             role=getattr(clip, "role", "render"),
             strength=getattr(clip, "strength", 1.0),
+            muted=getattr(clip, "muted", False),
         )
 
         # Trim first clip (left half)
@@ -3192,6 +3398,8 @@ if routes is not None:
         scene = project.get_scene(scene_id)
         if not scene:
             return _json_error(f"Scene not found: {scene_id}", 404)
+        if getattr(scene.prompt_track_config, "locked", False):
+            return _json_error("Prompt track is locked", 409)
 
         try:
             body = await request.json()
@@ -3220,6 +3428,8 @@ if routes is not None:
         scene = project.get_scene(scene_id)
         if not scene:
             return _json_error(f"Scene not found: {scene_id}", 404)
+        if getattr(scene.prompt_track_config, "locked", False):
+            return _json_error("Prompt track is locked", 409)
 
         idx = int(request.match_info["index"])
         if idx < 0 or idx >= len(scene.prompt_sections):
@@ -3254,6 +3464,8 @@ if routes is not None:
         scene = project.get_scene(scene_id)
         if not scene:
             return _json_error(f"Scene not found: {scene_id}", 404)
+        if getattr(scene.prompt_track_config, "locked", False):
+            return _json_error("Prompt track is locked", 409)
 
         idx = int(request.match_info["index"])
         if idx < 0 or idx >= len(scene.prompt_sections):
@@ -3397,6 +3609,8 @@ if routes is not None:
             "scene_height",
             "scene_fps",
             "template_id",
+            "mask_pre_offset",
+            "mask_post_offset",
         )):
             params["snapshot_version"] = 1
 
@@ -3418,6 +3632,8 @@ if routes is not None:
             context_frames=int(body.get("context_frames", 0)),
             pre_context_frames=int(body.get("pre_context_frames", 0)),
             post_context_frames=int(body.get("post_context_frames", 0)),
+            mask_pre_offset=int(body.get("mask_pre_offset", 0)),
+            mask_post_offset=int(body.get("mask_post_offset", 0)),
             guide_frame_snapshots=list(body.get("guide_frame_snapshots", []) or []),
             prompt_sections=list(body.get("prompt_sections", []) or []),
             scene_width=int(body.get("scene_width", 0)),

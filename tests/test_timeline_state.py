@@ -91,6 +91,7 @@ def test_guide_frame_roundtrip():
         asset_id="img001",
         source="asset",
         strength=0.8,
+        muted=True,
     )
     data = gf.to_dict()
     restored = GuideFrame.from_dict(data)
@@ -99,6 +100,7 @@ def test_guide_frame_roundtrip():
     assert restored.asset_id == "img001"
     assert restored.source == "asset"
     assert restored.strength == 0.8
+    assert restored.muted is True
 
 
 def test_guide_frame_last_frame():
@@ -271,6 +273,27 @@ def test_scene_motion_driver_lane_config_roundtrip_and_autopad():
     assert isinstance(restored.motion_driver_lane_configs[1], LaneConfig)
 
 
+def test_scene_fixed_track_config_roundtrip_and_defaults():
+    scene = Scene(
+        name="Fixed",
+        guide_track_config=LaneConfig(locked=True, hidden=True),
+        prompt_track_config=LaneConfig(locked=True, hidden=False),
+    )
+
+    restored = Scene.from_dict(scene.to_dict())
+
+    assert restored.guide_track_config.locked is True
+    assert restored.guide_track_config.hidden is True
+    assert restored.prompt_track_config.locked is True
+    assert restored.prompt_track_config.hidden is False
+
+    legacy = Scene.from_dict({"name": "Legacy"})
+    assert legacy.guide_track_config.locked is False
+    assert legacy.guide_track_config.hidden is False
+    assert legacy.prompt_track_config.locked is False
+    assert legacy.prompt_track_config.hidden is False
+
+
 def test_scene_content_hash_changes_with_clip_role_and_strength():
     base_clip = ClipReference(
         source_path="media/clip.mp4",
@@ -293,6 +316,35 @@ def test_scene_content_hash_changes_with_clip_role_and_strength():
     assert render_scene.content_hash() != strength_scene.content_hash()
 
 
+def test_scene_content_hash_changes_with_clip_and_guide_mute_state():
+    clip = ClipReference(
+        source_path="media/clip.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+    )
+    base_scene = Scene(name="Render")
+    base_scene.clips = [clip]
+    base_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
+
+    muted_clip_scene = Scene(name="Render")
+    muted_clip_scene.clips = [ClipReference.from_dict({**clip.to_dict(), "muted": True})]
+    muted_clip_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
+
+    muted_guide_scene = Scene(name="Render")
+    muted_guide_scene.clips = [ClipReference.from_dict(clip.to_dict())]
+    muted_guide_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a", muted=True)]
+
+    assert base_scene.content_hash() != muted_clip_scene.content_hash()
+    assert base_scene.content_hash() != muted_guide_scene.content_hash()
+
+    hidden_guides_scene = Scene(name="Render")
+    hidden_guides_scene.clips = [ClipReference.from_dict(clip.to_dict())]
+    hidden_guides_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
+    hidden_guides_scene.guide_track_config = LaneConfig(hidden=True)
+
+    assert base_scene.content_hash() != hidden_guides_scene.content_hash()
+
+
 # --- ClipReference ---
 
 def test_clip_reference_roundtrip():
@@ -306,6 +358,7 @@ def test_clip_reference_roundtrip():
         track_index=0,
         role="motion_driver",
         strength=0.42,
+        muted=True,
         prompt="a cat walking",
         is_generated=True,
         generation_params={"seed": 42, "cfg": 7.5},
@@ -324,6 +377,7 @@ def test_clip_reference_roundtrip():
     assert restored.source_out_frame == clip.source_out_frame
     assert restored.role == "motion_driver"
     assert restored.strength == 0.42
+    assert restored.muted is True
     assert restored.prompt == clip.prompt
     assert restored.is_generated == clip.is_generated
     assert restored.generation_params == clip.generation_params
@@ -388,6 +442,8 @@ def test_generation_job_roundtrip():
         context_frames=12,
         pre_context_frames=8,
         post_context_frames=12,
+        mask_pre_offset=2,
+        mask_post_offset=3,
         guide_frame_snapshots=[{"frame_index": 12, "asset_id": "guide001", "source": "asset", "strength": 0.8}],
         prompt_sections=[{"start_frame": 0, "end_frame": 96, "prompt": "section prompt"}],
         scene_width=1024,
@@ -415,6 +471,8 @@ def test_generation_job_roundtrip():
     assert restored.context_frames == 12
     assert restored.pre_context_frames == 8
     assert restored.post_context_frames == 12
+    assert restored.mask_pre_offset == 2
+    assert restored.mask_post_offset == 3
     assert restored.guide_frame_snapshots[0]["asset_id"] == "guide001"
     assert restored.prompt_sections[0]["prompt"] == "section prompt"
     assert restored.scene_width == 1024
@@ -434,6 +492,8 @@ def test_generation_job_legacy_context_frames_migrate_to_pre_and_post():
     assert restored.context_frames == 16
     assert restored.pre_context_frames == 16
     assert restored.post_context_frames == 16
+    assert restored.mask_pre_offset == 0
+    assert restored.mask_post_offset == 0
 
 
 def test_generation_job_invalid_take_placement_mode_defaults_to_trimmed():
@@ -661,6 +721,19 @@ def test_scene_get_prompt_for_range():
     assert scene.get_prompt_for_range(50, 150) == "section A"
     # Range outside all sections
     assert scene.get_prompt_for_range(200, 300) == "fallback"
+
+
+def test_hidden_prompt_track_outputs_empty_prompt():
+    scene = Scene(
+        prompt="fallback",
+        prompt_track_config=LaneConfig(hidden=True),
+        prompt_sections=[
+            PromptSection(start_frame=0, end_frame=100, prompt="section A"),
+        ],
+    )
+
+    assert scene.get_prompt_at_frame(50) == ""
+    assert scene.get_prompt_for_range(0, 100) == ""
 
 
 def test_scene_no_prompt_sections_uses_fallback():

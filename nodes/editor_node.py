@@ -148,6 +148,14 @@ class SonderEditor:
                     "default": 0, "min": 0, "max": 256, "step": 1,
                     "tooltip": "Context frames AFTER selection. Included in render but not denoised (use mask outputs). Clamped to available frames.",
                 }),
+                "mask_pre_offset": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Extra pre-context frames to exclude from denoise mask start. Clamped to actual pre-context.",
+                }),
+                "mask_post_offset": ("INT", {
+                    "default": 0, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Extra post-context frames to include in denoise mask end. Clamped to actual post-context.",
+                }),
                 "take_placement_mode": ("STRING", {
                     "default": "trimmed",
                     "tooltip": "Take placement mode for non-queued renders. Set by editor settings.",
@@ -422,6 +430,7 @@ class SonderEditor:
     def execute(self, project, project_name, fps, width, height,
                 scene_id="", selection_start=0, selection_end=0,
                 pre_context_frames=0, post_context_frames=0,
+                mask_pre_offset=0, mask_post_offset=0,
                 prompt=None, unique_id=None, take_placement_mode="trimmed",
                 render_queue_active=True):
         base_dir = _get_projects_base_dir()
@@ -430,6 +439,8 @@ class SonderEditor:
         selection_end = max(0, _coerce_int(selection_end, 0))
         pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
         post_context_frames = max(0, _coerce_int(post_context_frames, 0))
+        mask_pre_offset = max(0, _coerce_int(mask_pre_offset, 0))
+        mask_post_offset = max(0, _coerce_int(mask_post_offset, 0))
         take_placement_mode = take_placement_mode if take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
         render_queue_active = self._coerce_bool(render_queue_active, True)
         proj = None
@@ -471,6 +482,8 @@ class SonderEditor:
                 selection_end = max(0, _coerce_int(getattr(queue_job, "selection_end", 0), 0))
                 pre_context_frames = max(0, _coerce_int(getattr(queue_job, "pre_context_frames", 0), 0))
                 post_context_frames = max(0, _coerce_int(getattr(queue_job, "post_context_frames", 0), 0))
+                mask_pre_offset = max(0, _coerce_int(getattr(queue_job, "mask_pre_offset", 0), 0))
+                mask_post_offset = max(0, _coerce_int(getattr(queue_job, "mask_post_offset", 0), 0))
             logger.info(
                 "execute begin: scene_id=%s selection=%d-%d terminal_save=%s unmarked_save=%s render_queue_active=%s queue_length=%d queue_job_mode=%s queue_job_id=%s snapshot_range=%s-%s",
                 scene_id or "",
@@ -550,6 +563,8 @@ class SonderEditor:
             generation_end = render_end
             actual_pre = min(pre_context_frames, generation_start)
             actual_post = min(post_context_frames, scene.duration_frames - generation_end)
+            mask_pre_offset = min(mask_pre_offset, actual_pre)
+            mask_post_offset = min(mask_post_offset, actual_post)
             if actual_pre > 0 or actual_post > 0:
                 render_start = generation_start - actual_pre
                 render_end = generation_end + actual_post
@@ -573,8 +588,8 @@ class SonderEditor:
             )
 
             # Mask times - seconds offset within the output tensor for downstream temporal masks
-            mask_start_time = (generation_start - context_start) / proj_fps if proj_fps > 0 else 0.0
-            mask_end_time = (generation_end - context_start) / proj_fps if proj_fps > 0 else 0.0
+            mask_start_time = (generation_start - context_start - mask_pre_offset) / proj_fps if proj_fps > 0 else 0.0
+            mask_end_time = (generation_end - context_start + mask_post_offset + frame_count_padding) / proj_fps if proj_fps > 0 else 0.0
 
             # --- Render composited frames ---
             render_started_at = time.perf_counter()
@@ -605,8 +620,12 @@ class SonderEditor:
                     for guide in getattr(queue_job, "guide_frame_snapshots", [])
                     if isinstance(guide, dict)
                 ]
+            elif getattr(getattr(scene, "guide_track_config", None), "hidden", False):
+                guide_frames = []
 
             for guide in guide_frames:
+                if getattr(guide, "muted", False):
+                    continue
                 idx = guide.frame_index
                 if idx == -1:
                     idx = scene.duration_frames - 1
@@ -665,6 +684,8 @@ class SonderEditor:
                 "post_context_frames": actual_post,
                 "actual_pre_context_frames": actual_pre,
                 "actual_post_context_frames": actual_post,
+                "mask_pre_offset": mask_pre_offset,
+                "mask_post_offset": mask_post_offset,
                 "template_id": template_id,
                 "source_frame_count": source_frame_count,
                 "frame_count": frame_count,
@@ -733,6 +754,7 @@ class SonderEditor:
         driver_clips = [
             c for c in getattr(scene, "clips", [])
             if getattr(c, "role", "render") == "motion_driver"
+            and not getattr(c, "muted", False)
             and getattr(c, "track_index", 0) not in hidden_driver_lanes
             and c.timeline_start_frame < render_end
             and c.timeline_end_frame > render_start
@@ -874,6 +896,7 @@ class SonderEditor:
             c for c in scene.clips
             if c.track_index not in hidden_lanes
             and getattr(c, "role", "render") == "render"
+            and not getattr(c, "muted", False)
         ]
 
         if not visible_clips:
