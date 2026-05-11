@@ -704,7 +704,7 @@ def test_delete_last_audio_track_compacts_empty_audio_lane(tmp_path, monkeypatch
     assert [config.name for config in scene.audio_lane_configs] == ["Audio 2", "Audio 3"]
 
 
-def test_bridge_guides_route_returns_live_guides_in_window(tmp_path, monkeypatch):
+def test_bridge_guides_route_returns_all_scene_guides(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
     project_dir.mkdir()
@@ -729,25 +729,29 @@ def test_bridge_guides_route_returns_live_guides_in_window(tmp_path, monkeypatch
         "/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides",
     )
 
-    # No selection -> full-scene window: all three guides visible.
+    # Default request: all three scene guides returned with full-scene window.
     response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
     assert response.status == 200
     payload = _response_json(response)
     assert payload["source"] == "live"
+    assert payload["window_start"] == 0
+    assert payload["window_end"] == 120
     assert len(payload["guides"]) == 3
     keys = [row["guide_key"] for row in payload["guides"]]
     assert keys == ["asset-1:10", "asset-1:50", "asset-1:110"]
+    assert payload["all_guide_keys"] == ["asset-1:10", "asset-1:50", "asset-1:110"]
     muted_row = next(row for row in payload["guides"] if row["frame_index"] == 50)
     assert muted_row["editor_muted"] is True
     assert muted_row["asset_name"] == "GuideRef"
 
-    # Selection [40, 60) with no context -> only the muted guide at 50 in range.
+    # Legacy selection params are accepted but ignored: still all three guides.
     response = asyncio.run(handler(DummyRequest(
         match_info={"scene_id": "scene-1"},
         query={"selection_start": "40", "selection_end": "60", "pre_context": "0", "post_context": "0"},
     )))
     payload = _response_json(response)
-    assert [row["frame_index"] for row in payload["guides"]] == [50]
+    assert [row["frame_index"] for row in payload["guides"]] == [10, 50, 110]
+    assert payload["all_guide_keys"] == ["asset-1:10", "asset-1:50", "asset-1:110"]
 
     scene.guide_track_config = LaneConfig(hidden=True)
     response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
@@ -799,6 +803,8 @@ def test_bridge_guides_route_uses_running_job_snapshot(tmp_path, monkeypatch):
     assert payload["source"] == "snapshot"
     keys = [row["guide_key"] for row in payload["guides"]]
     assert keys == ["asset-1:30", "asset-1:70"]
+    # Snapshot key set comes from the snapshot, not the live scene guides.
+    assert payload["all_guide_keys"] == ["asset-1:30", "asset-1:70"]
     # Live guide at frame 10 is NOT included while a running job is active.
     assert "asset-1:10" not in keys
 
@@ -807,3 +813,34 @@ def test_bridge_guides_route_uses_running_job_snapshot(tmp_path, monkeypatch):
     payload = _response_json(response)
     # Snapshot rows use their frozen muted flags, not the live guide-track hidden flag.
     assert [row["editor_muted"] for row in payload["guides"]] == [False, True]
+
+
+def test_bridge_guides_route_resolves_minus_one_frame_index(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(
+        scene_id="scene-1",
+        name="Scene",
+        duration_frames=100,
+        guide_frames=[
+            GuideFrame(frame_index=-1, asset_id="asset-1", strength=1.0, muted=False),
+        ],
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [Asset(asset_id="asset-1", asset_type="image", path="media/g.png", name="LastFrame")]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    handler = _route_handler(
+        route_module,
+        "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides",
+    )
+
+    response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
+    payload = _response_json(response)
+    # `-1` sentinel resolves to `duration - 1` for both the rendered row key and
+    # the unfiltered `all_guide_keys` set, so frontend pruning matches the row.
+    assert [row["guide_key"] for row in payload["guides"]] == ["asset-1:99"]
+    assert [row["frame_index"] for row in payload["guides"]] == [99]
+    assert payload["all_guide_keys"] == ["asset-1:99"]

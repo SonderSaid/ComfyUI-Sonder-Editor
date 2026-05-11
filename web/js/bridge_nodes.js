@@ -453,25 +453,15 @@ async function loadLinkedEditorGuides(node) {
     const projectDir = controllerState?.projectDir || "";
     const projectId = projectIdFromDir(projectDir);
     if (!projectId) {
-        return { status: "Connect a Sonder Editor project.", guides: [] };
+        return { status: "Connect a Sonder Editor project.", guides: [], linked: false };
     }
 
     const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
     if (!sceneId) {
-        return { status: "No active scene.", guides: [] };
+        return { status: "No active scene.", guides: [], linked: false };
     }
 
-    const params = new URLSearchParams();
-    const selStart = Math.max(0, parseInt(controllerState?.selectionStart, 10) || 0);
-    const selEnd = Math.max(selStart, parseInt(controllerState?.selectionEnd, 10) || 0);
-    if (selEnd > selStart) {
-        params.set("selection_start", String(selStart));
-        params.set("selection_end", String(selEnd));
-        params.set("pre_context", String(Math.max(0, parseInt(controllerState?.preContextFrames, 10) || 0)));
-        params.set("post_context", String(Math.max(0, parseInt(controllerState?.postContextFrames, 10) || 0)));
-    }
-    const query = params.toString();
-    const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-guides${query ? `?${query}` : ""}`;
+    const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-guides`;
     const resp = await fetch(api.apiURL(url));
     if (!resp.ok) {
         throw new Error(`Bridge guide fetch failed: ${resp.status}`);
@@ -483,6 +473,7 @@ async function loadLinkedEditorGuides(node) {
         resolved_frame_index: Math.max(0, parseInt(row.frame_index, 10) || 0),
         muted: !!row.editor_muted,
     }));
+    const allGuideKeys = Array.isArray(payload?.all_guide_keys) ? payload.all_guide_keys : null;
     const sourceLabel = payload?.source === "snapshot" ? "Snapshot guides for running job" : "Live editor guides";
     const sceneName = payload?.scene_name || "Scene";
     const ws = payload?.window_start ?? 0;
@@ -490,6 +481,8 @@ async function loadLinkedEditorGuides(node) {
     return {
         status: `${sourceLabel} - ${sceneName} f${ws}-${we}`,
         guides,
+        all_guide_keys: allGuideKeys,
+        linked: true,
     };
 }
 
@@ -500,14 +493,15 @@ function renderGuidePanel(node, payload = { status: "", guides: [] }) {
     state.guideList.innerHTML = "";
     const guides = payload.guides || [];
 
-    // Prune stale override entries to the currently-visible guide set.
-    // Visible set = whatever the panel is showing right now (live OR snapshot).
-    // Backend ignores unmatched keys at runtime, but pruning prevents a deleted
-    // guide's override from re-applying if the same key is reused later.
-    const visibleKeys = new Set(guides.map((g) => g.guide_key).filter(Boolean));
+    // Prune overrides against the scene's full guide_key set, so a key only gets
+    // dropped when it is genuinely gone from the scene. If the backend did not
+    // supply `all_guide_keys` (older server), skip pruning entirely — leaving
+    // overrides untouched is safer than the old window-scoped prune.
+    const allKeys = Array.isArray(payload.all_guide_keys) ? payload.all_guide_keys : null;
     const overrides = readGuideOverrides(node);
-    if (visibleKeys.size > 0) {
-        const stale = Object.keys(overrides).filter((k) => !visibleKeys.has(k));
+    if (allKeys) {
+        const sceneKeys = new Set(allKeys.filter(Boolean));
+        const stale = Object.keys(overrides).filter((k) => !sceneKeys.has(k));
         if (stale.length) {
             const cleaned = { ...overrides };
             for (const k of stale) delete cleaned[k];
@@ -517,9 +511,11 @@ function renderGuidePanel(node, payload = { status: "", guides: [] }) {
     }
 
     if (!guides.length) {
-        const empty = style(document.createElement("div"), "color:#8b96a3;font-size:10px;padding:3px 0;");
-        empty.textContent = "No guide rows for this render window.";
-        state.guideList.appendChild(empty);
+        if (payload.linked) {
+            const empty = style(document.createElement("div"), "color:#8b96a3;font-size:10px;padding:3px 0;");
+            empty.textContent = "No guides in scene.";
+            state.guideList.appendChild(empty);
+        }
         return;
     }
     for (const guide of guides) {
@@ -586,6 +582,17 @@ function refreshBridgeGuidePanel(node) {
     if (!isStart(node)) return;
     const state = ensureNodeState(node);
     if (!state.guidePanel) return;
+
+    // Load-time race fix: when an editor node is wired but its async
+    // `updateProject()` has not populated `state.projectDir` yet, schedule a
+    // one-shot retry so the panel auto-refreshes once the project resolves.
+    // The current load still runs (and will show "Connect..." until the retry).
+    const editorNode = linkedNodeFromInput(node, "project");
+    const controller = editorNode?._sonderController || null;
+    if (controller && !controller.state?.projectDir && typeof controller.whenProjectReady === "function") {
+        controller.whenProjectReady(() => refreshBridgeGuidePanel(node));
+    }
+
     const token = ++state.guideRefreshToken;
     state.guideStatus.textContent = "Loading guides...";
     loadLinkedEditorGuides(node)
@@ -598,6 +605,7 @@ function refreshBridgeGuidePanel(node) {
             renderGuidePanel(node, {
                 status: error?.message || "Guide panel failed.",
                 guides: [],
+                linked: false,
             });
         });
 }

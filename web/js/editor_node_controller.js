@@ -1024,6 +1024,7 @@ export class EditorNodeController {
             moduleCache: this.moduleCache,
             isFullscreenOpen: false,
             expandedModuleId: "",
+            _projectReadyQueue: [],
         };
         this.moduleStatus = {
             assets: { loading: false, error: "" },
@@ -1066,6 +1067,8 @@ export class EditorNodeController {
             this.fullscreenSession = null;
             session.destroy();
         }
+
+        this.state._projectReadyQueue.length = 0;
     }
 
     getElement() {
@@ -1190,6 +1193,25 @@ export class EditorNodeController {
         if (name === "render_queue_active") this.state.renderQueueActive = coerceBoolean(value, true);
     }
 
+    whenProjectReady(callback) {
+        if (typeof callback !== "function") return;
+        if (this.state.projectDir) {
+            try { callback(); }
+            catch (error) { console.warn("[Sonder] whenProjectReady callback error:", error); }
+            return;
+        }
+        this.state._projectReadyQueue.push(callback);
+    }
+
+    _drainProjectReadyQueue() {
+        if (!this.state.projectDir) return;
+        const queue = this.state._projectReadyQueue.splice(0);
+        for (const callback of queue) {
+            try { callback(); }
+            catch (error) { console.warn("[Sonder] whenProjectReady drain error:", error); }
+        }
+    }
+
     async updateProject(projectDir, projectName = "") {
         if (this._destroyed) return;
 
@@ -1208,6 +1230,7 @@ export class EditorNodeController {
             this._frameConstraintHealedFor = "";
             this.state.projectDir = "";
             this.state.dormantSummary = null;
+            this.state._projectReadyQueue.length = 0;
             this._invalidateModules(["project", "assets", "scene", "queue"]);
             this.collapseModule();
             this.render();
@@ -1246,6 +1269,7 @@ export class EditorNodeController {
 
         await this.refreshSummary();
         this.render();
+        this._drainProjectReadyQueue();
     }
 
     async refreshSummary(options = {}) {

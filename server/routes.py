@@ -2711,15 +2711,16 @@ if routes is not None:
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-guides")
     async def api_bridge_guides(request: web.Request) -> web.Response:
-        """Return guides the Sonder Guides Bridge would inject for the given window.
+        """Return every guide the Sonder Guides Bridge would inject for this scene.
 
-        Mirrors `_filtered_guides()` semantics from `nodes/bridge_nodes.py`:
         - If an in-flight queue job exists for this scene with `snapshot_version > 0`,
           read guides from that job's snapshot. Else read live `scene.guide_frames`.
-        - Filter to the render window resolved from optional query params:
-          `selection_start`, `selection_end`, `pre_context`, `post_context`.
-        - Return rows tagged with `editor_muted` and `source` so the frontend
-          panel can apply per-bridge override toggles without re-deriving keys.
+        - Window is the full scene (`[0, duration_frames)`); legacy `selection_start`,
+          `selection_end`, `pre_context`, `post_context` query params are ignored so
+          the panel can show all scene guides for cross-batch planning.
+        - Rows are tagged with `editor_muted` and `source`; `all_guide_keys` carries
+          the full scene-level key set so the frontend can prune stale per-guide
+          overrides against the scene, not against the rendered window.
         """
         try:
             project = _load_project_from_request(request)
@@ -2731,27 +2732,9 @@ if routes is not None:
         if not scene:
             return _json_error(f"Scene not found: {scene_id}", 404)
 
-        def _q_int(name: str, default: int) -> int:
-            raw = request.query.get(name)
-            if raw is None or raw == "":
-                return default
-            try:
-                return int(raw)
-            except (TypeError, ValueError):
-                return default
-
         duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
-        sel_start = max(0, _q_int("selection_start", 0))
-        sel_end = max(sel_start, _q_int("selection_end", 0))
-        pre = max(0, _q_int("pre_context", 0))
-        post = max(0, _q_int("post_context", 0))
-        has_selection = sel_end > sel_start
-        if has_selection:
-            window_start = max(0, sel_start - pre)
-            window_end = min(duration, sel_end + post)
-        else:
-            window_start = 0
-            window_end = duration
+        window_start = 0
+        window_end = duration
 
         # Pick snapshot from a running job for this scene if one exists.
         active_job = None
@@ -2783,6 +2766,7 @@ if routes is not None:
         live_guide_track_hidden = source_label == "live" and bool(getattr(scene.guide_track_config, "hidden", False))
 
         rows = []
+        all_guide_keys = []
         for guide in guides_src:
             try:
                 idx = int(getattr(guide, "frame_index", 0))
@@ -2790,9 +2774,10 @@ if routes is not None:
                 continue
             if idx == -1:
                 idx = max(0, duration - 1)
+            asset_id = getattr(guide, "asset_id", "")
+            all_guide_keys.append(f"{asset_id}:{idx}")
             if not (window_start <= idx < window_end):
                 continue
-            asset_id = getattr(guide, "asset_id", "")
             asset = project.get_asset(asset_id)
             asset_name = ""
             if asset is not None:
@@ -2817,6 +2802,7 @@ if routes is not None:
             "scene_name": getattr(scene, "name", "") or scene_id,
             "source": source_label,
             "guides": rows,
+            "all_guide_keys": all_guide_keys,
         })
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap")
