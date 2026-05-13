@@ -8,8 +8,8 @@ logger = logging.getLogger("sonder_editor")
 
 PROJECT_SUBDIRS = [
     "media",
+    os.path.join("media", "Exports"),
     "renders",
-    "exports",
     os.path.join("cache", "thumbnails"),
     os.path.join("cache", "waveforms"),
     os.path.join("cache", "bridge_out"),

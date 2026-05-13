@@ -19,8 +19,10 @@ from .timeline_state import (
     ClipReference, LaneConfig, GenerationJob, classify_asset_path,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
+from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 
 logger = logging.getLogger("sonder_editor")
+_TIMELINE_EXPORTS = TimelineExportManager()
 
 # Defer route registration until ComfyUI's PromptServer is available.
 try:
@@ -1471,6 +1473,33 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     return asset
 
 
+def _timeline_export_job_response(request: web.Request, job) -> dict:
+    payload = job.public_status()
+    if job.status != "completed":
+        return payload
+
+    result = {
+        "asset": None,
+        "scene": None,
+        "placed_clip": job.placed_clip,
+        "warnings": list(job.warnings or []),
+    }
+    try:
+        project = _load_project_from_request(request)
+        asset = project.get_asset(job.result_asset_id) if job.result_asset_id else None
+        if asset:
+            result["asset"] = _asset_payload(project, asset)
+        scene = project.get_scene(job.result_scene_id) if job.result_scene_id else None
+        if scene:
+            result["scene"] = scene.to_dict()
+    except Exception as exc:
+        logger.warning("Failed to build timeline export completion payload: %s", exc)
+        if job.result_asset_id:
+            result["asset"] = {"asset_id": job.result_asset_id}
+    payload["result"] = result
+    return payload
+
+
 if routes is not None:
 
     # -----------------------------------------------------------------------
@@ -1567,6 +1596,55 @@ if routes is not None:
 
         save_project(project)
         return web.json_response(project.to_dict())
+
+    # -----------------------------------------------------------------------
+    # Timeline export jobs
+    # -----------------------------------------------------------------------
+
+    @routes.post("/sonder-editor/project/{project_id}/render_timeline")
+    async def api_start_render_timeline(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON body", "code": "invalid_json"}, status=400)
+
+        try:
+            job = _TIMELINE_EXPORTS.start(project, body if isinstance(body, dict) else {})
+        except ExportAlreadyRunning as e:
+            return web.json_response(
+                {"error": "export_running", "code": "export_running", "job_id": e.job_id},
+                status=409,
+            )
+        except ValueError as e:
+            return web.json_response({"error": str(e), "code": "invalid_request"}, status=400)
+        except Exception as e:
+            logger.exception("Failed to start timeline export")
+            return web.json_response({"error": str(e), "code": "export_start_failed"}, status=500)
+
+        return web.json_response({
+            "job_id": job.job_id,
+            "status": "running",
+            "phase": job.phase,
+        })
+
+    @routes.get("/sonder-editor/project/{project_id}/render_timeline/{job_id}")
+    async def api_get_render_timeline_job(request: web.Request) -> web.Response:
+        job = _TIMELINE_EXPORTS.get(request.match_info.get("job_id", ""))
+        if not job:
+            return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
+        return web.json_response(_timeline_export_job_response(request, job))
+
+    @routes.post("/sonder-editor/project/{project_id}/render_timeline/{job_id}/cancel")
+    async def api_cancel_render_timeline_job(request: web.Request) -> web.Response:
+        job = _TIMELINE_EXPORTS.cancel(request.match_info.get("job_id", ""))
+        if not job:
+            return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
+        return web.json_response(job.public_status())
 
     # -----------------------------------------------------------------------
     # Render cache

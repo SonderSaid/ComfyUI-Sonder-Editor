@@ -16,6 +16,11 @@ import numpy as np
 
 logger = logging.getLogger("sonder_editor")
 
+
+class MediaOperationCancelled(RuntimeError):
+    """Raised when a cooperative media operation is cancelled."""
+
+
 DEFAULT_SAVE_VIDEO_PRESET = "Compatible MP4"
 CUSTOM_SAVE_VIDEO_PRESET = "Custom"
 CUSTOM_OUTPUT_KIND_VIDEO = "Video File"
@@ -548,7 +553,70 @@ def _raise_stream_timeout(proc, cmd: list, timeout: int | float | None, stderr_f
     raise _timeout_expired(cmd, timeout, stderr_file)
 
 
-def _run_ffmpeg_streaming_frames(cmd: list, frames: np.ndarray, *, timeout: int | float | None) -> None:
+def _cancel_requested(cancel_event) -> bool:
+    return bool(cancel_event is not None and cancel_event.is_set())
+
+
+def _terminate_process(proc) -> None:
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def run_ffmpeg_command(
+    cmd: list,
+    *,
+    timeout: int | float | None = None,
+    cancel_event=None,
+) -> None:
+    deadline = time.perf_counter() + float(timeout) if timeout is not None else None
+    with tempfile.TemporaryFile() as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
+        while True:
+            if _cancel_requested(cancel_event):
+                _terminate_process(proc)
+                raise MediaOperationCancelled("media operation cancelled")
+
+            returncode = proc.poll()
+            if returncode is not None:
+                stderr = _read_process_stderr(stderr_file)
+                if returncode != 0:
+                    raise RuntimeError(_ffmpeg_failed_message(stderr))
+                return
+
+            if deadline is not None and time.perf_counter() >= deadline:
+                _terminate_process(proc)
+                raise _timeout_expired(cmd, timeout, stderr_file)
+
+            time.sleep(0.1)
+
+
+def _run_ffmpeg_streaming_frames(
+    cmd: list,
+    frames: np.ndarray,
+    *,
+    timeout: int | float | None,
+    cancel_event=None,
+) -> None:
     deadline = time.perf_counter() + float(timeout) if timeout is not None else None
     with tempfile.TemporaryFile() as stderr_file:
         proc = subprocess.Popen(
@@ -577,6 +645,9 @@ def _run_ffmpeg_streaming_frames(cmd: list, frames: np.ndarray, *, timeout: int 
                 raise RuntimeError("ffmpeg failed: stdin pipe was not available")
 
             for frame in frames:
+                if _cancel_requested(cancel_event):
+                    _terminate_process(proc)
+                    raise MediaOperationCancelled("media operation cancelled")
                 if timed_out.is_set():
                     _raise_stream_timeout(proc, cmd, timeout, stderr_file)
                 try:
@@ -593,13 +664,36 @@ def _run_ffmpeg_streaming_frames(cmd: list, frames: np.ndarray, *, timeout: int 
             if timed_out.is_set():
                 _raise_stream_timeout(proc, cmd, timeout, stderr_file)
 
-            wait_timeout = None
-            if deadline is not None:
-                wait_timeout = max(0.0, deadline - time.perf_counter())
-            try:
-                returncode = proc.wait(timeout=wait_timeout)
-            except subprocess.TimeoutExpired:
-                _raise_stream_timeout(proc, cmd, timeout, stderr_file)
+            if _cancel_requested(cancel_event):
+                _terminate_process(proc)
+                raise MediaOperationCancelled("media operation cancelled")
+
+            if cancel_event is None:
+                wait_timeout = None
+                if deadline is not None:
+                    wait_timeout = max(0.0, deadline - time.perf_counter())
+                try:
+                    returncode = proc.wait(timeout=wait_timeout)
+                except subprocess.TimeoutExpired:
+                    _raise_stream_timeout(proc, cmd, timeout, stderr_file)
+            else:
+                while True:
+                    if _cancel_requested(cancel_event):
+                        _terminate_process(proc)
+                        raise MediaOperationCancelled("media operation cancelled")
+                    if hasattr(proc, "poll"):
+                        returncode = proc.poll()
+                        if returncode is not None:
+                            break
+                    else:
+                        try:
+                            returncode = proc.wait(timeout=0.1)
+                            break
+                        except subprocess.TimeoutExpired:
+                            pass
+                    if deadline is not None and time.perf_counter() >= deadline:
+                        _raise_stream_timeout(proc, cmd, timeout, stderr_file)
+                    time.sleep(0.1)
             if timer is not None:
                 timer.cancel()
 
@@ -744,6 +838,7 @@ def encode_video(
     audio_path: str | None = None,
     custom_options: dict | None = None,
     timeout: int = 90,
+    cancel_event=None,
 ) -> dict:
     preset_id = normalize_save_preset(preset_id)
     if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
@@ -779,9 +874,123 @@ def encode_video(
 
     started_at = time.perf_counter()
     try:
-        _run_ffmpeg_streaming_frames(cmd, frames, timeout=timeout)
+        _run_ffmpeg_streaming_frames(cmd, frames, timeout=timeout, cancel_event=cancel_event)
     except subprocess.TimeoutExpired:
         logger.warning("ffmpeg timeout: encode_video output=%s", output_path)
         raise
+    except MediaOperationCancelled:
+        try:
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+        except OSError:
+            pass
+        raise
     logger.debug("ffmpeg encode complete output=%s frames=%d duration=%.2fs", output_path, frame_count, time.perf_counter() - started_at)
     return _preset_metadata(preset_id, custom_options)
+
+
+def _audio_codec_bitrate_from_args(args: list[str]) -> tuple[str, int | None]:
+    codec = ""
+    bitrate_kbps: int | None = None
+    for idx, value in enumerate(args):
+        if value == "-c:a" and idx + 1 < len(args):
+            codec = str(args[idx + 1])
+        elif value == "-b:a" and idx + 1 < len(args):
+            raw = str(args[idx + 1]).strip().lower()
+            try:
+                if raw.endswith("k"):
+                    bitrate_kbps = int(float(raw[:-1]))
+                else:
+                    bitrate_kbps = max(1, int(float(raw) / 1000.0))
+            except (TypeError, ValueError):
+                bitrate_kbps = None
+    return codec, bitrate_kbps
+
+
+def audio_only_export_spec(
+    preset_id: str | None,
+    custom_options: dict | None = None,
+) -> dict:
+    preset_id = normalize_save_preset(preset_id)
+    if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
+        spec = resolve_custom_export_options(custom_options)
+        codec = str(spec["audio_codec"])
+        bitrate_kbps = int(spec["audio_bitrate_kbps"])
+    else:
+        audio_args = _preset_audio_args(preset_id, custom_options)
+        codec, bitrate_kbps = _audio_codec_bitrate_from_args(audio_args)
+
+    if codec == "none" or not codec:
+        raise ValueError("Selected preset does not define an audio codec for audio-only export")
+    if codec == "aac":
+        extension = ".m4a"
+        container = "m4a"
+    elif codec == "pcm_s16le":
+        extension = ".wav"
+        container = "wav"
+    elif codec == "flac":
+        extension = ".flac"
+        container = "flac"
+    else:
+        raise ValueError(f"Unsupported audio-only codec: {codec}")
+
+    metadata = _preset_metadata(preset_id, custom_options)
+    metadata.update({
+        "codec": codec,
+        "pix_fmt": "",
+        "container": container,
+        "extension": extension,
+        "audio_only": True,
+        "video_stream": False,
+        "audio_mode": f"{codec} {bitrate_kbps}k".strip() if codec == "aac" and bitrate_kbps else codec,
+    })
+    return {
+        "codec": codec,
+        "container": container,
+        "extension": extension,
+        "bitrate_kbps": bitrate_kbps,
+        "metadata": metadata,
+    }
+
+
+def encode_audio(
+    input_wav: str,
+    output_path: str,
+    *,
+    codec: str,
+    container: str,
+    bitrate_kbps: int | None = None,
+    timeout: int | float | None = 90,
+    cancel_event=None,
+) -> None:
+    codec = str(codec or "").strip()
+    container = str(container or "").strip()
+    if codec not in {"aac", "pcm_s16le", "flac"}:
+        raise ValueError(f"Unsupported audio codec: {codec}")
+    if container not in {"m4a", "wav", "flac"}:
+        raise ValueError(f"Unsupported audio container: {container}")
+
+    args = ["-c:a", codec]
+    if codec == "aac":
+        args += ["-b:a", f"{int(bitrate_kbps or 192)}k"]
+    cmd = [
+        get_ffmpeg_path(),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_wav),
+        "-vn",
+        *args,
+        str(output_path),
+    ]
+    try:
+        run_ffmpeg_command(cmd, timeout=timeout, cancel_event=cancel_event)
+    except MediaOperationCancelled:
+        try:
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+        except OSError:
+            pass
+        raise

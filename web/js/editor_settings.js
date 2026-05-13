@@ -178,6 +178,14 @@ export const DEFAULT_EDITOR_SETTINGS = {
         maxRenderCacheEntries: 3,
         trashRetentionDays: 30,
         trashMaxSizeMB: null,
+        export: {
+            lastPreset: DEFAULT_SAVE_PRESET,
+            lastCustomEncode: null,
+            filenamePrefix: "",
+            includeVideo: true,
+            includeAudio: true,
+            placeAsTake: true,
+        },
     },
     guides: {
         guideSnapshotMaxLongEdge: 0,
@@ -222,6 +230,11 @@ const VALID_COMPARE_LAYOUTS = new Set(["divider", "sideBySide"]);
 const VALID_AUDIO_COMPARE_WAVEFORM_LAYOUTS = new Set(["stacked", "overlay"]);
 const VALID_AUDIO_COMPARE_MONITORS = new Set(["a", "b", "both", "mute"]);
 export const VALID_TAKE_PLACEMENT_MODES = new Set(TAKE_PLACEMENT_MODE_OPTIONS.map((entry) => entry.value));
+const VALID_CUSTOM_CONTAINERS = new Set(CUSTOM_CONTAINER_OPTIONS);
+const VALID_CUSTOM_VIDEO_CODECS = new Set(CUSTOM_VIDEO_CODEC_OPTIONS);
+const VALID_CUSTOM_PIX_FMTS = new Set(CUSTOM_PIX_FMT_OPTIONS);
+const VALID_CUSTOM_ENCODER_PRESETS = new Set(CUSTOM_ENCODER_PRESET_OPTIONS);
+const VALID_CUSTOM_AUDIO_CODECS = new Set(CUSTOM_AUDIO_CODEC_OPTIONS);
 
 const listeners = new Set();
 
@@ -466,6 +479,46 @@ function normalizeQueueBatchCollapsedByProject(nextValue) {
     return normalized;
 }
 
+function sanitizeExportFilenamePrefix(value) {
+    return String(value || "")
+        .replace(/[\\/:*?"<>|]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 64);
+}
+
+function normalizeLastCustomEncode(nextValue) {
+    if (!nextValue || typeof nextValue !== "object" || Array.isArray(nextValue)) {
+        return null;
+    }
+    return {
+        custom_output_kind: CUSTOM_OUTPUT_KIND_VIDEO,
+        custom_container: VALID_CUSTOM_CONTAINERS.has(nextValue.custom_container) ? nextValue.custom_container : "mp4",
+        custom_video_codec: VALID_CUSTOM_VIDEO_CODECS.has(nextValue.custom_video_codec) ? nextValue.custom_video_codec : "libx264",
+        custom_pix_fmt: VALID_CUSTOM_PIX_FMTS.has(nextValue.custom_pix_fmt) ? nextValue.custom_pix_fmt : "yuv420p",
+        custom_crf: clampNumber(nextValue.custom_crf, 0, 51, 18, true),
+        custom_encoder_preset: VALID_CUSTOM_ENCODER_PRESETS.has(nextValue.custom_encoder_preset) ? nextValue.custom_encoder_preset : "slow",
+        custom_audio_codec: VALID_CUSTOM_AUDIO_CODECS.has(nextValue.custom_audio_codec) ? nextValue.custom_audio_codec : "aac",
+        custom_audio_bitrate_kbps: clampNumber(nextValue.custom_audio_bitrate_kbps, 1, 10000, 192, true),
+        custom_png_compression: clampNumber(nextValue.custom_png_compression, 0, 9, 0, true),
+    };
+}
+
+function normalizeRenderExportSettings(nextValue) {
+    const defaults = DEFAULT_EDITOR_SETTINGS.render.export;
+    const source = nextValue && typeof nextValue === "object" && !Array.isArray(nextValue)
+        ? nextValue
+        : {};
+    return {
+        lastPreset: VALID_SAVE_PRESETS.has(source.lastPreset) ? source.lastPreset : defaults.lastPreset,
+        lastCustomEncode: normalizeLastCustomEncode(source.lastCustomEncode),
+        filenamePrefix: sanitizeExportFilenamePrefix(source.filenamePrefix),
+        includeVideo: source.includeVideo == null ? defaults.includeVideo : !!source.includeVideo,
+        includeAudio: source.includeAudio == null ? defaults.includeAudio : !!source.includeAudio,
+        placeAsTake: source.placeAsTake == null ? defaults.placeAsTake : !!source.placeAsTake,
+    };
+}
+
 function normalizeEditorSettings(source = null) {
     const stored = source && typeof source === "object" ? source : {};
     const legacyLayout = legacyLayoutSettings();
@@ -642,6 +695,7 @@ function normalizeEditorSettings(source = null) {
                     100000000,
                     defaults.render.trashMaxSizeMB,
                 ),
+            export: normalizeRenderExportSettings(stored?.render?.export),
         },
         guides: {
             guideSnapshotMaxLongEdge: clampNumber(

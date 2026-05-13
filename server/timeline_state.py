@@ -14,7 +14,7 @@ logger = logging.getLogger("sonder_editor")
 
 VIDEO_ASSET_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 IMAGE_ASSET_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-AUDIO_ASSET_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".aac"}
+AUDIO_ASSET_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
 ARTIFACT_KIND_BY_EXT = {
     ".latent": "latent",
     ".safetensors": "model",

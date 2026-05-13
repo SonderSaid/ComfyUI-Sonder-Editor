@@ -18,6 +18,7 @@ import folder_paths
 from ..server.project_manager import load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 from ..server.media_helpers import decode_video_frame, decode_video_range, fit_frame_to_canvas
+from ..server.timeline_renderer import render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
 
@@ -857,125 +858,13 @@ class SonderEditor:
         Returns (N, H, W, 3) float32 RGB tensor. Uses caching to skip
         re-rendering when the scene hasn't changed.
         """
-        proj_w, proj_h = proj.resolution
-        # Scene-level resolution override
-        if scene.width > 0:
-            proj_w = scene.width
-        if scene.height > 0:
-            proj_h = scene.height
-        num_frames = render_end - render_start
-
-        if num_frames <= 0:
-            return torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
-
-        # --- Check cache ---
-        cache_dir = os.path.join(proj.project_dir, "cache", "renders")
-        content_hash = scene.content_hash(render_start, render_end, proj.resolution)
-        cache_path = os.path.join(cache_dir, f"{scene.scene_id}_{content_hash}.pt")
-
-        if os.path.isfile(cache_path):
-            try:
-                cached = torch.load(cache_path, weights_only=True)
-                logger.info("Render cache hit for scene %s (%d frames)", scene.scene_id, num_frames)
-                return cached
-            except Exception as e:
-                logger.warning("Failed to load render cache: %s", e)
-                try:
-                    os.remove(cache_path)
-                    logger.warning("Deleted corrupt render cache: %s", cache_path)
-                except OSError as remove_error:
-                    logger.warning("Failed to delete corrupt render cache %s: %s", cache_path, remove_error)
-
-        # --- Collect visible clips (skip hidden video lanes) ---
-        hidden_lanes = set()
-        for i, cfg in enumerate(scene.video_lane_configs):
-            if cfg.hidden:
-                hidden_lanes.add(i)
-
-        visible_clips = [
-            c for c in scene.clips
-            if c.track_index not in hidden_lanes
-            and getattr(c, "role", "render") == "render"
-            and not getattr(c, "muted", False)
-        ]
-
-        if not visible_clips:
-            return torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
-
-        # --- Open video captures (reuse across frames) ---
-        captures = {}  # source_path -> cv2.VideoCapture
-
-        def get_cap(source_path):
-            abs_path = source_path
-            if not os.path.isfile(abs_path):
-                abs_path = os.path.join(proj.project_dir, source_path)
-            if abs_path not in captures:
-                cap = cv2.VideoCapture(abs_path)
-                if cap.isOpened():
-                    captures[abs_path] = cap
-                else:
-                    logger.warning("Cannot open video: %s", abs_path)
-                    return None
-            return captures[abs_path]
-
-        try:
-            frames = []
-            for f in range(render_start, render_end):
-                # Black canvas
-                canvas = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
-
-                # Find active clips at this frame, sorted by track_index (lower = bottom)
-                active = [c for c in visible_clips
-                          if c.timeline_start_frame <= f < c.timeline_end_frame]
-                active.sort(key=lambda c: c.track_index)
-
-                for clip in active:
-                    source_frame = clip.source_in_frame + (f - clip.timeline_start_frame)
-                    cap = get_cap(clip.source_path)
-                    if cap is None:
-                        continue
-
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
-                    ret, frame_bgr = cap.read()
-                    if not ret:
-                        continue
-
-                    # Fit frame to canvas preserving aspect ratio
-                    # BUG-2 fix: use placement bounds, not pixel values, for compositing
-                    placed, (dx, dy, dw, dh) = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
-
-                    if clip.opacity >= 1.0:
-                        # Direct composite — copy content region (black pixels preserved)
-                        canvas[dy:dy + dh, dx:dx + dw] = placed[dy:dy + dh, dx:dx + dw]
-                    else:
-                        # Blend with opacity within content region only
-                        roi_canvas = canvas[dy:dy + dh, dx:dx + dw]
-                        roi_placed = placed[dy:dy + dh, dx:dx + dw]
-                        canvas[dy:dy + dh, dx:dx + dw] = cv2.addWeighted(
-                            roi_canvas, 1.0 - clip.opacity,
-                            roi_placed, clip.opacity, 0
-                        )
-
-                # Convert BGR -> RGB
-                frames.append(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-
-            # Convert to tensor
-            arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
-            tensor = torch.from_numpy(arr)
-
-            # Save to cache
-            os.makedirs(cache_dir, exist_ok=True)
-            try:
-                torch.save(tensor, cache_path)
-                logger.info("Cached render for scene %s (%d frames)", scene.scene_id, num_frames)
-            except Exception as e:
-                logger.warning("Failed to save render cache: %s", e)
-
-            return tensor
-
-        finally:
-            for cap in captures.values():
-                cap.release()
+        return render_scene_frames(
+            proj,
+            scene,
+            render_start,
+            render_end,
+            video_capture_factory=cv2.VideoCapture,
+        )
 
     @staticmethod
     def _fit_frame_to_canvas(frame_bgr: np.ndarray, canvas_w: int, canvas_h: int):
