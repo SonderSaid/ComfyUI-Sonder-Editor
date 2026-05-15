@@ -314,3 +314,89 @@ def test_collector_passes_project_through_without_persisted_mutation(tmp_path):
 
     assert result[0] is project
     assert project.to_dict() == before
+
+
+def test_section_carries_display_type_for_known_class(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    module.SonderMetadataCollector().collect(
+        project,
+        prompt=_prompt(
+            {"lora_1": "a.safetensors", "strength_1": 1.0, "on_1": True},
+            class_type="Power Lora Loader (rgthree)",
+        ),
+        extra_pnginfo={"workflow": _workflow()},
+        unique_id="20",
+        value_0="connected",
+    )
+
+    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    assert section["display_type"] == "power_loras"
+
+
+def test_section_display_type_none_for_unknown_class(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    module.SonderMetadataCollector().collect(
+        project,
+        prompt=_prompt(class_type="Sampler"),
+        extra_pnginfo={"workflow": _workflow()},
+        unique_id="20",
+        value_0="connected",
+    )
+
+    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    assert section["display_type"] is None
+
+
+def test_registry_first_match_wins(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    stub = {
+        "display_type": "stub_first",
+        "predicate": lambda _class_type: True,
+        "transform": lambda _inputs: {"stub": "yes"},
+    }
+    module.COMPAT_HANDLERS.insert(0, stub)
+    try:
+        module.SonderMetadataCollector().collect(
+            project,
+            prompt=_prompt(
+                {"lora_1": "a.safetensors", "strength_1": 1.0, "on_1": True},
+                class_type="Power Lora Loader (rgthree)",
+            ),
+            extra_pnginfo={"workflow": _workflow()},
+            unique_id="20",
+            value_0="connected",
+        )
+    finally:
+        module.COMPAT_HANDLERS.remove(stub)
+
+    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    assert section["display_type"] == "stub_first"
+    assert section["fields"] == {"stub": "yes"}
+
+
+def test_power_lora_large_stack_preserves_list_shape(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    inputs = {}
+    for slot in range(1, 51):
+        inputs[f"lora_{slot}"] = f"FluxKlein\\very_long_lora_filename_for_slot_{slot:03d}.safetensors"
+        inputs[f"strength_{slot}"] = round(0.1 * (slot % 9 + 1), 2)
+        inputs[f"on_{slot}"] = bool(slot % 2)
+    module.SonderMetadataCollector().collect(
+        project,
+        prompt=_prompt(inputs, class_type="Power Lora Loader (rgthree)"),
+        extra_pnginfo={"workflow": _workflow()},
+        unique_id="20",
+        value_0="connected",
+    )
+
+    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    assert isinstance(section["fields"]["power_loras"], list), "structured cap must preserve list shape for matcher"
+    assert len(section["fields"]["power_loras"]) == 50
+    first = section["fields"]["power_loras"][0]
+    assert first["name"].startswith("FluxKlein\\")
+    assert section["fields"]["enabled_lora_count"] == 25
+    assert section["fields"]["total_lora_count"] == 50

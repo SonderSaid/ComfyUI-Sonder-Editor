@@ -135,6 +135,30 @@ def test_save_video_tracked_metadata_propagates(tmp_path, monkeypatch):
     assert tracked == [{"label": "Sampler", "fields": {"cfg": 7}}]
 
 
+def test_save_video_display_type_propagates(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    calls = []
+    _patch_save_deps(io_nodes, monkeypatch, calls)
+    project = _project(tmp_path)
+    section = {
+        "label": "Power LoRAs",
+        "source_node_id": "10",
+        "source_node_class": "Power Lora Loader (rgthree)",
+        "source_node_title": "",
+        "raw_widget_text": "lora_1: a.safetensors",
+        "fields": {"power_loras": [{"slot": 1, "name": "a.safetensors", "enabled": True}]},
+        "display_type": "power_loras",
+    }
+    project._execution_context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: [section]}
+
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False)
+
+    tracked = project.assets[0].generation_params["editor_export"]["tracked_metadata"]
+    assert tracked[0]["display_type"] == "power_loras"
+    assert tracked[0]["fields"]["power_loras"][0]["name"] == "a.safetensors"
+
+
 def test_save_video_take_mode_does_not_leak_sentinel(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")

@@ -9,6 +9,11 @@ import {
     updateEditorSettings,
 } from "./editor_settings.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
+import {
+    renderTrackedSectionBody,
+    trackedFieldMatchForEntry,
+    TRACKED_RENDERERS,
+} from "./tracked_metadata_renderers.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_INSPECTOR_SETTINGS = DEFAULT_EDITOR_SETTINGS.inspector;
@@ -358,6 +363,9 @@ function trackedMetadataBlob(asset) {
 
 function trackedFieldMatches(asset, name, value) {
     for (const entry of trackedMetadataEntries(asset)) {
+        const registryDecision = trackedFieldMatchForEntry(entry, name, value);
+        if (registryDecision === true) return true;
+        if (registryDecision === false) continue; // registered matcher had a definitive "no" for this entry
         const fields = entry.fields && typeof entry.fields === "object" ? entry.fields : {};
         for (const [fieldName, fieldValue] of Object.entries(fields)) {
             if (String(fieldName).toLowerCase() !== name) continue;
@@ -547,6 +555,16 @@ export function mountSharedAssetGallery(container, options = {}) {
         usageData: null,
         replaceAssetId: "",
         lastInteractedAt: 0,
+        // Session-only tracked-metadata pins. Per-gallery-instance: dormant and fullscreen
+        // each get their own; the inspect overlay shares the fullscreen instance's pins
+        // because it lives inside the same gallery's state.
+        inspectorPins: { sections: new Set(), fields: new Set() },
+        // Hook stored when the inspect overlay mounts its metadata panel, so token toggles
+        // can refresh just that panel without tearing the media element.
+        overlayMetadataRefresh: null,
+        // Hook stored when the compare overlay mounts its A/B choosers, so compare-mode
+        // metadata-cell L/R clicks can refresh both picker lists without tearing media.
+        overlayCompareChoosersRefresh: null,
         overlayState: {
             open: false,
             assetId: "",
@@ -560,7 +578,13 @@ export function mountSharedAssetGallery(container, options = {}) {
             compareLeftAssetId: "",
             compareRightAssetId: "",
             comparePickerQuery: "",
+            comparePickerQueryB: "",
             comparePickerSortMode: DEFAULT_SORT_MODE,
+            // Per-panel scrollTop persistence so asset cycling / token toggles don't
+            // jerk the metadata view back to the top. Cleared on overlay close.
+            metadataScrollTopSingle: 0,
+            metadataScrollTopA: 0,
+            metadataScrollTopB: 0,
             compareLayout: initialInspectorSettings.compareLayout || DEFAULT_INSPECTOR_SETTINGS.compareLayout,
             sideBySideLinkZoom: initialInspectorSettings.sideBySideLinkZoom !== false,
             audioCompareWaveformLayout: initialInspectorSettings.audioCompareWaveformLayout || DEFAULT_INSPECTOR_SETTINGS.audioCompareWaveformLayout,
@@ -649,6 +673,14 @@ export function mountSharedAssetGallery(container, options = {}) {
     listPane.append(bulkToolbarHost, listScroller);
 
     const detailPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:8px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.border};min-height:0;overflow:auto;`);
+    // Inspector contextmenu floor: stop right-clicks inside the inspector from
+    // bubbling up to the gallery surface (where the folder pane's menu lives).
+    // Per-cell handlers stopPropagation themselves; this catches anything that
+    // doesn't have its own listener yet.
+    detailPane.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+    });
     content.append(listPane, detailPane);
 
     const folderListId = `sonder-gallery-folders-${Math.random().toString(36).slice(2)}`;
@@ -985,6 +1017,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         searchInput.value = state.query;
         state.allowAutoFocus = true;
         render();
+        invalidateOverlayMetadata();
     }
 
     function removeSearchToken(token) {
@@ -997,6 +1030,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         searchInput.value = state.query;
         state.allowAutoFocus = true;
         render();
+        invalidateOverlayMetadata();
     }
 
     function toggleSearchToken(token) {
@@ -1017,6 +1051,208 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function searchHasToken(token) {
         return activeSearchTokens().has(String(token || "").trim());
+    }
+
+    // ---------- Compare-mode B-side query (mirrors A-side state.query semantics) ----------
+
+    function compareModeActive() {
+        return !!(state.overlayState && state.overlayState.open && state.overlayState.compareMode);
+    }
+
+    function compareQueryRef(side) {
+        return side === "B" ? "comparePickerQueryB" : "comparePickerQuery";
+    }
+
+    function compareSearchTokens(side) {
+        const raw = state.overlayState?.[compareQueryRef(side)] || "";
+        return new Set(String(raw).trim().split(/\s+/).filter(Boolean));
+    }
+
+    function compareSearchHasToken(side, token) {
+        return compareSearchTokens(side).has(String(token || "").trim());
+    }
+
+    function setCompareQuery(side, value) {
+        if (!state.overlayState) return;
+        state.overlayState[compareQueryRef(side)] = String(value || "");
+        if (typeof state.overlayCompareChoosersRefresh === "function") {
+            try { state.overlayCompareChoosersRefresh(); } catch (err) { console.warn("[gallery] compare choosers refresh failed", err); }
+        }
+        invalidateOverlayMetadata();
+    }
+
+    function toggleCompareSearchToken(side, token) {
+        const normalized = String(token || "").trim();
+        if (!normalized) return;
+        const tokens = Array.from(compareSearchTokens(side));
+        const idx = tokens.indexOf(normalized);
+        if (idx >= 0) tokens.splice(idx, 1);
+        else tokens.push(normalized);
+        setCompareQuery(side, tokens.join(" "));
+    }
+
+    // ---------- Tracked-metadata pin state ----------
+
+    function pinSetsForSurface(_surface) {
+        // Per-instance state (one gallery instance per host: dormant vs fullscreen).
+        // Inspect overlay shares the fullscreen instance's pins because it is part of
+        // the same gallery and reads `state.inspectorPins` directly.
+        return state.inspectorPins;
+    }
+
+    function togglePinSection(entry, surface) {
+        const pins = pinSetsForSurface(surface);
+        const key = trackedSectionPinKey(entry);
+        if (!key) return;
+        if (pins.sections.has(key)) pins.sections.delete(key);
+        else pins.sections.add(key);
+        render();
+        invalidateOverlayMetadata();
+    }
+
+    function togglePinField(entry, fieldKey, surface) {
+        const pins = pinSetsForSurface(surface);
+        const key = trackedFieldPinKey(entry, fieldKey);
+        if (!key) return;
+        if (pins.fields.has(key)) pins.fields.delete(key);
+        else pins.fields.add(key);
+        render();
+        invalidateOverlayMetadata();
+    }
+
+    function isSectionPinned(entry, surface) {
+        return pinSetsForSurface(surface).sections.has(trackedSectionPinKey(entry));
+    }
+
+    function isFieldPinned(entry, fieldKey, surface) {
+        return pinSetsForSurface(surface).fields.has(trackedFieldPinKey(entry, fieldKey));
+    }
+
+    // ---------- Overlay metadata refresh hook ----------
+
+    function invalidateOverlayMetadata() {
+        const refresh = state.overlayMetadataRefresh;
+        if (typeof refresh === "function") {
+            try { refresh(); } catch (err) { console.warn("[gallery] overlay metadata refresh failed", err); }
+        }
+    }
+
+    // ---------- Tracked-metadata click / contextmenu handlers ----------
+
+    function handleTrackedFieldClick(event, info, surface) {
+        if (!info || !info.fieldKey) return;
+        event?.stopPropagation();
+        const token = fieldSearchToken(info.fieldKey, info.value);
+        if (compareModeActive()) {
+            toggleCompareSearchToken("A", token);
+            return;
+        }
+        toggleSearchToken(token);
+    }
+
+    function handleTrackedFieldContextMenu(event, info, surface) {
+        if (!info || !info.fieldKey) return;
+        event?.preventDefault();
+        event?.stopPropagation();
+        const token = fieldSearchToken(info.fieldKey, info.value);
+        if (compareModeActive()) {
+            toggleCompareSearchToken("B", token);
+            return;
+        }
+        const items = trackedFieldContextMenuItems(info, surface, token);
+        showContextMenu(event.clientX, event.clientY, items);
+    }
+
+    function handleTrackedSectionContextMenu(event, entry, surface, kind) {
+        event?.preventDefault();
+        event?.stopPropagation();
+        if (compareModeActive()) return; // no section context menu in compare mode
+        const items = trackedSectionContextMenuItems(entry, surface, kind);
+        showContextMenu(event.clientX, event.clientY, items);
+    }
+
+    function copyToClipboardSafe(text) {
+        const value = String(text == null ? "" : text);
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(value).catch(() => fallbackCopy(value));
+            } else {
+                fallbackCopy(value);
+            }
+        } catch {
+            fallbackCopy(value);
+        }
+    }
+
+    function fallbackCopy(value) {
+        try {
+            const ta = document.createElement("textarea");
+            ta.value = value;
+            ta.style.position = "fixed";
+            ta.style.left = "-9999px";
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand("copy");
+            ta.remove();
+        } catch (err) {
+            console.warn("[gallery] copy fallback failed", err);
+        }
+    }
+
+    function trackedFieldContextMenuItems(info, surface, token) {
+        const entry = info.entry;
+        const fieldKey = info.fieldKey;
+        const pinned = isFieldPinned(entry, fieldKey, surface);
+        const tokenActive = searchHasToken(token);
+        let copyText = String(info.value == null ? "" : info.value);
+        if (info.displayKind === "power_lora_row" && info.rowMeta) {
+            copyText = String(info.rowMeta.name || info.rowMeta.lora || copyText);
+        }
+        return [
+            {
+                label: "Copy as text",
+                action: () => copyToClipboardSafe(copyText),
+            },
+            {
+                label: pinned ? "Unpin from top" : "Pin to top",
+                action: () => togglePinField(entry, fieldKey, surface),
+            },
+            {
+                label: tokenActive ? "Clear filter" : "Filter by this field",
+                action: () => toggleSearchToken(token),
+            },
+        ];
+    }
+
+    function trackedSectionContextMenuItems(entry, surface, kind) {
+        const pinned = isSectionPinned(entry, surface);
+        const items = [];
+        if (kind === "raw") {
+            items.push({
+                label: "Copy raw widget text",
+                action: () => copyToClipboardSafe(entry.raw_widget_text || ""),
+            });
+        } else {
+            // Section header: copy a useful summary depending on display_type.
+            if (entry.display_type === "power_loras") {
+                const rows = Array.isArray(entry.fields?.power_loras) ? entry.fields.power_loras : [];
+                const text = rows.map((row) => row && (row.name || row.lora || "")).filter(Boolean).join("\n");
+                items.push({
+                    label: "Copy LoRA names",
+                    action: () => copyToClipboardSafe(text),
+                });
+            } else {
+                items.push({
+                    label: "Copy raw widget text",
+                    action: () => copyToClipboardSafe(entry.raw_widget_text || ""),
+                });
+            }
+        }
+        items.push({
+            label: pinned ? "Unpin section from top" : "Pin section to top",
+            action: () => togglePinSection(entry, surface),
+        });
+        return items;
     }
 
     function sortAssetsByMode(assets, sortMode) {
@@ -1746,103 +1982,189 @@ export function mountSharedAssetGallery(container, options = {}) {
         bulkToolbarHost.appendChild(bar);
     }
 
-    function renderPowerLoraRows(rows) {
-        const entries = Array.isArray(rows) ? rows.filter((row) => row && typeof row === "object") : [];
-        if (!entries.length) return null;
-        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:5px;min-width:0;`);
-        const label = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
-        label.textContent = "Power LoRAs";
-        wrap.appendChild(label);
-        for (const row of entries) {
-            const name = String(row.name || row.lora || row.label || "-");
-            const token = fieldSearchToken("power_loras", name);
-            const active = searchHasToken(token);
-            const enabled = row.enabled !== false;
-            const line = style(document.createElement("button"), `
-                appearance:none;text-align:left;width:100%;min-width:0;
-                display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;
-                padding:7px 8px;border-radius:6px;border:1px solid ${active ? "rgba(143,192,240,0.58)" : CHROME.borderSoft};
-                background:${active ? "rgba(143,192,240,0.16)" : "rgba(255,255,255,0.03)"};
-                color:${enabled ? "#e4edf4" : "#9ca8b2"};cursor:pointer;
-                box-shadow:${active ? "inset 0 0 0 1px rgba(143,192,240,0.22)" : "none"};
-            `);
-            const main = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
-            const title = style(document.createElement("div"), `font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-            title.textContent = `${row.slot != null ? `${row.slot}. ` : ""}${name}`;
-            const parts = [];
-            for (const [key, labelText] of [
-                ["strength", "strength"],
-                ["model_strength", "model"],
-                ["clip_strength", "clip"],
-            ]) {
-                if (row[key] != null && row[key] !== "") parts.push(`${labelText} ${formatGenerationValue(row[key])}`);
+    function trackedRenderContext(surface) {
+        return {
+            style,
+            CHROME,
+            formatGenerationValue,
+            fieldSearchToken,
+            // Compare-mode-aware active checks. Outside compare, A == state.query; in compare,
+            // A == comparePickerQuery and B == comparePickerQueryB. Renderers call these for
+            // visual highlighting without needing to know which mode they're in.
+            tokenActiveA: (token) => compareModeActive() ? compareSearchHasToken("A", token) : searchHasToken(token),
+            tokenActiveB: (token) => compareModeActive() && compareSearchHasToken("B", token),
+            onFieldClick: (event, info) => handleTrackedFieldClick(event, info, surface),
+            onFieldContextMenu: (event, info) => handleTrackedFieldContextMenu(event, info, surface),
+        };
+    }
+
+    function trackedSectionPinKey(entry) {
+        return String(entry?.label || "").trim().toLowerCase();
+    }
+
+    function trackedFieldPinKey(entry, fieldKey) {
+        return `${trackedSectionPinKey(entry)}::${String(fieldKey || "").toLowerCase()}`;
+    }
+
+    function partitionTrackedEntriesByPin(entries, surface) {
+        const pinSets = pinSetsForSurface(surface);
+        if (!pinSets.sections.size && !pinSets.fields.size) {
+            return { pinned: [], unpinned: entries.slice() };
+        }
+        const pinned = [];
+        const unpinned = [];
+        for (const entry of entries) {
+            const sectionKey = trackedSectionPinKey(entry);
+            const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
+            const fieldKeys = Object.keys(fields);
+            const fieldHit = fieldKeys.some((key) => pinSets.fields.has(trackedFieldPinKey(entry, key)));
+            if (pinSets.sections.has(sectionKey) || fieldHit) {
+                pinned.push(entry);
+            } else {
+                unpinned.push(entry);
             }
-            const sub = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-            sub.textContent = parts.length ? parts.join(" | ") : "-";
-            main.append(title, sub);
-            const status = style(document.createElement("div"), `font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:${enabled ? "#b7e4b4" : "#c0a49a"};`);
-            status.textContent = enabled ? "On" : "Off";
-            line.append(main, status);
-            line.addEventListener("click", () => toggleSearchToken(token));
-            wrap.appendChild(line);
+        }
+        return { pinned, unpinned };
+    }
+
+    function renderTrackedMetadataSection(asset, options = {}) {
+        const entries = trackedMetadataEntries(asset);
+        if (!entries.length) return null;
+        const surface = options.surface || "fullscreen";
+        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;`);
+        const headerRow = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;`);
+        headerRow.appendChild(makeSectionTitle("Tracked Metadata"));
+        const pinSets = pinSetsForSurface(surface);
+        if (pinSets.sections.size || pinSets.fields.size) {
+            const total = pinSets.sections.size + pinSets.fields.size;
+            const unpin = style(document.createElement("button"), `appearance:none;border:none;background:transparent;color:${CHROME.textDim};font-size:10px;cursor:pointer;text-decoration:underline;padding:0;`);
+            unpin.textContent = `Unpin all (${total})`;
+            unpin.title = "Clear all pinned tracked sections/fields on this surface";
+            unpin.addEventListener("click", (event) => {
+                event.stopPropagation();
+                pinSets.sections.clear();
+                pinSets.fields.clear();
+                render();
+                invalidateOverlayMetadata();
+            });
+            headerRow.appendChild(unpin);
+        }
+        wrap.appendChild(headerRow);
+
+        const ctx = trackedRenderContext(surface);
+        const partitioned = partitionTrackedEntriesByPin(entries, surface);
+        const ordered = [...partitioned.pinned, ...partitioned.unpinned];
+        const pinnedSet = new Set(partitioned.pinned);
+        for (const entry of ordered) {
+            wrap.appendChild(renderTrackedSectionContainer(entry, ctx, surface, pinnedSet.has(entry)));
         }
         return wrap;
     }
 
-    function renderTrackedMetadataSection(asset) {
-        const entries = trackedMetadataEntries(asset);
-        if (!entries.length) return null;
-        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;`);
-        wrap.appendChild(makeSectionTitle("Tracked Metadata"));
-        for (const entry of entries) {
-            const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.025);border:1px solid ${CHROME.borderSoft};`);
-            const title = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;text-transform:uppercase;`);
-            title.textContent = String(entry.label || "Tracked");
-            section.appendChild(title);
-            const sourceBits = [entry.source_node_class, entry.source_node_title].filter((part, index, all) => part && all.indexOf(part) === index);
-            if (sourceBits.length) {
-                const source = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-                source.textContent = sourceBits.join(" | ");
-                section.appendChild(source);
-            }
-            const fields = entry.fields && typeof entry.fields === "object" ? entry.fields : {};
-            const powerLoras = renderPowerLoraRows(fields.power_loras);
-            if (powerLoras) section.appendChild(powerLoras);
-            const fieldEntries = Object.entries(fields).filter(([key]) => key !== "power_loras");
-            if (fieldEntries.length) {
-                const grid = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;min-width:0;`);
-                for (const [key, value] of fieldEntries) {
-                    const rendered = formatGenerationValue(value);
-                    const token = fieldSearchToken(key, rendered);
-                    const active = searchHasToken(token);
-                    const cell = makeMetaCell(key, rendered);
-                    cell.style.cursor = "pointer";
-                    if (active) {
-                        cell.style.background = "rgba(143,192,240,0.16)";
-                        cell.style.borderColor = "rgba(143,192,240,0.55)";
-                        cell.style.boxShadow = "inset 0 0 0 1px rgba(143,192,240,0.22)";
-                    }
-                    cell.addEventListener("click", () => {
-                        toggleSearchToken(token);
-                    });
-                    grid.appendChild(cell);
-                }
-                section.appendChild(grid);
-            }
-            if (entry.raw_widget_text) {
-                const details = document.createElement("details");
-                details.style.cssText = `font-size:10px;color:#cfd8df;`;
-                const summary = document.createElement("summary");
-                summary.textContent = "Raw";
-                summary.style.cursor = "pointer";
-                const raw = style(document.createElement("pre"), `margin:6px 0 0 0;white-space:pre-wrap;word-break:break-word;color:#d9e0e6;background:rgba(0,0,0,0.18);border-radius:6px;padding:6px;`);
-                raw.textContent = String(entry.raw_widget_text || "");
-                details.append(summary, raw);
-                section.appendChild(details);
-            }
-            wrap.appendChild(section);
+    function renderTrackedSectionContainer(entry, ctx, surface, isPinned) {
+        const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:${isPinned ? "rgba(143,192,240,0.06)" : "rgba(255,255,255,0.025)"};border:1px solid ${isPinned ? "rgba(143,192,240,0.32)" : CHROME.borderSoft};`);
+        section.appendChild(renderTrackedSectionHeader(entry, surface, isPinned));
+        const sourceBits = [entry.source_node_class, entry.source_node_title]
+            .filter((part, index, all) => part && all.indexOf(part) === index);
+        if (sourceBits.length) {
+            const source = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+            source.textContent = sourceBits.join(" | ");
+            section.appendChild(source);
         }
+        const bodyResult = renderTrackedSectionBody(entry, ctx);
+        let consumedFields = null; // null means generic grid is suppressed entirely
+        if (bodyResult && typeof bodyResult === "object" && "dom" in bodyResult) {
+            if (bodyResult.dom) section.appendChild(bodyResult.dom);
+            consumedFields = Array.isArray(bodyResult.consumedFields) ? bodyResult.consumedFields : null;
+        } else if (bodyResult) {
+            section.appendChild(bodyResult);
+        } else {
+            consumedFields = []; // no renderer fired; generic grid renders all fields
+        }
+        if (Array.isArray(consumedFields)) {
+            const generic = renderGenericTrackedFields(entry, ctx, surface, consumedFields);
+            if (generic) section.appendChild(generic);
+        }
+        if (entry.raw_widget_text) {
+            const details = document.createElement("details");
+            details.style.cssText = `font-size:10px;color:#cfd8df;`;
+            const summary = document.createElement("summary");
+            summary.textContent = "Raw";
+            summary.style.cursor = "pointer";
+            summary.addEventListener("contextmenu", (event) => {
+                handleTrackedSectionContextMenu(event, entry, surface, "raw");
+            });
+            const raw = style(document.createElement("pre"), `margin:6px 0 0 0;white-space:pre-wrap;word-break:break-word;color:#d9e0e6;background:rgba(0,0,0,0.18);border-radius:6px;padding:6px;`);
+            raw.textContent = String(entry.raw_widget_text || "");
+            details.append(summary, raw);
+            section.appendChild(details);
+        }
+        return section;
+    }
+
+    function renderTrackedSectionHeader(entry, surface, isPinned) {
+        const wrap = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;`);
+        const title = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;text-transform:uppercase;display:flex;align-items:center;gap:6px;min-width:0;`);
+        if (isPinned) {
+            const pinIcon = style(document.createElement("span"), `color:#8fc0f0;font-size:10px;`);
+            pinIcon.textContent = "📌";
+            title.appendChild(pinIcon);
+        }
+        const labelEl = style(document.createElement("span"), `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;`);
+        labelEl.textContent = String(entry.label || "Tracked");
+        title.appendChild(labelEl);
+        title.title = "Right-click for options";
+        title.addEventListener("contextmenu", (event) => {
+            handleTrackedSectionContextMenu(event, entry, surface, "header");
+        });
+        wrap.appendChild(title);
         return wrap;
+    }
+
+    function renderGenericTrackedFields(entry, ctx, surface, excludeKeys = null) {
+        const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
+        const exclude = new Set((excludeKeys || []).map((key) => String(key)));
+        const fieldEntries = Object.entries(fields).filter(([key]) => !exclude.has(String(key)));
+        if (!fieldEntries.length) return null;
+        const grid = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;min-width:0;`);
+        for (const [key, value] of fieldEntries) {
+            const rendered = formatGenerationValue(value);
+            const token = fieldSearchToken(key, rendered);
+            const cell = makeMetaCell(key, rendered);
+            cell.style.cursor = "pointer";
+            applyFieldCellActiveStyle(cell, surface, entry, key, token);
+            const cellInfo = {
+                entry,
+                fieldKey: String(key),
+                value: rendered,
+                displayKind: "generic",
+            };
+            cell.addEventListener("click", (event) => handleTrackedFieldClick(event, cellInfo, surface));
+            cell.addEventListener("contextmenu", (event) => handleTrackedFieldContextMenu(event, cellInfo, surface));
+            grid.appendChild(cell);
+        }
+        return grid;
+    }
+
+    function applyFieldCellActiveStyle(cell, surface, entry, fieldKey, token) {
+        const inCompare = compareModeActive();
+        // In compare mode, "A" filter == comparePickerQuery (overlay-scoped), not the
+        // gallery's main state.query. Outside compare, A == state.query and there is no B.
+        const activeA = inCompare ? compareSearchHasToken("A", token) : searchHasToken(token);
+        const activeB = inCompare && compareSearchHasToken("B", token);
+        if (activeA && activeB) {
+            cell.style.background = "linear-gradient(90deg, rgba(143,192,240,0.16) 0%, rgba(143,192,240,0.16) 50%, rgba(232,184,109,0.18) 50%, rgba(232,184,109,0.18) 100%)";
+            cell.style.borderColor = "rgba(187,176,170,0.55)";
+            cell.style.boxShadow = "inset 0 0 0 1px rgba(187,176,170,0.22)";
+        } else if (activeA) {
+            cell.style.background = "rgba(143,192,240,0.16)";
+            cell.style.borderColor = "rgba(143,192,240,0.55)";
+            cell.style.boxShadow = "inset 0 0 0 1px rgba(143,192,240,0.22)";
+        } else if (activeB) {
+            cell.style.background = "rgba(232,184,109,0.16)";
+            cell.style.borderColor = "rgba(232,184,109,0.55)";
+            cell.style.boxShadow = "inset 0 0 0 1px rgba(232,184,109,0.22)";
+        }
     }
 
     function renderGenerationSection(asset) {
@@ -1870,15 +2192,45 @@ export function mountSharedAssetGallery(container, options = {}) {
         return wrap;
     }
 
-    function renderOverlayMetadataPanel(assets) {
-        const assetList = (Array.isArray(assets) ? assets : [assets]).filter(Boolean);
-        const panel = style(document.createElement("div"), `flex:0 0 min(360px,32vw);max-width:420px;min-width:260px;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:10px;border-radius:10px;background:rgba(10,15,20,0.72);border:1px solid ${CHROME.border};`);
-        const header = style(document.createElement("div"), `color:#f1f5f8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
-        header.textContent = assetList.length > 1 ? "Compare Metadata" : "Metadata";
+    function renderOverlayMetadataPanel(assetOrAssets, options = {}) {
+        const assetList = (Array.isArray(assetOrAssets) ? assetOrAssets : [assetOrAssets]).filter(Boolean);
+        if (!assetList.length) return document.createElement("div");
+        const role = options.role || (assetList.length > 1 ? "compare" : "single");
+        // Single-asset overlay -> right-rail wide panel (~360px); compare panels are narrower
+        // because two of them flank the media at left and right screen edges.
+        const isCompareSide = role === "A" || role === "B";
+        const panelFlex = isCompareSide
+            ? `flex:0 0 min(300px,22vw);max-width:340px;min-width:220px;`
+            : `flex:0 0 min(360px,32vw);max-width:420px;min-width:260px;`;
+        const panel = style(document.createElement("div"), `${panelFlex}min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:10px;border-radius:10px;background:rgba(10,15,20,0.72);border:1px solid ${CHROME.border};`);
+        const header = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;color:#f1f5f8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
+        if (isCompareSide) {
+            const sideBadge = style(document.createElement("span"), `padding:2px 6px;border-radius:999px;font-size:9px;font-weight:800;letter-spacing:0.06em;background:${role === "A" ? "rgba(143,192,240,0.18)" : "rgba(232,184,109,0.18)"};color:${role === "A" ? "#c5dff7" : "#f0d8a8"};border:1px solid ${role === "A" ? "rgba(143,192,240,0.4)" : "rgba(232,184,109,0.4)"};`);
+            sideBadge.textContent = `Gallery ${role}`;
+            header.append(sideBadge);
+        } else {
+            header.textContent = "Metadata";
+        }
         panel.appendChild(header);
+        if (isCompareSide) {
+            const hint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
+            hint.textContent = "Left click = filter A | Right click = filter B";
+            panel.appendChild(hint);
+        }
+        // Restore prior scroll position so switching assets / toggling tokens does not jerk
+        // the user back to the top of the metadata list. Per-side scrollTop is tracked on
+        // overlayState; updated on every scroll event below.
+        const scrollKey = isCompareSide ? `metadataScrollTop${role}` : "metadataScrollTopSingle";
+        requestAnimationFrame(() => {
+            const stored = state.overlayState[scrollKey];
+            if (typeof stored === "number" && Number.isFinite(stored)) panel.scrollTop = stored;
+        });
+        panel.addEventListener("scroll", () => {
+            state.overlayState[scrollKey] = panel.scrollTop;
+        }, { passive: true });
         for (const item of assetList) {
             const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;`);
-            if (assetList.length > 1) {
+            if (isCompareSide) {
                 const title = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                 title.textContent = assetDisplayName(item);
                 title.title = assetDisplayName(item);
@@ -2446,7 +2798,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.compareLeftAssetId = "";
         state.overlayState.compareRightAssetId = "";
         state.overlayState.comparePickerQuery = "";
+        state.overlayState.comparePickerQueryB = "";
         state.overlayState.comparePickerSortMode = DEFAULT_SORT_MODE;
+        state.overlayState.metadataScrollTopSingle = 0;
+        state.overlayState.metadataScrollTopA = 0;
+        state.overlayState.metadataScrollTopB = 0;
+        state.overlayMetadataRefresh = null;
+        state.overlayCompareChoosersRefresh = null;
         state.overlayState.showWaveform = false;
         state.overlayState.audioFocus = "none";
         state.overlayState.audioTempFlip = false;
@@ -3018,6 +3376,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.compareLeftAssetId = asset.asset_id;
         state.overlayState.compareRightAssetId = "";
         state.overlayState.comparePickerQuery = "";
+        state.overlayState.comparePickerQueryB = "";
         state.overlayState.comparePickerSortMode = DEFAULT_SORT_MODE;
         state.overlayState.dividerRatio = 0.5;
         state.overlayState.audioFocus = "none";
@@ -3140,17 +3499,19 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
     }
 
-    function renderCompareChooser(assets, slotLabel, selectedId, onAssign, requestRefresh = () => {}) {
+    function renderCompareChooser(assets, slotLabel, selectedId, onAssign, requestRefresh = () => {}, side = "A") {
+        const queryRef = side === "B" ? "comparePickerQueryB" : "comparePickerQuery";
+        const sideAccent = side === "B" ? "#e8b86d" : "#7fc0ff";
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;height:100%;padding:10px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);overflow:hidden;`);
         const title = style(document.createElement("div"), `color:#d7e5f1;font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;`);
         title.textContent = slotLabel;
         const hint = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.45;`);
-        hint.textContent = "Left click assigns A. Right click assigns B.";
+        hint.textContent = `Left click assigns A. Right click assigns B. Search filters Gallery ${side}.`;
         const controls = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         const search = style(document.createElement("input"), `width:100%;box-sizing:border-box;${inputChromeCss()}`);
         search.type = "search";
-        search.placeholder = "Search assets (kind:/ext:/tracked:/field:)";
-        search.value = state.overlayState.comparePickerQuery || "";
+        search.placeholder = `Search Gallery ${side} (kind:/ext:/tracked:/field:)`;
+        search.value = state.overlayState[queryRef] || "";
         const sort = style(document.createElement("select"), `width:100%;box-sizing:border-box;${inputChromeCss()}`);
         for (const option of COMPARE_SORT_OPTIONS) {
             const optionEl = document.createElement("option");
@@ -3164,66 +3525,105 @@ export function mountSharedAssetGallery(container, options = {}) {
         controls.append(search, sort);
         const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;`);
 
-        const chooserAssets = () => {
-            const query = parseAssetSearchQuery(state.overlayState.comparePickerQuery || "");
-            const filtered = sortAssetsByMode(
-                assets.filter((entry) => assetMatchesParsedQuery(entry, query)),
-                state.overlayState.comparePickerSortMode || DEFAULT_SORT_MODE,
-            );
-            const pinnedIds = [
-                state.overlayState.compareLeftAssetId,
-                state.overlayState.compareRightAssetId,
-            ].filter(Boolean);
-            const result = [];
-            const seen = new Set();
-            for (const assetId of pinnedIds) {
-                const pinned = assets.find((entry) => entry.asset_id === assetId);
-                if (pinned && !seen.has(pinned.asset_id)) {
-                    result.push(pinned);
-                    seen.add(pinned.asset_id);
-                }
+        const sortedAssets = () => sortAssetsByMode(
+            assets.filter((entry) => assetMatchesParsedQuery(entry, parseAssetSearchQuery(state.overlayState[queryRef] || ""))),
+            state.overlayState.comparePickerSortMode || DEFAULT_SORT_MODE,
+        );
+
+        // Each pinned asset gets an L (left/A) or R (right/B) badge so users can tell at a glance
+        // which slot it occupies. The natural-position copy keeps the same badge.
+        const sideForAssetId = (assetId) => {
+            if (assetId && assetId === state.overlayState.compareLeftAssetId) return "L";
+            if (assetId && assetId === state.overlayState.compareRightAssetId) return "R";
+            return null;
+        };
+
+        const buildSelectionGroup = () => {
+            const ids = [];
+            const leftId = state.overlayState.compareLeftAssetId;
+            const rightId = state.overlayState.compareRightAssetId;
+            if (leftId) ids.push({ id: leftId, side: "L" });
+            if (rightId && rightId !== leftId) ids.push({ id: rightId, side: "R" });
+            const items = [];
+            for (const { id, side } of ids) {
+                const asset = assets.find((entry) => entry.asset_id === id);
+                if (asset) items.push({ asset, role: "top", forcedSide: side });
             }
-            for (const entry of filtered) {
-                if (!seen.has(entry.asset_id)) {
-                    result.push(entry);
-                    seen.add(entry.asset_id);
-                }
+            return items;
+        };
+
+        const buildOrderedNatural = () => {
+            const filtered = sortedAssets();
+            return filtered.map((entry) => {
+                const side = sideForAssetId(entry.asset_id);
+                return { asset: entry, role: side ? "natural-pinned" : "natural", forcedSide: side };
+            });
+        };
+
+        const sideBadgeStyle = (side) => {
+            const accent = side === "R" ? "#e8b86d" : "#7fc0ff";
+            const tint = side === "R" ? "rgba(232,184,109,0.18)" : "rgba(127,192,255,0.18)";
+            const border = side === "R" ? "rgba(232,184,109,0.45)" : "rgba(127,192,255,0.45)";
+            return `background:${tint};border:1px solid ${border};color:${accent};`;
+        };
+
+        const renderRow = ({ asset, role, forcedSide }) => {
+            const isSelected = selectedId === asset.asset_id;
+            const isPinned = role === "top" || role === "natural-pinned";
+            const row = style(document.createElement("div"), `display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:center;padding:6px;border-radius:8px;border:1px solid ${isSelected ? sideAccent : "#35414c"};background:${isSelected ? "rgba(78,121,160,0.18)" : "rgba(255,255,255,0.02)"};cursor:pointer;`);
+            const thumb = style(document.createElement("div"), `height:40px;border-radius:6px;background:#111;border:1px solid #293542;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#7f93a5;font-size:10px;`);
+            if (asset.has_thumbnail) {
+                const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+                img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
+                thumb.appendChild(img);
+            } else {
+                thumb.textContent = assetFallbackGlyph(asset.asset_type);
             }
-            return result;
+            const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
+            const name = style(document.createElement("div"), `color:#edf3f8;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:4px;`);
+            if (isPinned && forcedSide) {
+                const sideBadge = style(document.createElement("span"), `font-size:9px;font-weight:800;letter-spacing:0.05em;padding:1px 5px;border-radius:4px;flex:0 0 auto;${sideBadgeStyle(forcedSide)}`);
+                sideBadge.textContent = forcedSide;
+                name.appendChild(sideBadge);
+            }
+            const nameLabel = style(document.createElement("span"), `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;`);
+            nameLabel.textContent = assetDisplayName(asset);
+            name.appendChild(nameLabel);
+            const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+            meta.textContent = `${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
+            text.append(name, meta);
+            row.append(thumb, text);
+            row.addEventListener("click", () => onAssign("left", asset.asset_id));
+            row.addEventListener("contextmenu", (event) => {
+                event.preventDefault();
+                onAssign("right", asset.asset_id);
+            });
+            return row;
+        };
+
+        const renderSelectionGroup = (group) => {
+            if (!group.length) return null;
+            const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(143,192,240,0.06);border:1px solid rgba(143,192,240,0.28);`);
+            const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;color:#cfdef0;font-size:9px;font-weight:800;letter-spacing:0.08em;text-transform:uppercase;`);
+            header.textContent = "Current Selection";
+            const subtle = style(document.createElement("span"), `color:${CHROME.textDim};font-size:9px;font-weight:600;letter-spacing:0;text-transform:none;`);
+            subtle.textContent = "(also pinned below)";
+            header.appendChild(subtle);
+            wrap.appendChild(header);
+            for (const item of group) wrap.appendChild(renderRow(item));
+            return wrap;
         };
 
         const renderRows = () => {
             list.innerHTML = "";
-            search.value = state.overlayState.comparePickerQuery || "";
+            search.value = state.overlayState[queryRef] || "";
             sort.value = COMPARE_SORT_OPTIONS.some((entry) => entry.value === state.overlayState.comparePickerSortMode)
                 ? state.overlayState.comparePickerSortMode
                 : DEFAULT_SORT_MODE;
-            for (const asset of chooserAssets()) {
-                const pinned = asset.asset_id === state.overlayState.compareLeftAssetId || asset.asset_id === state.overlayState.compareRightAssetId;
-                const row = style(document.createElement("div"), `display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:center;padding:6px;border-radius:8px;border:1px solid ${selectedId === asset.asset_id ? "#7fc0ff" : "#35414c"};background:${selectedId === asset.asset_id ? "rgba(78,121,160,0.18)" : "rgba(255,255,255,0.02)"};cursor:pointer;`);
-                const thumb = style(document.createElement("div"), `height:40px;border-radius:6px;background:#111;border:1px solid #293542;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#7f93a5;font-size:10px;`);
-                if (asset.has_thumbnail) {
-                    const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
-                    img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
-                    thumb.appendChild(img);
-                } else {
-                    thumb.textContent = assetFallbackGlyph(asset.asset_type);
-                }
-                const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
-                const name = style(document.createElement("div"), `color:#edf3f8;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-                name.textContent = assetDisplayName(asset);
-                const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-                const pinLabel = pinned ? "Pinned | " : "";
-                meta.textContent = `${pinLabel}${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
-                text.append(name, meta);
-                row.append(thumb, text);
-                row.addEventListener("click", () => onAssign("left", asset.asset_id));
-                row.addEventListener("contextmenu", (event) => {
-                    event.preventDefault();
-                    onAssign("right", asset.asset_id);
-                });
-                list.appendChild(row);
-            }
+            const selectionGroupEl = renderSelectionGroup(buildSelectionGroup());
+            if (selectionGroupEl) list.appendChild(selectionGroupEl);
+            const naturalRows = buildOrderedNatural();
+            for (const item of naturalRows) list.appendChild(renderRow(item));
             if (!list.children.length) {
                 const empty = style(document.createElement("div"), `color:${CHROME.textDim};font-size:11px;padding:8px;`);
                 empty.textContent = "No matching assets.";
@@ -3232,7 +3632,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
 
         search.addEventListener("input", () => {
-            state.overlayState.comparePickerQuery = search.value || "";
+            state.overlayState[queryRef] = search.value || "";
             requestRefresh();
         });
         sort.addEventListener("change", () => {
@@ -3249,7 +3649,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         const compareA = candidates.find((entry) => entry.asset_id === state.overlayState.compareLeftAssetId) || asset;
         const compareB = candidates.find((entry) => entry.asset_id === state.overlayState.compareRightAssetId) || candidates.find((entry) => entry.asset_id !== compareA.asset_id) || compareA;
 
-        const layout = style(document.createElement("div"), `display:grid;grid-template-columns:minmax(220px,260px) minmax(0,1fr) minmax(220px,260px);gap:12px;flex:1 1 auto;min-height:0;width:100%;`);
+        // Lock chooser column widths so they DO NOT shrink when the metadata panels mount.
+        // Toggling Metadata on absorbs its cost from the central media area, not from the
+        // pickers; the picker layout matches the metadata-off visual at the same viewport.
+        const layout = style(document.createElement("div"), `display:grid;grid-template-columns:260px minmax(0,1fr) 260px;gap:12px;flex:1 1 auto;min-height:0;width:100%;min-width:0;`);
         const assignSlot = (slot, assetId) => {
             if (slot === "left") {
                 state.overlayState.compareLeftAssetId = assetId;
@@ -3259,12 +3662,15 @@ export function mountSharedAssetGallery(container, options = {}) {
             renderInspectOverlay();
         };
         let refreshCompareChoosers = () => {};
-        const chooserA = renderCompareChooser(candidates, "Gallery A", compareA.asset_id, assignSlot, () => refreshCompareChoosers());
-        const chooserB = renderCompareChooser(candidates, "Gallery B", compareB.asset_id, assignSlot, () => refreshCompareChoosers());
+        const chooserA = renderCompareChooser(candidates, "Gallery A", compareA.asset_id, assignSlot, () => refreshCompareChoosers(), "A");
+        const chooserB = renderCompareChooser(candidates, "Gallery B", compareB.asset_id, assignSlot, () => refreshCompareChoosers(), "B");
         refreshCompareChoosers = () => {
             chooserA.refresh();
             chooserB.refresh();
         };
+        // Expose the chooser refresh so setCompareQuery (driven by metadata-cell L/R clicks)
+        // can keep both picker lists in sync without redrawing the whole overlay.
+        state.overlayCompareChoosersRefresh = refreshCompareChoosers;
 
         layout.appendChild(chooserA.el);
 
@@ -3549,6 +3955,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         clearOverlayRuntime();
+        // Drop any prior re-render hooks tied to torn-down overlay sub-trees.
+        // renderCompareOverlay / metadata panel mount will reinstall them as needed.
+        state.overlayMetadataRefresh = null;
+        state.overlayCompareChoosersRefresh = null;
         let overlayEl = overlay.overlayEl;
         if (!overlayEl) {
             overlayEl = style(document.createElement("div"), `position:fixed;inset:0;z-index:99999;background:rgba(7,10,14,0.86);display:flex;align-items:stretch;justify-content:center;padding:20px;box-sizing:border-box;`);
@@ -3754,15 +4164,50 @@ export function mountSharedAssetGallery(container, options = {}) {
         } else {
             renderSingleOverlay(asset, mediaWrap);
         }
+        // Drop any prior metadata-refresh hook before deciding whether to mount a new one,
+        // so closing/reopening Metadata leaves no stale callback firing into a detached node.
+        state.overlayMetadataRefresh = null;
         if (overlay.showMetadata) {
             if (overlay.compareMode && compareCandidates.length >= 2) {
-                const compareAssets = [
-                    data.assets.find((entry) => entry.asset_id === overlay.compareLeftAssetId),
-                    data.assets.find((entry) => entry.asset_id === overlay.compareRightAssetId),
-                ].filter(Boolean);
-                contentWrap.appendChild(renderOverlayMetadataPanel(compareAssets.length ? compareAssets : [asset]));
+                // Lift the shell's centered-1600px cap and slim its padding so the metadata
+                // panels move into the previously-empty edge real estate. Choosers + media
+                // keep their toggled-off widths almost entirely; only a small residual
+                // overflow shrinks the central media (because metadata panel total width
+                // exceeds the recovered edge space at typical viewports).
+                shell.style.maxWidth = "100%";
+                shell.style.padding = "12px";
+                // Two narrow panels flank the media at the screen edges so neither side
+                // crowds the other or the central media area.
+                const slotA = style(document.createElement("div"), `display:flex;min-height:0;order:0;`);
+                const slotB = style(document.createElement("div"), `display:flex;min-height:0;order:2;`);
+                mediaWrap.style.order = "1";
+                const buildSidePanel = (slotRole) => {
+                    const targetId = slotRole === "A" ? overlay.compareLeftAssetId : overlay.compareRightAssetId;
+                    const item = data.assets.find((entry) => entry.asset_id === targetId) || asset;
+                    return renderOverlayMetadataPanel(item, { role: slotRole });
+                };
+                slotA.appendChild(buildSidePanel("A"));
+                slotB.appendChild(buildSidePanel("B"));
+                contentWrap.style.alignItems = "stretch";
+                contentWrap.insertBefore(slotA, mediaWrap);
+                contentWrap.appendChild(slotB);
+                state.overlayMetadataRefresh = () => {
+                    if (slotA.isConnected) slotA.replaceChildren(buildSidePanel("A"));
+                    if (slotB.isConnected) slotB.replaceChildren(buildSidePanel("B"));
+                    if (!slotA.isConnected && !slotB.isConnected) state.overlayMetadataRefresh = null;
+                };
             } else {
-                contentWrap.appendChild(renderOverlayMetadataPanel(asset));
+                const slot = style(document.createElement("div"), `display:flex;min-height:0;`);
+                const buildPanel = () => renderOverlayMetadataPanel(asset, { role: "single" });
+                slot.appendChild(buildPanel());
+                contentWrap.appendChild(slot);
+                state.overlayMetadataRefresh = () => {
+                    if (!slot.isConnected) {
+                        state.overlayMetadataRefresh = null;
+                        return;
+                    }
+                    slot.replaceChildren(buildPanel());
+                };
             }
         }
     }

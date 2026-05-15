@@ -183,8 +183,10 @@ def _json_safe(value: Any) -> Any:
         return str(value)
 
 
-def _cap_field_value(value: Any) -> Any:
+def _cap_field_value(value: Any, *, structured: bool = False) -> Any:
     safe = _json_safe(value)
+    if structured:
+        return _cap_structured(safe)
     try:
         encoded = json.dumps(safe, ensure_ascii=False, sort_keys=True)
     except Exception:
@@ -194,6 +196,16 @@ def _cap_field_value(value: Any) -> Any:
         return safe
     text = str(safe)
     return f"{text[:FIELD_VALUE_LIMIT]}{TRUNCATED_MARKER}"
+
+
+def _cap_structured(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _cap_structured(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cap_structured(item) for item in value]
+    if isinstance(value, str) and len(value) > FIELD_VALUE_LIMIT:
+        return f"{value[:FIELD_VALUE_LIMIT]}{TRUNCATED_MARKER}"
+    return value
 
 
 def _raw_widget_text(inputs: dict) -> str:
@@ -270,6 +282,41 @@ def _power_lora_summary(inputs: dict) -> list[dict]:
     return rows
 
 
+def _power_lora_transform(inputs: dict) -> dict | None:
+    summary = _power_lora_summary(inputs)
+    if not summary:
+        return None
+    return {
+        "power_loras": _cap_field_value(summary, structured=True),
+        "enabled_lora_count": sum(1 for row in summary if row.get("enabled") is not False),
+        "total_lora_count": len(summary),
+    }
+
+
+# Compatibility registry. Add a new node-pack handler by appending to this list.
+# Each entry: {"display_type", "predicate", "transform"}.
+#   - predicate(class_type: str) -> bool  : matches the node's prompt class_type.
+#   - transform(inputs: dict)    -> dict|None : structured fields dict, or None to fall through to generic dump.
+# First match wins. Schema is additive: handlers don't bump editor_export.schema_version.
+COMPAT_HANDLERS: list[dict] = [
+    {
+        "display_type": "power_loras",
+        "predicate": _is_power_lora_loader,
+        "transform": _power_lora_transform,
+    },
+]
+
+
+def _resolve_compat_handler(class_type: str) -> dict | None:
+    for handler in COMPAT_HANDLERS:
+        try:
+            if handler["predicate"](class_type):
+                return handler
+        except Exception:
+            continue
+    return None
+
+
 def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dict | None, label: str) -> dict:
     inputs = prompt_entry.get("inputs")
     if not isinstance(inputs, dict):
@@ -277,17 +324,19 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
     class_type = str(prompt_entry.get("class_type") or "")
     title = _workflow_title(workflow_node)
     section_label = str(label or "").strip() or title or class_type or prompt_key
-    if _is_power_lora_loader(class_type):
-        summary = _power_lora_summary(inputs)
-        if summary:
-            fields = {
-                "power_loras": _cap_field_value(summary),
-                "enabled_lora_count": sum(1 for row in summary if row.get("enabled") is not False),
-                "total_lora_count": len(summary),
-            }
-        else:
-            fields = {str(key): _cap_field_value(value) for key, value in inputs.items()}
-    else:
+
+    handler = _resolve_compat_handler(class_type)
+    fields: dict | None = None
+    display_type: str | None = None
+    if handler is not None:
+        try:
+            transformed = handler["transform"](inputs)
+        except Exception:
+            transformed = None
+        if transformed:
+            fields = transformed
+            display_type = handler["display_type"]
+    if fields is None:
         fields = {str(key): _cap_field_value(value) for key, value in inputs.items()}
     return {
         "label": section_label,
@@ -296,6 +345,7 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
         "source_node_title": title,
         "raw_widget_text": _raw_widget_text(inputs),
         "fields": fields,
+        "display_type": display_type,
     }
 
 

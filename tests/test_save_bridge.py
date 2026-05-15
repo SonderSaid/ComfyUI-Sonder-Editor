@@ -127,6 +127,34 @@ def test_bridge_marks_asset_workflow_when_downstream_file_embeds_it(tmp_path, mo
     assert restored.assets[0].prompt == ""
 
 
+def test_bridge_section_display_type_propagates(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    section = {
+        "label": "Power LoRAs",
+        "source_node_id": "10",
+        "source_node_class": "Power Lora Loader (rgthree)",
+        "source_node_title": "",
+        "raw_widget_text": "lora_1: a.safetensors",
+        "fields": {"power_loras": [{"slot": 1, "name": "a.safetensors", "enabled": True}]},
+        "display_type": "power_loras",
+    }
+    project._execution_context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: [section]}
+
+    bridge = io_nodes.SonderSaveBridge()
+    output_dir, _filename_prefix = bridge.prepare_output(project, prompt={}, unique_id="bridge-1")
+    _write_png(Path(output_dir) / "out.png")
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    tracked = restored.assets[0].generation_params["editor_export"]["tracked_metadata"]
+    assert tracked[0]["display_type"] == "power_loras"
+    assert tracked[0]["fields"]["power_loras"][0]["name"] == "a.safetensors"
+
+
 def test_bridge_registers_artifact_for_unknown_extension(tmp_path, monkeypatch):
     io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
     _clear_bridge_state(io_nodes)
