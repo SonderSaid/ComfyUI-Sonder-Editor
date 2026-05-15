@@ -257,6 +257,8 @@ def _editor_export_metadata(
 ) -> dict:
     width, height = _scene_resolution(project, scene)
     return {
+        "schema_version": "1.0",
+        "produced_by": {"tool": "sonder-editor", "version": "", "comfyui_version": ""},
         "exported_at": datetime.now().isoformat(),
         "project_name": project.name,
         "scene_id": scene.scene_id,

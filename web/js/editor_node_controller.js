@@ -1947,6 +1947,9 @@ export class EditorNodeController {
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
             onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
             onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
+            onOpenSourceWorkflow: async (asset) => {
+                await window.__SONDER_OPEN_SOURCE_WORKFLOW__?.(this.state.projectDir, asset);
+            },
             onRefresh: async () => {
                 const payload = await this._loadDormantAssets();
                 this.moduleCache.assets = payload;

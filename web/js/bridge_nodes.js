@@ -9,6 +9,7 @@
 //   slot type stays literally "*" so any wire still connects.
 
 import { app } from "/scripts/app.js";
+import { refreshAutogrowShape } from "./autogrow_passthrough.js";
 const { api } = window.comfyAPI.api;
 
 const EXT_NAME = "sonder.bridge";
@@ -379,24 +380,10 @@ const refreshNodeShape = (node) => {
     ensureNodeState(node);
 
     const peer = findPeer(node);
-    const desired = peer
-        ? Math.max(computeVisibleCount(node, peer), computeVisibleCount(peer, node))
-        : computeVisibleCount(node, null);
-
-    let mutated = applyShape(node, desired);
-    applyTypeLabels(node, peer, desired);
-
+    refreshAutogrowShape(node, { maxCount: MAX_PASSTHROUGH, peer });
     if (peer) {
-        const peerMutated = applyShape(peer, desired);
-        applyTypeLabels(peer, node, desired);
-        if (peerMutated && typeof peer.computeSize === "function" && typeof peer.setSize === "function") {
-            peer.setSize(peer.computeSize());
-        }
+        refreshAutogrowShape(peer, { maxCount: MAX_PASSTHROUGH, peer: node });
         peer.setDirtyCanvas?.(true, true);
-    }
-
-    if (mutated && typeof node.computeSize === "function" && typeof node.setSize === "function") {
-        node.setSize(node.computeSize());
     }
     node.setDirtyCanvas?.(true, true);
 };

@@ -253,6 +253,148 @@ def get_ffprobe_path() -> str:
     return _FFPROBE_PATH
 
 
+def _parse_metadata_json(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _workflow_from_metadata_tags(tags: dict):
+    if not isinstance(tags, dict):
+        return None
+    editor_export = None
+    for key, value in tags.items():
+        normalized = str(key or "").lower()
+        if normalized == "workflow":
+            parsed = _parse_metadata_json(value)
+            if isinstance(parsed, dict):
+                return parsed
+        elif normalized == "editor_export":
+            parsed = _parse_metadata_json(value)
+            if isinstance(parsed, dict):
+                editor_export = parsed
+    workflow = editor_export.get("workflow") if isinstance(editor_export, dict) else None
+    return workflow if isinstance(workflow, dict) else None
+
+
+def _ffmetadata_unescape(value: str) -> str:
+    result = []
+    escaped = False
+    replacements = {"n": "\n", "r": "\r"}
+    for char in str(value):
+        if escaped:
+            result.append(replacements.get(char, char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        else:
+            result.append(char)
+    if escaped:
+        result.append("\\")
+    return "".join(result)
+
+
+def _split_ffmetadata_line(line: str) -> tuple[str, str] | None:
+    escaped = False
+    for index, char in enumerate(str(line)):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "=":
+            return (_ffmetadata_unescape(line[:index]), _ffmetadata_unescape(line[index + 1:]))
+    return None
+
+
+def _parse_ffmetadata_tags(text: str) -> dict:
+    tags = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line == ";FFMETADATA1" or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            continue
+        pair = _split_ffmetadata_line(raw_line)
+        if not pair:
+            continue
+        key, value = pair
+        if key:
+            tags[key] = value
+    return tags
+
+
+def extract_embedded_workflow_metadata(path: str):
+    ext = os.path.splitext(str(path or ""))[1].lower()
+    if ext == ".png":
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                return _workflow_from_metadata_tags(image.info or {})
+        except Exception as exc:
+            logger.debug("PNG workflow metadata extraction failed for %s: %s", path, exc)
+            return None
+    if ext not in {".mp4", ".m4v", ".mov", ".mkv"}:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                get_ffprobe_path(),
+                "-v",
+                "quiet",
+                "-show_format",
+                "-print_format",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout or "{}")
+            workflow = _workflow_from_metadata_tags(((data.get("format") or {}).get("tags") or {}))
+            if workflow is not None:
+                return workflow
+        else:
+            logger.debug("ffprobe workflow metadata extraction failed for %s: %s", path, (result.stderr or "")[:240])
+    except Exception as exc:
+        logger.debug("ffprobe workflow metadata extraction failed for %s: %s", path, exc)
+
+    try:
+        result = subprocess.run(
+            [
+                get_ffmpeg_path(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-f",
+                "ffmetadata",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.debug("ffmpeg workflow metadata extraction failed for %s: %s", path, (result.stderr or "")[:240])
+            return None
+        return _workflow_from_metadata_tags(_parse_ffmetadata_tags(result.stdout or ""))
+    except Exception as exc:
+        logger.debug("ffmpeg workflow metadata extraction failed for %s: %s", path, exc)
+        return None
+
+
 def normalize_save_preset(preset_id: str | None) -> str:
     candidate = str(preset_id or "").strip()
     return candidate if candidate in SAVE_VIDEO_PRESETS else DEFAULT_SAVE_VIDEO_PRESET
@@ -502,13 +644,25 @@ def decode_video_frame(path: str, frame_index: int) -> np.ndarray | None:
         return None
 
 
-def write_png(path: str, frame_rgb: np.ndarray, *, compression: int = 0) -> None:
+def write_png(path: str, frame_rgb: np.ndarray, *, compression: int = 0, metadata: dict[str, str] | None = None) -> None:
     from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    pnginfo = None
+    if metadata:
+        pnginfo = PngInfo()
+        for key, value in metadata.items():
+            if not key:
+                continue
+            # ComfyUI's canvas drag workflow reader is most compatible with
+            # plain text PNG chunks. Keep these uncompressed so generated PNGs
+            # round-trip through the native workflow drop path.
+            pnginfo.add_text(str(key), str(value), zip=False)
     Image.fromarray(np.asarray(frame_rgb, dtype=np.uint8), mode="RGB").save(
         path,
         compress_level=_clamp_int(compression, 0, 9, 0),
+        pnginfo=pnginfo,
     )
 
 
@@ -829,6 +983,58 @@ def metadata_for_save_preset(preset_id: str | None, custom_options: dict | None 
     return _preset_metadata(normalize_save_preset(preset_id), custom_options)
 
 
+def _escape_ffmetadata(value: str) -> str:
+    text = str(value)
+    replacements = {
+        "\\": "\\\\",
+        "=": "\\=",
+        ";": "\\;",
+        "#": "\\#",
+        "\n": "\\n",
+        "\r": "\\r",
+    }
+    return "".join(replacements.get(char, char) for char in text)
+
+
+def _write_ffmetadata_file(metadata: dict[str, str]) -> str:
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="\n",
+        delete=False,
+        suffix=".ffmetadata",
+    )
+    try:
+        handle.write(";FFMETADATA1\n")
+        for key, value in metadata.items():
+            if not key:
+                continue
+            handle.write(f"{_escape_ffmetadata(str(key))}={_escape_ffmetadata(str(value))}\n")
+        return handle.name
+    finally:
+        handle.close()
+
+
+def _video_args_with_metadata_movflags(video_args: list[str], output_path: str) -> list[str]:
+    ext = os.path.splitext(str(output_path or ""))[1].lower()
+    if ext not in {".mp4", ".m4v", ".mov"}:
+        return video_args
+    args = list(video_args)
+    for index, value in enumerate(args):
+        if value != "-movflags" or index + 1 >= len(args):
+            continue
+        flags = str(args[index + 1] or "")
+        if "use_metadata_tags" not in flags:
+            prefix = "+" if flags.startswith("+") else ""
+            normalized = flags.lstrip("+")
+            parts = [part for part in normalized.split("+") if part]
+            parts.append("use_metadata_tags")
+            args[index + 1] = prefix + "+".join(parts)
+        return args
+    args += ["-movflags", "+use_metadata_tags"]
+    return args
+
+
 def encode_video(
     frames_iter: Iterable[np.ndarray],
     *,
@@ -839,6 +1045,7 @@ def encode_video(
     custom_options: dict | None = None,
     timeout: int = 90,
     cancel_event=None,
+    embed_metadata: dict[str, str] | None = None,
 ) -> dict:
     preset_id = normalize_save_preset(preset_id)
     if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
@@ -867,9 +1074,24 @@ def encode_video(
     if has_audio:
         cmd += ["-i", str(audio_path)]
 
-    cmd += _preset_video_args(preset_id, custom_options)
+    ffmetadata_path = ""
+    if embed_metadata:
+        ffmetadata_path = _write_ffmetadata_file(embed_metadata)
+        cmd += ["-i", ffmetadata_path]
+        metadata_input_index = 2 if has_audio else 1
+    else:
+        metadata_input_index = -1
+
+    video_args = _preset_video_args(preset_id, custom_options)
+    if embed_metadata:
+        video_args = _video_args_with_metadata_movflags(video_args, output_path)
+    cmd += video_args
+    if embed_metadata:
+        cmd += ["-map_metadata", str(metadata_input_index)]
     if has_audio:
         cmd += ["-map", "0:v:0", "-map", "1:a:0", *audio_args, "-shortest"]
+    elif embed_metadata:
+        cmd += ["-map", "0:v:0"]
     cmd += [str(output_path), "-y"]
 
     started_at = time.perf_counter()
@@ -885,6 +1107,12 @@ def encode_video(
         except OSError:
             pass
         raise
+    finally:
+        if ffmetadata_path:
+            try:
+                os.remove(ffmetadata_path)
+            except OSError:
+                pass
     logger.debug("ffmpeg encode complete output=%s frames=%d duration=%.2fs", output_path, frame_count, time.perf_counter() - started_at)
     return _preset_metadata(preset_id, custom_options)
 

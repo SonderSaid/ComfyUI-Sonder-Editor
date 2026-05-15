@@ -275,8 +275,32 @@ function assetExtension(asset) {
     return match ? match[1].toLowerCase() : "";
 }
 
+function editorExportFor(asset) {
+    const value = asset?.generation_params?.editor_export;
+    return value && typeof value === "object" ? value : {};
+}
+
+function embeddedWorkflowFlag(asset) {
+    const value = editorExportFor(asset).has_embedded_workflow;
+    return typeof value === "boolean" ? value : null;
+}
+
+function workflowStatusLabel(asset) {
+    const flag = embeddedWorkflowFlag(asset);
+    if (flag === true) return "Embedded";
+    if (flag === false) return "Not embedded";
+    return "Unknown";
+}
+
+function workflowStatusMeta(asset) {
+    const flag = embeddedWorkflowFlag(asset);
+    if (flag === true) return "workflow";
+    if (flag === false) return "no workflow";
+    return "";
+}
+
 function parseAssetSearchQuery(rawQuery) {
-    const result = { nameTerms: [], kindTerms: [], extTerms: [] };
+    const result = { nameTerms: [], kindTerms: [], extTerms: [], trackedTerms: [], fieldTerms: [] };
     for (const token of String(rawQuery || "").trim().split(/\s+/).filter(Boolean)) {
         const lowerToken = token.toLowerCase();
         if (lowerToken.startsWith("kind:")) {
@@ -289,9 +313,63 @@ function parseAssetSearchQuery(rawQuery) {
             if (ext) result.extTerms.push(ext);
             continue;
         }
+        if (lowerToken.startsWith("tracked:")) {
+            const term = lowerToken.slice(8).trim();
+            if (term) result.trackedTerms.push(term);
+            continue;
+        }
+        if (lowerToken.startsWith("field:")) {
+            const rawField = token.slice(6);
+            const eqIndex = rawField.indexOf("=");
+            if (eqIndex > 0) {
+                const decode = (value) => {
+                    try { return decodeURIComponent(value); } catch { return value; }
+                };
+                result.fieldTerms.push({
+                    name: decode(rawField.slice(0, eqIndex)).toLowerCase(),
+                    value: decode(rawField.slice(eqIndex + 1)).toLowerCase(),
+                });
+            }
+            continue;
+        }
         result.nameTerms.push(lowerToken);
     }
     return result;
+}
+
+function trackedMetadataEntries(asset) {
+    const entries = asset?.generation_params?.editor_export?.tracked_metadata;
+    return Array.isArray(entries) ? entries.filter((entry) => entry && typeof entry === "object") : [];
+}
+
+function trackedMetadataBlob(asset) {
+    return trackedMetadataEntries(asset).map((entry) => {
+        try {
+            return JSON.stringify({
+                label: entry.label || "",
+                raw_widget_text: entry.raw_widget_text || "",
+                fields: entry.fields || {},
+            });
+        } catch {
+            return `${entry.label || ""} ${entry.raw_widget_text || ""}`;
+        }
+    }).join(" ").toLowerCase();
+}
+
+function trackedFieldMatches(asset, name, value) {
+    for (const entry of trackedMetadataEntries(asset)) {
+        const fields = entry.fields && typeof entry.fields === "object" ? entry.fields : {};
+        for (const [fieldName, fieldValue] of Object.entries(fields)) {
+            if (String(fieldName).toLowerCase() !== name) continue;
+            if (formatGenerationValue(fieldValue).toLowerCase().includes(value)) return true;
+        }
+    }
+    return false;
+}
+
+function canOpenWorkflowFor(asset) {
+    if (editorExportFor(asset).has_embedded_workflow) return true;
+    return new Set(["png", "mp4", "m4v", "mov", "mkv"]).has(assetExtension(asset));
 }
 
 function compareStrings(a, b) {
@@ -405,11 +483,27 @@ function dataTransferHasType(dataTransfer, type) {
 }
 
 function makeMetaCell(label, value) {
-    const cell = style(document.createElement("div"), `padding:6px;border-radius:6px;background:rgba(255,255,255,0.03);min-width:0;`);
+    const displayValue = String(value ?? "-");
+    const cell = style(document.createElement("div"), `padding:6px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid transparent;min-width:0;`);
     const title = style(document.createElement("div"), `color:#7f8b96;margin-bottom:2px;font-size:10px;`);
     title.textContent = label;
     const content = style(document.createElement("div"), `color:#ececec;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-    content.textContent = value;
+    content.textContent = displayValue;
+    cell.addEventListener("mouseenter", () => {
+        if (content.scrollWidth <= content.clientWidth) return;
+        content.style.whiteSpace = "normal";
+        content.style.wordBreak = "break-word";
+        content.style.maxHeight = "140px";
+        content.style.overflow = "auto";
+        content.style.textOverflow = "clip";
+    });
+    cell.addEventListener("mouseleave", () => {
+        content.style.whiteSpace = "nowrap";
+        content.style.wordBreak = "";
+        content.style.maxHeight = "";
+        content.style.overflow = "hidden";
+        content.style.textOverflow = "ellipsis";
+    });
     cell.append(title, content);
     return cell;
 }
@@ -462,6 +556,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             overlayEl: null,
             cleanupFns: [],
             compareMode: false,
+            showMetadata: false,
             compareLeftAssetId: "",
             compareRightAssetId: "",
             comparePickerQuery: "",
@@ -502,7 +597,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     const controls = style(document.createElement("div"), `display:flex;gap:6px;align-items:center;min-width:0;flex-wrap:wrap;`);
     const searchInput = style(document.createElement("input"), `flex:1 1 180px;${inputChromeCss({ minWidth: "120px" })}`);
     searchInput.type = "search";
-    searchInput.placeholder = "Search assets (kind:/ext:)";
+    searchInput.placeholder = "Search assets (kind:/ext:/tracked:/field:)";
     controls.appendChild(searchInput);
 
     const sortSelect = style(document.createElement("select"), `flex:0 0 auto;${inputChromeCss({ minWidth: "110px" })}`);
@@ -869,9 +964,59 @@ export function mountSharedAssetGallery(container, options = {}) {
             const ext = assetExtension(asset);
             if (!query.extTerms.every((term) => ext === term)) return false;
         }
+        if (query.trackedTerms.length) {
+            const blob = trackedMetadataBlob(asset);
+            if (!query.trackedTerms.every((term) => blob.includes(term))) return false;
+        }
+        if (query.fieldTerms.length) {
+            if (!query.fieldTerms.every((term) => trackedFieldMatches(asset, term.name, term.value))) return false;
+        }
         if (!query.nameTerms.length) return true;
         const name = assetDisplayName(asset).toLowerCase();
         return query.nameTerms.every((term) => name.includes(term));
+    }
+
+    function addSearchToken(token) {
+        const normalized = String(token || "").trim();
+        if (!normalized) return;
+        const tokens = String(state.query || "").trim().split(/\s+/).filter(Boolean);
+        if (!tokens.includes(normalized)) tokens.push(normalized);
+        state.query = tokens.join(" ");
+        searchInput.value = state.query;
+        state.allowAutoFocus = true;
+        render();
+    }
+
+    function removeSearchToken(token) {
+        const normalized = String(token || "").trim();
+        if (!normalized) return;
+        const tokens = String(state.query || "").trim().split(/\s+/).filter(Boolean);
+        const nextTokens = tokens.filter((entry) => entry !== normalized);
+        if (nextTokens.length === tokens.length) return;
+        state.query = nextTokens.join(" ");
+        searchInput.value = state.query;
+        state.allowAutoFocus = true;
+        render();
+    }
+
+    function toggleSearchToken(token) {
+        if (searchHasToken(token)) {
+            removeSearchToken(token);
+        } else {
+            addSearchToken(token);
+        }
+    }
+
+    function fieldSearchToken(key, value) {
+        return `field:${encodeURIComponent(String(key || ""))}=${encodeURIComponent(String(value || ""))}`;
+    }
+
+    function activeSearchTokens() {
+        return new Set(String(state.query || "").trim().split(/\s+/).filter(Boolean));
+    }
+
+    function searchHasToken(token) {
+        return activeSearchTokens().has(String(token || "").trim());
     }
 
     function sortAssetsByMode(assets, sortMode) {
@@ -1601,6 +1746,105 @@ export function mountSharedAssetGallery(container, options = {}) {
         bulkToolbarHost.appendChild(bar);
     }
 
+    function renderPowerLoraRows(rows) {
+        const entries = Array.isArray(rows) ? rows.filter((row) => row && typeof row === "object") : [];
+        if (!entries.length) return null;
+        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:5px;min-width:0;`);
+        const label = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
+        label.textContent = "Power LoRAs";
+        wrap.appendChild(label);
+        for (const row of entries) {
+            const name = String(row.name || row.lora || row.label || "-");
+            const token = fieldSearchToken("power_loras", name);
+            const active = searchHasToken(token);
+            const enabled = row.enabled !== false;
+            const line = style(document.createElement("button"), `
+                appearance:none;text-align:left;width:100%;min-width:0;
+                display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;
+                padding:7px 8px;border-radius:6px;border:1px solid ${active ? "rgba(143,192,240,0.58)" : CHROME.borderSoft};
+                background:${active ? "rgba(143,192,240,0.16)" : "rgba(255,255,255,0.03)"};
+                color:${enabled ? "#e4edf4" : "#9ca8b2"};cursor:pointer;
+                box-shadow:${active ? "inset 0 0 0 1px rgba(143,192,240,0.22)" : "none"};
+            `);
+            const main = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
+            const title = style(document.createElement("div"), `font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+            title.textContent = `${row.slot != null ? `${row.slot}. ` : ""}${name}`;
+            const parts = [];
+            for (const [key, labelText] of [
+                ["strength", "strength"],
+                ["model_strength", "model"],
+                ["clip_strength", "clip"],
+            ]) {
+                if (row[key] != null && row[key] !== "") parts.push(`${labelText} ${formatGenerationValue(row[key])}`);
+            }
+            const sub = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+            sub.textContent = parts.length ? parts.join(" | ") : "-";
+            main.append(title, sub);
+            const status = style(document.createElement("div"), `font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:${enabled ? "#b7e4b4" : "#c0a49a"};`);
+            status.textContent = enabled ? "On" : "Off";
+            line.append(main, status);
+            line.addEventListener("click", () => toggleSearchToken(token));
+            wrap.appendChild(line);
+        }
+        return wrap;
+    }
+
+    function renderTrackedMetadataSection(asset) {
+        const entries = trackedMetadataEntries(asset);
+        if (!entries.length) return null;
+        const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;`);
+        wrap.appendChild(makeSectionTitle("Tracked Metadata"));
+        for (const entry of entries) {
+            const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.025);border:1px solid ${CHROME.borderSoft};`);
+            const title = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;text-transform:uppercase;`);
+            title.textContent = String(entry.label || "Tracked");
+            section.appendChild(title);
+            const sourceBits = [entry.source_node_class, entry.source_node_title].filter((part, index, all) => part && all.indexOf(part) === index);
+            if (sourceBits.length) {
+                const source = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                source.textContent = sourceBits.join(" | ");
+                section.appendChild(source);
+            }
+            const fields = entry.fields && typeof entry.fields === "object" ? entry.fields : {};
+            const powerLoras = renderPowerLoraRows(fields.power_loras);
+            if (powerLoras) section.appendChild(powerLoras);
+            const fieldEntries = Object.entries(fields).filter(([key]) => key !== "power_loras");
+            if (fieldEntries.length) {
+                const grid = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;min-width:0;`);
+                for (const [key, value] of fieldEntries) {
+                    const rendered = formatGenerationValue(value);
+                    const token = fieldSearchToken(key, rendered);
+                    const active = searchHasToken(token);
+                    const cell = makeMetaCell(key, rendered);
+                    cell.style.cursor = "pointer";
+                    if (active) {
+                        cell.style.background = "rgba(143,192,240,0.16)";
+                        cell.style.borderColor = "rgba(143,192,240,0.55)";
+                        cell.style.boxShadow = "inset 0 0 0 1px rgba(143,192,240,0.22)";
+                    }
+                    cell.addEventListener("click", () => {
+                        toggleSearchToken(token);
+                    });
+                    grid.appendChild(cell);
+                }
+                section.appendChild(grid);
+            }
+            if (entry.raw_widget_text) {
+                const details = document.createElement("details");
+                details.style.cssText = `font-size:10px;color:#cfd8df;`;
+                const summary = document.createElement("summary");
+                summary.textContent = "Raw";
+                summary.style.cursor = "pointer";
+                const raw = style(document.createElement("pre"), `margin:6px 0 0 0;white-space:pre-wrap;word-break:break-word;color:#d9e0e6;background:rgba(0,0,0,0.18);border-radius:6px;padding:6px;`);
+                raw.textContent = String(entry.raw_widget_text || "");
+                details.append(summary, raw);
+                section.appendChild(details);
+            }
+            wrap.appendChild(section);
+        }
+        return wrap;
+    }
+
     function renderGenerationSection(asset) {
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         if (asset.prompt) {
@@ -1624,6 +1868,36 @@ export function mountSharedAssetGallery(container, options = {}) {
             wrap.appendChild(empty);
         }
         return wrap;
+    }
+
+    function renderOverlayMetadataPanel(assets) {
+        const assetList = (Array.isArray(assets) ? assets : [assets]).filter(Boolean);
+        const panel = style(document.createElement("div"), `flex:0 0 min(360px,32vw);max-width:420px;min-width:260px;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:10px;border-radius:10px;background:rgba(10,15,20,0.72);border:1px solid ${CHROME.border};`);
+        const header = style(document.createElement("div"), `color:#f1f5f8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
+        header.textContent = assetList.length > 1 ? "Compare Metadata" : "Metadata";
+        panel.appendChild(header);
+        for (const item of assetList) {
+            const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;`);
+            if (assetList.length > 1) {
+                const title = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                title.textContent = assetDisplayName(item);
+                title.title = assetDisplayName(item);
+                section.appendChild(title);
+            }
+            const quick = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;`);
+            quick.append(
+                makeMetaCell("Type", assetKindLabel(item.asset_type)),
+                makeMetaCell("Workflow", workflowStatusLabel(item)),
+                makeMetaCell("Duration", formatDuration(item)),
+                makeMetaCell("Size", item.asset_type === "artifact" ? formatBytes(item.size_bytes) : formatResolution(item)),
+            );
+            section.appendChild(quick);
+            const tracked = renderTrackedMetadataSection(item);
+            if (tracked) section.appendChild(tracked);
+            section.appendChild(renderGenerationSection(item));
+            panel.appendChild(section);
+        }
+        return panel;
     }
 
     function renderMediaScrubBar(mediaEl) {
@@ -2168,6 +2442,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.open = false;
         state.overlayState.assetId = "";
         state.overlayState.compareMode = false;
+        state.overlayState.showMetadata = false;
         state.overlayState.compareLeftAssetId = "";
         state.overlayState.compareRightAssetId = "";
         state.overlayState.comparePickerQuery = "";
@@ -2739,6 +3014,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.open = true;
         state.overlayState.assetId = asset.asset_id;
         state.overlayState.compareMode = false;
+        state.overlayState.showMetadata = false;
         state.overlayState.compareLeftAssetId = asset.asset_id;
         state.overlayState.compareRightAssetId = "";
         state.overlayState.comparePickerQuery = "";
@@ -2873,7 +3149,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const controls = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         const search = style(document.createElement("input"), `width:100%;box-sizing:border-box;${inputChromeCss()}`);
         search.type = "search";
-        search.placeholder = "Search assets (kind:/ext:)";
+        search.placeholder = "Search assets (kind:/ext:/tracked:/field:)";
         search.value = state.overlayState.comparePickerQuery || "";
         const sort = style(document.createElement("select"), `width:100%;box-sizing:border-box;${inputChromeCss()}`);
         for (const option of COMPARE_SORT_OPTIONS) {
@@ -3443,6 +3719,15 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
         toolbarActions.appendChild(compareBtn);
 
+        const metadataBtn = makeActionButton(overlay.showMetadata ? "active" : "subtle");
+        metadataBtn.textContent = overlay.showMetadata ? "Metadata On" : "Metadata";
+        metadataBtn.title = "Show or hide asset metadata in this inspector";
+        metadataBtn.addEventListener("click", () => {
+            overlay.showMetadata = !overlay.showMetadata;
+            renderInspectOverlay();
+        });
+        toolbarActions.appendChild(metadataBtn);
+
         const helpBtn = makeActionButton("subtle");
         helpBtn.textContent = "?";
         helpBtn.title = "Inspect shortcuts (?)";
@@ -3457,15 +3742,28 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         toolbar.append(titleWrap, toolbarActions);
 
-        const contentWrap = style(document.createElement("div"), `flex:1 1 auto;min-height:0;display:flex;`);
+        const contentWrap = style(document.createElement("div"), `flex:1 1 auto;min-height:0;display:flex;gap:12px;`);
+        const mediaWrap = style(document.createElement("div"), `flex:1 1 auto;min-width:0;min-height:0;display:flex;`);
+        contentWrap.appendChild(mediaWrap);
         shell.append(toolbar, contentWrap);
         overlayEl.appendChild(shell);
 
         if (overlay.compareMode && compareCandidates.length >= 2) {
             ensureCompareDefaults(asset);
-            renderCompareOverlay(asset, contentWrap);
+            renderCompareOverlay(asset, mediaWrap);
         } else {
-            renderSingleOverlay(asset, contentWrap);
+            renderSingleOverlay(asset, mediaWrap);
+        }
+        if (overlay.showMetadata) {
+            if (overlay.compareMode && compareCandidates.length >= 2) {
+                const compareAssets = [
+                    data.assets.find((entry) => entry.asset_id === overlay.compareLeftAssetId),
+                    data.assets.find((entry) => entry.asset_id === overlay.compareRightAssetId),
+                ].filter(Boolean);
+                contentWrap.appendChild(renderOverlayMetadataPanel(compareAssets.length ? compareAssets : [asset]));
+            } else {
+                contentWrap.appendChild(renderOverlayMetadataPanel(asset));
+            }
         }
     }
 
@@ -3678,6 +3976,12 @@ export function mountSharedAssetGallery(container, options = {}) {
             artifactBadge.textContent = String(asset.artifact_kind || "other");
             badges.appendChild(artifactBadge);
         }
+        const workflowFlag = embeddedWorkflowFlag(asset);
+        if (workflowFlag !== null) {
+            const workflowBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:${workflowFlag ? "rgba(120,172,124,0.14)" : "rgba(160,150,126,0.12)"};border:1px solid ${workflowFlag ? "rgba(120,172,124,0.36)" : "rgba(177,166,139,0.3)"};color:${workflowFlag ? "#b7e4b4" : "#cfc4a5"};font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
+            workflowBadge.textContent = workflowFlag ? "Workflow" : "No Workflow";
+            badges.appendChild(workflowBadge);
+        }
         if (isTrashed(asset)) {
             const trashedBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(184,96,72,0.18);border:1px solid rgba(214,132,98,0.45);color:#f0b39f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
             trashedBadge.textContent = "Trashed";
@@ -3764,6 +4068,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 ["Status", assetIsMissing(asset) ? "Missing" : "Available"],
                 ["Folder", normalizeFolderName(asset.folder) || "Root"],
                 ["Size", formatBytes(asset.size_bytes)],
+                ["Source Workflow", workflowStatusLabel(asset)],
                 ["Imported", formatDate(asset.imported_at)],
             ]
             : [
@@ -3775,6 +4080,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 ["FPS", asset.fps ? String(asset.fps) : "-"],
                 ["Sample Rate", asset.sample_rate ? `${asset.sample_rate} Hz` : "-"],
                 ["Embedded Audio", asset.has_audio ? "Yes" : "No"],
+                ["Source Workflow", workflowStatusLabel(asset)],
                 ["Imported", formatDate(asset.imported_at)],
             ];
         if (isTrashed(asset)) {
@@ -3794,9 +4100,13 @@ export function mountSharedAssetGallery(container, options = {}) {
             });
             detailSections.push(artifactToggle);
             if (state.artifactInspectorExpanded) {
+                const tracked = renderTrackedMetadataSection(asset);
+                if (tracked) detailSections.push(tracked);
                 detailSections.push(renderGenerationSection(asset));
             }
         } else {
+            const tracked = renderTrackedMetadataSection(asset);
+            if (tracked) detailSections.push(tracked);
             detailSections.push(renderGenerationSection(asset));
         }
         if (isTrashed(asset)) {
@@ -4106,6 +4416,14 @@ export function mountSharedAssetGallery(container, options = {}) {
                 action: () => {
                     selectAsset(asset.asset_id, { focusList: true });
                     openInspectOverlay(asset);
+                },
+            },
+            {
+                label: "Open Source Workflow",
+                disabled: !options.onOpenSourceWorkflow || !canOpenWorkflowFor(asset),
+                action: async () => {
+                    selectAsset(asset.asset_id, { focusList: true });
+                    await options.onOpenSourceWorkflow?.(asset);
                 },
             },
             ...((asset.width || 0) > 0 && (asset.height || 0) > 0 ? [
@@ -4457,9 +4775,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 name.textContent = assetDisplayName(asset);
                 if (isMissing) name.style.color = "#ffd0bc";
                 const meta = style(document.createElement("div"), `color:#8ea0af;font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-                const metaLabel = asset.asset_type === "artifact"
+                let metaLabel = asset.asset_type === "artifact"
                     ? `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${String(asset.artifact_kind || "other")} | ${assetExtension(asset) ? `.${assetExtension(asset)}` : "no ext"}`
                     : `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
+                const workflowMeta = workflowStatusMeta(asset);
+                if (workflowMeta) metaLabel += ` | ${workflowMeta}`;
                 meta.textContent = metaLabel;
                 text.append(name, meta);
                 row.append(thumb, text);
@@ -4529,7 +4849,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const name = style(document.createElement("div"), `color:#f0d6cc;font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                     name.textContent = assetDisplayName(asset);
                     const meta = style(document.createElement("div"), `color:#c0a49a;font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-                    meta.textContent = `trashed | ${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatDate(asset.trashed_at)}`;
+                    const workflowMeta = workflowStatusMeta(asset);
+                    meta.textContent = `trashed | ${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatDate(asset.trashed_at)}${workflowMeta ? ` | ${workflowMeta}` : ""}`;
                     text.append(name, meta);
                     row.append(thumb, text);
                     listScroller.appendChild(row);

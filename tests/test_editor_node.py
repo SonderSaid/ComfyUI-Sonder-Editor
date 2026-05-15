@@ -66,7 +66,7 @@ def _import_io_nodes(tmp_path, monkeypatch):
 
 
 def _fake_encode_video_success(io_nodes, calls=None):
-    def fake_encode_video(frames_iter, *, preset_id, output_path, fps, audio_path=None, custom_options=None, timeout=90):
+    def fake_encode_video(frames_iter, *, preset_id, output_path, fps, audio_path=None, custom_options=None, timeout=90, **kwargs):
         Path(output_path).write_bytes(b"video")
         if calls is not None:
             calls.append({
@@ -76,6 +76,7 @@ def _fake_encode_video_success(io_nodes, calls=None):
                 "audio_path": audio_path,
                 "custom_options": custom_options,
                 "timeout": timeout,
+                **kwargs,
             })
         return io_nodes.metadata_for_save_preset(preset_id, custom_options)
 

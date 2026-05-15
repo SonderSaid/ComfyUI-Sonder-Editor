@@ -70,6 +70,16 @@ def _write_png(path: Path):
     Image.new("RGB", (2, 2), color=(32, 64, 96)).save(path)
 
 
+def _write_workflow_png(path: Path, workflow: dict):
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pnginfo = PngInfo()
+    pnginfo.add_text("workflow", json.dumps(workflow), zip=False)
+    Image.new("RGB", (2, 2), color=(32, 64, 96)).save(path, pnginfo=pnginfo)
+
+
 def _load_saved_project(project_manager, project):
     return project_manager.load_project(project.project_dir)
 
@@ -94,6 +104,27 @@ def test_bridge_registers_image_output(tmp_path, monkeypatch):
     assert asset.folder == "FreshTake"
     assert asset.path.startswith(os.path.join("media", "Bridge_Test_"))
     assert asset.path.endswith("_0001.png")
+
+
+def test_bridge_marks_asset_workflow_when_downstream_file_embeds_it(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    workflow = {"nodes": [{"id": 1, "type": "DownstreamSave"}]}
+    bridge = io_nodes.SonderSaveBridge()
+    output_dir, _filename_prefix = bridge.prepare_output(project, prompt={}, unique_id="bridge-1")
+    _write_workflow_png(Path(output_dir) / "out.png", workflow)
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    editor_export = restored.assets[0].generation_params["editor_export"]
+    assert editor_export["has_embedded_workflow"] is True
+    assert "workflow_sha256" in editor_export
+    assert "workflow" not in editor_export
+    assert restored.assets[0].prompt == ""
 
 
 def test_bridge_registers_artifact_for_unknown_extension(tmp_path, monkeypatch):

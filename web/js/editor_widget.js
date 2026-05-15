@@ -1197,6 +1197,10 @@ export class EditorWidget {
             onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
             onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
             onSetSceneAspectRatio: (width, height) => this._setSceneAspectRatioFromDimensions(width, height),
+            onOpenSourceWorkflow: async (asset) => {
+                const handled = await window.__SONDER_OPEN_SOURCE_WORKFLOW__?.(this.projectDir, asset);
+                if (!handled) this._showToast?.("Source workflow unavailable");
+            },
             onRefresh: async () => await this._fetchAssets(),
         });
 

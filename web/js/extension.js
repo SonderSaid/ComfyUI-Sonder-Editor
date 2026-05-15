@@ -110,6 +110,88 @@ async function listProjectAssetFolders(projectId) {
     return uniqueFolderValues(data?.folders || []).filter(Boolean);
 }
 
+function showSonderToast(message, duration = 2600) {
+    console.info(`[Sonder] ${message}`);
+    const doc = globalThis.document;
+    if (!doc?.body) return;
+    let toast = doc.getElementById("sonder-global-toast");
+    if (!toast) {
+        toast = doc.createElement("div");
+        toast.id = "sonder-global-toast";
+        toast.style.cssText = `
+            position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
+            z-index:100000;padding:8px 12px;border-radius:8px;
+            background:rgba(20,24,30,0.94);border:1px solid rgba(255,255,255,0.16);
+            color:#f0f4f8;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,0.35);
+            opacity:0;transition:opacity 140ms ease;pointer-events:none;
+        `;
+        doc.body.appendChild(toast);
+    }
+    if (toast._sonderTimer) globalThis.clearTimeout(toast._sonderTimer);
+    toast.textContent = message;
+    toast.style.opacity = "1";
+    toast._sonderTimer = globalThis.setTimeout(() => {
+        toast.style.opacity = "0";
+    }, duration);
+}
+
+async function openWorkflowJson(workflow, name = "Sonder Source Workflow") {
+    if (!workflow || typeof workflow !== "object") {
+        showSonderToast("Source workflow unavailable");
+        return false;
+    }
+    const openWorkflow = app?.workflowManager?.openWorkflow;
+    if (typeof openWorkflow === "function") {
+        try {
+            await openWorkflow.call(app.workflowManager, workflow, { name });
+            return true;
+        } catch (error) {
+            console.warn("[Sonder] workflowManager.openWorkflow failed, falling back to loadGraphData:", error);
+        }
+    }
+    if (typeof app?.loadGraphData !== "function") {
+        showSonderToast("Source workflow unavailable");
+        return false;
+    }
+    showSonderToast("Opening workflow will replace current canvas");
+    return await withGraphLoadBypass(async () => {
+        await app.loadGraphData(workflow);
+        return true;
+    });
+}
+
+async function openSourceWorkflowForAsset(projectDir, asset) {
+    const projectId = projectIdFromProjectValue(projectDir);
+    const assetId = asset?.asset_id || asset?.id || "";
+    if (!projectId || !assetId) {
+        showSonderToast("Source workflow unavailable");
+        return false;
+    }
+    try {
+        const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}/workflow`;
+        const resp = await fetch(api.apiURL(url));
+        if (!resp.ok) {
+            let reason = "unavailable";
+            try {
+                const payload = await resp.json();
+                reason = payload?.reason || payload?.error || reason;
+            } catch (_) { /* ignore */ }
+            showSonderToast(`Source workflow ${reason}`);
+            return false;
+        }
+        const payload = await resp.json();
+        return await openWorkflowJson(payload?.workflow, asset?.name || "Sonder Source Workflow");
+    } catch (error) {
+        console.warn("[Sonder] Open Source Workflow failed:", error);
+        showSonderToast("Source workflow unavailable");
+        return false;
+    }
+}
+
+if (typeof window !== "undefined") {
+    window.__SONDER_OPEN_SOURCE_WORKFLOW__ = openSourceWorkflowForAsset;
+}
+
 async function createProjectFromNode(node, projectWidget) {
     const projectNameWidget = node.widgets.find((widget) => widget.name === "project_name");
     const fpsWidget = node.widgets.find((widget) => widget.name === "fps");
@@ -449,6 +531,7 @@ const sonderGraphUndoSuppression = {
     reason: "",
     nodeIds: [],
 };
+let sonderGraphLoadBypassDepth = 0;
 
 function nowMs() {
     if (typeof performance !== "undefined" && typeof performance.now === "function") {
@@ -472,6 +555,15 @@ function activateGraphUndoSuppression(reason = "unknown", nodeIds = []) {
     });
 }
 
+async function withGraphLoadBypass(callback) {
+    sonderGraphLoadBypassDepth += 1;
+    try {
+        return await callback();
+    } finally {
+        sonderGraphLoadBypassDepth = Math.max(0, sonderGraphLoadBypassDepth - 1);
+    }
+}
+
 function installGraphLoadGuard() {
     if (!app || app._sonderGraphLoadGuardInstalled) return;
 
@@ -479,7 +571,7 @@ function installGraphLoadGuard() {
     if (!originalLoadGraphData) return;
 
     app.loadGraphData = async function (...args) {
-        if (isGraphUndoSuppressed() && shouldSuppressComfyGraphUndo()) {
+        if (sonderGraphLoadBypassDepth <= 0 && isGraphUndoSuppressed() && shouldSuppressComfyGraphUndo()) {
             sonderKeyboardDebug("blocked app.loadGraphData during fullscreen editor undo window", {
                 reason: sonderGraphUndoSuppression.reason,
                 nodeIds: sonderGraphUndoSuppression.nodeIds,
@@ -499,6 +591,7 @@ function installGraphLoadGuard() {
                 reason: sonderGraphUndoSuppression.reason,
                 nodeIds: sonderGraphUndoSuppression.nodeIds.slice(),
             }),
+            withBypass: async (callback) => await withGraphLoadBypass(callback),
         };
     }
     sonderKeyboardDebug("installed graph load guard");

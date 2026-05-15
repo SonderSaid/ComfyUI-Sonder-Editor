@@ -4,9 +4,11 @@ import asyncio
 import importlib
 import json
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -52,6 +54,88 @@ def _route_handler(route_module, method, path):
 
 def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
+
+
+def test_workflow_endpoint_extracts_from_png_when_cache_empty(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    workflow = {"nodes": [{"id": 1, "type": "Node"}]}
+    route_module.write_png(
+        str(media_dir / "source.png"),
+        np.zeros((1, 1, 3), dtype=np.uint8),
+        metadata={"workflow": json.dumps(workflow)},
+    )
+    asset = Asset(asset_id="asset-1", name="source.png", asset_type="image", path=os.path.join("media", "source.png"))
+    project = TimelineProject(project_dir=str(project_dir), name="Project", assets=[asset])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+
+    handler = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/assets/{asset_id}/workflow")
+    response = asyncio.run(handler(DummyRequest(match_info={"asset_id": "asset-1"})))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload == {"workflow": workflow, "source": "embedded"}
+
+
+def test_workflow_endpoint_returns_404_when_unavailable(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    (media_dir / "source.png").write_bytes(b"not a png")
+    asset = Asset(asset_id="asset-1", name="source.png", asset_type="image", path=os.path.join("media", "source.png"))
+    project = TimelineProject(project_dir=str(project_dir), name="Project", assets=[asset])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+
+    handler = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/assets/{asset_id}/workflow")
+    response = asyncio.run(handler(DummyRequest(match_info={"asset_id": "asset-1"})))
+    payload = _response_json(response)
+
+    assert response.status == 404
+    assert payload["reason"] == "unavailable"
+
+
+def test_workflow_endpoint_extracts_from_mp4_when_cache_empty(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    (media_dir / "source.mp4").write_bytes(b"video")
+    workflow = {"nodes": [{"id": 2, "type": "VideoNode"}]}
+    asset = Asset(asset_id="asset-1", name="source.mp4", asset_type="video", path=os.path.join("media", "source.mp4"))
+    project = TimelineProject(project_dir=str(project_dir), name="Project", assets=[asset])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "_extract_video_workflow_metadata", lambda path: workflow)
+
+    handler = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/assets/{asset_id}/workflow")
+    response = asyncio.run(handler(DummyRequest(match_info={"asset_id": "asset-1"})))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload == {"workflow": workflow, "source": "embedded"}
+
+
+def test_workflow_video_extraction_falls_back_to_ffmpeg_ffmetadata(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    workflow = {"nodes": [{"id": 3, "type": "FallbackNode"}]}
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[0] == "missing-ffprobe":
+            raise FileNotFoundError("ffprobe")
+        stdout = ";FFMETADATA1\nworkflow=" + json.dumps(workflow) + "\n"
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(route_module, "get_ffprobe_path", lambda: "missing-ffprobe")
+    monkeypatch.setattr(route_module, "get_ffmpeg_path", lambda: "ffmpeg")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert route_module._extract_video_workflow_metadata("source.mp4") == workflow
+    assert calls[0][0] == "missing-ffprobe"
+    assert calls[1][0] == "ffmpeg"
 
 
 def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):

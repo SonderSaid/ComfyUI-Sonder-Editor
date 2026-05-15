@@ -10,6 +10,7 @@ from aiohttp import web
 from .media_helpers import (
     decode_video_frame,
     get_ffmpeg_path,
+    get_ffprobe_path,
     resize_frame_to_long_edge,
     write_png,
 )
@@ -294,6 +295,170 @@ def _asset_payload(project: TimelineProject, asset: Asset) -> dict:
     payload["size_bytes"] = _asset_file_size(source_path) if source_path else 0
     payload["extension"] = os.path.splitext(getattr(asset, "path", "") or "")[1].lower()
     return payload
+
+
+def _parse_metadata_json(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _workflow_from_metadata_tags(tags: dict):
+    if not isinstance(tags, dict):
+        return None
+    editor_export = None
+    for key, value in tags.items():
+        normalized = str(key or "").lower()
+        if normalized == "workflow":
+            parsed = _parse_metadata_json(value)
+            if isinstance(parsed, dict):
+                return parsed
+        elif normalized == "editor_export":
+            parsed = _parse_metadata_json(value)
+            if isinstance(parsed, dict):
+                editor_export = parsed
+    workflow = editor_export.get("workflow") if isinstance(editor_export, dict) else None
+    return workflow if isinstance(workflow, dict) else None
+
+
+def _extract_png_workflow_metadata(path: str):
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return _workflow_from_metadata_tags(image.info or {})
+    except Exception as exc:
+        logger.debug("PNG workflow metadata extraction failed for %s: %s", path, exc)
+        return None
+
+
+def _ffmetadata_unescape(value: str) -> str:
+    result = []
+    escaped = False
+    replacements = {"n": "\n", "r": "\r"}
+    for char in str(value):
+        if escaped:
+            result.append(replacements.get(char, char))
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        else:
+            result.append(char)
+    if escaped:
+        result.append("\\")
+    return "".join(result)
+
+
+def _split_ffmetadata_line(line: str) -> tuple[str, str] | None:
+    escaped = False
+    for index, char in enumerate(str(line)):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "=":
+            return (_ffmetadata_unescape(line[:index]), _ffmetadata_unescape(line[index + 1:]))
+    return None
+
+
+def _parse_ffmetadata_tags(text: str) -> dict:
+    tags = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line == ";FFMETADATA1" or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            continue
+        pair = _split_ffmetadata_line(raw_line)
+        if not pair:
+            continue
+        key, value = pair
+        if key:
+            tags[key] = value
+    return tags
+
+
+def _extract_video_workflow_metadata_ffprobe(path: str):
+    import subprocess
+
+    result = subprocess.run(
+        [
+            get_ffprobe_path(),
+            "-v",
+            "quiet",
+            "-show_format",
+            "-print_format",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        logger.debug("ffprobe workflow metadata extraction failed for %s: %s", path, (result.stderr or "")[:240])
+        return None
+    data = json.loads(result.stdout or "{}")
+    tags = ((data.get("format") or {}).get("tags") or {})
+    return _workflow_from_metadata_tags(tags)
+
+
+def _extract_video_workflow_metadata_ffmpeg(path: str):
+    import subprocess
+
+    result = subprocess.run(
+        [
+            get_ffmpeg_path(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-f",
+            "ffmetadata",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        logger.debug("ffmpeg workflow metadata extraction failed for %s: %s", path, (result.stderr or "")[:240])
+        return None
+    return _workflow_from_metadata_tags(_parse_ffmetadata_tags(result.stdout or ""))
+
+
+def _extract_video_workflow_metadata(path: str):
+    try:
+        workflow = _extract_video_workflow_metadata_ffprobe(path)
+        if workflow is not None:
+            return workflow
+    except Exception as exc:
+        logger.debug("ffprobe video workflow metadata extraction failed for %s: %s", path, exc)
+    try:
+        return _extract_video_workflow_metadata_ffmpeg(path)
+    except Exception as exc:
+        logger.debug("ffmpeg video workflow metadata extraction failed for %s: %s", path, exc)
+    return None
+
+
+def _extract_embedded_workflow(project: TimelineProject, asset: Asset):
+    path = _asset_abspath(project, asset)
+    if not path or not os.path.isfile(path):
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".png":
+        return _extract_png_workflow_metadata(path)
+    if ext in {".mp4", ".m4v", ".mov", ".mkv"}:
+        return _extract_video_workflow_metadata(path)
+    return None
 
 
 def _get_audio_duration(filepath: str) -> float:
@@ -2326,6 +2491,23 @@ if routes is not None:
 
         save_project(project)
         return web.json_response(_asset_payload(project, asset))
+
+    @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/workflow")
+    async def api_get_asset_workflow(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_id = request.match_info["asset_id"]
+        asset = project.get_asset(asset_id)
+        if not asset:
+            return _json_error(f"Asset not found: {asset_id}", 404)
+
+        workflow = _extract_embedded_workflow(project, asset)
+        if workflow is None:
+            return web.json_response({"reason": "unavailable"}, status=404)
+        return web.json_response({"workflow": workflow, "source": "embedded"})
 
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/usages")
     async def api_get_asset_usages(request: web.Request) -> web.Response:

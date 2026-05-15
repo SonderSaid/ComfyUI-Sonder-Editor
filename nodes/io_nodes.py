@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import hashlib
 import random
 import re
 import shutil
@@ -19,6 +20,7 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server.project_manager import load_project, save_project
+from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
     CUSTOM_CONTAINER_OPTIONS,
@@ -33,6 +35,7 @@ from ..server.media_helpers import (
     SAVE_VIDEO_PRESET_ORDER,
     SAVE_VIDEO_PRESETS,
     encode_video,
+    extract_embedded_workflow_metadata,
     get_ffmpeg_path,
     metadata_for_save_preset,
     normalize_save_preset,
@@ -89,6 +92,121 @@ def _ensure_asset_folder_metadata(project, folder: str) -> None:
 def _copy_execution_context(project) -> dict:
     context = getattr(project, "_execution_context", None) or {}
     return dict(context) if isinstance(context, dict) else {}
+
+
+EDITOR_EXPORT_SCHEMA_VERSION = "1.0"
+
+
+def _json_clone(value):
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return value
+
+
+def _json_dumps_compact(value) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _public_execution_context(context: dict) -> dict:
+    return {
+        str(key): _json_clone(value)
+        for key, value in dict(context or {}).items()
+        if not str(key).startswith("_")
+    }
+
+
+def _produced_by_metadata() -> dict:
+    return {
+        "tool": "sonder-editor",
+        "version": "",
+        "comfyui_version": "",
+    }
+
+
+def _tracked_metadata_from_context(context: dict) -> list:
+    tracked = (context or {}).get(TRACKED_METADATA_CONTEXT_KEY, [])
+    if not isinstance(tracked, list):
+        return []
+    return [_json_clone(item) for item in tracked if isinstance(item, dict)]
+
+
+def _workflow_from_extra_pnginfo(extra_pnginfo):
+    if isinstance(extra_pnginfo, dict) and isinstance(extra_pnginfo.get("workflow"), dict):
+        return extra_pnginfo.get("workflow")
+    return None
+
+
+def _workflow_digest(workflow) -> str:
+    if workflow is None:
+        return ""
+    try:
+        payload = json.dumps(workflow, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        payload = str(workflow)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _compact_editor_export(project, context: dict, *, has_embedded_workflow=False, workflow=None) -> dict:
+    export = {
+        "schema_version": EDITOR_EXPORT_SCHEMA_VERSION,
+        # Additive fields stay at schema 1.0; bump only for shape-breaking changes.
+        "produced_by": _produced_by_metadata(),
+        "exported_at": datetime.now().isoformat(),
+        "project_name": getattr(project, "name", ""),
+        "scene_id": str(context.get("scene_id") or ""),
+        "scene_name": str(context.get("scene_name") or ""),
+        "tracked_metadata": _tracked_metadata_from_context(context),
+        "has_embedded_workflow": bool(has_embedded_workflow),
+    }
+    digest = _workflow_digest(workflow) if has_embedded_workflow else ""
+    if digest:
+        export["workflow_sha256"] = digest
+    return export
+
+
+def _bridge_generation_params(project, context: dict) -> dict:
+    return {
+        "scene_id": str((context or {}).get("scene_id") or ""),
+        "scene_name": str((context or {}).get("scene_name") or ""),
+        "editor_export": _compact_editor_export(
+            project,
+            context,
+            has_embedded_workflow=False,
+            workflow=None,
+        ),
+    }
+
+
+def _generation_params_with_detected_workflow(generation_params: dict, file_path: str) -> dict:
+    params = dict(generation_params or {})
+    editor_export = params.get("editor_export")
+    if not isinstance(editor_export, dict):
+        return params
+    workflow = extract_embedded_workflow_metadata(file_path)
+    if not isinstance(workflow, dict):
+        return params
+    updated_export = dict(editor_export)
+    updated_export["has_embedded_workflow"] = True
+    digest = _workflow_digest(workflow)
+    if digest:
+        updated_export["workflow_sha256"] = digest
+    params["editor_export"] = updated_export
+    return params
+
+
+def _file_metadata_payload(prompt, workflow, editor_export: dict) -> dict[str, str]:
+    file_editor_export = dict(editor_export)
+    if prompt is not None:
+        file_editor_export["prompt"] = _json_clone(prompt)
+    if workflow is not None:
+        file_editor_export["workflow"] = _json_clone(workflow)
+    payload = {"editor_export": _json_dumps_compact(file_editor_export)}
+    if prompt is not None:
+        payload["prompt"] = _json_dumps_compact(prompt)
+    if workflow is not None:
+        payload["workflow"] = _json_dumps_compact(workflow)
+    return payload
 
 
 def _find_queue_job(project, queue_job_id: str):
@@ -339,7 +457,13 @@ def _save_image_asset_thumbnail(project, asset: Asset, filepath: str) -> None:
         logger.warning("Failed to generate image thumbnail for %s: %s", filepath, exc)
 
 
-def _save_custom_png_sequence(project, rgb_frames: np.ndarray, filename_prefix: str, metadata: dict) -> tuple[str, list[Asset]]:
+def _save_custom_png_sequence(
+    project,
+    rgb_frames: np.ndarray,
+    filename_prefix: str,
+    metadata: dict,
+    file_metadata: dict[str, str] | None = None,
+) -> tuple[str, list[Asset]]:
     media_dir = os.path.join(project.project_dir, "media")
     os.makedirs(media_dir, exist_ok=True)
     stem = _sanitize_bridge_component(filename_prefix) or "output"
@@ -350,7 +474,7 @@ def _save_custom_png_sequence(project, rgb_frames: np.ndarray, filename_prefix: 
     if frame_count == 1:
         filename = _bridge_unique_media_name(media_dir, f"{stem}.png")
         filepath = os.path.join(media_dir, filename)
-        write_png(filepath, rgb_frames[0], compression=compression)
+        write_png(filepath, rgb_frames[0], compression=compression, metadata=file_metadata)
         asset = Asset(
             name=filename,
             asset_type="image",
@@ -377,7 +501,14 @@ def _save_custom_png_sequence(project, rgb_frames: np.ndarray, filename_prefix: 
     for idx, frame in enumerate(rgb_frames, start=1):
         filename = f"{stem}_{idx:04d}.png"
         filepath = os.path.join(folder_path, filename)
-        write_png(filepath, frame, compression=compression)
+        write_png(filepath, frame, compression=compression, metadata=file_metadata if idx == 1 else None)
+        frame_metadata = dict(metadata)
+        editor_export = frame_metadata.get("editor_export")
+        if idx != 1 and isinstance(editor_export, dict):
+            editor_export = dict(editor_export)
+            editor_export["has_embedded_workflow"] = False
+            editor_export.pop("workflow_sha256", None)
+            frame_metadata["editor_export"] = editor_export
         asset = Asset(
             name=filename,
             asset_type="image",
@@ -387,7 +518,7 @@ def _save_custom_png_sequence(project, rgb_frames: np.ndarray, filename_prefix: 
             frame_count=1,
             folder=folder_name,
             generation_params={
-                **metadata,
+                **frame_metadata,
                 "image_sequence": True,
                 "sequence_folder": folder_name,
                 "sequence_total": frame_count,
@@ -709,13 +840,17 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
 
         asset_type, artifact_kind = classify_asset_path(final_path)
         metadata = _extract_bridge_asset_metadata(final_path, asset_type)
+        generation_params = _generation_params_with_detected_workflow(
+            dict(entry.get("generation_params") or {}),
+            final_path,
+        )
         asset = Asset(
             name=final_name,
             asset_type=asset_type,
             artifact_kind=artifact_kind,
             path=os.path.join("media", final_name),
             prompt=str(entry.get("prompt_text") or ""),
-            generation_params=dict(entry.get("generation_params") or {}),
+            generation_params=generation_params,
             width=metadata["width"],
             height=metadata["height"],
             frame_count=metadata["frame_count"],
@@ -929,6 +1064,7 @@ class SonderSaveVideo:
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "Audio to mux into the video."}),
+                "embed_metadata": ("BOOLEAN", {"default": True, "tooltip": "Embed source ComfyUI workflow metadata into files written by this save node."}),
                 "save_preset": (SAVE_VIDEO_PRESET_ORDER, {"default": DEFAULT_SAVE_VIDEO_PRESET, "tooltip": SAVE_PRESET_TOOLTIP}),
                 "custom_output_kind": (CUSTOM_OUTPUT_KIND_OPTIONS, {"default": CUSTOM_OUTPUT_KIND_VIDEO, "tooltip": "Custom only. Video File encodes one media asset; PNG Sequence writes frame images."}),
                 "custom_container": (CUSTOM_CONTAINER_OPTIONS, {"default": "mp4", "tooltip": "Custom video only. Output container/extension."}),
@@ -940,6 +1076,11 @@ class SonderSaveVideo:
                 "custom_audio_bitrate_kbps": ("INT", {"default": 192, "min": 1, "max": 10000, "tooltip": "Custom AAC audio only. Audio bitrate in kbps."}),
                 "custom_png_compression": ("INT", {"default": 0, "min": 0, "max": 9, "tooltip": "Custom PNG Sequence only. 0 is fastest/largest; 9 is smallest/slowest."}),
             },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     def save_video(self, project, frames, filename_prefix="output", fps=24.0,
@@ -950,10 +1091,14 @@ class SonderSaveVideo:
                    custom_video_codec="libx264",
                    custom_pix_fmt="yuv420p",
                    custom_crf=18,
-                   custom_encoder_preset="slow",
-                   custom_audio_codec="aac",
-                   custom_audio_bitrate_kbps=192,
-                   custom_png_compression=0):
+                    custom_encoder_preset="slow",
+                    custom_audio_codec="aac",
+                    custom_audio_bitrate_kbps=192,
+                    custom_png_compression=0,
+                    embed_metadata=True,
+                    prompt=None,
+                    extra_pnginfo=None,
+                    unique_id=None):
         # Save to media/ so it appears in the project's asset gallery
         media_dir = os.path.join(project.project_dir, "media")
         os.makedirs(media_dir, exist_ok=True)
@@ -980,14 +1125,46 @@ class SonderSaveVideo:
         tensor_mode = custom_spec["tensor_mode"] if custom_spec else tensor_mode_for_preset(preset_id)
         rgb_frames = tensor_to_uint8_frames(frames, mode=tensor_mode)
         h, w = rgb_frames[0].shape[:2]
+        execution_context = _copy_execution_context(project)
+        workflow = _workflow_from_extra_pnginfo(extra_pnginfo)
+        embed_metadata_enabled = bool(embed_metadata)
+
+        def build_asset_editor_export() -> dict:
+            editor_export = _compact_editor_export(
+                project,
+                execution_context,
+                has_embedded_workflow=embed_metadata_enabled and workflow is not None,
+                workflow=workflow,
+            )
+            editor_export.update({
+                "fps": fps,
+                "resolution": {"width": w, "height": h},
+                "preset": preset_id,
+                "custom_encode": dict(custom_options) if custom_spec else None,
+            })
+            return editor_export
+
+        asset_editor_export = build_asset_editor_export()
+        file_metadata = (
+            _file_metadata_payload(prompt, workflow, asset_editor_export)
+            if embed_metadata_enabled and (prompt is not None or workflow is not None)
+            else None
+        )
 
         if custom_spec and custom_spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE:
             encode_metadata = metadata_for_save_preset(preset_id, custom_options)
-            output_path, png_assets = _save_custom_png_sequence(project, rgb_frames, filename_prefix, encode_metadata)
+            asset_metadata = dict(encode_metadata)
+            asset_metadata["editor_export"] = asset_editor_export
+            output_path, png_assets = _save_custom_png_sequence(
+                project,
+                rgb_frames,
+                filename_prefix,
+                asset_metadata,
+                file_metadata=file_metadata,
+            )
             if mark_queue_complete:
-                ctx = _copy_execution_context(project)
                 result_asset_id = png_assets[0].asset_id if png_assets else ""
-                _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), result_asset_id)
+                _mark_queue_job_completed(project, str(execution_context.get("queue_job_id") or ""), result_asset_id)
             save_project(project)
             preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savepng")
             logger.info("Saved PNG sequence to %s (%d frames)", output_path, len(rgb_frames))
@@ -1031,6 +1208,7 @@ class SonderSaveVideo:
                 audio_path=audio_tmp,
                 custom_options=custom_options if custom_spec else None,
                 timeout=encode_timeout,
+                embed_metadata=file_metadata,
             )
         except subprocess.TimeoutExpired:
             logger.warning(
@@ -1048,6 +1226,8 @@ class SonderSaveVideo:
             preset_id,
             time.perf_counter() - ffmpeg_started_at,
         )
+        asset_generation_params = dict(encode_metadata)
+        asset_generation_params["editor_export"] = asset_editor_export
 
         # Auto-register as a project asset
         total_frames = len(rgb_frames)
@@ -1061,7 +1241,7 @@ class SonderSaveVideo:
             fps=fps,
             duration_sec=total_frames / fps if fps > 0 else 0.0,
             has_audio=has_audio,
-            generation_params=dict(encode_metadata),
+            generation_params=dict(asset_generation_params),
         )
         project.add_asset(asset)
 
@@ -1080,7 +1260,7 @@ class SonderSaveVideo:
             if scene:
                 # Organize asset into Takes folder
                 asset.folder = f"Takes/{ctx.get('scene_name', scene.name)}"
-                take_generation_params = {**dict(ctx), **dict(encode_metadata)}
+                take_generation_params = {**_public_execution_context(ctx), **dict(asset_generation_params)}
                 asset.generation_params = dict(take_generation_params)
 
                 # Find next available video lane
@@ -1242,6 +1422,7 @@ class SonderSaveBridge:
         prompt_key, prompt_key_source = _resolve_bridge_prompt_key(prompt)
         bridge_node_id = str(unique_id or uuid.uuid4().hex[:8])
         execution_context = _copy_execution_context(project)
+        generation_params = _bridge_generation_params(project, execution_context)
         naming_stem = _build_bridge_naming_stem(project, execution_context, prefix)
         output_dir, filename_prefix = _prepare_bridge_output_dir(project, prompt_key, bridge_node_id, naming_stem)
 
@@ -1254,8 +1435,8 @@ class SonderSaveBridge:
             "target_folder": _normalize_asset_folder(target_folder),
             "mark_queue_complete": bool(mark_queue_complete),
             "queue_job_id": str(execution_context.get("queue_job_id") or ""),
-            "prompt_text": str(execution_context.get("prompt") or ""),
-            "generation_params": execution_context,
+            "prompt_text": "",
+            "generation_params": generation_params,
             "naming_stem": naming_stem,
         }
 

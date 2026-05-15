@@ -6,9 +6,11 @@ try:
     from .nodes.editor_node import SonderEditor
     from .nodes.io_nodes import SonderSaveBridge, SonderSaveVideo, SonderPreviewVideo
     from .nodes.bridge_nodes import SonderGuidesBridgeStart, SonderGuidesBridgeEnd
+    from .nodes.metadata_collector import SonderMetadataCollector
 
     NODE_CLASS_MAPPINGS = {
         "SonderEditor": SonderEditor,
+        "SonderMetadataCollector": SonderMetadataCollector,
         "SonderSaveBridge": SonderSaveBridge,
         "SonderSaveVideo": SonderSaveVideo,
         "SonderPreviewVideo": SonderPreviewVideo,
@@ -18,6 +20,7 @@ try:
 
     NODE_DISPLAY_NAME_MAPPINGS = {
         "SonderEditor": "Sonder Editor",
+        "SonderMetadataCollector": "Sonder Metadata Collector",
         "SonderSaveBridge": "Sonder Save Bridge",
         "SonderSaveVideo": "Sonder Save Video",
         "SonderPreviewVideo": "Sonder Preview Video",
