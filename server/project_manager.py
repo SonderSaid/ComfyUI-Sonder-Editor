@@ -1,6 +1,9 @@
 import json
 import os
 import logging
+import uuid
+from datetime import datetime
+from typing import Callable
 
 from .timeline_state import TimelineProject
 
@@ -14,6 +17,31 @@ PROJECT_SUBDIRS = [
     os.path.join("cache", "waveforms"),
     os.path.join("cache", "bridge_out"),
 ]
+
+_PROJECT_SAVED_HOOKS: list[Callable[[TimelineProject], None]] = []
+
+
+class ProjectVersionConflict(RuntimeError):
+    """Raised when a caller tries to save over a newer project version."""
+
+    def __init__(
+        self,
+        *,
+        project_dir: str,
+        expected_modified_at: str,
+        actual_modified_at: str,
+        current_data: dict | None = None,
+    ):
+        super().__init__("project_version_conflict")
+        self.project_dir = project_dir
+        self.expected_modified_at = expected_modified_at
+        self.actual_modified_at = actual_modified_at
+        self.current_data = current_data or {}
+
+
+def register_project_saved_hook(hook: Callable[[TimelineProject], None]) -> None:
+    if hook not in _PROJECT_SAVED_HOOKS:
+        _PROJECT_SAVED_HOOKS.append(hook)
 
 
 def create_project(
@@ -53,11 +81,47 @@ def create_project(
     return project
 
 
-def save_project(project: TimelineProject) -> None:
+def save_project(
+    project: TimelineProject,
+    *,
+    expected_modified_at: str | None = None,
+    bump_modified_at: bool = True,
+    notify: bool = True,
+) -> None:
     project_file = os.path.join(project.project_dir, "project.json")
+    if expected_modified_at is None:
+        expected_modified_at = getattr(project, "_expected_modified_at", None) or None
+    current_data = None
+    if expected_modified_at:
+        if os.path.isfile(project_file):
+            with open(project_file, "r", encoding="utf-8") as f:
+                current_data = json.load(f)
+            actual_modified_at = str(current_data.get("modified_at", "") or "")
+        else:
+            actual_modified_at = ""
+        if actual_modified_at != expected_modified_at:
+            raise ProjectVersionConflict(
+                project_dir=project.project_dir,
+                expected_modified_at=expected_modified_at,
+                actual_modified_at=actual_modified_at,
+                current_data=current_data,
+            )
+
+    if bump_modified_at:
+        project.modified_at = datetime.now().isoformat()
     data = project.to_dict()
-    with open(project_file, "w", encoding="utf-8") as f:
+    tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_file, project_file)
+    if hasattr(project, "_expected_modified_at"):
+        setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
+    if notify:
+        for hook in list(_PROJECT_SAVED_HOOKS):
+            try:
+                hook(project)
+            except Exception:
+                logger.exception("Project save hook failed")
 
 
 def load_project(project_dir: str) -> TimelineProject:

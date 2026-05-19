@@ -20,6 +20,7 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server.project_manager import load_project, save_project
+from ..server.project_commit import save_generated_project
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
@@ -92,6 +93,13 @@ def _ensure_asset_folder_metadata(project, folder: str) -> None:
 def _copy_execution_context(project) -> dict:
     context = getattr(project, "_execution_context", None) or {}
     return dict(context) if isinstance(context, dict) else {}
+
+
+def _save_generated_project(project, base_modified_at: str = ""):
+    if base_modified_at:
+        return save_generated_project(project, str(base_modified_at))
+    save_project(project)
+    return project
 
 
 EDITOR_EXPORT_SCHEMA_VERSION = "1.0"
@@ -401,6 +409,7 @@ def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
             "prompt_text": "",
             "generation_params": {},
             "naming_stem": recovered_stem,
+            "base_modified_at": "",
         }
         try:
             _finalize_bridge_entry(orphan_entry)
@@ -893,7 +902,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         )
 
     if changed:
-        save_project(project)
+        _save_generated_project(project, entry.get("base_modified_at", ""))
 
     logger.info(
         "Bridge finalize: prompt=%s node=%s moved=%d target_folder=%s stem=%s",
@@ -1165,7 +1174,7 @@ class SonderSaveVideo:
             if mark_queue_complete:
                 result_asset_id = png_assets[0].asset_id if png_assets else ""
                 _mark_queue_job_completed(project, str(execution_context.get("queue_job_id") or ""), result_asset_id)
-            save_project(project)
+            _save_generated_project(project, str(execution_context.get("base_modified_at") or ""))
             preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savepng")
             logger.info("Saved PNG sequence to %s (%d frames)", output_path, len(rgb_frames))
             return {
@@ -1378,7 +1387,7 @@ class SonderSaveVideo:
             ctx = _copy_execution_context(project)
             _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), asset.asset_id)
 
-        save_project(project)
+        _save_generated_project(project, str(execution_context.get("base_modified_at") or ""))
 
         # Generate preview thumbnail for ComfyUI node display
         preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savevid")
@@ -1438,6 +1447,7 @@ class SonderSaveBridge:
             "prompt_text": "",
             "generation_params": generation_params,
             "naming_stem": naming_stem,
+            "base_modified_at": str(execution_context.get("base_modified_at") or ""),
         }
 
         with _BRIDGE_REGISTRY_LOCK:

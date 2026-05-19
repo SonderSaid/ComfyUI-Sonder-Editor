@@ -57,6 +57,9 @@ class Asset:
     duration_sec: float = 0.0
     sample_rate: int = 0                    # audio only
     has_audio: bool = False                  # video files: True if video contains audio stream
+    has_audio_checked: bool = False          # video files: audio probe has completed for current signature
+    duration_checked: bool = False           # audio files: duration probe has completed for current signature
+    media_probe_signature: str = ""          # file size + mtime marker for cached probes
     imported_at: str = field(default_factory=lambda: datetime.now().isoformat())
     folder: str = ""                            # organizational folder (e.g., "Takes/Scene 1")
     trashed_at: str = ""                    # ISO timestamp when moved to trash
@@ -78,6 +81,9 @@ class Asset:
             "duration_sec": self.duration_sec,
             "sample_rate": self.sample_rate,
             "has_audio": self.has_audio,
+            "has_audio_checked": self.has_audio_checked,
+            "duration_checked": self.duration_checked,
+            "media_probe_signature": self.media_probe_signature,
             "imported_at": self.imported_at,
             "folder": self.folder,
             "trashed_at": self.trashed_at,
@@ -101,6 +107,9 @@ class Asset:
             duration_sec=data.get("duration_sec", 0.0),
             sample_rate=data.get("sample_rate", 0),
             has_audio=data.get("has_audio", False),
+            has_audio_checked=data.get("has_audio_checked", False),
+            duration_checked=data.get("duration_checked", False),
+            media_probe_signature=data.get("media_probe_signature", ""),
             imported_at=data.get("imported_at", datetime.now().isoformat()),
             folder=data.get("folder", ""),
             trashed_at=data.get("trashed_at", ""),
@@ -658,6 +667,7 @@ class GenerationJob:
     frame_constraint: dict | None = None
     take_placement_mode: str = "trimmed"
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    base_modified_at: str = ""
     completed_at: str = ""
     result_asset_id: str = ""
 
@@ -691,6 +701,7 @@ class GenerationJob:
             "frame_constraint": self.frame_constraint,
             "take_placement_mode": self.take_placement_mode,
             "created_at": self.created_at,
+            "base_modified_at": self.base_modified_at,
             "completed_at": self.completed_at,
             "result_asset_id": self.result_asset_id,
         }
@@ -731,6 +742,7 @@ class GenerationJob:
             frame_constraint=data.get("frame_constraint"),
             take_placement_mode=take_placement_mode,
             created_at=data.get("created_at", ""),
+            base_modified_at=data.get("base_modified_at", ""),
             completed_at=data.get("completed_at", ""),
             result_asset_id=data.get("result_asset_id", ""),
         )

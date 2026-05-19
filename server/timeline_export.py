@@ -31,7 +31,8 @@ from .media_helpers import (
     tensor_mode_for_preset,
     tensor_to_uint8_frames,
 )
-from .project_manager import load_project, save_project
+from .project_commit import save_generated_project
+from .project_manager import load_project
 from .thumbnail_service import ensure_thumbnail
 from .timeline_renderer import (
     TimelineRenderCancelled,
@@ -686,6 +687,7 @@ class TimelineExportManager:
 
             self._set_phase(job, "registering", "Registering asset...")
             current_project = load_project(job.project_dir)
+            base_modified_at = str(getattr(current_project, "modified_at", "") or "")
             current_scene = current_project.get_scene(job.request["scene_id"])
             if place_as_take and include_video and not current_scene:
                 job.warnings.append("Target scene was deleted; placement skipped.")
@@ -749,7 +751,7 @@ class TimelineExportManager:
                         logger.warning("Timeline export take audio extraction failed: %s", exc)
                         job.warnings.append("Placed video take, but embedded audio extraction failed.")
 
-            save_project(current_project)
+            save_generated_project(current_project, base_modified_at)
             cleanup_paths.remove(final_output_path)
             if placed_audio_cleanup_path and placed_audio_cleanup_path in cleanup_paths:
                 cleanup_paths.remove(placed_audio_cleanup_path)

@@ -6,8 +6,46 @@ import {
     resolveFrameConstraintForTemplate,
     updateEditorSettings,
 } from "./editor_settings.js";
+import { installProjectVersionFetchPatch } from "./api_client.js";
+import {
+    claimEditorSession,
+    createEditorHandoff,
+    getEditorSession,
+    getEditorWidgetState,
+    heartbeatCanvasHost,
+    heartbeatEditorSession,
+    newEditorSessionId,
+    putEditorWidgetState,
+    releaseEditorSession,
+} from "./editor_session_client.js";
+import { connectProjectSync } from "./cross_tab_sync.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { register as registerKeyboardConsumer, PRIORITY as KEYBOARD_PRIORITY } from "./keyboard_ownership.js";
+
+// Session-diagnostic mode is gated by `window.SONDER_DEBUG_SESSION === true`.
+// When off, the helpers below are no-ops with zero allocation. Do NOT enable
+// minification of this module without re-validating the stack-based caller
+// attribution in `_logRender` — the second frame of `new Error().stack` is
+// expected to identify the immediate caller.
+//
+// Persistent enable across page reloads: set `localStorage.SONDER_DEBUG_SESSION = "1"`
+// once in the canvas page console; this bootstrap copies it into the window
+// global before the controller is constructed.
+const SESSION_DIAG_RING_MAX = 2048;
+const WIDGET_STATE_FALLBACK_POLL_MS = 2000;
+
+if (typeof window !== "undefined" && !window.SONDER_DEBUG_SESSION) {
+    try {
+        if (window.localStorage?.getItem?.("SONDER_DEBUG_SESSION") === "1") {
+            window.SONDER_DEBUG_SESSION = true;
+        }
+    } catch (_) {}
+}
+
+function isSessionDiagEnabled() {
+    return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
+}
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -47,6 +85,18 @@ const CHROME = {
     dangerBorder: "#8f5f66",
     dangerText: "#efc0c4",
 };
+
+const EDITOR_WIDGET_FIELDS = [
+    "scene_id",
+    "selection_start",
+    "selection_end",
+    "pre_context_frames",
+    "post_context_frames",
+    "mask_pre_offset",
+    "mask_post_offset",
+    "take_placement_mode",
+    "render_queue_active",
+];
 
 const BUTTON_STYLES = {
     muted: {
@@ -96,6 +146,24 @@ function iconForAssetType(type) {
 
 function projectIdFromDir(projectDir) {
     return projectDir ? projectDir.split(/[/\\]/).pop() : "";
+}
+
+const CANVAS_INSTANCE_STORAGE_KEY = "sonder-editor-canvas-instance-id";
+
+function getCanvasInstanceId() {
+    const fallback = `canvas-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+        const storage = globalThis.sessionStorage;
+        if (!storage) return fallback;
+        let value = storage.getItem(CANVAS_INSTANCE_STORAGE_KEY);
+        if (!value) {
+            value = globalThis.crypto?.randomUUID?.() || fallback;
+            storage.setItem(CANVAS_INSTANCE_STORAGE_KEY, value);
+        }
+        return value;
+    } catch (_err) {
+        return fallback;
+    }
 }
 
 function formatCountLabel(prefix, value) {
@@ -624,6 +692,7 @@ class FullscreenEditorSession {
         const state = this.controller.state;
         const editor = new EditorWidget(this.controller.node, {
             onFullscreenExit: () => this._handleEditorClosed(),
+            onMountInTab: () => this.controller.mountFullscreenInTab(),
             onWidgetValueChange: (name, value) => this.controller.onEditorWidgetValueChange(name, value),
         });
 
@@ -782,6 +851,17 @@ class DormantNodeCard {
         this._badgeRowEl.innerHTML = "";
         const badges = [];
         if (state.isFullscreenOpen) badges.push({ text: "Editor Active", color: CHROME.accentSoft, border: CHROME.accentBorder });
+        if (state.activeOwner?.host_mode === "tab") {
+            const orphaned = state.activeOwner?.status === "orphaned";
+            badges.push({
+                text: orphaned ? "Mounted Tab Stale" : "Mounted Tab",
+                color: orphaned ? CHROME.warningSoft : "#2a3b2f",
+                border: orphaned ? CHROME.warningBorder : "#5a8063",
+            });
+        }
+        if (state.activeOwner && state.activeOwner.host_mode !== "tab" && state.activeOwner.session_id !== this.controller._editorSessionId) {
+            badges.push({ text: "Owned", color: CHROME.warningSoft, border: CHROME.warningBorder });
+        }
         if ((queueCounts.running || 0) > 0) badges.push({ text: `${queueCounts.running} Running`, color: "#264863", border: "#5d8db5" });
         if ((queueCounts.pending || 0) > 0) badges.push({ text: `${queueCounts.pending} Pending`, color: CHROME.warningSoft, border: CHROME.warningBorder });
         if (!badges.length && summary) badges.push({ text: "Idle", color: "#223128", border: "#4d6a58" });
@@ -853,14 +933,56 @@ class DormantNodeCard {
         }
 
         this._actionRowEl.innerHTML = "";
+        const owner = state.activeOwner || null;
+        const ownedByThis = owner?.session_id === this.controller._editorSessionId;
+        const ownedByTab = owner?.host_mode === "tab";
+        const ownedExternally = !!owner && !ownedByThis && !ownedByTab;
+        const pendingHandoff = !!state.pendingTabHandoff;
+        const actionLabel = pendingHandoff
+            ? "Waiting for Tab"
+            : state.isFullscreenOpen
+                ? "Editor Active"
+                : ownedByTab
+                    ? "Open Mounted Editor"
+                    : ownedExternally
+                        ? "Owned by Workflow"
+                        : "Open Editor";
+        const actionDisabled = !state.projectDir || state.isFullscreenOpen || pendingHandoff || ownedExternally;
         const openBtn = style(document.createElement("button"), `
-            ${buttonStyle(state.isFullscreenOpen ? "subtle" : "primary")}
-            cursor: ${state.projectDir && !state.isFullscreenOpen ? "pointer" : "default"};
+            ${buttonStyle((state.isFullscreenOpen || ownedByTab || ownedExternally || pendingHandoff) ? "subtle" : "primary")}
+            cursor: ${state.projectDir && !actionDisabled ? "pointer" : "default"};
         `);
-        openBtn.textContent = state.isFullscreenOpen ? "Editor Active" : "Open Editor";
-        openBtn.disabled = !state.projectDir || state.isFullscreenOpen;
-        openBtn.addEventListener("click", () => this.controller.openFullscreen());
+        openBtn.textContent = actionLabel;
+        openBtn.disabled = actionDisabled;
+        openBtn.addEventListener("click", () => {
+            if (ownedByTab) this.controller.focusMountedTab();
+            else this.controller.openFullscreen();
+        });
         this._actionRowEl.appendChild(openBtn);
+        if (owner && !ownedByThis) {
+            const ownerLine = style(document.createElement("div"), `
+                color: ${CHROME.textDim};
+                font-size: 10px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            `);
+            const text = document.createElement("span");
+            const ownerStatus = owner?.status === "orphaned" ? " (stale)" : "";
+            text.textContent = ownedByTab
+                ? `Mounted tab${ownerStatus}: ${owner.workflow_label || "Persistent editor tab"}`
+                : `Owner${ownerStatus}: ${owner.workflow_label || owner.host_mode || "editor"}`;
+            ownerLine.appendChild(text);
+            const release = style(document.createElement("button"), `
+                ${buttonStyle("ghost")}
+                padding: 2px 6px;
+                font-size: 10px;
+            `);
+            release.textContent = "Force Release";
+            release.addEventListener("click", () => this.controller.forceReleaseOwner(owner));
+            ownerLine.appendChild(release);
+            this._actionRowEl.appendChild(ownerLine);
+        }
 
         for (const moduleId of ["assets", "preview", "queue"]) {
             const isExpanded = state.expandedModuleId === moduleId;
@@ -1005,6 +1127,7 @@ class DormantNodeCard {
 
 export class EditorNodeController {
     constructor(node, projectWidget) {
+        installProjectVersionFetchPatch();
         this.node = node;
         this.projectWidget = projectWidget;
         this.projectName = projectWidget?.value || "";
@@ -1023,6 +1146,12 @@ export class EditorNodeController {
             dormantSummary: null,
             moduleCache: this.moduleCache,
             isFullscreenOpen: false,
+            activeOwner: null,
+            sessionStatus: "",
+            lastOwnerSignature: "",
+            canvasHostConnected: false,
+            syncConnectionState: "closed",
+            pendingTabHandoff: null,
             expandedModuleId: "",
             _projectReadyQueue: [],
         };
@@ -1045,11 +1174,155 @@ export class EditorNodeController {
         this._queueSaveCompletionCounter = 0;
         this._lastQueueSettledSaveCompletionCounter = 0;
         this._frameConstraintHealedFor = "";
+        this._editorSessionId = newEditorSessionId("fullscreen");
+        this._sessionHeartbeatTimer = null;
+        this._suppressNextSessionRelease = false;
+        this._syncConnection = null;
+        this._syncProjectId = "";
+        this._syncHostId = "";
+        this._syncSourceNodeId = "";
+        this._syncRetryTimer = null;
+        this._syncSubscribed = false;
+        this._widgetStatePollTimer = null;
+        this._widgetStatePollInFlight = false;
+        this._canvasHostHeartbeatTimer = null;
+        this._ownerPollTimer = null;
+        this._ownerPollIntervalMs = 0;
+        this._ownerPollInFlight = false;
+        this._ownerPollQueued = false;
+        this._pendingHandoffTimer = null;
+        this._canvasInstanceId = getCanvasInstanceId();
+        this._cachedHostNodeId = "";
+        this._cachedHostId = "";
+        this._mountedTabWindowName = `sonder-editor-tab-${this._editorSessionId}`;
+        this._diagEvents = [];
+        this._diagBoot = null;
+        this._diagHotkeyUnregister = null;
+        // Register hotkey unconditionally; handler checks flag at press time.
+        this._registerDiagHotkey();
+        this._diagBootIfNeeded();
+    }
+
+    _diagBootIfNeeded() {
+        if (!isSessionDiagEnabled() || this._diagBoot) return;
+        this._diagBoot = {
+            kind: "boot",
+            t_wall: Date.now(),
+            t_mono: performance.now(),
+            build_marker: `canvas:${this._editorSessionId || ""}`,
+            canvas_instance_id: this._canvasInstanceId,
+        };
+        this._diagEvents.push({ ...this._diagBoot });
+    }
+
+    _recordDiagEvent(kind, payload = {}) {
+        if (!isSessionDiagEnabled()) return;
+        this._diagBootIfNeeded();
+        if (!this._diagHotkeyUnregister) this._registerDiagHotkey();
+        if (this._diagEvents.length >= SESSION_DIAG_RING_MAX) {
+            this._diagEvents.shift();
+        }
+        this._diagEvents.push({
+            t_wall: Date.now(),
+            t_mono: performance.now(),
+            kind,
+            ...payload,
+        });
+    }
+
+    _logRender(reason = "") {
+        if (!isSessionDiagEnabled()) return;
+        let caller = reason;
+        if (!caller) {
+            const stack = (new Error()).stack || "";
+            const lines = stack.split("\n");
+            caller = (lines[2] || "").trim();
+        }
+        this._recordDiagEvent("render", { caller });
+    }
+
+    _registerDiagHotkey() {
+        // Register unconditionally — flag check happens inside the handler so the
+        // hotkey works even if the user flips `window.SONDER_DEBUG_SESSION` on
+        // after the controller was constructed.
+        if (this._diagHotkeyUnregister) {
+            try { this._diagHotkeyUnregister(); } catch (_) {}
+            this._diagHotkeyUnregister = null;
+        }
+        try {
+            this._diagHotkeyUnregister = registerKeyboardConsumer({
+                id: `session-diag-dump:${this._editorSessionId}`,
+                priority: KEYBOARD_PRIORITY?.EDITOR ?? 10,
+                keydown: (event) => {
+                    if (!isSessionDiagEnabled()) return false;
+                    if (!event.ctrlKey || !event.altKey || !event.shiftKey) return false;
+                    if (String(event.key || "").toLowerCase() !== "d") return false;
+                    this._dumpSessionDiagnostics().catch(() => {});
+                    return true;
+                },
+            });
+        } catch (_) {
+            this._diagHotkeyUnregister = null;
+        }
+    }
+
+    async _dumpSessionDiagnostics() {
+        const projectDir = this.state?.projectDir || "";
+        let backendDiag = null;
+        if (projectDir) {
+            try {
+                const response = await fetch(`/sonder-editor/session/${encodeURIComponent(projectDir)}/diag`);
+                if (response.ok) backendDiag = await response.json();
+            } catch (_) { backendDiag = null; }
+        }
+        const canvasDiag = (typeof window !== "undefined" && window.__SONDER_CANVAS_DIAG) || null;
+        const bundle = {
+            captured_at_wall: Date.now(),
+            captured_at_mono: performance.now(),
+            actor: "canvas_controller",
+            session_id: this._editorSessionId,
+            project_dir: projectDir,
+            controller: {
+                boot: this._diagBoot ? { ...this._diagBoot } : null,
+                events: this._diagEvents.slice(),
+            },
+            canvas_page: canvasDiag ? {
+                boot: canvasDiag.boot ? { ...canvasDiag.boot } : null,
+                events: Array.isArray(canvasDiag.events) ? canvasDiag.events.slice() : [],
+            } : null,
+            backend: backendDiag,
+        };
+        const json = JSON.stringify(bundle, null, 2);
+        try {
+            await navigator.clipboard.writeText(json);
+            console.info("[Sonder Session Diag] Copied diagnostic bundle to clipboard:", bundle);
+        } catch (_) {
+            try {
+                const blob = new Blob([json], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const anchor = document.createElement("a");
+                anchor.href = url;
+                anchor.download = `sonder-session-diag-canvas-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+                document.body.appendChild(anchor);
+                anchor.click();
+                document.body.removeChild(anchor);
+                setTimeout(() => URL.revokeObjectURL(url), 5000);
+                console.info("[Sonder Session Diag] Downloaded diagnostic bundle:", bundle);
+            } catch (err) {
+                console.warn("[Sonder Session Diag] Failed to copy/download diagnostic bundle:", err);
+            }
+        }
     }
 
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+
+        if (this._diagHotkeyUnregister) {
+            try { this._diagHotkeyUnregister(); } catch (_) {}
+            this._diagHotkeyUnregister = null;
+        }
+        this._diagEvents.length = 0;
 
         if (this._summaryAborter) {
             this._summaryAborter.abort();
@@ -1060,12 +1333,17 @@ export class EditorNodeController {
             this._abortModuleLoad(moduleId);
         }
 
+        clearTimeout(this._pendingHandoffTimer);
+        this._pendingHandoffTimer = null;
+        this._teardownProjectSync();
         this.card.teardown();
 
         if (this.fullscreenSession) {
             const session = this.fullscreenSession;
             this.fullscreenSession = null;
             session.destroy();
+        } else {
+            this._releaseFullscreenSession();
         }
 
         this.state._projectReadyQueue.length = 0;
@@ -1081,6 +1359,7 @@ export class EditorNodeController {
 
     render() {
         if (this._destroyed) return;
+        this._logRender();
         this.card.render();
     }
 
@@ -1182,7 +1461,7 @@ export class EditorNodeController {
         this.state.renderQueueActive = coerceBoolean(this._getWidgetValue("render_queue_active", true), true);
     }
 
-    onEditorWidgetValueChange(name, value) {
+    onEditorWidgetValueChange(name, value, { publish = true } = {}) {
         if (name === "scene_id") this.state.sceneId = value || "";
         if (name === "selection_start") this.state.selectionStart = Math.max(0, parseInt(value, 10) || 0);
         if (name === "selection_end") this.state.selectionEnd = Math.max(0, parseInt(value, 10) || 0);
@@ -1191,6 +1470,417 @@ export class EditorNodeController {
         if (name === "mask_pre_offset") this.state.maskPreOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "mask_post_offset") this.state.maskPostOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "render_queue_active") this.state.renderQueueActive = coerceBoolean(value, true);
+        if (publish) this._seedWidgetState({ [name]: value }, { seed: false });
+        this.render();
+    }
+
+    _sourceNodeId() {
+        return String(this.node?.id ?? "");
+    }
+
+    _hostId() {
+        const sourceNodeId = this._sourceNodeId() || "anon";
+        if (!this._cachedHostId || this._cachedHostNodeId !== sourceNodeId) {
+            this._cachedHostNodeId = sourceNodeId;
+            this._cachedHostId = `${this._canvasInstanceId}:${sourceNodeId}`;
+        }
+        return this._cachedHostId;
+    }
+
+    _currentWidgetStateValues() {
+        const values = {};
+        for (const name of EDITOR_WIDGET_FIELDS) {
+            const fallback = name === "scene_id" ? ""
+                : name === "take_placement_mode" ? "trimmed"
+                    : name === "render_queue_active" ? true
+                        : 0;
+            values[name] = this._getWidgetValue(name, fallback);
+        }
+        return values;
+    }
+
+    _teardownProjectSync({ preserveRetry = false } = {}) {
+        if (!preserveRetry) {
+            clearTimeout(this._syncRetryTimer);
+            this._syncRetryTimer = null;
+        }
+        clearInterval(this._canvasHostHeartbeatTimer);
+        this._canvasHostHeartbeatTimer = null;
+        clearInterval(this._widgetStatePollTimer);
+        this._widgetStatePollTimer = null;
+        this._widgetStatePollInFlight = false;
+        this._syncSubscribed = false;
+        this._stopOwnerPolling();
+        if (this._syncConnection) {
+            this._syncConnection.close();
+            this._syncConnection = null;
+        }
+        this._syncProjectId = "";
+        this._syncHostId = "";
+        this._syncSourceNodeId = "";
+        this.state.syncConnectionState = "closed";
+        this.state.canvasHostConnected = false;
+    }
+
+    _projectSyncMatches() {
+        const projectId = this._projectId();
+        const sourceNodeId = this._sourceNodeId();
+        if (!this._syncConnection || !projectId || !sourceNodeId) return false;
+        return this._syncProjectId === projectId
+            && this._syncHostId === this._hostId()
+            && this._syncSourceNodeId === sourceNodeId;
+    }
+
+    _startCanvasHostHeartbeat(projectId, hostId, sourceNodeId) {
+        clearInterval(this._canvasHostHeartbeatTimer);
+        let lastSentAt = 0;
+        const sendHeartbeat = () => {
+            if (this._destroyed || projectId !== this._projectId() || hostId !== this._hostId() || sourceNodeId !== this._sourceNodeId()) return;
+            const now = performance.now();
+            const gapMs = lastSentAt > 0 ? now - lastSentAt : 0;
+            lastSentAt = now;
+            this._recordDiagEvent("canvas_host_heartbeat_send", { gap_ms: gapMs, project_id: projectId });
+            heartbeatCanvasHost(projectId, this._editorSessionId, hostId, sourceNodeId, this._fullscreenOwnerInfo()).then((result) => {
+                this._recordDiagEvent("canvas_host_heartbeat_recv", {
+                    duration_ms: performance.now() - now,
+                    ok: !!(result && result.ok),
+                    canvas_host_connected: !!(result && result.canvas_host_connected),
+                    code: result?.code || "",
+                });
+                if (this._destroyed || projectId !== this._projectId() || hostId !== this._hostId()) return;
+                if (Object.prototype.hasOwnProperty.call(result, "canvas_host_connected")) {
+                    const connected = !!result.canvas_host_connected;
+                    if (this.state.canvasHostConnected !== connected) {
+                        this.state.canvasHostConnected = connected;
+                        this.render();
+                    }
+                }
+            }).catch((error) => {
+                this._recordDiagEvent("canvas_host_heartbeat_error", {
+                    duration_ms: performance.now() - now,
+                    error: String(error && error.message ? error.message : error),
+                });
+                console.warn("[Sonder] Canvas host heartbeat failed:", error);
+            });
+        };
+        sendHeartbeat();
+        this._canvasHostHeartbeatTimer = setInterval(sendHeartbeat, 5000);
+    }
+
+    _setupProjectSync() {
+        if (this._destroyed) return;
+        const projectId = this._projectId();
+        if (!projectId) {
+            this._teardownProjectSync();
+            return;
+        }
+        clearTimeout(this._syncRetryTimer);
+        this._syncRetryTimer = null;
+        const sourceNodeId = this._sourceNodeId();
+        if (!sourceNodeId) {
+            this._teardownProjectSync({ preserveRetry: true });
+            this.state.syncConnectionState = "waiting_for_node_id";
+            this.state.canvasHostConnected = false;
+            this.render();
+            this._syncRetryTimer = setTimeout(() => {
+                if (this._destroyed) return;
+                this._syncRetryTimer = null;
+                this._setupProjectSync();
+            }, 250);
+            return;
+        }
+        const hostId = this._hostId();
+        this._teardownProjectSync();
+        this._syncProjectId = projectId;
+        this._syncHostId = hostId;
+        this._syncSourceNodeId = sourceNodeId;
+        this._syncSubscribed = false;
+        this._startCanvasHostHeartbeat(projectId, hostId, sourceNodeId);
+        this._syncConnection = connectProjectSync(projectId, {
+            onProjectUpdated: (event) => this._handleProjectUpdatedFromSync(event),
+            onWidgetStateChanged: (event) => this._handleWidgetStateChanged(event),
+            onSessionChanged: (event) => this._handleSessionChanged(event),
+            onHostPresenceChanged: (event) => this._handleHostPresenceChanged(event),
+            onSubscribed: (event) => this._handleSyncSubscribed(event),
+            onConnectionState: (state, details = {}) => {
+                if (state !== "open") this._syncSubscribed = false;
+                this._recordDiagEvent("sync_transport_state", { state, url: details.url || "" });
+                if (this.state.syncConnectionState !== state) {
+                    this.state.syncConnectionState = state;
+                    this.render();
+                }
+            },
+        }, {
+            role: "canvas_host",
+            hostId,
+            sourceNodeId,
+            sessionId: this._editorSessionId,
+            workflowLabel: document.title || "ComfyUI workflow",
+        });
+        this._seedWidgetState(this._currentWidgetStateValues(), { seed: true });
+        this._startWidgetStateFallbackPolling(projectId, hostId, sourceNodeId);
+        this._startOwnerPolling(4000);
+        getEditorSession(projectId, hostId, sourceNodeId).then((result) => {
+            if (this._destroyed || projectId !== this._projectId()) return;
+            this._applyOwnerState(result.owner || null, "initial");
+        }).catch(() => {});
+    }
+
+    _seedWidgetState(values = this._currentWidgetStateValues(), { seed = false } = {}) {
+        const projectId = this._projectId();
+        if (!projectId) return;
+        putEditorWidgetState(projectId, this._sourceNodeId(), this._editorSessionId, values, { seed, hostId: this._hostId() }).catch((error) => {
+            console.warn("[Sonder] Failed to publish editor widget state:", error);
+        });
+    }
+
+    _applyRemoteWidgetState(values = {}, source = "unknown", remoteSessionId = "") {
+        if (!values || typeof values !== "object") return false;
+        const changedFields = [];
+        for (const [name, value] of Object.entries(values)) {
+            if (!EDITOR_WIDGET_FIELDS.includes(name)) continue;
+            if (Object.is(this._getWidgetValue(name), value)) continue;
+            this._setWidgetValue(name, value);
+            this.onEditorWidgetValueChange(name, value, { publish: false });
+            changedFields.push(name);
+        }
+        if (!changedFields.length) return false;
+        this._recordDiagEvent("widget_state_apply", {
+            source,
+            remote_session_id: remoteSessionId || "",
+            fields: changedFields,
+        });
+        this.node?.setDirtyCanvas?.(true, true);
+        this.fullscreenSession?.editor?.applyWidgetState?.(values);
+        this.refreshSummary().finally(() => this.render());
+        return true;
+    }
+
+    _startWidgetStateFallbackPolling(projectId, hostId, sourceNodeId) {
+        clearInterval(this._widgetStatePollTimer);
+        this._widgetStatePollTimer = setInterval(() => {
+            this._pollWidgetStateFallback(projectId, hostId, sourceNodeId);
+        }, WIDGET_STATE_FALLBACK_POLL_MS);
+        this._pollWidgetStateFallback(projectId, hostId, sourceNodeId);
+    }
+
+    _pollWidgetStateFallback(projectId, hostId, sourceNodeId) {
+        if (this._destroyed || !projectId || !hostId || !sourceNodeId) return;
+        if (projectId !== this._projectId() || hostId !== this._hostId() || sourceNodeId !== this._sourceNodeId()) return;
+        if (this._syncSubscribed && this.state.syncConnectionState === "open") return;
+        if (this._widgetStatePollInFlight) return;
+        this._widgetStatePollInFlight = true;
+        const sentAt = performance.now();
+        this._recordDiagEvent("widget_state_poll_send", {
+            sync_state: this.state.syncConnectionState,
+            sync_subscribed: this._syncSubscribed,
+        });
+        getEditorWidgetState(projectId, sourceNodeId, hostId).then((payload) => {
+            this._recordDiagEvent("widget_state_poll_recv", {
+                duration_ms: performance.now() - sentAt,
+                ok: !!payload?.ok,
+                canvas_host_connected: !!payload?.canvas_host_connected,
+                field_count: Object.keys(payload?.state || payload?.values || {}).length,
+            });
+            if (this._destroyed || projectId !== this._projectId() || hostId !== this._hostId() || sourceNodeId !== this._sourceNodeId()) return;
+            if (Object.prototype.hasOwnProperty.call(payload || {}, "canvas_host_connected")) {
+                const connected = !!payload.canvas_host_connected;
+                if (this.state.canvasHostConnected !== connected) {
+                    this.state.canvasHostConnected = connected;
+                    this.render();
+                }
+            }
+            const values = payload?.state && typeof payload.state === "object"
+                ? payload.state
+                : (payload?.values && typeof payload.values === "object" ? payload.values : {});
+            this._applyRemoteWidgetState(values, "poll", payload?.session_id || "");
+        }).catch((error) => {
+            this._recordDiagEvent("widget_state_poll_error", {
+                duration_ms: performance.now() - sentAt,
+                error: String(error && error.message ? error.message : error),
+            });
+        }).finally(() => {
+            this._widgetStatePollInFlight = false;
+        });
+    }
+
+    _handleProjectUpdatedFromSync(event) {
+        if (!event || event.project_id !== this._projectId()) return;
+        this._invalidateModules(["project", "assets", "scene", "queue", "preview"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue", "preview"]);
+        this.refreshSummary({ syncAssets: true }).finally(() => this.render());
+        this.fullscreenSession?.refresh(["project", "assets", "scenes", "queue"]);
+    }
+
+    _handleWidgetStateChanged(event) {
+        if (!event || event.project_id !== this._projectId()) return;
+        if (String(event.host_id || "") !== this._hostId()) return;
+        if (String(event.source_node_id || "") !== this._sourceNodeId()) return;
+        if (String(event.session_id || "") === this._editorSessionId) return;
+        const values = event.values && typeof event.values === "object" ? event.values : {};
+        this._recordDiagEvent("ws_widget_state_changed", {
+            remote_session_id: event.session_id || "",
+            field_count: Object.keys(values).length,
+            fields: Object.keys(values).sort(),
+        });
+        this._applyRemoteWidgetState(values, "ws", event.session_id || "");
+    }
+
+    _ownerSignature(owner) {
+        if (!owner) return "";
+        return JSON.stringify({
+            host_mode: owner.host_mode || "",
+            session_id: owner.session_id || "",
+            status: owner.status || "active",
+            source_node_id: owner.source_node_id || "",
+            workflow_label: owner.workflow_label || "",
+            browser_instance_id: owner.browser_instance_id || "",
+        });
+    }
+
+    _applyOwnerState(owner, source = "unknown") {
+        const normalized = owner || null;
+        const signature = this._ownerSignature(normalized);
+        const previousSignature = this.state.lastOwnerSignature;
+        if (signature === previousSignature) {
+            this._recordDiagEvent("apply_owner_noop", {
+                source,
+                signature_unchanged: true,
+                status: normalized?.status || "",
+                host_mode: normalized?.host_mode || "",
+            });
+            return false;
+        }
+        this._recordDiagEvent("apply_owner_change", {
+            source,
+            previous_signature: previousSignature,
+            next_signature: signature,
+            status: normalized?.status || "",
+            host_mode: normalized?.host_mode || "",
+            session_id: normalized?.session_id || "",
+            same_session: normalized?.session_id === this._editorSessionId,
+        });
+        this.state.lastOwnerSignature = signature;
+        this.state.activeOwner = normalized;
+        this.state.sessionStatus = normalized?.status || "";
+
+        if (this.state.pendingTabHandoff && normalized?.host_mode === "tab") {
+            clearTimeout(this._pendingHandoffTimer);
+            this._pendingHandoffTimer = null;
+            this.state.pendingTabHandoff = null;
+            this._startOwnerPolling(4000);
+        }
+
+        if (normalized?.host_mode === "tab" && normalized.session_id !== this._editorSessionId && this.state.isFullscreenOpen && this.fullscreenSession) {
+            const session = this.fullscreenSession;
+            this._suppressNextSessionRelease = true;
+            this.fullscreenSession = null;
+            session.destroy();
+        }
+
+        this.render();
+        return true;
+    }
+
+    _stopOwnerPolling() {
+        clearInterval(this._ownerPollTimer);
+        this._ownerPollTimer = null;
+        this._ownerPollIntervalMs = 0;
+        this._ownerPollInFlight = false;
+        this._ownerPollQueued = false;
+    }
+
+    _startOwnerPolling(intervalMs = 4000) {
+        const projectId = this._projectId();
+        const hostId = this._hostId();
+        const sourceNodeId = this._sourceNodeId();
+        if (!projectId || !hostId || !sourceNodeId) return;
+        if (this._ownerPollTimer && this._ownerPollIntervalMs === intervalMs) return;
+        clearInterval(this._ownerPollTimer);
+        this._ownerPollIntervalMs = intervalMs;
+        const poll = () => this._pollOwnerState(intervalMs <= 500 ? "handoff_poll" : "poll");
+        poll();
+        this._ownerPollTimer = setInterval(poll, intervalMs);
+    }
+
+    _pollOwnerState(source = "poll") {
+        const projectId = this._projectId();
+        const hostId = this._hostId();
+        const sourceNodeId = this._sourceNodeId();
+        if (this._destroyed || !projectId || !hostId || !sourceNodeId) return;
+        if (this._ownerPollInFlight) {
+            this._ownerPollQueued = true;
+            this._recordDiagEvent("owner_poll_queue", { source });
+            return;
+        }
+        this._ownerPollInFlight = true;
+        const sentAt = performance.now();
+        this._recordDiagEvent("owner_poll_send", { source, interval_ms: this._ownerPollIntervalMs });
+        getEditorSession(projectId, hostId, sourceNodeId).then((result) => {
+            this._recordDiagEvent("owner_poll_recv", {
+                source,
+                duration_ms: performance.now() - sentAt,
+                has_owner: !!(result && result.owner),
+                owner_status: result?.owner?.status || "",
+                owner_host_mode: result?.owner?.host_mode || "",
+            });
+            if (this._destroyed || projectId !== this._projectId() || hostId !== this._hostId() || sourceNodeId !== this._sourceNodeId()) return;
+            this._applyOwnerState(result.owner || null, source);
+        }).catch((err) => {
+            this._recordDiagEvent("owner_poll_error", {
+                source,
+                duration_ms: performance.now() - sentAt,
+                error: String(err && err.message ? err.message : err),
+            });
+        }).finally(() => {
+            this._ownerPollInFlight = false;
+            if (this._ownerPollQueued && !this._destroyed) {
+                this._ownerPollQueued = false;
+                this._pollOwnerState("queued");
+            }
+        });
+    }
+
+    _handleSessionChanged(event) {
+        if (!event || event.project_id !== this._projectId()) return;
+        if (String(event.host_id || "") !== this._hostId()) return;
+        this._recordDiagEvent("ws_session_changed", {
+            owner_status: event?.owner?.status || "",
+            owner_host_mode: event?.owner?.host_mode || "",
+            owner_session_id: event?.owner?.session_id || "",
+        });
+        this._pollOwnerState("ws_notify");
+    }
+
+    _handleHostPresenceChanged(event) {
+        if (!event || event.project_id !== this._projectId()) return;
+        if (String(event.host_id || "") !== this._hostId()) return;
+        if (String(event.source_node_id || "") !== this._sourceNodeId()) return;
+        const connected = !!event.canvas_host_connected;
+        this._recordDiagEvent("ws_host_presence", { connected, previous_connected: this.state.canvasHostConnected });
+        if (this.state.canvasHostConnected !== connected) {
+            this.state.canvasHostConnected = connected;
+            this.render();
+        }
+    }
+
+    _handleSyncSubscribed(event) {
+        if (!event || event.project_id !== this._projectId()) return;
+        if (event.host_id && String(event.host_id) !== this._hostId()) return;
+        if (event.source_node_id && String(event.source_node_id) !== this._sourceNodeId()) return;
+        this._syncSubscribed = true;
+        this._recordDiagEvent("ws_sync_subscribed", {
+            canvas_host_connected: !!event?.canvas_host_connected,
+            previous_connected: this.state.canvasHostConnected,
+            has_canvas_host_field: Object.prototype.hasOwnProperty.call(event, "canvas_host_connected"),
+        });
+        if (Object.prototype.hasOwnProperty.call(event, "canvas_host_connected")) {
+            const connected = !!event.canvas_host_connected;
+            if (this.state.canvasHostConnected !== connected) {
+                this.state.canvasHostConnected = connected;
+                this.render();
+            }
+        }
     }
 
     whenProjectReady(callback) {
@@ -1230,7 +1920,12 @@ export class EditorNodeController {
             this._frameConstraintHealedFor = "";
             this.state.projectDir = "";
             this.state.dormantSummary = null;
+            this.state.activeOwner = null;
+            this.state.sessionStatus = "";
+            this.state.lastOwnerSignature = "";
+            this.state.pendingTabHandoff = null;
             this.state._projectReadyQueue.length = 0;
+            this._teardownProjectSync();
             this._invalidateModules(["project", "assets", "scene", "queue"]);
             this.collapseModule();
             this.render();
@@ -1256,6 +1951,13 @@ export class EditorNodeController {
             this._setWidgetValue("selection_end", 0);
             this._invalidateModules(["project", "assets", "scene", "queue"]);
             this.state.expandedModuleId = "";
+            this.state.activeOwner = null;
+            this.state.sessionStatus = "";
+            this.state.lastOwnerSignature = "";
+            this.state.pendingTabHandoff = null;
+            this._setupProjectSync();
+        } else if (!this._projectSyncMatches()) {
+            this._setupProjectSync();
         }
 
         if (this._frameConstraintHealedFor !== projectDir) {
@@ -1268,6 +1970,7 @@ export class EditorNodeController {
         }
 
         await this.refreshSummary();
+        this._seedWidgetState(this._currentWidgetStateValues(), { seed: true });
         this.render();
         this._drainProjectReadyQueue();
     }
@@ -1394,10 +2097,198 @@ export class EditorNodeController {
         }
     }
 
-    openFullscreen() {
+    _projectId() {
+        return projectIdFromDir(this.state.projectDir);
+    }
+
+    focusMountedTab() {
+        const projectId = this._projectId();
+        if (!projectId) return;
+        const tabName = this.state.activeOwner?.browser_instance_id || this._mountedTabWindowName;
+        const opened = window.open("", tabName);
+        if (opened) {
+            try {
+                if (opened.location?.href === "about:blank") {
+                    opened.close?.();
+                    window.alert?.("The mounted editor tab could not be focused. Use Force Release if the tab was closed.");
+                    return;
+                }
+                opened.focus?.();
+            } catch (_err) {}
+            return;
+        }
+        window.alert?.("The mounted editor tab could not be focused. Use Force Release if the tab was closed.");
+    }
+
+    async forceReleaseOwner(owner) {
+        const projectId = this._projectId();
+        const sessionId = owner?.session_id || "";
+        if (!projectId || !sessionId) return;
+        const ok = window.confirm?.("Force release the mounted editor session? Unsaved tab-only widget edits may be lost.") ?? true;
+        if (!ok) return;
+        const result = await releaseEditorSession(projectId, sessionId, true, this._hostId(), this._sourceNodeId());
+        if (!result.ok) {
+            window.alert?.(result.code ? `Could not release editor session (${result.code}).` : "Could not release editor session.");
+            return;
+        }
+        this.state.pendingTabHandoff = null;
+        this._applyOwnerState(null, "force_release");
+    }
+
+    _startSessionHeartbeat() {
+        clearInterval(this._sessionHeartbeatTimer);
+        const projectId = this._projectId();
+        if (!projectId) return;
+        const sendHeartbeat = () => {
+            const sessionId = this._editorSessionId;
+            heartbeatEditorSession(projectId, sessionId, this._hostId(), this._sourceNodeId())
+                .then((result) => {
+                    // Self-stop on backend rejection. If the backend says
+                    // we're no longer the owner (tab took over via handoff,
+                    // force-release, orphan expiry, or session TTL), keep
+                    // heartbeating only adds noise (logged 409s) and racks
+                    // up rejected requests. The owner-poll path is the
+                    // authoritative recovery mechanism — let it handle
+                    // re-claiming if appropriate.
+                    if (result && result.ok === false && this._sessionHeartbeatTimer) {
+                        this._recordDiagEvent("session_heartbeat_self_stop", {
+                            session_id: sessionId,
+                            code: result.code || "",
+                            owner_session_id: result.owner?.session_id || "",
+                            owner_host_mode: result.owner?.host_mode || "",
+                        });
+                        clearInterval(this._sessionHeartbeatTimer);
+                        this._sessionHeartbeatTimer = null;
+                    }
+                })
+                .catch(() => {});
+        };
+        sendHeartbeat();
+        this._sessionHeartbeatTimer = setInterval(sendHeartbeat, 10000);
+    }
+
+    _releaseFullscreenSession() {
+        clearInterval(this._sessionHeartbeatTimer);
+        this._sessionHeartbeatTimer = null;
+        const projectId = this._projectId();
+        if (!projectId || this._suppressNextSessionRelease) {
+            this._suppressNextSessionRelease = false;
+            return;
+        }
+        releaseEditorSession(projectId, this._editorSessionId, false, this._hostId(), this._sourceNodeId()).catch(() => {});
+    }
+
+    _fullscreenOwnerInfo() {
+        return {
+            host_id: this._hostId(),
+            source_node_id: this._sourceNodeId(),
+            browser_instance_id: this._editorSessionId,
+            workflow_label: document.title || "ComfyUI workflow",
+        };
+    }
+
+    async _ensureFullscreenSessionOwner() {
+        const projectId = this._projectId();
+        if (!projectId) throw new Error("No project selected");
+        const current = await getEditorSession(projectId, this._hostId(), this._sourceNodeId());
+        const owner = current.owner || null;
+        if (owner?.session_id === this._editorSessionId) {
+            this._applyOwnerState(owner, "ensure_fullscreen");
+            this._startSessionHeartbeat();
+            heartbeatEditorSession(projectId, this._editorSessionId, this._hostId(), this._sourceNodeId()).catch(() => {});
+            return owner;
+        }
+        if (owner) {
+            const label = owner?.host_mode ? `${owner.host_mode} editor` : "another editor";
+            throw new Error(`Project is already owned by ${label}.`);
+        }
+        await this._claimFullscreenSession();
+        return this.state.activeOwner;
+    }
+
+    async _claimFullscreenSession() {
+        const projectId = this._projectId();
+        if (!projectId) throw new Error("No project selected");
+        installProjectVersionFetchPatch();
+        const claim = await claimEditorSession(projectId, this._editorSessionId, "fullscreen", this._fullscreenOwnerInfo(), "", this._hostId());
+        if (!claim.ok) {
+            const owner = claim.owner;
+            const label = owner?.host_mode ? `${owner.host_mode} editor` : "another editor";
+            throw new Error(`Project is already owned by ${label}.`);
+        }
+        this._applyOwnerState(claim.owner || null, "claim_fullscreen");
+        this._seedWidgetState(this._currentWidgetStateValues(), { seed: true });
+        this._startSessionHeartbeat();
+    }
+
+    async mountFullscreenInTab() {
+        const projectId = this._projectId();
+        if (!projectId || !this.fullscreenSession) return;
+        const opened = window.open("about:blank", this._mountedTabWindowName);
+        if (!opened) {
+            window.alert?.("The browser blocked the editor tab.");
+            return;
+        }
+        try {
+            await this._ensureFullscreenSessionOwner();
+            let handoff = await createEditorHandoff(projectId, this._editorSessionId, this._hostId(), this._sourceNodeId());
+            if (!handoff.ok && handoff.code === "not_owner" && !handoff.owner) {
+                await this._claimFullscreenSession();
+                handoff = await createEditorHandoff(projectId, this._editorSessionId, this._hostId(), this._sourceNodeId());
+            }
+            if (!handoff.ok || !handoff.token) {
+                const owner = handoff.owner;
+                const reason = handoff.code ? ` (${handoff.code})` : "";
+                const ownerLabel = owner?.host_mode ? ` Current owner: ${owner.host_mode}.` : "";
+                throw new Error(`Could not create editor handoff token${reason}.${ownerLabel}`);
+            }
+            this.state.pendingTabHandoff = { token: handoff.token, openedAt: Date.now() };
+            this.render();
+            clearTimeout(this._pendingHandoffTimer);
+            this._pendingHandoffTimer = setTimeout(() => {
+                if (!this.state.pendingTabHandoff) return;
+                this.state.pendingTabHandoff = null;
+                this._startOwnerPolling(4000);
+                this.render();
+                window.alert?.("The editor tab did not claim the session. Check popup blockers or try again.");
+            }, 10000);
+            const url = api.apiURL(
+                `/sonder-editor/tab/${encodeURIComponent(projectId)}?handoff=${encodeURIComponent(handoff.token)}&host_id=${encodeURIComponent(this._hostId())}&source_node_id=${encodeURIComponent(this._sourceNodeId())}&session_name=${encodeURIComponent(this._mountedTabWindowName)}`
+            );
+            opened.location.href = url;
+            this._startOwnerPolling(400);
+        } catch (error) {
+            opened.close?.();
+            this.state.pendingTabHandoff = null;
+            clearTimeout(this._pendingHandoffTimer);
+            this._pendingHandoffTimer = null;
+            this._startOwnerPolling(4000);
+            this.render();
+            console.warn("[Sonder] Failed to mount editor in tab:", error);
+            window.alert?.(error?.message || String(error));
+        }
+    }
+
+    async openFullscreen() {
         if (this._destroyed || !this.state.projectDir || this.fullscreenSession || this.state.isFullscreenOpen) return;
+        const owner = this.state.activeOwner;
+        if (owner?.host_mode === "tab") {
+            this.focusMountedTab();
+            return;
+        }
+        if (owner && owner.session_id !== this._editorSessionId) {
+            window.alert?.("This project is currently owned by another editor session.");
+            return;
+        }
 
         this.syncStateFromWidgets();
+        try {
+            await this._claimFullscreenSession();
+        } catch (error) {
+            console.warn("[Sonder] Failed to claim fullscreen editor session:", error);
+            window.alert?.(error?.message || String(error));
+            return;
+        }
         this._preFullscreenModuleId = this.state.expandedModuleId || "";
         if (this.state.expandedModuleId) {
             this.collapseModule();
@@ -1422,6 +2313,7 @@ export class EditorNodeController {
             }
             this.fullscreenSession = null;
             this.state.isFullscreenOpen = false;
+            this._releaseFullscreenSession();
             if (this._preFullscreenModuleId && this.modules[this._preFullscreenModuleId]) {
                 this.expandModule(this._preFullscreenModuleId);
                 this._preFullscreenModuleId = "";
@@ -1435,6 +2327,7 @@ export class EditorNodeController {
         if (this.fullscreenSession === session) {
             this.fullscreenSession = null;
         }
+        this._releaseFullscreenSession();
 
         this.state.isFullscreenOpen = false;
         this.syncStateFromWidgets();
@@ -2785,6 +3678,7 @@ export class EditorNodeController {
             activeStatus.textContent = nextActive ? "On" : "Off";
             this._setWidgetValue("render_queue_active", nextActive);
             this.state.renderQueueActive = nextActive;
+            this._seedWidgetState({ render_queue_active: nextActive }, { seed: false });
             this.fullscreenSession?.editor?._setRenderQueueActive?.(nextActive, { syncWidget: false });
         });
         activeRight.append(activeStatus, activeCheckbox);

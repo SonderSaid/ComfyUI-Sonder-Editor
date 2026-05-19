@@ -125,6 +125,82 @@ def test_sync_media_folder_repairs_false_video_has_audio_flags(tmp_path, monkeyp
 
     assert routes._sync_media_folder(project) is True
     assert project.assets[0].has_audio is True
+    assert project.assets[0].has_audio_checked is True
+    assert project.assets[0].media_probe_signature
+
+
+def test_sync_media_folder_caches_no_audio_video_probe(tmp_path, monkeypatch):
+    project = _make_project(tmp_path)
+    _write_project_file(project, "media/silent.mp4", b"video")
+    project.assets = [
+        Asset(asset_id="vid-1", asset_type="video", path="media/silent.mp4", has_audio=False),
+    ]
+
+    calls = []
+
+    def fake_video_has_audio(filepath):
+        calls.append(filepath)
+        return False
+
+    monkeypatch.setattr(routes, "_video_has_audio", fake_video_has_audio)
+
+    assert routes._sync_media_folder(project) is True
+    assert project.assets[0].has_audio is False
+    assert project.assets[0].has_audio_checked is True
+    assert project.assets[0].media_probe_signature
+    assert routes._sync_media_folder(project) is False
+    assert len(calls) == 1
+
+
+def test_sync_media_folder_caches_failed_audio_duration_probe(tmp_path, monkeypatch):
+    project = _make_project(tmp_path)
+    _write_project_file(project, "media/no-duration.wav", b"audio")
+    project.assets = [
+        Asset(asset_id="aud-1", asset_type="audio", path="media/no-duration.wav", duration_sec=0),
+    ]
+
+    calls = []
+
+    def fake_get_audio_duration(filepath):
+        calls.append(filepath)
+        return 0
+
+    monkeypatch.setattr(routes, "_get_audio_duration", fake_get_audio_duration)
+
+    assert routes._sync_media_folder(project) is True
+    assert project.assets[0].duration_sec == 0
+    assert project.assets[0].duration_checked is True
+    assert project.assets[0].media_probe_signature
+    assert routes._sync_media_folder(project) is False
+    assert len(calls) == 1
+
+
+def test_sync_media_folder_reprobes_when_media_signature_changes(tmp_path, monkeypatch):
+    project = _make_project(tmp_path)
+    media_path = _write_project_file(project, "media/changing.mp4", b"video")
+    project.assets = [
+        Asset(asset_id="vid-1", asset_type="video", path="media/changing.mp4", has_audio=False),
+    ]
+
+    calls = []
+
+    def fake_video_has_audio(filepath):
+        calls.append(routes._media_probe_signature(filepath))
+        return len(calls) == 2
+
+    monkeypatch.setattr(routes, "_video_has_audio", fake_video_has_audio)
+
+    assert routes._sync_media_folder(project) is True
+    first_signature = project.assets[0].media_probe_signature
+    assert project.assets[0].has_audio is False
+
+    with open(media_path, "wb") as handle:
+        handle.write(b"video-with-new-audio-stream")
+
+    assert routes._sync_media_folder(project) is True
+    assert project.assets[0].has_audio is True
+    assert project.assets[0].media_probe_signature != first_signature
+    assert len(calls) == 2
 
 
 def test_find_asset_usages_returns_unified_usage_list(tmp_path):

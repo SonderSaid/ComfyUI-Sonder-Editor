@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import folder_paths
 
-from ..server.project_manager import load_project, create_project, save_project
+from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 from ..server.media_helpers import decode_video_frame, decode_video_range, fit_frame_to_canvas
 from ..server.timeline_renderer import render_scene_frames
@@ -366,23 +366,37 @@ class SonderEditor:
         return None
 
     def _consume_queue_job(self, proj: TimelineProject):
-        queue = getattr(proj, "generation_queue", []) or []
-        # A new consume pass means a fresh ComfyUI prompt execution. Any prior
-        # running job therefore never completed and must be retried.
-        for job in queue:
-            if (job.status or "pending").lower() == "running":
-                job.status = "pending"
+        last_conflict = None
+        for _attempt in range(3):
+            queue = getattr(proj, "generation_queue", []) or []
+            base_modified_at = getattr(proj, "modified_at", "")
+            # A new consume pass means a fresh ComfyUI prompt execution. Any prior
+            # running job therefore never completed and must be retried.
+            for job in queue:
+                if (job.status or "pending").lower() == "running":
+                    job.status = "pending"
+                    job.error = ""
+                    job.progress = 0.0
+            for job in queue:
+                if (job.status or "pending").lower() != "pending":
+                    continue
+                job.status = "running"
                 job.error = ""
                 job.progress = 0.0
-        for job in queue:
-            if (job.status or "pending").lower() != "pending":
-                continue
-            job.status = "running"
-            job.error = ""
-            job.progress = 0.0
-            save_project(proj)
-            return job
-        return None
+                job.base_modified_at = base_modified_at
+                try:
+                    if base_modified_at:
+                        save_project(proj, expected_modified_at=base_modified_at)
+                    else:
+                        save_project(proj)
+                except ProjectVersionConflict as exc:
+                    last_conflict = exc
+                    proj = load_project(proj.project_dir)
+                    break
+                return proj, job
+            else:
+                return proj, None
+        raise RuntimeError("Queue job claim conflicted with an editor save; retry the prompt.") from last_conflict
 
     def _mark_later_batch_jobs_failed(self, proj: TimelineProject, queue_job):
         batch_id = str(getattr(queue_job, "batch_id", "") or "")
@@ -422,11 +436,30 @@ class SonderEditor:
     def _mark_queue_job_failed(self, proj: TimelineProject, queue_job, error_message: str):
         if not proj or not queue_job:
             return
-        queue_job.status = "failed"
-        queue_job.error = str(error_message)
-        queue_job.progress = 0.0
-        self._mark_later_batch_jobs_failed(proj, queue_job)
-        save_project(proj)
+        job_id = str(getattr(queue_job, "job_id", "") or "")
+        last_conflict = None
+        for _attempt in range(3):
+            base_modified_at = getattr(proj, "modified_at", "")
+            target = queue_job
+            if job_id:
+                target = next(
+                    (job for job in (getattr(proj, "generation_queue", []) or []) if getattr(job, "job_id", "") == job_id),
+                    queue_job,
+                )
+            target.status = "failed"
+            target.error = str(error_message)
+            target.progress = 0.0
+            self._mark_later_batch_jobs_failed(proj, target)
+            try:
+                if base_modified_at:
+                    save_project(proj, expected_modified_at=base_modified_at)
+                else:
+                    save_project(proj)
+                return
+            except ProjectVersionConflict as exc:
+                last_conflict = exc
+                proj = load_project(proj.project_dir)
+        raise RuntimeError("Failed to mark queue job failed after concurrent editor saves.") from last_conflict
 
     def execute(self, project, project_name, fps, width, height,
                 scene_id="", selection_start=0, selection_end=0,
@@ -464,19 +497,22 @@ class SonderEditor:
 
             proj_fps = proj.fps
             proj_w, proj_h = proj.resolution
+            execution_base_modified_at = getattr(proj, "modified_at", "")
 
             terminal_save_reached = self._execution_reaches_terminal_save(prompt, unique_id)
             unmarked_save_reached = self._execution_targets_unmarked_save(prompt, unique_id)
             queue_length = len(getattr(proj, "generation_queue", []) or [])
             queue_job_mode = ""
             if render_queue_active and terminal_save_reached:
-                queue_job = self._consume_queue_job(proj)
+                proj, queue_job = self._consume_queue_job(proj)
                 queue_job_consumed = queue_job is not None
                 queue_job_mode = "consume" if queue_job else ""
             elif render_queue_active and unmarked_save_reached:
                 queue_job = self._peek_queue_job(proj)
                 queue_job_mode = "peek" if queue_job else ""
             snapshot_version = self._queue_snapshot_version(queue_job)
+            if queue_job:
+                execution_base_modified_at = getattr(queue_job, "base_modified_at", "") or getattr(proj, "modified_at", "")
             if queue_job:
                 scene_id = queue_job.scene_id or scene_id
                 selection_start = max(0, _coerce_int(getattr(queue_job, "selection_start", 0), 0))
@@ -694,6 +730,7 @@ class SonderEditor:
                 "take_placement_mode": take_placement_mode,
                 "prompt": prompt_text,
                 "queue_job_id": queue_job.job_id if queue_job and queue_job_consumed else "",
+                "base_modified_at": execution_base_modified_at,
             }
             logger.info(
                 "execute end: scene_id=%s frames=%d duration=%.2fs",

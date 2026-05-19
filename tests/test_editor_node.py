@@ -1752,13 +1752,13 @@ def test_consume_resets_stale_running_job(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node,
         "save_project",
-        lambda proj: save_states.append(
+        lambda proj, **_kwargs: save_states.append(
             [(job.job_id, job.status, job.error, job.progress) for job in proj.generation_queue]
         ),
     )
 
     node = editor_node.SonderEditor()
-    consumed = node._consume_queue_job(project)
+    project, consumed = node._consume_queue_job(project)
 
     assert consumed is job_a
     assert job_a.status == "running"
@@ -1788,19 +1788,89 @@ def test_consume_resets_sole_stale_running_job(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node,
         "save_project",
-        lambda proj: save_states.append(
+        lambda proj, **_kwargs: save_states.append(
             [(job.job_id, job.status, job.error, job.progress) for job in proj.generation_queue]
         ),
     )
 
     node = editor_node.SonderEditor()
-    consumed = node._consume_queue_job(project)
+    project, consumed = node._consume_queue_job(project)
 
     assert consumed is job_a
     assert job_a.status == "running"
     assert job_a.error == ""
     assert job_a.progress == 0.0
     assert save_states == [[("job-a", "running", "", 0.0)]]
+
+
+def test_consume_queue_job_uses_pre_claim_version(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    job = types.SimpleNamespace(job_id="job-a", status="pending", error="", progress=0.0)
+    project = types.SimpleNamespace(
+        project_dir="project-dir",
+        modified_at="base-version",
+        generation_queue=[job],
+    )
+    save_kwargs = []
+
+    def fake_save(proj, **kwargs):
+        save_kwargs.append(kwargs)
+        proj.modified_at = "post-claim-version"
+
+    monkeypatch.setattr(editor_node, "save_project", fake_save)
+
+    node = editor_node.SonderEditor()
+    project, consumed = node._consume_queue_job(project)
+
+    assert consumed is job
+    assert job.base_modified_at == "base-version"
+    assert save_kwargs == [{"expected_modified_at": "base-version"}]
+
+
+def test_consume_queue_job_retries_conflict_instead_of_live_fallback(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+
+    first_job = types.SimpleNamespace(job_id="job-a", status="pending", error="", progress=0.0)
+    first_project = types.SimpleNamespace(
+        project_dir="project-dir",
+        modified_at="base-version",
+        generation_queue=[first_job],
+    )
+    retry_job = types.SimpleNamespace(job_id="job-a", status="pending", error="", progress=0.0)
+    retry_project = types.SimpleNamespace(
+        project_dir="project-dir",
+        modified_at="new-version",
+        generation_queue=[retry_job],
+    )
+    calls = {"save": 0, "load": 0}
+
+    def fake_save(proj, **kwargs):
+        calls["save"] += 1
+        if calls["save"] == 1:
+            raise editor_node.ProjectVersionConflict(
+                project_dir="project-dir",
+                expected_modified_at=kwargs.get("expected_modified_at", ""),
+                actual_modified_at="new-version",
+            )
+        proj.modified_at = "post-claim-version"
+
+    def fake_load(project_dir):
+        calls["load"] += 1
+        assert project_dir == "project-dir"
+        return retry_project
+
+    monkeypatch.setattr(editor_node, "save_project", fake_save)
+    monkeypatch.setattr(editor_node, "load_project", fake_load)
+
+    node = editor_node.SonderEditor()
+    project, consumed = node._consume_queue_job(first_project)
+
+    assert project is retry_project
+    assert consumed is retry_job
+    assert retry_job.status == "running"
+    assert retry_job.base_modified_at == "new-version"
+    assert calls == {"save": 2, "load": 1}
 
 
 def test_mark_queue_job_failed_skips_later_batch_siblings(tmp_path, monkeypatch):
@@ -1844,7 +1914,7 @@ def test_mark_queue_job_failed_skips_later_batch_siblings(tmp_path, monkeypatch)
     monkeypatch.setattr(
         editor_node,
         "save_project",
-        lambda proj: save_states.append(
+        lambda proj, **_kwargs: save_states.append(
             [(job.job_id, job.status, job.error, job.progress) for job in proj.generation_queue]
         ),
     )

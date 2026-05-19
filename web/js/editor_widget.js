@@ -5,6 +5,133 @@
 
 const { api } = window.comfyAPI.api;
 
+
+// Session-diagnostic mode (gated by `window.SONDER_DEBUG_SESSION === true`).
+// Initialized lazily so the cost is zero when off. The window-global
+// `__SONDER_CANVAS_DIAG` surface is read by the canvas controller when the
+// user triggers the Ctrl+Alt+Shift+D dump hotkey.
+//
+// Persistent enable across page reloads: set `localStorage.SONDER_DEBUG_SESSION = "1"`
+// once; this bootstrap copies it into the window global on import.
+const SESSION_DIAG_RING_MAX = 2048;
+
+if (typeof window !== "undefined" && !window.SONDER_DEBUG_SESSION) {
+    try {
+        if (window.localStorage?.getItem?.("SONDER_DEBUG_SESSION") === "1") {
+            window.SONDER_DEBUG_SESSION = true;
+        }
+    } catch (_) {}
+}
+
+let _sessionDiagInitialized = false;
+let _sessionDiagLoadMarkerSeq = 0;
+let _sessionDiagInFlightMarkerId = "";
+let _sessionDiagInFlightKind = "";
+let _sessionDiagRafGapHandle = 0;
+let _sessionDiagLastRafTs = 0;
+let _sessionDiagLongTaskObserver = null;
+
+function isSessionDiagEnabled() {
+    return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
+}
+
+function _sessionDiagInit() {
+    if (_sessionDiagInitialized) return window.__SONDER_CANVAS_DIAG;
+    _sessionDiagInitialized = true;
+    const boot = {
+        kind: "boot",
+        t_wall: Date.now(),
+        t_mono: performance.now(),
+        build_marker: "canvas_page",
+        href: typeof location !== "undefined" ? String(location.href || "") : "",
+    };
+    const events = [boot];
+    const surface = {
+        boot,
+        events,
+        record(kind, payload = {}) {
+            if (events.length >= SESSION_DIAG_RING_MAX) events.shift();
+            events.push({
+                t_wall: Date.now(),
+                t_mono: performance.now(),
+                kind,
+                ...payload,
+            });
+        },
+    };
+    window.__SONDER_CANVAS_DIAG = surface;
+    // rAF gap detector — emits when a frame gap exceeds 250 ms
+    const rafTick = (now) => {
+        if (!isSessionDiagEnabled()) {
+            _sessionDiagRafGapHandle = 0;
+            _sessionDiagLastRafTs = 0;
+            return;
+        }
+        if (_sessionDiagLastRafTs > 0) {
+            const gap = now - _sessionDiagLastRafTs;
+            if (gap > 250) {
+                surface.record("raf_gap", {
+                    gap_ms: gap,
+                    in_flight_marker_id: _sessionDiagInFlightMarkerId,
+                    in_flight_kind: _sessionDiagInFlightKind,
+                });
+            }
+        }
+        _sessionDiagLastRafTs = now;
+        _sessionDiagRafGapHandle = requestAnimationFrame(rafTick);
+    };
+    _sessionDiagRafGapHandle = requestAnimationFrame(rafTick);
+    // PerformanceObserver longtask — emits entries over 50 ms
+    try {
+        if (typeof PerformanceObserver !== "undefined") {
+            _sessionDiagLongTaskObserver = new PerformanceObserver((list) => {
+                if (!isSessionDiagEnabled()) return;
+                for (const entry of list.getEntries()) {
+                    if (entry.duration > 50) {
+                        surface.record("longtask", {
+                            duration_ms: entry.duration,
+                            start_time: entry.startTime,
+                            entry_type: entry.entryType,
+                            in_flight_marker_id: _sessionDiagInFlightMarkerId,
+                            in_flight_kind: _sessionDiagInFlightKind,
+                        });
+                    }
+                }
+            });
+            _sessionDiagLongTaskObserver.observe({ entryTypes: ["longtask"] });
+        }
+    } catch (_) {
+        _sessionDiagLongTaskObserver = null;
+    }
+    return surface;
+}
+
+function sessionDiagRecord(kind, payload) {
+    if (!isSessionDiagEnabled()) return;
+    const surface = _sessionDiagInit();
+    surface.record(kind, payload || {});
+}
+
+function sessionDiagBeginLoad(kind, payload) {
+    if (!isSessionDiagEnabled()) return "";
+    _sessionDiagInit();
+    _sessionDiagLoadMarkerSeq += 1;
+    const markerId = `${kind}-${_sessionDiagLoadMarkerSeq}`;
+    _sessionDiagInFlightMarkerId = markerId;
+    _sessionDiagInFlightKind = kind;
+    sessionDiagRecord(`${kind}_start`, { marker_id: markerId, ...(payload || {}) });
+    return markerId;
+}
+
+function sessionDiagEndLoad(kind, markerId, payload) {
+    if (!isSessionDiagEnabled() || !markerId) return;
+    if (_sessionDiagInFlightMarkerId === markerId) {
+        _sessionDiagInFlightMarkerId = "";
+        _sessionDiagInFlightKind = "";
+    }
+    sessionDiagRecord(`${kind}_end`, { marker_id: markerId, ...(payload || {}) });
+}
+
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
@@ -398,7 +525,10 @@ export class EditorWidget {
         this.node = node;
         this.options = options;
         this.onFullscreenExit = options.onFullscreenExit || null;
+        this.onMountInTab = options.onMountInTab || null;
+        this.hostMode = options.hostMode || "node";
         this.onWidgetValueChange = options.onWidgetValueChange || null;
+        this.widgetHost = options.host || this._createNodeWidgetHost(node);
         this.projectDir = "";
         this.projectId = "";
         this._frameConstraintHealedFor = "";
@@ -559,6 +689,77 @@ export class EditorWidget {
         this._containerResizeObserver = new ResizeObserver(() => {
             this._renderTimeline();
         });
+    }
+
+    _createNodeWidgetHost(node) {
+        return {
+            getValue: (name, defaultValue = 0) => {
+                const widget = node?.widgets?.find(w => w.name === name);
+                return widget ? widget.value : defaultValue;
+            },
+            setValue: (name, value) => {
+                const widget = node?.widgets?.find(w => w.name === name);
+                if (!widget) return;
+                widget.value = value;
+                this.onWidgetValueChange?.(name, value);
+            },
+            setValueLocal: (name, value) => {
+                const widget = node?.widgets?.find(w => w.name === name);
+                if (widget) widget.value = value;
+            },
+            getNodeId: () => node?.id ?? "anon",
+            getSize: () => node?.size ? [...node.size] : null,
+            setSize: (size) => node?.setSize?.(size),
+            computeSize: () => node?.computeSize?.(),
+            markDirty: () => node?.setDirtyCanvas?.(true, true),
+        };
+    }
+
+    _setHostValueLocal(name, value) {
+        if (this.widgetHost?.setValueLocal) {
+            this.widgetHost.setValueLocal(name, value);
+            return;
+        }
+        this._setWidgetValue(name, value);
+    }
+
+    applyWidgetState(values = {}) {
+        if (!values || typeof values !== "object") return;
+        this._applyingWidgetState = true;
+        try {
+            for (const [name, value] of Object.entries(values)) {
+                this._setHostValueLocal(name, value);
+            }
+            if (Object.prototype.hasOwnProperty.call(values, "scene_id")) {
+                const sceneId = String(values.scene_id || "");
+                if (sceneId && sceneId !== this.activeSceneId) {
+                    const scene = this.scenes.find(s => s.scene_id === sceneId);
+                    if (scene) {
+                        this._setActiveScene(scene);
+                    } else {
+                        this.activeSceneId = sceneId;
+                    }
+                }
+            }
+        } finally {
+            this._applyingWidgetState = false;
+        }
+        if (Object.prototype.hasOwnProperty.call(values, "selection_start")) {
+            this.selectionStart = Math.max(0, parseInt(values.selection_start, 10) || 0);
+        }
+        if (Object.prototype.hasOwnProperty.call(values, "selection_end")) {
+            this.selectionEnd = Math.max(0, parseInt(values.selection_end, 10) || 0);
+        }
+        if (Object.prototype.hasOwnProperty.call(values, "render_queue_active")) {
+            this.renderQueueActive = coerceBoolean(values.render_queue_active, true);
+        }
+        this.selectionStart = Math.min(this.selectionStart, this.selectionEnd);
+        this.playhead = Math.max(0, Math.min(this.playhead, this.totalFrames));
+        this._refreshContextInputs();
+        this._refreshSelectionInputs();
+        this._updateToolbar();
+        this._renderTimeline();
+        this._renderQueuePanel();
     }
 
     _buildDOM() {
@@ -7703,11 +7904,21 @@ export class EditorWidget {
         const spacer = document.createElement("span");
         spacer.style.flex = "1";
 
+        const mountTabBtn = this.onMountInTab ? this._makeBtn("Mount in Tab", "Move this editor to a persistent browser tab") : null;
+        if (mountTabBtn) {
+            mountTabBtn.style.cssText += `font-size: 12px; padding: 4px 12px; color: ${COLORS.textDim}; margin-right: 8px;`;
+            mountTabBtn.addEventListener("click", () => this.onMountInTab?.());
+        }
+
         const exitBtn = this._makeBtn("✕ Exit", "Exit fullscreen");
         exitBtn.style.cssText += `font-size: 12px; padding: 4px 12px; color: ${COLORS.textDim};`;
         exitBtn.addEventListener("click", () => this._exitFullscreen());
 
-        toolbar.append(this._fsTitle, spacer, exitBtn);
+        if (mountTabBtn) {
+            toolbar.append(this._fsTitle, spacer, mountTabBtn, exitBtn);
+        } else {
+            toolbar.append(this._fsTitle, spacer, exitBtn);
+        }
 
         // Content area — three-panel layout
         this._fsContent = document.createElement("div");
@@ -7951,7 +8162,7 @@ export class EditorWidget {
         // Save position and node size for re-insertion
         this._nodeParent = this.container.parentElement;
         this._nodeSibling = this.container.nextSibling;
-        this._savedNodeSize = this.node.size ? [...this.node.size] : null;
+        this._savedNodeSize = this.widgetHost?.getSize?.() || null;
 
         // Reparent: gallery goes to sidebar, rest of container goes to bottom row
         // Save gallery's position in container for restoration
@@ -8020,7 +8231,7 @@ export class EditorWidget {
         });
 
         // Collapse node
-        this.node.setSize?.(this.node.computeSize?.());
+        this.widgetHost?.setSize?.(this.widgetHost?.computeSize?.());
     }
 
     _exitFullscreen() {
@@ -8074,10 +8285,10 @@ export class EditorWidget {
 
         // Restore node size to what it was before fullscreen
         if (this._savedNodeSize) {
-            this.node.setSize?.(this._savedNodeSize);
+            this.widgetHost?.setSize?.(this._savedNodeSize);
             this._savedNodeSize = null;
         } else {
-            this.node.setSize?.(this.node.computeSize?.());
+            this.widgetHost?.setSize?.(this.widgetHost?.computeSize?.());
         }
 
         this.onFullscreenExit?.();
@@ -8286,7 +8497,7 @@ export class EditorWidget {
     }
 
     _keyboardConsumerId(suffix) {
-        const nodeId = this.node?.id ?? "anon";
+        const nodeId = this.widgetHost?.getNodeId?.() ?? this.node?.id ?? "anon";
         return `sonder-editor-${nodeId}:${suffix}`;
     }
 
@@ -8319,7 +8530,7 @@ export class EditorWidget {
             ? window.__SONDER_SUPPRESS_COMFY_GRAPH_UNDO__
             : null;
         if (typeof suppress !== "function") return;
-        const nodeId = this.node?.id;
+        const nodeId = this.widgetHost?.getNodeId?.() ?? this.node?.id;
         suppress(reason, nodeId == null ? [] : [nodeId]);
         this._keyboardDebug("requested graph undo suppression", {
             reason,
@@ -8399,7 +8610,7 @@ export class EditorWidget {
         }
         this._renderTimeline();
         // Notify ComfyUI that our size changed
-        if (this.node) this.node.setDirtyCanvas?.(true, true);
+        this.widgetHost?.markDirty?.();
     }
 
     _canvasMouseCoords(e) {
@@ -9751,20 +9962,36 @@ export class EditorWidget {
         const cache = { img: new Image(), frameWidth: 0, numFrames: 0, loaded: false };
         this._thumbStripCache[assetId] = cache;
 
+        const markerId = sessionDiagBeginLoad("thumb_strip", { asset_id: assetId, project_dir: dirName });
+
         // Fetch info first
         fetch(api.apiURL(`/sonder-editor/project/${dirName}/thumbnail_strip/${assetId}?info=1`))
             .then(r => r.ok ? r.json() : null)
             .then(info => {
-                if (!info) return;
+                if (!info) {
+                    sessionDiagEndLoad("thumb_strip", markerId, { asset_id: assetId, ok: false, reason: "no_info" });
+                    return;
+                }
                 cache.frameWidth = info.frame_width;
                 cache.numFrames = info.num_frames;
                 cache.img.onload = () => {
                     cache.loaded = true;
+                    sessionDiagEndLoad("thumb_strip", markerId, {
+                        asset_id: assetId,
+                        ok: true,
+                        num_frames: cache.numFrames,
+                        frame_width: cache.frameWidth,
+                    });
                     this._renderTimeline();
                 };
                 cache.img.src = api.apiURL(`/sonder-editor/project/${dirName}/thumbnail_strip/${assetId}`);
             })
-            .catch(() => {});
+            .catch((err) => {
+                sessionDiagEndLoad("thumb_strip", markerId, {
+                    asset_id: assetId, ok: false, reason: "error",
+                    error: String(err && err.message ? err.message : err),
+                });
+            });
 
         return null;
     }
@@ -9777,16 +10004,29 @@ export class EditorWidget {
         const cache = { peaks: [], numBuckets: 0, loaded: false };
         this._waveformCache[assetId] = cache;
 
+        const markerId = sessionDiagBeginLoad("waveform", { asset_id: assetId, project_dir: dirName });
+
         fetch(api.apiURL(`/sonder-editor/project/${dirName}/waveform/${assetId}`))
             .then(r => r.ok ? r.json() : null)
             .then(data => {
-                if (!data) return;
+                if (!data) {
+                    sessionDiagEndLoad("waveform", markerId, { asset_id: assetId, ok: false, reason: "no_data" });
+                    return;
+                }
                 cache.peaks = data.peaks;
                 cache.numBuckets = data.num_buckets;
                 cache.loaded = true;
+                sessionDiagEndLoad("waveform", markerId, {
+                    asset_id: assetId, ok: true, num_buckets: cache.numBuckets,
+                });
                 this._renderTimeline();
             })
-            .catch(() => {});
+            .catch((err) => {
+                sessionDiagEndLoad("waveform", markerId, {
+                    asset_id: assetId, ok: false, reason: "error",
+                    error: String(err && err.message ? err.message : err),
+                });
+            });
 
         return null;
     }
@@ -9942,15 +10182,23 @@ export class EditorWidget {
 
     // ── Widget Value Helpers ───────────────────────────────────────────
     _setWidgetValue(name, value) {
-        const widget = this.node.widgets?.find(w => w.name === name);
-        if (widget) {
-            widget.value = value;
-            this.onWidgetValueChange?.(name, value);
+        if (this._applyingWidgetState) {
+            this._setHostValueLocal(name, value);
+            return;
         }
+        if (this.widgetHost?.setValue) {
+            this.widgetHost.setValue(name, value);
+            return;
+        }
+        const widget = this.node?.widgets?.find(w => w.name === name);
+        if (widget) widget.value = value;
     }
 
     _getWidgetValue(name, defaultValue = 0) {
-        const widget = this.node.widgets?.find(w => w.name === name);
+        if (this.widgetHost?.getValue) {
+            return this.widgetHost.getValue(name, defaultValue);
+        }
+        const widget = this.node?.widgets?.find(w => w.name === name);
         return widget ? widget.value : defaultValue;
     }
 
@@ -10312,17 +10560,26 @@ export class EditorWidget {
         video.muted = true;
         video.playsInline = true;
 
+        const markerId = sessionDiagBeginLoad("video_blob", { source_path: sourcePath });
+
         fetch(url)
             .then(resp => resp.blob())
             .then(blob => {
                 const blobUrl = URL.createObjectURL(blob);
                 video._blobUrl = blobUrl;
                 video.src = blobUrl;
+                sessionDiagEndLoad("video_blob", markerId, {
+                    source_path: sourcePath, ok: true, blob_size: blob.size, mime: blob.type,
+                });
             })
             .catch(err => {
                 console.warn("[Sonder] Failed to load video as blob, falling back to direct URL:", err);
                 video.crossOrigin = "anonymous";
                 video.src = url;
+                sessionDiagEndLoad("video_blob", markerId, {
+                    source_path: sourcePath, ok: false, reason: "blob_fetch_failed",
+                    error: String(err && err.message ? err.message : err),
+                });
             });
 
         this._videoCache[sourcePath] = video;
@@ -10338,16 +10595,25 @@ export class EditorWidget {
         const audio = document.createElement("audio");
         audio.preload = "auto";
 
+        const markerId = sessionDiagBeginLoad("audio_blob", { source_path: sourcePath });
+
         fetch(url)
             .then(resp => resp.blob())
             .then(blob => {
                 const blobUrl = URL.createObjectURL(blob);
                 audio._blobUrl = blobUrl;
                 audio.src = blobUrl;
+                sessionDiagEndLoad("audio_blob", markerId, {
+                    source_path: sourcePath, ok: true, blob_size: blob.size, mime: blob.type,
+                });
             })
             .catch(err => {
                 console.warn("[Sonder] Failed to load audio as blob, falling back to direct URL:", err);
                 audio.src = url;
+                sessionDiagEndLoad("audio_blob", markerId, {
+                    source_path: sourcePath, ok: false, reason: "blob_fetch_failed",
+                    error: String(err && err.message ? err.message : err),
+                });
             });
 
         this._audioCacheMap[sourcePath] = audio;

@@ -66,6 +66,22 @@ def test_asset_audio_metadata():
     assert restored.duration_sec == 30.5
 
 
+def test_asset_probe_metadata_roundtrip():
+    asset = Asset(
+        asset_type="video",
+        has_audio=True,
+        has_audio_checked=True,
+        duration_checked=True,
+        media_probe_signature="123:456",
+    )
+    data = asset.to_dict()
+    restored = Asset.from_dict(data)
+
+    assert restored.has_audio_checked is True
+    assert restored.duration_checked is True
+    assert restored.media_probe_signature == "123:456"
+
+
 def test_asset_trash_metadata_roundtrip():
     asset = Asset(
         asset_id="trash1",

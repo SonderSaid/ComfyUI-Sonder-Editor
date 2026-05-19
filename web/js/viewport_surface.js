@@ -8,6 +8,16 @@ const PLAYBACK_COVERAGE_EPSILON = 0.75;
 const PLAYBACK_PREBUFFER_GUARD_MS = 500;
 const PLAYBACK_PREBUFFER_SAFE_LEAD_MS = 2000;
 
+// Session-diagnostic helper: writes to `window.__SONDER_CANVAS_DIAG` populated
+// by editor_widget.js when `window.SONDER_DEBUG_SESSION === true`. Zero-cost
+// when disabled.
+function viewportDiagRecord(kind, payload) {
+    if (typeof window === "undefined" || window.SONDER_DEBUG_SESSION !== true) return;
+    const surface = window.__SONDER_CANVAS_DIAG;
+    if (!surface || typeof surface.record !== "function") return;
+    surface.record(kind, payload || {});
+}
+
 function fitRect(sourceWidth, sourceHeight, targetWidth, targetHeight) {
     const safeSourceWidth = Math.max(1, Number(sourceWidth) || 1);
     const safeSourceHeight = Math.max(1, Number(sourceHeight) || 1);
@@ -87,9 +97,11 @@ function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120) {
     if (!mediaEl || typeof mediaEl.requestVideoFrameCallback !== "function") {
         return Promise.resolve(mediaEl);
     }
+    const startTs = performance.now();
     return new Promise((resolve) => {
         let settled = false;
         let callbackId = null;
+        let viaCallback = false;
         const finish = () => {
             if (settled) return;
             settled = true;
@@ -99,11 +111,17 @@ function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120) {
                     mediaEl.cancelVideoFrameCallback(callbackId);
                 } catch (error) {}
             }
+            viewportDiagRecord("wait_decoded_frame", {
+                duration_ms: performance.now() - startTs,
+                timeout_ms: timeoutMs,
+                via_callback: viaCallback,
+                ready_state: mediaEl.readyState,
+            });
             resolve(mediaEl);
         };
         const timer = window.setTimeout(finish, timeoutMs);
         try {
-            callbackId = mediaEl.requestVideoFrameCallback(finish);
+            callbackId = mediaEl.requestVideoFrameCallback(() => { viaCallback = true; finish(); });
         } catch (error) {
             finish();
         }
@@ -114,9 +132,11 @@ function waitForDecodedVideoFrameAtTarget(mediaEl, targetTime, tolerance = 0.02,
     if (!mediaEl || typeof mediaEl.requestVideoFrameCallback !== "function") {
         return Promise.resolve(isMediaAtTarget(mediaEl, targetTime, tolerance));
     }
+    const startTs = performance.now();
     return new Promise((resolve) => {
         let settled = false;
         let callbackId = null;
+        let viaCallback = false;
         const finish = (ok) => {
             if (settled) return;
             settled = true;
@@ -126,6 +146,14 @@ function waitForDecodedVideoFrameAtTarget(mediaEl, targetTime, tolerance = 0.02,
                     mediaEl.cancelVideoFrameCallback(callbackId);
                 } catch (error) {}
             }
+            viewportDiagRecord("wait_decoded_frame_at_target", {
+                duration_ms: performance.now() - startTs,
+                target_time: targetTime,
+                timeout_ms: timeoutMs,
+                via_callback: viaCallback,
+                ready_state: mediaEl.readyState,
+                ok: !!ok,
+            });
             resolve(!!ok);
         };
         const timer = window.setTimeout(() => {
@@ -133,6 +161,7 @@ function waitForDecodedVideoFrameAtTarget(mediaEl, targetTime, tolerance = 0.02,
         }, timeoutMs);
         try {
             callbackId = mediaEl.requestVideoFrameCallback((_now, metadata = {}) => {
+                viaCallback = true;
                 const mediaTime = Number(metadata.mediaTime);
                 const decodedAtTarget = Number.isFinite(mediaTime)
                     ? Math.abs(mediaTime - targetTime) <= tolerance

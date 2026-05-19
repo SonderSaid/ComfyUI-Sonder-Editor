@@ -1,7 +1,9 @@
+import asyncio
 import json
 import logging
 import os
 import shutil
+import time
 import uuid
 from datetime import datetime, timedelta
 
@@ -14,7 +16,35 @@ from .media_helpers import (
     resize_frame_to_long_edge,
     write_png,
 )
-from .project_manager import create_project, load_project, save_project, list_projects
+from .project_manager import (
+    ProjectVersionConflict,
+    create_project,
+    load_project,
+    save_project,
+    list_projects,
+    register_project_saved_hook,
+)
+from .session_registry import (
+    claim_session,
+    create_handoff,
+    get_canvas_host,
+    get_diag_state,
+    get_project_debug_state,
+    get_widget_state,
+    get_owner,
+    heartbeat_session,
+    record_diag_event,
+    register_canvas_host,
+    release_session,
+    remember_event_loop,
+    refresh_canvas_host,
+    schedule_project_event,
+    seed_widget_state,
+    subscribe,
+    unregister_canvas_host,
+    unsubscribe,
+    update_widget_state,
+)
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
     ClipReference, LaneConfig, GenerationJob, classify_asset_path,
@@ -36,6 +66,90 @@ except Exception:
 
 def _json_error(msg: str, status: int = 400) -> web.Response:
     return web.json_response({"error": msg}, status=status)
+
+
+def _project_saved_event(project: TimelineProject) -> None:
+    schedule_project_event(
+        getattr(project, "project_id", ""),
+        {
+            "type": "project_updated",
+            "project_id": getattr(project, "project_id", ""),
+            "modified_at": getattr(project, "modified_at", ""),
+        },
+    )
+
+
+register_project_saved_hook(_project_saved_event)
+
+
+@web.middleware
+async def _project_conflict_middleware(request: web.Request, handler):
+    try:
+        return await handler(request)
+    except ProjectVersionConflict as exc:
+        payload = {
+            "error": "project_version_conflict",
+            "code": "project_version_conflict",
+            "expected_modified_at": exc.expected_modified_at,
+            "actual_modified_at": exc.actual_modified_at,
+            "project": exc.current_data,
+        }
+        return web.json_response(payload, status=409)
+
+
+try:
+    app = PromptServer.instance.app if routes is not None else None
+    if app is not None and not getattr(app, "_sonder_project_conflict_middleware", False):
+        app.middlewares.append(_project_conflict_middleware)
+        setattr(app, "_sonder_project_conflict_middleware", True)
+except Exception:
+    logger.debug("Could not install Sonder project conflict middleware", exc_info=True)
+
+
+# Route-timing diagnostic. When `SONDER_DEBUG_SESSION` is enabled, logs any
+# `/sonder-editor/*` handler that took longer than the threshold to complete.
+# Lets us correlate disconnects with the specific handler that blocked the
+# Python event loop. Zero-allocation when the flag is off — `record_diag_event`
+# short-circuits before any payload is built.
+_ROUTE_TIMING_THRESHOLD_S = 0.5
+
+
+@web.middleware
+async def _route_timing_middleware(request: web.Request, handler):
+    started = time.monotonic()
+    response = None
+    try:
+        response = await handler(request)
+        return response
+    finally:
+        elapsed = time.monotonic() - started
+        if elapsed >= _ROUTE_TIMING_THRESHOLD_S:
+            try:
+                path = request.path or ""
+                if path.startswith("/sonder-editor/"):
+                    project_id = ""
+                    try:
+                        project_id = str(request.match_info.get("project_id", "") or "")
+                    except Exception:
+                        project_id = ""
+                    record_diag_event(
+                        "route_blocking",
+                        project_id=project_id,
+                        path=path,
+                        method=request.method,
+                        duration_ms=elapsed * 1000.0,
+                        status=int(getattr(response, "status", 0) or 0),
+                    )
+            except Exception:
+                logger.debug("route timing middleware failed to emit diag event", exc_info=True)
+
+
+try:
+    if app is not None and not getattr(app, "_sonder_route_timing_middleware", False):
+        app.middlewares.append(_route_timing_middleware)
+        setattr(app, "_sonder_route_timing_middleware", True)
+except Exception:
+    logger.debug("Could not install Sonder route timing middleware", exc_info=True)
 
 
 def _coerce_nonnegative_int(value, default: int = 0) -> int:
@@ -766,6 +880,14 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
     return False
 
 
+def _media_probe_signature(filepath: str) -> str:
+    try:
+        stat = os.stat(filepath)
+        return f"{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        return ""
+
+
 def _sync_media_folder(
     project: TimelineProject,
     trash_retention_days: int = TRASH_RETENTION_DAYS,
@@ -784,15 +906,28 @@ def _sync_media_folder(
     if not os.path.isdir(media_dir):
         return changed
 
+    def _mark_probe_state(asset: Asset, signature: str, *, has_audio: bool | None = None, duration: bool | None = None) -> bool:
+        probe_changed = False
+        if signature and getattr(asset, "media_probe_signature", "") != signature:
+            asset.media_probe_signature = signature
+            probe_changed = True
+        if has_audio is not None and getattr(asset, "has_audio_checked", False) != has_audio:
+            asset.has_audio_checked = has_audio
+            probe_changed = True
+        if duration is not None and getattr(asset, "duration_checked", False) != duration:
+            asset.duration_checked = duration
+            probe_changed = True
+        return probe_changed
+
     # Build set of known relative paths
-    known_paths = {a.path for a in project.assets}
+    known_paths = {str(a.path or "").replace("\\", "/") for a in project.assets}
     for filename in os.listdir(media_dir):
         filepath = os.path.join(media_dir, filename)
         if not os.path.isfile(filepath):
             continue
 
         rel_path = os.path.join("media", filename)
-        if rel_path in known_paths:
+        if rel_path.replace("\\", "/") in known_paths:
             continue
 
         asset_type, artifact_kind = _classify_asset_for_registration(filename)
@@ -812,6 +947,9 @@ def _sync_media_folder(
             duration_sec=metadata["duration_sec"],
             sample_rate=metadata["sample_rate"],
             has_audio=metadata["has_audio"],
+            has_audio_checked=asset_type == "video",
+            duration_checked=asset_type == "audio",
+            media_probe_signature=_media_probe_signature(filepath),
         )
         project.add_asset(asset)
 
@@ -827,26 +965,56 @@ def _sync_media_folder(
 
     # Repair video assets missing has_audio detection
     for asset in project.assets:
-        if asset.asset_type == "video" and not asset.has_audio:
-            filepath = os.path.join(project.project_dir, asset.path)
-            if os.path.isfile(filepath) and _video_has_audio(filepath):
-                asset.has_audio = True
-                changed = True
+        if asset.asset_type != "video":
+            continue
+        filepath = os.path.join(project.project_dir, asset.path)
+        if not os.path.isfile(filepath):
+            continue
+        signature = _media_probe_signature(filepath)
+        checked = bool(getattr(asset, "has_audio_checked", False))
+        stored_signature = getattr(asset, "media_probe_signature", "") or ""
+        signature_changed = bool(stored_signature and signature and stored_signature != signature)
+        if asset.has_audio and not checked and not stored_signature:
+            changed = _mark_probe_state(asset, signature, has_audio=True) or changed
+            continue
+        if checked and not signature_changed:
+            if signature and not stored_signature:
+                changed = _mark_probe_state(asset, signature) or changed
+            continue
+        has_audio = _video_has_audio(filepath)
+        if asset.has_audio != has_audio:
+            asset.has_audio = has_audio
+            changed = True
+            if has_audio:
                 logger.info("Detected audio in video: %s", asset.name)
+        changed = _mark_probe_state(asset, signature, has_audio=True) or changed
 
     # Repair existing audio assets with missing duration
     repaired_assets = {}
     for asset in project.assets:
-        if asset.asset_type == "audio" and asset.duration_sec <= 0:
-            filepath = os.path.join(project.project_dir, asset.path)
-            if not os.path.isfile(filepath):
-                continue
-            dur = _get_audio_duration(filepath)
-            if dur and dur > 0:
-                asset.duration_sec = dur
-                repaired_assets[asset.path] = dur
-                changed = True
-                logger.info("Repaired audio duration: %.2fs (%s)", dur, asset.name)
+        if asset.asset_type != "audio":
+            continue
+        filepath = os.path.join(project.project_dir, asset.path)
+        if not os.path.isfile(filepath):
+            continue
+        signature = _media_probe_signature(filepath)
+        checked = bool(getattr(asset, "duration_checked", False))
+        stored_signature = getattr(asset, "media_probe_signature", "") or ""
+        signature_changed = bool(stored_signature and signature and stored_signature != signature)
+        if asset.duration_sec > 0 and not checked and not stored_signature:
+            changed = _mark_probe_state(asset, signature, duration=True) or changed
+            continue
+        if checked and not signature_changed:
+            if signature and not stored_signature:
+                changed = _mark_probe_state(asset, signature) or changed
+            continue
+        dur = _get_audio_duration(filepath)
+        if dur and dur > 0:
+            asset.duration_sec = dur
+            repaired_assets[asset.path] = dur
+            changed = True
+            logger.info("Repaired audio duration: %.2fs (%s)", dur, asset.name)
+        changed = _mark_probe_state(asset, signature, duration=True) or changed
 
     # Repair audio tracks with 1-frame duration (caused by previous 0-duration bug)
     if repaired_assets:
@@ -871,6 +1039,35 @@ def _get_base_dir() -> str:
         return os.path.join(folder_paths.get_output_directory(), "sonder-projects")
     except Exception:
         return ""
+
+
+def _request_if_match(request: web.Request) -> str:
+    value = str(request.headers.get("If-Match", "") or "").strip()
+    if not value:
+        return ""
+    if value.startswith("W/"):
+        value = value[2:].strip()
+    return value.strip('"')
+
+
+def _validate_request_project_version(request: web.Request, project: TimelineProject) -> None:
+    if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return
+    expected = _request_if_match(request)
+    if not expected:
+        return
+    actual = str(getattr(project, "modified_at", "") or "")
+    if expected == actual:
+        setattr(project, "_expected_modified_at", expected)
+        return
+    payload = {
+        "error": "project_version_conflict",
+        "code": "project_version_conflict",
+        "expected_modified_at": expected,
+        "actual_modified_at": actual,
+        "project": project.to_dict(),
+    }
+    raise web.HTTPConflict(text=json.dumps(payload), content_type="application/json")
 
 
 def _load_project_from_request(request: web.Request) -> TimelineProject:
@@ -912,6 +1109,8 @@ def _load_project_from_request(request: web.Request) -> TimelineProject:
                     changed = True
     if changed:
         save_project(project)
+
+    _validate_request_project_version(request, project)
 
     return project
 
@@ -1629,6 +1828,9 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     asset.duration_sec = metadata["duration_sec"]
     asset.sample_rate = metadata["sample_rate"]
     asset.has_audio = metadata["has_audio"]
+    asset.has_audio_checked = asset.asset_type == "video"
+    asset.duration_checked = asset.asset_type == "audio"
+    asset.media_probe_signature = _media_probe_signature(next_abs_path)
     asset.artifact_kind = replacement_artifact_kind if asset.asset_type == "artifact" else ""
 
     old_basename = os.path.basename(old_rel_path or "")
@@ -1666,6 +1868,188 @@ def _timeline_export_job_response(request: web.Request, job) -> dict:
 
 
 if routes is not None:
+
+    # -----------------------------------------------------------------------
+    # Persistent editor tab/session ownership
+    # -----------------------------------------------------------------------
+
+    @routes.get("/sonder-editor/tab/{project_id}")
+    async def api_editor_tab(request: web.Request) -> web.StreamResponse:
+        tab_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web", "editor.html"))
+        if not os.path.isfile(tab_path):
+            return _json_error("Editor tab shell not found", 404)
+        return web.FileResponse(tab_path)
+
+    @routes.get("/sonder-editor/static/{filename:.*}")
+    async def api_editor_static(request: web.Request) -> web.StreamResponse:
+        web_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
+        requested = os.path.abspath(os.path.join(web_root, request.match_info.get("filename", "")))
+        if requested != web_root and not requested.startswith(web_root + os.sep):
+            return _json_error("Invalid static path", 400)
+        if not os.path.isfile(requested):
+            return _json_error("Static file not found", 404)
+        return web.FileResponse(requested)
+
+    @routes.get("/sonder-editor/session/{project_id}")
+    async def api_get_editor_session(request: web.Request) -> web.Response:
+        remember_event_loop()
+        owner = await get_owner(
+            request.match_info.get("project_id", ""),
+            host_id=str(request.query.get("host_id") or ""),
+            source_node_id=str(request.query.get("source_node_id") or ""),
+        )
+        return web.json_response({"owner": owner})
+
+    @routes.get("/sonder-editor/session/{project_id}/debug")
+    async def api_debug_editor_session(request: web.Request) -> web.Response:
+        remember_event_loop()
+        payload = await get_project_debug_state(
+            request.match_info.get("project_id", ""),
+            source_node_id=str(request.query.get("source_node_id") or ""),
+            host_id=str(request.query.get("host_id") or ""),
+        )
+        return web.json_response(payload)
+
+    @routes.get("/sonder-editor/session/{project_id}/diag")
+    async def api_diag_editor_session(request: web.Request) -> web.Response:
+        remember_event_loop()
+        payload = get_diag_state(request.match_info.get("project_id", ""))
+        return web.json_response(payload)
+
+    @routes.post("/sonder-editor/session/{project_id}/claim")
+    async def api_claim_editor_session(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        result = await claim_session(
+            request.match_info.get("project_id", ""),
+            str(body.get("session_id") or ""),
+            str(body.get("host_mode") or "fullscreen"),
+            body.get("owner") if isinstance(body.get("owner"), dict) else body,
+            str(body.get("handoff_token") or ""),
+            host_id=str(body.get("host_id") or ""),
+        )
+        status = 200 if result.get("ok") else 409
+        return web.json_response(result, status=status)
+
+    @routes.post("/sonder-editor/session/{project_id}/heartbeat")
+    async def api_heartbeat_editor_session(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        result = await heartbeat_session(
+            request.match_info.get("project_id", ""),
+            str(body.get("session_id") or ""),
+            host_id=str(body.get("host_id") or ""),
+            source_node_id=str(body.get("source_node_id") or ""),
+        )
+        status = 200 if result.get("ok") else 409
+        return web.json_response(result, status=status)
+
+    @routes.post("/sonder-editor/session/{project_id}/canvas_host")
+    async def api_canvas_host_heartbeat(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        project_id = request.match_info.get("project_id", "")
+        host_id = str(body.get("host_id") or "")
+        source_node_id = str(body.get("source_node_id") or "")
+        session_id = str(body.get("session_id") or "")
+        result = await refresh_canvas_host(project_id, host_id, source_node_id, session_id)
+        if not result.get("ok"):
+            result = await register_canvas_host(
+                project_id,
+                source_node_id,
+                session_id,
+                str(body.get("workflow_id") or ""),
+                str(body.get("workflow_label") or ""),
+                host_id=host_id,
+            )
+        status = 200 if result.get("ok") else 409
+        return web.json_response(result, status=status)
+
+    @routes.post("/sonder-editor/session/{project_id}/release")
+    async def api_release_editor_session(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        result = await release_session(
+            request.match_info.get("project_id", ""),
+            str(body.get("session_id") or ""),
+            force=bool(body.get("force")),
+            host_id=str(body.get("host_id") or ""),
+            source_node_id=str(body.get("source_node_id") or ""),
+        )
+        status = 200 if result.get("ok") else 409
+        return web.json_response(result, status=status)
+
+    @routes.post("/sonder-editor/session/{project_id}/handoff")
+    async def api_create_editor_handoff(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        result = await create_handoff(
+            request.match_info.get("project_id", ""),
+            str(body.get("session_id") or ""),
+            host_id=str(body.get("host_id") or ""),
+            source_node_id=str(body.get("source_node_id") or ""),
+        )
+        status = 200 if result.get("ok") else 409
+        return web.json_response(result, status=status)
+
+    @routes.get("/sonder-editor/project/{project_id}/widget_state")
+    async def api_get_editor_widget_state(request: web.Request) -> web.Response:
+        remember_event_loop()
+        payload = await get_widget_state(
+            request.match_info.get("project_id", ""),
+            str(request.query.get("source_node_id") or ""),
+            host_id=str(request.query.get("host_id") or ""),
+        )
+        return web.json_response(payload)
+
+    @routes.put("/sonder-editor/project/{project_id}/widget_state")
+    async def api_put_editor_widget_state(request: web.Request) -> web.Response:
+        remember_event_loop()
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            body = {}
+        values = body.get("values")
+        if not isinstance(values, dict):
+            name = str(body.get("name") or "")
+            values = {name: body.get("value")} if name else {}
+        source_node_id = str(body.get("source_node_id") or request.query.get("source_node_id") or "")
+        host_id = str(body.get("host_id") or request.query.get("host_id") or "")
+        session_id = str(body.get("session_id") or "")
+        replace = bool(body.get("replace") or body.get("seed"))
+        if replace:
+            payload = await seed_widget_state(
+                request.match_info.get("project_id", ""),
+                source_node_id,
+                session_id,
+                values,
+                host_id=host_id,
+            )
+        else:
+            payload = await update_widget_state(
+                request.match_info.get("project_id", ""),
+                source_node_id,
+                session_id,
+                values,
+                host_id=host_id,
+            )
+        status = 200 if payload.get("ok", True) else 409
+        return web.json_response(payload, status=status)
 
     # -----------------------------------------------------------------------
     # Project CRUD
@@ -1865,7 +2249,7 @@ if routes is not None:
         Auto-discovers untracked files in media/ folder.
         """
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -1878,10 +2262,20 @@ if routes is not None:
             None,
         )
 
-        # Auto-discover untracked files in media/ folder
-        # BUG-4 fix: persist newly discovered assets so IDs remain stable
-        if _sync_media_folder(project, trash_retention_days, trash_max_size_mb):
-            save_project(project)
+        # Auto-discover untracked files in media/ folder.
+        # `_sync_media_folder` walks the project's media dir, ffprobes every
+        # unknown file, regenerates thumbnails, and re-probes existing video
+        # and audio assets to repair missing `has_audio` / `duration_sec`.
+        # On a project with many files, that synchronous work can take tens
+        # of seconds and would freeze the aiohttp event loop, which trips
+        # canvas-host / session TTLs and triggers spurious disconnects. Run
+        # it on a worker thread so heartbeats and the sweeper keep firing.
+        # BUG-4 fix: persist newly discovered assets so IDs remain stable.
+        changed = await asyncio.to_thread(
+            _sync_media_folder, project, trash_retention_days, trash_max_size_mb
+        )
+        if changed:
+            await asyncio.to_thread(save_project, project)
 
         asset_type = request.query.get("type", "")
         include_trashed = _query_flag(request.query.get("include_trashed"))
@@ -1894,7 +2288,12 @@ if routes is not None:
 
         result = [_asset_payload(project, asset) for asset in assets]
 
-        return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
+        return web.json_response({
+            "project_id": project.project_id,
+            "modified_at": project.modified_at,
+            "assets": result,
+            "folders": _collect_asset_folders(project),
+        })
 
     @routes.get("/sonder-editor/project/{project_id}/assets/dormant")
     async def api_list_dormant_assets(request: web.Request) -> web.Response:
@@ -1908,7 +2307,12 @@ if routes is not None:
         assets = project.assets if include_trashed else [asset for asset in project.assets if not _asset_is_trashed(asset)]
         result = [_asset_payload(project, asset) for asset in assets]
 
-        return web.json_response({"assets": result, "folders": _collect_asset_folders(project)})
+        return web.json_response({
+            "project_id": project.project_id,
+            "modified_at": project.modified_at,
+            "assets": result,
+            "folders": _collect_asset_folders(project),
+        })
 
     @routes.post("/sonder-editor/project/{project_id}/assets/import")
     async def api_import_asset(request: web.Request) -> web.Response:
@@ -1957,6 +2361,9 @@ if routes is not None:
             duration_sec=metadata["duration_sec"],
             sample_rate=metadata["sample_rate"],
             has_audio=metadata["has_audio"],
+            has_audio_checked=asset_type == "video",
+            duration_checked=asset_type == "audio",
+            media_probe_signature=_media_probe_signature(dest_path),
             prompt=body.get("prompt", ""),
             generation_params=body.get("generation_params", {}),
         )
@@ -2599,7 +3006,10 @@ if routes is not None:
         source_path = _asset_abspath(project, asset)
         if not source_path or not os.path.isfile(source_path):
             return _json_error("Thumbnail unavailable for missing asset", 404)
-        if not ensure_thumbnail(asset.asset_type, source_path, thumb_path):
+        # Cache-miss generation calls ffmpeg synchronously; run off the event
+        # loop so heartbeats and the sweeper keep firing.
+        ok = await asyncio.to_thread(ensure_thumbnail, asset.asset_type, source_path, thumb_path)
+        if not ok:
             return _json_error("Failed to generate thumbnail", 500)
 
         return web.FileResponse(thumb_path)
@@ -2623,12 +3033,12 @@ if routes is not None:
         )
         info_path = strip_path + ".json"
 
-        # Generate if not cached
+        # Generate if not cached. ffmpeg call must stay off the event loop.
         if not os.path.isfile(strip_path):
             source_path = _asset_abspath(project, asset)
             if not source_path or not os.path.isfile(source_path):
                 return _json_error("Thumbnail strip unavailable for missing asset", 404)
-            info = generate_thumbnail_strip(source_path, strip_path)
+            info = await asyncio.to_thread(generate_thumbnail_strip, source_path, strip_path)
             if info:
                 import json as _json
                 with open(info_path, "w") as f:
@@ -2664,7 +3074,7 @@ if routes is not None:
             f"{asset_id}.json"
         )
 
-        # Generate if not cached
+        # Generate if not cached. ffmpeg calls must stay off the event loop.
         if not os.path.isfile(waveform_path):
             source_path = _asset_abspath(project, asset)
             if not source_path or not os.path.isfile(source_path):
@@ -2675,10 +3085,12 @@ if routes is not None:
                 f"{asset_id}_audio.wav"
             )
             if asset.asset_type == "video":
-                if not os.path.isfile(extracted_audio_path) and not _extract_audio_from_video(source_path, extracted_audio_path):
-                    return _json_error("Failed to extract video audio for waveform", 500)
+                if not os.path.isfile(extracted_audio_path):
+                    ok = await asyncio.to_thread(_extract_audio_from_video, source_path, extracted_audio_path)
+                    if not ok:
+                        return _json_error("Failed to extract video audio for waveform", 500)
                 waveform_source = extracted_audio_path
-            data = generate_waveform_data(waveform_source, waveform_path)
+            data = await asyncio.to_thread(generate_waveform_data, waveform_source, waveform_path)
             if not data:
                 return _json_error("Failed to generate waveform data", 500)
 
@@ -3968,17 +4380,101 @@ if routes is not None:
 
     @routes.get("/sonder-editor/ws")
     async def api_websocket(request: web.Request) -> web.WebSocketResponse:
+        remember_event_loop()
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        subscribed_project_id = str(request.query.get("project_id") or "")
+        host_registration: dict[str, str] | None = None
 
-        async for msg in ws:
-            if msg.type == web.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    await ws.send_json({"type": "ack", "received": data.get("type", "unknown")})
-                except json.JSONDecodeError:
-                    await ws.send_json({"type": "error", "message": "Invalid JSON"})
-            elif msg.type == web.WSMsgType.ERROR:
-                logger.error("WebSocket error: %s", ws.exception())
+        async def clear_host_registration() -> None:
+            nonlocal host_registration
+            if not host_registration:
+                return
+            await unregister_canvas_host(
+                host_registration.get("project_id", ""),
+                host_registration.get("source_node_id", ""),
+                host_registration.get("session_id", ""),
+                host_id=host_registration.get("host_id", ""),
+            )
+            host_registration = None
 
+        if subscribed_project_id:
+            await subscribe(subscribed_project_id, ws)
+            await ws.send_json({"type": "subscribed", "project_id": subscribed_project_id})
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        message_type = data.get("type", "unknown")
+                        if message_type == "subscribe":
+                            next_project_id = str(data.get("project_id") or "")
+                            source_node_id = str(data.get("source_node_id") or "")
+                            host_id = str(data.get("host_id") or "")
+                            await clear_host_registration()
+                            if subscribed_project_id:
+                                await unsubscribe(subscribed_project_id, ws)
+                            subscribed_project_id = next_project_id
+                            if subscribed_project_id:
+                                await subscribe(subscribed_project_id, ws)
+
+                            response = {"type": "subscribed", "project_id": subscribed_project_id}
+                            if subscribed_project_id and data.get("role") == "canvas_host":
+                                session_id = str(data.get("session_id") or "")
+                                host_result = await register_canvas_host(
+                                    subscribed_project_id,
+                                    source_node_id,
+                                    session_id,
+                                    str(data.get("workflow_id") or ""),
+                                    str(data.get("workflow_label") or ""),
+                                    host_id=host_id,
+                                )
+                                host_registration = {
+                                    "project_id": subscribed_project_id,
+                                    "host_id": host_result.get("host_id") or host_id,
+                                    "source_node_id": source_node_id,
+                                    "session_id": session_id,
+                                }
+                                response.update({
+                                    "host_id": host_result.get("host_id") or host_id,
+                                    "source_node_id": host_result.get("source_node_id") or source_node_id,
+                                    "host": host_result.get("host"),
+                                    "canvas_host_connected": host_result.get("canvas_host_connected", False),
+                                })
+                            elif subscribed_project_id and (host_id or source_node_id):
+                                host = await get_canvas_host(subscribed_project_id, source_node_id, host_id=host_id)
+                                response.update({
+                                    "host_id": host.get("host_id") if host else host_id or source_node_id,
+                                    "source_node_id": host.get("source_node_id") if host else source_node_id,
+                                    "host": host,
+                                    "canvas_host_connected": bool(host),
+                                })
+                            await ws.send_json(response)
+                        elif message_type == "host_heartbeat":
+                            if host_registration:
+                                host_result = await refresh_canvas_host(
+                                    host_registration.get("project_id", ""),
+                                    host_registration.get("host_id", ""),
+                                    host_registration.get("source_node_id", ""),
+                                    host_registration.get("session_id", ""),
+                                )
+                                await ws.send_json({
+                                    "type": "host_heartbeat",
+                                    "ok": host_result.get("ok", False),
+                                    "project_id": host_registration.get("project_id", ""),
+                                    "host_id": host_registration.get("host_id", ""),
+                                })
+                            else:
+                                await ws.send_json({"type": "host_heartbeat", "ok": False, "code": "no_canvas_host"})
+                        else:
+                            await ws.send_json({"type": "ack", "received": message_type})
+                    except json.JSONDecodeError:
+                        await ws.send_json({"type": "error", "message": "Invalid JSON"})
+                elif msg.type == web.WSMsgType.ERROR:
+                    logger.error("WebSocket error: %s", ws.exception())
+        finally:
+            await clear_host_registration()
+            if subscribed_project_id:
+                await unsubscribe(subscribed_project_id, ws)
         return ws
