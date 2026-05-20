@@ -1738,6 +1738,33 @@ export class EditorNodeController {
         });
     }
 
+    _reconcileOwnerStateEffects(owner, source = "unknown") {
+        let changed = false;
+
+        if (this.state.pendingTabHandoff && owner?.host_mode === "tab") {
+            clearTimeout(this._pendingHandoffTimer);
+            this._pendingHandoffTimer = null;
+            this.state.pendingTabHandoff = null;
+            this._startOwnerPolling(4000);
+            this._recordDiagEvent("pending_tab_handoff_cleared", { source });
+            changed = true;
+        }
+
+        if (owner?.host_mode === "tab" && owner.session_id !== this._editorSessionId && this.state.isFullscreenOpen && this.fullscreenSession) {
+            const session = this.fullscreenSession;
+            this._suppressNextSessionRelease = true;
+            this.fullscreenSession = null;
+            this._recordDiagEvent("tab_owner_destroy_fullscreen", {
+                source,
+                owner_session_id: owner.session_id || "",
+            });
+            session.destroy();
+            changed = true;
+        }
+
+        return changed;
+    }
+
     _applyOwnerState(owner, source = "unknown") {
         const normalized = owner || null;
         const signature = this._ownerSignature(normalized);
@@ -1749,6 +1776,9 @@ export class EditorNodeController {
                 status: normalized?.status || "",
                 host_mode: normalized?.host_mode || "",
             });
+            if (this._reconcileOwnerStateEffects(normalized, source)) {
+                this.render();
+            }
             return false;
         }
         this._recordDiagEvent("apply_owner_change", {
@@ -1764,19 +1794,7 @@ export class EditorNodeController {
         this.state.activeOwner = normalized;
         this.state.sessionStatus = normalized?.status || "";
 
-        if (this.state.pendingTabHandoff && normalized?.host_mode === "tab") {
-            clearTimeout(this._pendingHandoffTimer);
-            this._pendingHandoffTimer = null;
-            this.state.pendingTabHandoff = null;
-            this._startOwnerPolling(4000);
-        }
-
-        if (normalized?.host_mode === "tab" && normalized.session_id !== this._editorSessionId && this.state.isFullscreenOpen && this.fullscreenSession) {
-            const session = this.fullscreenSession;
-            this._suppressNextSessionRelease = true;
-            this.fullscreenSession = null;
-            session.destroy();
-        }
+        this._reconcileOwnerStateEffects(normalized, source);
 
         this.render();
         return true;

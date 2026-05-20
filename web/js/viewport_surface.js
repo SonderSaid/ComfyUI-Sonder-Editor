@@ -7,6 +7,7 @@ const PLAYBACK_OPAQUE_OPACITY = 0.999;
 const PLAYBACK_COVERAGE_EPSILON = 0.75;
 const PLAYBACK_PREBUFFER_GUARD_MS = 500;
 const PLAYBACK_PREBUFFER_SAFE_LEAD_MS = 2000;
+const PLAYBACK_FIRST_COMMIT_HOLD_MS = 2500;
 
 // Session-diagnostic helper: writes to `window.__SONDER_CANVAS_DIAG` populated
 // by editor_widget.js when `window.SONDER_DEBUG_SESSION === true`. Zero-cost
@@ -259,6 +260,9 @@ export function createViewportSurface(options = {}) {
         playbackLastCommittedFrame: null,
         playbackLastCommittedSignature: "",
         playbackLastCommittedSessionId: 0,
+        playbackFirstCommitStartedAt: null,
+        playbackFirstCommitFrame: null,
+        playbackFirstCommitHoldExpired: false,
         renderToken: 0,
         sourceUrlCache: new Map(),
         activePlaybackVideos: new Map(),
@@ -332,6 +336,18 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedSignature = "";
         state.playbackLastCommittedSessionId = 0;
         state.prebufferSkipLogKeys.clear();
+    }
+
+    function beginFirstCommitHold(timestamp, frame) {
+        state.playbackFirstCommitStartedAt = Number.isFinite(timestamp) ? timestamp : performance.now();
+        state.playbackFirstCommitFrame = clamp(Math.round(Number(frame) || 0), 0, totalFrames());
+        state.playbackFirstCommitHoldExpired = false;
+    }
+
+    function clearFirstCommitHold() {
+        state.playbackFirstCommitStartedAt = null;
+        state.playbackFirstCommitFrame = null;
+        state.playbackFirstCommitHoldExpired = false;
     }
 
     function playbackCanvasStillValid() {
@@ -1583,6 +1599,7 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedFrame = snapshot.frame;
         state.playbackLastCommittedSignature = playbackLayerSignature(snapshot);
         state.playbackLastCommittedSessionId = state.playbackSessionId;
+        clearFirstCommitHold();
         debugPlaybackBoundary("commit-playback-composite", {
             frame: snapshot.frame,
             drewAny,
@@ -1650,13 +1667,62 @@ export function createViewportSurface(options = {}) {
         });
     }
 
+    // Tiny loops can outrun the first async seek; hold the clock briefly so
+    // the current playback session can commit one drawable frame.
+    function holdPlaybackClockForFirstCommit(timestamp, nextFrame, endFrame) {
+        if (state.playbackCompositeCommitted || state.playbackFirstCommitHoldExpired) return false;
+        const holdFrame = clamp(
+            Math.round(Number(state.playbackFirstCommitFrame ?? state.playbackStartFrame) || 0),
+            0,
+            totalFrames()
+        );
+        if (nextFrame <= holdFrame) return false;
+        const startedAt = Number.isFinite(state.playbackFirstCommitStartedAt)
+            ? state.playbackFirstCommitStartedAt
+            : state.playbackStartTime;
+        const blockedForMs = timestamp - startedAt;
+        if (blockedForMs > PLAYBACK_FIRST_COMMIT_HOLD_MS) {
+            state.playbackFirstCommitHoldExpired = true;
+            debugPlaybackBoundary("release-first-commit-clock", {
+                frame: holdFrame,
+                nextFrame,
+                endFrame,
+                blockedForMs,
+                playbackSessionId: state.playbackSessionId,
+            });
+            return false;
+        }
+        if (currentFrame() !== holdFrame) {
+            applyFrame(holdFrame, { reason: "playback-first-commit-hold" });
+        }
+        state.playbackStartTime = timestamp;
+        state.playbackStartFrame = holdFrame;
+        const snapshot = buildFrameSnapshot(holdFrame);
+        invalidateAsyncPreviewRenders();
+        renderPlaybackFrame(snapshot);
+        debugPlaybackBoundary("hold-first-commit-clock", {
+            frame: holdFrame,
+            nextFrame,
+            endFrame,
+            blockedForMs,
+            playbackSessionId: state.playbackSessionId,
+        });
+        state.playbackRAF = requestAnimationFrame(playbackTick);
+        return true;
+    }
+
     function restartPlaybackLoop(timestamp) {
         if (!state.playbackLoopRange) return;
+        const hadCommittedFrame = state.playbackCompositeCommitted;
         state.playbackSessionId += 1;
         resetPlaybackCompositeState();
         const nextFrame = applyFrame(state.playbackLoopRange.start, { reason: "playback-loop" });
         state.playbackStartTime = timestamp;
         state.playbackStartFrame = nextFrame;
+        state.playbackFirstCommitFrame = nextFrame;
+        if (hadCommittedFrame || state.playbackFirstCommitStartedAt === null) {
+            beginFirstCommitHold(timestamp, nextFrame);
+        }
         const snapshot = buildFrameSnapshot(nextFrame);
         invalidateAsyncPreviewRenders();
         renderPlaybackFrame(snapshot);
@@ -1669,6 +1735,9 @@ export function createViewportSurface(options = {}) {
         const nextFrame = state.playbackStartFrame + Math.floor(elapsedSeconds * fps());
         const loopRange = state.playbackLoopRange;
         const endFrame = loopRange ? loopRange.end : totalFrames();
+        if (holdPlaybackClockForFirstCommit(timestamp, nextFrame, endFrame)) {
+            return;
+        }
         if (nextFrame >= endFrame) {
             if (loopRange) {
                 restartPlaybackLoop(timestamp);
@@ -1711,6 +1780,7 @@ export function createViewportSurface(options = {}) {
         clearActivePlaybackMedia();
         clearPrebufferCache();
         resetPlaybackCompositeState();
+        clearFirstCommitHold();
         if (!preservePlayhead && shouldReturnToPlaybackStart()) {
             applyFrame(state.playbackSessionStartFrame, { reason: "playback-stop-return" });
         }
@@ -1735,6 +1805,7 @@ export function createViewportSurface(options = {}) {
         state.playbackSessionId += 1;
         invalidateAsyncPreviewRenders();
         resetPlaybackCompositeState();
+        beginFirstCommitHold(state.playbackStartTime, startFrame);
         updatePlaybackState(true);
         const snapshot = buildFrameSnapshot(startFrame);
         renderPlaybackFrame(snapshot);
@@ -1753,6 +1824,7 @@ export function createViewportSurface(options = {}) {
         clearActivePlaybackMedia();
         clearPrebufferCache();
         resetPlaybackCompositeState();
+        clearFirstCommitHold();
         for (const mediaEl of Object.values(state.videoCache)) {
             removeMediaSource(mediaEl);
         }

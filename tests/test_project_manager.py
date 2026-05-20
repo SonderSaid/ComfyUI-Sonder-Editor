@@ -3,6 +3,7 @@
 import sys
 import os
 import tempfile
+import builtins
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -81,6 +82,39 @@ def test_list_projects_empty_dir():
 def test_list_projects_nonexistent_dir():
     projects = list_projects("/nonexistent/path/that/should/not/exist")
     assert projects == []
+
+
+def test_route_project_lookup_reads_utf8_index_by_folder_and_project_id(monkeypatch):
+    from server import routes
+
+    class DummyRequest:
+        def __init__(self, project_id):
+            self.match_info = {"project_id": project_id}
+            self.query = {}
+            self.method = "GET"
+
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Dance", base_dir=base_dir)
+        project.name = "Second Pass 🎬"
+        save_project(project)
+
+        project_file = os.path.abspath(os.path.join(project.project_dir, "project.json"))
+        original_open = builtins.open
+
+        def checked_open(file, mode="r", *args, **kwargs):
+            if os.path.abspath(str(file)) == project_file and "r" in str(mode):
+                assert kwargs.get("encoding") == "utf-8"
+            return original_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(routes, "_get_base_dir", lambda: base_dir)
+        monkeypatch.setattr(builtins, "open", checked_open)
+
+        by_folder = routes._load_project_from_request(DummyRequest("Dance"))
+        by_project_id = routes._load_project_from_request(DummyRequest(project.project_id))
+
+        assert by_folder.project_id == project.project_id
+        assert by_folder.name == "Second Pass 🎬"
+        assert by_project_id.project_dir == project.project_dir
 
 
 def test_load_project_missing():

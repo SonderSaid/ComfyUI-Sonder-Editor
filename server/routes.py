@@ -1083,12 +1083,13 @@ def _load_project_from_request(request: web.Request) -> TimelineProject:
                 pfile = os.path.join(entry_path, "project.json")
                 if os.path.isfile(pfile):
                     try:
-                        with open(pfile, "r") as f:
+                        with open(pfile, "r", encoding="utf-8") as f:
                             data = json.load(f)
                         if data.get("project_id", "") == project_id or entry == project_id:
                             project_dir = entry_path
                             break
-                    except Exception:
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        logger.debug("Skipping unreadable project index at %s: %s", pfile, exc)
                         continue
     if not project_dir:
         raise FileNotFoundError(f"Project not found: {project_id}")
