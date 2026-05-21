@@ -98,6 +98,16 @@ const EDITOR_WIDGET_FIELDS = [
     "render_queue_active",
 ];
 
+const PREVIEW_WIDGET_FIELDS = new Set([
+    "scene_id",
+    "selection_start",
+    "selection_end",
+    "pre_context_frames",
+    "post_context_frames",
+    "render_queue_active",
+]);
+const PREVIEW_STATE_REFRESH_DEBOUNCE_MS = 80;
+
 const BUTTON_STYLES = {
     muted: {
         background: CHROME.panelRaised,
@@ -1162,6 +1172,9 @@ export class EditorNodeController {
         };
         this._moduleLoadAborters = {};
         this._summaryAborter = null;
+        this._previewStateRefreshTimer = null;
+        this._pendingPreviewRefreshKeys = new Set();
+        this._pendingPreviewRefreshSyncAssets = false;
         this.fullscreenSession = null;
         this._preFullscreenModuleId = "";
         this.modules = this._buildModules();
@@ -1329,6 +1342,11 @@ export class EditorNodeController {
             this._summaryAborter = null;
         }
 
+        clearTimeout(this._previewStateRefreshTimer);
+        this._previewStateRefreshTimer = null;
+        this._pendingPreviewRefreshKeys.clear();
+        this._pendingPreviewRefreshSyncAssets = false;
+
         for (const moduleId of Object.keys(this._moduleLoadAborters)) {
             this._abortModuleLoad(moduleId);
         }
@@ -1424,7 +1442,7 @@ export class EditorNodeController {
                 load: async (controller, signal) => await controller._loadPreviewModule(signal),
                 mount: (container, data, controller) => controller._mountPreviewModule(container, data),
                 collapseCleanup: () => {},
-                invalidate: (keys) => keys.some(key => key === "project" || key === "scene" || key === "assets"),
+                invalidate: (keys) => keys.some(key => key === "project" || key === "scene" || key === "assets" || key === "queue" || key === "preview"),
             },
             queue: {
                 id: "queue",
@@ -1461,7 +1479,7 @@ export class EditorNodeController {
         this.state.renderQueueActive = coerceBoolean(this._getWidgetValue("render_queue_active", true), true);
     }
 
-    onEditorWidgetValueChange(name, value, { publish = true } = {}) {
+    onEditorWidgetValueChange(name, value, { publish = true, refreshPreview = true } = {}) {
         if (name === "scene_id") this.state.sceneId = value || "";
         if (name === "selection_start") this.state.selectionStart = Math.max(0, parseInt(value, 10) || 0);
         if (name === "selection_end") this.state.selectionEnd = Math.max(0, parseInt(value, 10) || 0);
@@ -1471,7 +1489,35 @@ export class EditorNodeController {
         if (name === "mask_post_offset") this.state.maskPostOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "render_queue_active") this.state.renderQueueActive = coerceBoolean(value, true);
         if (publish) this._seedWidgetState({ [name]: value }, { seed: false });
+        const previewKeys = this._previewInvalidationKeysForWidget(name);
+        if (refreshPreview && previewKeys.length) {
+            this._schedulePreviewStateRefresh(previewKeys);
+        }
         this.render();
+    }
+
+    _previewInvalidationKeysForWidget(name) {
+        if (!PREVIEW_WIDGET_FIELDS.has(name)) return [];
+        if (name === "scene_id") return ["scene", "preview"];
+        if (name === "render_queue_active") return ["queue", "preview"];
+        return ["preview"];
+    }
+
+    _schedulePreviewStateRefresh(keys = ["preview"], { syncAssets = false } = {}) {
+        if (this._destroyed || !this.state.projectDir) return;
+        for (const key of keys || []) {
+            this._pendingPreviewRefreshKeys.add(key);
+        }
+        this._pendingPreviewRefreshSyncAssets = this._pendingPreviewRefreshSyncAssets || !!syncAssets;
+        clearTimeout(this._previewStateRefreshTimer);
+        this._previewStateRefreshTimer = setTimeout(() => {
+            this._previewStateRefreshTimer = null;
+            const pendingKeys = Array.from(this._pendingPreviewRefreshKeys);
+            const pendingSyncAssets = this._pendingPreviewRefreshSyncAssets;
+            this._pendingPreviewRefreshKeys.clear();
+            this._pendingPreviewRefreshSyncAssets = false;
+            this._refreshSummaryThenReloadModules(pendingKeys, { syncAssets: pendingSyncAssets });
+        }, PREVIEW_STATE_REFRESH_DEBOUNCE_MS);
     }
 
     _sourceNodeId() {
@@ -1637,11 +1683,15 @@ export class EditorNodeController {
     _applyRemoteWidgetState(values = {}, source = "unknown", remoteSessionId = "") {
         if (!values || typeof values !== "object") return false;
         const changedFields = [];
+        const previewRefreshKeys = new Set();
         for (const [name, value] of Object.entries(values)) {
             if (!EDITOR_WIDGET_FIELDS.includes(name)) continue;
             if (Object.is(this._getWidgetValue(name), value)) continue;
             this._setWidgetValue(name, value);
-            this.onEditorWidgetValueChange(name, value, { publish: false });
+            this.onEditorWidgetValueChange(name, value, { publish: false, refreshPreview: false });
+            for (const key of this._previewInvalidationKeysForWidget(name)) {
+                previewRefreshKeys.add(key);
+            }
             changedFields.push(name);
         }
         if (!changedFields.length) return false;
@@ -1652,7 +1702,11 @@ export class EditorNodeController {
         });
         this.node?.setDirtyCanvas?.(true, true);
         this.fullscreenSession?.editor?.applyWidgetState?.(values);
-        this.refreshSummary().finally(() => this.render());
+        if (previewRefreshKeys.size) {
+            this._schedulePreviewStateRefresh(Array.from(previewRefreshKeys));
+        } else {
+            this.refreshSummary().finally(() => this.render());
+        }
         return true;
     }
 
@@ -1706,9 +1760,7 @@ export class EditorNodeController {
 
     _handleProjectUpdatedFromSync(event) {
         if (!event || event.project_id !== this._projectId()) return;
-        this._invalidateModules(["project", "assets", "scene", "queue", "preview"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue", "preview"]);
-        this.refreshSummary({ syncAssets: true }).finally(() => this.render());
+        this._refreshSummaryThenReloadModules(["project", "assets", "scene", "queue", "preview"], { syncAssets: true });
         this.fullscreenSession?.refresh(["project", "assets", "scenes", "queue"]);
     }
 
@@ -1944,7 +1996,7 @@ export class EditorNodeController {
             this.state.pendingTabHandoff = null;
             this.state._projectReadyQueue.length = 0;
             this._teardownProjectSync();
-            this._invalidateModules(["project", "assets", "scene", "queue"]);
+            this._invalidateModules(["project", "assets", "scene", "queue", "preview"]);
             this.collapseModule();
             this.render();
             return;
@@ -1967,7 +2019,7 @@ export class EditorNodeController {
             this._setWidgetValue("scene_id", "");
             this._setWidgetValue("selection_start", 0);
             this._setWidgetValue("selection_end", 0);
-            this._invalidateModules(["project", "assets", "scene", "queue"]);
+            this._invalidateModules(["project", "assets", "scene", "queue", "preview"]);
             this.state.expandedModuleId = "";
             this.state.activeOwner = null;
             this.state.sessionStatus = "";
@@ -1995,13 +2047,14 @@ export class EditorNodeController {
 
     async refreshSummary(options = {}) {
         const { syncAssets = false } = options;
-        if (this._destroyed || !this.state.projectDir) return;
+        if (this._destroyed || !this.state.projectDir) return false;
 
         if (this._summaryAborter) {
             this._summaryAborter.abort();
         }
         const aborter = new AbortController();
         this._summaryAborter = aborter;
+        let refreshed = false;
 
         try {
             if (syncAssets) {
@@ -2017,6 +2070,7 @@ export class EditorNodeController {
                 buildDormantSummaryUrl(this.state),
                 aborter.signal,
             );
+            refreshed = true;
             const activeScene = this.state.dormantSummary?.active_scene;
             const widgetValue = this._getWidgetValue("scene_id", "") || "";
             if (activeScene?.scene_id && !this.state.sceneId && !widgetValue) {
@@ -2033,6 +2087,16 @@ export class EditorNodeController {
             }
             this.render();
         }
+        return refreshed;
+    }
+
+    async _refreshSummaryThenReloadModules(keys = [], options = {}) {
+        const refreshed = await this.refreshSummary(options);
+        if (this._destroyed || !refreshed) return false;
+        this._invalidateModules(keys);
+        this._reloadExpandedModuleIfNeeded(keys);
+        this.render();
+        return true;
     }
 
     toggleModule(moduleId) {
@@ -2101,6 +2165,7 @@ export class EditorNodeController {
     _invalidateModules(keys) {
         for (const [moduleId, moduleDef] of Object.entries(this.modules)) {
             if (moduleDef.invalidate(keys)) {
+                this._abortModuleLoad(moduleId);
                 delete this.moduleCache[moduleId];
                 this.moduleStatus[moduleId].error = "";
             }
@@ -2349,23 +2414,25 @@ export class EditorNodeController {
 
         this.state.isFullscreenOpen = false;
         this.syncStateFromWidgets();
-        this._invalidateModules(["scene", "assets", "queue"]);
+        const refreshKeys = ["scene", "assets", "queue", "preview"];
         const restoreModuleId = this._preFullscreenModuleId;
         this._preFullscreenModuleId = "";
-        if (restoreModuleId && this.modules[restoreModuleId]) {
-            this.expandModule(restoreModuleId);
-        } else {
-            this._reloadExpandedModuleIfNeeded(["scene", "assets", "queue"]);
-        }
-        this.refreshSummary().finally(() => this.render());
+        this.refreshSummary().then((refreshed) => {
+            if (this._destroyed || !refreshed) return;
+            this._invalidateModules(refreshKeys);
+            if (restoreModuleId && this.modules[restoreModuleId]) {
+                this.expandModule(restoreModuleId);
+            } else {
+                this._reloadExpandedModuleIfNeeded(refreshKeys);
+            }
+            this.render();
+        });
     }
 
     handleNodeExecuted() {
         if (this._destroyed || !this.state.projectDir) return;
         this.syncStateFromWidgets();
-        this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        this.refreshSummary({ syncAssets: true }).finally(() => this.render());
+        this._refreshSummaryThenReloadModules(["assets", "scene", "queue", "preview"], { syncAssets: true });
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
     }
 
@@ -2373,9 +2440,7 @@ export class EditorNodeController {
         if (this._destroyed || !this.state.projectDir) return;
         this._queueSaveCompletionCounter += 1;
         this.syncStateFromWidgets();
-        this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        this.refreshSummary({ syncAssets: true }).finally(() => this.render());
+        this._refreshSummaryThenReloadModules(["assets", "scene", "queue", "preview"], { syncAssets: true });
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
     }
 
@@ -2384,9 +2449,11 @@ export class EditorNodeController {
             return this.state.dormantSummary?.queue_counts || {};
         }
         this.syncStateFromWidgets();
-        this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        await this.refreshSummary({ syncAssets: true });
+        const refreshed = await this.refreshSummary({ syncAssets: true });
+        if (refreshed) {
+            this._invalidateModules(["assets", "scene", "queue", "preview"]);
+            this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue", "preview"]);
+        }
         const counts = this.state.dormantSummary?.queue_counts || {};
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
         this.render();
@@ -2398,17 +2465,21 @@ export class EditorNodeController {
             return this.state.dormantSummary?.queue_counts || {};
         }
         this.syncStateFromWidgets();
-        this._invalidateModules(["queue"]);
-        this._reloadExpandedModuleIfNeeded(["queue"]);
-        await this.refreshSummary();
+        let refreshed = await this.refreshSummary();
+        if (refreshed) {
+            this._invalidateModules(["queue", "preview"]);
+            this._reloadExpandedModuleIfNeeded(["queue", "preview"]);
+        }
         let counts = this.state.dormantSummary?.queue_counts || {};
         const sawSaveCompletion = this._queueSaveCompletionCounter > this._lastQueueSettledSaveCompletionCounter;
         if (allowRollback && (counts.running || 0) > 0 && !sawSaveCompletion) {
             const rolledBack = await this._rollbackStaleRunningQueueJobs();
             if (rolledBack) {
-                this._invalidateModules(["queue"]);
-                this._reloadExpandedModuleIfNeeded(["queue"]);
-                await this.refreshSummary();
+                refreshed = await this.refreshSummary();
+                if (refreshed) {
+                    this._invalidateModules(["queue", "preview"]);
+                    this._reloadExpandedModuleIfNeeded(["queue", "preview"]);
+                }
                 counts = this.state.dormantSummary?.queue_counts || {};
             }
         }
@@ -2764,7 +2835,11 @@ export class EditorNodeController {
 
     async _loadPreviewModule(signal) {
         const summary = this.state.dormantSummary;
-        const sceneId = summary?.active_scene?.scene_id || this.state.sceneId;
+        const activeQueueJob = summary?.active_queue_job || null;
+        const queuePreviewActive = coerceBoolean(this.state.renderQueueActive, true) && !!activeQueueJob;
+        const sceneId = (queuePreviewActive && activeQueueJob?.scene_id)
+            ? activeQueueJob.scene_id
+            : (summary?.active_scene?.scene_id || this.state.sceneId);
         if (!sceneId) {
             return {
                 kind: "empty",
@@ -2791,37 +2866,80 @@ export class EditorNodeController {
                 || parseInt(summary?.active_scene?.duration_frames, 10)
                 || 0
         );
-        const initialFrame = clamp(
-            parseInt(this.state.selectionStart, 10)
-                || parseInt(summary?.active_scene?.selection?.generation_start_frame, 10)
-                || 0,
-            0,
-            durationFrames
-        );
+        const selection = summary?.active_scene?.selection || {};
+        const resolveRange = (startValue, endValue) => {
+            if (durationFrames <= 0) return [0, 0];
+            const start = clamp(Math.max(0, parseInt(startValue, 10) || 0), 0, durationFrames);
+            const end = clamp(Math.max(0, parseInt(endValue, 10) || 0), 0, durationFrames);
+            if (end > start) return [start, end];
+            return [0, durationFrames];
+        };
+
+        let rangeStartFrame = 0;
+        let rangeEndFrame = durationFrames;
+        let previewSource = "selection";
+        let sourceLabel = summary?.active_scene?.name || scene?.name || "Scene";
+        if (queuePreviewActive) {
+            [rangeStartFrame, rangeEndFrame] = resolveRange(
+                activeQueueJob.selection_start,
+                activeQueueJob.selection_end
+            );
+            previewSource = "queue";
+            sourceLabel = activeQueueJob.scene_name || scene?.name || sourceLabel;
+        } else {
+            [rangeStartFrame, rangeEndFrame] = resolveRange(
+                selection.generation_start_frame,
+                selection.generation_end_frame
+            );
+            if (selection.is_full_scene) {
+                previewSource = "scene";
+            }
+        }
+        const hasPreviewRange = durationFrames > 0 && rangeEndFrame > rangeStartFrame;
+        const rawInitialFrame = (queuePreviewActive || previewSource === "scene")
+            ? rangeStartFrame
+            : (parseInt(this.state.selectionStart, 10) || rangeStartFrame);
+        const initialFrame = hasPreviewRange
+            ? clamp(
+                rawInitialFrame,
+                rangeStartFrame,
+                Math.max(rangeStartFrame, rangeEndFrame - 1)
+            )
+            : 0;
+        const queueFps = queuePreviewActive ? Number(activeQueueJob.scene_fps) : 0;
+        const queueWidth = queuePreviewActive ? parseInt(activeQueueJob.scene_width, 10) : 0;
+        const queueHeight = queuePreviewActive ? parseInt(activeQueueJob.scene_height, 10) : 0;
         return {
             kind: "viewport",
             label: "Viewport Preview",
-            subtitle: summary?.active_scene?.name || "Scene",
+            subtitle: previewSource === "queue" ? `${sourceLabel} - Queue` : sourceLabel,
             scene,
             assets,
             fps: Math.max(
                 1,
-                Number(scene?.fps)
+                queueFps
+                    || Number(scene?.fps)
                     || Number(summary?.active_scene?.effective_fps)
                     || Number(summary?.fps)
                     || 24
             ),
             initialFrame,
             durationFrames,
+            rangeStartFrame,
+            rangeEndFrame,
+            previewSource,
+            activeQueueJob: queuePreviewActive ? activeQueueJob : null,
             frameWidth: Math.max(
                 1,
-                parseInt(scene?.width, 10)
+                queueWidth
+                    || parseInt(scene?.width, 10)
                     || parseInt(summary?.active_scene?.effective_width, 10)
                     || 768
             ),
             frameHeight: Math.max(
                 1,
-                parseInt(scene?.height, 10)
+                queueHeight
+                    || parseInt(scene?.height, 10)
                     || parseInt(summary?.active_scene?.effective_height, 10)
                     || 512
             ),
@@ -3029,14 +3147,34 @@ export class EditorNodeController {
         const assetsByPath = new Map((data.assets || []).map((asset) => [asset.path, asset]));
         const effectiveFps = Math.max(1, Number(data.fps) || 24);
         const totalFrames = Math.max(0, parseInt(data.durationFrames, 10) || 0);
-        const lastRenderableFrame = Math.max(0, totalFrames - 1);
+        const rawRangeStart = Math.max(0, parseInt(data.rangeStartFrame, 10) || 0);
+        const rawRangeEnd = Math.max(0, parseInt(data.rangeEndFrame, 10) || totalFrames);
+        let rangeStartFrame = clamp(rawRangeStart, 0, totalFrames);
+        let rangeEndFrame = clamp(rawRangeEnd, 0, totalFrames);
+        if (rangeEndFrame <= rangeStartFrame) {
+            rangeStartFrame = 0;
+            rangeEndFrame = totalFrames;
+        }
+        const hasFrameRange = totalFrames > 0 && rangeEndFrame > rangeStartFrame;
+        const firstRenderableFrame = hasFrameRange ? rangeStartFrame : 0;
+        const lastRenderableFrame = hasFrameRange ? Math.max(rangeStartFrame, rangeEndFrame - 1) : 0;
+        const playableFrameCount = hasFrameRange ? rangeEndFrame - rangeStartFrame : 0;
+        const overlapsPreviewRange = (startValue, endValue) => {
+            if (!hasFrameRange) return false;
+            const start = Math.max(0, parseInt(startValue, 10) || 0);
+            const end = Math.max(0, parseInt(endValue, 10) || 0);
+            return start < rangeEndFrame && end > rangeStartFrame;
+        };
         const hasSceneAudio = (data.scene?.audio_tracks || []).some((track) => {
             if (track?.muted) return false;
+            if (!overlapsPreviewRange(track.timeline_start_frame, track.timeline_end_frame)) return false;
             if (isAudioLaneHidden(data.scene, track.lane_index || 0)) return false;
             return !assetsByPath.get(track.source_path)?.missing;
         });
 
-        let currentFrame = clamp(parseInt(data.initialFrame, 10) || 0, 0, totalFrames);
+        let currentFrame = hasFrameRange
+            ? clamp(parseInt(data.initialFrame, 10) || firstRenderableFrame, firstRenderableFrame, lastRenderableFrame)
+            : 0;
         let destroyed = false;
         let isPlaying = false;
         let audioEnabled = hasSceneAudio;
@@ -3054,7 +3192,7 @@ export class EditorNodeController {
 
         const clipPlaybackKey = (clip) => clip?.clip_id || `${clip?.source_path || ""}:${clip?.timeline_start_frame || 0}:${clip?.track_index || 0}`;
         const audioPlaybackKey = (track) => track?.track_id || `${track?.source_path || ""}:${track?.timeline_start_frame || 0}:${track?.lane_index || 0}`;
-        const renderFrameIndex = () => (totalFrames > 0 ? clamp(currentFrame, 0, lastRenderableFrame) : 0);
+        const renderFrameIndex = () => (hasFrameRange ? clamp(currentFrame, firstRenderableFrame, lastRenderableFrame) : 0);
         const getTargetForFrame = (frame) => pickPreviewTargetForFrame(
             projectDir,
             data.scene,
@@ -3099,6 +3237,7 @@ export class EditorNodeController {
         function getAudioTracksAtFrame(frame) {
             return (data.scene?.audio_tracks || [])
                 .filter(track => frame >= track.timeline_start_frame && frame < track.timeline_end_frame)
+                .filter(track => overlapsPreviewRange(track.timeline_start_frame, track.timeline_end_frame))
                 .filter(track => !track.muted)
                 .filter(track => !isAudioLaneHidden(data.scene, track.lane_index || 0))
                 .filter(track => !assetsByPath.get(track.source_path)?.missing)
@@ -3299,11 +3438,13 @@ export class EditorNodeController {
         }
 
         function updateTransport() {
-            scrubber.max = String(totalFrames);
-            scrubber.value = String(currentFrame);
-            frameLabel.textContent = `f${currentFrame} / ${totalFrames}`;
+            const frame = renderFrameIndex();
+            scrubber.min = String(firstRenderableFrame);
+            scrubber.max = String(lastRenderableFrame);
+            scrubber.value = String(frame);
+            frameLabel.textContent = hasFrameRange ? `f${frame} / ${lastRenderableFrame}` : "f0 / 0";
             playBtn.textContent = isPlaying ? "Pause" : "Play";
-            playBtn.disabled = totalFrames <= 0;
+            playBtn.disabled = playableFrameCount <= 0;
             audioBtn.textContent = hasSceneAudio ? (audioEnabled ? "Audio On" : "Muted") : "No audio";
             audioBtn.disabled = !hasSceneAudio;
             const targetKind = currentTarget?.kind || data.kind;
@@ -3546,7 +3687,7 @@ export class EditorNodeController {
 
         function stopPlayback({ preservePlayhead = true, shouldRender = true } = {}) {
             if (!preservePlayhead) {
-                currentFrame = 0;
+                currentFrame = firstRenderableFrame;
             }
             if (!isPlaying && !shouldRender) return;
             isPlaying = false;
@@ -3563,9 +3704,9 @@ export class EditorNodeController {
         }
 
         function startPlayback() {
-            if (destroyed || totalFrames <= 0) return;
-            if (currentFrame >= totalFrames) {
-                currentFrame = 0;
+            if (destroyed || playableFrameCount <= 0) return;
+            if (currentFrame < firstRenderableFrame || currentFrame > lastRenderableFrame) {
+                currentFrame = firstRenderableFrame;
             }
             isPlaying = true;
             playbackStartTs = performance.now();
@@ -3574,9 +3715,11 @@ export class EditorNodeController {
             const tick = (timestamp) => {
                 if (!isPlaying || destroyed) return;
                 const elapsedFrames = Math.floor(((timestamp - playbackStartTs) / 1000) * effectiveFps);
-                currentFrame = clamp(playbackStartFrame + elapsedFrames, 0, totalFrames);
+                const nextFrame = playbackStartFrame + elapsedFrames;
+                currentFrame = clamp(nextFrame, firstRenderableFrame, lastRenderableFrame);
                 renderPreviewFrame();
-                if (currentFrame >= totalFrames) {
+                if (nextFrame >= rangeEndFrame) {
+                    currentFrame = lastRenderableFrame;
                     stopPlayback({ preservePlayhead: true, shouldRender: true });
                     return;
                 }
@@ -3613,7 +3756,9 @@ export class EditorNodeController {
             if (isPlaying) {
                 stopPlayback({ preservePlayhead: true, shouldRender: false });
             }
-            currentFrame = clamp(parseInt(scrubber.value, 10) || 0, 0, totalFrames);
+            currentFrame = hasFrameRange
+                ? clamp(parseInt(scrubber.value, 10) || firstRenderableFrame, firstRenderableFrame, lastRenderableFrame)
+                : 0;
             scheduleRender({ forceSeek: true });
             updateTransport();
         });
@@ -3697,6 +3842,7 @@ export class EditorNodeController {
             this._setWidgetValue("render_queue_active", nextActive);
             this.state.renderQueueActive = nextActive;
             this._seedWidgetState({ render_queue_active: nextActive }, { seed: false });
+            this._schedulePreviewStateRefresh(["queue", "preview"]);
             this.fullscreenSession?.editor?._setRenderQueueActive?.(nextActive, { syncWidget: false });
         });
         activeRight.append(activeStatus, activeCheckbox);
@@ -3747,9 +3893,9 @@ export class EditorNodeController {
                     if (!response.ok) {
                         throw new Error(`Clear completed renders failed: ${response.status}`);
                     }
-                    this._invalidateModules(["queue"]);
-                    this._reloadExpandedModuleIfNeeded(["queue"]);
                     await this.refreshSummary();
+                    this._invalidateModules(["queue", "preview"]);
+                    this._reloadExpandedModuleIfNeeded(["queue", "preview"]);
                     this.fullscreenSession?.refresh(["queue"]);
                 } catch (error) {
                     console.warn("[Sonder] Failed to clear completed renders:", error);

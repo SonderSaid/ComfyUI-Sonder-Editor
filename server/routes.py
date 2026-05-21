@@ -69,14 +69,28 @@ def _json_error(msg: str, status: int = 400) -> web.Response:
 
 
 def _project_saved_event(project: TimelineProject) -> None:
-    schedule_project_event(
-        getattr(project, "project_id", ""),
-        {
-            "type": "project_updated",
-            "project_id": getattr(project, "project_id", ""),
-            "modified_at": getattr(project, "modified_at", ""),
-        },
-    )
+    canonical_project_id = str(getattr(project, "project_id", "") or "")
+    project_dir = str(getattr(project, "project_dir", "") or "")
+    folder_project_id = os.path.basename(os.path.normpath(project_dir)) if project_dir else ""
+
+    aliases = []
+    seen = set()
+    for alias in (canonical_project_id, folder_project_id):
+        if not alias or alias in seen:
+            continue
+        aliases.append(alias)
+        seen.add(alias)
+
+    for alias in aliases:
+        schedule_project_event(
+            alias,
+            {
+                "type": "project_updated",
+                "project_id": alias,
+                "canonical_project_id": canonical_project_id,
+                "modified_at": getattr(project, "modified_at", ""),
+            },
+        )
 
 
 register_project_saved_hook(_project_saved_event)
@@ -1218,6 +1232,7 @@ def _build_dormant_summary(
         status = (job.status or "pending").lower()
         queue_counts[status] = queue_counts.get(status, 0) + 1
     queue_counts["total"] = len(project.generation_queue)
+    active_queue_job = _pick_active_queue_job(project)
 
     if active_scene:
         effective_width = active_scene.width or project.resolution[0]
@@ -1255,7 +1270,36 @@ def _build_dormant_summary(
         "scene_count": len(project.scenes),
         "asset_counts": asset_counts,
         "queue_counts": queue_counts,
+        "active_queue_job": _dormant_queue_job_payload(active_queue_job),
         "active_scene": active_scene_payload,
+    }
+
+
+def _pick_active_queue_job(project: TimelineProject) -> GenerationJob | None:
+    queue = getattr(project, "generation_queue", []) or []
+    for desired_status in ("running", "pending"):
+        for job in queue:
+            if (getattr(job, "status", "pending") or "pending").lower() == desired_status:
+                return job
+    return None
+
+
+def _dormant_queue_job_payload(job: GenerationJob | None) -> dict | None:
+    if job is None:
+        return None
+    return {
+        "job_id": getattr(job, "job_id", ""),
+        "status": getattr(job, "status", "pending") or "pending",
+        "scene_id": getattr(job, "scene_id", ""),
+        "scene_name": getattr(job, "scene_name", ""),
+        "selection_start": int(getattr(job, "selection_start", 0) or 0),
+        "selection_end": int(getattr(job, "selection_end", 0) or 0),
+        "context_frames": int(getattr(job, "context_frames", 0) or 0),
+        "pre_context_frames": int(getattr(job, "pre_context_frames", 0) or 0),
+        "post_context_frames": int(getattr(job, "post_context_frames", 0) or 0),
+        "scene_width": int(getattr(job, "scene_width", 0) or 0),
+        "scene_height": int(getattr(job, "scene_height", 0) or 0),
+        "scene_fps": float(getattr(job, "scene_fps", 0.0) or 0.0),
     }
 
 

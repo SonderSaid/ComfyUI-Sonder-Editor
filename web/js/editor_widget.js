@@ -10406,12 +10406,29 @@ export class EditorWidget {
             : this._settings.playback.resolution === "half"
                 ? 0.5
                 : 1;
-        this._vpCanvas.width = Math.max(1, Math.floor(canvasW * resolutionScale));
-        this._vpCanvas.height = Math.max(1, Math.floor(canvasH * resolutionScale));
-        this._vpCanvas.style.width = canvasW + "px";
-        this._vpCanvas.style.height = canvasH + "px";
+        const targetBufferW = Math.max(1, Math.floor(canvasW * resolutionScale));
+        const targetBufferH = Math.max(1, Math.floor(canvasH * resolutionScale));
+        const targetStyleW = `${canvasW}px`;
+        const targetStyleH = `${canvasH}px`;
+        const backingChanged = this._vpCanvas.width !== targetBufferW || this._vpCanvas.height !== targetBufferH;
+        const styleChanged = this._vpCanvas.style.width !== targetStyleW || this._vpCanvas.style.height !== targetStyleH;
+
+        if (!backingChanged && !styleChanged) {
+            return false;
+        }
+
+        if (backingChanged) {
+            this._vpCanvas.width = targetBufferW;
+            this._vpCanvas.height = targetBufferH;
+            this._viewportSurface?.invalidatePlaybackComposite?.();
+        }
+        if (styleChanged) {
+            this._vpCanvas.style.width = targetStyleW;
+            this._vpCanvas.style.height = targetStyleH;
+        }
 
         this._renderViewportFrame();
+        return true;
     }
 
     _getClipAtFrame(frame) {

@@ -1842,6 +1842,10 @@ export function createViewportSurface(options = {}) {
         clearCacheObject(state.imageCache);
     }
 
+    function invalidatePlaybackComposite() {
+        resetPlaybackCompositeState();
+    }
+
     function setLiveMediaEnabled(nextValue) {
         const enabled = !!nextValue;
         if (state.liveMediaEnabled === enabled) {
@@ -1876,6 +1880,7 @@ export function createViewportSurface(options = {}) {
         stopPlayback,
         captureSourceFrame,
         clearMediaCache,
+        invalidatePlaybackComposite,
         destroy,
         setLiveMediaEnabled,
         isLiveMediaEnabled: () => state.liveMediaEnabled,

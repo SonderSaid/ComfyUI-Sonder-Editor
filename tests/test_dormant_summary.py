@@ -65,8 +65,27 @@ def _make_project():
             Asset(asset_id="aud-1", name="Audio", asset_type="audio", path="media/a.wav"),
         ],
         generation_queue=[
-            GenerationJob(job_id="job-1", status="pending", scene_name="Opening"),
-            GenerationJob(job_id="job-2", status="running", scene_name="Opening"),
+            GenerationJob(
+                job_id="job-1",
+                status="pending",
+                scene_id="scene-1",
+                scene_name="Opening",
+                selection_start=12,
+                selection_end=36,
+            ),
+            GenerationJob(
+                job_id="job-2",
+                status="running",
+                scene_id="scene-1",
+                scene_name="Opening",
+                selection_start=24,
+                selection_end=72,
+                pre_context_frames=4,
+                post_context_frames=8,
+                scene_width=1280,
+                scene_height=720,
+                scene_fps=24.0,
+            ),
             GenerationJob(job_id="job-3", status="completed", scene_name="Opening"),
         ],
     )
@@ -130,6 +149,20 @@ def test_build_dormant_summary_reports_counts_and_effective_scene_values():
         "failed": 0,
         "total": 3,
     }
+    assert summary["active_queue_job"] == {
+        "job_id": "job-2",
+        "status": "running",
+        "scene_id": "scene-1",
+        "scene_name": "Opening",
+        "selection_start": 24,
+        "selection_end": 72,
+        "context_frames": 0,
+        "pre_context_frames": 4,
+        "post_context_frames": 8,
+        "scene_width": 1280,
+        "scene_height": 720,
+        "scene_fps": 24.0,
+    }
 
     active = summary["active_scene"]
     assert active["scene_id"] == "scene-1"
@@ -152,3 +185,25 @@ def test_build_dormant_summary_falls_back_to_first_scene_when_scene_id_missing()
     summary = _build_dormant_summary(project, scene_id="missing")
 
     assert summary["active_scene"]["scene_id"] == "scene-1"
+
+
+def test_build_dormant_summary_uses_pending_when_no_running_queue_job():
+    project = _make_project()
+    project.generation_queue[1].status = "completed"
+
+    summary = _build_dormant_summary(project, scene_id="scene-1")
+
+    assert summary["active_queue_job"]["job_id"] == "job-1"
+    assert summary["active_queue_job"]["status"] == "pending"
+    assert summary["active_queue_job"]["selection_start"] == 12
+    assert summary["active_queue_job"]["selection_end"] == 36
+
+
+def test_build_dormant_summary_ignores_completed_and_failed_queue_jobs():
+    project = _make_project()
+    for job in project.generation_queue:
+        job.status = "failed" if job.job_id == "job-1" else "completed"
+
+    summary = _build_dormant_summary(project, scene_id="scene-1")
+
+    assert summary["active_queue_job"] is None

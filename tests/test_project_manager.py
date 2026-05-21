@@ -117,6 +117,50 @@ def test_route_project_lookup_reads_utf8_index_by_folder_and_project_id(monkeypa
         assert by_project_id.project_dir == project.project_dir
 
 
+def test_project_saved_event_publishes_canonical_and_folder_aliases(monkeypatch):
+    from server import routes
+
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Alias Project", base_dir=base_dir)
+        events = []
+
+        monkeypatch.setattr(
+            routes,
+            "schedule_project_event",
+            lambda project_id, event: events.append((project_id, event)),
+        )
+
+        routes._project_saved_event(project)
+
+        folder_id = os.path.basename(os.path.normpath(project.project_dir))
+        assert project.project_id != folder_id
+        assert [project_id for project_id, _event in events] == [project.project_id, folder_id]
+        assert [event["project_id"] for _project_id, event in events] == [project.project_id, folder_id]
+        assert {event["canonical_project_id"] for _project_id, event in events} == {project.project_id}
+        assert all(event["type"] == "project_updated" for _project_id, event in events)
+
+
+def test_project_saved_event_dedupes_matching_alias(monkeypatch):
+    from server import routes
+
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Same Alias", base_dir=base_dir)
+        folder_id = os.path.basename(os.path.normpath(project.project_dir))
+        project.project_id = folder_id
+        events = []
+
+        monkeypatch.setattr(
+            routes,
+            "schedule_project_event",
+            lambda project_id, event: events.append((project_id, event)),
+        )
+
+        routes._project_saved_event(project)
+
+        assert [project_id for project_id, _event in events] == [folder_id]
+        assert events[0][1]["project_id"] == folder_id
+
+
 def test_load_project_missing():
     import pytest
     with tempfile.TemporaryDirectory() as base_dir:
