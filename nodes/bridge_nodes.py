@@ -308,7 +308,10 @@ class SonderGuidesBridgeStart:
             iteration_index = 0
 
         if not guides or iteration_index < 0 or iteration_index >= len(guides):
-            return (FLOW_SENTINEL, _empty_image(proj_w, proj_h), 0, 1.0) + passthrough
+            # Empty/out-of-range placeholder: black image with strength 0.0 so downstream
+            # guide conditioning treats it as inert. Corrupt-image branch below preserves
+            # the configured guide strength (different semantic — real guide exists).
+            return (FLOW_SENTINEL, _empty_image(proj_w, proj_h), 0, 0.0) + passthrough
 
         guide = guides[iteration_index]
         img = _load_guide_image_bridge(

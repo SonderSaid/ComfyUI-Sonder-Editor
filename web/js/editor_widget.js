@@ -551,6 +551,10 @@ export class EditorWidget {
         this.pixelsPerFrame = this._settings.layout.timelinePixelsPerFrame;
         this.isDragging = false;
         this.dragType = null; // "selection", "playhead", "selStart", "selEnd"
+        this._pendingApplyWidgetState = null;
+        this._pendingScenesRefresh = false;
+        this._timelineMutationDepth = 0;
+        this._sceneFetchSeq = 0;
 
         // Asset state
         this.assets = { video: [], image: [], audio: [], artifact: [] };
@@ -700,6 +704,7 @@ export class EditorWidget {
             setValue: (name, value) => {
                 const widget = node?.widgets?.find(w => w.name === name);
                 if (!widget) return;
+                if (Object.is(widget.value, value)) return;
                 widget.value = value;
                 this.onWidgetValueChange?.(name, value);
             },
@@ -725,6 +730,22 @@ export class EditorWidget {
 
     applyWidgetState(values = {}) {
         if (!values || typeof values !== "object") return;
+        const fieldNames = Object.keys(values);
+        if (this.isDragging && fieldNames.length > 0) {
+            // #36 residual: remote widget_state_changed events can arrive while a
+            // drag/trim owns editor object references and scalar selection state.
+            // This ephemeral buffer is replayed after mouseup/commit and never
+            // persists to project or browser-local state.
+            this._pendingApplyWidgetState = {
+                ...(this._pendingApplyWidgetState || {}),
+                ...values,
+            };
+            sessionDiagRecord("widget_state_deferred", {
+                drag_type: this.dragType || "",
+                fields: fieldNames.sort(),
+            });
+            return;
+        }
         this._applyingWidgetState = true;
         try {
             for (const [name, value] of Object.entries(values)) {
@@ -760,6 +781,62 @@ export class EditorWidget {
         this._updateToolbar();
         this._renderTimeline();
         this._renderQueuePanel();
+    }
+
+    _flushDeferredDragState(commitPromise = null) {
+        const replay = () => {
+            const pendingWidgetState = this._pendingApplyWidgetState;
+            const pendingScenesRefresh = !!this._pendingScenesRefresh;
+            this._pendingApplyWidgetState = null;
+            this._pendingScenesRefresh = false;
+
+            if (pendingWidgetState && Object.keys(pendingWidgetState).length > 0) {
+                sessionDiagRecord("widget_state_replayed", {
+                    fields: Object.keys(pendingWidgetState).sort(),
+                });
+                this.applyWidgetState(pendingWidgetState);
+            }
+            if (pendingScenesRefresh) {
+                this._fetchScenes({ reason: "deferred_drag_replay" });
+            }
+        };
+
+        if (commitPromise && typeof commitPromise.then === "function") {
+            commitPromise.then(replay, replay);
+            return;
+        }
+        replay();
+    }
+
+    _shouldDeferSceneRefresh({ ignoreMutationGate = false } = {}) {
+        return !!(this.isDragging || (!ignoreMutationGate && this._timelineMutationDepth > 0));
+    }
+
+    _deferSceneRefresh(reason = "unknown", details = {}) {
+        this._pendingScenesRefresh = true;
+        sessionDiagRecord("scene_refresh_deferred", {
+            reason,
+            drag_type: this.dragType || "",
+            mutation_depth: this._timelineMutationDepth || 0,
+            ...details,
+        });
+    }
+
+    async _withTimelineMutationCommit(kind, callback) {
+        this._timelineMutationDepth += 1;
+        sessionDiagRecord("timeline_mutation_commit_start", {
+            kind,
+            mutation_depth: this._timelineMutationDepth,
+        });
+        try {
+            return await callback();
+        } finally {
+            this._timelineMutationDepth = Math.max(0, this._timelineMutationDepth - 1);
+            sessionDiagRecord("timeline_mutation_commit_end", {
+                kind,
+                mutation_depth: this._timelineMutationDepth,
+            });
+        }
     }
 
     _buildDOM() {
@@ -1483,14 +1560,42 @@ export class EditorWidget {
     }
 
     // ── Scene Management ───────────────────────────────────────────────
-    async _fetchScenes() {
+    async _fetchScenes({ ignoreMutationGate = false, reason = "external" } = {}) {
         if (!this.projectDir) return;
 
+        // #36 mid-drag refresh race: external WS / heartbeat / timer paths can call
+        // `_fetchScenes` while the user is mid-drag/mid-trim. `_setActiveScene` replaces
+        // `activeScene.clips` and `.audio_tracks` with fresh server-side instances, which
+        // orphans every `_dragItemsOrig`/`_trimItem` `data` reference held by the drag
+        // handler. The next mousemove tick then mutates ghost objects while the renderer
+        // reads the new ones → visual snap-back to mousedown origin every tick.
+        // Defer the refresh until the drag/trim completes; mouseup will replay it.
+        // #36 follow-up: also gate the commit window, and re-check before apply
+        // because a pre-drag fetch can resolve after the next drag has started.
+        if (this._shouldDeferSceneRefresh({ ignoreMutationGate })) {
+            this._deferSceneRefresh(reason, { stage: "start" });
+            return;
+        }
+
+        const fetchSeq = ++this._sceneFetchSeq;
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`));
             if (resp.ok) {
                 const data = await resp.json();
+                if (fetchSeq !== this._sceneFetchSeq) {
+                    sessionDiagRecord("scene_refresh_stale", {
+                        reason,
+                        fetch_seq: fetchSeq,
+                        current_seq: this._sceneFetchSeq,
+                    });
+                    return;
+                }
+                if (this._shouldDeferSceneRefresh({ ignoreMutationGate })) {
+                    this._deferSceneRefresh(reason, { stage: "apply" });
+                    return;
+                }
+                this._pendingScenesRefresh = false;
                 this.scenes = data.scenes || [];
                 if (this.scenes.length > 0 && !this.activeSceneId) {
                     this._setActiveScene(this.scenes[0]);
@@ -2465,6 +2570,8 @@ export class EditorWidget {
 
     _snapSelectionFrame(value, { direction = "up", clampMax = null } = {}) {
         const numeric = Math.max(0, Math.round(Number(value) || 0));
+        // Frame 0 is always a valid selection endpoint; template constraint snapping must never push it above 0.
+        if (numeric <= 0) return 0;
         const constraint = this._getActiveTemplate()?.constraints?.frames;
         if (!constraint?.step) return clampMax != null ? Math.min(numeric, Math.max(0, clampMax)) : numeric;
         const step = constraint.step;
@@ -4947,7 +5054,7 @@ export class EditorWidget {
     /** Snap a frame to nearby edges (clip edges, guide frames, playhead, selection bounds).
      *  Returns the snapped frame, or the original if no snap.
      *  Sets this._snapIndicator for visual feedback. */
-    _snapFrame(frame, excludeIds = []) {
+    _snapFrame(frame, excludeIds = [], excludeFrames = []) {
         if (!this.snappingEnabled || !this.activeScene) {
             this._snapIndicator = null;
             return frame;
@@ -4956,6 +5063,11 @@ export class EditorWidget {
         const threshold = this._snapThreshold;
         const candidates = [];
         const snapTargets = this._settings.timelineBehavior.snapTargets;
+        // Snap-back guard (#35): never snap to a frame that exactly equals an excluded frame
+        // (the drag's origin positions). Without this, dragging a clip whose origin is
+        // adjacent to another clip's edge — or near scene bounds — gets pulled back to
+        // origin and frameDelta collapses to 0.
+        const excludeSet = excludeFrames.length > 0 ? new Set(excludeFrames) : null;
 
         // Playhead
         if (snapTargets.playhead) {
@@ -5008,6 +5120,7 @@ export class EditorWidget {
         let best = frame;
         let bestDist = threshold + 1;
         for (const c of candidates) {
+            if (excludeSet && excludeSet.has(c)) continue;
             const d = Math.abs(frame - c);
             if (d < bestDist) {
                 bestDist = d;
@@ -5091,12 +5204,22 @@ export class EditorWidget {
                         if (edgeHit.type === "prompt" && this._isPromptTrackLocked()) return;
                         this._pushUndo("trim");
                         const isPrompt = edgeHit.type === "prompt";
+                        const trimOrigStart = isPrompt ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame;
+                        const trimOrigEnd = isPrompt ? edgeHit.data.end_frame : edgeHit.data.timeline_end_frame;
+                        const trimOrigSourceIn = edgeHit.data.source_in_frame || 0;
+                        const trimOrigSourceOut = edgeHit.data.source_out_frame || (trimOrigEnd - trimOrigStart);
+                        // Read total_source_frames from item data (set by backend on placement/split).
+                        // Fall back to (sourceOut - sourceIn) + visible duration for legacy data without the field.
+                        const trimOrigTotalSource = (typeof edgeHit.data.total_source_frames === "number" && edgeHit.data.total_source_frames > 0)
+                            ? edgeHit.data.total_source_frames
+                            : (trimOrigSourceOut - trimOrigSourceIn) + (trimOrigEnd - trimOrigStart);
                         this._trimItem = {
                             ...edgeHit,
-                            origStart: isPrompt ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame,
-                            origEnd: isPrompt ? edgeHit.data.end_frame : edgeHit.data.timeline_end_frame,
-                            origSourceIn: edgeHit.data.source_in_frame || 0,
-                            origSourceOut: edgeHit.data.source_out_frame || ((isPrompt ? edgeHit.data.end_frame : edgeHit.data.timeline_end_frame) - (isPrompt ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame)),
+                            origStart: trimOrigStart,
+                            origEnd: trimOrigEnd,
+                            origSourceIn: trimOrigSourceIn,
+                            origSourceOut: trimOrigSourceOut,
+                            origTotalSourceFrames: trimOrigTotalSource,
                         };
                         this.isDragging = true;
                         this.dragType = "trimEdge";
@@ -5133,6 +5256,12 @@ export class EditorWidget {
                         this._lastSnappedDelta = 0; // Track snapped delta for commit
                         this._dragItemOrigStart = hit.data.timeline_start_frame ?? hit.data.start_frame ?? hit.data.frame_index ?? 0;
                         this._dragItemOrigEnd = hit.data.timeline_end_frame ?? hit.data.end_frame ?? this._dragItemOrigStart;
+                        // Anchor lane/type for per-item lane-delta calculation (#15)
+                        this._dragAnchorId = hit.id;
+                        this._dragAnchorOrigLane = hit.type === "clip" ? (hit.data.track_index || 0)
+                            : (hit.type === "audio" ? (hit.data.lane_index || 0) : 0);
+                        this._dragAnchorTrackType = hit.type === "clip" ? this._clipTrackType(hit.data)
+                            : (hit.type === "audio" ? TRACK_TYPE.AUDIO : "");
                         // Store original positions + lane info for all selected items (group move)
                         this._dragItemsOrig = this.selectedItems.map(s => ({
                             type: s.type, id: s.id, data: s.data,
@@ -5142,14 +5271,24 @@ export class EditorWidget {
                             origTrackType: s.type === "clip" ? this._clipTrackType(s.data) : (s.type === "audio" ? TRACK_TYPE.AUDIO : ""),
                         }));
                         this._dragLaneChanged = false;
-                        // Snapshot ALL clip/audio lanes for swap preview
+                        this._dragSwapTarget = null;
+                        this._dragLastValidProposed = null;
+                        // Snapshot ALL clip/audio lanes AND positions for swap preview + hold-preview restore (#35)
                         this._origAllClipLanes = {};
+                        this._origAllClipStarts = {};
+                        this._origAllClipEnds = {};
                         for (const c of (this.activeScene?.clips || [])) {
                             this._origAllClipLanes[c.clip_id] = c.track_index || 0;
+                            this._origAllClipStarts[c.clip_id] = c.timeline_start_frame || 0;
+                            this._origAllClipEnds[c.clip_id] = c.timeline_end_frame || 0;
                         }
                         this._origAllAudioLanes = {};
+                        this._origAllAudioStarts = {};
+                        this._origAllAudioEnds = {};
                         for (const a of (this.activeScene?.audio_tracks || [])) {
                             this._origAllAudioLanes[a.track_id] = a.lane_index || 0;
+                            this._origAllAudioStarts[a.track_id] = a.timeline_start_frame || 0;
+                            this._origAllAudioEnds[a.track_id] = a.timeline_end_frame || 0;
                         }
                     } else {
                         // Click on empty space — deselect all
@@ -5222,7 +5361,6 @@ export class EditorWidget {
                     }
                 } else {
                     // Clips and audio — clamp to source media bounds
-                    const totalSourceFrames = (item.origEnd - item.origStart) + item.origSourceIn;
                     if (item.edge === "left") {
                         const delta = Math.max(-item.origSourceIn, snappedFrame - item.origStart);
                         const newStart = Math.max(0, Math.min(item.origEnd - 1, item.origStart + delta));
@@ -5234,8 +5372,10 @@ export class EditorWidget {
                             item.data.source_in_frame = Math.max(0, item.origSourceIn + sourceInDelta);
                         }
                     } else {
-                        // Clamp: can't extend past total source duration
-                        const maxEnd = item.origStart + totalSourceFrames - item.origSourceIn;
+                        // Right-edge trim ceiling = total_source_frames - source_in_frame
+                        // (post-trim tail remaining beyond the current visible end)
+                        const tailRemaining = Math.max(0, item.origTotalSourceFrames - item.origSourceOut);
+                        const maxEnd = item.origEnd + tailRemaining;
                         const newEnd = Math.max(item.origStart + 1, Math.min(maxEnd, snappedFrame));
                         item.data.timeline_end_frame = newEnd;
                         if (item.type === "clip") {
@@ -5246,25 +5386,20 @@ export class EditorWidget {
             } else if (this.dragType === "moveItem" && this.selectedItems.length > 0) {
                 canvas.style.cursor = "grabbing";
                 const rawDelta = frame - this._dragStartFrame;
-                // Apply snapping to the primary item's new position, compute adjusted delta
                 const excludeIds = this.selectedItems.map(s => s.id);
-                const primaryNewStart = Math.max(0, this._dragItemOrigStart + rawDelta);
-                const snappedStart = this._snapFrame(primaryNewStart, excludeIds);
-                const frameDelta = snappedStart - this._dragItemOrigStart;
-                this._lastSnappedDelta = frameDelta; // Store for mouseup commit
-                // Also snap the end edge of the primary item
-                if (this.selectedItem && (this.selectedItem.type === "clip" || this.selectedItem.type === "audio")) {
-                    const primaryEnd = snappedStart + (this._dragItemOrigEnd - this._dragItemOrigStart);
-                    const snappedEnd = this._snapFrame(primaryEnd, excludeIds);
-                    if (snappedEnd !== primaryEnd && this._snapIndicator === null) {
-                        // End edge snapped — adjust delta
-                        const endDelta = snappedEnd - this._dragItemOrigEnd;
-                        // Use end-snap if it's closer
-                        if (Math.abs(endDelta - rawDelta) < Math.abs(frameDelta - rawDelta - this._dragItemOrigStart)) {
-                            // Keep start-edge snap if active, otherwise use end-edge snap
-                        }
-                    }
+                // Snap-back guard (#35): exclude every dragged item's origStart/origEnd so
+                // snapping cannot pull primaryNewStart back to where the drag began. Adjacent
+                // clip edges and scene bounds remain valid snap targets when they aren't the origin.
+                const excludeFrames = [];
+                for (const o of (this._dragItemsOrig || [])) {
+                    if (typeof o.origStart === "number") excludeFrames.push(o.origStart);
+                    if (typeof o.origEnd === "number" && o.origEnd !== o.origStart) excludeFrames.push(o.origEnd);
                 }
+                const primaryNewStart = Math.max(0, this._dragItemOrigStart + rawDelta);
+                const snappedStart = this._snapFrame(primaryNewStart, excludeIds, excludeFrames);
+                const frameDelta = snappedStart - this._dragItemOrigStart;
+                this._lastSnappedDelta = frameDelta;
+
                 // Detect lane from Y position for cross-lane drag
                 let hoverLaneType = null;
                 let hoverLaneIndex = -1;
@@ -5275,55 +5410,170 @@ export class EditorWidget {
                     hoverLaneIndex = hoverEntry.laneIndex;
                 }
 
-                // Step 1: Restore ALL clips/audio to their original lanes
+                // Restore ALL clips/audio to their original lanes + positions before recomputing.
+                // Mid-drag mutations can leave previous-tick state on non-anchor items; the snapshot
+                // taken at mousedown is the canonical baseline.
                 for (const c of (this.activeScene?.clips || [])) {
                     if (this._origAllClipLanes && this._origAllClipLanes[c.clip_id] !== undefined) {
                         c.track_index = this._origAllClipLanes[c.clip_id];
+                    }
+                    if (this._origAllClipStarts && this._origAllClipStarts[c.clip_id] !== undefined) {
+                        c.timeline_start_frame = this._origAllClipStarts[c.clip_id];
+                        c.timeline_end_frame = this._origAllClipEnds[c.clip_id];
                     }
                 }
                 for (const a of (this.activeScene?.audio_tracks || [])) {
                     if (this._origAllAudioLanes && this._origAllAudioLanes[a.track_id] !== undefined) {
                         a.lane_index = this._origAllAudioLanes[a.track_id];
                     }
+                    if (this._origAllAudioStarts && this._origAllAudioStarts[a.track_id] !== undefined) {
+                        a.timeline_start_frame = this._origAllAudioStarts[a.track_id];
+                        a.timeline_end_frame = this._origAllAudioEnds[a.track_id];
+                    }
                 }
 
-                // Step 2: Determine dragged items' target lane
                 const draggedClipIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "clip").map(o => o.id));
                 const draggedAudioIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "audio").map(o => o.id));
-                this._dragLaneChanged = false;
 
-                // Step 3: Move all selected items + apply swap preview
+                // Anchor lane delta (#15): each dragged item's lane = origLane + (hoverLane - anchorOrigLane).
+                // Only applies when the hovered lane type matches the anchor's track type.
+                let anchorDelta = 0;
+                if (hoverLaneType === this._dragAnchorTrackType && hoverLaneIndex >= 0) {
+                    anchorDelta = hoverLaneIndex - this._dragAnchorOrigLane;
+                }
+
+                const scene = this.activeScene;
+                const laneMaxFor = (trackType) => {
+                    if (trackType === TRACK_TYPE.AUDIO) return scene?.audio_lane_count || 1;
+                    if (trackType === TRACK_TYPE.MOTION_DRIVER) return scene?.motion_driver_lane_count || 1;
+                    return scene?.video_lane_count || 1;
+                };
+
+                // Validate every dragged item's target lane is in range. If any fails, lane delta
+                // collapses to 0 — items keep their origLane while horizontal motion continues (#15 hold-preview).
+                let laneFitsAll = true;
                 for (const orig of (this._dragItemsOrig || [])) {
-                    if (orig.type === "clip" || orig.type === "audio") {
-                        const duration = orig.origEnd - orig.origStart;
-                        const newStart = Math.max(0, orig.origStart + frameDelta);
-                        orig.data.timeline_start_frame = newStart;
-                        orig.data.timeline_end_frame = newStart + duration;
-                        // Lane swap preview
-                        const origTrackType = orig.origTrackType || (orig.type === "clip" ? this._clipTrackType(orig.data) : "");
-                        if (orig.type === "clip" && hoverLaneType === origTrackType && hoverLaneIndex >= 0) {
-                            if (hoverLaneIndex !== orig.origLane) {
-                                orig.data.track_index = hoverLaneIndex;
-                                this._dragLaneChanged = true;
-                                // Swap: move all non-dragged clips on target lane to source lane
-                                for (const c of (this.activeScene?.clips || [])) {
-                                    if (!draggedClipIds.has(c.clip_id) && this._clipTrackType(c) === origTrackType && c.track_index === hoverLaneIndex) {
-                                        c.track_index = orig.origLane;
-                                    }
-                                }
-                            }
-                        } else if (orig.type === "audio" && hoverLaneType === TRACK_TYPE.AUDIO && hoverLaneIndex >= 0) {
-                            if (hoverLaneIndex !== orig.origLane) {
-                                orig.data.lane_index = hoverLaneIndex;
-                                this._dragLaneChanged = true;
-                                for (const a of (this.activeScene?.audio_tracks || [])) {
-                                    if (!draggedAudioIds.has(a.track_id) && a.lane_index === hoverLaneIndex) {
-                                        a.lane_index = orig.origLane;
-                                    }
-                                }
-                            }
+                    if (orig.type !== "clip" && orig.type !== "audio") continue;
+                    if (orig.origTrackType !== this._dragAnchorTrackType) continue;
+                    const targetLane = orig.origLane + anchorDelta;
+                    if (targetLane < 0 || targetLane >= laneMaxFor(orig.origTrackType)) {
+                        laneFitsAll = false;
+                        break;
+                    }
+                }
+                const effectiveLaneDelta = laneFitsAll ? anchorDelta : 0;
+
+                // Swap-target detection (#35): single-item drag where cursor is on a non-dragged
+                // same-type clip/audio item. Triggers a full position+lane swap rather than overlap.
+                let swapTarget = null;
+                const draggedOrig = this._dragItemsOrig || [];
+                if (draggedOrig.length === 1 && hoverLaneIndex >= 0) {
+                    const anchor = draggedOrig[0];
+                    if ((anchor.type === "clip" && hoverLaneType === anchor.origTrackType) ||
+                        (anchor.type === "audio" && hoverLaneType === TRACK_TYPE.AUDIO)) {
+                        const candidate = this._hitTestItem(x, rawY);
+                        if (candidate && candidate.id !== anchor.id && candidate.type === anchor.type) {
+                            swapTarget = candidate;
                         }
-                    } else if (orig.type === "guide") {
+                    }
+                }
+                this._dragSwapTarget = swapTarget;
+
+                // Compute proposed positions for all dragged items.
+                const proposed = [];
+                for (const orig of (this._dragItemsOrig || [])) {
+                    if (orig.type !== "clip" && orig.type !== "audio") continue;
+                    const duration = orig.origEnd - orig.origStart;
+                    let newStart, newLane;
+                    if (swapTarget && orig.id === this._dragAnchorId) {
+                        newStart = swapTarget.data.timeline_start_frame;
+                        newLane = orig.type === "clip"
+                            ? (swapTarget.data.track_index || 0)
+                            : (swapTarget.data.lane_index || 0);
+                    } else {
+                        newStart = Math.max(0, orig.origStart + frameDelta);
+                        newLane = (orig.origTrackType === this._dragAnchorTrackType)
+                            ? orig.origLane + effectiveLaneDelta
+                            : orig.origLane;
+                    }
+                    proposed.push({ orig, newStart, newEnd: newStart + duration, newLane });
+                }
+
+                // Overlap validation (#35 lock-lane-merge). Same-lane overlap with a non-dragged
+                // item is invalid unless that item is the swap target.
+                const ignoreIds = new Set();
+                if (swapTarget) ignoreIds.add(swapTarget.id);
+                let allFitsValid = true;
+                for (const p of proposed) {
+                    const others = p.orig.type === "clip"
+                        ? (scene?.clips || [])
+                        : (scene?.audio_tracks || []);
+                    for (const c of others) {
+                        const cid = c.clip_id || c.track_id;
+                        if (draggedClipIds.has(cid) || draggedAudioIds.has(cid)) continue;
+                        if (ignoreIds.has(cid)) continue;
+                        const cLane = (c.track_index !== undefined) ? c.track_index : c.lane_index;
+                        if (cLane !== p.newLane) continue;
+                        if (p.orig.type === "clip" && this._clipTrackType(c) !== p.orig.origTrackType) continue;
+                        // Half-open overlap: [a_start, a_end) intersects [b_start, b_end) iff a_start < b_end && a_end > b_start
+                        if (p.newStart < (c.timeline_end_frame ?? 0) && p.newEnd > (c.timeline_start_frame ?? 0)) {
+                            allFitsValid = false;
+                            break;
+                        }
+                    }
+                    if (!allFitsValid) break;
+                }
+
+                if (allFitsValid) {
+                    // Apply proposed positions/lanes to all dragged items
+                    for (const p of proposed) {
+                        p.orig.data.timeline_start_frame = p.newStart;
+                        p.orig.data.timeline_end_frame = p.newEnd;
+                        if (p.orig.type === "clip") {
+                            p.orig.data.track_index = p.newLane;
+                        } else {
+                            p.orig.data.lane_index = p.newLane;
+                        }
+                    }
+                    // Swap target takes anchor's original (position + lane)
+                    if (swapTarget) {
+                        const anchor = draggedOrig[0];
+                        const tDur = (swapTarget.data.timeline_end_frame ?? 0) - (swapTarget.data.timeline_start_frame ?? 0);
+                        swapTarget.data.timeline_start_frame = anchor.origStart;
+                        swapTarget.data.timeline_end_frame = anchor.origStart + tDur;
+                        if (anchor.type === "clip") {
+                            swapTarget.data.track_index = anchor.origLane;
+                        } else {
+                            swapTarget.data.lane_index = anchor.origLane;
+                        }
+                    }
+                    this._dragLastValidProposed = proposed;
+                    this._dragLastValidSwapTarget = swapTarget;
+                    this._dragLaneChanged = (effectiveLaneDelta !== 0) || swapTarget != null;
+                } else if (this._dragLastValidProposed) {
+                    // Hold preview at last valid frame — replay it
+                    for (const p of this._dragLastValidProposed) {
+                        p.orig.data.timeline_start_frame = p.newStart;
+                        p.orig.data.timeline_end_frame = p.newEnd;
+                        if (p.orig.type === "clip") p.orig.data.track_index = p.newLane;
+                        else p.orig.data.lane_index = p.newLane;
+                    }
+                    if (this._dragLastValidSwapTarget) {
+                        const lastTarget = this._dragLastValidSwapTarget;
+                        const anchor = draggedOrig[0];
+                        const tDur = (lastTarget.data.timeline_end_frame ?? 0) - (lastTarget.data.timeline_start_frame ?? 0);
+                        // Reapply swap from snapshot to keep the swap target in anchor's origin
+                        lastTarget.data.timeline_start_frame = anchor.origStart;
+                        lastTarget.data.timeline_end_frame = anchor.origStart + tDur;
+                        if (anchor.type === "clip") lastTarget.data.track_index = anchor.origLane;
+                        else lastTarget.data.lane_index = anchor.origLane;
+                    }
+                }
+                // (else no prior valid state — items already restored to origLane/origStart above)
+
+                // Non-clip/audio items move directly per frameDelta
+                for (const orig of (this._dragItemsOrig || [])) {
+                    if (orig.type === "guide") {
                         const newIdx = Math.max(0, Math.min(this.totalFrames - 1, orig.origStart + frameDelta));
                         orig.data._previewFrameIndex = newIdx;
                     } else if (orig.type === "prompt") {
@@ -5344,6 +5594,7 @@ export class EditorWidget {
             this.isDragging = false;
             this.dragType = null;
             this._snapIndicator = null;
+            let commitPromise = null;
 
             if (wasDragType === "headerResize") {
                 this._updateSettings({
@@ -5354,18 +5605,19 @@ export class EditorWidget {
                 });
                 canvas.style.cursor = "crosshair";
                 this._renderTimeline();
+                this._flushDeferredDragState();
                 return;
             } else if (wasDragType === "trimEdge" && this._trimItem) {
                 // Commit trim to server
-                this._commitTrim(this._trimItem);
+                commitPromise = this._commitTrim(this._trimItem);
                 this._trimItem = null;
                 canvas.style.cursor = "crosshair";
             } else if (wasDragType === "moveItem" && this.selectedItems.length > 0) {
                 // Use the snapped delta (stored during mousemove), not raw mouse position
                 const frameDelta = this._lastSnappedDelta || 0;
 
-                if (frameDelta !== 0 || this._dragLaneChanged) {
-                    this._commitItemMove(frameDelta);
+                if (frameDelta !== 0 || this._dragLaneChanged || this._dragSwapTarget) {
+                    commitPromise = this._commitItemMove(frameDelta);
                 } else {
                     // Click without drag = show properties editor (single item only)
                     // Remove the undo entry since nothing changed
@@ -5387,9 +5639,19 @@ export class EditorWidget {
                 canvas.style.cursor = "grab";
                 this._dragItemsOrig = null;
                 this._origAllClipLanes = {};
+                this._origAllClipStarts = {};
+                this._origAllClipEnds = {};
                 this._origAllAudioLanes = {};
+                this._origAllAudioStarts = {};
+                this._origAllAudioEnds = {};
                 this._lastSnappedDelta = 0;
                 this._dragLaneChanged = false;
+                this._dragSwapTarget = null;
+                this._dragLastValidProposed = null;
+                this._dragLastValidSwapTarget = null;
+                this._dragAnchorId = null;
+                this._dragAnchorOrigLane = 0;
+                this._dragAnchorTrackType = "";
             } else {
                 // Normalize selection direction
                 if (this.selectionStart > this.selectionEnd) {
@@ -5401,6 +5663,10 @@ export class EditorWidget {
             }
 
             this._renderTimeline();
+
+            // #36: replay deferred remote widget/scenes state after move/trim commits
+            // settle so a stale refresh cannot pull pre-commit state over the released drag.
+            this._flushDeferredDragState(commitPromise);
         };
 
         canvas.addEventListener("mouseup", onMouseUp);
@@ -5437,7 +5703,20 @@ export class EditorWidget {
             e.preventDefault();
             e.stopPropagation(); // Prevent ComfyUI from also handling this drop
             const assetData = e.dataTransfer.getData("application/x-sonder-asset");
-            if (!assetData) return;
+            if (!assetData) {
+                // #5 diagnostic: a drop reached the timeline canvas but lacks the asset payload.
+                // Most common cause is the gallery being in manage mode (it then sets
+                // `application/x-sonder-asset-move` only). Surface the situation rather than
+                // silently doing nothing so the next repro identifies the seam.
+                const types = Array.from(e.dataTransfer?.types || []);
+                if (types.length > 0) {
+                    console.debug("[Sonder] Timeline drop received non-asset payload; types:", types);
+                    if (types.includes("application/x-sonder-asset-move")) {
+                        this._showToast?.("Turn off Manage mode in the gallery to drop assets onto the timeline.");
+                    }
+                }
+                return;
+            }
 
             try {
                 const asset = JSON.parse(assetData);
@@ -5710,10 +5989,6 @@ export class EditorWidget {
 
         this._pushUndo("add asset");
 
-        // Block drop on locked lanes
-        if (this._isLaneLocked(TRACK_TYPE.VIDEO, targetVideoLane) || this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
-
-        // Auto-add lane if target lane has overlapping items at the drop frame
         const _findAsset = (id) => {
             for (const type of ["video", "image", "audio", "artifact"]) {
                 const found = (this.assets[type] || []).find(a => a.asset_id === id);
@@ -5721,6 +5996,22 @@ export class EditorWidget {
             }
             return null;
         };
+
+        // Block drop on locked lanes — only the lane the asset would actually land on.
+        // Image drops always go to the Guides track (its own lock checked above at line 5800),
+        // so the default targetVideoLane/targetAudioLane lock check must not run for images.
+        // (#5/#14b 2026-05-21: image drops were getting blocked when V1 or A1 was locked
+        //  because the lane defaults match that lane.)
+        if (asset.asset_type === "video") {
+            if (this._isLaneLocked(TRACK_TYPE.VIDEO, targetVideoLane)) return;
+            const _assetObjForLock = _findAsset(asset.asset_id);
+            const _videoHasAudio = _assetObjForLock?.has_audio === true || asset?.has_audio === true;
+            if (_videoHasAudio && this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
+        } else if (asset.asset_type === "audio") {
+            if (this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
+        }
+
+        // Auto-add lane if target lane has overlapping items at the drop frame
         if (asset.asset_type === "video") {
             const assetObj = _findAsset(asset.asset_id);
             const videoHasAudio = assetObj?.has_audio === true || asset?.has_audio === true;
@@ -6273,12 +6564,29 @@ export class EditorWidget {
             : (this.activeScene.audio_lane_count || 1);
         if (currentCount <= 1) return;
 
-        // Shift items on higher lanes down
+        const cloneLaneConfig = (cfg) => ({
+            name: cfg?.name || "",
+            color: cfg?.color || "",
+            locked: !!cfg?.locked,
+            hidden: !!cfg?.hidden,
+        });
+        const reindexLaneConfigs = (configs) => {
+            const nextCount = currentCount - 1;
+            const next = (configs || [])
+                .filter((_cfg, idx) => idx !== laneIndex)
+                .map(cloneLaneConfig)
+                .slice(0, nextCount);
+            while (next.length < nextCount) next.push(this._defaultLaneConfig());
+            return next;
+        };
+
         const body = {};
         if (isVideo) {
             body.video_lane_count = currentCount - 1;
+            body.video_lane_configs = reindexLaneConfigs(this.activeScene.video_lane_configs);
         } else {
             body.audio_lane_count = currentCount - 1;
+            body.audio_lane_configs = reindexLaneConfigs(this.activeScene.audio_lane_configs);
         }
         try {
             this._pushUndo("remove lane");
@@ -7149,22 +7457,28 @@ export class EditorWidget {
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
 
-        try {
-            const draggedClipIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "clip").map(o => o.id));
-            const draggedAudioIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "audio").map(o => o.id));
+        return this._withTimelineMutationCommit("moveItem", async () => {
+            try {
+            const dragItemsOrig = this._dragItemsOrig || [];
+            const draggedClipIds = new Set(dragItemsOrig.filter(o => o.type === "clip").map(o => o.id));
+            const draggedAudioIds = new Set(dragItemsOrig.filter(o => o.type === "audio").map(o => o.id));
             const origClipLanes = this._origAllClipLanes || {};
             const origAudioLanes = this._origAllAudioLanes || {};
+            const origClipStarts = this._origAllClipStarts || {};
+            const origAudioStarts = this._origAllAudioStarts || {};
 
-            // Persist the exact previewed lane map so swap-on-drag commits
-            // the same final state the user saw during the drag.
+            // Persist the exact previewed state. A non-dragged item is committed when its
+            // lane OR timeline_start changed — supports full position+lane swap from #35.
             for (const clip of (this.activeScene.clips || [])) {
                 const clipId = clip.clip_id;
                 const isDragged = draggedClipIds.has(clipId);
                 const origLane = origClipLanes[clipId];
                 const laneChanged = origLane !== undefined && (clip.track_index || 0) !== origLane;
-                if (!isDragged && !laneChanged) continue;
+                const origStart = origClipStarts[clipId];
+                const startChanged = origStart !== undefined && (clip.timeline_start_frame || 0) !== origStart;
+                if (!isDragged && !laneChanged && !startChanged) continue;
                 const putBody = { track_index: clip.track_index || 0 };
-                if (isDragged) {
+                if (isDragged || startChanged) {
                     putBody.timeline_start_frame = clip.timeline_start_frame;
                     putBody.timeline_end_frame = clip.timeline_end_frame;
                 }
@@ -7180,9 +7494,11 @@ export class EditorWidget {
                 const isDragged = draggedAudioIds.has(trackId);
                 const origLane = origAudioLanes[trackId];
                 const laneChanged = origLane !== undefined && (track.lane_index || 0) !== origLane;
-                if (!isDragged && !laneChanged) continue;
+                const origStart = origAudioStarts[trackId];
+                const startChanged = origStart !== undefined && (track.timeline_start_frame || 0) !== origStart;
+                if (!isDragged && !laneChanged && !startChanged) continue;
                 const putBody = { lane_index: track.lane_index || 0 };
-                if (isDragged) {
+                if (isDragged || startChanged) {
                     putBody.timeline_start_frame = track.timeline_start_frame;
                     putBody.timeline_end_frame = track.timeline_end_frame;
                 }
@@ -7193,7 +7509,7 @@ export class EditorWidget {
                 });
             }
 
-            for (const orig of (this._dragItemsOrig || [])) {
+            for (const orig of dragItemsOrig) {
                 const { type, id, data } = orig;
                 if (type === "clip" || type === "audio") {
                     continue;
@@ -7232,13 +7548,14 @@ export class EditorWidget {
                 }
             }
 
-            await this._fetchScenes();
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_commit" });
             this._renderTimeline();
-        } catch (e) {
+            } catch (e) {
             console.warn("[Sonder] Failed to move items:", e);
-            await this._fetchScenes();
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_error" });
             this._renderTimeline();
-        }
+            }
+        });
     }
 
     /** Commit a trim operation (edge drag) to the server. */
@@ -7248,7 +7565,8 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
         const { type, id, data } = trimInfo;
 
-        try {
+        return this._withTimelineMutationCommit("trimEdge", async () => {
+            try {
             if (type === "clip") {
                 await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`), {
                     method: "PUT",
@@ -7281,13 +7599,14 @@ export class EditorWidget {
                     }),
                 });
             }
-            await this._fetchScenes();
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_commit" });
             this._renderTimeline();
-        } catch (e) {
+            } catch (e) {
             console.warn("[Sonder] Failed to commit trim:", e);
-            await this._fetchScenes();
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_error" });
             this._renderTimeline();
-        }
+            }
+        });
     }
 
     /** Split a clip at the given frame (razor tool). */

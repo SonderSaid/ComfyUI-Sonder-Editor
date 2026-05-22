@@ -227,6 +227,185 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
     assert invalid_image_update.status == 400
 
 
+def test_post_guide_to_scene_with_empty_guide_frames(tmp_path, monkeypatch):
+    # #5: POST /guides must accept additions to a scene with no existing guides.
+    # Regression guard for the "delete all guides → drag broken" repro shape;
+    # confirms the backend POST is not gated on a non-empty guide list.
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=48)
+    scene.guide_frames = []
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [
+        Asset(asset_id="img-1", asset_type="image", path="media/ref.png"),
+    ]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    add_guide = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/guides",
+    )
+    response = asyncio.run(add_guide(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"frame_index": 5, "asset_id": "img-1", "source": "asset", "strength": 0.8},
+    )))
+
+    assert response.status == 201
+    assert len(scene.guide_frames) == 1
+    assert scene.guide_frames[0].frame_index == 5
+    assert scene.guide_frames[0].asset_id == "img-1"
+
+
+def test_clip_put_accepts_same_lane_move_when_no_other_clip_overlaps(tmp_path, monkeypatch):
+    # #35: single-clip move forward/backward must not be rejected when nothing collides.
+    # Confirms the backend stays permissive — frontend owns overlap policy.
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    clip = ClipReference(
+        clip_id="lonely",
+        source_path="media/a.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        source_out_frame=10,
+        total_source_frames=10,
+        track_index=0,
+    )
+    scene = Scene(scene_id="scene-1", name="Scene", video_lane_count=1)
+    scene.video_lane_configs = [LaneConfig(name="Lane 1")]
+    scene.clips = [clip]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    update_clip = _route_handler(
+        route_module,
+        "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}",
+    )
+
+    # Forward move
+    forward = asyncio.run(update_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "lonely"},
+        body={"timeline_start_frame": 20, "timeline_end_frame": 30},
+    )))
+    assert forward.status == 200
+    assert clip.timeline_start_frame == 20
+    assert clip.timeline_end_frame == 30
+
+    # Backward move
+    backward = asyncio.run(update_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "lonely"},
+        body={"timeline_start_frame": 5, "timeline_end_frame": 15},
+    )))
+    assert backward.status == 200
+    assert clip.timeline_start_frame == 5
+    assert clip.timeline_end_frame == 15
+
+
+def test_clip_put_round_trips_cross_lane_swap(tmp_path, monkeypatch):
+    # #35: full position+lane swap commits as two PUTs. Anchor moves to target's
+    # original (start, lane); target moves to anchor's original (start, lane).
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    anchor = ClipReference(
+        clip_id="anchor",
+        source_path="media/a.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        source_out_frame=10,
+        total_source_frames=10,
+        track_index=0,
+    )
+    target = ClipReference(
+        clip_id="target",
+        source_path="media/b.mp4",
+        timeline_start_frame=20,
+        timeline_end_frame=30,
+        source_out_frame=10,
+        total_source_frames=10,
+        track_index=1,
+    )
+    scene = Scene(scene_id="scene-1", name="Scene", video_lane_count=2)
+    scene.video_lane_configs = [LaneConfig(name="Lane 1"), LaneConfig(name="Lane 2")]
+    scene.clips = [anchor, target]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    update_clip = _route_handler(
+        route_module,
+        "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}",
+    )
+
+    # Frontend commits both halves of the swap as two PUTs
+    anchor_resp = asyncio.run(update_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "anchor"},
+        body={"timeline_start_frame": 20, "timeline_end_frame": 30, "track_index": 1},
+    )))
+    target_resp = asyncio.run(update_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "target"},
+        body={"timeline_start_frame": 0, "timeline_end_frame": 10, "track_index": 0},
+    )))
+
+    assert anchor_resp.status == 200
+    assert target_resp.status == 200
+    assert anchor.timeline_start_frame == 20
+    assert anchor.track_index == 1
+    assert target.timeline_start_frame == 0
+    assert target.track_index == 0
+
+
+def test_clip_right_trim_extends_when_split_ceiling_allows(tmp_path, monkeypatch):
+    # #9: end-trim restore. A clip with total_source_frames=20 trimmed to source_out_frame=5
+    # must accept a PUT that re-extends source_out_frame back up to 20.
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    clip = ClipReference(
+        clip_id="trim-restore",
+        source_path="media/clip.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=5,
+        source_in_frame=0,
+        source_out_frame=5,
+        total_source_frames=20,
+        track_index=0,
+    )
+    scene = Scene(scene_id="scene-1", name="Scene", video_lane_count=1)
+    scene.video_lane_configs = [LaneConfig(name="Lane 1")]
+    scene.clips = [clip]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+
+    update_clip = _route_handler(
+        route_module,
+        "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips/{clip_id}",
+    )
+    response = asyncio.run(update_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": "trim-restore"},
+        body={"timeline_end_frame": 20, "source_out_frame": 20},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["timeline_end_frame"] == 20
+    assert payload["source_out_frame"] == 20
+    assert clip.timeline_end_frame == 20
+    assert clip.source_out_frame == 20
+
+
 def test_dual_drop_skips_audio_when_video_asset_has_no_audio(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"

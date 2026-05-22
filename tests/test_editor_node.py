@@ -2150,7 +2150,7 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
     assert trimmed.source_in_frame == 2
     assert trimmed.source_out_frame == 6
     assert trimmed.source_origin_frame == 2
-    assert trimmed.total_source_frames == 9
+    assert trimmed.total_source_frames == 7
 
     project._execution_context = {
         "scene_id": "scene-1",
@@ -2170,6 +2170,61 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
     assert untrimmed.source_out_frame == 8
     assert untrimmed.source_origin_frame == 0
     assert untrimmed.total_source_frames == 8
+
+
+def test_save_video_take_trimmed_with_mask_offsets(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True, exist_ok=True)
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=48)
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Take Mask Offset Test",
+        scenes=[scene],
+    )
+
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    node = io_nodes.SonderSaveVideo()
+
+    # actual_pre=2, actual_post=2, selection=[10,15), padding=2 -> total_frames=11
+    # mask_pre=1, mask_post=1
+    # Expected:
+    #   source_in     = max(0, 2 - 1) = 1
+    #   hidden_tail   = (2 - 1) + 2 = 3
+    #   source_out    = 11 - 3 = 8
+    #   timeline_start = 10 - 1 = 9
+    #   timeline_end   = 15 + 1 = 16
+    #   total_source  = 11 - 2 = 9
+    project._execution_context = {
+        "scene_id": "scene-1",
+        "scene_name": "Scene 1",
+        "selection_start": 10,
+        "selection_end": 15,
+        "actual_pre_context_frames": 2,
+        "actual_post_context_frames": 2,
+        "mask_pre_offset": 1,
+        "mask_post_offset": 1,
+        "frame_count_padding": 2,
+        "take_placement_mode": "trimmed",
+    }
+    node.save_video(project, torch.zeros(11, 2, 2, 3, dtype=torch.float32), filename_prefix="mask", fps=24.0, mode="Take")
+    clip = scene.clips[-1]
+
+    assert clip.timeline_start_frame == 9
+    assert clip.timeline_end_frame == 16
+    assert clip.source_in_frame == 1
+    assert clip.source_out_frame == 8
+    assert clip.source_origin_frame == 1
+    assert clip.total_source_frames == 9
 
 
 def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, monkeypatch):

@@ -161,6 +161,36 @@ def test_project_saved_event_dedupes_matching_alias(monkeypatch):
         assert events[0][1]["project_id"] == folder_id
 
 
+def test_save_project_diag_uses_folder_alias(monkeypatch):
+    from server import session_registry
+
+    events = []
+
+    def capture(kind, project_id="", host_id="", **details):
+        events.append((kind, project_id, host_id, details))
+
+    monkeypatch.setattr(session_registry, "record_diag_event", capture)
+
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Diag Alias", base_dir=base_dir)
+        events.clear()
+
+        save_project(project)
+
+        folder_id = os.path.basename(os.path.normpath(project.project_dir))
+        saved_events = [event for event in events if event[0] == "project_saved"]
+        assert len(saved_events) == 1
+        kind, project_id, host_id, details = saved_events[0]
+        assert kind == "project_saved"
+        assert project_id == folder_id
+        assert project_id != project.project_id
+        assert host_id == ""
+        assert details["canonical_project_id"] == project.project_id
+        assert details["modified_at"] == project.modified_at
+        assert details["bumped"] is True
+        assert details["caller"]
+
+
 def test_load_project_missing():
     import pytest
     with tempfile.TemporaryDirectory() as base_dir:

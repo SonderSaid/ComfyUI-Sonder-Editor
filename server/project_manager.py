@@ -116,6 +116,27 @@ def save_project(
     os.replace(tmp_file, project_file)
     if hasattr(project, "_expected_modified_at"):
         setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
+    # #36 diagnostic: every save with the caller's immediate stack frame so the diag ring
+    # shows WHO bumped modified_at. Pairs with `project_version_conflict_409` events to
+    # trace concurrent writers. Lazy import avoids circular dependency at module load.
+    try:
+        from .session_registry import record_diag_event as _record_diag_event
+        import sys as _sys
+        _caller = _sys._getframe(1)
+        _caller_info = f"{os.path.basename(_caller.f_code.co_filename)}:{_caller.f_lineno} {_caller.f_code.co_name}"
+        _canonical_project_id = str(getattr(project, "project_id", "") or "")
+        _project_dir = str(getattr(project, "project_dir", "") or "")
+        _folder_project_id = os.path.basename(os.path.normpath(_project_dir)) if _project_dir else ""
+        _record_diag_event(
+            "project_saved",
+            project_id=_folder_project_id or _canonical_project_id,
+            canonical_project_id=_canonical_project_id,
+            modified_at=str(getattr(project, "modified_at", "") or ""),
+            bumped=bool(bump_modified_at),
+            caller=_caller_info,
+        )
+    except Exception:
+        logger.debug("save_project failed to emit diag event", exc_info=True)
     if notify:
         for hook in list(_PROJECT_SAVED_HOOKS):
             try:

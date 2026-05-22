@@ -129,12 +129,14 @@ class TabWidgetHost {
     }
 
     setValue(name, value) {
+        if (Object.is(this.values[name], value)) return;
         this.values[name] = value;
         if (!this.publishEnabled || !this.canvasHostConnected) return;
         this._publish({ [name]: value });
     }
 
     setValueLocal(name, value) {
+        if (Object.is(this.values[name], value)) return;
         this.values[name] = value;
     }
 
@@ -498,7 +500,14 @@ async function main() {
 
     const sync = connectProjectSync(projectId, {
         onProjectUpdated: (event) => {
-            if (event.modified_at && event.modified_at !== getProjectVersion(projectId)) {
+            const currentVersion = getProjectVersion(projectId);
+            const shouldRefresh = !!(event.modified_at && event.modified_at !== currentVersion);
+            tabDiagRecord("project_updated_recv", {
+                event_modified_at: event.modified_at || "",
+                current_version: currentVersion || "",
+                refresh: shouldRefresh,
+            });
+            if (shouldRefresh) {
                 editor.refresh(["project", "assets", "scenes", "queue"]);
             }
         },
@@ -575,6 +584,7 @@ async function main() {
             const response = await fetch(api.apiURL(`/sonder-editor/session/${encodeURIComponent(projectId)}/diag`));
             if (response.ok) backendDiag = await response.json();
         } catch (_) { backendDiag = null; }
+        const canvasDiag = (typeof window !== "undefined" && window.__SONDER_CANVAS_DIAG) || null;
         const bundle = {
             captured_at_wall: Date.now(),
             captured_at_mono: performance.now(),
@@ -587,6 +597,10 @@ async function main() {
                 boot: _tabDiagBoot ? { ..._tabDiagBoot } : null,
                 events: _tabDiagEvents.slice(),
             },
+            canvas_page: canvasDiag ? {
+                boot: canvasDiag.boot ? { ...canvasDiag.boot } : null,
+                events: Array.isArray(canvasDiag.events) ? canvasDiag.events.slice() : [],
+            } : null,
             backend: backendDiag,
         };
         const json = JSON.stringify(bundle, null, 2);

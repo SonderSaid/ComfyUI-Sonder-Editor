@@ -101,6 +101,25 @@ async def _project_conflict_middleware(request: web.Request, handler):
     try:
         return await handler(request)
     except ProjectVersionConflict as exc:
+        # #36 / 409-race diagnostic: capture every project_version_conflict so the
+        # diag ring shows when stale `If-Match` headers collide with concurrent writers.
+        # Lets us correlate snap-back symptoms with the request path that 409'd.
+        try:
+            project_id = ""
+            try:
+                project_id = str(request.match_info.get("project_id", "") or "")
+            except Exception:
+                project_id = ""
+            record_diag_event(
+                "project_version_conflict_409",
+                project_id=project_id,
+                path=str(request.path or ""),
+                method=str(request.method or ""),
+                expected_modified_at=str(exc.expected_modified_at or ""),
+                actual_modified_at=str(exc.actual_modified_at or ""),
+            )
+        except Exception:
+            logger.debug("project_conflict_middleware failed to emit diag event", exc_info=True)
         payload = {
             "error": "project_version_conflict",
             "code": "project_version_conflict",

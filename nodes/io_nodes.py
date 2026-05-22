@@ -1302,9 +1302,12 @@ class SonderSaveVideo:
                 frame_count_padding = max(0, context_int("frame_count_padding", 0))
                 take_placement_mode = ctx.get("take_placement_mode", "trimmed")
 
+                mask_pre = max(0, min(actual_pre, context_int("mask_pre_offset", 0)))
+                mask_post = max(0, min(actual_post, context_int("mask_post_offset", 0)))
+
                 if take_placement_mode == "untrimmed":
-                    # Untrimmed: place full rendered source (pre+generation+post) on the timeline
-                    # so the seam is visible rather than inferred.
+                    # DIAGNOSTIC: untrimmed mode intentionally ignores mask_pre/post_offset (Phase 1 decision).
+                    # Places full rendered source (pre+generation+post) on the timeline so the seam is visible.
                     source_in_frame = 0
                     source_out_frame = total_frames
                     timeline_start_frame = sel_start - actual_pre
@@ -1312,15 +1315,16 @@ class SonderSaveVideo:
                     source_origin_frame = 0
                     clip_total_source_frames = total_frames
                 else:
-                    # Trimmed (default): show only the generated portion on the timeline
-                    source_in_frame = min(total_frames, actual_pre if actual_pre > 0 else 0)
-                    hidden_tail_frames = actual_post + frame_count_padding
+                    # Trimmed (default): show generated portion plus mask offsets on the timeline.
+                    # total_source_frames excludes padding so trim cannot expose padding frames.
+                    source_in_frame = max(0, actual_pre - mask_pre)
+                    hidden_tail_frames = (actual_post - mask_post) + frame_count_padding
                     source_out_frame = total_frames - hidden_tail_frames if hidden_tail_frames > 0 else total_frames
                     source_out_frame = max(source_in_frame, min(total_frames, source_out_frame))
-                    timeline_start_frame = sel_start
-                    timeline_end_frame = sel_end
+                    timeline_start_frame = sel_start - mask_pre
+                    timeline_end_frame = sel_end + mask_post
                     source_origin_frame = source_in_frame
-                    clip_total_source_frames = total_frames
+                    clip_total_source_frames = max(0, total_frames - frame_count_padding)
 
                 clip = ClipReference(
                     source_path=os.path.join("media", output_filename),
@@ -1366,6 +1370,18 @@ class SonderSaveVideo:
                             scene.audio_lane_count = new_audio_lane + 1
                         while len(scene.audio_lane_configs) < scene.audio_lane_count:
                             scene.audio_lane_configs.append(LaneConfig())
+
+                        if take_placement_mode != "untrimmed":
+                            visible_len = (sel_end + mask_post) - (sel_start - mask_pre)
+                            assert (timeline_end_frame - timeline_start_frame) == visible_len, (
+                                f"audio invariant: timeline span {timeline_end_frame - timeline_start_frame} != visible_len {visible_len}"
+                            )
+                            assert source_in_frame == max(0, actual_pre - mask_pre), (
+                                f"audio invariant: source_in_frame {source_in_frame} != actual_pre - mask_pre {max(0, actual_pre - mask_pre)}"
+                            )
+                            assert clip_total_source_frames == max(0, total_frames - frame_count_padding), (
+                                f"audio invariant: total_source_frames {clip_total_source_frames} != total_frames - padding {max(0, total_frames - frame_count_padding)}"
+                            )
 
                         scene.audio_tracks.append(AudioTrack(
                             source_path=audio_rel_path,

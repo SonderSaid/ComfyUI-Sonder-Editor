@@ -226,6 +226,72 @@ def test_bridge_guide_track_hidden_skips_unless_overridden(tmp_path, monkeypatch
     assert [g["local_idx"] for g in bridge._apply_bridge_overrides(guides, override_json)] == [3]
 
 
+# ── #14b: empty / out-of-range / all-muted guide set returns strength 0.0 ────
+def test_bridge_start_returns_strength_zero_for_empty_guides(tmp_path, monkeypatch):
+    bridge, _ts, project, scene = _make_project_with_guides(tmp_path, monkeypatch, [])
+    _set_render_window(project, 0, scene.duration_frames)
+
+    node = bridge.SonderGuidesBridgeStart()
+    result = node.execute(project, iteration_index=0)
+    _flow, image, frame_idx, strength = result[:4]
+    assert frame_idx == 0
+    assert strength == 0.0
+    # _empty_image returns a black 1xHxWx3 tensor at the scene resolution.
+    assert image.shape[0] == 1
+
+
+def test_bridge_start_returns_strength_zero_for_out_of_range_index(tmp_path, monkeypatch):
+    bridge, _ts, project, scene = _make_project_with_guides(
+        tmp_path, monkeypatch,
+        [{"frame_index": 5, "asset_id": "a", "strength": 0.7}],
+    )
+    _set_render_window(project, 0, scene.duration_frames)
+
+    node = bridge.SonderGuidesBridgeStart()
+    result = node.execute(project, iteration_index=5)  # only 1 guide, index 5 out of range
+    _flow, _image, frame_idx, strength = result[:4]
+    assert frame_idx == 0
+    assert strength == 0.0
+
+
+def test_bridge_start_returns_strength_zero_for_all_muted_overrides(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project_with_guides(
+        tmp_path, monkeypatch,
+        [
+            {"frame_index": 3, "asset_id": "a", "strength": 0.5},
+            {"frame_index": 6, "asset_id": "b", "strength": 0.9},
+        ],
+    )
+    # Hide the guide track so every editor_muted is True; no overrides flip any back on.
+    scene.guide_track_config = timeline_state.LaneConfig(hidden=True)
+    _set_render_window(project, 0, scene.duration_frames)
+
+    node = bridge.SonderGuidesBridgeStart()
+    result = node.execute(project, iteration_index=0)
+    _flow, _image, frame_idx, strength = result[:4]
+    assert frame_idx == 0
+    assert strength == 0.0
+
+
+def test_bridge_start_preserves_strength_when_image_corrupt(tmp_path, monkeypatch):
+    # Regression guard for the corrupt-image branch at bridge_nodes.py:317-323.
+    # That branch keeps the configured guide strength because a real guide existed;
+    # only the empty/out-of-range branch is the 0.0 placeholder.
+    bridge, _ts, project, scene = _make_project_with_guides(
+        tmp_path, monkeypatch,
+        [{"frame_index": 5, "asset_id": "a", "strength": 0.7}],
+    )
+    _set_render_window(project, 0, scene.duration_frames)
+
+    monkeypatch.setattr(bridge, "_load_guide_image_bridge", lambda *_args, **_kwargs: None)
+
+    node = bridge.SonderGuidesBridgeStart()
+    result = node.execute(project, iteration_index=0)
+    _flow, _image, frame_idx, strength = result[:4]
+    assert frame_idx == 5
+    assert abs(strength - 0.7) < 1e-6
+
+
 # ── End: empty guide list returns Start.value_i passthrough refs ──────
 class _FakeDynPrompt:
     def __init__(self, nodes):

@@ -929,6 +929,18 @@ async def unsubscribe(project_id: str, ws: web.WebSocketResponse) -> None:
 async def broadcast_project_event(project_id: str, event: dict[str, Any]) -> None:
     async with _lock:
         subscribers = list(_subscribers.get(project_id, set()))
+    # #36 diagnostic: every fan-out of a project/widget event to WS subscribers.
+    # Pairs with `project_saved` events to trace writer -> broadcast -> client refresh.
+    try:
+        record_diag_event(
+            "ws_broadcast",
+            project_id=project_id,
+            event_type=str(event.get("type", "") if isinstance(event, dict) else ""),
+            subscriber_count=len(subscribers),
+            event_modified_at=str(event.get("modified_at", "") if isinstance(event, dict) else ""),
+        )
+    except Exception:
+        logger.debug("broadcast_project_event failed to emit diag event", exc_info=True)
     if not subscribers:
         return
     dead = []
