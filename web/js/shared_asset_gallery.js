@@ -4598,7 +4598,12 @@ export function mountSharedAssetGallery(container, options = {}) {
             img.alt = assetDisplayName(asset);
             previewSurface.appendChild(img);
         } else if (asset.asset_type === "video") {
-            const video = style(document.createElement("video"), `width:100%;max-height:220px;display:block;background:#000;`);
+            previewSurface.style.height = "220px";
+            previewSurface.style.minHeight = "180px";
+            previewSurface.style.flex = "0 0 auto";
+            previewSurface.style.alignItems = "stretch";
+            previewSurface.style.justifyContent = "stretch";
+            const video = style(document.createElement("video"), `width:100%;height:100%;max-width:100%;max-height:100%;object-fit:contain;display:block;background:#000;`);
             video.controls = true;
             video.preload = "metadata";
             video.playsInline = true;

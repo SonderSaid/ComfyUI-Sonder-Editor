@@ -3002,9 +3002,7 @@ export class EditorNodeController {
             gap: 8px;
             flex: 1 1 auto;
             min-height: 0;
-            overflow-y: auto;
-            overflow-x: hidden;
-            padding-right: 2px;
+            overflow: hidden;
         `);
         container.appendChild(wrap);
 
@@ -3030,8 +3028,8 @@ export class EditorNodeController {
         wrap.appendChild(header);
 
         const surface = style(document.createElement("div"), `
-            flex: 1 1 110px;
-            min-height: 96px;
+            flex: 1 1 0;
+            min-height: 0;
             border-radius: 6px;
             border: 1px solid ${CHROME.border};
             background: ${CHROME.panelMuted};
@@ -3465,20 +3463,25 @@ export class EditorNodeController {
 
         function resizeCanvas() {
             const rect = surface.getBoundingClientRect();
+            // Canvas is sized to the SCENE's aspect ratio (data.frameWidth/Height),
+            // fitted inside the stage's content box (rect.{w,h} - 16 for stage padding).
+            // Surface's panelMuted background shows in the unused band, the asset
+            // within the canvas is letterboxed at its native aspect by drawDormantCanvasMedia.
             const availableWidth = Math.max(1, Math.floor(rect.width - 16));
             const availableHeight = Math.max(1, Math.floor(rect.height - 16));
-            if (availableWidth <= 0 || availableHeight <= 0) return;
-            const aspect = data.frameWidth / Math.max(1, data.frameHeight);
-            let canvasWidth = availableWidth;
-            let canvasHeight = Math.floor(canvasWidth / Math.max(aspect, 0.01));
-            if (canvasHeight > availableHeight) {
-                canvasHeight = availableHeight;
-                canvasWidth = Math.floor(canvasHeight * aspect);
+            const aspect = (Number(data.frameWidth) > 0 && Number(data.frameHeight) > 0)
+                ? data.frameWidth / data.frameHeight
+                : 1;
+            let cssWidth = availableWidth;
+            let cssHeight = Math.max(1, Math.floor(cssWidth / aspect));
+            if (cssHeight > availableHeight) {
+                cssHeight = availableHeight;
+                cssWidth = Math.max(1, Math.floor(cssHeight * aspect));
             }
-            canvas.width = Math.max(1, canvasWidth);
-            canvas.height = Math.max(1, canvasHeight);
-            canvas.style.width = `${canvasWidth}px`;
-            canvas.style.height = `${canvasHeight}px`;
+            if (canvas.width !== cssWidth) canvas.width = cssWidth;
+            if (canvas.height !== cssHeight) canvas.height = cssHeight;
+            canvas.style.width = `${cssWidth}px`;
+            canvas.style.height = `${cssHeight}px`;
         }
 
         function scheduleRender({ forceSeek = false } = {}) {
@@ -3660,6 +3663,10 @@ export class EditorNodeController {
         function renderPreviewFrame({ forceSeek = false } = {}) {
             if (destroyed) return;
             resizeCanvas();
+            if (canvas.width < 4 || canvas.height < 4) {
+                updateTransport();
+                return;
+            }
             currentTarget = getTargetForCurrentFrame();
 
             if (isPlaying) {
