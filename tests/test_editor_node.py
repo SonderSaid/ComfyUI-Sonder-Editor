@@ -231,13 +231,17 @@ def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, mo
     audio = result[13]
     assert result[9] == 169
     assert tuple(result[1].shape) == (169, 4, 4, 3)
-    assert result[14] == pytest.approx(48 / 24.0)
+    # mask_start_pixel = 48 falls inside LTX latent 6 (pixels 41..48); snap-start floors to 41.
+    # mask_end_pixel = 169 is already on the 8n+1 grid (boundary set 1,9,17,...,169).
+    assert result[14] == pytest.approx(41 / 24.0)
     assert result[15] == pytest.approx(169 / 24.0)
     assert audio["waveform"].shape[-1] >= int((169 / 24.0) * audio["sample_rate"])
     assert project._execution_context["source_frame_count"] == 167
     assert project._execution_context["frame_count"] == 169
     assert project._execution_context["frame_count_padding"] == 2
     assert project._execution_context["template_id"] == "ltxv-2.3"
+    assert project._execution_context["mask_start_frame"] == 41
+    assert project._execution_context["mask_end_frame"] == 169
 
 
 def test_queue_job_frame_constraint_overrides_project(tmp_path, monkeypatch):
@@ -342,6 +346,87 @@ def test_custom_template_constraint_pads_correctly(tmp_path, monkeypatch):
     assert project._execution_context["frame_count"] == 173
     assert project._execution_context["frame_count_padding"] == 6
     assert project._execution_context["template_id"] == "my-custom-template"
+
+
+def test_snap_pixel_to_constraint_helper_covers_boundary_cases(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    snap = editor_node.SonderEditor._snap_pixel_to_constraint
+    ltx = {"step": 8, "offset": 1, "min": 1}
+
+    # No constraint / empty / step<=1 -> no-op
+    assert snap(48, None, "start") == 48
+    assert snap(48, {}, "end") == 48
+    assert snap(48, {"step": 1, "offset": 0}, "start") == 48
+
+    # LTX boundary set: 0, 1, 9, 17, 25, 33, 41, 49, ...
+    # Exact boundary -> no change either side
+    assert snap(41, ltx, "start") == 41
+    assert snap(41, ltx, "end") == 41
+    assert snap(49, ltx, "start") == 49
+    assert snap(49, ltx, "end") == 49
+    # Inside latent 6 (pixels 41..48 belong to one latent) -> start floors to 41, end ceils to 49
+    assert snap(48, ltx, "start") == 41
+    assert snap(48, ltx, "end") == 49
+    assert snap(45, ltx, "start") == 41
+    assert snap(45, ltx, "end") == 49
+    # Pixel 0 -> 0 either side; negative -> 0
+    assert snap(0, ltx, "start") == 0
+    assert snap(0, ltx, "end") == 0
+    assert snap(-5, ltx, "start") == 0
+    assert snap(-5, ltx, "end") == 0
+
+    # Custom constraint {step:10, offset:3} -> boundary set 0, 3, 13, 23, 33, 43, 53, ...
+    custom = {"step": 10, "offset": 3, "min": 1}
+    assert snap(48, custom, "start") == 43
+    assert snap(48, custom, "end") == 53
+    # Below offset (pixel > 0 but < offset) -> 0 for start, offset for end
+    assert snap(2, custom, "start") == 0
+    assert snap(2, custom, "end") == 3
+
+
+def test_execute_snaps_mask_pre_offset_below_ltx_boundary(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=482,
+        selection_end=601,
+        pre_context_frames=48,
+        post_context_frames=0,
+        mask_pre_offset=10,
+        mask_post_offset=0,
+    )
+
+    # mask_start_pixel = actual_pre(48) - mask_pre_offset(10) = 38;
+    # LTX boundaries below or equal to 38 are 33, so start floors to 33.
+    # mask_end_pixel = selection(119) + actual_pre(48) + mask_post(0) + padding(2) = 169 (on grid).
+    assert result[14] == pytest.approx(33 / 24.0)
+    assert result[15] == pytest.approx(169 / 24.0)
+    assert project._execution_context["mask_start_frame"] == 33
+    assert project._execution_context["mask_end_frame"] == 169
+
+
+def test_execute_mask_times_unsnapped_without_frame_constraint(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(tmp_path, template_id="free", frame_constraint=None)
+    result = _execute_constraint_test(editor_node, project, monkeypatch)
+    # No constraint -> snap is a no-op; raw values pass through.
+    # source = 167 (no padding); mask_start_pixel = 48, mask_end_pixel = 167.
+    assert result[14] == pytest.approx(48 / 24.0)
+    assert result[15] == pytest.approx(167 / 24.0)
+    assert project._execution_context["mask_start_frame"] == 48
+    assert project._execution_context["mask_end_frame"] == 167
 
 
 def test_execution_reaches_terminal_save_only_for_linked_editor(tmp_path, monkeypatch):

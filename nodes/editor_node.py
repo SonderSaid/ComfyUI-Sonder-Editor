@@ -232,6 +232,28 @@ class SonderEditor:
         return offset + math.ceil((count - offset) / step) * step
 
     @staticmethod
+    def _snap_pixel_to_constraint(pixel: int, frame_constraint: dict | None, side: str) -> int:
+        # Boundary set in pixel-frame space: {0} ∪ {step*k + offset : k ≥ 0}.
+        # side="start" floors to boundary ≤ pixel; side="end" ceils to boundary ≥ pixel.
+        # No-op when constraint is missing or step <= 1, so "free" template scenes are unchanged.
+        # Used to align mask_start_time / mask_end_time so downstream latent maskers
+        # (e.g. kjnodes LTXVAudioVideoMask) include the full requested generation region.
+        if not frame_constraint or "step" not in frame_constraint:
+            return pixel
+        step = max(1, _coerce_int(frame_constraint.get("step"), 1))
+        offset = _coerce_int(frame_constraint.get("offset"), 0)
+        if step <= 1:
+            return pixel
+        if pixel <= 0:
+            return 0
+        if pixel < offset:
+            return 0 if side == "start" else offset
+        k = (pixel - offset) / step
+        if side == "start":
+            return offset + math.floor(k) * step
+        return offset + math.ceil(k) * step
+
+    @staticmethod
     def _pad_image_batch_to_frame_count(frames: torch.Tensor, target_count: int) -> torch.Tensor:
         if not torch.is_tensor(frames) or frames.ndim < 1:
             return frames
@@ -624,9 +646,19 @@ class SonderEditor:
                 frame_count_padding,
             )
 
-            # Mask times - seconds offset within the output tensor for downstream temporal masks
-            mask_start_time = (generation_start - context_start - mask_pre_offset) / proj_fps if proj_fps > 0 else 0.0
-            mask_end_time = (generation_end - context_start + mask_post_offset + frame_count_padding) / proj_fps if proj_fps > 0 else 0.0
+            # Mask times - seconds offset within the output tensor for downstream temporal masks.
+            # Boundaries are snapped outward to the active template's frame constraint grid
+            # (start floors, end ceils) so latent maskers like LTXVAudioVideoMask include the
+            # full requested generation region without dropping the straddling boundary latent.
+            mask_start_pixel = generation_start - context_start - mask_pre_offset
+            mask_end_pixel = generation_end - context_start + mask_post_offset + frame_count_padding
+            mask_start_pixel = max(0, self._snap_pixel_to_constraint(mask_start_pixel, frame_constraint, "start"))
+            mask_end_pixel = min(
+                self._snap_pixel_to_constraint(mask_end_pixel, frame_constraint, "end"),
+                source_frame_count + frame_count_padding,
+            )
+            mask_start_time = mask_start_pixel / proj_fps if proj_fps > 0 else 0.0
+            mask_end_time = mask_end_pixel / proj_fps if proj_fps > 0 else 0.0
 
             # --- Render composited frames ---
             render_started_at = time.perf_counter()
@@ -723,6 +755,8 @@ class SonderEditor:
                 "actual_post_context_frames": actual_post,
                 "mask_pre_offset": mask_pre_offset,
                 "mask_post_offset": mask_post_offset,
+                "mask_start_frame": mask_start_pixel,
+                "mask_end_frame": mask_end_pixel,
                 "template_id": template_id,
                 "source_frame_count": source_frame_count,
                 "frame_count": frame_count,
