@@ -2008,17 +2008,17 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function partitionTrackedEntriesByPin(entries, surface) {
         const pinSets = pinSetsForSurface(surface);
-        if (!pinSets.sections.size && !pinSets.fields.size) {
+        if (!pinSets.sections.size) {
             return { pinned: [], unpinned: entries.slice() };
         }
         const pinned = [];
         const unpinned = [];
         for (const entry of entries) {
             const sectionKey = trackedSectionPinKey(entry);
-            const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
-            const fieldKeys = Object.keys(fields);
-            const fieldHit = fieldKeys.some((key) => pinSets.fields.has(trackedFieldPinKey(entry, key)));
-            if (pinSets.sections.has(sectionKey) || fieldHit) {
+            // #16: only section pins bubble the section. Field pins reorder rows
+            // inside their own section in renderGenericTrackedFields below; the
+            // section itself stays in natural order unless also section-pinned.
+            if (pinSets.sections.has(sectionKey)) {
                 pinned.push(entry);
             } else {
                 unpinned.push(entry);
@@ -2052,6 +2052,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         wrap.appendChild(headerRow);
 
         const ctx = trackedRenderContext(surface);
+        // #16: pinned fields lift to a "Pinned Fields" group at the very top of
+        // the inspector (above any pinned sections). They also stay in their
+        // natural section with a glyph (see renderGenericTrackedFields below),
+        // mirroring the compare-picker `Current Selection` pattern.
+        const pinnedFieldsTop = renderPinnedFieldsTopGroup(entries, surface);
+        if (pinnedFieldsTop) wrap.appendChild(pinnedFieldsTop);
+
         const partitioned = partitionTrackedEntriesByPin(entries, surface);
         const ordered = [...partitioned.pinned, ...partitioned.unpinned];
         const pinnedSet = new Set(partitioned.pinned);
@@ -2059,6 +2066,117 @@ export function mountSharedAssetGallery(container, options = {}) {
             wrap.appendChild(renderTrackedSectionContainer(entry, ctx, surface, pinnedSet.has(entry)));
         }
         return wrap;
+    }
+
+    function renderPinnedFieldsTopGroup(entries, surface) {
+        const pinSets = pinSetsForSurface(surface);
+        if (!pinSets.fields.size) return null;
+
+        // Bucket pinned field keys per entry so we can decide per-entry whether
+        // to delegate to a structured renderer or render generic cells.
+        const pinnedByEntry = [];
+        for (const entry of entries) {
+            const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
+            const pinnedKeys = [];
+            for (const key of Object.keys(fields)) {
+                if (pinSets.fields.has(trackedFieldPinKey(entry, key))) {
+                    pinnedKeys.push(String(key));
+                }
+            }
+            if (pinnedKeys.length) pinnedByEntry.push({ entry, pinnedKeys });
+        }
+        if (!pinnedByEntry.length) return null;
+
+        const ctx = trackedRenderContext(surface);
+
+        const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:8px;background:rgba(143,192,240,0.06);border:1px solid rgba(143,192,240,0.32);`);
+        const titleBar = style(document.createElement("div"), `color:#dce8f2;font-size:11px;font-weight:700;text-transform:uppercase;display:flex;align-items:center;gap:6px;min-width:0;`);
+        const titlePin = style(document.createElement("span"), `color:#8fc0f0;font-size:10px;`);
+        titlePin.textContent = "📌";
+        titleBar.appendChild(titlePin);
+        const titleLabel = style(document.createElement("span"), `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;`);
+        titleBar.appendChild(titleLabel);
+        section.appendChild(titleBar);
+
+        let totalLifted = 0;
+
+        for (const { entry, pinnedKeys } of pinnedByEntry) {
+            const sectionLabel = String(entry?.label || "section");
+
+            // Ask the structured renderer (if any) to render its body; capture
+            // which field keys it consumes so we know which pinned keys still
+            // need a generic cell. Renderer is called twice per render (once here,
+            // once in the natural section below) — acceptable for Phase 1 scope.
+            let consumedFields = new Set();
+            let structuredDom = null;
+            const bodyResult = renderTrackedSectionBody(entry, ctx);
+            if (bodyResult) {
+                if (typeof bodyResult === "object" && "dom" in bodyResult) {
+                    structuredDom = bodyResult.dom;
+                    consumedFields = new Set((Array.isArray(bodyResult.consumedFields) ? bodyResult.consumedFields : []).map(String));
+                } else {
+                    structuredDom = bodyResult;
+                    consumedFields = new Set(Object.keys(entry?.fields || {}).map(String));
+                }
+            }
+
+            const structuredPinnedKeys = pinnedKeys.filter((k) => consumedFields.has(k));
+            const genericPinnedKeys = pinnedKeys.filter((k) => !consumedFields.has(k));
+            if (!structuredPinnedKeys.length && !genericPinnedKeys.length) continue;
+
+            // One sub-card per entry with a single `from <section>` subtitle so
+            // the lifted structured body and any generic cells share provenance.
+            const subCard = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;padding:6px;border-radius:6px;background:rgba(255,255,255,0.025);border:1px solid ${CHROME.borderSoft};`);
+            const subtitle = style(document.createElement("div"), `color:${CHROME.textDim};font-size:9px;display:flex;align-items:center;gap:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+            const subPin = style(document.createElement("span"), `color:#8fc0f0;`);
+            subPin.textContent = "📌";
+            subtitle.appendChild(subPin);
+            const subLabel = document.createElement("span");
+            subLabel.textContent = `from ${sectionLabel}`;
+            subtitle.appendChild(subLabel);
+            subCard.appendChild(subtitle);
+
+            if (structuredPinnedKeys.length && structuredDom) {
+                subCard.appendChild(structuredDom);
+                totalLifted += structuredPinnedKeys.length;
+            }
+
+            if (genericPinnedKeys.length) {
+                const grid = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;min-width:0;`);
+                for (const key of genericPinnedKeys) {
+                    const value = entry.fields[key];
+                    const rendered = formatGenerationValue(value);
+                    const token = fieldSearchToken(key, rendered);
+                    const cell = makeMetaCell(key, rendered);
+                    cell.style.cursor = "pointer";
+                    applyFieldCellActiveStyle(cell, surface, entry, key, token);
+                    const titleEl = cell.firstChild;
+                    if (titleEl) {
+                        const cellPin = style(document.createElement("span"), `color:#8fc0f0;margin-right:4px;`);
+                        cellPin.textContent = "📌";
+                        titleEl.prepend(cellPin);
+                    }
+                    cell.title = "Pinned to top — right-click to unpin";
+                    const cellInfo = {
+                        entry,
+                        fieldKey: key,
+                        value: rendered,
+                        displayKind: "generic",
+                    };
+                    cell.addEventListener("click", (event) => handleTrackedFieldClick(event, cellInfo, surface));
+                    cell.addEventListener("contextmenu", (event) => handleTrackedFieldContextMenu(event, cellInfo, surface));
+                    grid.appendChild(cell);
+                }
+                subCard.appendChild(grid);
+                totalLifted += genericPinnedKeys.length;
+            }
+
+            section.appendChild(subCard);
+        }
+
+        if (!totalLifted) return null;
+        titleLabel.textContent = `Pinned Fields (${totalLifted})`;
+        return section;
     }
 
     function renderTrackedSectionContainer(entry, ctx, surface, isPinned) {
@@ -2126,13 +2244,35 @@ export function mountSharedAssetGallery(container, options = {}) {
         const exclude = new Set((excludeKeys || []).map((key) => String(key)));
         const fieldEntries = Object.entries(fields).filter(([key]) => !exclude.has(String(key)));
         if (!fieldEntries.length) return null;
+        // #16: pinned field rows float to the top of the section's grid in their
+        // existing natural order; unpinned rows follow. Section bubble is handled
+        // separately in partitionTrackedEntriesByPin.
+        const pinnedFieldEntries = [];
+        const unpinnedFieldEntries = [];
+        for (const fieldEntry of fieldEntries) {
+            if (isFieldPinned(entry, fieldEntry[0], surface)) {
+                pinnedFieldEntries.push(fieldEntry);
+            } else {
+                unpinnedFieldEntries.push(fieldEntry);
+            }
+        }
+        const orderedFieldEntries = [...pinnedFieldEntries, ...unpinnedFieldEntries];
         const grid = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;min-width:0;`);
-        for (const [key, value] of fieldEntries) {
+        for (const [key, value] of orderedFieldEntries) {
             const rendered = formatGenerationValue(value);
             const token = fieldSearchToken(key, rendered);
             const cell = makeMetaCell(key, rendered);
             cell.style.cursor = "pointer";
             applyFieldCellActiveStyle(cell, surface, entry, key, token);
+            if (isFieldPinned(entry, key, surface)) {
+                const titleEl = cell.firstChild;
+                if (titleEl) {
+                    const pinIcon = style(document.createElement("span"), `color:#8fc0f0;margin-right:4px;`);
+                    pinIcon.textContent = "📌";
+                    titleEl.prepend(pinIcon);
+                }
+                cell.title = "Pinned to top — right-click to unpin";
+            }
             const cellInfo = {
                 entry,
                 fieldKey: String(key),

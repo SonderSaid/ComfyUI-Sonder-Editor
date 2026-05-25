@@ -3202,6 +3202,11 @@ export class EditorWidget {
         return idx >= 0 && !!this._trackLayout[idx]?.hidden;
     }
 
+    _isGuideTrackCollapsed() {
+        const idx = this._guidesLayoutIdx();
+        return idx >= 0 && !!this._trackLayout[idx]?.collapsed;
+    }
+
     _isPromptTrackLocked() {
         const idx = this._promptLayoutIdx();
         return idx >= 0 && !!this._trackLayout[idx]?.locked;
@@ -5696,6 +5701,17 @@ export class EditorWidget {
         canvas.addEventListener("dragover", (e) => {
             e.preventDefault();
             e.stopPropagation(); // Prevent ComfyUI from showing its own drop indicator
+            // Best-effort cursor cue: reject when the lane under the cursor is collapsed.
+            // Browsers restrict `getData()` during dragover so we cannot reliably know
+            // the asset type here — image drags over a collapsed non-Guides lane will
+            // still show "no-drop" even though the drop would land on Guides; the
+            // authoritative reject lives in _handleAssetDrop.
+            const { rawY } = this._canvasMouseCoords(e);
+            const layoutIdx = this._layoutIndexFromRawY(rawY);
+            if (layoutIdx >= 0 && this._trackLayout[layoutIdx]?.collapsed) {
+                e.dataTransfer.dropEffect = "none";
+                return;
+            }
             e.dataTransfer.dropEffect = "copy";
         });
 
@@ -5926,6 +5942,15 @@ export class EditorWidget {
             return;
         }
 
+        // #33: collapse is layout-only but the asset-drop hit-test should mirror
+        // the item hit-tests, which already reject collapsed lanes. Image drops
+        // route to Guides regardless of cursor lane, so check Guides collapse
+        // for images; everything else is rejected against the cursor lane below.
+        // Silent reject (no toast) — the dragover cursor is the user-visible cue.
+        if (asset.asset_type === "image" && this._isGuideTrackCollapsed()) {
+            return;
+        }
+
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         // Determine drop target lane from Y position
@@ -5936,6 +5961,12 @@ export class EditorWidget {
             const layoutIdx = this._layoutIndexFromRawY(trackRawY);
             if (layoutIdx >= 0) {
                 const entry = this._trackLayout[layoutIdx];
+                // #33: reject drops onto any collapsed non-image destination lane.
+                // Image drops were checked against Guides above; for video/audio/
+                // motion-driver we use the lane the cursor is over.
+                if (asset.asset_type !== "image" && entry.collapsed) {
+                    return;
+                }
                 if (entry.type === TRACK_TYPE.VIDEO) targetVideoLane = entry.laneIndex;
                 if (entry.type === TRACK_TYPE.AUDIO) targetAudioLane = entry.laneIndex;
                 if (entry.type === TRACK_TYPE.MOTION_DRIVER) targetMotionDriverLane = entry.laneIndex;
