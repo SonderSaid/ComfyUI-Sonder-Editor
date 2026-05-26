@@ -1437,6 +1437,34 @@ export class EditorNodeController {
         this.card.syncModuleContainerHeight?.();
     }
 
+    // Align _height with an already-restored node.size[1] (e.g. workflow load).
+    // Overhead is recomputed here because widget visibility (Create button, hidden
+    // workflow widgets) can change it between calls.
+    adoptLoadedNodeHeight() {
+        if (this._destroyed) return;
+        const nodeHeight = Math.max(0, this.node.size?.[1] || 0);
+        if (nodeHeight <= 0) return;
+        const computed = this.node.computeSize?.();
+        const totalComputed = computed?.[1] || nodeHeight;
+        const overhead = Math.max(0, totalComputed - 150);
+        this._height = Math.max(150, nodeHeight - overhead);
+        this.card.syncModuleContainerHeight?.();
+    }
+
+    // Wraps node.setSize in _programmaticResize so handleNodeResize treats it
+    // as programmatic. Per durable_rules.md > Dormant Resize Contract.
+    setNodeSizeProgrammatic(width, height) {
+        if (this._destroyed) return;
+        const w = Math.max(0, Number(width) || 0);
+        const h = Math.max(0, Number(height) || 0);
+        this._programmaticResize = true;
+        try {
+            this.node.setSize?.([w, h]);
+        } finally {
+            this._programmaticResize = false;
+        }
+    }
+
     queueResize() {
         if (this._destroyed || this._resizeScheduled) return;
         this._resizeScheduled = true;
@@ -1445,20 +1473,21 @@ export class EditorNodeController {
             if (this._destroyed) return;
             if (this.state.isFullscreenOpen) return;
             if (this.root.style.display === "none") return;
-            const currentWidth = Math.max(240, this.node.size?.[0] || 0);
-            const currentHeight = Math.max(0, this.node.size?.[1] || 0);
             const expandedModuleId = this.state.expandedModuleId;
-            if (expandedModuleId && !this.card.shouldAutoResizeNode?.(expandedModuleId)) {
+            // queueResize only drives node height when an auto-resize module is mounted.
+            // No-module and manual-module states leave node height to the user — required
+            // for workflow-loaded sizes to survive collapse/expand cycles.
+            if (!expandedModuleId || !this.card.shouldAutoResizeNode?.(expandedModuleId)) {
                 this.card.syncModuleContainerHeight?.();
                 return;
             }
+            const currentWidth = Math.max(240, this.node.size?.[0] || 0);
+            const currentHeight = Math.max(0, this.node.size?.[1] || 0);
             this.card.syncModuleContainerHeight?.();
             const measured = Math.ceil(this.root.scrollHeight || this.root.offsetHeight || this.root.clientHeight || 190);
             this._height = Math.max(150, measured + 10);
             if (Math.abs(currentHeight - this._height) > 1) {
-                this._programmaticResize = true;
-                this.node.setSize?.([currentWidth, this._height]);
-                this._programmaticResize = false;
+                this.setNodeSizeProgrammatic(currentWidth, this._height);
             }
         });
     }

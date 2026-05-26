@@ -972,6 +972,21 @@ app.registerExtension({
                 node.flags = { ...(node.flags || {}), resizable: true };
                 controller.render();
 
+                // Mark workflow-loaded nodes so updateVisibility can preserve their
+                // saved node.size instead of stomping it with preferred defaults.
+                // onConfigure only fires on workflow restore, so its presence is the
+                // load signal. Fires after node.configure() has already set node.size.
+                const origNodeOnConfigure = node.onConfigure;
+                node.onConfigure = function (info) {
+                    if (Array.isArray(info?.size) && info.size.length >= 2) {
+                        node._sonderLoadedSize = [
+                            Number(info.size[0]) || 0,
+                            Number(info.size[1]) || 0,
+                        ];
+                    }
+                    return origNodeOnConfigure?.apply(this, arguments);
+                };
+
                 const editorDOMWidget = node.addDOMWidget("sonder_editor_ui", "SonderEditorWidget", controller.getElement(), {
                     serialize: false,
                     hideOnZoom: false,
@@ -1041,21 +1056,38 @@ app.registerExtension({
                     const nextSize = node.computeSize();
                     const preferredWidth = isCreateNew ? 340 : 440;
                     const modeKey = isCreateNew ? "create" : "existing";
+                    const minComputedHeight = nextSize?.[1] || 0;
                     if (!node._sonderInitializedSize) {
                         node._sonderInitializedSize = true;
                         node._sonderPreferredWidthMode = modeKey;
-                        node.size = [preferredWidth, Math.max(nextSize?.[1] || 0, node.size?.[1] || 0)];
-                    } else {
-                        if (node._sonderPreferredWidthMode !== modeKey && (node.size?.[0] || 0) < preferredWidth) {
-                            node._sonderPreferredWidthMode = modeKey;
-                            node.size = [preferredWidth, node.size?.[1] || nextSize?.[1] || controller.getHeight()];
+                        if (node._sonderLoadedSize) {
+                            // Workflow load: preserve saved node.size; only grow if below
+                            // safety floors (240 width, computed min height).
+                            controller.adoptLoadedNodeHeight();
+                            const loadedW = node.size?.[0] || 0;
+                            const loadedH = node.size?.[1] || 0;
+                            const safeW = Math.max(loadedW, 240);
+                            const safeH = Math.max(loadedH, minComputedHeight);
+                            if (safeW !== loadedW || safeH !== loadedH) {
+                                controller.setNodeSizeProgrammatic(safeW, safeH);
+                                controller.adoptLoadedNodeHeight();
+                            }
+                        } else {
+                            // Menu-created node: apply preferred default size.
+                            controller.setNodeSizeProgrammatic(
+                                preferredWidth,
+                                Math.max(minComputedHeight, node.size?.[1] || 0),
+                            );
                         }
-                        node.size = [
-                            Math.max(node.size?.[0] || 0, 240),
-                            nextSize?.[1] || node.size?.[1] || controller.getHeight(),
-                        ];
+                    } else if (node._sonderPreferredWidthMode !== modeKey && (node.size?.[0] || 0) < preferredWidth) {
+                        // Mode switch (create ↔ existing) grows a too-narrow node to the
+                        // preferred width for the new mode. Height is preserved.
+                        node._sonderPreferredWidthMode = modeKey;
+                        controller.setNodeSizeProgrammatic(
+                            preferredWidth,
+                            node.size?.[1] || minComputedHeight || controller.getHeight(),
+                        );
                     }
-                    node.setSize(node.size);
 
                     if (!isCreateNew) {
                         controller.queueResize();
