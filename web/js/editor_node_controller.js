@@ -1030,7 +1030,7 @@ class DormantNodeCard {
 
     getModuleHostSizing(moduleId) {
         const moduleDef = this._getModuleDef(moduleId);
-        return moduleDef?.hostSizing || moduleDef?.sizing || "auto";
+        return moduleDef?.hostSizing || "auto";
     }
 
     isFillModule(moduleId) {
@@ -1464,6 +1464,7 @@ export class EditorNodeController {
     }
 
     _buildModules() {
+        // `hostSizing` controls the module container; `nodeResize` controls whether the node grows to content.
         return {
             assets: {
                 id: "assets",
