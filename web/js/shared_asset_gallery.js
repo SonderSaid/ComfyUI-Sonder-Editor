@@ -1487,7 +1487,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function updateLayout() {
-        const width = root.getBoundingClientRect().width || 0;
+        const width = root.clientWidth || root.offsetWidth || 0;
         const singleColumn = state.inspectorCollapsed || (width > 0 && width < 520);
         if (singleColumn && !state.inspectorCollapsed) {
             content.style.gridTemplateColumns = "minmax(0,1fr)";

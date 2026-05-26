@@ -1011,6 +1011,7 @@ class DormantNodeCard {
     }
 
     _applyModuleContainerSizing(moduleId) {
+        this._moduleContainerEl.dataset.sonderModuleSizing = this.getModuleHostSizing(moduleId);
         style(this._moduleContainerEl, `
             display: flex;
             flex-direction: column;
@@ -1023,20 +1024,57 @@ class DormantNodeCard {
         `);
     }
 
+    _getModuleDef(moduleId) {
+        return moduleId ? (this.controller.modules?.[moduleId] || null) : null;
+    }
+
+    getModuleHostSizing(moduleId) {
+        const moduleDef = this._getModuleDef(moduleId);
+        return moduleDef?.hostSizing || moduleDef?.sizing || "auto";
+    }
+
+    isFillModule(moduleId) {
+        return this.getModuleHostSizing(moduleId) === "fill";
+    }
+
+    shouldAutoResizeNode(moduleId) {
+        if (!moduleId) return false;
+        const moduleDef = this._getModuleDef(moduleId);
+        const nodeResize = moduleDef?.nodeResize || (this.isFillModule(moduleId) ? "manual" : "auto");
+        return nodeResize === "auto";
+    }
+
     _measureAvailableModuleHeight() {
+        const rootHeight = this.root.clientHeight || this.root.offsetHeight || 0;
+        if (!rootHeight) return 0;
+
         const rootRect = this.root.getBoundingClientRect();
         const containerRect = this._moduleContainerEl.getBoundingClientRect();
-        if (!rootRect.height) return 0;
+        const layoutWidth = this.root.offsetWidth || this.root.clientWidth || 0;
+        const layoutHeight = this.root.offsetHeight || this.root.clientHeight || 0;
+        let visualScale = 1;
+        if (layoutWidth > 0 && rootRect.width > 0) {
+            visualScale = rootRect.width / layoutWidth;
+        } else if (layoutHeight > 0 && rootRect.height > 0) {
+            visualScale = rootRect.height / layoutHeight;
+        }
+        if (!Number.isFinite(visualScale) || visualScale <= 0) {
+            visualScale = 1;
+        }
         const rootStyle = window.getComputedStyle(this.root);
         const paddingBottom = parseFloat(rootStyle.paddingBottom) || 0;
-        return Math.max(0, Math.floor(rootRect.bottom - paddingBottom - containerRect.top));
+        const containerTop = Math.max(
+            0,
+            ((containerRect.top - rootRect.top) / visualScale) - (this.root.clientTop || 0)
+        );
+        return Math.max(0, Math.floor(rootHeight - paddingBottom - containerTop));
     }
 
     syncModuleContainerHeight() {
         const moduleId = this.controller.state.expandedModuleId;
         if (!moduleId || this._moduleContainerEl.style.display === "none") return;
         this._applyModuleContainerSizing(moduleId);
-        if (moduleId !== "assets" && moduleId !== "preview") {
+        if (!this.isFillModule(moduleId)) {
             this._moduleContainerEl.style.height = "";
             this._moduleContainerEl.style.maxHeight = "";
             return;
@@ -1053,7 +1091,7 @@ class DormantNodeCard {
         const moduleData = moduleId ? this.controller.moduleCache[moduleId] : null;
         const loading = !!moduleStatus?.loading;
         const error = moduleStatus?.error || "";
-        const shouldAutoResizeNode = moduleId && moduleId !== "assets";
+        const shouldAutoResizeNode = this.shouldAutoResizeNode(moduleId);
 
         if (!moduleId) {
             this._teardownModule();
@@ -1409,12 +1447,13 @@ export class EditorNodeController {
             if (this.root.style.display === "none") return;
             const currentWidth = Math.max(240, this.node.size?.[0] || 0);
             const currentHeight = Math.max(0, this.node.size?.[1] || 0);
-            if (this.state.expandedModuleId === "assets") {
+            const expandedModuleId = this.state.expandedModuleId;
+            if (expandedModuleId && !this.card.shouldAutoResizeNode?.(expandedModuleId)) {
                 this.card.syncModuleContainerHeight?.();
                 return;
             }
             this.card.syncModuleContainerHeight?.();
-            const measured = Math.ceil(this.root.scrollHeight || this.root.getBoundingClientRect().height || 190);
+            const measured = Math.ceil(this.root.scrollHeight || this.root.offsetHeight || this.root.clientHeight || 190);
             this._height = Math.max(150, measured + 10);
             if (Math.abs(currentHeight - this._height) > 1) {
                 this._programmaticResize = true;
@@ -1429,6 +1468,8 @@ export class EditorNodeController {
             assets: {
                 id: "assets",
                 title: "Assets",
+                hostSizing: "fill",
+                nodeResize: "manual",
                 resourceTier: "light",
                 load: async (controller, signal) => await controller._loadDormantAssets(signal),
                 mount: (container, data, controller) => controller._mountAssetsModule(container, data),
@@ -1438,6 +1479,8 @@ export class EditorNodeController {
             preview: {
                 id: "preview",
                 title: "Preview",
+                hostSizing: "fill",
+                nodeResize: "auto",
                 resourceTier: "media",
                 load: async (controller, signal) => await controller._loadPreviewModule(signal),
                 mount: (container, data, controller) => controller._mountPreviewModule(container, data),
@@ -1447,6 +1490,8 @@ export class EditorNodeController {
             queue: {
                 id: "queue",
                 title: "Queue",
+                hostSizing: "fill",
+                nodeResize: "manual",
                 resourceTier: "light",
                 load: async (controller, signal) => await controller._loadQueueModule(signal),
                 mount: (container, data, controller) => controller._mountQueueModule(container, data),
@@ -3462,13 +3507,12 @@ export class EditorNodeController {
         }
 
         function resizeCanvas() {
-            const rect = surface.getBoundingClientRect();
             // Canvas is sized to the SCENE's aspect ratio (data.frameWidth/Height),
-            // fitted inside the stage's content box (rect.{w,h} - 16 for stage padding).
+            // fitted inside the stage's content box (surface layout size - 16 for stage padding).
             // Surface's panelMuted background shows in the unused band, the asset
             // within the canvas is letterboxed at its native aspect by drawDormantCanvasMedia.
-            const availableWidth = Math.max(1, Math.floor(rect.width - 16));
-            const availableHeight = Math.max(1, Math.floor(rect.height - 16));
+            const availableWidth = Math.max(1, Math.floor((surface.clientWidth || surface.offsetWidth || 0) - 16));
+            const availableHeight = Math.max(1, Math.floor((surface.clientHeight || surface.offsetHeight || 0) - 16));
             const aspect = (Number(data.frameWidth) > 0 && Number(data.frameHeight) > 0)
                 ? data.frameWidth / data.frameHeight
                 : 1;
@@ -3800,9 +3844,12 @@ export class EditorNodeController {
             display: flex;
             flex-direction: column;
             gap: 6px;
-            max-height: 220px;
+            flex: 1 1 auto;
+            min-height: 0;
+            height: 100%;
             overflow-y: auto;
             padding-right: 2px;
+            box-sizing: border-box;
         `);
         container.appendChild(wrap);
 
@@ -3858,7 +3905,7 @@ export class EditorNodeController {
 
         const allJobs = Array.isArray(data) ? data : [];
         const completedCount = allJobs.filter((job) => String(job?.status || "").toLowerCase() === "completed").length;
-        const jobs = allJobs.slice(0, 8);
+        const jobs = allJobs;
         if (!jobs.length) {
             const emptyEl = style(document.createElement("div"), `
                 padding: 10px;
