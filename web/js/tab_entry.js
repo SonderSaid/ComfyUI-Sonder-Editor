@@ -55,6 +55,8 @@ const sourceNodeId = params.get("source_node_id") || "";
 const sessionWindowName = params.get("session_name") || "";
 const statusEl = document.getElementById("status");
 const sessionId = `tab-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+const STATUS_PILL_TOOLBAR_GAP = 12;
+const STATUS_PILL_FALLBACK_RIGHT = 140;
 
 const DEFAULT_WIDGET_VALUES = {
     scene_id: "",
@@ -90,6 +92,54 @@ function makeStatusPill() {
     pill.textContent = "Connecting";
     document.body.appendChild(pill);
     return pill;
+}
+
+function attachStatusPillOffset(pill) {
+    let raf = 0;
+    let observer = null;
+    let observed = null;
+
+    const applyFallback = () => {
+        pill.style.right = `${STATUS_PILL_FALLBACK_RIGHT}px`;
+    };
+
+    const measure = () => {
+        const toolbarButtons = document.querySelector("[data-fs-toolbar-buttons]");
+        if (!toolbarButtons) {
+            applyFallback();
+            return false;
+        }
+        if (toolbarButtons !== observed && typeof ResizeObserver !== "undefined") {
+            observer?.disconnect();
+            observer = new ResizeObserver(() => schedule(false));
+            observer.observe(toolbarButtons);
+            observed = toolbarButtons;
+        }
+        const width = Math.ceil(toolbarButtons.getBoundingClientRect().width || toolbarButtons.offsetWidth || 0);
+        if (width <= 0) {
+            applyFallback();
+            return false;
+        }
+        pill.style.right = `${width + STATUS_PILL_TOOLBAR_GAP}px`;
+        return true;
+    };
+
+    const schedule = (retry = false) => {
+        if (raf) cancelAnimationFrame(raf);
+        raf = requestAnimationFrame(() => {
+            raf = 0;
+            if (!measure() && retry) requestAnimationFrame(measure);
+        });
+    };
+
+    schedule(true);
+    return {
+        refresh: () => schedule(false),
+        cleanup: () => {
+            if (raf) cancelAnimationFrame(raf);
+            observer?.disconnect();
+        },
+    };
 }
 
 function projectWidgetNode() {
@@ -276,6 +326,7 @@ async function main() {
     }
 
     const statusPill = makeStatusPill();
+    const statusPillOffset = attachStatusPillOffset(statusPill);
     const blocker = document.createElement("div");
     blocker.style.cssText = `
         position: fixed;
@@ -396,6 +447,7 @@ async function main() {
         host.lastPillSignature = signature;
         statusPill.textContent = label;
         statusPill.style.color = color;
+        statusPillOffset.refresh();
         updateBlocker();
     };
     setCanvasConnected(host.canvasHostConnected);
@@ -553,6 +605,7 @@ async function main() {
             updatePill(state);
         },
     }, {
+        clientId: hostId,
         hostId,
         sourceNodeId,
         sessionId,
@@ -632,6 +685,7 @@ async function main() {
         }
         clearInterval(heartbeat);
         clearInterval(hostPresencePoll);
+        statusPillOffset.cleanup();
         sync.close();
         try {
             const queued = navigator.sendBeacon(

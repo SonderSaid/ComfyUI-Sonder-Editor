@@ -2234,7 +2234,7 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
     assert trimmed.timeline_end_frame == 14
     assert trimmed.source_in_frame == 2
     assert trimmed.source_out_frame == 6
-    assert trimmed.source_origin_frame == 2
+    assert trimmed.source_origin_frame == 0
     assert trimmed.total_source_frames == 7
 
     project._execution_context = {
@@ -2288,6 +2288,7 @@ def test_save_video_take_trimmed_with_mask_offsets(tmp_path, monkeypatch):
     #   source_out    = 11 - 3 = 8
     #   timeline_start = 10 - 1 = 9
     #   timeline_end   = 15 + 1 = 16
+    #   source_origin = 0
     #   total_source  = 11 - 2 = 9
     project._execution_context = {
         "scene_id": "scene-1",
@@ -2308,8 +2309,57 @@ def test_save_video_take_trimmed_with_mask_offsets(tmp_path, monkeypatch):
     assert clip.timeline_end_frame == 16
     assert clip.source_in_frame == 1
     assert clip.source_out_frame == 8
-    assert clip.source_origin_frame == 1
+    assert clip.source_origin_frame == 0
     assert clip.total_source_frames == 9
+
+
+def test_save_video_take_trimmed_pre_context_does_not_create_tail_ghost(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True, exist_ok=True)
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=48)
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Take No Tail Ghost Test",
+        scenes=[scene],
+    )
+
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    project._execution_context = {
+        "scene_id": "scene-1",
+        "scene_name": "Scene 1",
+        "selection_start": 10,
+        "selection_end": 14,
+        "actual_pre_context_frames": 2,
+        "actual_post_context_frames": 0,
+        "frame_count_padding": 0,
+        "take_placement_mode": "trimmed",
+    }
+
+    node = io_nodes.SonderSaveVideo()
+    node.save_video(project, torch.zeros(6, 2, 2, 3, dtype=torch.float32), filename_prefix="pre_only", fps=24.0, mode="Take")
+    clip = scene.clips[-1]
+
+    visible_duration = clip.timeline_end_frame - clip.timeline_start_frame
+    left_trimmed = clip.source_in_frame - clip.source_origin_frame
+    right_trimmed = clip.total_source_frames - visible_duration - left_trimmed
+
+    assert clip.timeline_start_frame == 10
+    assert clip.timeline_end_frame == 14
+    assert clip.source_in_frame == 2
+    assert clip.source_origin_frame == 0
+    assert clip.total_source_frames == 6
+    assert left_trimmed == 2
+    assert right_trimmed == 0
 
 
 def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, monkeypatch):
@@ -2387,6 +2437,7 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
     assert scene.audio_tracks[-1].timeline_start_frame == 8
     assert scene.audio_tracks[-1].timeline_end_frame == 12
     assert scene.audio_tracks[-1].source_in_frame == 1
+    assert scene.audio_tracks[-1].source_origin_frame == 0
     assert scene.audio_tracks[-1].total_source_frames == 5
     assert any(str(path).endswith("_audio.wav") for path in saved_audio_paths)
 

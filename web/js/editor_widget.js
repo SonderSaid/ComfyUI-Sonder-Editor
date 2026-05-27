@@ -302,6 +302,7 @@ const TIMELINE_HEIGHT = 212;
 const GALLERY_HEIGHT = 160;
 const RULER_HEIGHT = 24;
 const TRACK_HEIGHT = 32;
+const GUIDE_LABEL_RESERVE = 14;
 const SCENE_BAR_HEIGHT = 36;
 const FULLSCREEN_SIDEBAR_DEFAULT_WIDTH = 240;
 const FULLSCREEN_SIDEBAR_MIN_WIDTH = 180;
@@ -1597,13 +1598,15 @@ export class EditorWidget {
                 }
                 this._pendingScenesRefresh = false;
                 this.scenes = data.scenes || [];
-                if (this.scenes.length > 0 && !this.activeSceneId) {
-                    this._setActiveScene(this.scenes[0]);
-                } else if (this.activeSceneId) {
-                    const scene = this.scenes.find(s => s.scene_id === this.activeSceneId);
+                if (this.scenes.length > 0) {
+                    const widgetSceneId = String(this._getWidgetValue("scene_id", "") || "");
+                    const desiredSceneIds = [this.activeSceneId, widgetSceneId].filter((id, idx, arr) => id && arr.indexOf(id) === idx);
+                    const scene = desiredSceneIds
+                        .map(id => this.scenes.find(s => s.scene_id === id))
+                        .find(Boolean);
                     if (scene) {
                         this._setActiveScene(scene);
-                    } else if (this.scenes.length > 0) {
+                    } else {
                         this._setActiveScene(this.scenes[0]);
                     }
                 }
@@ -3422,11 +3425,15 @@ export class EditorWidget {
         for (const entry of this._trackLayout) {
             h += Math.round((entry.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT) * ts);
         }
-        return h;
+        return h + this._timelineGuideLabelReserve();
     }
 
     _timelineRulerHeight() {
         return Math.round(RULER_HEIGHT * this._scaleTimeline);
+    }
+
+    _timelineGuideLabelReserve() {
+        return this.isFullscreen ? Math.round(GUIDE_LABEL_RESERVE * this._scaleTimeline) : 0;
     }
 
     _visibleTimelineContentHeight() {
@@ -8264,11 +8271,15 @@ export class EditorWidget {
         exitBtn.style.cssText += `font-size: 12px; padding: 4px 12px; color: ${COLORS.textDim};`;
         exitBtn.addEventListener("click", () => this._exitFullscreen());
 
+        const toolbarButtons = document.createElement("div");
+        toolbarButtons.dataset.fsToolbarButtons = "true";
+        toolbarButtons.style.cssText = `display: flex; align-items: center; flex-shrink: 0;`;
         if (mountTabBtn) {
-            toolbar.append(this._fsTitle, spacer, mountTabBtn, exitBtn);
+            toolbarButtons.append(mountTabBtn, exitBtn);
         } else {
-            toolbar.append(this._fsTitle, spacer, exitBtn);
+            toolbarButtons.append(exitBtn);
         }
+        toolbar.append(this._fsTitle, spacer, toolbarButtons);
 
         // Content area — three-panel layout
         this._fsContent = document.createElement("div");
@@ -8485,9 +8496,10 @@ export class EditorWidget {
         const sceneBarH = SCENE_BAR_HEIGHT * st;
         const toolbarH = 24 * st;
         const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * st;
+        const guideLabelReserve = this._timelineGuideLabelReserve();
 
         // Timeline height — canvas renders at 1:1 now (individual elements scale themselves)
-        this._timelineHeight = Math.max(100, bottomH - sceneBarH - toolbarH - editorsH);
+        this._timelineHeight = Math.max(100, bottomH - sceneBarH - toolbarH - editorsH - guideLabelReserve);
         this._clampScrollY();
         // Gallery is in the sidebar now, doesn't need height calc
         this._galleryHeight = GALLERY_HEIGHT; // Not used in fullscreen layout

@@ -98,9 +98,7 @@ class SonderEditor:
     )
     FUNCTION = "execute"
     DESCRIPTION = (
-        "All-in-one editor node. Select a project and scene, set up your timeline "
-        "with guide frames and prompts, then select a section to render. "
-        "Outputs everything the sampler needs."
+        "Build and render video scenes with timeline clips, guides, prompts, takes, and project assets."
     )
 
     @classmethod

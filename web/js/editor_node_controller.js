@@ -1733,6 +1733,7 @@ export class EditorNodeController {
             },
         }, {
             role: "canvas_host",
+            clientId: this._canvasInstanceId,
             hostId,
             sourceNodeId,
             sessionId: this._editorSessionId,
@@ -2077,7 +2078,9 @@ export class EditorNodeController {
             return;
         }
 
-        if (projectDir !== this.state.projectDir) {
+        const previousProjectDir = this.state.projectDir || "";
+        if (projectDir !== previousProjectDir) {
+            const switchingExistingProject = !!previousProjectDir && previousProjectDir !== projectDir;
             if (this.fullscreenSession) {
                 const session = this.fullscreenSession;
                 this.fullscreenSession = null;
@@ -2087,13 +2090,15 @@ export class EditorNodeController {
             this._lastQueueSettledSaveCompletionCounter = 0;
             this._frameConstraintHealedFor = "";
             this.state.projectDir = projectDir;
-            this.state.sceneId = "";
-            this.state.selectionStart = 0;
-            this.state.selectionEnd = 0;
             this.state.dormantSummary = null;
-            this._setWidgetValue("scene_id", "");
-            this._setWidgetValue("selection_start", 0);
-            this._setWidgetValue("selection_end", 0);
+            if (switchingExistingProject) {
+                this.state.sceneId = "";
+                this.state.selectionStart = 0;
+                this.state.selectionEnd = 0;
+                this._setWidgetValue("scene_id", "");
+                this._setWidgetValue("selection_start", 0);
+                this._setWidgetValue("selection_end", 0);
+            }
             this._invalidateModules(["project", "assets", "scene", "queue", "preview"]);
             this.state.expandedModuleId = "";
             this.state.activeOwner = null;

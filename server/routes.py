@@ -4447,6 +4447,8 @@ if routes is not None:
         remember_event_loop()
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        # SwarmUI's ComfyBackendDirect proxy needs a Comfy-style sid to close cleanly.
+        await ws.send_json({"type": "status", "data": {"sid": uuid.uuid4().hex}})
         subscribed_project_id = str(request.query.get("project_id") or "")
         host_registration: dict[str, str] | None = None
 

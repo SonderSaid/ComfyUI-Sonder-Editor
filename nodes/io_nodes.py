@@ -1323,7 +1323,7 @@ class SonderSaveVideo:
                     source_out_frame = max(source_in_frame, min(total_frames, source_out_frame))
                     timeline_start_frame = sel_start - mask_pre
                     timeline_end_frame = sel_end + mask_post
-                    source_origin_frame = source_in_frame
+                    source_origin_frame = 0
                     clip_total_source_frames = max(0, total_frames - frame_count_padding)
 
                 clip = ClipReference(

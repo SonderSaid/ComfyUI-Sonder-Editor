@@ -13,6 +13,8 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
     let hostHeartbeatTimer = null;
     let attempt = 0;
     const encodedProjectId = encodeURIComponent(projectId || "");
+    const clientId = String(options.clientId || options.hostId || options.sessionId || "").trim();
+    const encodedClientId = encodeURIComponent(clientId);
 
     const emitState = (state, details = {}) => {
         try {
@@ -72,8 +74,8 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
     };
 
     function connect() {
-        if (closed || !projectId) return;
-        const url = wsURL(`/sonder-editor/ws?project_id=${encodedProjectId}`);
+        if (closed || !projectId || !clientId) return;
+        const url = wsURL(`/sonder-editor/ws?project_id=${encodedProjectId}&client_id=${encodedClientId}&clientId=${encodedClientId}`);
         emitState(attempt ? "reconnecting" : "connecting", { url });
         try {
             ws = new WebSocket(url);
