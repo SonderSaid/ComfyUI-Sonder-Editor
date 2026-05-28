@@ -907,18 +907,73 @@ export function snapResolution(width, height, template) {
     };
 }
 
-export function resolveBatchChunkSize({ settings, template } = {}) {
+export function resolveBatchChunkSize({ settings, template, preContext = 0, postContext = 0 } = {}) {
+    // `batchMaxFrames` is a TOTAL rendered-tensor budget per chunk (LTX 2.3 default
+    // of 97 = the model's frame ceiling). Selection chunk size = total budget minus
+    // context. Mirrors the four-snap policy in editor_node.py / editor_widget.js:
+    // pre snaps to G (when > 0), post snaps to multiples of step, total snaps UP
+    // (ceil) to next G, selection budget snaps to V (multiples of step when pre>0,
+    // G when pre==0).
     const requested = pickDefined(
         settings?.batchRender?.maxFramesPerChunk > 0 ? settings.batchRender.maxFramesPerChunk : undefined,
         template?.constraints?.batchMaxFrames,
         97,
     );
     const numeric = Math.max(1, Math.round(Number(requested) || 97));
+    const pre = Math.max(0, Math.round(Number(preContext) || 0));
+    const post = Math.max(0, Math.round(Number(postContext) || 0));
     const frameConstraint = template?.constraints?.frames;
-    if (frameConstraint && typeof frameConstraint === "object") {
-        return Math.max(1, Math.round(snapToConstraint(numeric, frameConstraint)));
+    if (!frameConstraint || typeof frameConstraint !== "object" || !frameConstraint.step || frameConstraint.step <= 1) {
+        // Free / no-constraint: just subtract context from the requested budget.
+        return Math.max(1, numeric - pre - post);
     }
-    return numeric;
+    const step = frameConstraint.step;
+    const offset = frameConstraint.offset || 0;
+    // Snap pre to G (when > 0); snap post to multiple of step. Both go UP.
+    const snappedPre = pre > 0
+        ? offset + Math.ceil(Math.max(0, pre - offset) / step) * step
+        : 0;
+    const snappedPost = post > 0 ? Math.ceil(post / step) * step : 0;
+    // Total budget: explicit ceil to next G value (NOT snapToConstraint, which rounds
+    // to nearest and would snap DOWN for some inputs, e.g. numeric=92 -> 89).
+    const targetTotal = numeric <= offset
+        ? Math.max(1, offset)
+        : offset + Math.ceil((numeric - offset) / step) * step;
+    const selectionBudget = targetTotal - snappedPre - snappedPost;
+    if (selectionBudget <= 0) {
+        // Context already swallows the budget; emit smallest valid chunk so at least one job lands.
+        return snappedPre > 0 ? step : Math.max(1, offset || step);
+    }
+    if (snappedPre > 0) {
+        // Selection ∈ {multiples of step} so out_point = pre + sel ∈ G.
+        return Math.max(step, Math.ceil(selectionBudget / step) * step);
+    }
+    // pre == 0: selection ∈ G (in_point at 0, out_point = sel must be in G).
+    if (selectionBudget <= offset) return offset || step;
+    return offset + Math.ceil((selectionBudget - offset) / step) * step;
+}
+
+export function resolveBatchChunkSizes({ settings, template, preContext = 0, postContext = 0, selectionStart = 0 } = {}) {
+    // Returns { chunkSize, firstChunkSize }. chunkSize is the size for non-first chunks.
+    // The FIRST chunk carries the template's constant frame (offset) in its gen when it
+    // sits at the scene start and therefore has no real frames before it to grab as
+    // pre-context: with preContext > 0 the snapped pre is always >= 1, so "no available
+    // pre-context" reduces exactly to selectionStart <= 0. Without this, the first chunk
+    // total = chunkSize (a bare multiple of step) is off-grid and the backend would
+    // tail-pad it with a repeated frame instead of generating the constant as a real
+    // frame. `chunkSize + offset` lands the total on G and self-handles offset == 0
+    // templates (no-op). Guarded by step > 1 so free / no-constraint templates are
+    // unaffected. Subsequent chunks (which grab pre-context from the prior take) stay
+    // at chunkSize.
+    const chunkSize = resolveBatchChunkSize({ settings, template, preContext, postContext });
+    const frameConstraint = template?.constraints?.frames;
+    const step = frameConstraint?.step;
+    const offset = frameConstraint?.offset || 0;
+    const firstChunkLacksPreContext = preContext > 0 && (parseInt(selectionStart, 10) || 0) <= 0;
+    const firstChunkSize = (step && step > 1 && firstChunkLacksPreContext)
+        ? chunkSize + offset
+        : chunkSize;
+    return { chunkSize, firstChunkSize };
 }
 
 export function describeConstraintFormula(constraint) {

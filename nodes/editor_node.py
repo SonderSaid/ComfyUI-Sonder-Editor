@@ -252,6 +252,42 @@ class SonderEditor:
         return offset + math.ceil(k) * step
 
     @staticmethod
+    def _snap_mask_pre_offset_up(value: int, actual_pre: int, step: int) -> int:
+        # Valid set: {0, step, 2*step, ..., k*step where k*step <= actual_pre} ∪ {actual_pre}.
+        # The "∪ {actual_pre}" full-mask option is needed because actual_pre on the LTX
+        # grid (e.g. 25 = step*3 + offset) is NOT itself a multiple of step.
+        # Returns 0 when actual_pre <= 0 or value <= 0. Clamps down to actual_pre when value > actual_pre.
+        value = _coerce_int(value, 0)
+        actual_pre = _coerce_int(actual_pre, 0)
+        step = max(1, _coerce_int(step, 1))
+        if actual_pre <= 0 or value <= 0:
+            return 0
+        if value >= actual_pre:
+            return actual_pre
+        snapped = math.ceil(value / step) * step
+        if snapped <= actual_pre:
+            return snapped
+        return actual_pre
+
+    @staticmethod
+    def _snap_mask_post_offset_up(value: int, actual_post: int, step: int) -> int:
+        # Valid set: {0, step, 2*step, ..., k*step where k*step <= actual_post}.
+        # Post side does not need the full-context include (actual_post is itself a
+        # multiple of step by construction since it doesn't carry the +1 offset).
+        # Returns 0 when actual_post <= 0 or value <= 0. Clamps down to actual_post when value > actual_post.
+        value = _coerce_int(value, 0)
+        actual_post = _coerce_int(actual_post, 0)
+        step = max(1, _coerce_int(step, 1))
+        if actual_post <= 0 or value <= 0:
+            return 0
+        if value >= actual_post:
+            return actual_post
+        snapped = math.ceil(value / step) * step
+        if snapped <= actual_post:
+            return snapped
+        return actual_post
+
+    @staticmethod
     def _pad_image_batch_to_frame_count(frames: torch.Tensor, target_count: int) -> torch.Tensor:
         if not torch.is_tensor(frames) or frames.ndim < 1:
             return frames
@@ -620,8 +656,51 @@ class SonderEditor:
             generation_end = render_end
             actual_pre = min(pre_context_frames, generation_start)
             actual_post = min(post_context_frames, scene.duration_frames - generation_end)
-            mask_pre_offset = min(mask_pre_offset, actual_pre)
-            mask_post_offset = min(mask_post_offset, actual_post)
+
+            template_id = self._execution_template_id(proj, queue_job)
+            frame_constraint = self._execution_frame_constraint(proj, queue_job)
+
+            # Independent snaps for the four sections — mask offsets do NOT inflate the
+            # rendered tensor (the bug fixed here). The LTX +1 (offset=1) lives once at
+            # the start of the total tensor and is carried by `actual_pre` when pre > 0,
+            # or by `gen_len` via the existing selection-endpoint snap when pre == 0.
+            # post never carries the +1. Mask offsets snap to the valid grid-difference
+            # set within their context cap — they only choose which already-rendered
+            # frames are masked, not how many frames get rendered.
+            #
+            # Scene-edge fallback: when expansion can't reach the next grid value
+            # because of scene bounds, expansion is skipped (all-or-nothing) and the
+            # `_snap_pixel_to_constraint` helper below fires on the mask boundary as a
+            # last resort. In the common case the helper is a no-op since boundaries
+            # are already on grid by construction.
+            if frame_constraint and _coerce_int(frame_constraint.get("step"), 1) > 1:
+                step = max(1, _coerce_int(frame_constraint.get("step"), 1))
+                # 1. actual_pre -> next G value (when pre > 0).
+                if actual_pre > 0:
+                    grid_aligned_pre = self._snap_pixel_to_constraint(
+                        actual_pre, frame_constraint, "end"
+                    )
+                    pre_extension = max(0, grid_aligned_pre - actual_pre)
+                    if pre_extension <= (generation_start - actual_pre):
+                        actual_pre += pre_extension
+                # 2. actual_post -> next multiple of step.
+                post_remainder = actual_post % step
+                post_extension = (step - post_remainder) % step
+                if post_extension <= (scene.duration_frames - generation_end - actual_post):
+                    actual_post += post_extension
+                # 3 & 4. Mask offsets snap to their valid sets within the (now snapped)
+                # context caps. These calls absorb the previous pre-snap clamp.
+                mask_pre_offset = self._snap_mask_pre_offset_up(
+                    mask_pre_offset, actual_pre, step
+                )
+                mask_post_offset = self._snap_mask_post_offset_up(
+                    mask_post_offset, actual_post, step
+                )
+            else:
+                # No template constraint: just clamp offsets to context bounds (old behavior).
+                mask_pre_offset = max(0, min(mask_pre_offset, actual_pre))
+                mask_post_offset = max(0, min(mask_post_offset, actual_post))
+
             if actual_pre > 0 or actual_post > 0:
                 render_start = generation_start - actual_pre
                 render_end = generation_end + actual_post
@@ -630,8 +709,6 @@ class SonderEditor:
             context_end = render_end
             source_frame_count = render_end - render_start
             frame_count = source_frame_count
-            template_id = self._execution_template_id(proj, queue_job)
-            frame_constraint = self._execution_frame_constraint(proj, queue_job)
             target_frame_count = self._round_up_frame_count(frame_count, frame_constraint)
             frame_count_padding = max(0, target_frame_count - frame_count)
             logger.info(

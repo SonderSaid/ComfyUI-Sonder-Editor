@@ -231,16 +231,19 @@ def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, mo
     audio = result[13]
     assert result[9] == 169
     assert tuple(result[1].shape) == (169, 4, 4, 3)
-    # mask_start_pixel = 48 falls inside LTX latent 6 (pixels 41..48); snap-start floors to 41.
-    # mask_end_pixel = 169 is already on the 8n+1 grid (boundary set 1,9,17,...,169).
-    assert result[14] == pytest.approx(41 / 24.0)
+    # Context-first alignment: requested pre=48 sits between LTX boundaries 41 and 49;
+    # actual_pre expands by 1 to 49 so the in-point (mask_start) lands on grid without
+    # the snap helper extending the mask into already-rendered pre-context.
+    # mask_end = 49 + 119 + 0 + padding(1) = 169 is already on the 8n+1 grid.
+    assert result[14] == pytest.approx(49 / 24.0)
     assert result[15] == pytest.approx(169 / 24.0)
     assert audio["waveform"].shape[-1] >= int((169 / 24.0) * audio["sample_rate"])
-    assert project._execution_context["source_frame_count"] == 167
+    assert project._execution_context["source_frame_count"] == 168
     assert project._execution_context["frame_count"] == 169
-    assert project._execution_context["frame_count_padding"] == 2
+    assert project._execution_context["frame_count_padding"] == 1
     assert project._execution_context["template_id"] == "ltxv-2.3"
-    assert project._execution_context["mask_start_frame"] == 41
+    assert project._execution_context["actual_pre_context_frames"] == 49
+    assert project._execution_context["mask_start_frame"] == 49
     assert project._execution_context["mask_end_frame"] == 169
 
 
@@ -340,11 +343,14 @@ def test_custom_template_constraint_pads_correctly(tmp_path, monkeypatch):
     )
     result = _execute_constraint_test(editor_node, project, monkeypatch)
 
-    # 167 source -> next 10n+3 is 173
+    # Context-first alignment with step=10/offset=3: desired mask_start = 48,
+    # next grid value is 53, so actual_pre expands by 5 to 53.
+    # source = 53+119+0 = 172 -> next 10n+3 is 173 -> padding = 1 (was 6 pre-expansion).
     assert result[9] == 173
     assert tuple(result[1].shape) == (173, 4, 4, 3)
+    assert project._execution_context["actual_pre_context_frames"] == 53
     assert project._execution_context["frame_count"] == 173
-    assert project._execution_context["frame_count_padding"] == 6
+    assert project._execution_context["frame_count_padding"] == 1
     assert project._execution_context["template_id"] == "my-custom-template"
 
 
@@ -384,7 +390,7 @@ def test_snap_pixel_to_constraint_helper_covers_boundary_cases(tmp_path, monkeyp
     assert snap(2, custom, "end") == 3
 
 
-def test_execute_snaps_mask_pre_offset_below_ltx_boundary(tmp_path, monkeypatch):
+def test_execute_expands_pre_context_to_align_mask_with_ltx_boundary(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
@@ -408,13 +414,284 @@ def test_execute_snaps_mask_pre_offset_below_ltx_boundary(tmp_path, monkeypatch)
         mask_post_offset=0,
     )
 
-    # mask_start_pixel = actual_pre(48) - mask_pre_offset(10) = 38;
-    # LTX boundaries below or equal to 38 are 33, so start floors to 33.
-    # mask_end_pixel = selection(119) + actual_pre(48) + mask_post(0) + padding(2) = 169 (on grid).
+    # Independent snaps with mask_pre_offset=10: actual_pre(48) snaps to next G = 49
+    # (independent of mask offset). mask_pre_offset(10) snaps to the valid set within
+    # actual_pre=49 (= {0, 8, 16, 24, 32, 40, 48, 49}), next >= 10 is 16.
+    # mask_start = 49 - 16 = 33; source = 49+119+0 = 168; target = 169; padding = 1;
+    # mask_end = 49+119+0+1 = 169 (on grid). No snap-helper fallback fires.
     assert result[14] == pytest.approx(33 / 24.0)
     assert result[15] == pytest.approx(169 / 24.0)
+    assert project._execution_context["actual_pre_context_frames"] == 49
+    assert project._execution_context["mask_pre_offset"] == 16
+    assert project._execution_context["frame_count_padding"] == 1
     assert project._execution_context["mask_start_frame"] == 33
     assert project._execution_context["mask_end_frame"] == 169
+
+
+def test_execute_expands_both_sides_for_ltx_alignment(tmp_path, monkeypatch):
+    # Exercises pre- AND post-side context expansion in the same render. With pre=8,
+    # post=5, mask_pre=0, mask_post=0 on LTX 8n+1: actual_pre grows 8 -> 9
+    # (desired mask_start=8, next grid 9); actual_post grows 5 -> 8 ((post-mask)%8=5,
+    # so extension=3). source = 9+100+8 = 117; target = 121; padding = 4;
+    # mask_start = 9, mask_end = 9+100+0+4 = 113 (both on grid, no snap fires).
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=100,
+        selection_end=200,
+        pre_context_frames=8,
+        post_context_frames=5,
+        mask_pre_offset=0,
+        mask_post_offset=0,
+    )
+
+    assert result[14] == pytest.approx(9 / 24.0)
+    assert result[15] == pytest.approx(113 / 24.0)
+    assert project._execution_context["actual_pre_context_frames"] == 9
+    assert project._execution_context["actual_post_context_frames"] == 8
+    assert project._execution_context["frame_count"] == 121
+    assert project._execution_context["frame_count_padding"] == 4
+    assert project._execution_context["mask_start_frame"] == 9
+    assert project._execution_context["mask_end_frame"] == 113
+
+
+def test_execute_falls_back_to_floor_snap_at_scene_start(tmp_path, monkeypatch):
+    # Scene-edge fallback: selection_start=3 leaves only 3 frames of pre-context
+    # available. Requested pre=24 is clamped to 3; desired mask_start=3 needs to
+    # reach grid value 9 (extension 6), but available=0 -> expansion is skipped
+    # (all-or-nothing) and the floor snap fires as a fallback so mask_start lands
+    # on grid by extending the mask back into the available pre-context (the leak
+    # the new policy avoids when expansion is possible).
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=3,
+        selection_end=100,
+        pre_context_frames=24,
+        post_context_frames=0,
+        mask_pre_offset=0,
+        mask_post_offset=0,
+    )
+
+    # actual_pre clamped to 3 (scene start); no expansion possible; snap floor 3 -> 1.
+    assert project._execution_context["actual_pre_context_frames"] == 3
+    assert result[14] == pytest.approx(1 / 24.0)
+    assert project._execution_context["mask_start_frame"] == 1
+
+
+def test_execute_snaps_mask_offsets_independently_of_context_frames(tmp_path, monkeypatch):
+    # The core fix: setting a mask offset must NOT inflate the rendered tensor.
+    # Inputs pre=24, mask_pre=12, post=24, mask_post=12 -> actual_pre snaps 24 -> 25
+    # (independent of mask_pre); actual_post stays 24 (already multiple of step);
+    # mask_pre_offset snaps 12 -> 16 (within {0,8,16,24,25}); mask_post_offset
+    # snaps 12 -> 16 (within {0,8,16,24}). source = 25+120+24 = 169 (already in G,
+    # padding=0). mask_start = 9, mask_end = 161. Crucially: rendered tensor is 169
+    # frames, NOT inflated to e.g. 177 (the pre-fix coupled-expansion behavior).
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=100,
+        selection_end=220,
+        pre_context_frames=24,
+        post_context_frames=24,
+        mask_pre_offset=12,
+        mask_post_offset=12,
+    )
+
+    assert result[9] == 169
+    assert project._execution_context["actual_pre_context_frames"] == 25
+    assert project._execution_context["actual_post_context_frames"] == 24
+    assert project._execution_context["mask_pre_offset"] == 16
+    assert project._execution_context["mask_post_offset"] == 16
+    assert project._execution_context["frame_count"] == 169
+    assert project._execution_context["frame_count_padding"] == 0
+    assert project._execution_context["mask_start_frame"] == 9
+    assert project._execution_context["mask_end_frame"] == 161
+    # Sanity vs the post-side bug: if mask_post=0 instead, frame_count should be the
+    # same 169. Verifies mask_post does not inflate the tensor.
+
+
+def test_execute_snaps_stored_off_grid_mask_offsets_from_queue_job(tmp_path, monkeypatch):
+    # Backward-compat regression: queued GenerationJob snapshots persisted before
+    # the independent-snap rewrite carry raw off-grid mask offsets (e.g. 10). On
+    # consume, the new rules snap them up to the nearest valid value (16 for LTX).
+    # Verifies the consume path matches the widget-input path.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    queue_job = type(
+        "DummyQueueJob",
+        (),
+        {
+            "scene_id": "scene-1",
+            "selection_start": 482,
+            "selection_end": 601,
+            "pre_context_frames": 48,
+            "post_context_frames": 0,
+            "context_frames": 48,
+            "mask_pre_offset": 10,  # off-grid; pre-existing queue snapshot
+            "mask_post_offset": 0,
+            "template_id": "ltxv-2.3",
+            "frame_constraint": {"step": 8, "offset": 1, "min": 1},
+            "take_placement_mode": "trimmed",
+            "params": {},
+            "prompt": "queued",
+            "scene_name": "Scene 1",
+            "status": "pending",
+            "job_id": "job-1",
+            "batch_id": "",
+            "batch_total": 0,
+            "batch_index": 0,
+            "guide_frame_snapshots": [],
+            "prompt_sections": [],
+            "scene_width": 0,
+            "scene_height": 0,
+            "scene_fps": 0.0,
+            "error": "",
+            "progress": 0.0,
+        },
+    )()
+    project.generation_queue = [queue_job]
+
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(editor_node, "save_project", lambda proj: None)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_execution_reaches_terminal_save",
+        lambda self, prompt, node_id: True,
+    )
+    _patch_render_and_audio(editor_node, monkeypatch)
+
+    editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=0,
+        pre_context_frames=0,
+        post_context_frames=0,
+        prompt={"1": {"class_type": "SonderEditor", "inputs": {}}},
+        unique_id="1",
+    )
+
+    # Same end-state as the widget-input path: actual_pre 48 -> 49, mask_pre 10 -> 16.
+    assert project._execution_context["actual_pre_context_frames"] == 49
+    assert project._execution_context["mask_pre_offset"] == 16
+    assert project._execution_context["mask_start_frame"] == 33
+    assert project._execution_context["mask_end_frame"] == 169
+
+
+def test_execute_first_batch_chunk_with_offset_grown_gen_renders_clean(tmp_path, monkeypatch):
+    # Backend side of the frontend's first-chunk fix (resolveBatchChunkSizes): a batch's
+    # first chunk sits at scene frame 0, so it has no pre-context to carry the LTX +1.
+    # The frontend grows that chunk's gen by `offset` (72 -> 73) so the total lands on G
+    # WITHOUT the backend tail-padding a repeated frame. This verifies the grown chunk
+    # (selection [0, 73), pre=25) renders as a clean 73-frame tensor with zero padding.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=73,
+        pre_context_frames=25,
+        post_context_frames=0,
+        mask_pre_offset=0,
+        mask_post_offset=0,
+    )
+
+    # actual_pre clamps to 0 (no frames before scene start); gen=73 is already in G,
+    # so total=73 with NO padding (contrast: un-grown gen=72 would round up to 73 with
+    # padding=1, a repeated tail frame).
+    assert result[9] == 73
+    assert project._execution_context["actual_pre_context_frames"] == 0
+    assert project._execution_context["frame_count"] == 73
+    assert project._execution_context["frame_count_padding"] == 0
+    assert project._execution_context["mask_start_frame"] == 0
+    assert project._execution_context["mask_end_frame"] == 73
+
+
+def test_execute_first_batch_chunk_without_offset_grown_gen_needs_padding(tmp_path, monkeypatch):
+    # Companion contrast: the SAME chunk un-grown (gen=72) at scene start needs 1 frame
+    # of tail padding to satisfy the constraint — which is exactly what the frontend's
+    # +offset growth avoids. Locks in the motivation for the first-chunk fix.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(
+        tmp_path,
+        template_id="ltxv-2.3",
+        frame_constraint={"step": 8, "offset": 1, "min": 1},
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=72,
+        pre_context_frames=25,
+        post_context_frames=0,
+        mask_pre_offset=0,
+        mask_post_offset=0,
+    )
+
+    assert result[9] == 73
+    assert project._execution_context["frame_count_padding"] == 1
 
 
 def test_execute_mask_times_unsnapped_without_frame_constraint(tmp_path, monkeypatch):
@@ -2178,7 +2455,8 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
 
     node = io_nodes.SonderSaveVideo()
-    frames = torch.zeros(5, 2, 2, 3, dtype=torch.float32)
+    # selection=[4,12) plus pre=2 plus post=1 -> 11 source frames in the rendered tensor.
+    frames = torch.zeros(11, 2, 2, 3, dtype=torch.float32)
     result = node.save_video(project, frames, filename_prefix="queued", fps=24.0, mode="Take", mark_queue_complete=True)
 
     assert save_calls == ["completed"]
@@ -2311,6 +2589,58 @@ def test_save_video_take_trimmed_with_mask_offsets(tmp_path, monkeypatch):
     assert clip.source_out_frame == 8
     assert clip.source_origin_frame == 0
     assert clip.total_source_frames == 9
+
+
+def test_save_video_take_trimmed_honors_snapped_mask_frames(tmp_path, monkeypatch):
+    # Mirrors the LTX 8n+1 snap from test_execute_snaps_mask_pre_offset_below_ltx_boundary:
+    # the renderer floors mask_start from 38 -> 33 to include the straddling latent, so the
+    # take must extend 5 frames earlier than the un-snapped mask_pre_offset would imply.
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True, exist_ok=True)
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=700)
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Take Snap Test",
+        scenes=[scene],
+    )
+
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    project._execution_context = {
+        "scene_id": "scene-1",
+        "scene_name": "Scene 1",
+        "selection_start": 482,
+        "selection_end": 601,
+        "actual_pre_context_frames": 48,
+        "actual_post_context_frames": 0,
+        "mask_pre_offset": 10,
+        "mask_post_offset": 0,
+        "mask_start_frame": 33,
+        "mask_end_frame": 169,
+        "frame_count_padding": 2,
+        "take_placement_mode": "trimmed",
+    }
+    node = io_nodes.SonderSaveVideo()
+    node.save_video(project, torch.zeros(169, 2, 2, 3, dtype=torch.float32), filename_prefix="snap", fps=24.0, mode="Take")
+    clip = scene.clips[-1]
+
+    # context_start_scene_frame = 482 - 48 = 434; mask_start_frame=33 -> timeline 434+33=467
+    # (un-snapped placement would have used sel_start - mask_pre_offset = 472).
+    assert clip.timeline_start_frame == 467
+    # mask_end_frame=169 minus padding=2 -> visible_source_end=167; timeline 434+167=601.
+    assert clip.timeline_end_frame == 601
+    assert clip.source_in_frame == 33
+    assert clip.source_out_frame == 167
+    assert clip.total_source_frames == 167
 
 
 def test_save_video_take_trimmed_pre_context_does_not_create_tail_ghost(tmp_path, monkeypatch):

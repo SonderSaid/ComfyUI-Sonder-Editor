@@ -167,7 +167,7 @@ import {
     getAllModelTemplates,
     getTemplateById,
     previewConstraintValues,
-    resolveBatchChunkSize,
+    resolveBatchChunkSizes,
     resolveFrameConstraintForTemplate,
     snapResolution,
     snapToConstraint,
@@ -2571,6 +2571,50 @@ export class EditorWidget {
         return Math.max(1, Math.round(snapToConstraint(numeric, durationConstraint)));
     }
 
+    _snapPreContextFrames(value) {
+        // Pre context snaps UP to next G value (= step*k + offset, k>=0). 0 stays 0
+        // because pre=0 means no pre context — the +1 then lives in the selection
+        // via the existing _snapSelectionFrame path (selection endpoint snap).
+        const numeric = Math.max(0, parseInt(value, 10) || 0);
+        if (numeric <= 0) return 0;
+        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        const step = constraint?.step;
+        if (!step || step <= 1) return numeric;
+        const offset = constraint.offset || 0;
+        if (numeric <= offset) return offset;
+        const k = (numeric - offset) / step;
+        return offset + Math.ceil(k) * step;
+    }
+
+    _snapPostContextFrames(value) {
+        // Post context snaps UP to next multiple of step. Post never carries the
+        // +1 offset (the leading single frame lives at the start of the tensor,
+        // not the tail).
+        const numeric = Math.max(0, parseInt(value, 10) || 0);
+        if (numeric <= 0) return 0;
+        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        const step = constraint?.step;
+        if (!step || step <= 1) return numeric;
+        return Math.ceil(numeric / step) * step;
+    }
+
+    _snapMaskOffset(value, cap) {
+        // Mask offset snaps UP to the next multiple of step within [0, cap]. When
+        // value >= cap, returns cap (the "full mask" option — needed on the pre
+        // side because actual_pre = G value isn't itself a multiple of step; on
+        // the post side cap is already a multiple of step so this collapses to
+        // the same multiples-of-step rule).
+        const numeric = Math.max(0, parseInt(value, 10) || 0);
+        const capValue = Math.max(0, parseInt(cap, 10) || 0);
+        if (capValue <= 0 || numeric <= 0) return 0;
+        if (numeric >= capValue) return capValue;
+        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        const step = constraint?.step;
+        if (!step || step <= 1) return Math.min(numeric, capValue);
+        const snapped = Math.ceil(numeric / step) * step;
+        return snapped <= capValue ? snapped : capValue;
+    }
+
     _snapSelectionFrame(value, { direction = "up", clampMax = null } = {}) {
         const numeric = Math.max(0, Math.round(Number(value) || 0));
         // Frame 0 is always a valid selection endpoint; template constraint snapping must never push it above 0.
@@ -2997,14 +3041,26 @@ export class EditorWidget {
         if (this._maskPostOffsetInput) {
             this._maskPostOffsetInput.value = this._contextFrameValue("mask_post_offset");
         }
-        this._updateToolbar();
+        // Re-snap once after external refresh so old projects whose stored values are
+        // off-grid under the new policy reconcile display and persisted state on the
+        // first paint. _updateContextFrameWidgets handles toolbar update too.
+        this._updateContextFrameWidgets();
     }
 
     _updateContextFrameWidgets() {
-        const pre = Math.max(0, parseInt(this._preContextInput?.value, 10) || 0);
-        const post = Math.max(0, parseInt(this._postContextInput?.value, 10) || 0);
-        const maskPre = Math.max(0, parseInt(this._maskPreOffsetInput?.value, 10) || 0);
-        const maskPost = Math.max(0, parseInt(this._maskPostOffsetInput?.value, 10) || 0);
+        const preRaw = Math.max(0, parseInt(this._preContextInput?.value, 10) || 0);
+        const postRaw = Math.max(0, parseInt(this._postContextInput?.value, 10) || 0);
+        const maskPreRaw = Math.max(0, parseInt(this._maskPreOffsetInput?.value, 10) || 0);
+        const maskPostRaw = Math.max(0, parseInt(this._maskPostOffsetInput?.value, 10) || 0);
+        // Four independent snaps mirroring SonderEditor backend: context snaps grow
+        // the rendered tensor, mask offsets only choose which frames are masked
+        // within the snapped context cap. The mask-offset cap is the post-snap
+        // context value so any context change re-snaps the same-side mask offset
+        // in the same pass (forward-direction cross-field coupling).
+        const pre = this._snapPreContextFrames(preRaw);
+        const post = this._snapPostContextFrames(postRaw);
+        const maskPre = this._snapMaskOffset(maskPreRaw, pre);
+        const maskPost = this._snapMaskOffset(maskPostRaw, post);
         if (this._preContextInput) this._preContextInput.value = pre;
         if (this._postContextInput) this._postContextInput.value = post;
         if (this._maskPreOffsetInput) this._maskPreOffsetInput.value = maskPre;
@@ -9795,20 +9851,24 @@ export class EditorWidget {
         };
     }
 
-    _buildBatchQueueRanges(selStart, selEnd, chunkSize) {
+    _buildBatchQueueRanges(selStart, selEnd, chunkSize, firstChunkSize = chunkSize) {
         const start = Math.max(0, parseInt(selStart, 10) || 0);
         const end = Math.max(start, parseInt(selEnd, 10) || 0);
         const size = Math.max(1, parseInt(chunkSize, 10) || 1);
+        const firstSize = Math.max(1, parseInt(firstChunkSize, 10) || size);
         if (end <= start) {
             return [];
         }
 
         const ranges = [];
         let cursor = start;
+        let isFirst = true;
         while (cursor < end) {
-            const nextEnd = Math.min(cursor + size, end);
+            const thisSize = isFirst ? firstSize : size;
+            const nextEnd = Math.min(cursor + thisSize, end);
             ranges.push({ start: cursor, end: nextEnd });
             cursor = nextEnd;
+            isFirst = false;
         }
         return ranges;
     }
@@ -9825,11 +9885,14 @@ export class EditorWidget {
 
         const preContextFrames = this._contextFrameValue("pre_context_frames");
         const postContextFrames = this._contextFrameValue("post_context_frames");
-        const chunkSize = resolveBatchChunkSize({
+        const { chunkSize, firstChunkSize } = resolveBatchChunkSizes({
             settings: this._settings,
             template: this._getActiveTemplate(),
+            preContext: preContextFrames,
+            postContext: postContextFrames,
+            selectionStart: range.selStart,
         });
-        const chunks = this._buildBatchQueueRanges(range.selStart, range.selEnd, chunkSize);
+        const chunks = this._buildBatchQueueRanges(range.selStart, range.selEnd, chunkSize, firstChunkSize);
         const chunkCount = Math.max(1, chunks.length);
         const scopeLabel = range.hasSelection ? "selection" : "scene";
         const modeLabel = preContextFrames > 0 || postContextFrames > 0
@@ -9895,11 +9958,14 @@ export class EditorWidget {
         const range = this._resolveQueueSelectionRange();
         if (!range) return;
 
-        const chunkSize = resolveBatchChunkSize({
+        const { chunkSize, firstChunkSize } = resolveBatchChunkSizes({
             settings: this._settings,
             template: this._getActiveTemplate(),
+            preContext: this._contextFrameValue("pre_context_frames"),
+            postContext: this._contextFrameValue("post_context_frames"),
+            selectionStart: range.selStart,
         });
-        const chunks = this._buildBatchQueueRanges(range.selStart, range.selEnd, chunkSize);
+        const chunks = this._buildBatchQueueRanges(range.selStart, range.selEnd, chunkSize, firstChunkSize);
         if (chunks.length <= 1) {
             await this._addToRenderQueue();
             return;
@@ -11855,9 +11921,16 @@ export class EditorWidget {
                 const normalized = coerce(value);
                 return normalized === undefined ? coerce(config.customDefault) : normalized;
             };
+            // Whether the user explicitly picked Custom from the select. Tracked separately
+            // because the persisted value alone can't tell us: every numeric value the change
+            // handler would write happens to match one of the presets, so deriving "custom"
+            // from the value would always snap the select back to a preset and re-hide the input.
+            let customSelected = presetValueFor(config.getter()) === "custom";
             const sync = () => {
                 const value = currentValue();
-                const selectedPreset = presetValueFor(value);
+                const valueDerivedPreset = presetValueFor(value);
+                if (valueDerivedPreset === "custom") customSelected = true;
+                const selectedPreset = customSelected ? "custom" : valueDerivedPreset;
                 select.value = selectedPreset;
                 const showCustom = selectedPreset === "custom";
                 input.style.display = showCustom ? "" : "none";
@@ -11866,10 +11939,14 @@ export class EditorWidget {
 
             select.addEventListener("change", () => {
                 if (select.value === "custom") {
-                    config.onChange(currentValue() ?? coerce(config.customDefault));
+                    customSelected = true;
+                    // Don't write a value until the user edits the input; this keeps an
+                    // "unlimited" (null) setting unchanged when the user opens the custom
+                    // field but decides not to commit a value.
                     sync();
                     return;
                 }
+                customSelected = false;
                 if (select.value === "unlimited") {
                     config.onChange(null);
                     sync();
@@ -12448,7 +12525,7 @@ export class EditorWidget {
             renderSection,
             "batchRenderMaxFramesPerChunk",
             "Batch Max Frames",
-            "Preferred chunk size before the active template's frame constraint snaps and clamps it. A value of 0 uses the active template's batch ceiling.",
+            "Maximum total frames per chunk including pre/post context (the rendered tensor size cap). Snaps up to the active template's frame constraint. A value of 0 uses the active template's batch ceiling.",
             {
                 min: 0,
                 max: 10000,

@@ -1315,14 +1315,30 @@ class SonderSaveVideo:
                     source_origin_frame = 0
                     clip_total_source_frames = total_frames
                 else:
-                    # Trimmed (default): show generated portion plus mask offsets on the timeline.
-                    # total_source_frames excludes padding so trim cannot expose padding frames.
-                    source_in_frame = max(0, actual_pre - mask_pre)
-                    hidden_tail_frames = (actual_post - mask_post) + frame_count_padding
-                    source_out_frame = total_frames - hidden_tail_frames if hidden_tail_frames > 0 else total_frames
-                    source_out_frame = max(source_in_frame, min(total_frames, source_out_frame))
-                    timeline_start_frame = sel_start - mask_pre
-                    timeline_end_frame = sel_end + mask_post
+                    # Trimmed (default): align the visible region with the mask region the
+                    # renderer actually denoised. mask_start_frame / mask_end_frame are the
+                    # post-snap output-tensor coords published by SonderEditor; on the LTX
+                    # 8n+1 grid they extend outward (start floors, end ceils) so the take
+                    # must mirror that extension. Defaults fall back to the un-snapped
+                    # offsets so behavior is unchanged when no template constraint applies.
+                    gen_len = max(0, sel_end - sel_start)
+                    mask_start_frame = max(0, context_int("mask_start_frame", actual_pre - mask_pre))
+                    mask_end_frame = context_int(
+                        "mask_end_frame",
+                        actual_pre + gen_len + mask_post + frame_count_padding,
+                    )
+                    # Padding sits at the tail of the output tensor and is never user-visible
+                    # content; subtracting it preserves prior trimmed placement when snap is a
+                    # no-op while still extending the take by the snap delta when present.
+                    visible_source_end = max(mask_start_frame, min(
+                        mask_end_frame - frame_count_padding,
+                        total_frames - frame_count_padding,
+                    ))
+                    context_start_scene_frame = sel_start - actual_pre
+                    source_in_frame = mask_start_frame
+                    source_out_frame = visible_source_end
+                    timeline_start_frame = context_start_scene_frame + mask_start_frame
+                    timeline_end_frame = context_start_scene_frame + visible_source_end
                     source_origin_frame = 0
                     clip_total_source_frames = max(0, total_frames - frame_count_padding)
 
@@ -1372,12 +1388,9 @@ class SonderSaveVideo:
                             scene.audio_lane_configs.append(LaneConfig())
 
                         if take_placement_mode != "untrimmed":
-                            visible_len = (sel_end + mask_post) - (sel_start - mask_pre)
+                            visible_len = source_out_frame - source_in_frame
                             assert (timeline_end_frame - timeline_start_frame) == visible_len, (
                                 f"audio invariant: timeline span {timeline_end_frame - timeline_start_frame} != visible_len {visible_len}"
-                            )
-                            assert source_in_frame == max(0, actual_pre - mask_pre), (
-                                f"audio invariant: source_in_frame {source_in_frame} != actual_pre - mask_pre {max(0, actual_pre - mask_pre)}"
                             )
                             assert clip_total_source_frames == max(0, total_frames - frame_count_padding), (
                                 f"audio invariant: total_source_frames {clip_total_source_frames} != total_frames - padding {max(0, total_frames - frame_count_padding)}"
