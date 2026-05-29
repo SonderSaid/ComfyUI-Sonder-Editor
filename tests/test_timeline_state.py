@@ -465,7 +465,7 @@ def test_generation_job_roundtrip():
         scene_width=1024,
         scene_height=576,
         scene_fps=30.0,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1, "max": 257},
         take_placement_mode="untrimmed",
     )
@@ -494,7 +494,7 @@ def test_generation_job_roundtrip():
     assert restored.scene_width == 1024
     assert restored.scene_height == 576
     assert restored.scene_fps == 30.0
-    assert restored.template_id == "ltxv-2.3"
+    assert restored.template_id == "ltx-2.3"
     assert restored.frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert restored.take_placement_mode == "untrimmed"
 
@@ -530,7 +530,7 @@ def test_timeline_project_roundtrip():
         name="Test Project",
         fps=30.0,
         resolution=(1920, 1080),
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1, "max": 257},
     )
 
@@ -556,7 +556,7 @@ def test_timeline_project_roundtrip():
     assert restored.name == "Test Project"
     assert restored.fps == 30.0
     assert restored.resolution == (1920, 1080)
-    assert restored.template_id == "ltxv-2.3"
+    assert restored.template_id == "ltx-2.3"
     assert restored.frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert len(restored.scenes) == 1
     assert restored.scenes[0].scene_id == "sc1"

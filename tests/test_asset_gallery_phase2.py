@@ -419,7 +419,7 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
         "scene_width": 1024,
         "scene_height": 576,
         "scene_fps": 30.0,
-        "template_id": "ltxv-2.3",
+        "template_id": "ltx-2.3",
         "frame_constraint": {"step": 8, "offset": 1, "min": 1, "max": 257},
         "take_placement_mode": "untrimmed",
     })
@@ -441,7 +441,7 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     assert payload["scene_width"] == 1024
     assert payload["scene_height"] == 576
     assert payload["scene_fps"] == 30.0
-    assert payload["template_id"] == "ltxv-2.3"
+    assert payload["template_id"] == "ltx-2.3"
     assert payload["frame_constraint"] == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert payload["take_placement_mode"] == "untrimmed"
     assert project.generation_queue[0].frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}

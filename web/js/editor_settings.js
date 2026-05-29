@@ -84,8 +84,8 @@ export const MODEL_TEMPLATE_PARAM_KEYS = ["width", "height", "frames", "fps"];
 export const BUILTIN_MODEL_TEMPLATES = [
     { id: "free", name: "No Model Template", builtIn: true, constraints: {} },
     {
-        id: "ltxv-2.3",
-        name: "LTXV 2.3",
+        id: "ltx-2.3",
+        name: "LTX 2.3",
         builtIn: true,
         hintTier: 720,
         constraints: {
@@ -226,6 +226,21 @@ const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.
 const VALID_SAVE_PRESETS = new Set(SAVE_PRESET_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
 const BUILTIN_MODEL_TEMPLATE_IDS = new Set(BUILTIN_MODEL_TEMPLATES.map((entry) => entry.id));
+
+// Legacy model-template ids that earlier projects/settings may still carry.
+// Resolution is frontend-only: the backend stores template_id as an opaque
+// string, so normalizing here (the single chokepoint every consumer flows
+// through) keeps legacy projects resolving and lets the next save write back
+// the canonical id automatically. Must be declared up here with the other
+// module-level config consts: the eager `currentSettings` initializer below
+// calls normalizeEditorSettings() -> normalizeModelTemplateId() during module
+// load, so a late `const` would throw a TDZ ReferenceError and abort the whole
+// frontend extension.
+const LEGACY_MODEL_TEMPLATE_ID_ALIASES = { "ltxv-2.3": "ltx-2.3" };
+
+export function normalizeModelTemplateId(id) {
+    return LEGACY_MODEL_TEMPLATE_ID_ALIASES[id] ?? id;
+}
 const VALID_COMPARE_LAYOUTS = new Set(["divider", "sideBySide"]);
 const VALID_AUDIO_COMPARE_WAVEFORM_LAYOUTS = new Set(["stacked", "overlay"]);
 const VALID_AUDIO_COMPARE_MONITORS = new Set(["a", "b", "both", "mute"]);
@@ -742,8 +757,8 @@ function normalizeEditorSettings(source = null) {
                 1.0,
                 defaults.projectDefaults.defaultMotionDriverStrength,
             ),
-            defaultTemplateId: validTemplateIds.has(stored?.projectDefaults?.defaultTemplateId)
-                ? stored.projectDefaults.defaultTemplateId
+            defaultTemplateId: validTemplateIds.has(normalizeModelTemplateId(stored?.projectDefaults?.defaultTemplateId))
+                ? normalizeModelTemplateId(stored.projectDefaults.defaultTemplateId)
                 : defaults.projectDefaults.defaultTemplateId,
         },
         gallery: {
@@ -838,7 +853,8 @@ export function getAllModelTemplates(settings) {
 }
 
 export function getTemplateById(id, settings) {
-    return getAllModelTemplates(settings).find((template) => template.id === id) || BUILTIN_MODEL_TEMPLATES[0];
+    const wanted = normalizeModelTemplateId(id);
+    return getAllModelTemplates(settings).find((template) => template.id === wanted) || BUILTIN_MODEL_TEMPLATES[0];
 }
 
 export function resolveFrameConstraintForTemplate(templateId, settings) {

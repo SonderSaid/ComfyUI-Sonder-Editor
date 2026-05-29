@@ -13,12 +13,12 @@ from server.timeline_state import ClipReference, Scene
 
 def test_create_project():
     with tempfile.TemporaryDirectory() as base_dir:
-        project = create_project("Test Video", fps=30.0, width=1920, height=1080, template_id="ltxv-2.3", base_dir=base_dir)
+        project = create_project("Test Video", fps=30.0, width=1920, height=1080, template_id="ltx-2.3", base_dir=base_dir)
 
         assert project.name == "Test Video"
         assert project.fps == 30.0
         assert project.resolution == (1920, 1080)
-        assert project.template_id == "ltxv-2.3"
+        assert project.template_id == "ltx-2.3"
         assert os.path.isdir(project.project_dir)
         assert os.path.isfile(os.path.join(project.project_dir, "project.json"))
         assert os.path.isdir(os.path.join(project.project_dir, "media"))
@@ -32,7 +32,7 @@ def test_create_project():
 def test_save_and_load_roundtrip():
     with tempfile.TemporaryDirectory() as base_dir:
         project = create_project("Roundtrip Test", base_dir=base_dir)
-        project.template_id = "ltxv-2.3"
+        project.template_id = "ltx-2.3"
 
         clip = ClipReference(
             clip_id="test_clip",
@@ -47,10 +47,27 @@ def test_save_and_load_roundtrip():
 
         assert loaded.name == "Roundtrip Test"
         assert loaded.project_id == project.project_id
-        assert loaded.template_id == "ltxv-2.3"
+        assert loaded.template_id == "ltx-2.3"
         assert len(loaded.clips) == 1
         assert loaded.clips[0].clip_id == "test_clip"
         assert loaded.clips[0].timeline_end_frame == 48
+
+
+def test_legacy_template_id_roundtrips_unchanged():
+    """LTX rename (#25) backward compat: the backend treats template_id as an
+    opaque string with no registry validation, so a project saved with the
+    legacy "ltxv-2.3" id must load and round-trip the string unchanged. The
+    frontend (getTemplateById alias in editor_settings.js) canonicalizes it to
+    "ltx-2.3" on resolution and the next save persists the new id; the backend
+    deliberately does not rewrite it."""
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Legacy Template", base_dir=base_dir)
+        project.template_id = "ltxv-2.3"
+        save_project(project)
+
+        loaded = load_project(project.project_dir)
+
+        assert loaded.template_id == "ltxv-2.3"
 
 
 def test_list_projects():

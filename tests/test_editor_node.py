@@ -223,7 +223,7 @@ def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, mo
 
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     result = _execute_constraint_test(editor_node, project, monkeypatch)
@@ -241,7 +241,7 @@ def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, mo
     assert project._execution_context["source_frame_count"] == 168
     assert project._execution_context["frame_count"] == 169
     assert project._execution_context["frame_count_padding"] == 1
-    assert project._execution_context["template_id"] == "ltxv-2.3"
+    assert project._execution_context["template_id"] == "ltx-2.3"
     assert project._execution_context["actual_pre_context_frames"] == 49
     assert project._execution_context["mask_start_frame"] == 49
     assert project._execution_context["mask_end_frame"] == 169
@@ -252,7 +252,7 @@ def test_queue_job_frame_constraint_overrides_project(tmp_path, monkeypatch):
 
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     queue_job = type(
@@ -394,7 +394,7 @@ def test_execute_expands_pre_context_to_align_mask_with_ltx_boundary(tmp_path, m
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
@@ -437,7 +437,7 @@ def test_execute_expands_both_sides_for_ltx_alignment(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
@@ -477,7 +477,7 @@ def test_execute_falls_back_to_floor_snap_at_scene_start(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
@@ -514,7 +514,7 @@ def test_execute_snaps_mask_offsets_independently_of_context_frames(tmp_path, mo
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
@@ -555,7 +555,7 @@ def test_execute_snaps_stored_off_grid_mask_offsets_from_queue_job(tmp_path, mon
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     queue_job = type(
@@ -570,7 +570,7 @@ def test_execute_snaps_stored_off_grid_mask_offsets_from_queue_job(tmp_path, mon
             "context_frames": 48,
             "mask_pre_offset": 10,  # off-grid; pre-existing queue snapshot
             "mask_post_offset": 0,
-            "template_id": "ltxv-2.3",
+            "template_id": "ltx-2.3",
             "frame_constraint": {"step": 8, "offset": 1, "min": 1},
             "take_placement_mode": "trimmed",
             "params": {},
@@ -632,7 +632,7 @@ def test_execute_first_batch_chunk_with_offset_grown_gen_renders_clean(tmp_path,
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
@@ -670,7 +670,7 @@ def test_execute_first_batch_chunk_without_offset_grown_gen_needs_padding(tmp_pa
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
-        template_id="ltxv-2.3",
+        template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1},
     )
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
