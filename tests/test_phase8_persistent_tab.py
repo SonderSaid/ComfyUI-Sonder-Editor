@@ -1,10 +1,17 @@
 import asyncio
+import copy
 import os
 import tempfile
 
 import pytest
 
-from server.project_commit import save_generated_project
+from server.project_commit import (
+    _merge_generated_outputs,
+    created_ids_since,
+    save_generated_project,
+    snapshot_item_ids,
+)
+from server.routes import _compact_empty_media_lane
 from server.project_manager import (
     ProjectVersionConflict,
     create_project,
@@ -213,8 +220,337 @@ def test_generated_commit_extends_lanes_only_when_generated_content_uses_them():
         assert restored_scene.name == "Edited"
         assert restored_scene.video_lane_count == 3
         assert len(restored_scene.video_lane_configs) == 3
-        assert restored_scene.video_lane_configs[2].name == "V2_take"
+        # Appended generated lane gets a fresh default config (matches take
+        # placement); produced's lane name is intentionally not carried.
+        assert restored_scene.video_lane_configs[2].name == ""
         assert restored_scene.clips[0].clip_id == "clip-1"
+
+
+def test_generated_commit_nontail_delete_no_phantom_lane():
+    """Repro (2026-06-01): deleting a NON-TAIL lane mid-generation must not
+    create a phantom duplicate/resurrected lane when the take commits via the
+    conflict path. RED before the merge fix."""
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Phase 2 Nontail", base_dir=base_dir)
+        scene = Scene(scene_id="scene-1", name="Scene", duration_frames=12)
+        scene.video_lane_count = 3
+        scene.video_lane_configs = [
+            LaneConfig(name="V0"),
+            LaneConfig(name="V1"),
+            LaneConfig(name="V2"),
+        ]
+        # A non-generated user clip on each lane.
+        for i in range(3):
+            scene.clips.append(ClipReference(
+                clip_id=f"user-{i}",
+                source_path=os.path.join("media", f"user{i}.mp4"),
+                timeline_start_frame=0,
+                timeline_end_frame=12,
+                track_index=i,
+            ))
+        project.scenes.append(scene)
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+
+        # Editor side (V2): user deletes the NON-TAIL lane V1 mid-gen, exactly as
+        # api_delete_clip does — remove its clip then compact the now-empty lane.
+        current = load_project(project.project_dir)
+        current_scene = current.get_scene("scene-1")
+        current_scene.clips = [c for c in current_scene.clips if c.clip_id != "user-1"]
+        assert _compact_empty_media_lane(current_scene, "video", 1) is True
+        assert current_scene.video_lane_count == 2
+        assert [c.name for c in current_scene.video_lane_configs] == ["V0", "V2"]
+        save_project(current, expected_modified_at=base_version)
+
+        # Produced side (V1 + take): take auto-placed at max(track_index)+1 = 3
+        # with its own appended config — mirrors io_nodes/timeline_export.
+        produced_scene = produced.get_scene("scene-1")
+        produced_scene.video_lane_count = 4
+        produced_scene.video_lane_configs.append(LaneConfig())  # production appends a default config
+        generated_asset = Asset(
+            asset_id="asset-take",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            generation_params={"save_preset": "test"},
+        )
+        produced.assets.append(generated_asset)
+        produced_scene.clips.append(ClipReference(
+            clip_id="take-clip",
+            source_path=generated_asset.path,
+            timeline_start_frame=0,
+            timeline_end_frame=12,
+            is_generated=True,
+            track_index=3,
+        ))
+
+        save_generated_project(produced, base_version)
+
+        restored = load_project(project.project_dir)
+        rs = restored.get_scene("scene-1")
+        names = [c.name for c in rs.video_lane_configs]
+        # No phantom: exactly 3 lanes — V0, V2 (survivor), and a fresh appended
+        # take lane. V1 not resurrected; no duplicate of a surviving lane.
+        assert rs.video_lane_count == 3, names
+        assert len(rs.video_lane_configs) == 3, names
+        assert names[:2] == ["V0", "V2"], names
+        assert "V1" not in names, names
+        # Take landed on the appended lane; survivors keep identity at compacted indices.
+        take_clip = next(c for c in rs.clips if c.clip_id == "take-clip")
+        assert take_clip.track_index == 2, take_clip.track_index
+        assert next(c for c in rs.clips if c.clip_id == "user-0").track_index == 0
+        assert next(c for c in rs.clips if c.clip_id == "user-2").track_index == 1
+        assert not any(c.clip_id == "user-1" for c in rs.clips)
+
+
+def test_generated_commit_nontail_delete_audio_no_phantom_lane():
+    """Audio variant: deleting a non-tail audio lane mid-gen must not create a
+    phantom audio lane when an audio take commits via the conflict path."""
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Phase 2 Audio Nontail", base_dir=base_dir)
+        scene = Scene(scene_id="scene-1", name="Scene", duration_frames=12)
+        scene.audio_lane_count = 3
+        scene.audio_lane_configs = [LaneConfig(name="A0"), LaneConfig(name="A1"), LaneConfig(name="A2")]
+        for i in range(3):
+            scene.audio_tracks.append(AudioTrack(
+                track_id=f"aud-{i}",
+                source_path=os.path.join("media", f"a{i}.wav"),
+                timeline_start_frame=0,
+                timeline_end_frame=12,
+                lane_index=i,
+            ))
+        project.scenes.append(scene)
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+
+        # Editor deletes the non-tail audio lane A1 (remove its track, compact).
+        current = load_project(project.project_dir)
+        cs = current.get_scene("scene-1")
+        cs.audio_tracks = [t for t in cs.audio_tracks if t.track_id != "aud-1"]
+        assert _compact_empty_media_lane(cs, "audio", 1) is True
+        assert cs.audio_lane_count == 2
+        assert [c.name for c in cs.audio_lane_configs] == ["A0", "A2"]
+        save_project(current, expected_modified_at=base_version)
+
+        # Produced: generated audio take at lane_index 3 referencing a generated
+        # asset (so _audio_is_generated matches by source path).
+        ps = produced.get_scene("scene-1")
+        ps.audio_lane_count = 4
+        ps.audio_lane_configs.append(LaneConfig())
+        take_path = os.path.join("media", "take_audio.wav")
+        produced.assets.append(Asset(
+            asset_id="asset-aud-take", name="take_audio.wav", asset_type="audio",
+            path=take_path, generation_params={"save_preset": "test"},
+        ))
+        ps.audio_tracks.append(AudioTrack(
+            track_id="aud-take",
+            source_path=take_path,
+            timeline_start_frame=0,
+            timeline_end_frame=12,
+            lane_index=3,
+        ))
+
+        save_generated_project(produced, base_version)
+
+        restored = load_project(project.project_dir)
+        rs = restored.get_scene("scene-1")
+        names = [c.name for c in rs.audio_lane_configs]
+        assert rs.audio_lane_count == 3, names
+        assert len(rs.audio_lane_configs) == 3, names
+        assert names[:2] == ["A0", "A2"], names
+        assert "A1" not in names, names
+        take = next(t for t in rs.audio_tracks if t.track_id == "aud-take")
+        assert take.lane_index == 2, take.lane_index
+        assert not any(t.track_id == "aud-1" for t in rs.audio_tracks)
+
+
+def test_generated_commit_via_timeline_export_no_phantom_lane():
+    """The timeline-export 'place as take' path shares save_generated_project;
+    the merge fix must cover it too (audit F2)."""
+    pytest.importorskip("cv2")
+    from server.timeline_export import _place_video_take
+
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Phase 2 Export Path", base_dir=base_dir)
+        scene = Scene(scene_id="scene-1", name="Scene", duration_frames=12)
+        scene.video_lane_count = 3
+        scene.video_lane_configs = [LaneConfig(name="V0"), LaneConfig(name="V1"), LaneConfig(name="V2")]
+        for i in range(3):
+            scene.clips.append(ClipReference(
+                clip_id=f"user-{i}",
+                source_path=os.path.join("media", f"user{i}.mp4"),
+                timeline_start_frame=0, timeline_end_frame=12, track_index=i,
+            ))
+        project.scenes.append(scene)
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+
+        # Editor deletes the non-tail lane V1 mid-export.
+        current = load_project(project.project_dir)
+        cs = current.get_scene("scene-1")
+        cs.clips = [c for c in cs.clips if c.clip_id != "user-1"]
+        assert _compact_empty_media_lane(cs, "video", 1) is True
+        save_project(current, expected_modified_at=base_version)
+
+        # Produced: place the take exactly as the export flow does.
+        take_asset = Asset(
+            asset_id="asset-export-take", name="export_take.mp4", asset_type="video",
+            path=os.path.join("media", "export_take.mp4"), frame_count=12,
+            generation_params={"save_preset": "test"},
+        )
+        produced.assets.append(take_asset)
+        take_clip = _place_video_take(produced, produced.get_scene("scene-1"), take_asset, 0, 12)
+
+        save_generated_project(produced, base_version)
+
+        restored = load_project(project.project_dir)
+        rs = restored.get_scene("scene-1")
+        names = [c.name for c in rs.video_lane_configs]
+        assert rs.video_lane_count == 3, names
+        assert len(rs.video_lane_configs) == 3, names
+        assert "V1" not in names, names
+        named = [n for n in names if n]
+        assert len(named) == len(set(named)), names
+        merged_take = next(c for c in rs.clips if c.clip_id == take_clip.clip_id)
+        assert sum(1 for c in rs.clips if c.track_index == merged_take.track_index) == 1
+        assert not any(c.clip_id == "user-1" for c in rs.clips)
+
+
+def test_generated_commit_take_on_shifted_empty_lane_no_corruption():
+    """Accepted edge (F1): empty lanes above content + deleting a lower empty
+    interleaved lane mid-gen. The take must not corrupt data or duplicate a
+    surviving lane; it lands on a fresh appended lane (no stable lane id exists
+    to map it back to its original empty lane). This also catches the OLD bug,
+    which duplicated the surviving lane's config here."""
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Phase 2 Edge", base_dir=base_dir)
+        scene = Scene(scene_id="scene-1", name="Scene", duration_frames=12)
+        # Content on lanes 0 and 2; empty lanes at 1 and 3.
+        scene.video_lane_count = 4
+        scene.video_lane_configs = [
+            LaneConfig(name="V0"), LaneConfig(name="V1"),
+            LaneConfig(name="V2"), LaneConfig(name="V3"),
+        ]
+        scene.clips.append(ClipReference(clip_id="user-0", source_path="media/u0.mp4",
+                                         timeline_start_frame=0, timeline_end_frame=12, track_index=0))
+        scene.clips.append(ClipReference(clip_id="user-2", source_path="media/u2.mp4",
+                                         timeline_start_frame=0, timeline_end_frame=12, track_index=2))
+        project.scenes.append(scene)
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+
+        # Take placed at max(content)+1 = 3 (an existing empty lane), as production does.
+        ps = produced.get_scene("scene-1")
+        produced.assets.append(Asset(asset_id="asset-take", name="take.mp4", asset_type="video",
+                                     path="media/take.mp4", generation_params={"save_preset": "test"}))
+        ps.clips.append(ClipReference(clip_id="take-clip", source_path="media/take.mp4",
+                                      timeline_start_frame=0, timeline_end_frame=12,
+                                      is_generated=True, track_index=3))
+
+        # Editor deletes the lower empty interleaved lane V1.
+        current = load_project(project.project_dir)
+        cs = current.get_scene("scene-1")
+        assert _compact_empty_media_lane(cs, "video", 1) is True
+        assert cs.video_lane_count == 3
+        assert [c.name for c in cs.video_lane_configs] == ["V0", "V2", "V3"]
+        save_project(current, expected_modified_at=base_version)
+
+        save_generated_project(produced, base_version)
+
+        restored = load_project(project.project_dir)
+        rs = restored.get_scene("scene-1")
+        names = [c.name for c in rs.video_lane_configs]
+        # Invariants that MUST hold: deleted V1 stays gone; no duplicate among
+        # surviving (named) lanes; take present on its own lane; no data loss.
+        assert "V1" not in names, names
+        named = [n for n in names if n]
+        assert len(named) == len(set(named)), names
+        take = next(c for c in rs.clips if c.clip_id == "take-clip")
+        assert sum(1 for c in rs.clips if c.track_index == take.track_index) == 1
+        assert next(c for c in rs.clips if c.clip_id == "user-0").track_index == 0
+        assert next(c for c in rs.clips if c.clip_id == "user-2").track_index == 1
+
+
+def test_generated_commit_created_set_prevents_take_resurrection():
+    """Deleting prior generated takes (clips + assets) mid-generation must not
+    resurrect them. The created-set hand-off restricts the conflict-path merge to
+    items created THIS run. Demonstrates the legacy path RESURRECTS (the bug) and
+    the created-set path does NOT (the fix)."""
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Phase 2 Resurrect", base_dir=base_dir)
+        scene = Scene(scene_id="scene-1", name="Scene", duration_frames=12)
+        scene.video_lane_count = 3
+        scene.video_lane_configs = [LaneConfig(name="V0"), LaneConfig(name="V1"), LaneConfig(name="V2")]
+        # 3 prior TAKES (generated clips), each with a backing generated asset.
+        for i in range(3):
+            project.assets.append(Asset(
+                asset_id=f"take-asset-{i}", name=f"SecondPass_{i}.mp4", asset_type="video",
+                path=os.path.join("media", f"sp{i}.mp4"), generation_params={"save_preset": "x"},
+            ))
+            scene.clips.append(ClipReference(
+                clip_id=f"take-{i}", source_path=os.path.join("media", f"sp{i}.mp4"),
+                timeline_start_frame=0, timeline_end_frame=12, track_index=i, is_generated=True,
+            ))
+        project.scenes.append(scene)
+        save_project(project)
+
+        # Produced = V1 + a NEW take (this run). The created-set is the snapshot diff.
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+        before = snapshot_item_ids(produced)
+        produced.assets.append(Asset(
+            asset_id="take-asset-new", name="SecondPass_new.mp4", asset_type="video",
+            path=os.path.join("media", "spnew.mp4"), generation_params={"save_preset": "x"},
+        ))
+        ps = produced.get_scene("scene-1")
+        ps.video_lane_count = 4
+        ps.video_lane_configs.append(LaneConfig())
+        ps.clips.append(ClipReference(
+            clip_id="take-new", source_path=os.path.join("media", "spnew.mp4"),
+            timeline_start_frame=0, timeline_end_frame=12, track_index=3, is_generated=True,
+        ))
+        created = created_ids_since(before, produced)
+        assert created["clips"] == {"take-new"}
+        assert created["assets"] == {"take-asset-new"}
+
+        # Editor (V2): delete ALL 3 prior takes (clips + assets), add a user clip.
+        current = load_project(project.project_dir)
+        cs = current.get_scene("scene-1")
+        cs.clips = [c for c in cs.clips if not c.clip_id.startswith("take-")]
+        current.assets = [a for a in current.assets if not a.asset_id.startswith("take-asset")]
+        cs.clips.append(ClipReference(
+            clip_id="user-clip", source_path=os.path.join("media", "user.mp4"),
+            timeline_start_frame=0, timeline_end_frame=12, track_index=0,
+        ))
+        cs.video_lane_count = 1
+        cs.video_lane_configs = [LaneConfig(name="V0")]
+        save_project(current, expected_modified_at=base_version)
+
+        # Legacy merge (no created-set) RESURRECTS the deleted takes — the bug.
+        legacy = load_project(project.project_dir)
+        _merge_generated_outputs(legacy, copy.deepcopy(produced))
+        legacy_clip_ids = {c.clip_id for c in legacy.get_scene("scene-1").clips}
+        legacy_asset_ids = {a.asset_id for a in legacy.assets}
+        assert "take-0" in legacy_clip_ids
+        assert "take-asset-0" in legacy_asset_ids
+
+        # Fixed path (created-set): no resurrection; new take + user clip survive.
+        save_generated_project(produced, base_version, created_ids=created)
+        restored = load_project(project.project_dir)
+        rs = restored.get_scene("scene-1")
+        clip_ids = {c.clip_id for c in rs.clips}
+        asset_ids = {a.asset_id for a in restored.assets}
+        assert clip_ids == {"user-clip", "take-new"}, clip_ids
+        assert "take-asset-new" in asset_ids
+        assert not any(a.startswith("take-asset-") and a != "take-asset-new" for a in asset_ids), asset_ids
 
 
 def test_tab_session_requires_handoff_and_transfers_owner():

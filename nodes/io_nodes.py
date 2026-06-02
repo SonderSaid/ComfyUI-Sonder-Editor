@@ -20,7 +20,7 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server.project_manager import load_project, save_project
-from ..server.project_commit import save_generated_project
+from ..server.project_commit import created_ids_since, save_generated_project, snapshot_item_ids
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
@@ -95,9 +95,9 @@ def _copy_execution_context(project) -> dict:
     return dict(context) if isinstance(context, dict) else {}
 
 
-def _save_generated_project(project, base_modified_at: str = ""):
+def _save_generated_project(project, base_modified_at: str = "", created_ids=None):
     if base_modified_at:
-        return save_generated_project(project, str(base_modified_at))
+        return save_generated_project(project, str(base_modified_at), created_ids)
     save_project(project)
     return project
 
@@ -817,6 +817,7 @@ def _cleanup_bridge_output_dir(bridge_dir: str) -> None:
 
 def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     project = load_project(entry["project_dir"])
+    _pre_item_ids = snapshot_item_ids(project)
     queue_job_id = str(entry.get("queue_job_id") or "")
     target_folder = _normalize_asset_folder(entry.get("target_folder", ""))
     bridge_dir = entry["bridge_dir"]
@@ -902,7 +903,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         )
 
     if changed:
-        _save_generated_project(project, entry.get("base_modified_at", ""))
+        _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
 
     logger.info(
         "Bridge finalize: prompt=%s node=%s moved=%d target_folder=%s stem=%s",
@@ -1111,6 +1112,10 @@ class SonderSaveVideo:
         # Save to media/ so it appears in the project's asset gallery
         media_dir = os.path.join(project.project_dir, "media")
         os.makedirs(media_dir, exist_ok=True)
+        # Baseline for the created-set hand-off: anything added to `project` below
+        # is "generated this run". Pre-existing generated items the user deletes
+        # mid-generation stay deleted (not resurrected) by the conflict-path merge.
+        _pre_item_ids = snapshot_item_ids(project)
 
         preset_id = normalize_save_preset(save_preset)
         custom_options = {
@@ -1174,7 +1179,7 @@ class SonderSaveVideo:
             if mark_queue_complete:
                 result_asset_id = png_assets[0].asset_id if png_assets else ""
                 _mark_queue_job_completed(project, str(execution_context.get("queue_job_id") or ""), result_asset_id)
-            _save_generated_project(project, str(execution_context.get("base_modified_at") or ""))
+            _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
             preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savepng")
             logger.info("Saved PNG sequence to %s (%d frames)", output_path, len(rgb_frames))
             return {
@@ -1416,7 +1421,7 @@ class SonderSaveVideo:
             ctx = _copy_execution_context(project)
             _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), asset.asset_id)
 
-        _save_generated_project(project, str(execution_context.get("base_modified_at") or ""))
+        _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
 
         # Generate preview thumbnail for ComfyUI node display
         preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savevid")
