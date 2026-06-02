@@ -242,6 +242,63 @@ def test_create_project_idempotent():
         assert project2.scenes[0].clips[0].clip_id == "important_clip"
 
 
+def test_save_project_retries_transient_permission_error(monkeypatch):
+    """save_project survives a transient Windows-style PermissionError by retrying
+    the atomic os.replace, and leaves no orphan temp file behind."""
+    from server import atomic_io
+
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Retry Test", base_dir=base_dir)
+        project.name = "Renamed Before Save"
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky_replace(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "transient lock")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(atomic_io.time, "sleep", lambda *a, **k: None)
+        monkeypatch.setattr(atomic_io.os, "replace", flaky_replace)
+
+        save_project(project)
+
+        assert calls["n"] == 3  # failed twice, succeeded on the third attempt
+        assert load_project(project.project_dir).name == "Renamed Before Save"
+        leftovers = [f for f in os.listdir(project.project_dir) if f.endswith(".tmp")]
+        assert leftovers == []
+
+
+def test_atomic_replace_exhausts_retries_and_cleans_temp(monkeypatch, tmp_path):
+    """On a persistent lock atomic_replace re-raises PermissionError after the
+    configured retries and removes the orphan temp; the destination is untouched."""
+    import pytest
+    from server import atomic_io
+
+    src = tmp_path / "payload.tmp"
+    dst = tmp_path / "payload.json"
+    src.write_text("new", encoding="utf-8")
+    dst.write_text("old", encoding="utf-8")
+
+    attempts = {"n": 0}
+
+    def always_locked(_src, _dst):
+        attempts["n"] += 1
+        raise PermissionError(13, "stuck lock")
+
+    monkeypatch.setattr(atomic_io.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(atomic_io.os, "replace", always_locked)
+
+    with pytest.raises(PermissionError):
+        atomic_io.atomic_replace(str(src), str(dst))
+
+    assert attempts["n"] == atomic_io.ATOMIC_REPLACE_RETRIES
+    assert not src.exists()
+    assert dst.read_text(encoding="utf-8") == "old"
+
+
 def test_safe_dirname_special_chars():
     from server.project_manager import _safe_dirname
 

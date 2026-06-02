@@ -1207,7 +1207,7 @@ def test_render_scene_frames_uses_take_source_in_without_repeating_seam_frame(tm
     assert values == [4, 5, 6, 7]
 
 
-def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path, monkeypatch):
+def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
 
@@ -1294,12 +1294,17 @@ def test_execute_skips_pending_queue_job_without_downstream_save_video(tmp_path,
         take_placement_mode="untrimmed",
     )
 
+    # render_queue_active defaults True and a job is pending; with no save node the
+    # editor PEEKS the queued snapshot (renders its range) without consuming it. The
+    # no-mutation invariants below prove peek != consume.
     assert save_calls == []
     assert queue_job.status == "pending"
-    assert result[8] == "live:1-10"
-    assert result[9] == 9
-    assert result[14] == pytest.approx(1 / 24.0)
-    assert result[15] == pytest.approx(7 / 24.0)
+    # Queued snapshot 10-30 with pre=4/post=6 → gen window [6, 36) = 30 frames,
+    # overriding the live 2-8 selection passed to execute(); mask spans 4/24 → 24/24.
+    assert result[8] == "queued prompt"
+    assert result[9] == 30
+    assert result[14] == pytest.approx(4 / 24.0)
+    assert result[15] == pytest.approx(24 / 24.0)
     assert project._execution_context["queue_job_id"] == ""
     assert project._execution_context["take_placement_mode"] == "untrimmed"
 

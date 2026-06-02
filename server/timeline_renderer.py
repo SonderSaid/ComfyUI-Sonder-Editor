@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import torch
 
+from .atomic_io import atomic_replace
 from .media_helpers import fit_frame_to_canvas, get_ffmpeg_path, run_ffmpeg_command
 from .timeline_state import Scene, TimelineProject
 
@@ -155,7 +156,7 @@ def render_scene_frames(
             _check_cancel(cancel_event)
             torch.save(tensor, tmp_path)
             _check_cancel(cancel_event)
-            os.replace(tmp_path, cache_path)
+            atomic_replace(tmp_path, cache_path)
             logger.info("Cached render for scene %s (%d frames)", scene.scene_id, num_frames)
         except TimelineRenderCancelled:
             try:

@@ -31,6 +31,7 @@ from .media_helpers import (
     tensor_mode_for_preset,
     tensor_to_uint8_frames,
 )
+from .atomic_io import atomic_replace
 from .project_commit import created_ids_since, save_generated_project, snapshot_item_ids
 from .project_manager import load_project
 from .thumbnail_service import ensure_thumbnail
@@ -681,7 +682,7 @@ class TimelineExportManager:
                 encode_metadata = dict(audio_spec["metadata"])
 
             self._check_cancel(job)
-            os.replace(temp_output_path, final_output_path)
+            atomic_replace(temp_output_path, final_output_path)
             cleanup_paths.remove(temp_output_path)
             self._check_cancel(job)
 

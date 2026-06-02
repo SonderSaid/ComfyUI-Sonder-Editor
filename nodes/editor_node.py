@@ -563,7 +563,11 @@ class SonderEditor:
                 proj, queue_job = self._consume_queue_job(proj)
                 queue_job_consumed = queue_job is not None
                 queue_job_mode = "consume" if queue_job else ""
-            elif render_queue_active and unmarked_save_reached:
+            elif render_queue_active:
+                # Peek the queued snapshot for any non-consume queue-active case,
+                # including when no save node is wired (e.g. preview/show-any-only
+                # quick tests). Peek renders the queued range without claiming,
+                # completing, or otherwise mutating the job or the project.
                 queue_job = self._peek_queue_job(proj)
                 queue_job_mode = "peek" if queue_job else ""
             snapshot_version = self._queue_snapshot_version(queue_job)

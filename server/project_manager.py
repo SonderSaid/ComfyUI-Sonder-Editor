@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Callable
 
+from .atomic_io import atomic_replace
 from .timeline_state import TimelineProject
 
 logger = logging.getLogger("sonder_editor")
@@ -113,7 +114,7 @@ def save_project(
     tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_file, project_file)
+    atomic_replace(tmp_file, project_file)
     if hasattr(project, "_expected_modified_at"):
         setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
     # #36 diagnostic: every save with the caller's immediate stack frame so the diag ring
