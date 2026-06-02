@@ -9,7 +9,7 @@ function methodIsMutating(method) {
     return !["GET", "HEAD", "OPTIONS"].includes(String(method || "GET").toUpperCase());
 }
 
-function projectIdFromUrl(url) {
+export function projectIdFromUrl(url) {
     const match = String(url || "").match(/\/sonder-editor\/project\/([^/?#]+)/);
     return match ? decodeURIComponent(match[1]) : "";
 }
@@ -33,8 +33,77 @@ export function rememberProjectVersionFromPayload(payload, fallbackProjectId = "
     }
 }
 
+export function rememberProjectVersionFromResponse(response, fallbackProjectId = "") {
+    if (!response?.headers) return;
+    const headerProjectId = response.headers.get?.("X-Sonder-Project-Id") || "";
+    const headerModifiedAt = response.headers.get?.("X-Sonder-Project-Modified-At") || "";
+    const projectId = normalizeProjectId(headerProjectId || fallbackProjectId);
+    if (projectId && headerModifiedAt) {
+        rememberProjectVersion(projectId, headerModifiedAt);
+    }
+}
+
 export function getProjectVersion(projectId) {
     return projectVersions.get(normalizeProjectId(projectId)) || "";
+}
+
+function withProjectVersionHeader(input, init = {}, fallbackProjectId = "") {
+    const requestUrl = typeof input === "string" ? input : input?.url;
+    const method = String(init?.method || input?.method || "GET").toUpperCase();
+    const projectId = normalizeProjectId(fallbackProjectId || projectIdFromUrl(requestUrl));
+    let nextInit = init || {};
+
+    if (projectId && methodIsMutating(method)) {
+        const version = getProjectVersion(projectId);
+        if (version) {
+            const headers = new Headers(input instanceof Request ? input.headers : undefined);
+            new Headers(nextInit.headers || {}).forEach((value, key) => headers.set(key, value));
+            if (!headers.has("If-Match")) {
+                headers.set("If-Match", version);
+                nextInit = { ...nextInit, headers };
+            }
+        }
+    }
+
+    return { init: nextInit, projectId };
+}
+
+async function parseResponsePayload(response) {
+    const text = await response.text();
+    if (!text) return null;
+    try {
+        return JSON.parse(text);
+    } catch (_error) {
+        return text;
+    }
+}
+
+export async function fetchProjectJson(input, init = {}, { projectId: fallbackProjectId = "" } = {}) {
+    const { init: nextInit, projectId } = withProjectVersionHeader(input, init, fallbackProjectId);
+    const response = await fetch(input, nextInit);
+    rememberProjectVersionFromResponse(response, projectId);
+    const payload = await parseResponsePayload(response);
+    if (payload && typeof payload === "object") {
+        rememberProjectVersionFromPayload(payload, projectId);
+    }
+
+    if (!response.ok) {
+        const message = payload && typeof payload === "object"
+            ? (payload.error || payload.message || `Request failed: ${response.status}`)
+            : (payload || `Request failed: ${response.status}`);
+        const error = new Error(message);
+        error.status = response.status;
+        error.payload = payload;
+        if (response.status === 409 && payload?.code === "project_version_conflict") {
+            error.code = "project_version_conflict";
+            error.expectedModifiedAt = payload.expected_modified_at || "";
+            error.actualModifiedAt = payload.actual_modified_at || "";
+            error.project = payload.project || null;
+        }
+        throw error;
+    }
+
+    return { response, payload };
 }
 
 export function installProjectVersionFetchPatch() {
@@ -45,23 +114,11 @@ export function installProjectVersionFetchPatch() {
     window.fetch = async (input, init = {}) => {
         const requestUrl = typeof input === "string" ? input : input?.url;
         const method = String(init?.method || input?.method || "GET").toUpperCase();
-        const projectId = projectIdFromUrl(requestUrl);
-        let nextInit = init || {};
-
-        if (projectId && methodIsMutating(method)) {
-            const version = getProjectVersion(projectId);
-            if (version) {
-                const headers = new Headers(input instanceof Request ? input.headers : undefined);
-                new Headers(nextInit.headers || {}).forEach((value, key) => headers.set(key, value));
-                if (!headers.has("If-Match")) {
-                    headers.set("If-Match", version);
-                    nextInit = { ...nextInit, headers };
-                }
-            }
-        }
+        const { init: nextInit, projectId } = withProjectVersionHeader(input, init);
 
         const response = await nativeFetch(input, nextInit);
         if (projectId) {
+            rememberProjectVersionFromResponse(response, projectId);
             response.clone().json()
                 .then((payload) => rememberProjectVersionFromPayload(payload, projectId))
                 .catch(() => {});

@@ -68,6 +68,40 @@ def _json_error(msg: str, status: int = 400) -> web.Response:
     return web.json_response({"error": msg}, status=status)
 
 
+def _attach_project_version_headers(
+    response: web.StreamResponse,
+    project_id: str = "",
+    modified_at: str = "",
+) -> web.StreamResponse:
+    project_id = str(project_id or "")
+    modified_at = str(modified_at or "")
+    if project_id:
+        response.headers["X-Sonder-Project-Id"] = project_id
+    if modified_at:
+        response.headers["X-Sonder-Project-Modified-At"] = modified_at
+    return response
+
+
+def _remember_request_project(request: web.Request, project: TimelineProject) -> None:
+    try:
+        request["sonder_editor_project"] = project
+    except Exception:
+        try:
+            setattr(request, "_sonder_editor_project", project)
+        except Exception:
+            pass
+
+
+def _request_project(request: web.Request) -> TimelineProject | None:
+    try:
+        project = request.get("sonder_editor_project")
+    except Exception:
+        project = None
+    if project is None:
+        project = getattr(request, "_sonder_editor_project", None)
+    return project if isinstance(project, TimelineProject) else None
+
+
 def _project_saved_event(project: TimelineProject) -> None:
     canonical_project_id = str(getattr(project, "project_id", "") or "")
     project_dir = str(getattr(project, "project_dir", "") or "")
@@ -127,7 +161,14 @@ async def _project_conflict_middleware(request: web.Request, handler):
             "actual_modified_at": exc.actual_modified_at,
             "project": exc.current_data,
         }
-        return web.json_response(payload, status=409)
+        response = web.json_response(payload, status=409)
+        current = exc.current_data or {}
+        _attach_project_version_headers(
+            response,
+            current.get("project_id", "") or project_id,
+            exc.actual_modified_at or current.get("modified_at", ""),
+        )
+        return response
 
 
 try:
@@ -137,6 +178,33 @@ try:
         setattr(app, "_sonder_project_conflict_middleware", True)
 except Exception:
     logger.debug("Could not install Sonder project conflict middleware", exc_info=True)
+
+
+@web.middleware
+async def _project_version_header_middleware(request: web.Request, handler):
+    response = await handler(request)
+    try:
+        path = str(request.path or "")
+        status = int(getattr(response, "status", 0) or 0)
+        if path.startswith("/sonder-editor/project/") and 200 <= status < 400:
+            project = _request_project(request)
+            if project is not None:
+                _attach_project_version_headers(
+                    response,
+                    getattr(project, "project_id", "") or request.match_info.get("project_id", ""),
+                    getattr(project, "modified_at", ""),
+                )
+    except Exception:
+        logger.debug("Could not attach Sonder project version headers", exc_info=True)
+    return response
+
+
+try:
+    if app is not None and not getattr(app, "_sonder_project_version_header_middleware", False):
+        app.middlewares.append(_project_version_header_middleware)
+        setattr(app, "_sonder_project_version_header_middleware", True)
+except Exception:
+    logger.debug("Could not install Sonder project version header middleware", exc_info=True)
 
 
 # Route-timing diagnostic. When `SONDER_DEBUG_SESSION` is enabled, logs any
@@ -399,6 +467,582 @@ def _compact_empty_media_lane(scene: Scene, lane_type: str, lane_index: int) -> 
         return True
 
     return False
+
+
+class ProjectMutationRequestError(Exception):
+    def __init__(self, message: str, status: int = 400, code: str = "invalid_project_mutation"):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.code = code
+
+
+def _mutation_error(message: str, status: int = 400, code: str = "invalid_project_mutation") -> None:
+    raise ProjectMutationRequestError(message, status, code)
+
+
+def _mutation_json_error(exc: ProjectMutationRequestError) -> web.Response:
+    return web.json_response({"error": exc.message, "code": exc.code}, status=exc.status)
+
+
+def _mutation_int(value, field_name: str, default: int | None = None) -> int:
+    if value is None and default is not None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        _mutation_error(f"Invalid integer for {field_name}: {value!r}", 400)
+
+
+def _mutation_float(value, field_name: str, default: float | None = None) -> float:
+    if value is None and default is not None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        _mutation_error(f"Invalid number for {field_name}: {value!r}", 400)
+
+
+def _scene_lane_configs(scene: Scene, lane_type: str) -> list[LaneConfig]:
+    if lane_type == "video":
+        return scene.video_lane_configs
+    if lane_type == "motion_driver":
+        return scene.motion_driver_lane_configs
+    if lane_type == "audio":
+        return scene.audio_lane_configs
+    _mutation_error(f"Unknown lane type: {lane_type}", 400)
+
+
+def _scene_lane_count(scene: Scene, lane_type: str) -> int:
+    if lane_type == "video":
+        return max(1, int(scene.video_lane_count or 1))
+    if lane_type == "motion_driver":
+        return max(1, int(scene.motion_driver_lane_count or 1))
+    if lane_type == "audio":
+        return max(1, int(scene.audio_lane_count or 1))
+    _mutation_error(f"Unknown lane type: {lane_type}", 400)
+
+
+def _set_scene_lane_count(scene: Scene, lane_type: str, count: int) -> None:
+    count = max(1, int(count))
+    if lane_type == "video":
+        scene.video_lane_count = count
+        configs = scene.video_lane_configs
+    elif lane_type == "motion_driver":
+        scene.motion_driver_lane_count = count
+        configs = scene.motion_driver_lane_configs
+    elif lane_type == "audio":
+        scene.audio_lane_count = count
+        configs = scene.audio_lane_configs
+    else:
+        _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    while len(configs) < count:
+        configs.append(LaneConfig())
+    while len(configs) > count:
+        configs.pop()
+
+
+def _lane_config(scene: Scene, lane_type: str, lane_index: int) -> LaneConfig:
+    lane_index = _mutation_int(lane_index, "lane_index")
+    if lane_index < 0:
+        _mutation_error("Lane index must be non-negative", 400)
+    configs = _scene_lane_configs(scene, lane_type)
+    while len(configs) <= lane_index:
+        configs.append(LaneConfig())
+    return configs[lane_index]
+
+
+def _is_lane_config_locked(config: LaneConfig | None) -> bool:
+    return bool(getattr(config, "locked", False)) if config is not None else False
+
+
+def _require_lane_unlocked(scene: Scene, lane_type: str, lane_index: int | None = None) -> None:
+    if lane_type == "guide":
+        if _is_lane_config_locked(getattr(scene, "guide_track_config", None)):
+            _mutation_error("Guide track is locked", 409, "track_locked")
+        return
+    if lane_type == "prompt":
+        if _is_lane_config_locked(getattr(scene, "prompt_track_config", None)):
+            _mutation_error("Prompt track is locked", 409, "track_locked")
+        return
+    if lane_index is None:
+        return
+    if _is_lane_config_locked(_lane_config(scene, lane_type, lane_index)):
+        _mutation_error("Lane is locked", 409, "track_locked")
+
+
+def _clip_lane_type(clip: ClipReference) -> str:
+    return "video" if _is_render_clip(clip) else "motion_driver"
+
+
+def _require_clip_unlocked(scene: Scene, clip: ClipReference) -> None:
+    _require_lane_unlocked(scene, _clip_lane_type(clip), int(getattr(clip, "track_index", 0) or 0))
+
+
+def _require_audio_unlocked(scene: Scene, track: AudioTrack) -> None:
+    _require_lane_unlocked(scene, "audio", int(getattr(track, "lane_index", 0) or 0))
+
+
+def _ensure_scene_lane_config_lengths(scene: Scene) -> None:
+    _set_scene_lane_count(scene, "video", _scene_lane_count(scene, "video"))
+    _set_scene_lane_count(scene, "motion_driver", _scene_lane_count(scene, "motion_driver"))
+    _set_scene_lane_count(scene, "audio", _scene_lane_count(scene, "audio"))
+
+
+def _find_clip(scene: Scene, clip_id: str) -> ClipReference:
+    clip = next((c for c in scene.clips if c.clip_id == clip_id), None)
+    if not clip:
+        _mutation_error(f"Clip not found: {clip_id}", 404, "item_not_found")
+    return clip
+
+
+def _find_audio_track(scene: Scene, track_id: str) -> AudioTrack:
+    track = next((t for t in scene.audio_tracks if t.track_id == track_id), None)
+    if not track:
+        _mutation_error(f"Audio track not found: {track_id}", 404, "item_not_found")
+    return track
+
+
+def _find_guide(scene: Scene, frame_index: int) -> GuideFrame:
+    guide = next((g for g in scene.guide_frames if g.frame_index == frame_index), None)
+    if not guide:
+        _mutation_error(f"No guide at frame {frame_index}", 404, "item_not_found")
+    return guide
+
+
+def _find_prompt_section(scene: Scene, index: int) -> PromptSection:
+    if index < 0 or index >= len(scene.prompt_sections):
+        _mutation_error(f"Prompt section index out of range: {index}", 404, "item_not_found")
+    return scene.prompt_sections[index]
+
+
+def _expected_matches(value, expected) -> bool:
+    if isinstance(value, float) or isinstance(expected, float):
+        try:
+            return abs(float(value) - float(expected)) <= 1e-9
+        except (TypeError, ValueError):
+            return False
+    return value == expected
+
+
+def _validate_guide_identity(guide: GuideFrame, expected: dict | None) -> None:
+    if not isinstance(expected, dict):
+        return
+    checks = {
+        "frame_index": getattr(guide, "frame_index", 0),
+        "asset_id": getattr(guide, "asset_id", ""),
+        "source": getattr(guide, "source", ""),
+        "strength": getattr(guide, "strength", 1.0),
+        "muted": bool(getattr(guide, "muted", False)),
+    }
+    for key, current in checks.items():
+        if key in expected and not _expected_matches(current, expected[key]):
+            _mutation_error("Guide identity mismatch", 409, "identity_mismatch")
+
+
+def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> None:
+    if not isinstance(expected, dict):
+        return
+    checks = {
+        "start_frame": getattr(section, "start_frame", 0),
+        "end_frame": getattr(section, "end_frame", 0),
+        "prompt": getattr(section, "prompt", ""),
+    }
+    for key, current in checks.items():
+        if key in expected and not _expected_matches(current, expected[key]):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+
+
+def _apply_scene_fields(scene: Scene, fields: dict) -> None:
+    if not isinstance(fields, dict):
+        _mutation_error("update_scene_fields requires fields", 400)
+    if "name" in fields:
+        scene.name = str(fields["name"])
+    if "duration_frames" in fields:
+        scene.duration_frames = max(0, int(fields["duration_frames"]))
+    if "prompt" in fields:
+        scene.prompt = str(fields["prompt"])
+    if "generation_params" in fields:
+        scene.generation_params = fields["generation_params"] if isinstance(fields["generation_params"], dict) else {}
+    if "width" in fields:
+        scene.width = max(0, int(fields["width"]))
+    if "height" in fields:
+        scene.height = max(0, int(fields["height"]))
+    if "fps" in fields:
+        scene.fps = max(0.0, float(fields["fps"]))
+    if "video_lane_count" in fields:
+        _set_scene_lane_count(scene, "video", max(1, int(fields["video_lane_count"])))
+    if "motion_driver_lane_count" in fields:
+        _set_scene_lane_count(scene, "motion_driver", max(1, int(fields["motion_driver_lane_count"])))
+    if "audio_lane_count" in fields:
+        _set_scene_lane_count(scene, "audio", max(1, int(fields["audio_lane_count"])))
+    _ensure_scene_lane_config_lengths(scene)
+
+
+def _apply_lane_configs(scene: Scene, fields: dict) -> None:
+    if not isinstance(fields, dict):
+        _mutation_error("update_lane_configs requires fields", 400)
+    if "video_lane_configs" in fields:
+        scene.video_lane_configs = [LaneConfig.from_dict(c) for c in fields["video_lane_configs"]]
+    if "motion_driver_lane_configs" in fields:
+        scene.motion_driver_lane_configs = [LaneConfig.from_dict(c) for c in fields["motion_driver_lane_configs"]]
+    if "audio_lane_configs" in fields:
+        scene.audio_lane_configs = [LaneConfig.from_dict(c) for c in fields["audio_lane_configs"]]
+    if "guide_track_config" in fields:
+        scene.guide_track_config = LaneConfig.from_dict(fields["guide_track_config"])
+    if "prompt_track_config" in fields:
+        scene.prompt_track_config = LaneConfig.from_dict(fields["prompt_track_config"])
+    _ensure_scene_lane_config_lengths(scene)
+
+
+def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_policy: str, target_lane: int | None = None) -> None:
+    if lane_type not in {"video", "audio"}:
+        _mutation_error(f"Cannot remove lane type: {lane_type}", 400)
+    lane_index = _mutation_int(lane_index, "lane_index")
+    current_count = _scene_lane_count(scene, lane_type)
+    if current_count <= 1:
+        _mutation_error("Cannot remove the only lane", 409, "invalid_lane_operation")
+    if lane_index < 0 or lane_index >= current_count:
+        _mutation_error(f"Lane index out of range: {lane_index}", 404, "item_not_found")
+    _require_lane_unlocked(scene, lane_type, lane_index)
+
+    if lane_type == "video":
+        lane_items = [clip for clip in scene.clips if _is_render_clip(clip) and int(clip.track_index or 0) == lane_index]
+    else:
+        lane_items = [track for track in scene.audio_tracks if int(track.lane_index or 0) == lane_index]
+
+    item_policy = str(item_policy or "require_empty")
+    if lane_items and item_policy == "require_empty":
+        _mutation_error("Lane is not empty", 409, "lane_not_empty")
+
+    if lane_items and item_policy == "move_items":
+        if target_lane is None:
+            target_lane = lane_index - 1 if lane_index > 0 else 1
+        target_lane = _mutation_int(target_lane, "target_lane")
+        if target_lane < 0 or target_lane >= current_count or target_lane == lane_index:
+            _mutation_error("Invalid target lane", 400)
+        _require_lane_unlocked(scene, lane_type, target_lane)
+        for item in lane_items:
+            if lane_type == "video":
+                item.track_index = target_lane
+            else:
+                item.lane_index = target_lane
+    elif lane_items and item_policy == "delete_items":
+        if lane_type == "video":
+            deleting = {item.clip_id for item in lane_items}
+            scene.clips = [clip for clip in scene.clips if clip.clip_id not in deleting]
+        else:
+            deleting = {item.track_id for item in lane_items}
+            scene.audio_tracks = [track for track in scene.audio_tracks if track.track_id not in deleting]
+    elif lane_items:
+        _mutation_error(f"Unknown lane item policy: {item_policy}", 400)
+
+    if lane_type == "video":
+        for clip in scene.clips:
+            if _is_render_clip(clip) and int(clip.track_index or 0) > lane_index:
+                clip.track_index = max(0, int(clip.track_index or 0) - 1)
+        scene.video_lane_count = current_count - 1
+        _trim_lane_configs(scene.video_lane_configs, lane_index, scene.video_lane_count)
+    else:
+        for track in scene.audio_tracks:
+            if int(track.lane_index or 0) > lane_index:
+                track.lane_index = max(0, int(track.lane_index or 0) - 1)
+        scene.audio_lane_count = current_count - 1
+        _trim_lane_configs(scene.audio_lane_configs, lane_index, scene.audio_lane_count)
+
+
+def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fields: dict) -> ClipReference:
+    if not isinstance(fields, dict):
+        _mutation_error("update_clip requires fields", 400)
+    clip = _find_clip(scene, clip_id)
+    _require_clip_unlocked(scene, clip)
+    target_role = fields.get("role", getattr(clip, "role", "render"))
+    if "role" in fields:
+        if target_role not in {"render", "motion_driver"}:
+            _mutation_error(f"Invalid clip role: {target_role}", 400)
+        if target_role == "motion_driver" and _clip_source_asset_type(project, clip) != "video":
+            _mutation_error("Motion-driver clips require video assets", 400)
+    if "track_index" in fields:
+        target_lane_type = "video" if target_role in {"", "render"} else "motion_driver"
+        _require_lane_unlocked(scene, target_lane_type, int(fields["track_index"]))
+
+    if "timeline_start_frame" in fields:
+        new_start = max(0, int(fields["timeline_start_frame"]))
+        if "timeline_end_frame" not in fields:
+            duration = clip.timeline_end_frame - clip.timeline_start_frame
+            clip.timeline_start_frame = new_start
+            clip.timeline_end_frame = clip.timeline_start_frame + duration
+        else:
+            clip.timeline_start_frame = new_start
+    if "timeline_end_frame" in fields:
+        clip.timeline_end_frame = int(fields["timeline_end_frame"])
+    if "source_in_frame" in fields:
+        clip.source_in_frame = int(fields["source_in_frame"])
+    if "source_out_frame" in fields:
+        clip.source_out_frame = int(fields["source_out_frame"])
+    if "opacity" in fields:
+        clip.opacity = float(fields["opacity"])
+    if "track_index" in fields:
+        clip.track_index = int(fields["track_index"])
+    if "role" in fields:
+        clip.role = target_role
+    if "strength" in fields:
+        clip.strength = float(fields["strength"])
+    if "muted" in fields:
+        clip.muted = bool(fields["muted"])
+    return clip
+
+
+def _apply_update_audio_track(scene: Scene, track_id: str, fields: dict) -> AudioTrack:
+    if not isinstance(fields, dict):
+        _mutation_error("update_audio_track requires fields", 400)
+    track = _find_audio_track(scene, track_id)
+    _require_audio_unlocked(scene, track)
+    if "lane_index" in fields:
+        _require_lane_unlocked(scene, "audio", int(fields["lane_index"]))
+
+    if "timeline_start_frame" in fields:
+        new_start = max(0, int(fields["timeline_start_frame"]))
+        if "timeline_end_frame" not in fields:
+            duration = track.timeline_end_frame - track.timeline_start_frame
+            track.timeline_start_frame = new_start
+            track.timeline_end_frame = track.timeline_start_frame + duration
+        else:
+            track.timeline_start_frame = new_start
+    if "timeline_end_frame" in fields:
+        track.timeline_end_frame = int(fields["timeline_end_frame"])
+    if "source_in_frame" in fields:
+        track.source_in_frame = int(fields["source_in_frame"])
+    if "muted" in fields:
+        track.muted = bool(fields["muted"])
+    if "volume" in fields:
+        track.volume = float(fields["volume"])
+    if "lane_index" in fields:
+        track.lane_index = int(fields["lane_index"])
+    return track
+
+
+def _delete_clip(scene: Scene, clip_id: str, preserve_lane: bool = False) -> None:
+    clip = _find_clip(scene, clip_id)
+    _require_clip_unlocked(scene, clip)
+    deleted_lane = int(clip.track_index or 0)
+    should_compact = _is_render_clip(clip) and not preserve_lane
+    scene.clips = [item for item in scene.clips if item.clip_id != clip_id]
+    if should_compact:
+        _compact_empty_media_lane(scene, "video", deleted_lane)
+
+
+def _delete_audio_track(scene: Scene, track_id: str, preserve_lane: bool = False) -> None:
+    track = _find_audio_track(scene, track_id)
+    _require_audio_unlocked(scene, track)
+    deleted_lane = int(track.lane_index or 0)
+    scene.audio_tracks = [item for item in scene.audio_tracks if item.track_id != track_id]
+    if not preserve_lane:
+        _compact_empty_media_lane(scene, "audio", deleted_lane)
+
+
+def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = False) -> None:
+    if not isinstance(items, list):
+        _mutation_error("bulk_delete_items requires items", 400)
+    resolved = []
+    for item in items:
+        if not isinstance(item, dict):
+            _mutation_error("bulk_delete_items item must be an object", 400)
+        item_type = str(item.get("type", ""))
+        item_id = item.get("id")
+        expected = item.get("expected")
+        if item_type == "clip":
+            clip = _find_clip(scene, str(item_id))
+            _require_clip_unlocked(scene, clip)
+            resolved.append((item_type, clip, bool(item.get("preserve_lane", preserve_lanes))))
+        elif item_type == "audio":
+            track = _find_audio_track(scene, str(item_id))
+            _require_audio_unlocked(scene, track)
+            resolved.append((item_type, track, bool(item.get("preserve_lane", preserve_lanes))))
+        elif item_type == "guide":
+            _require_lane_unlocked(scene, "guide")
+            frame_index = _mutation_int(item_id, "guide frame_index")
+            guide = _find_guide(scene, frame_index)
+            _validate_guide_identity(guide, expected)
+            resolved.append((item_type, guide, True))
+        elif item_type == "prompt":
+            _require_lane_unlocked(scene, "prompt")
+            index = _mutation_int(item_id, "prompt index")
+            section = _find_prompt_section(scene, index)
+            _validate_prompt_identity(section, expected)
+            resolved.append((item_type, index, True))
+        else:
+            _mutation_error(f"Unsupported bulk delete item type: {item_type}", 400)
+
+    video_lanes = []
+    audio_lanes = []
+    prompt_indexes = []
+    guide_frames = set()
+    for item_type, item, preserve_lane in resolved:
+        if item_type == "clip":
+            video_lanes.append(int(item.track_index or 0))
+            scene.clips = [clip for clip in scene.clips if clip.clip_id != item.clip_id]
+        elif item_type == "audio":
+            audio_lanes.append(int(item.lane_index or 0))
+            scene.audio_tracks = [track for track in scene.audio_tracks if track.track_id != item.track_id]
+        elif item_type == "guide":
+            guide_frames.add(int(item.frame_index))
+        elif item_type == "prompt":
+            prompt_indexes.append(int(item))
+        if preserve_lane:
+            if item_type == "clip" and video_lanes:
+                video_lanes.pop()
+            if item_type == "audio" and audio_lanes:
+                audio_lanes.pop()
+
+    if guide_frames:
+        scene.guide_frames = [guide for guide in scene.guide_frames if int(guide.frame_index) not in guide_frames]
+    for idx in sorted(set(prompt_indexes), reverse=True):
+        if 0 <= idx < len(scene.prompt_sections):
+            scene.prompt_sections.pop(idx)
+    for lane in sorted(set(video_lanes), reverse=True):
+        _compact_empty_media_lane(scene, "video", lane)
+    for lane in sorted(set(audio_lanes), reverse=True):
+        _compact_empty_media_lane(scene, "audio", lane)
+
+
+def _apply_move_guide(scene: Scene, op: dict) -> GuideFrame:
+    _require_lane_unlocked(scene, "guide")
+    old_frame = _mutation_int(op.get("from_frame_index"), "from_frame_index")
+    new_frame = _mutation_int(op.get("to_frame_index"), "to_frame_index")
+    guide = _find_guide(scene, old_frame)
+    _validate_guide_identity(guide, op.get("expected"))
+    next_guide = GuideFrame(
+        frame_index=new_frame,
+        asset_id=str(op.get("asset_id", getattr(guide, "asset_id", "")) or ""),
+        source=str(op.get("source", getattr(guide, "source", "") or "asset") or "asset"),
+        strength=_mutation_float(op.get("strength", getattr(guide, "strength", 1.0)), "strength", 1.0),
+        muted=bool(op.get("muted", getattr(guide, "muted", False))),
+    )
+    scene.guide_frames = [
+        current for current in scene.guide_frames
+        if current.frame_index not in {old_frame, new_frame}
+    ]
+    scene.guide_frames.append(next_guide)
+    scene.guide_frames.sort(key=lambda g: g.frame_index)
+    return next_guide
+
+
+def _apply_update_guide(scene: Scene, frame_index: int, fields: dict, expected: dict | None = None) -> GuideFrame:
+    _require_lane_unlocked(scene, "guide")
+    guide = _find_guide(scene, frame_index)
+    _validate_guide_identity(guide, expected)
+    if "strength" in fields:
+        guide.strength = float(fields["strength"])
+    if "muted" in fields:
+        guide.muted = bool(fields["muted"])
+    return guide
+
+
+def _apply_delete_guide(scene: Scene, frame_index: int, expected: dict | None = None) -> None:
+    _require_lane_unlocked(scene, "guide")
+    guide = _find_guide(scene, frame_index)
+    _validate_guide_identity(guide, expected)
+    scene.guide_frames = [current for current in scene.guide_frames if current.frame_index != frame_index]
+
+
+def _apply_create_guide(scene: Scene, fields: dict) -> GuideFrame:
+    _require_lane_unlocked(scene, "guide")
+    guide = GuideFrame(
+        frame_index=_mutation_int(fields.get("frame_index", 0), "frame_index", 0),
+        asset_id=str(fields.get("asset_id", "") or ""),
+        source=str(fields.get("source", "asset") or "asset"),
+        strength=_mutation_float(fields.get("strength", 1.0), "strength", 1.0),
+        muted=bool(fields.get("muted", False)),
+    )
+    scene.guide_frames = [current for current in scene.guide_frames if current.frame_index != guide.frame_index]
+    scene.guide_frames.append(guide)
+    scene.guide_frames.sort(key=lambda g: g.frame_index)
+    return guide
+
+
+def _apply_update_prompt_section(scene: Scene, index: int, fields: dict, expected: dict | None = None) -> PromptSection:
+    _require_lane_unlocked(scene, "prompt")
+    section = _find_prompt_section(scene, index)
+    _validate_prompt_identity(section, expected)
+    if "start_frame" in fields:
+        section.start_frame = int(fields["start_frame"])
+    if "end_frame" in fields:
+        section.end_frame = int(fields["end_frame"])
+    if "prompt" in fields:
+        section.prompt = str(fields["prompt"])
+    scene.prompt_sections.sort(key=lambda s: s.start_frame)
+    return section
+
+
+def _apply_delete_prompt_section(scene: Scene, index: int, expected: dict | None = None) -> None:
+    _require_lane_unlocked(scene, "prompt")
+    section = _find_prompt_section(scene, index)
+    _validate_prompt_identity(section, expected)
+    scene.prompt_sections.pop(index)
+
+
+def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict) -> dict:
+    if not isinstance(op, dict):
+        _mutation_error("Mutation operation must be an object", 400)
+    op_type = str(op.get("type", ""))
+    if op_type == "update_scene_fields":
+        _apply_scene_fields(scene, op.get("fields", {}))
+        return {"type": op_type}
+    if op_type == "update_lane_configs":
+        _apply_lane_configs(scene, op.get("fields", {}))
+        return {"type": op_type}
+    if op_type == "set_lane_count":
+        lane_type = str(op.get("lane_type", ""))
+        _set_scene_lane_count(scene, lane_type, max(1, _mutation_int(op.get("count"), "count")))
+        return {"type": op_type, "lane_type": lane_type}
+    if op_type == "remove_lane":
+        _remove_media_lane(
+            scene,
+            str(op.get("lane_type", "")),
+            _mutation_int(op.get("lane_index"), "lane_index"),
+            str(op.get("item_policy", "require_empty")),
+            op.get("target_lane"),
+        )
+        return {"type": op_type}
+    if op_type == "update_clip":
+        clip = _apply_update_clip(project, scene, str(op.get("clip_id", "")), op.get("fields", {}))
+        return {"type": op_type, "clip_id": clip.clip_id}
+    if op_type == "delete_clip":
+        _delete_clip(scene, str(op.get("clip_id", "")), bool(op.get("preserve_lane", False)))
+        return {"type": op_type, "clip_id": str(op.get("clip_id", ""))}
+    if op_type == "update_audio_track":
+        track = _apply_update_audio_track(scene, str(op.get("track_id", "")), op.get("fields", {}))
+        return {"type": op_type, "track_id": track.track_id}
+    if op_type == "delete_audio_track":
+        _delete_audio_track(scene, str(op.get("track_id", "")), bool(op.get("preserve_lane", False)))
+        return {"type": op_type, "track_id": str(op.get("track_id", ""))}
+    if op_type == "bulk_delete_items":
+        _apply_bulk_delete_items(scene, op.get("items", []), bool(op.get("preserve_lanes", False)))
+        return {"type": op_type, "count": len(op.get("items", []) or [])}
+    if op_type == "move_guide":
+        guide = _apply_move_guide(scene, op)
+        return {"type": op_type, "frame_index": guide.frame_index}
+    if op_type == "update_guide":
+        frame_index = _mutation_int(op.get("frame_index"), "frame_index")
+        guide = _apply_update_guide(scene, frame_index, op.get("fields", {}), op.get("expected"))
+        return {"type": op_type, "frame_index": guide.frame_index}
+    if op_type == "delete_guide":
+        frame_index = _mutation_int(op.get("frame_index"), "frame_index")
+        _apply_delete_guide(scene, frame_index, op.get("expected"))
+        return {"type": op_type, "frame_index": frame_index}
+    if op_type == "create_guide":
+        guide = _apply_create_guide(scene, op.get("fields", {}))
+        return {"type": op_type, "frame_index": guide.frame_index}
+    if op_type == "update_prompt_section":
+        index = _mutation_int(op.get("index"), "index")
+        section = _apply_update_prompt_section(scene, index, op.get("fields", {}), op.get("expected"))
+        return {"type": op_type, "index": index, "start_frame": section.start_frame, "end_frame": section.end_frame}
+    if op_type == "delete_prompt_section":
+        index = _mutation_int(op.get("index"), "index")
+        _apply_delete_prompt_section(scene, index, op.get("expected"))
+        return {"type": op_type, "index": index}
+    _mutation_error(f"Unsupported mutation operation: {op_type}", 400, "unsupported_project_mutation")
 
 
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
@@ -1093,14 +1737,12 @@ def _validate_request_project_version(request: web.Request, project: TimelinePro
     if expected == actual:
         setattr(project, "_expected_modified_at", expected)
         return
-    payload = {
-        "error": "project_version_conflict",
-        "code": "project_version_conflict",
-        "expected_modified_at": expected,
-        "actual_modified_at": actual,
-        "project": project.to_dict(),
-    }
-    raise web.HTTPConflict(text=json.dumps(payload), content_type="application/json")
+    raise ProjectVersionConflict(
+        project_dir=getattr(project, "project_dir", ""),
+        expected_modified_at=expected,
+        actual_modified_at=actual,
+        current_data=project.to_dict(),
+    )
 
 
 def _load_project_from_request(request: web.Request) -> TimelineProject:
@@ -1145,6 +1787,7 @@ def _load_project_from_request(request: web.Request) -> TimelineProject:
         save_project(project)
 
     _validate_request_project_version(request, project)
+    _remember_request_project(request, project)
 
     return project
 
@@ -3313,6 +3956,44 @@ if routes is not None:
 
         save_project(project)
         return web.json_response(scene.to_dict())
+
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations")
+    async def api_apply_scene_mutations(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene_id = request.match_info["scene_id"]
+        scene = project.get_scene(scene_id)
+        if not scene:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        operations = body.get("operations", [])
+        if not isinstance(operations, list):
+            return _json_error("operations must be a list", 400)
+
+        try:
+            results = [
+                _apply_scene_mutation_operation(project, scene, operation)
+                for operation in operations
+            ]
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+
+        save_project(project)
+        return web.json_response({
+            "status": "ok",
+            "scene_id": scene_id,
+            "operation_count": len(operations),
+            "results": results,
+            "scene": scene.to_dict(),
+        })
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_delete_scene(request: web.Request) -> web.Response:

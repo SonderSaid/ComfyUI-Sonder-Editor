@@ -694,6 +694,7 @@ class FullscreenEditorSession {
         this.controller = controller;
         this.editor = null;
         this._destroyed = false;
+        this._destroyPromise = null;
     }
 
     mount() {
@@ -728,27 +729,34 @@ class FullscreenEditorSession {
     }
 
     _handleEditorClosed() {
-        this.destroy(true);
+        void this.destroy(true);
     }
 
     destroy(fromEditor = false) {
-        if (this._destroyed) return;
+        if (this._destroyed) return this._destroyPromise || Promise.resolve();
         this._destroyed = true;
 
         const editor = this.editor;
         this.editor = null;
 
-        if (editor) {
-            if (!fromEditor && editor.isFullscreen) {
-                const exitCallback = editor.onFullscreenExit;
-                editor.onFullscreenExit = null;
-                editor._exitFullscreen();
-                editor.onFullscreenExit = exitCallback;
+        this._destroyPromise = (async () => {
+            if (editor) {
+                if (!fromEditor && editor.isFullscreen) {
+                    const exitCallback = editor.onFullscreenExit;
+                    editor.onFullscreenExit = null;
+                    if (typeof editor._requestExitFullscreen === "function") {
+                        await editor._requestExitFullscreen({ reason: "controller_destroy" });
+                    } else {
+                        editor._exitFullscreen();
+                    }
+                    editor.onFullscreenExit = exitCallback;
+                }
+                editor.destroy();
             }
-            editor.destroy();
-        }
 
-        this.controller.onFullscreenSessionDestroyed(this);
+            this.controller.onFullscreenSessionDestroyed(this);
+        })();
+        return this._destroyPromise;
     }
 }
 

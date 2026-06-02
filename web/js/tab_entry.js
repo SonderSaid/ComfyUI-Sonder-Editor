@@ -686,6 +686,9 @@ async function main() {
         clearInterval(heartbeat);
         clearInterval(hostPresencePoll);
         statusPillOffset.cleanup();
+        try {
+            editor?._drainProjectMutations?.("tab_pagehide").catch(() => {});
+        } catch (_err) {}
         sync.close();
         try {
             const queued = navigator.sendBeacon(

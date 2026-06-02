@@ -174,6 +174,8 @@ import {
     subscribeEditorSettings,
     updateEditorSettings,
 } from "./editor_settings.js";
+import { fetchProjectJson, rememberProjectVersionFromPayload } from "./api_client.js";
+import { ProjectMutationQueue } from "./project_mutation_queue.js";
 
 const RENDER_CACHE_ENTRY_PRESETS = [
     { value: "3", label: "3" },
@@ -554,8 +556,14 @@ export class EditorWidget {
         this.dragType = null; // "selection", "playhead", "selStart", "selEnd"
         this._pendingApplyWidgetState = null;
         this._pendingScenesRefresh = false;
+        this._pendingProjectRefreshKeys = null;
+        this._pendingProjectRefreshDrain = false;
         this._timelineMutationDepth = 0;
         this._sceneFetchSeq = 0;
+        this._projectMutationQueue = new ProjectMutationQueue({
+            onIdle: () => this._replayDeferredProjectBackedRefresh(),
+        });
+        this._projectMutationCloseInProgress = null;
 
         // Asset state
         this.assets = { video: [], image: [], audio: [], artifact: [] };
@@ -810,17 +818,22 @@ export class EditorWidget {
     }
 
     _shouldDeferSceneRefresh({ ignoreMutationGate = false } = {}) {
-        return !!(this.isDragging || (!ignoreMutationGate && this._timelineMutationDepth > 0));
+        return !!(
+            this.isDragging
+            || (!ignoreMutationGate && this._timelineMutationDepth > 0)
+            || (!ignoreMutationGate && this._hasPendingProjectMutations())
+        );
     }
 
     _deferSceneRefresh(reason = "unknown", details = {}) {
         this._pendingScenesRefresh = true;
         sessionDiagRecord("scene_refresh_deferred", {
             reason,
-            drag_type: this.dragType || "",
-            mutation_depth: this._timelineMutationDepth || 0,
-            ...details,
-        });
+                drag_type: this.dragType || "",
+                mutation_depth: this._timelineMutationDepth || 0,
+                project_mutation_busy: this._hasPendingProjectMutations(),
+                ...details,
+            });
     }
 
     async _withTimelineMutationCommit(kind, callback) {
@@ -1783,7 +1796,6 @@ export class EditorWidget {
         if (!this.activeScene || !this.projectDir) return;
         w = Math.max(0, parseInt(w, 10) || 0);
         h = Math.max(0, parseInt(h, 10) || 0);
-        const dirName = this._projectDirName();
         const sceneRef = this.activeScene;
         const sceneId = this.activeSceneId;
         const prevWidth = sceneRef.width || 0;
@@ -1797,11 +1809,15 @@ export class EditorWidget {
             this._renderViewportFrame();
         }
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ width: w, height: h }),
-            });
+            await this._runSceneMutation(
+                [{ type: "update_scene_fields", fields: { width: w, height: h } }],
+                {
+                    key: `scene:${sceneId}:width-height`,
+                    label: "scene resolution",
+                    coalesce: true,
+                    refreshScenes: false,
+                }
+            );
         } catch (e) {
             sceneRef.width = prevWidth;
             sceneRef.height = prevHeight;
@@ -1817,15 +1833,18 @@ export class EditorWidget {
 
     async _updateSceneFps(fps) {
         if (!this.activeScene || !this.projectDir) return;
-        const dirName = this._projectDirName();
         const sceneRef = this.activeScene;
         const sceneId = this.activeSceneId;
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ fps }),
-            });
+            await this._runSceneMutation(
+                [{ type: "update_scene_fields", fields: { fps } }],
+                {
+                    key: `scene:${sceneId}:fps`,
+                    label: "scene fps",
+                    coalesce: true,
+                    refreshScenes: false,
+                }
+            );
             sceneRef.fps = fps;
             if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
                 this._updateViewportHeader();
@@ -1860,13 +1879,16 @@ export class EditorWidget {
         if (!name || name === this.activeScene.name) return;
         this._pushUndo("rename scene");
 
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ name }),
-            });
+            await this._runSceneMutation(
+                [{ type: "update_scene_fields", fields: { name } }],
+                {
+                    key: `scene:${this.activeSceneId}:name`,
+                    label: "rename scene",
+                    coalesce: true,
+                    refreshScenes: false,
+                }
+            );
             this.activeScene.name = name;
             this.sceneLabel.textContent = name;
         } catch (e) {
@@ -1878,7 +1900,6 @@ export class EditorWidget {
         if (!this.activeScene || !this.projectDir) return;
         frames = Math.max(1, parseInt(frames, 10) || 1);
         this._pushUndo("change duration");
-        const dirName = this._projectDirName();
         const sceneRef = this.activeScene;
         const sceneId = this.activeSceneId;
         const prevDuration = sceneRef.duration_frames || this.totalFrames;
@@ -1893,11 +1914,15 @@ export class EditorWidget {
             this._updateTransportUI();
         }
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ duration_frames: frames }),
-            });
+            await this._runSceneMutation(
+                [{ type: "update_scene_fields", fields: { duration_frames: frames } }],
+                {
+                    key: `scene:${sceneId}:duration`,
+                    label: "scene duration",
+                    coalesce: true,
+                    refreshScenes: false,
+                }
+            );
         } catch (e) {
             sceneRef.duration_frames = prevDuration;
             if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
@@ -1954,8 +1979,12 @@ export class EditorWidget {
     }
 
     // ── Asset Management ───────────────────────────────────────────────
-    async _fetchAssets() {
+    async _fetchAssets({ ignoreMutationGate = false, reason = "assets" } = {}) {
         if (!this.projectDir) return;
+        if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
+            this._deferProjectBackedRefresh(["assets"], reason);
+            return;
+        }
 
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -2311,6 +2340,152 @@ export class EditorWidget {
                 }
             }
         }
+    }
+
+    _snapshotProjectMutationContext() {
+        if (!this.projectDir || !this.activeSceneId) return null;
+        const projectId = this.projectDir.split(/[/\\]/).pop();
+        if (!projectId) return null;
+        return {
+            projectId,
+            projectDir: this.projectDir,
+            sceneId: this.activeSceneId,
+        };
+    }
+
+    _hasPendingProjectMutations() {
+        return !!this._projectMutationQueue?.isBusy?.();
+    }
+
+    _deferProjectBackedRefresh(keys, reason = "project_mutation") {
+        if (!this._pendingProjectRefreshKeys) {
+            this._pendingProjectRefreshKeys = new Set();
+        }
+        for (const key of keys || []) {
+            this._pendingProjectRefreshKeys.add(key);
+        }
+        if (!this._pendingProjectRefreshDrain) {
+            this._pendingProjectRefreshDrain = true;
+            this._projectMutationQueue?.drain?.(reason).then(() => this._replayDeferredProjectBackedRefresh());
+        }
+    }
+
+    _replayDeferredProjectBackedRefresh() {
+        if (this._destroyed || this._hasPendingProjectMutations()) return;
+        const keys = this._pendingProjectRefreshKeys;
+        this._pendingProjectRefreshKeys = null;
+        this._pendingProjectRefreshDrain = false;
+        if (!keys || keys.size === 0) return;
+        if (keys.has("project")) {
+            this._fetchProjectSettings({ ignoreMutationGate: true });
+        }
+        const wantsAssets = keys.has("assets");
+        const wantsScenes = keys.has("scenes");
+        if (wantsAssets && wantsScenes) {
+            this._fetchAssets({ ignoreMutationGate: true }).then(() => {
+                if (!this._destroyed) {
+                    this._fetchScenes({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay" });
+                }
+            });
+        } else {
+            if (wantsAssets) {
+                this._fetchAssets({ ignoreMutationGate: true });
+            }
+            if (wantsScenes) {
+                this._fetchScenes({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay" });
+            }
+        }
+    }
+
+    _schedulePostMutationSceneRefresh(reason = "project_mutation") {
+        if (this._destroyed) return;
+        if (this._hasPendingProjectMutations() || this.isDragging || this._timelineMutationDepth > 0) {
+            this._deferProjectBackedRefresh(["scenes"], reason);
+            return;
+        }
+        this._fetchScenes({ ignoreMutationGate: true, reason });
+    }
+
+    async _drainProjectMutations(reason = "drain") {
+        await this._projectMutationQueue?.drain?.(reason);
+        this._replayDeferredProjectBackedRefresh();
+    }
+
+    async _runVersionedProjectMutation(path, init = {}, { projectId = "", retryOnConflict = true, maxAttempts = 2 } = {}) {
+        let attempt = 0;
+        while (true) {
+            attempt += 1;
+            try {
+                return await fetchProjectJson(api.apiURL(path), init, { projectId });
+            } catch (error) {
+                if (
+                    retryOnConflict
+                    && error?.code === "project_version_conflict"
+                    && attempt < maxAttempts
+                ) {
+                    if (error.project) {
+                        rememberProjectVersionFromPayload(error.project, projectId);
+                    }
+                    continue;
+                }
+                throw error;
+            }
+        }
+    }
+
+    _queueProjectMutation({ key, label, coalesce = true, merge = null, intent = null, run, refreshScenes = true }) {
+        const promise = this._projectMutationQueue.enqueue({
+            key,
+            label,
+            coalesce,
+            merge,
+            intent,
+            run: async (queuedIntent) => run(queuedIntent),
+        });
+        promise.then(
+            () => {
+                if (refreshScenes) this._schedulePostMutationSceneRefresh(label || key);
+            },
+            (error) => {
+                console.warn(`[Sonder] Project mutation failed (${label || key}):`, error);
+                if (refreshScenes) this._deferProjectBackedRefresh(["scenes"], `${label || key}_error`);
+            }
+        );
+        return promise;
+    }
+
+    _runSceneMutation(operations, {
+        key = "",
+        label = "scene mutation",
+        coalesce = true,
+        merge = null,
+        refreshScenes = true,
+    } = {}) {
+        const context = this._snapshotProjectMutationContext();
+        if (!context) return Promise.resolve(null);
+        const intent = {
+            ...context,
+            operations: JSON.parse(JSON.stringify(operations || [])),
+        };
+        return this._queueProjectMutation({
+            key: key || `scene:${context.sceneId}:mutation`,
+            label,
+            coalesce,
+            merge,
+            intent,
+            refreshScenes,
+            run: async (queuedIntent) => {
+                return await this._runVersionedProjectMutation(
+                    `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ operations: queuedIntent.operations }),
+                    },
+                    { projectId: queuedIntent.projectId }
+                );
+            },
+        });
     }
 
     _buildAssetItem(asset) {
@@ -2905,12 +3080,16 @@ export class EditorWidget {
         const dirName = this._projectDirName();
         const frameConstraint = this._resolveFrameConstraintForTemplate(templateId);
         try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ template_id: templateId, frame_constraint: frameConstraint }),
-            });
-            return !!resp.ok;
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ template_id: templateId, frame_constraint: frameConstraint }),
+                },
+                { projectId: dirName }
+            );
+            return true;
         } catch (error) {
             console.warn("[Sonder] Failed to update project template:", error);
             return false;
@@ -6273,8 +6452,6 @@ export class EditorWidget {
             return;
         }
 
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const sceneId = this.activeSceneId;
         const oldState = {
             role: clip.role || "render",
             track_index: clip.track_index || 0,
@@ -6288,15 +6465,14 @@ export class EditorWidget {
         this._pushUndo("convert clip role");
         Object.assign(clip, body);
         try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${clipId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-            if (!resp.ok) {
-                throw new Error(await resp.text());
-            }
-            await this._fetchScenes();
+            await this._runSceneMutation(
+                [{ type: "update_clip", clip_id: clipId, fields: body }],
+                {
+                    key: `clip:${clipId}:role`,
+                    label: "convert clip role",
+                    coalesce: false,
+                }
+            );
             this._clearSelection();
             this._hideItemEditor();
             this._renderTimeline();
@@ -6311,11 +6487,11 @@ export class EditorWidget {
 
     async _moveItemToNewLane(hit) {
         if (!this.activeScene || !this.projectDir) return;
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
         this._pushUndo("move to new lane");
 
         try {
+            const operations = [];
             if (hit.type === "clip") {
                 if (this._isMotionDriverClip(hit.data)) {
                     this._showToast("Motion-driver lanes are single-lane in this phase.");
@@ -6324,31 +6500,21 @@ export class EditorWidget {
                 // Add a new video lane and move clip there
                 const newCount = (this.activeScene.video_lane_count || 1) + 1;
                 const newLane = newCount - 1;
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ video_lane_count: newCount }),
-                });
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${hit.id}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ track_index: newLane }),
-                });
+                operations.push({ type: "set_lane_count", lane_type: "video", count: newCount });
+                operations.push({ type: "update_clip", clip_id: hit.id, fields: { track_index: newLane } });
             } else if (hit.type === "audio") {
                 const newCount = (this.activeScene.audio_lane_count || 1) + 1;
                 const newLane = newCount - 1;
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ audio_lane_count: newCount }),
-                });
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${hit.id}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ lane_index: newLane }),
+                operations.push({ type: "set_lane_count", lane_type: "audio", count: newCount });
+                operations.push({ type: "update_audio_track", track_id: hit.id, fields: { lane_index: newLane } });
+            }
+            if (operations.length > 0) {
+                await this._runSceneMutation(operations, {
+                    key: `scene:${sceneId}:move-item-new-lane:${Date.now()}`,
+                    label: "move item to new lane",
+                    coalesce: false,
                 });
             }
-            await this._fetchScenes();
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
@@ -6378,6 +6544,7 @@ export class EditorWidget {
 
     async _setTrackItemsMuted(entry, muted) {
         const items = this._trackItemsForEntry(entry).filter((item) => "muted" in item);
+        const operations = [];
         for (const item of items) {
             if (!!item.muted === !!muted) continue;
             item.muted = !!muted;
@@ -6391,7 +6558,29 @@ export class EditorWidget {
                 : type === "guide"
                     ? item.frame_index
                     : item.clip_id;
-            await this._updateItemProperty(type, id, { muted: !!muted }, { refresh: false });
+            if (type === "clip") {
+                operations.push({ type: "update_clip", clip_id: id, fields: { muted: !!muted } });
+            } else if (type === "audio") {
+                operations.push({ type: "update_audio_track", track_id: id, fields: { muted: !!muted } });
+            } else {
+                operations.push({
+                    type: "update_guide",
+                    frame_index: id,
+                    expected: {
+                        frame_index: item.frame_index,
+                        asset_id: item.asset_id || "",
+                    },
+                    fields: { muted: !!muted },
+                });
+            }
+        }
+        if (operations.length > 0) {
+            await this._runSceneMutation(operations, {
+                key: `scene:${this.activeSceneId}:track-items-muted:${entry.type}:${entry.laneIndex ?? "track"}`,
+                label: "track item mute",
+                coalesce: false,
+                refreshScenes: false,
+            });
         }
     }
 
@@ -6476,7 +6665,6 @@ export class EditorWidget {
     /** Persist lane configs (lock/hide/name/color) to server from current _trackLayout */
     async _saveLaneConfig() {
         if (!this.activeScene || !this.projectDir) return;
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
         const sceneRef = this.activeScene;
         const videoConfigs = [];
@@ -6501,18 +6689,23 @@ export class EditorWidget {
         for (let i = 0; i < videoConfigs.length; i++) if (!videoConfigs[i]) videoConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         for (let i = 0; i < motionDriverConfigs.length; i++) if (!motionDriverConfigs[i]) motionDriverConfigs[i] = { name: "", color: "", locked: false, hidden: false };
         for (let i = 0; i < audioConfigs.length; i++) if (!audioConfigs[i]) audioConfigs[i] = { name: "", color: "", locked: false, hidden: false };
+        const fields = {
+            video_lane_configs: videoConfigs,
+            motion_driver_lane_configs: motionDriverConfigs,
+            audio_lane_configs: audioConfigs,
+            guide_track_config: guideTrackConfig,
+            prompt_track_config: promptTrackConfig,
+        };
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    video_lane_configs: videoConfigs,
-                    motion_driver_lane_configs: motionDriverConfigs,
-                    audio_lane_configs: audioConfigs,
-                    guide_track_config: guideTrackConfig,
-                    prompt_track_config: promptTrackConfig,
-                }),
-            });
+            await this._runSceneMutation(
+                [{ type: "update_lane_configs", fields }],
+                {
+                    key: `scene:${sceneId}:lane-config`,
+                    label: "lane config",
+                    coalesce: true,
+                    refreshScenes: false,
+                }
+            );
             // Update local scene data
             if (sceneRef) {
                 sceneRef.video_lane_configs = videoConfigs;
@@ -6532,22 +6725,20 @@ export class EditorWidget {
             this._showToast("Motion-driver lanes are single-lane in this phase.");
             return;
         }
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         const isVideo = trackType === TRACK_TYPE.VIDEO;
-        const body = {};
-        if (isVideo) {
-            body.video_lane_count = (this.activeScene.video_lane_count || 1) + 1;
-        } else {
-            body.audio_lane_count = (this.activeScene.audio_lane_count || 1) + 1;
-        }
+        const nextCount = isVideo
+            ? (this.activeScene.video_lane_count || 1) + 1
+            : (this.activeScene.audio_lane_count || 1) + 1;
         try {
             this._pushUndo("add lane");
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-            await this._fetchScenes();
+            await this._runSceneMutation(
+                [{ type: "set_lane_count", lane_type: isVideo ? "video" : "audio", count: nextCount }],
+                {
+                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-lane-count`,
+                    label: "add lane",
+                    coalesce: false,
+                }
+            );
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
@@ -6577,31 +6768,22 @@ export class EditorWidget {
             : `This ${label} lane has ${items.length} item(s). Delete them and remove this lane?`;
         if (!confirm(msg)) return;
 
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            if (willMove) {
-                // Move items to adjacent lane
-                for (const item of items) {
-                    const id = isVideo ? item.clip_id : item.track_id;
-                    const endpoint = isVideo ? "clips" : "audio_tracks";
-                    const field = isVideo ? "track_index" : "lane_index";
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
-                        method: "PUT",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ [field]: targetLane }),
-                    });
+            this._pushUndo("remove lane");
+            await this._runSceneMutation(
+                [{
+                    type: "remove_lane",
+                    lane_type: isVideo ? "video" : "audio",
+                    lane_index: laneIndex,
+                    item_policy: willMove ? "move_items" : "delete_items",
+                    target_lane: targetLane,
+                }],
+                {
+                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-remove-lane:${laneIndex}`,
+                    label: "remove lane",
+                    coalesce: false,
                 }
-            } else {
-                // Delete items on this lane
-                for (const item of items) {
-                    const id = isVideo ? item.clip_id : item.track_id;
-                    const endpoint = isVideo ? "clips" : "audio_tracks";
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}`), {
-                        method: "DELETE",
-                    });
-                }
-            }
-            await this._removeLane(trackType, laneIndex);
+            );
         } catch (e) {
             console.warn("[Sonder] Failed to remove lane with items:", e);
         }
@@ -6624,19 +6806,26 @@ export class EditorWidget {
         }
         if (!confirm(`Delete ${items.length} ${label} item(s) on lane ${laneIndex + 1}? The lane will remain.`)) return;
 
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
             this._pushUndo("delete lane items");
-            for (const item of items) {
-                const id = isVideo ? item.clip_id : item.track_id;
-                const endpoint = isVideo ? "clips" : "audio_tracks";
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/${endpoint}/${id}?preserve_lane=1`), {
-                    method: "DELETE",
-                });
-            }
+            await this._runSceneMutation(
+                [{
+                    type: "bulk_delete_items",
+                    preserve_lanes: true,
+                    items: items.map((item) => ({
+                        type: isVideo ? "clip" : "audio",
+                        id: isVideo ? item.clip_id : item.track_id,
+                        preserve_lane: true,
+                    })),
+                }],
+                {
+                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-delete-lane-items:${laneIndex}`,
+                    label: "delete lane items",
+                    coalesce: false,
+                }
+            );
             this._clearSelection();
             this._hideItemEditor();
-            await this._fetchScenes();
             this._buildTrackLayout();
             this._renderTimeline();
             this._renderViewportFrame();
@@ -6651,67 +6840,26 @@ export class EditorWidget {
             this._showToast("Motion-driver lanes are single-lane in this phase.");
             return;
         }
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         const isVideo = trackType === TRACK_TYPE.VIDEO;
         const currentCount = isVideo
             ? (this.activeScene.video_lane_count || 1)
             : (this.activeScene.audio_lane_count || 1);
         if (currentCount <= 1) return;
-
-        const cloneLaneConfig = (cfg) => ({
-            name: cfg?.name || "",
-            color: cfg?.color || "",
-            locked: !!cfg?.locked,
-            hidden: !!cfg?.hidden,
-        });
-        const reindexLaneConfigs = (configs) => {
-            const nextCount = currentCount - 1;
-            const next = (configs || [])
-                .filter((_cfg, idx) => idx !== laneIndex)
-                .map(cloneLaneConfig)
-                .slice(0, nextCount);
-            while (next.length < nextCount) next.push(this._defaultLaneConfig());
-            return next;
-        };
-
-        const body = {};
-        if (isVideo) {
-            body.video_lane_count = currentCount - 1;
-            body.video_lane_configs = reindexLaneConfigs(this.activeScene.video_lane_configs);
-        } else {
-            body.audio_lane_count = currentCount - 1;
-            body.audio_lane_configs = reindexLaneConfigs(this.activeScene.audio_lane_configs);
-        }
         try {
             this._pushUndo("remove lane");
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-            // Shift items on lanes above the removed one
-            if (isVideo) {
-                for (const clip of (this.activeScene.clips || [])) {
-                    if (this._isRenderClip(clip) && (clip.track_index || 0) > laneIndex) {
-                        await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips/${clip.clip_id}`), {
-                            method: "PUT",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ track_index: clip.track_index - 1 }),
-                        });
-                    }
+            await this._runSceneMutation(
+                [{
+                    type: "remove_lane",
+                    lane_type: isVideo ? "video" : "audio",
+                    lane_index: laneIndex,
+                    item_policy: "require_empty",
+                }],
+                {
+                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-remove-lane:${laneIndex}`,
+                    label: "remove lane",
+                    coalesce: false,
                 }
-            } else {
-                for (const track of (this.activeScene.audio_tracks || [])) {
-                    if ((track.lane_index || 0) > laneIndex) {
-                        await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks/${track.track_id}`), {
-                            method: "PUT",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ lane_index: track.lane_index - 1 }),
-                        });
-                    }
-                }
-            }
-            await this._fetchScenes();
+            );
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
@@ -6881,15 +7029,38 @@ export class EditorWidget {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
         this._pushUndo("edit prompt");
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const section = (this.activeScene.prompt_sections || [])[idx];
 
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections/${idx}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(updates),
-            });
-            await this._fetchScenes();
+            await this._runSceneMutation(
+                [{
+                    type: "update_prompt_section",
+                    index: idx,
+                    expected: section ? {
+                        start_frame: section.start_frame,
+                        end_frame: section.end_frame,
+                    } : undefined,
+                    fields: { ...updates },
+                }],
+                {
+                    key: `prompt:${this.activeSceneId}:${idx}:fields:${Object.keys(updates || {}).sort().join("-")}`,
+                    label: "edit prompt",
+                    coalesce: true,
+                    merge: (oldIntent, nextIntent) => {
+                        if (!oldIntent?.operations?.[0] || !nextIntent?.operations?.[0]) return nextIntent;
+                        return {
+                            ...nextIntent,
+                            operations: [{
+                                ...nextIntent.operations[0],
+                                fields: {
+                                    ...(oldIntent.operations[0].fields || {}),
+                                    ...(nextIntent.operations[0].fields || {}),
+                                },
+                            }],
+                        };
+                    },
+                }
+            );
             this._selectedPromptIdx = null;
             this._renderTimeline();
         } catch (e) {
@@ -6901,15 +7072,26 @@ export class EditorWidget {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
         this._pushUndo("delete prompt");
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const section = (this.activeScene.prompt_sections || [])[idx];
 
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections/${idx}`), {
-                method: "DELETE",
-            });
+            await this._runSceneMutation(
+                [{
+                    type: "delete_prompt_section",
+                    index: idx,
+                    expected: section ? {
+                        start_frame: section.start_frame,
+                        end_frame: section.end_frame,
+                    } : undefined,
+                }],
+                {
+                    key: `prompt:${this.activeSceneId}:${idx}:delete`,
+                    label: "delete prompt",
+                    coalesce: false,
+                }
+            );
             this._selectedPromptIdx = null;
             this._hidePromptEditor();
-            await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
             console.warn("[Sonder] Failed to delete prompt section:", e);
@@ -7191,19 +7373,16 @@ export class EditorWidget {
     async _moveItemToFrame(type, id, data, newStart) {
         if (!this.activeScene || !this.projectDir) return;
         this._pushUndo("move item");
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const sceneId = this.activeSceneId;
-        const endpoint = type === "clip"
-            ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`
-            : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
+        const operation = type === "clip"
+            ? { type: "update_clip", clip_id: id, fields: { timeline_start_frame: newStart } }
+            : { type: "update_audio_track", track_id: id, fields: { timeline_start_frame: newStart } };
 
         try {
-            await fetch(api.apiURL(endpoint), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ timeline_start_frame: newStart }),
+            await this._runSceneMutation([operation], {
+                key: `${type}:${id}:timeline`,
+                label: "move item",
+                coalesce: false,
             });
-            await this._fetchScenes();
             this._clearSelection();
             this._hideItemEditor();
             this._renderTimeline();
@@ -7214,23 +7393,51 @@ export class EditorWidget {
 
     async _updateItemProperty(type, id, props, { refresh = true } = {}) {
         if (!this.activeScene || !this.projectDir) return;
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const sceneId = this.activeSceneId;
-        const endpoint = type === "clip"
-            ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`
-            : type === "guide"
-                ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${id}`
-                : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`;
-        const method = type === "guide" ? "PATCH" : "PUT";
+        let operation;
+        if (type === "clip") {
+            operation = { type: "update_clip", clip_id: id, fields: { ...props } };
+        } else if (type === "guide") {
+            const frameIndex = parseInt(id, 10);
+            const guide = (this.activeScene.guide_frames || []).find((g) => (g.frame_index || 0) === frameIndex);
+            operation = {
+                type: "update_guide",
+                frame_index: frameIndex,
+                expected: guide ? {
+                    frame_index: guide.frame_index,
+                    asset_id: guide.asset_id || "",
+                } : undefined,
+                fields: { ...props },
+            };
+        } else {
+            operation = { type: "update_audio_track", track_id: id, fields: { ...props } };
+        }
+        const fieldNames = Object.keys(props || {}).sort();
+        const key = fieldNames.length === 1
+            ? `${type}:${id}:field:${fieldNames[0]}`
+            : `${type}:${id}:fields:${fieldNames.join("-")}`;
+        const merge = (oldIntent, nextIntent) => {
+            if (!oldIntent?.operations?.[0] || !nextIntent?.operations?.[0]) return nextIntent;
+            return {
+                ...nextIntent,
+                operations: [{
+                    ...nextIntent.operations[0],
+                    fields: {
+                        ...(oldIntent.operations[0].fields || {}),
+                        ...(nextIntent.operations[0].fields || {}),
+                    },
+                }],
+            };
+        };
 
         try {
-            await fetch(api.apiURL(endpoint), {
-                method,
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(props),
+            await this._runSceneMutation([operation], {
+                key,
+                label: "item property",
+                coalesce: true,
+                merge,
+                refreshScenes: refresh,
             });
             if (refresh) {
-                await this._fetchScenes();
                 this._renderTimeline();
                 this._renderViewportFrame();
             }
@@ -7247,11 +7454,30 @@ export class EditorWidget {
 
         const nextMuted = !targets.every((item) => !!item.data?.muted);
         this._pushUndo(nextMuted ? "mute items" : "unmute items");
+        const operations = [];
         for (const item of targets) {
             item.data.muted = nextMuted;
-            await this._updateItemProperty(item.type, item.id, { muted: nextMuted }, { refresh: false });
+            if (item.type === "clip") {
+                operations.push({ type: "update_clip", clip_id: item.id, fields: { muted: nextMuted } });
+            } else if (item.type === "audio") {
+                operations.push({ type: "update_audio_track", track_id: item.id, fields: { muted: nextMuted } });
+            } else if (item.type === "guide") {
+                operations.push({
+                    type: "update_guide",
+                    frame_index: item.id,
+                    expected: {
+                        frame_index: item.data?.frame_index ?? item.id,
+                        asset_id: item.data?.asset_id || "",
+                    },
+                    fields: { muted: nextMuted },
+                });
+            }
         }
-        await this._fetchScenes();
+        await this._runSceneMutation(operations, {
+            key: `scene:${this.activeSceneId}:selected-mute`,
+            label: nextMuted ? "mute items" : "unmute items",
+            coalesce: false,
+        });
         this._reconcileSelection();
         if (this._itemEditorEl && this.selectedItem) {
             this._showItemEditor();
@@ -7265,26 +7491,29 @@ export class EditorWidget {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isGuideTrackLocked()) return;
         this._pushUndo("move guide");
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const sceneId = this.activeSceneId;
         const oldIdx = guideData.frame_index;
 
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${oldIdx}`), {
-                method: "DELETE",
-            });
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides`), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    frame_index: newIdx,
+            await this._runSceneMutation(
+                [{
+                    type: "move_guide",
+                    from_frame_index: oldIdx,
+                    to_frame_index: newIdx,
+                    expected: {
+                        frame_index: oldIdx,
+                        asset_id: guideData.asset_id || "",
+                    },
                     asset_id: guideData.asset_id,
                     source: guideData.source || "asset",
                     strength,
                     muted: !!guideData.muted,
-                }),
-            });
-            await this._fetchScenes();
+                }],
+                {
+                    key: `guide:${this.activeSceneId}:${oldIdx}:move`,
+                    label: "move guide",
+                    coalesce: false,
+                }
+            );
             this._clearSelection();
             this._hideItemEditor();
             this._renderTimeline();
@@ -7517,35 +7746,51 @@ export class EditorWidget {
         this.selectedItems = this.selectedItems.filter((item) => !this._isItemLocked(item));
         if (this.selectedItems.length === 0) return;
         this._pushUndo("delete items");
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const sceneId = this.activeSceneId;
+        const items = this.selectedItems.map((item) => {
+            if (item.type === "guide") {
+                return {
+                    type: "guide",
+                    id: item.id,
+                    expected: {
+                        frame_index: item.data?.frame_index ?? item.id,
+                        asset_id: item.data?.asset_id || "",
+                    },
+                };
+            }
+            if (item.type === "prompt") {
+                return {
+                    type: "prompt",
+                    id: item.id,
+                    expected: {
+                        start_frame: item.data?.start_frame,
+                        end_frame: item.data?.end_frame,
+                    },
+                };
+            }
+            return {
+                type: item.type,
+                id: item.id,
+            };
+        });
 
         try {
-            for (const item of this.selectedItems) {
-                let endpoint;
-                if (item.type === "clip") {
-                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${item.id}`;
-                } else if (item.type === "audio") {
-                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${item.id}`;
-                } else if (item.type === "guide") {
-                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${item.id}`;
-                } else if (item.type === "prompt") {
-                    endpoint = `/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${item.id}`;
+            await this._runSceneMutation(
+                [{ type: "bulk_delete_items", items }],
+                {
+                    key: `scene:${this.activeSceneId}:delete-selected:${Date.now()}`,
+                    label: "delete items",
+                    coalesce: false,
                 }
-                if (endpoint) {
-                    await fetch(api.apiURL(endpoint), { method: "DELETE" });
-                }
-            }
+            );
             this._clearSelection();
             this._hideItemEditor();
-            await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
             console.warn("[Sonder] Failed to delete items:", e);
         }
     }
 
-    async _commitItemMove(frameDelta) {
+    async _commitItemMoveLegacyBeforeProjectMutationQueue(frameDelta) {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
         // Note: _pushUndo already called at drag start (mousedown)
         const dirName = this.projectDir.split(/[/\\]/).pop();
@@ -7653,7 +7898,7 @@ export class EditorWidget {
     }
 
     /** Commit a trim operation (edge drag) to the server. */
-    async _commitTrim(trimInfo) {
+    async _commitTrimLegacyBeforeProjectMutationQueue(trimInfo) {
         if (!this.projectDir || !this.activeScene) return;
         const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
@@ -7699,6 +7944,172 @@ export class EditorWidget {
             console.warn("[Sonder] Failed to commit trim:", e);
             await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_error" });
             this._renderTimeline();
+            }
+        });
+    }
+
+    async _commitItemMove(frameDelta) {
+        if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
+        const sceneId = this.activeSceneId;
+
+        return this._withTimelineMutationCommit("moveItem", async () => {
+            try {
+                const operations = [];
+                const dragItemsOrig = this._dragItemsOrig || [];
+                const draggedClipIds = new Set(dragItemsOrig.filter(o => o.type === "clip").map(o => o.id));
+                const draggedAudioIds = new Set(dragItemsOrig.filter(o => o.type === "audio").map(o => o.id));
+                const origClipLanes = this._origAllClipLanes || {};
+                const origAudioLanes = this._origAllAudioLanes || {};
+                const origClipStarts = this._origAllClipStarts || {};
+                const origAudioStarts = this._origAllAudioStarts || {};
+
+                for (const clip of (this.activeScene.clips || [])) {
+                    const clipId = clip.clip_id;
+                    const isDragged = draggedClipIds.has(clipId);
+                    const origLane = origClipLanes[clipId];
+                    const laneChanged = origLane !== undefined && (clip.track_index || 0) !== origLane;
+                    const origStart = origClipStarts[clipId];
+                    const startChanged = origStart !== undefined && (clip.timeline_start_frame || 0) !== origStart;
+                    if (!isDragged && !laneChanged && !startChanged) continue;
+                    const fields = { track_index: clip.track_index || 0 };
+                    if (isDragged || startChanged) {
+                        fields.timeline_start_frame = clip.timeline_start_frame;
+                        fields.timeline_end_frame = clip.timeline_end_frame;
+                    }
+                    operations.push({ type: "update_clip", clip_id: clipId, fields });
+                }
+
+                for (const track of (this.activeScene.audio_tracks || [])) {
+                    const trackId = track.track_id;
+                    const isDragged = draggedAudioIds.has(trackId);
+                    const origLane = origAudioLanes[trackId];
+                    const laneChanged = origLane !== undefined && (track.lane_index || 0) !== origLane;
+                    const origStart = origAudioStarts[trackId];
+                    const startChanged = origStart !== undefined && (track.timeline_start_frame || 0) !== origStart;
+                    if (!isDragged && !laneChanged && !startChanged) continue;
+                    const fields = { lane_index: track.lane_index || 0 };
+                    if (isDragged || startChanged) {
+                        fields.timeline_start_frame = track.timeline_start_frame;
+                        fields.timeline_end_frame = track.timeline_end_frame;
+                    }
+                    operations.push({ type: "update_audio_track", track_id: trackId, fields });
+                }
+
+                for (const orig of dragItemsOrig) {
+                    const { type, id, data } = orig;
+                    if (type === "clip" || type === "audio") continue;
+                    if (type === "guide") {
+                        if (this._isGuideTrackLocked()) continue;
+                        const oldIdx = orig.origStart;
+                        const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
+                        const newIdx = previewIdx ?? Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
+                        operations.push({
+                            type: "move_guide",
+                            from_frame_index: oldIdx,
+                            to_frame_index: newIdx,
+                            expected: {
+                                frame_index: oldIdx,
+                                asset_id: data.asset_id || "",
+                            },
+                            asset_id: data.asset_id,
+                            source: data.source || "asset",
+                            strength: data.strength ?? 1.0,
+                            muted: !!data.muted,
+                        });
+                        delete data._previewFrameIndex;
+                    } else if (type === "prompt") {
+                        if (this._isPromptTrackLocked()) continue;
+                        operations.push({
+                            type: "update_prompt_section",
+                            index: id,
+                            expected: {
+                                start_frame: orig.origStart,
+                                end_frame: orig.origEnd,
+                            },
+                            fields: {
+                                start_frame: data.start_frame,
+                                end_frame: data.end_frame,
+                            },
+                        });
+                    }
+                }
+
+                if (operations.length > 0) {
+                    await this._runSceneMutation(operations, {
+                        key: `scene:${sceneId}:move-commit:${Date.now()}`,
+                        label: "move item commit",
+                        coalesce: false,
+                        refreshScenes: false,
+                    });
+                }
+                await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_commit" });
+                this._renderTimeline();
+            } catch (e) {
+                console.warn("[Sonder] Failed to move items:", e);
+                await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_error" });
+                this._renderTimeline();
+            }
+        });
+    }
+
+    async _commitTrim(trimInfo) {
+        if (!this.projectDir || !this.activeScene) return;
+        const sceneId = this.activeSceneId;
+        const { type, id, data, origStart, origEnd } = trimInfo;
+
+        return this._withTimelineMutationCommit("trimEdge", async () => {
+            try {
+                const operations = [];
+                if (type === "clip") {
+                    operations.push({
+                        type: "update_clip",
+                        clip_id: id,
+                        fields: {
+                            timeline_start_frame: data.timeline_start_frame,
+                            timeline_end_frame: data.timeline_end_frame,
+                            source_in_frame: data.source_in_frame || 0,
+                            source_out_frame: data.source_out_frame,
+                        },
+                    });
+                } else if (type === "audio") {
+                    operations.push({
+                        type: "update_audio_track",
+                        track_id: id,
+                        fields: {
+                            timeline_start_frame: data.timeline_start_frame,
+                            timeline_end_frame: data.timeline_end_frame,
+                            source_in_frame: data.source_in_frame || 0,
+                        },
+                    });
+                } else if (type === "prompt") {
+                    if (this._isPromptTrackLocked()) return;
+                    operations.push({
+                        type: "update_prompt_section",
+                        index: id,
+                        expected: {
+                            start_frame: origStart,
+                            end_frame: origEnd,
+                        },
+                        fields: {
+                            start_frame: data.start_frame,
+                            end_frame: data.end_frame,
+                        },
+                    });
+                }
+                if (operations.length > 0) {
+                    await this._runSceneMutation(operations, {
+                        key: `scene:${sceneId}:trim-commit:${Date.now()}`,
+                        label: "trim commit",
+                        coalesce: false,
+                        refreshScenes: false,
+                    });
+                }
+                await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_commit" });
+                this._renderTimeline();
+            } catch (e) {
+                console.warn("[Sonder] Failed to commit trim:", e);
+                await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_error" });
+                this._renderTimeline();
             }
         });
     }
@@ -7843,13 +8254,24 @@ export class EditorWidget {
             deleteBtn.addEventListener("click", async (event) => {
                 event.stopPropagation();
                 this._pushUndo("delete guide");
-                const dirName = this._projectDirName();
-                const sceneId = this.activeSceneId;
                 try {
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${guide.frame_index}`), {
-                        method: "DELETE",
-                    });
-                    await this._fetchScenes();
+                    await this._runSceneMutation(
+                        [{
+                            type: "delete_guide",
+                            frame_index: guide.frame_index,
+                            expected: {
+                                frame_index: guide.frame_index,
+                                asset_id: guide.asset_id || "",
+                            },
+                        }],
+                        {
+                            key: `guide:${this.activeSceneId}:${guide.frame_index}:delete`,
+                            label: "delete guide",
+                            coalesce: false,
+                            refreshScenes: false,
+                        }
+                    );
+                    await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_guide" });
                     this._renderTimeline();
                     this._showGuideManagementPopup(x, y);
                 } catch (e) {
@@ -8096,12 +8518,23 @@ export class EditorWidget {
                 event.stopPropagation();
                 if (locked) return;
                 this._pushUndo("delete guide");
-                const dirName = this._projectDirName();
-                const sceneId = this.activeSceneId;
                 try {
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${guide.frame_index}`), {
-                        method: "DELETE",
-                    });
+                    await this._runSceneMutation(
+                        [{
+                            type: "delete_guide",
+                            frame_index: guide.frame_index,
+                            expected: {
+                                frame_index: guide.frame_index,
+                                asset_id: guide.asset_id || "",
+                            },
+                        }],
+                        {
+                            key: `guide:${this.activeSceneId}:${guide.frame_index}:delete`,
+                            label: "delete guide",
+                            coalesce: false,
+                            refreshScenes: false,
+                        }
+                    );
                     await refreshPanel();
                 } catch (e) {
                     console.warn("[Sonder] Failed to delete guide:", e);
@@ -8325,7 +8758,7 @@ export class EditorWidget {
 
         const exitBtn = this._makeBtn("✕ Exit", "Exit fullscreen");
         exitBtn.style.cssText += `font-size: 12px; padding: 4px 12px; color: ${COLORS.textDim};`;
-        exitBtn.addEventListener("click", () => this._exitFullscreen());
+        exitBtn.addEventListener("click", () => void this._requestExitFullscreen({ reason: "toolbar" }));
 
         const toolbarButtons = document.createElement("div");
         toolbarButtons.dataset.fsToolbarButtons = "true";
@@ -8625,7 +9058,7 @@ export class EditorWidget {
         this._fullscreenPlaceholder.innerHTML = `Editor is in fullscreen mode`;
         const exitPlaceholderBtn = this._makeBtn("Exit Fullscreen", "Return editor to node");
         exitPlaceholderBtn.style.cssText += `display: block; margin: 8px auto 0;`;
-        exitPlaceholderBtn.addEventListener("click", () => this._exitFullscreen());
+        exitPlaceholderBtn.addEventListener("click", () => void this._requestExitFullscreen({ reason: "placeholder" }));
         this._fullscreenPlaceholder.appendChild(exitPlaceholderBtn);
 
         if (this._nodeParent) {
@@ -8650,6 +9083,25 @@ export class EditorWidget {
 
         // Collapse node
         this.widgetHost?.setSize?.(this.widgetHost?.computeSize?.());
+    }
+
+    async _requestExitFullscreen({ reason = "user" } = {}) {
+        if (!this.isFullscreen) return;
+        if (this._projectMutationCloseInProgress) {
+            return this._projectMutationCloseInProgress;
+        }
+        this._projectMutationCloseInProgress = (async () => {
+            this._stopPlayback();
+            await this._drainProjectMutations(`fullscreen_exit:${reason}`);
+            if (!this._destroyed && this.isFullscreen) {
+                this._exitFullscreen();
+            }
+        })();
+        try {
+            await this._projectMutationCloseInProgress;
+        } finally {
+            this._projectMutationCloseInProgress = null;
+        }
     }
 
     _exitFullscreen() {
@@ -8714,7 +9166,7 @@ export class EditorWidget {
 
     _toggleFullscreen() {
         if (this.isFullscreen) {
-            this._exitFullscreen();
+            void this._requestExitFullscreen({ reason: "toggle" });
         } else {
             this._enterFullscreen();
         }
@@ -8754,7 +9206,7 @@ export class EditorWidget {
 
             // ── Escape ──
             if (key === "Escape") {
-                if (this.isFullscreen) { this._exitFullscreen(); return true; }
+                if (this.isFullscreen) { void this._requestExitFullscreen({ reason: "escape" }); return true; }
                 if (this.selectedItems.length > 0) {
                     this.selectedItems = [];
                     this._renderTimeline();
@@ -10662,19 +11114,28 @@ export class EditorWidget {
 
     refresh(keys = []) {
         const wanted = new Set(keys);
-        if (!wanted.size || wanted.has("project")) {
-            this._fetchProjectSettings();
-        }
         const wantsAssets = !wanted.size || wanted.has("assets");
         const wantsScenes = !wanted.size || wanted.has("scenes");
-        if (wantsAssets && wantsScenes) {
-            this._fetchAssets().then(() => this._fetchScenes());
+        const wantsProject = !wanted.size || wanted.has("project");
+        if (this._hasPendingProjectMutations() && (wantsProject || wantsAssets || wantsScenes)) {
+            const deferred = [];
+            if (wantsProject) deferred.push("project");
+            if (wantsAssets) deferred.push("assets");
+            if (wantsScenes) deferred.push("scenes");
+            this._deferProjectBackedRefresh(deferred, "external_refresh");
         } else {
-            if (wantsAssets) {
-                this._fetchAssets();
+            if (wantsProject) {
+                this._fetchProjectSettings();
             }
-            if (wantsScenes) {
-                this._fetchScenes();
+            if (wantsAssets && wantsScenes) {
+                this._fetchAssets().then(() => this._fetchScenes());
+            } else {
+                if (wantsAssets) {
+                    this._fetchAssets();
+                }
+                if (wantsScenes) {
+                    this._fetchScenes();
+                }
             }
         }
         if (!wanted.size || wanted.has("queue")) {
@@ -10682,8 +11143,12 @@ export class EditorWidget {
         }
     }
 
-    async _fetchProjectSettings() {
+    async _fetchProjectSettings({ ignoreMutationGate = false, reason = "project_settings" } = {}) {
         if (!this.projectDir) return;
+        if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
+            this._deferProjectBackedRefresh(["project"], reason);
+            return;
+        }
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`));
@@ -10712,15 +11177,20 @@ export class EditorWidget {
             this._frameConstraintHealedFor = projectDir;
             return;
         }
+        if (this._hasPendingProjectMutations()) {
+            this._deferProjectBackedRefresh(["project"], "frame_constraint_heal");
+            return;
+        }
         try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}`), {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ frame_constraint: expected }),
-            });
-            if (!resp.ok) {
-                throw new Error(`Frame-constraint self-heal failed: ${resp.status}`);
-            }
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ frame_constraint: expected }),
+                },
+                { projectId: dirName }
+            );
             this._frameConstraintHealedFor = projectDir;
         } catch (error) {
             console.warn("[Sonder] Frame-constraint self-heal threw:", error);
