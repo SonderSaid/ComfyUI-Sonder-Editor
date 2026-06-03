@@ -22,6 +22,7 @@ import { connectProjectSync } from "./cross_tab_sync.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEYBOARD_PRIORITY } from "./keyboard_ownership.js";
+import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
 
 // Session-diagnostic mode is gated by `window.SONDER_DEBUG_SESSION === true`.
 // When off, the helpers below are no-ops with zero allocation. Do NOT enable
@@ -63,29 +64,6 @@ function coerceBoolean(value, defaultValue = false) {
     return defaultValue;
 }
 
-const CHROME = {
-    panelMuted: "#10161d",
-    panel: "#151c24",
-    panelRaised: "#1b2430",
-    panelRaisedHover: "#25313f",
-    border: "#34414d",
-    borderSoft: "#28313b",
-    borderStrong: "#587089",
-    text: "#dbe3ea",
-    textDim: "#90a0af",
-    textMuted: "#748291",
-    accent: "#4a82ad",
-    accentSoft: "#263a4d",
-    accentSoftHover: "#314961",
-    accentBorder: "#6686a3",
-    warningSoft: "#45361f",
-    warningBorder: "#9a7a42",
-    warningText: "#efd79f",
-    dangerSoft: "#44292d",
-    dangerBorder: "#8f5f66",
-    dangerText: "#efc0c4",
-};
-
 const EDITOR_WIDGET_FIELDS = [
     "scene_id",
     "selection_start",
@@ -122,12 +100,12 @@ const BUTTON_STYLES = {
     primary: {
         background: CHROME.accentSoft,
         border: CHROME.accentBorder,
-        text: "#f7fbff",
+        text: CHROME.text,
     },
     active: {
         background: CHROME.accent,
-        border: "#7ea8c9",
-        text: "#ffffff",
+        border: CHROME.accentHi,
+        text: CHROME.bg,
     },
 };
 
@@ -144,6 +122,34 @@ function buttonStyle(variant = "muted", { padding = "6px 10px", radius = "6px", 
         font-weight: ${fontWeight};
         box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
     `;
+}
+
+function makeStatusPill(text, state = "idle", { fontSize = "10px", padding = "2px 8px" } = {}) {
+    const pill = style(document.createElement("span"), `
+        ${statusPillCss({ state, padding })}
+        font-size: ${fontSize};
+        line-height: 1.35;
+        font-weight: 600;
+    `);
+    const dot = style(document.createElement("span"), `
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: var(--sonder-status-color);
+        flex: 0 0 auto;
+    `);
+    const label = document.createElement("span");
+    label.textContent = text;
+    pill.append(dot, label);
+    return pill;
+}
+
+function statusStateForQueue(status) {
+    const normalized = String(status || "pending").trim().toLowerCase();
+    if (normalized === "running") return "running";
+    if (normalized === "pending") return "pending";
+    if (normalized === "failed") return "failed";
+    return "idle";
 }
 
 function iconForAssetType(type) {
@@ -296,7 +302,7 @@ function renderDormantMediaScrubBar(mediaEl) {
         flex: 1 1 auto;
         height: 10px;
         border-radius: 999px;
-        background: #1a2631;
+        background: ${THEME.bg3};
         cursor: pointer;
         overflow: hidden;
     `);
@@ -306,7 +312,7 @@ function renderDormantMediaScrubBar(mediaEl) {
         top: 0;
         bottom: 0;
         width: 0;
-        background: linear-gradient(90deg,#6fa7d8,#8fc0f0);
+        background: linear-gradient(90deg, ${THEME.accent}, ${THEME.accentHi});
     `);
     const thumb = style(document.createElement("div"), `
         position: absolute;
@@ -314,7 +320,7 @@ function renderDormantMediaScrubBar(mediaEl) {
         width: 12px;
         height: 12px;
         border-radius: 50%;
-        background: #d9ebfb;
+        background: ${THEME.fg0};
         border: 1px solid rgba(0,0,0,0.35);
         transform: translate(-50%,-50%);
         left: 100%;
@@ -324,7 +330,7 @@ function renderDormantMediaScrubBar(mediaEl) {
     fill.appendChild(thumb);
     track.appendChild(fill);
     const label = style(document.createElement("div"), `
-        color: #a9bccb;
+        color: ${THEME.fg1};
         font-size: 10px;
         white-space: nowrap;
         min-width: 72px;
@@ -776,7 +782,7 @@ class DormantNodeCard {
             border-radius: 10px;
             background: linear-gradient(180deg, ${CHROME.panelRaised} 0%, ${CHROME.panelMuted} 100%);
             color: ${CHROME.text};
-            font-family: 'Segoe UI', Arial, sans-serif;
+            font-family: ${FONT.sans};
             font-size: 11px;
             overflow: hidden;
         `);
@@ -849,7 +855,7 @@ class DormantNodeCard {
         const projectTitle = style(document.createElement("div"), `
             font-size: 12px;
             font-weight: 700;
-            color: #f0f4f8;
+            color: ${CHROME.text};
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -868,33 +874,22 @@ class DormantNodeCard {
 
         this._badgeRowEl.innerHTML = "";
         const badges = [];
-        if (state.isFullscreenOpen) badges.push({ text: "Editor Active", color: CHROME.accentSoft, border: CHROME.accentBorder });
+        if (state.isFullscreenOpen) badges.push({ text: "Editor Active", state: "running" });
         if (state.activeOwner?.host_mode === "tab") {
             const orphaned = state.activeOwner?.status === "orphaned";
             badges.push({
                 text: orphaned ? "Mounted Tab Stale" : "Mounted Tab",
-                color: orphaned ? CHROME.warningSoft : "#2a3b2f",
-                border: orphaned ? CHROME.warningBorder : "#5a8063",
+                state: orphaned ? "pending" : "running",
             });
         }
         if (state.activeOwner && state.activeOwner.host_mode !== "tab" && state.activeOwner.session_id !== this.controller._editorSessionId) {
-            badges.push({ text: "Owned", color: CHROME.warningSoft, border: CHROME.warningBorder });
+            badges.push({ text: "Owned", state: "pending" });
         }
-        if ((queueCounts.running || 0) > 0) badges.push({ text: `${queueCounts.running} Running`, color: "#264863", border: "#5d8db5" });
-        if ((queueCounts.pending || 0) > 0) badges.push({ text: `${queueCounts.pending} Pending`, color: CHROME.warningSoft, border: CHROME.warningBorder });
-        if (!badges.length && summary) badges.push({ text: "Idle", color: "#223128", border: "#4d6a58" });
+        if ((queueCounts.running || 0) > 0) badges.push({ text: `${queueCounts.running} Running`, state: "running" });
+        if ((queueCounts.pending || 0) > 0) badges.push({ text: `${queueCounts.pending} Pending`, state: "pending" });
+        if (!badges.length && summary) badges.push({ text: "Idle", state: "idle" });
         for (const badge of badges) {
-            const pill = style(document.createElement("span"), `
-                padding: 2px 8px;
-                border-radius: 999px;
-                background: ${badge.color};
-                border: 1px solid ${badge.border};
-                color: #f5f5f5;
-                font-size: 10px;
-                font-weight: 600;
-            `);
-            pill.textContent = badge.text;
-            this._badgeRowEl.appendChild(pill);
+            this._badgeRowEl.appendChild(makeStatusPill(badge.text, badge.state));
         }
 
         this._metaGridEl.innerHTML = "";
@@ -3215,15 +3210,15 @@ export class EditorNodeController {
         scrubber.style.cssText = `
             flex: 1 1 140px;
             min-width: 120px;
-            accent-color: #6fa7d8;
+            accent-color: ${THEME.accent};
         `;
         const frameLabel = style(document.createElement("div"), `
-            color: #a9bccb;
+            color: ${THEME.fg1};
             font-size: 10px;
             min-width: 92px;
             text-align: right;
             white-space: nowrap;
-            font-family: monospace;
+            font-family: ${FONT.mono};
             margin-left: auto;
         `);
         scrubRow.append(scrubber, frameLabel);
@@ -4011,14 +4006,8 @@ export class EditorNodeController {
                 || Number(this.state?.dormantSummary?.fps)
                 || 24
         );
-        const colors = {
-            pending: CHROME.textMuted,
-            running: "#67a6d6",
-            completed: "#68a376",
-            failed: "#c66d76",
-        };
-
         const createQueueRow = (job, options = {}) => {
+            const statusState = statusStateForQueue(job?.status);
             const row = style(document.createElement("div"), `
                 display: grid;
                 grid-template-columns: auto minmax(0, 1fr);
@@ -4035,7 +4024,13 @@ export class EditorNodeController {
                 height: 8px;
                 margin-top: 4px;
                 border-radius: 50%;
-                background: ${colors[job.status] || "#888"};
+                background: ${statusState === "running"
+                    ? THEME.statusRunning
+                    : statusState === "pending"
+                        ? THEME.statusPending
+                        : statusState === "failed"
+                            ? THEME.statusFailed
+                            : THEME.statusIdle};
             `);
 
             const text = style(document.createElement("div"), `
@@ -4067,13 +4062,12 @@ export class EditorNodeController {
             `);
             title.textContent = options.title || job.scene_name || "Scene";
 
-            const status = style(document.createElement("div"), `
-                color: ${CHROME.textMuted};
-                font-size: 10px;
-                flex-shrink: 0;
-                white-space: nowrap;
-            `);
-            status.textContent = formatQueueStatusLabel(job?.status);
+            const status = makeStatusPill(formatQueueStatusLabel(job?.status), statusState, {
+                fontSize: "10px",
+                padding: "1px 7px",
+            });
+            status.style.flexShrink = "0";
+            status.style.whiteSpace = "nowrap";
 
             const selectionSummary = style(document.createElement("div"), `
                 color: ${CHROME.textDim};

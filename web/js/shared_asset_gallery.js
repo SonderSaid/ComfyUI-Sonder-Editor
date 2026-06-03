@@ -14,6 +14,7 @@ import {
     trackedFieldMatchForEntry,
     TRACKED_RENDERERS,
 } from "./tracked_metadata_renderers.js";
+import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_INSPECTOR_SETTINGS = DEFAULT_EDITOR_SETTINGS.inspector;
@@ -49,37 +50,114 @@ function style(el, cssText) {
     return el;
 }
 
-const CHROME = {
-    panelMuted: "#10161d",
-    panel: "#151c24",
-    panelRaised: "#1b2430",
-    panelRaisedHover: "#25313f",
-    border: "#34414d",
-    borderSoft: "#28313b",
-    borderStrong: "#587089",
-    text: "#dbe3ea",
-    textDim: "#90a0af",
-    textMuted: "#748291",
-    accent: "#4a82ad",
-    accentSoft: "#263a4d",
-    accentSoftHover: "#314961",
-    accentBorder: "#6686a3",
-    warningBorder: "#9a7a42",
-    dangerBorder: "#8f5f66",
-};
-
 function inputChromeCss({ minWidth = "0", padding = "6px 8px" } = {}) {
     return `background:${CHROME.panel};border:1px solid ${CHROME.border};border-radius:6px;color:${CHROME.text};padding:${padding};font-size:11px;min-width:${minWidth};box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);`;
 }
 
-function actionButtonCss(variant = "primary") {
+function actionButtonPalette(variant = "primary") {
     const variants = {
-        primary: `border:1px solid ${CHROME.accentBorder};background:${CHROME.accentSoft};color:#fff;`,
-        subtle: `border:1px solid ${CHROME.border};background:${CHROME.panelRaised};color:${CHROME.textDim};`,
-        active: `border:1px solid #7ea8c9;background:${CHROME.accent};color:#fff;`,
-        danger: `border:1px solid ${CHROME.dangerBorder};background:#44292d;color:#efc0c4;`,
+        primary: {
+            base: { border: CHROME.accentBorder, background: CHROME.accentSoft, color: CHROME.text },
+            hover: { border: CHROME.accentHi, background: CHROME.accentSoftHover, color: CHROME.text },
+            pressed: { border: CHROME.accentHi, background: CHROME.accent, color: CHROME.bg },
+        },
+        subtle: {
+            base: { border: CHROME.border, background: CHROME.panelRaised, color: CHROME.textDim },
+            hover: { border: CHROME.borderStrong, background: CHROME.panelRaisedHover, color: CHROME.text },
+            pressed: { border: CHROME.accentBorder, background: CHROME.sceneBtnActive, color: CHROME.text },
+        },
+        active: {
+            base: { border: CHROME.accentHi, background: CHROME.accent, color: CHROME.bg },
+            hover: { border: CHROME.accentHi, background: THEME.accentHi, color: THEME.bg0 },
+            pressed: { border: CHROME.accentBorder, background: THEME.accentLo, color: THEME.fg0 },
+        },
+        danger: {
+            base: { border: CHROME.dangerBorder, background: CHROME.dangerSoft, color: CHROME.dangerText },
+            hover: { border: THEME.statusFailed, background: `${THEME.statusFailed}33`, color: CHROME.text },
+            pressed: { border: THEME.statusFailed, background: `${THEME.statusFailed}44`, color: CHROME.text },
+        },
+        success: {
+            base: { border: `${THEME.statusRunning}88`, background: `${THEME.statusRunning}22`, color: CHROME.text },
+            hover: { border: THEME.statusRunning, background: `${THEME.statusRunning}33`, color: CHROME.text },
+            pressed: { border: THEME.statusRunning, background: `${THEME.statusRunning}44`, color: CHROME.text },
+        },
     };
-    return `padding:6px 10px;border-radius:6px;${variants[variant] || variants.primary}cursor:pointer;font-size:11px;font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,0.04);`;
+    return variants[variant] || variants.primary;
+}
+
+function actionButtonCss(variant = "primary", extraCss = "") {
+    const base = actionButtonPalette(variant).base;
+    return `appearance:none;padding:6px 10px;border-radius:6px;border:1px solid ${base.border};background:${base.background};color:${base.color};cursor:pointer;font-size:11px;font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,0.04);transition:background 140ms ease,border-color 140ms ease,color 140ms ease,opacity 140ms ease;${extraCss}`;
+}
+
+function applyActionButtonState(btn, state = "base") {
+    if (!btn?.style) return;
+    const palette = actionButtonPalette(btn.dataset.sonderActionVariant || "primary");
+    const colors = palette[btn.disabled ? "base" : state] || palette.base;
+    btn.dataset.sonderActionState = btn.disabled ? "base" : state;
+    btn.style.background = colors.background;
+    btn.style.borderColor = colors.border;
+    btn.style.color = colors.color;
+    btn.style.cursor = btn.disabled ? "default" : "pointer";
+}
+
+function bindActionButtonFeedback(btn) {
+    if (!btn || btn._sonderActionFeedbackBound) return btn;
+    btn._sonderActionFeedbackBound = true;
+    btn.addEventListener("mouseenter", () => {
+        btn.dataset.sonderActionHover = "1";
+        applyActionButtonState(btn, "hover");
+    });
+    btn.addEventListener("mouseleave", () => {
+        btn.dataset.sonderActionHover = "0";
+        applyActionButtonState(btn, "base");
+    });
+    btn.addEventListener("mousedown", () => {
+        applyActionButtonState(btn, "pressed");
+    });
+    btn.addEventListener("mouseup", () => {
+        applyActionButtonState(btn, btn.dataset.sonderActionHover === "1" ? "hover" : "base");
+    });
+    btn.addEventListener("focus", () => {
+        btn.style.outline = `1px solid ${THEME.accent}`;
+        btn.style.outlineOffset = "1px";
+    });
+    btn.addEventListener("blur", () => {
+        btn.style.outline = "none";
+        applyActionButtonState(btn, "base");
+    });
+    return btn;
+}
+
+function setActionButtonVariant(btn, variant = "primary", extraCss = "") {
+    if (!btn?.style) return btn;
+    btn.dataset.sonderActionVariant = variant;
+    btn.style.cssText = actionButtonCss(variant, extraCss);
+    bindActionButtonFeedback(btn);
+    applyActionButtonState(btn, btn.dataset.sonderActionHover === "1" ? "hover" : "base");
+    return btn;
+}
+
+function galleryStatusPill(text, state = "idle") {
+    const pill = style(document.createElement("div"), `
+        ${statusPillCss({ state, padding: "3px 6px" })}
+        font-size:9px;
+        font-weight:700;
+        text-transform:uppercase;
+        letter-spacing:0.05em;
+        white-space:nowrap;
+    `);
+    const dot = style(document.createElement("span"), `
+        width:6px;
+        height:6px;
+        border-radius:999px;
+        background:var(--sonder-status-color);
+        flex:0 0 auto;
+    `);
+    const label = document.createElement("span");
+    label.textContent = text;
+    pill.append(dot, label);
+    return pill;
 }
 
 function menuChromeCss(minWidth = 160) {
@@ -633,7 +711,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
     controls.appendChild(sortSelect);
 
-    const makeActionButton = (variant = "primary") => style(document.createElement("button"), actionButtonCss(variant));
+    const makeActionButton = (variant = "primary") => setActionButtonVariant(document.createElement("button"), variant);
 
     const inspectorBtn = makeActionButton("subtle");
     controls.appendChild(inspectorBtn);
@@ -651,7 +729,12 @@ export function mountSharedAssetGallery(container, options = {}) {
     refreshBtn.textContent = "Refresh";
     refreshBtn.addEventListener("click", async () => {
         hideContextMenu();
-        await options.onRefresh?.();
+        setBusyButton(refreshBtn, true, "Refreshing...", "Refresh");
+        try {
+            await options.onRefresh?.();
+        } finally {
+            setBusyButton(refreshBtn, false, "Refreshing...", "Refresh");
+        }
     });
     controls.appendChild(refreshBtn);
 
@@ -788,7 +871,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         sortSelect.value = state.sortMode;
         inspectorBtn.textContent = state.inspectorCollapsed ? "Show Inspector" : "Hide Inspector";
         manageBtn.textContent = state.manageMode ? "Done" : "Manage";
-        manageBtn.style.cssText = actionButtonCss(state.manageMode ? "active" : "subtle");
+        setActionButtonVariant(manageBtn, state.manageMode ? "active" : "subtle");
     }
 
     const unsubscribeSettings = subscribeEditorSettings((settings) => {
@@ -799,6 +882,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         btn.disabled = isBusy;
         btn.textContent = isBusy ? busyLabel : idleLabel;
         btn.style.opacity = isBusy ? "0.75" : "1";
+        applyActionButtonState(btn, "base");
     }
 
     function queueResize() {
@@ -1942,7 +2026,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const deleteBtn = makeActionButton();
             deleteBtn.textContent = activeAssets.length === assets.length ? "Trash" : `Trash ${activeAssets.length}`;
-            deleteBtn.style.cssText = actionButtonCss("danger");
+            setActionButtonVariant(deleteBtn, "danger");
             deleteBtn.disabled = !options.onBulkDeleteAssets;
             deleteBtn.addEventListener("click", async () => {
                 await handleBulkDelete(activeAssets.map((asset) => asset.asset_id));
@@ -1953,7 +2037,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (trashedSelection.length) {
             const restoreBtn = makeActionButton();
             restoreBtn.textContent = trashedSelection.length === assets.length ? "Restore" : `Restore ${trashedSelection.length}`;
-            restoreBtn.style.cssText = `padding:6px 10px;border-radius:6px;border:1px solid #48644f;background:#203427;color:#e5f7e8;cursor:pointer;font-size:11px;font-weight:600;box-shadow:inset 0 1px 0 rgba(255,255,255,0.04);`;
+            setActionButtonVariant(restoreBtn, "success");
             restoreBtn.disabled = !options.onBulkRestoreAssets;
             restoreBtn.addEventListener("click", async () => {
                 await handleBulkRestore(trashedSelection.map((asset) => asset.asset_id));
@@ -1962,7 +2046,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const permanentBtn = makeActionButton();
             permanentBtn.textContent = trashedSelection.length === assets.length ? "Delete Permanently" : `Delete ${trashedSelection.length} Permanently`;
-            permanentBtn.style.cssText = actionButtonCss("danger");
+            setActionButtonVariant(permanentBtn, "danger");
             permanentBtn.disabled = !options.onBulkPermanentDeleteAssets;
             permanentBtn.addEventListener("click", async () => {
                 await handleBulkPermanentDelete(trashedSelection.map((asset) => asset.asset_id));
@@ -1972,7 +2056,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const clearBtn = makeActionButton();
         clearBtn.textContent = "Clear";
-        clearBtn.style.cssText = actionButtonCss("subtle");
+        setActionButtonVariant(clearBtn, "subtle");
         clearBtn.addEventListener("click", () => {
             clearSelection();
         });
@@ -2869,7 +2953,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:4px;`);
         for (const [key, desc] of INSPECT_OVERLAY_SHORTCUTS) {
             const row = style(document.createElement("div"), `display:grid;grid-template-columns:minmax(116px,auto) minmax(0,1fr);gap:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05);`);
-            const keyEl = style(document.createElement("div"), `color:#9fc9ec;font-size:11px;font-family:monospace;white-space:nowrap;`);
+            const keyEl = style(document.createElement("div"), `color:#9fc9ec;font-size:11px;font-family:${FONT.mono};white-space:nowrap;`);
             keyEl.textContent = key;
             const descEl = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;min-width:0;`);
             descEl.textContent = desc;
@@ -3532,7 +3616,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         host.appendChild(content);
 
         if (assetIsMissing(asset)) {
-            const missing = style(document.createElement("div"), `margin:auto;color:#f0b39f;font-size:13px;`);
+            const missing = style(document.createElement("div"), `margin:auto;color:${THEME.statusFailed};font-size:13px;`);
             missing.textContent = "Missing asset preview unavailable.";
             content.appendChild(missing);
             return;
@@ -3863,7 +3947,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 audioA.volume = both ? AUDIO_DUCK_VOLUME : 1;
                 audioB.volume = both ? AUDIO_DUCK_VOLUME : 1;
                 for (const [btn, value] of monitorButtons) {
-                    btn.style.cssText = actionButtonCss(state.overlayState.audioCompareMonitor === value ? "active" : "subtle");
+                    setActionButtonVariant(btn, state.overlayState.audioCompareMonitor === value ? "active" : "subtle");
                 }
             };
             state.overlayState.applyAudioMonitor = applyAudioMonitor;
@@ -4286,7 +4370,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const closeBtn = makeActionButton();
         closeBtn.textContent = "Close";
-        closeBtn.style.cssText = actionButtonCss("subtle");
+        setActionButtonVariant(closeBtn, "subtle");
         closeBtn.addEventListener("click", () => closeInspectOverlay());
         toolbarActions.appendChild(closeBtn);
 
@@ -4372,7 +4456,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const backBtn = makeActionButton();
         backBtn.textContent = "Back";
-        backBtn.style.cssText = actionButtonCss("subtle");
+        setActionButtonVariant(backBtn, "subtle");
         backBtn.addEventListener("click", () => {
             clearUsageView();
             render();
@@ -4393,7 +4477,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         if (state.usageError) {
-            const error = style(document.createElement("div"), `color:#ffb18c;font-size:10px;line-height:1.45;`);
+            const error = style(document.createElement("div"), `color:${THEME.statusFailed};font-size:10px;line-height:1.45;`);
             error.textContent = state.usageError;
             detailPane.appendChild(error);
             queueResize();
@@ -4484,8 +4568,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const deleteBtn = makeActionButton();
             deleteBtn.textContent = activeAssets.length === assets.length ? "Move to Trash" : `Trash ${activeAssets.length} Active`;
-            deleteBtn.style.background = "#392420";
-            deleteBtn.style.borderColor = "#73443b";
+            setActionButtonVariant(deleteBtn, "danger");
             deleteBtn.disabled = !options.onBulkDeleteAssets;
             deleteBtn.addEventListener("click", async () => {
                 await handleBulkDelete(activeAssets.map((asset) => asset.asset_id));
@@ -4496,8 +4579,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (trashedSelection.length) {
             const restoreBtn = makeActionButton();
             restoreBtn.textContent = trashedSelection.length === assets.length ? "Restore Selected" : `Restore ${trashedSelection.length} Trashed`;
-            restoreBtn.style.background = "#203427";
-            restoreBtn.style.borderColor = "#48644f";
+            setActionButtonVariant(restoreBtn, "success");
             restoreBtn.disabled = !options.onBulkRestoreAssets;
             restoreBtn.addEventListener("click", async () => {
                 await handleBulkRestore(trashedSelection.map((asset) => asset.asset_id));
@@ -4506,8 +4588,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const permanentBtn = makeActionButton();
             permanentBtn.textContent = trashedSelection.length === assets.length ? "Delete Permanently" : `Delete ${trashedSelection.length} Permanently`;
-            permanentBtn.style.background = "#4a1c1c";
-            permanentBtn.style.borderColor = "#8a3f3f";
+            setActionButtonVariant(permanentBtn, "danger");
             permanentBtn.disabled = !options.onBulkPermanentDeleteAssets;
             permanentBtn.addEventListener("click", async () => {
                 await handleBulkPermanentDelete(trashedSelection.map((asset) => asset.asset_id));
@@ -4553,32 +4634,28 @@ export function mountSharedAssetGallery(container, options = {}) {
         const title = style(document.createElement("div"), `color:${CHROME.text};font-size:11px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         title.textContent = assetDisplayName(asset);
         const badges = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;flex:0 0 auto;`);
-        const kind = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(143,192,240,0.12);border:1px solid rgba(143,192,240,0.28);color:#9fc8ea;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
+        const kind = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:${THEME.accent}1f;border:1px solid ${THEME.accent}47;color:${THEME.accentHi};font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
         kind.textContent = assetKindLabel(asset.asset_type);
         badges.appendChild(kind);
         if (asset.asset_type === "artifact") {
-            const artifactBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(181,199,116,0.12);border:1px solid rgba(181,199,116,0.3);color:#d7e59f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
+            const artifactBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:${THEME.bg3};border:1px solid ${THEME.line2};color:${THEME.fg1};font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
             artifactBadge.textContent = String(asset.artifact_kind || "other");
             badges.appendChild(artifactBadge);
         }
         const workflowFlag = embeddedWorkflowFlag(asset);
         if (workflowFlag !== null) {
-            const workflowBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:${workflowFlag ? "rgba(120,172,124,0.14)" : "rgba(160,150,126,0.12)"};border:1px solid ${workflowFlag ? "rgba(120,172,124,0.36)" : "rgba(177,166,139,0.3)"};color:${workflowFlag ? "#b7e4b4" : "#cfc4a5"};font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
+            const workflowBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:${workflowFlag ? `${THEME.statusRunning}24` : `${THEME.statusIdle}1f`};border:1px solid ${workflowFlag ? `${THEME.statusRunning}5c` : `${THEME.statusIdle}4d`};color:${workflowFlag ? THEME.fg1 : THEME.fg2};font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
             workflowBadge.textContent = workflowFlag ? "Workflow" : "No Workflow";
             badges.appendChild(workflowBadge);
         }
         if (isTrashed(asset)) {
-            const trashedBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(184,96,72,0.18);border:1px solid rgba(214,132,98,0.45);color:#f0b39f;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
-            trashedBadge.textContent = "Trashed";
-            badges.appendChild(trashedBadge);
+            badges.appendChild(galleryStatusPill("Trashed", "pending"));
         }
         if (assetIsMissing(asset)) {
-            const missingBadge = style(document.createElement("div"), `padding:3px 6px;border-radius:999px;background:rgba(204,92,48,0.14);border:1px solid rgba(255,158,112,0.35);color:#ffb18c;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;white-space:nowrap;`);
-            missingBadge.textContent = "Missing";
-            badges.appendChild(missingBadge);
+            badges.appendChild(galleryStatusPill("Missing", "failed"));
         }
         titleRow.append(title, badges);
-        const pathLine = style(document.createElement("div"), `color:${assetIsMissing(asset) ? "#ffb18c" : "#7f8b96"};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const pathLine = style(document.createElement("div"), `color:${assetIsMissing(asset) ? THEME.statusFailed : THEME.fg2};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         pathLine.textContent = asset.path || "-";
 
         const previewSurface = style(document.createElement("div"), `min-height:140px;border-radius:8px;border:1px solid ${CHROME.border};background:${CHROME.panelMuted};overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;`);
@@ -4586,9 +4663,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         const projectDir = currentProjectDir();
         if (assetIsMissing(asset)) {
             const missingWrap = style(document.createElement("div"), `padding:18px;text-align:center;display:flex;flex-direction:column;gap:6px;align-items:center;`);
-            const missingTitle = style(document.createElement("div"), `color:#ffb18c;font-size:11px;font-weight:700;`);
+            const missingTitle = style(document.createElement("div"), `color:${THEME.statusFailed};font-size:11px;font-weight:700;`);
             missingTitle.textContent = "Missing Asset";
-            const missingText = style(document.createElement("div"), `color:#d4a690;font-size:10px;line-height:1.45;max-width:280px;`);
+            const missingText = style(document.createElement("div"), `color:${THEME.fg1};font-size:10px;line-height:1.45;max-width:280px;`);
             missingText.textContent = "The source file is gone, but this asset entry still exists. Relink it to restore existing references, or delete the asset to remove it from the project.";
             missingWrap.append(missingTitle, missingText);
             previewSurface.appendChild(missingWrap);
@@ -4632,7 +4709,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             previewExtras.push(scrubBar.el);
         } else if (asset.asset_type === "artifact") {
             const artifactWrap = style(document.createElement("div"), `width:100%;padding:16px;display:flex;flex-direction:column;gap:10px;align-items:flex-start;box-sizing:border-box;`);
-            const artifactLabel = style(document.createElement("div"), `color:#d7e59f;font-size:10px;text-transform:uppercase;letter-spacing:0.08em;`);
+            const artifactLabel = style(document.createElement("div"), `color:${THEME.fg1};font-size:10px;text-transform:uppercase;letter-spacing:0.08em;`);
             artifactLabel.textContent = "Artifact Metadata";
             const artifactIntro = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;line-height:1.5;max-width:340px;`);
             artifactIntro.textContent = "Artifacts stay inspectable and searchable, but they do not render a media preview in the gallery.";
@@ -4700,13 +4777,12 @@ export function mountSharedAssetGallery(container, options = {}) {
             detailSections.push(renderGenerationSection(asset));
         }
         if (isTrashed(asset)) {
-            const trashedNote = style(document.createElement("div"), `padding:8px;border-radius:6px;background:rgba(184,96,72,0.12);border:1px solid rgba(214,132,98,0.3);color:#d8b4aa;font-size:10px;line-height:1.45;`);
+            const trashedNote = style(document.createElement("div"), `padding:8px;border-radius:6px;background:${THEME.bg2};border:1px solid ${THEME.statusPending}55;color:${THEME.fg1};font-size:10px;line-height:1.45;`);
             trashedNote.textContent = "Trashed assets stay out of the normal gallery but keep their references recoverable until they are permanently deleted.";
             const trashActions = style(document.createElement("div"), `display:flex;flex-wrap:wrap;gap:6px;align-items:center;`);
             const restoreBtn = makeActionButton();
             restoreBtn.textContent = "Restore";
-            restoreBtn.style.background = "#203427";
-            restoreBtn.style.borderColor = "#48644f";
+            setActionButtonVariant(restoreBtn, "success");
             restoreBtn.disabled = !options.onRestoreAsset;
             restoreBtn.addEventListener("click", async () => {
                 await handleAssetRestore(asset);
@@ -4715,8 +4791,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const permanentBtn = makeActionButton();
             permanentBtn.textContent = "Delete Permanently";
-            permanentBtn.style.background = "#4a1c1c";
-            permanentBtn.style.borderColor = "#8a3f3f";
+            setActionButtonVariant(permanentBtn, "danger");
             permanentBtn.disabled = !options.onPermanentDeleteAsset;
             permanentBtn.addEventListener("click", async () => {
                 await handleAssetPermanentDelete(asset);
@@ -4752,7 +4827,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const replaceBtn = makeActionButton();
             replaceBtn.textContent = assetIsMissing(asset) ? "Relink" : "Replace File";
-            replaceBtn.style.cssText = actionButtonCss("subtle");
+            setActionButtonVariant(replaceBtn, "subtle");
             replaceBtn.addEventListener("click", async () => {
                 await beginAssetReplace(asset);
             });
@@ -4760,7 +4835,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
             const deleteBtn = makeActionButton();
             deleteBtn.textContent = "Move to Trash";
-            deleteBtn.style.cssText = actionButtonCss("danger");
+            setActionButtonVariant(deleteBtn, "danger");
             deleteBtn.addEventListener("click", async () => {
                 await handleAssetDelete(asset);
             });
@@ -5065,7 +5140,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function renderFolderHeader(folderName, assetCount) {
         const normalized = normalizeFolderName(folderName);
         const collapsed = isFolderCollapsed(normalized);
-        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${normalized ? "#1a1a2e" : "#1f2530"};color:#8fc0f0;font-size:10px;font-weight:600;border:1px solid transparent;`);
+        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${normalized ? THEME.bg2 : THEME.bg1};color:${THEME.fg1};font-size:10px;font-weight:600;border:1px solid transparent;`);
         header.dataset.folderDrop = normalized;
         header.dataset.folderHeader = normalized || "__root__";
         header.title = state.manageMode
@@ -5073,7 +5148,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             : (normalized ? "Drop files here to import into this folder." : "Root folder");
 
         const left = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;min-width:0;`);
-        const toggle = style(document.createElement("button"), `width:18px;height:18px;border-radius:4px;border:1px solid #34414d;background:#182330;color:#9fc8ea;cursor:pointer;font-size:10px;line-height:1;padding:0;flex:0 0 auto;`);
+        const toggle = style(document.createElement("button"), `width:18px;height:18px;border-radius:4px;border:1px solid ${THEME.line2};background:${THEME.bg2};color:${THEME.fg1};cursor:pointer;font-size:10px;line-height:1;padding:0;flex:0 0 auto;`);
         toggle.type = "button";
         toggle.textContent = collapsed ? ">" : "v";
         toggle.title = collapsed ? `Expand ${normalized || "root"}` : `Collapse ${normalized || "root"}`;
@@ -5093,7 +5168,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
         left.appendChild(label);
 
-        const count = style(document.createElement("div"), `color:#9fc8ea;font-size:10px;flex:0 0 auto;`);
+        const count = style(document.createElement("div"), `color:${THEME.fg2};font-size:10px;flex:0 0 auto;`);
         count.textContent = String(assetCount);
         header.append(left, count);
         header.addEventListener("contextmenu", (event) => {
@@ -5141,11 +5216,11 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function renderTrashFolderHeader(assetCount) {
         const collapsed = isFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY);
-        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:#2a1814;color:#f0b39f;font-size:10px;font-weight:600;border:1px solid rgba(214,132,98,0.22);`);
+        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${THEME.bg2};color:${THEME.fg1};font-size:10px;font-weight:600;border:1px solid ${THEME.statusPending}55;`);
         header.dataset.folderHeader = TRASH_FOLDER_COLLAPSE_KEY;
 
         const left = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;min-width:0;`);
-        const toggle = style(document.createElement("button"), `width:18px;height:18px;border-radius:4px;border:1px solid #73443b;background:#3a211d;color:#f3c9bb;cursor:pointer;font-size:10px;line-height:1;padding:0;flex:0 0 auto;`);
+        const toggle = style(document.createElement("button"), `width:18px;height:18px;border-radius:4px;border:1px solid ${THEME.statusPending}55;background:${THEME.bg3};color:${THEME.fg1};cursor:pointer;font-size:10px;line-height:1;padding:0;flex:0 0 auto;`);
         toggle.type = "button";
         toggle.textContent = collapsed ? ">" : "v";
         toggle.addEventListener("click", (event) => {
@@ -5161,7 +5236,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
         left.append(toggle, label);
 
-        const count = style(document.createElement("div"), `color:#f0b39f;font-size:10px;flex:0 0 auto;`);
+        const count = style(document.createElement("div"), `color:${THEME.statusPending};font-size:10px;flex:0 0 auto;`);
         count.textContent = String(assetCount);
         header.append(left, count);
         header.addEventListener("contextmenu", (event) => {
@@ -5229,7 +5304,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         ];
         for (const [type, label] of tabs) {
             const isActive = state.type === type;
-            const tab = style(document.createElement("button"), `${actionButtonCss(isActive ? "active" : "subtle")} padding:5px 8px;font-size:10px;`);
+            const tab = setActionButtonVariant(document.createElement("button"), isActive ? "active" : "subtle", "padding:5px 8px;font-size:10px;");
             tab.textContent = label;
             tab.addEventListener("click", () => {
                 state.type = type;
@@ -5269,14 +5344,14 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const isFocused = state.focusedAssetId === asset.asset_id;
                 const isMissing = assetIsMissing(asset);
                 const borderColor = isSelected
-                    ? (isMissing ? "#c97a59" : (isPrimary ? "#8fbbe5" : "#6f8ea8"))
-                    : (isMissing ? "#8d5c4b" : (isFocused ? "#7f8b96" : "#373737"));
+                    ? (isMissing ? THEME.statusFailed : (isPrimary ? CHROME.accentHi : CHROME.accentBorder))
+                    : (isMissing ? `${THEME.statusFailed}66` : (isFocused ? THEME.fg2 : CHROME.borderSoft));
                 const background = isSelected
-                    ? (isMissing ? "rgba(133,82,58,0.24)" : "rgba(75,105,135,0.18)")
-                    : (isMissing ? "rgba(96,54,39,0.18)" : (isFocused ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.03)"));
+                    ? (isMissing ? `${THEME.statusFailed}22` : CHROME.accentSoft)
+                    : (isMissing ? `${THEME.statusFailed}18` : (isFocused ? CHROME.galleryItemHover : CHROME.galleryItem));
                 const focusRing = isPrimary
-                    ? "box-shadow:inset 0 0 0 1px rgba(143,192,240,0.45);"
-                    : (isFocused ? "box-shadow:inset 0 0 0 1px rgba(143,192,240,0.25);" : "");
+                    ? `box-shadow:inset 0 0 0 1px ${THEME.accent}73;`
+                    : (isFocused ? `box-shadow:inset 0 0 0 1px ${THEME.accent}40;` : "");
                 const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
                 row.dataset.assetRow = asset.asset_id;
                 row.draggable = state.manageMode ? !!options.onBulkMoveAssets : true;
@@ -5347,7 +5422,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     row.appendChild(checkboxWrap);
                 }
 
-                const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${isMissing ? "#211714" : "#161616"};border:1px solid ${isMissing ? "#6f4a3d" : "#2e2e2e"};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? "#ffb18c" : "#75818c"};font-size:${thumbConfig.metaFont}px;`);
+                const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${isMissing ? THEME.bg2 : THEME.bg0};border:1px solid ${isMissing ? `${THEME.statusFailed}66` : THEME.line2};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? THEME.statusFailed : THEME.fg2};font-size:${thumbConfig.metaFont}px;`);
                 if (isMissing) {
                     thumb.textContent = "Missing";
                 } else if (asset.has_thumbnail) {
@@ -5361,10 +5436,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
 
                 const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
-                const name = style(document.createElement("div"), `color:#ececec;font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                const name = style(document.createElement("div"), `color:${THEME.fg0};font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                 name.textContent = assetDisplayName(asset);
-                if (isMissing) name.style.color = "#ffd0bc";
-                const meta = style(document.createElement("div"), `color:#8ea0af;font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                if (isMissing) name.style.color = THEME.statusFailed;
+                const meta = style(document.createElement("div"), `color:${THEME.fg2};font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                 let metaLabel = asset.asset_type === "artifact"
                     ? `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${String(asset.artifact_kind || "other")} | ${assetExtension(asset) ? `.${assetExtension(asset)}` : "no ext"}`
                     : `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
@@ -5388,14 +5463,14 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const isPrimary = state.selectedAssetId === asset.asset_id;
                     const isFocused = state.focusedAssetId === asset.asset_id;
                     const borderColor = isSelected
-                        ? (isPrimary ? "#d39b86" : "#9f6d5f")
-                        : (isFocused ? "#8e6f67" : "#5a433c");
+                        ? (isPrimary ? THEME.statusPending : `${THEME.statusPending}aa`)
+                        : (isFocused ? `${THEME.statusPending}88` : `${THEME.statusPending}55`);
                     const background = isSelected
-                        ? "rgba(123,73,58,0.26)"
-                        : (isFocused ? "rgba(123,73,58,0.17)" : "rgba(90,52,41,0.14)");
+                        ? `${THEME.statusPending}26`
+                        : (isFocused ? `${THEME.statusPending}18` : `${THEME.statusPending}12`);
                     const focusRing = isPrimary
-                        ? "box-shadow:inset 0 0 0 1px rgba(240,179,159,0.42);"
-                        : (isFocused ? "box-shadow:inset 0 0 0 1px rgba(240,179,159,0.2);" : "");
+                        ? `box-shadow:inset 0 0 0 1px ${THEME.statusPending}6b;`
+                        : (isFocused ? `box-shadow:inset 0 0 0 1px ${THEME.statusPending}33;` : "");
                     const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;opacity:0.92;${focusRing}`);
                     row.dataset.assetRow = asset.asset_id;
                     row.title = "Trashed asset. Restore to bring it back to its previous folder.";
@@ -5424,7 +5499,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                         row.appendChild(checkboxWrap);
                     }
 
-                    const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:#1a1412;border:1px solid #6b4d43;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#f0b39f;font-size:${thumbConfig.metaFont}px;`);
+                    const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${THEME.bg2};border:1px solid ${THEME.statusPending}55;display:flex;align-items:center;justify-content:center;overflow:hidden;color:${THEME.statusPending};font-size:${thumbConfig.metaFont}px;`);
                     if (asset.has_thumbnail) {
                         const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;opacity:0.74;filter:saturate(0.6);`);
                         img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
@@ -5436,9 +5511,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                     }
 
                     const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
-                    const name = style(document.createElement("div"), `color:#f0d6cc;font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                    const name = style(document.createElement("div"), `color:${THEME.fg1};font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                     name.textContent = assetDisplayName(asset);
-                    const meta = style(document.createElement("div"), `color:#c0a49a;font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                    const meta = style(document.createElement("div"), `color:${THEME.fg2};font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
                     const workflowMeta = workflowStatusMeta(asset);
                     meta.textContent = `trashed | ${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatDate(asset.trashed_at)}${workflowMeta ? ` | ${workflowMeta}` : ""}`;
                     text.append(name, meta);
@@ -5449,7 +5524,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         if (!renderedAnything) {
-            const empty = style(document.createElement("div"), `padding:10px;border-radius:6px;background:rgba(255,255,255,0.04);color:#9aa6b2;font-size:10px;`);
+            const empty = style(document.createElement("div"), `padding:10px;border-radius:6px;background:${THEME.bg2};color:${THEME.fg2};font-size:10px;`);
             empty.textContent = data.assets.length ? "No assets match the current filter." : "No assets in this project yet. Drag files here or use Import.";
             listScroller.appendChild(empty);
         }

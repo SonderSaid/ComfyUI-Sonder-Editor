@@ -16,6 +16,9 @@ import {
     getEditorSettings,
     resolveFrameConstraintForTemplate,
 } from "./editor_settings.js";
+import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
+
+injectSonderFontFaces();
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -120,9 +123,9 @@ function showSonderToast(message, duration = 2600) {
         toast.id = "sonder-global-toast";
         toast.style.cssText = `
             position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
-            z-index:100000;padding:8px 12px;border-radius:8px;
-            background:rgba(20,24,30,0.94);border:1px solid rgba(255,255,255,0.16);
-            color:#f0f4f8;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,0.35);
+            z-index:100000;padding:8px 12px;border-radius:6px;
+            background:${THEME.bg2};border:1px solid ${THEME.line2};
+            color:${THEME.fg0};font-family:${FONT.sans};font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,0.35);
             opacity:0;transition:opacity 140ms ease;pointer-events:none;
         `;
         doc.body.appendChild(toast);
@@ -404,7 +407,8 @@ function installSaveVideoPresetUi(node) {
         width: 100%;
         min-height: 30px;
         padding: 5px 8px;
-        color: #b8c2cc;
+        color: ${THEME.fg1};
+        font-family: ${FONT.sans};
         font-size: 10px;
         line-height: 1.35;
         white-space: normal;
@@ -785,7 +789,8 @@ function installBridgeFolderPicker(node) {
     `);
 
     const label = style(document.createElement("div"), `
-        color:#cfd7df;
+        color:${THEME.fg0};
+        font-family:${FONT.sans};
         font-size:10px;
         font-weight:600;
         line-height:1.2;
@@ -795,12 +800,8 @@ function installBridgeFolderPicker(node) {
     const input = style(document.createElement("input"), `
         width:100%;
         box-sizing:border-box;
-        padding:4px 6px;
-        border-radius:6px;
-        border:1px solid rgba(126, 168, 201, 0.35);
-        background:rgba(14, 19, 25, 0.92);
-        color:#e5edf5;
-        font-size:11px;
+        ${chromeInputCss({ padding: "4px 6px", fontSize: "11px" })}
+        background:${THEME.bg2};
         outline:none;
     `);
     const datalist = document.createElement("datalist");
@@ -808,7 +809,8 @@ function installBridgeFolderPicker(node) {
     input.setAttribute("list", datalist.id);
 
     const help = style(document.createElement("div"), `
-        color:#7f8d9b;
+        color:${THEME.fg2};
+        font-family:${FONT.sans};
         font-size:10px;
         line-height:1.25;
     `);

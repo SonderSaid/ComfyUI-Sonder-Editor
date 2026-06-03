@@ -1,6 +1,8 @@
 import { installComfyApiShim } from "./comfy_api_shim.js";
+import { FONT, THEME, injectSonderFontFaces, statusPillCss } from "./editor_theme.js";
 
 installComfyApiShim();
+injectSonderFontFaces();
 
 const { api } = window.comfyAPI.api;
 
@@ -81,17 +83,39 @@ function makeStatusPill() {
         right: 12px;
         top: 10px;
         z-index: 10020;
-        padding: 4px 8px;
-        border-radius: 6px;
-        background: rgba(21, 28, 36, 0.92);
-        border: 1px solid rgba(88, 112, 137, 0.75);
-        color: #90a0af;
-        font: 11px "Segoe UI", Arial, sans-serif;
+        ${statusPillCss({ state: "idle", padding: "4px 8px" })}
+        font-size: 11px;
         pointer-events: none;
     `;
-    pill.textContent = "Connecting";
+    const dot = document.createElement("span");
+    dot.style.cssText = `
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: var(--sonder-status-color);
+        flex: 0 0 auto;
+    `;
+    const label = document.createElement("span");
+    label.textContent = "Connecting";
+    pill._sonderLabel = label;
+    pill.append(dot, label);
     document.body.appendChild(pill);
     return pill;
+}
+
+function setStatusPillState(pill, label, state = "idle") {
+    const color = {
+        running: THEME.statusRunning,
+        pending: THEME.statusPending,
+        failed: THEME.statusFailed,
+        idle: THEME.statusIdle,
+    }[state] || THEME.statusIdle;
+    if (pill?._sonderLabel) {
+        pill._sonderLabel.textContent = label;
+    } else if (pill) {
+        pill.textContent = label;
+    }
+    pill?.style?.setProperty?.("--sonder-status-color", color);
 }
 
 function attachStatusPillOffset(pill) {
@@ -337,9 +361,9 @@ async function main() {
         justify-content: center;
         flex-direction: column;
         gap: 8px;
-        background: rgba(15, 20, 26, 0.72);
-        color: #f0c48b;
-        font: 13px "Segoe UI", Arial, sans-serif;
+        background: ${THEME.bg0}cc;
+        color: ${THEME.statusPending};
+        font: 13px ${FONT.sans};
         pointer-events: auto;
     `;
     const blockerMessage = document.createElement("div");
@@ -347,7 +371,7 @@ async function main() {
     const blockerDebug = document.createElement("div");
     blockerDebug.style.cssText = `
         max-width: min(720px, 80vw);
-        color: #90a0af;
+        color: ${THEME.fg2};
         font-size: 11px;
         line-height: 1.4;
         text-align: center;
@@ -413,25 +437,25 @@ async function main() {
     const updatePill = (state = "") => {
         if (state) transportState = state;
         let label = "Canvas connected";
-        let color = "#bfe5c8";
+        let pillState = "running";
         if (transportState === "reconnecting" || transportState === "closed") {
             label = "Reconnecting";
-            color = "#f0c48b";
+            pillState = "pending";
         } else if (!host.canvasHostConnected) {
             label = "Canvas not connected";
-            color = "#f0c48b";
+            pillState = "pending";
         } else if (host.sessionStatus === "orphaned") {
             label = "Reconnecting session";
-            color = "#f0c48b";
+            pillState = "pending";
         } else if (host.sessionStatus === "released") {
             label = "Session released";
-            color = "#ff9f9f";
+            pillState = "failed";
         } else if (host.sessionStatus === "reconnecting") {
             label = "Reconnecting session";
-            color = "#f0c48b";
+            pillState = "pending";
         } else if (host.sessionStatus !== "active") {
             label = "Session not active";
-            color = "#f0c48b";
+            pillState = "pending";
         }
         const signature = `${host.canvasHostConnected ? "1" : "0"}|${host.sessionStatus || ""}|${transportState}|${label}`;
         const changed = signature !== host.lastPillSignature;
@@ -445,8 +469,7 @@ async function main() {
         });
         if (!changed) return;
         host.lastPillSignature = signature;
-        statusPill.textContent = label;
-        statusPill.style.color = color;
+        setStatusPillState(statusPill, label, pillState);
         statusPillOffset.refresh();
         updateBlocker();
     };

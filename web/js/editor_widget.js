@@ -135,6 +135,20 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
+    EDITOR_COLORS as COLORS,
+    FONT,
+    LANE_PALETTE,
+    lightenColor,
+    scaleColor,
+} from "./editor_theme.js";
+import {
+    buildEditorSceneBar,
+    buildEditorToolbar,
+    queueChromeBadges,
+    updateEditorToolbar,
+    updateQueueChromeStatus,
+} from "./editor_top_chrome.js";
+import {
     _debugListConsumers as debugKeyboardConsumers,
     isKeyboardDebugEnabled,
     register as registerKeyboardConsumer,
@@ -314,68 +328,6 @@ const TRACK_TYPE = { VIDEO: "video", AUDIO: "audio", MOTION_DRIVER: "motion_driv
 const TRACK_COLLAPSED_HEIGHT = 8; // Height when a track is collapsed
 const LABEL_WIDTH = 55; // px reserved for track labels (node mode)
 const LABEL_WIDTH_FS = 70; // px reserved for track labels (fullscreen)
-const LANE_PALETTE = [
-    "#3a6ea5",  // Blue
-    "#6a8e3e",  // Green
-    "#a05a2c",  // Orange
-    "#7e4a8a",  // Purple
-    "#8a6b3e",  // Gold
-    "#3a8a7a",  // Teal
-];
-const COLORS = {
-    bg: "#121820",
-    panelMuted: "#10161d",
-    panel: "#151c24",
-    panelRaised: "#1b2430",
-    panelRaisedHover: "#25313f",
-    ruler: "#25303c",
-    rulerText: "#8694a3",
-    rulerTick: "#54616f",
-    track: "#202934",
-    trackBorder: "#33404d",
-    clip: "#3a7ca5",
-    clipSelected: "#5aacd5",
-    motionDriver: "#e8a030",
-    motionDriverSelected: "#ffcc44",
-    audioClip: "#5a8a5a",
-    audioClipSelected: "#7aba7a",
-    guide: "#e8a030",
-    guideSelected: "#ffcc44",
-    selection: "rgba(100, 180, 255, 0.14)",
-    selectionBorder: "rgba(100, 180, 255, 0.58)",
-    selectionContext: "rgba(100, 180, 255, 0.07)",
-    selectionContextBorder: "rgba(100, 180, 255, 0.24)",
-    maskOffset: "rgba(255, 190, 80, 0.11)",
-    maskOffsetBorder: "rgba(255, 190, 80, 0.34)",
-    playhead: "#ff4444",
-    promptSection: "rgba(180, 120, 255, 0.2)",
-    promptBorder: "rgba(180, 120, 255, 0.5)",
-    galleryBg: "#171e26",
-    galleryItem: "#202934",
-    galleryItemHover: "#2a3644",
-    galleryItemBorder: "#3a4a5b",
-    galleryText: "#d6dde5",
-    galleryLabel: "#8795a3",
-    sceneBar: "#171e26",
-    sceneBtn: "#243342",
-    sceneBtnHover: "#304456",
-    sceneBtnActive: "#4a82ad",
-    text: "#dbe3ea",
-    textDim: "#90a0af",
-    textMuted: "#748291",
-    border: "#34414d",
-    borderSoft: "#28313b",
-    borderStrong: "#587089",
-    accentSoft: "#263a4d",
-    accentSoftHover: "#314961",
-    accentBorder: "#6686a3",
-    warningSoft: "#45361f",
-    warningBorder: "#9a7a42",
-    warningText: "#efd79f",
-    dangerSoft: "#44292d",
-    dangerBorder: "#8f5f66",
-    dangerText: "#efc0c4",
-};
 
 const BUTTON_VARIANTS = {
     muted: {
@@ -485,7 +437,7 @@ function chromeMenuCss(minWidth = 140) {
     `;
 }
 
-function chromeOverlayPanelCss({ width = "90%", maxWidth = "520px", maxHeight = "80vh", padding = "20px 28px", fontFamily = "sans-serif" } = {}) {
+function chromeOverlayPanelCss({ width = "90%", maxWidth = "520px", maxHeight = "80vh", padding = "20px 28px", fontFamily = FONT.sans } = {}) {
     return `
         background: ${COLORS.panel};
         border: 1px solid ${COLORS.borderStrong};
@@ -500,26 +452,6 @@ function chromeOverlayPanelCss({ width = "90%", maxWidth = "520px", maxHeight = 
         font-size: 12px;
         box-shadow: 0 24px 60px rgba(0,0,0,0.46);
     `;
-}
-
-function lightenColor(hex, amount) {
-    if (typeof hex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
-    const mix = Math.max(0, Math.min(1, amount));
-    const channel = (offset) => {
-        const value = parseInt(hex.slice(offset, offset + 2), 16);
-        return Math.round(value + (255 - value) * mix);
-    };
-    return `#${channel(1).toString(16).padStart(2, "0")}${channel(3).toString(16).padStart(2, "0")}${channel(5).toString(16).padStart(2, "0")}`;
-}
-
-function scaleColor(hex, factor) {
-    if (typeof hex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
-    const scale = Math.max(0.2, Math.min(2.0, factor));
-    const channel = (offset) => {
-        const value = parseInt(hex.slice(offset, offset + 2), 16);
-        return Math.round(Math.max(0, Math.min(255, value * scale)));
-    };
-    return `#${channel(1).toString(16).padStart(2, "0")}${channel(3).toString(16).padStart(2, "0")}${channel(5).toString(16).padStart(2, "0")}`;
 }
 
 // ── Editor Widget Class ────────────────────────────────────────────────
@@ -860,7 +792,7 @@ export class EditorWidget {
         this.container.style.cssText = `
             width: 100%; display: flex; flex-direction: column;
             padding: 4px 8px;
-            font-family: 'Segoe UI', Arial, sans-serif; font-size: 11px;
+            font-family: ${FONT.sans}; font-size: 11px;
             color: ${COLORS.text}; user-select: none;
             box-sizing: border-box;
             background: linear-gradient(180deg, ${COLORS.panel} 0%, ${COLORS.panelMuted} 100%);
@@ -891,559 +823,24 @@ export class EditorWidget {
     }
 
     _buildSceneBar() {
-        const bar = document.createElement("div");
-        bar.style.cssText = `
-            display: flex; align-items: center; gap: 4px;
-            padding: 4px 6px; background: ${COLORS.sceneBar};
-            border-bottom: 1px solid ${COLORS.border}; min-height: ${SCENE_BAR_HEIGHT}px;
-        `;
-
-        // Prev scene
-        const prevBtn = this._makeBtn("◀", "Previous scene");
-        prevBtn.addEventListener("click", () => this._cycleScene(-1));
-
-        // Scene label
-        this.sceneLabel = document.createElement("span");
-        this.sceneLabel.style.cssText = `
-            flex: 1; text-align: center; font-size: 12px; font-weight: 600;
-            color: ${COLORS.text}; overflow: hidden; text-overflow: ellipsis;
-            white-space: nowrap; cursor: pointer;
-        `;
-        this.sceneLabel.textContent = "No Scene";
-        this.sceneLabel.title = "Double-click to rename · Right-click for options";
-        this.sceneLabel.addEventListener("dblclick", () => this._renameScene());
-        this.sceneLabel.addEventListener("contextmenu", (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!this.activeScene) return;
-
-            const menuItems = [
-                { label: "Rename Scene", action: () => this._renameScene() },
-                { label: "Duplicate Scene", action: () => this._duplicateScene() },
-                { label: "Delete Scene", action: () => this._deleteScene(), danger: true },
-            ];
-            this._showContextMenu(e.clientX, e.clientY, menuItems);
-        });
-
-        // Next scene
-        const nextBtn = this._makeBtn("▶", "Next scene");
-        nextBtn.addEventListener("click", () => this._cycleScene(1));
-
-        // Add scene
-        const addBtn = this._makeBtn("+", "Create new scene");
-        setButtonVariant(addBtn, "primary");
-        addBtn.dataset.sonderHoverVariant = "primary";
-        addBtn.addEventListener("click", () => this._createScene());
-
-        // Duration input
-        this._durLabel = document.createElement("span");
-        this._durLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 8px;`;
-        this._durLabel.textContent = "Frames:";
-
-        this.durationInput = document.createElement("input");
-        this.durationInput.type = "number";
-        this.durationInput.min = 1;
-        this.durationInput.max = 99999;
-        this.durationInput.value = this.totalFrames;
-        this.durationInput.style.cssText = `
-            ${chromeInputCss({ width: "55px", fontSize: "11px", padding: "2px 4px" })}
-        `;
-        this.durationInput.addEventListener("change", () => {
-            if (this._timecodeMode === "timecode") {
-                const sec = parseFloat(this.durationInput.value) || 0;
-                this.totalFrames = Math.max(1, this._secondsToFrames(sec));
-            } else {
-                this.totalFrames = Math.max(1, parseInt(this.durationInput.value) || 200);
-            }
-            this.totalFrames = this._snapSceneDurationToTemplate(this.totalFrames);
-            this._refreshDurationInput();
-            if (this.activeScene) {
-                this._updateSceneDuration(this.totalFrames);
-            }
-            this._renderTimeline();
-        });
-
-        const ctxLabel = document.createElement("span");
-        ctxLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
-        ctxLabel.textContent = "Ctx:";
-
-        const ctxInputStyle = `
-            ${chromeInputCss({ width: "40px", fontSize: "10px", padding: "2px 3px" })}
-        `;
-
-        const preCtxLabel = document.createElement("span");
-        preCtxLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
-        preCtxLabel.textContent = "Pre";
-
-        this._preContextInput = document.createElement("input");
-        this._preContextInput.type = "number";
-        this._preContextInput.min = 0;
-        this._preContextInput.max = 256;
-        this._preContextInput.step = 1;
-        this._preContextInput.value = 0;
-        this._preContextInput.title = "Frames to include before the selected generation range";
-        this._preContextInput.style.cssText = ctxInputStyle;
-        this._preContextInput.addEventListener("change", () => this._updateContextFrameWidgets());
-
-        const postCtxLabel = document.createElement("span");
-        postCtxLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
-        postCtxLabel.textContent = "Post";
-
-        this._postContextInput = document.createElement("input");
-        this._postContextInput.type = "number";
-        this._postContextInput.min = 0;
-        this._postContextInput.max = 256;
-        this._postContextInput.step = 1;
-        this._postContextInput.value = 0;
-        this._postContextInput.title = "Frames to include after the selected generation range";
-        this._postContextInput.style.cssText = ctxInputStyle;
-        this._postContextInput.addEventListener("change", () => this._updateContextFrameWidgets());
-
-        const maskLabel = document.createElement("span");
-        maskLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 4px;`;
-        maskLabel.textContent = "Mask Offset:";
-
-        const maskPreLabel = document.createElement("span");
-        maskPreLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
-        maskPreLabel.textContent = "-";
-
-        this._maskPreOffsetInput = document.createElement("input");
-        this._maskPreOffsetInput.type = "number";
-        this._maskPreOffsetInput.min = 0;
-        this._maskPreOffsetInput.max = 256;
-        this._maskPreOffsetInput.step = 1;
-        this._maskPreOffsetInput.value = 0;
-        this._maskPreOffsetInput.title = "Extra pre-context frames excluded from denoise mask start";
-        this._maskPreOffsetInput.style.cssText = ctxInputStyle;
-        this._maskPreOffsetInput.addEventListener("change", () => this._updateContextFrameWidgets());
-
-        const maskPostLabel = document.createElement("span");
-        maskPostLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
-        maskPostLabel.textContent = "+";
-
-        this._maskPostOffsetInput = document.createElement("input");
-        this._maskPostOffsetInput.type = "number";
-        this._maskPostOffsetInput.min = 0;
-        this._maskPostOffsetInput.max = 256;
-        this._maskPostOffsetInput.step = 1;
-        this._maskPostOffsetInput.value = 0;
-        this._maskPostOffsetInput.title = "Extra post-context frames included in denoise mask end";
-        this._maskPostOffsetInput.style.cssText = ctxInputStyle;
-        this._maskPostOffsetInput.addEventListener("change", () => this._updateContextFrameWidgets());
-
-        // Resolution inputs
-        const resLabel = document.createElement("span");
-        resLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
-        resLabel.textContent = "Res:";
-
-        const inputStyle = chromeInputCss({ width: "48px", fontSize: "10px", padding: "2px 3px" });
-
-        this._resWInput = document.createElement("input");
-        this._resWInput.type = "number"; this._resWInput.min = 0; this._resWInput.max = 4096; this._resWInput.step = 8;
-        this._resWInput.placeholder = "W";
-        this._resWInput.style.cssText = inputStyle;
-        this._resWInput.addEventListener("change", () => this._onResolutionChange("w"));
-
-        const xLabel = document.createElement("span");
-        xLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
-        xLabel.textContent = "x";
-
-        this._resHInput = document.createElement("input");
-        this._resHInput.type = "number"; this._resHInput.min = 0; this._resHInput.max = 4096; this._resHInput.step = 8;
-        this._resHInput.placeholder = "H";
-        this._resHInput.style.cssText = inputStyle;
-        this._resHInput.addEventListener("change", () => this._onResolutionChange("h"));
-
-        this._aspectRatioSelect = document.createElement("select");
-        this._aspectRatioSelect.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 72px;`;
-        for (const preset of ASPECT_RATIO_PRESETS) {
-            const opt = document.createElement("option");
-            opt.value = this._aspectRatioOptionValue(preset.a, preset.b);
-            opt.textContent = preset.label;
-            this._aspectRatioSelect.appendChild(opt);
-        }
-        this._aspectRatioSelect.addEventListener("change", () => {
-            this._resetFreeAspectTierDraft();
-            this._updateResolutionInputMode();
-            this._recalculateResolution();
-        });
-
-        this._resTierSelect = document.createElement("select");
-        this._resTierSelect.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 92px;`;
-        this._resTierSelect.addEventListener("change", () => {
-            this._resetFreeAspectTierDraft();
-            this._recalculateResolution();
-        });
-
-        this._templateSelect = document.createElement("select");
-        this._templateSelect.style.cssText = `${chromeInputCss({ fontSize: "9px", padding: "1px 4px" })} width: 108px;`;
-        this._templateSelect.addEventListener("change", () => this._handleTemplateSelectionChange());
-        this._rebuildTemplateOptions();
-        this._rebuildResolutionTierOptions();
-        this._applyTemplateConstraintMetadata();
-        this._updateResolutionInputMode();
-
-        // FPS input
-        const fpsLabel = document.createElement("span");
-        fpsLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 10px; margin-left: 6px;`;
-        fpsLabel.textContent = "FPS:";
-
-        this._fpsInput = document.createElement("input");
-        this._fpsInput.type = "number"; this._fpsInput.min = 0; this._fpsInput.max = 120; this._fpsInput.step = 0.001;
-        this._fpsInput.placeholder = String(this.fps);
-        this._fpsInput.style.cssText = chromeInputCss({ width: "42px", fontSize: "10px", padding: "2px 3px" });
-        this._fpsInput.addEventListener("change", () => {
-            const template = this._getActiveTemplate();
-            const rawValue = parseFloat(this._fpsInput.value) || 0;
-            const val = template.id === "free"
-                ? rawValue
-                : Number(snapToConstraint(rawValue, template?.constraints?.fps).toFixed(3));
-            this._fpsInput.value = val || "";
-            if (this.activeScene) {
-                this._updateSceneFps(val);
-            }
-        });
-
-        bar.append(prevBtn, this.sceneLabel, nextBtn, addBtn,
-            this._durLabel, this.durationInput,
-            ctxLabel, preCtxLabel, this._preContextInput, postCtxLabel, this._postContextInput,
-            maskLabel, maskPreLabel, this._maskPreOffsetInput, maskPostLabel, this._maskPostOffsetInput,
-            resLabel, this._resWInput, xLabel, this._resHInput, this._aspectRatioSelect, this._resTierSelect, this._templateSelect,
-            fpsLabel, this._fpsInput);
-        this._sceneBar = bar;
-        this.container.appendChild(bar);
+        return buildEditorSceneBar(this, { sceneBarHeight: SCENE_BAR_HEIGHT });
     }
 
     _buildToolbar() {
-        this._toolbar = document.createElement("div");
-        this._toolbar.style.cssText = `
-            display: flex; align-items: center; gap: 2px;
-            padding: 3px 6px; background: ${COLORS.panel};
-            border-bottom: 1px solid ${COLORS.border}; font-size: 10px; min-height: 26px;
-        `;
-
-        // Tool buttons with active states
-        const makeToolBtn = (label, shortcut, tooltip, getter, toggle) => {
-            const btn = document.createElement("button");
-            btn.style.cssText = `${chromeButtonCss({ variant: "muted", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
-            btn.textContent = label;
-            btn.title = `${tooltip} [${shortcut}]`;
-            btn.addEventListener("click", toggle);
-            return btn;
-        };
-
-        this._toolBtnSnap = makeToolBtn("⊞ Snap", "S", "Toggle snapping", () => this.snappingEnabled, () => {
-            this._setSnappingEnabled(!this.snappingEnabled);
-        });
-
-        this._toolBtnRazor = makeToolBtn("✂ Cut", "C", "Toggle razor/cut mode", () => this._razorMode, () => {
-            this._razorMode = !this._razorMode;
-            this._updateToolbar();
-        });
-
-        const cutHereBtn = makeToolBtn("⌇ Split Here", "", "Split clip/audio at playhead", () => false, async () => {
-            const selectedTargets = this.selectedItems
-                .filter((item) => (item.type === "clip" || item.type === "audio")
-                    && this.playhead > item.data.timeline_start_frame
-                    && this.playhead < item.data.timeline_end_frame);
-            if (selectedTargets.length) {
-                for (const hit of selectedTargets) {
-                    await this._splitClipAtFrame(hit, this.playhead);
-                }
-                return;
-            }
-
-            const clip = this._getClipAtFrame(this.playhead) || this._getMotionDriverClipAtFrame(this.playhead);
-            if (clip) {
-                await this._splitClipAtFrame({ type: "clip", id: clip.clip_id, data: clip }, this.playhead);
-            }
-            const audio = this._getAudioAtFrame(this.playhead);
-            if (audio) {
-                await this._splitClipAtFrame({ type: "audio", id: audio.track_id, data: audio }, this.playhead);
-            }
-        });
-        cutHereBtn.title = "Split clip/audio at current playhead position";
-
-        // Separator
-        const sep1 = document.createElement("span");
-        sep1.style.cssText = chromeDividerCss();
-
-        // Playhead Frame box (navigation only; clamp to scene bounds)
-        const frameLabel = document.createElement("span");
-        frameLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px; margin-left: 2px;`;
-        frameLabel.textContent = "F";
-        const playheadInputCss = `${chromeInputCss({ width: "58px", fontSize: "10px", padding: "2px 4px", textAlign: "right" })} min-width: 0;`;
-        this._playheadFrameInput = document.createElement("input");
-        this._playheadFrameInput.type = "text";
-        this._playheadFrameInput.inputMode = "decimal";
-        this._playheadFrameInput.title = "Playhead frame";
-        this._playheadFrameInput.style.cssText = playheadInputCss;
-        const applyPlayhead = (value) => {
-            const parsed = this._parsePositionInput(value);
-            if (!Number.isFinite(parsed)) { this._refreshPlayheadInput(); return; }
-            const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
-            this.playhead = Math.max(0, Math.min(maxFrame, Math.round(parsed)));
-            if (this.isPlaying) this._stopPlayback();
-            this._renderTimeline();
-            this._renderViewportFrame();
-            this._updateToolbar();
-        };
-        this._playheadFrameInput.addEventListener("change", () => applyPlayhead(this._playheadFrameInput.value));
-        this._playheadFrameInput.addEventListener("keydown", (e) => {
-            if (e.key === "Enter") {
-                applyPlayhead(this._playheadFrameInput.value);
-                e.preventDefault();
-            } else if (e.key === "Escape") {
-                this._refreshPlayheadInput();
-            }
-            e.stopPropagation();
-        });
-
-        // Editable selection (In/Out) controls.
-        const inLabel = document.createElement("span");
-        inLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px; margin-left: 2px;`;
-        inLabel.textContent = "In";
-        const outLabel = document.createElement("span");
-        outLabel.style.cssText = `color: ${COLORS.textDim}; font-size: 9px;`;
-        outLabel.textContent = "Out";
-        const selectionInputCss = `${chromeInputCss({ width: "58px", fontSize: "10px", padding: "2px 4px", textAlign: "right" })} min-width: 0;`;
-        const makeSelectionInput = (title, apply) => {
-            const input = document.createElement("input");
-            input.type = "text";
-            input.inputMode = "decimal";
-            input.title = title;
-            input.style.cssText = selectionInputCss;
-            input.addEventListener("change", () => apply(input.value));
-            input.addEventListener("keydown", (e) => {
-                if (e.key === "Enter") {
-                    apply(input.value);
-                    e.preventDefault();
-                } else if (e.key === "Escape") {
-                    this._refreshSelectionInputs();
-                }
-                e.stopPropagation();
-            });
-            return input;
-        };
-        this._selectionStartInput = makeSelectionInput("Selection in-point", (value) => {
-            const frame = this._parsePositionInput(value);
-            if (Number.isFinite(frame)) {
-                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
-                this._setSelectionStartFrame(this._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
-            } else this._refreshSelectionInputs();
-        });
-        this._selectionEndInput = makeSelectionInput("Selection out-point", (value) => {
-            const frame = this._parsePositionInput(value);
-            if (Number.isFinite(frame)) {
-                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
-                this._setSelectionEndFrame(this._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
-            } else this._refreshSelectionInputs();
-        });
-
-        const clearSelBtn = makeToolBtn("✕", "X", "Clear selection", () => false, () => {
-            this._clearTimelineSelection();
-        });
-        clearSelBtn.style.padding = "2px 4px";
-        clearSelBtn.style.fontSize = "9px";
-
-        // Separator 2
-        const sep2 = document.createElement("span");
-        sep2.style.cssText = chromeDividerCss();
-
-        // Fit to view button
-        const fitBtn = makeToolBtn("⊞ Fit", "F", "Fit timeline to view", () => false, () => {
-            this._fitToView();
-        });
-
-        // Timecode toggle button
-        this._toolBtnTimecode = makeToolBtn("TC", "T", "Toggle timecode/frame display", () => this._timecodeMode === "timecode", () => {
-            this._toggleTimecodeMode();
-        });
-
-        // Undo/Redo buttons
-        const undoBtn = this._makeBtn("↩", "Undo (Ctrl+Z)");
-        undoBtn.style.fontSize = "13px";
-        undoBtn.addEventListener("click", () => this._undo());
-
-        const redoBtn = this._makeBtn("↪", "Redo (Ctrl+Y)");
-        redoBtn.style.fontSize = "13px";
-        redoBtn.addEventListener("click", () => this._redo());
-
-        // Separator 3
-        const sep3 = document.createElement("span");
-        sep3.style.cssText = chromeDividerCss();
-
-        // Spacer
-        const spacer = document.createElement("span");
-        spacer.style.flex = "1";
-
-        // Shortcut help button
-        const helpBtn = document.createElement("button");
-        helpBtn.textContent = "?";
-        helpBtn.title = "Keyboard Shortcuts";
-        helpBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "1px 7px", fontSize: "10px", radius: "999px" });
-        helpBtn.addEventListener("click", () => this._showShortcutOverlay());
-
-        // Settings gear button
-        const settingsBtn = document.createElement("button");
-        settingsBtn.textContent = "⚙";
-        settingsBtn.title = "Editor Settings";
-        settingsBtn.style.cssText = `${chromeButtonCss({ variant: "subtle", padding: "1px 7px", fontSize: "12px", radius: "999px" })} margin-left: 4px;`;
-        settingsBtn.addEventListener("click", () => this._showSettingsPanel());
-
-        // Saved selections bookmark button
-        this._bookmarkBtn = document.createElement("button");
-        this._bookmarkBtn.textContent = "🔖";
-        this._bookmarkBtn.title = "Saved Selections";
-        this._bookmarkBtn.style.cssText = `${chromeButtonCss({ variant: "subtle", padding: "1px 6px", fontSize: "11px", radius: "6px" })} position: relative;`;
-        this._bookmarkBtn.addEventListener("click", (e) => this._toggleSavedSelectionsDropdown(e));
-
-        // + Queue button
-        this._queueBtn = document.createElement("button");
-        this._queueBtn.textContent = "+ Queue";
-        this._queueBtn.title = "Add current selection to render queue";
-        this._queueBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
-        this._queueBtn.addEventListener("click", () => this._addToRenderQueue());
-
-        this._batchQueueBtn = document.createElement("button");
-        this._batchQueueBtn.textContent = "+ Batch (1)";
-        this._batchQueueBtn.title = "Add the current selection to the render queue as chunked jobs";
-        this._batchQueueBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
-        this._batchQueueBtn.addEventListener("click", () => this._addBatchToRenderQueue());
-
-        this._queueStatusWrap = document.createElement("div");
-        this._queueStatusWrap.style.cssText = `
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            margin-left: 4px;
-            min-width: 0;
-            white-space: nowrap;
-        `;
-        this._queueStatusWrap.title = "Queue status";
-
-        this._exportBtn = document.createElement("button");
-        this._exportBtn.textContent = "Export";
-        this._exportBtn.title = "Export the current scene timeline";
-        this._exportBtn.style.cssText = `${chromeButtonCss({ variant: "primary", padding: "2px 8px", fontSize: "10px", radius: "6px" })} white-space: nowrap;`;
-        this._exportBtn.addEventListener("click", () => this._showExportPanel());
-
-        // Animatic toggle button
-        this._toolBtnAnimatic = makeToolBtn("👁 Anim", "A", "Toggle animatic mode (hide all video)", () => this._animaticMode, () => {
-            this._toggleAnimatic();
-        });
-
-        // Zoom controls + fullscreen (migrated from info bar)
-        const zoomOut = this._makeBtn("−", "Zoom out [-]");
-        zoomOut.style.fontSize = "13px";
-        zoomOut.addEventListener("click", () => this._zoom(-1));
-
-        const zoomIn = this._makeBtn("+", "Zoom in [+]");
-        zoomIn.style.fontSize = "13px";
-        zoomIn.addEventListener("click", () => this._zoom(1));
-
-        this._fullscreenBtn = this._makeBtn("⛶", "Toggle fullscreen");
-        this._fullscreenBtn.style.fontSize = "14px";
-        this._fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
-
-        this._toolbar.append(undoBtn, redoBtn, sep3, this._toolBtnSnap, this._toolBtnRazor, cutHereBtn, sep1, frameLabel, this._playheadFrameInput, inLabel, this._selectionStartInput, outLabel, this._selectionEndInput, clearSelBtn, this._bookmarkBtn, sep2, fitBtn, this._toolBtnTimecode, this._toolBtnAnimatic, this._queueBtn, this._batchQueueBtn, this._queueStatusWrap, this._exportBtn, spacer, zoomOut, zoomIn, this._fullscreenBtn, helpBtn, settingsBtn);
-        this.container.appendChild(this._toolbar);
-        this._updateToolbar();
+        return buildEditorToolbar(this);
     }
 
     _queueChromeBadges(queue = this._renderQueue) {
-        const counts = { running: 0, pending: 0 };
-        for (const job of Array.isArray(queue) ? queue : []) {
-            const status = String(job?.status || "pending").trim().toLowerCase();
-            if (status === "running") {
-                counts.running += 1;
-            } else if (status === "pending") {
-                counts.pending += 1;
-            }
-        }
-
-        if (this.renderQueueActive === false) {
-            return {
-                badges: [{ text: "Inactive", background: COLORS.panelRaised, border: COLORS.borderStrong }],
-                counts,
-            };
-        }
-
-        const badges = [];
-        if (counts.running > 0) {
-            badges.push({ text: `${counts.running} Running`, background: "#264863", border: "#5d8db5" });
-        }
-        if (counts.pending > 0) {
-            badges.push({ text: `${counts.pending} Pending`, background: COLORS.warningSoft, border: COLORS.warningBorder });
-        }
-        if (!badges.length) {
-            badges.push({ text: "Idle", background: "#223128", border: "#4d6a58" });
-        }
-        return { badges, counts };
+        return queueChromeBadges(this, queue);
     }
 
     _updateQueueChromeStatus() {
-        if (!this._queueStatusWrap) return;
-        this._queueStatusWrap.innerHTML = "";
-
-        const label = document.createElement("span");
-        label.textContent = "Queue";
-        label.style.cssText = `
-            color: ${COLORS.textMuted};
-            font-size: 9px;
-            font-weight: 600;
-            letter-spacing: 0.02em;
-        `;
-        this._queueStatusWrap.appendChild(label);
-
-        const { badges, counts } = this._queueChromeBadges();
-        for (const badge of badges) {
-            const pill = document.createElement("span");
-            pill.style.cssText = `
-                padding: 1px 7px;
-                border-radius: 999px;
-                background: ${badge.background};
-                border: 1px solid ${badge.border};
-                color: #f5f5f5;
-                font-size: 9px;
-                font-weight: 600;
-                line-height: 1.4;
-            `;
-            pill.textContent = badge.text;
-            this._queueStatusWrap.appendChild(pill);
-        }
-
-        const titleParts = [];
-        if (counts.running > 0) titleParts.push(`${counts.running} running`);
-        if (counts.pending > 0) titleParts.push(`${counts.pending} pending`);
-        if (this.renderQueueActive === false) {
-            this._queueStatusWrap.title = titleParts.length
-                ? `Queue inactive: ${titleParts.join(", ")}`
-                : "Queue inactive";
-        } else {
-            this._queueStatusWrap.title = titleParts.length ? `Queue: ${titleParts.join(", ")}` : "Queue: idle";
-        }
+        return updateQueueChromeStatus(this);
     }
 
     _updateToolbar() {
-        if (!this._toolBtnSnap) return;
-        setButtonVariant(this._toolBtnSnap, this.snappingEnabled ? "active" : "muted");
-        setButtonVariant(this._toolBtnRazor, this._razorMode ? "danger" : "muted");
-        if (this._toolBtnTimecode) {
-            const isTc = this._timecodeMode === "timecode";
-            setButtonVariant(this._toolBtnTimecode, isTc ? "warning" : "muted");
-        }
-
-        this._refreshSelectionInputs();
-
-        // Animatic toggle state
-        if (this._toolBtnAnimatic) {
-            setButtonVariant(this._toolBtnAnimatic, this._animaticMode ? "warning" : "muted");
-        }
-        this._updateBatchButtonLabel();
-        this._updateQueueChromeStatus();
+        return updateEditorToolbar(this);
     }
-
     // Info bar removed — zoom/fullscreen controls moved to toolbar.
     // _updateInfoLabel calls replaced with _updateToolbar.
     _buildAssetGallery() {
@@ -3062,7 +2459,7 @@ export class EditorWidget {
             if (!input) continue;
             input.readOnly = readOnly;
             input.style.opacity = readOnly ? "0.68" : "1";
-            input.style.background = readOnly ? COLORS.panelMuted : "";
+            input.style.background = readOnly ? COLORS.panelMuted : COLORS.panelRaised;
             input.style.cursor = readOnly ? "default" : "text";
         }
     }
@@ -7565,7 +6962,7 @@ export class EditorWidget {
                 position: fixed; z-index: 10030; pointer-events: none;
                 border-radius: 8px; overflow: hidden;
                 box-shadow: 0 18px 42px rgba(0,0,0,0.52);
-                font-family: 'Segoe UI', Arial, sans-serif;
+                font-family: ${FONT.sans};
             `;
             document.body.appendChild(preview);
             this._guidePreviewEl = preview;
@@ -7613,7 +7010,7 @@ export class EditorWidget {
         label.style.cssText = `min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:${COLORS.text};`;
         const frameLabel = document.createElement("div");
         frameLabel.textContent = `f${frame}`;
-        frameLabel.style.cssText = `flex-shrink:0;font-size:11px;color:${COLORS.guideSelected};font-family:monospace;`;
+        frameLabel.style.cssText = `flex-shrink:0;font-size:11px;color:${COLORS.guideSelected};font-family:${FONT.mono};`;
         meta.append(label, frameLabel);
 
         preview.append(imageWrap, meta);
@@ -8708,7 +8105,7 @@ export class EditorWidget {
     _shortcutSection(title, shortcuts) {
         let html = `<div style="margin-bottom:12px;"><div style="color:${COLORS.textDim};font-size:10px;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.08em;">${title}</div>`;
         for (const [key, desc] of shortcuts) {
-            html += `<div style="display:flex;justify-content:space-between;gap:16px;padding:3px 0;"><span style="color:${lightenColor(COLORS.sceneBtnActive, 0.3)};min-width:120px;font-family:monospace;">${key}</span><span style="color:${COLORS.text};">${desc}</span></div>`;
+            html += `<div style="display:flex;justify-content:space-between;gap:16px;padding:3px 0;"><span style="color:${lightenColor(COLORS.sceneBtnActive, 0.3)};min-width:120px;font-family:${FONT.mono};">${key}</span><span style="color:${COLORS.text};">${desc}</span></div>`;
         }
         return html + `</div>`;
     }
@@ -8846,7 +8243,7 @@ export class EditorWidget {
         this._vpFrameLabel.style.cssText = `
             position: absolute; bottom: 8px; right: 8px;
             font-size: 11px; color: rgba(255,255,255,0.5);
-            pointer-events: none; font-family: monospace;
+            pointer-events: none; font-family: ${FONT.mono};
         `;
         this._fsViewportContent.appendChild(this._vpFrameLabel);
 
@@ -8871,7 +8268,7 @@ export class EditorWidget {
         // Frame counter
         this._vpFrameCounter = document.createElement("span");
         this._vpFrameCounter.style.cssText = `
-            font-size: 11px; color: ${COLORS.text}; font-family: monospace;
+            font-size: 11px; color: ${COLORS.text}; font-family: ${FONT.mono};
         `;
         this._vpFrameCounter.textContent = "Frame 0 / 0";
 
