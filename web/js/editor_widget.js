@@ -318,7 +318,6 @@ const TIMELINE_HEIGHT = 212;
 const GALLERY_HEIGHT = 160;
 const RULER_HEIGHT = 24;
 const TRACK_HEIGHT = 32;
-const GUIDE_LABEL_RESERVE = 14;
 const SCENE_BAR_HEIGHT = 36;
 const FULLSCREEN_SIDEBAR_DEFAULT_WIDTH = 240;
 const FULLSCREEN_SIDEBAR_MIN_WIDTH = 180;
@@ -2969,7 +2968,7 @@ export class EditorWidget {
                 customName: cfg.name || "",
                 laneIndex: i,
                 collapsed: isStored ? storedCollapsed.has(key) : false,
-                color: cfg.color || COLORS.motionDriver,
+                color: cfg.color || COLORS.laneDriver,
                 locked: cfg.locked || false,
                 hidden: cfg.hidden || false,
             });
@@ -3057,15 +3056,11 @@ export class EditorWidget {
         for (const entry of this._trackLayout) {
             h += Math.round((entry.collapsed ? TRACK_COLLAPSED_HEIGHT : TRACK_HEIGHT) * ts);
         }
-        return h + this._timelineGuideLabelReserve();
+        return h;
     }
 
     _timelineRulerHeight() {
         return Math.round(RULER_HEIGHT * this._scaleTimeline);
-    }
-
-    _timelineGuideLabelReserve() {
-        return this.isFullscreen ? Math.round(GUIDE_LABEL_RESERVE * this._scaleTimeline) : 0;
     }
 
     _visibleTimelineContentHeight() {
@@ -3496,6 +3491,34 @@ export class EditorWidget {
         return scaleColor(hex, this._timelineBrightnessFactor());
     }
 
+    _canvasSansFont(size, weight = 400) {
+        return `${weight} ${Math.max(1, Math.round(size))}px ${FONT.sans}`;
+    }
+
+    _canvasMonoFont(size, weight = 400) {
+        return `${weight} ${Math.max(1, Math.round(size))}px ${FONT.mono}`;
+    }
+
+    _timelineLaneAccent(entry) {
+        if (entry?.color) return entry.color;
+        if (entry?.type === TRACK_TYPE.AUDIO) return COLORS.laneAudio;
+        if (entry?.type === TRACK_TYPE.MOTION_DRIVER) return COLORS.laneDriver;
+        if (entry?.type === TRACK_TYPE.GUIDES) return COLORS.laneGuide;
+        if (entry?.type === TRACK_TYPE.PROMPT) return COLORS.lanePrompt;
+        return COLORS.laneVideo;
+    }
+
+    _drawTimelineItemRail(ctx, x, y, w, h, color) {
+        if (w <= 4 || h <= 4 || !color) return;
+        const railW = Math.min(Math.max(2, Math.round(4 * this._scaleTimeline)), Math.max(2, w - 4));
+        ctx.fillStyle = color;
+        ctx.fillRect(x + 2, y + 2, railW, h - 4);
+        ctx.save();
+        ctx.globalAlpha *= 0.68;
+        ctx.fillRect(x + 2, y + 2, Math.max(0, w - 4), 2);
+        ctx.restore();
+    }
+
     _waveformAccentColor() {
         return this._settings?.appearance?.waveformAccent || DEFAULT_EDITOR_SETTINGS.appearance.waveformAccent;
     }
@@ -3702,7 +3725,7 @@ export class EditorWidget {
 
         ctx.strokeStyle = COLORS.rulerTick;
         ctx.fillStyle = COLORS.rulerText;
-        ctx.font = `${Math.round(9 * ts)}px monospace`;
+        ctx.font = this._canvasMonoFont(Math.max(11, Math.round(9 * ts)), 500);
         ctx.textAlign = "center";
 
         // Determine tick spacing based on zoom
@@ -3771,8 +3794,8 @@ export class EditorWidget {
 
             if (collapsed) {
                 // Collapsed: just arrow + short label
-                ctx.fillStyle = "#555";
-                ctx.font = `${Math.round(7 * hs)}px sans-serif`;
+                ctx.fillStyle = COLORS.textMuted;
+                ctx.font = this._canvasSansFont(Math.round(8 * hs), 500);
                 ctx.textAlign = "left";
                 ctx.fillText(`▸ ${entry.label}`, Math.round((fs ? 6 : 3) * hs), y + h / 2 + 2);
             } else {
@@ -3784,20 +3807,20 @@ export class EditorWidget {
 
                 // 1. Collapse arrow
                 ctx.fillStyle = COLORS.textDim;
-                ctx.font = `${iconSize}px sans-serif`;
+                ctx.font = this._canvasSansFont(iconSize, 500);
                 ctx.textAlign = "left";
                 ctx.fillText("▾", curX, y + h / 2 + Math.round((fs ? 5 : 4) * hs));
                 curX += iconSize + Math.round(2 * hs);
 
                 if (hasHeaderControls) {
-                    // 2. Lock icon — bright red-orange when locked, dim when unlocked
+                    // 2. Lock icon.
                     if (entry.locked) {
                         // Draw bright background indicator for locked state
-                        ctx.fillStyle = "rgba(255, 80, 60, 0.3)";
+                        ctx.fillStyle = "rgba(178, 100, 100, 0.22)";
                         ctx.fillRect(curX - 1, y + 2, iconSize + 1, h - 4);
                     }
-                    ctx.fillStyle = entry.locked ? "#ff5544" : "#666";
-                    ctx.font = `${iconSize - Math.round(2 * hs)}px sans-serif`;
+                    ctx.fillStyle = entry.locked ? COLORS.dangerText : COLORS.textMuted;
+                    ctx.font = this._canvasSansFont(iconSize - Math.round(2 * hs), 500);
                     ctx.fillText(entry.locked ? "🔒" : "🔓", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
                     curX += iconSize + Math.round(1 * hs);
 
@@ -3805,10 +3828,10 @@ export class EditorWidget {
                     const visibilityState = this._trackVisibilityState(entry);
                     const isAudioLike = entry.type === TRACK_TYPE.AUDIO || entry.type === TRACK_TYPE.PROMPT;
                     ctx.fillStyle = visibilityState === "hidden"
-                        ? "#e05050"
+                        ? COLORS.dangerText
                         : visibilityState === "partial"
-                            ? COLORS.warningText
-                            : "#555";
+                            ? COLORS.accentHi
+                            : COLORS.textMuted;
                     const visibleIcon = isAudioLike ? "🔊" : "👁";
                     const hiddenIcon = isAudioLike ? "🔇" : "🚫";
                     ctx.fillText(
@@ -3827,8 +3850,8 @@ export class EditorWidget {
                 }
 
                 // 5. Label
-                ctx.fillStyle = hasHeaderControls && this._trackVisibilityState(entry) === "hidden" ? "#666" : COLORS.textDim;
-                ctx.font = `${Math.round((fs ? 10 : 8) * hs)}px sans-serif`;
+                ctx.fillStyle = hasHeaderControls && this._trackVisibilityState(entry) === "hidden" ? COLORS.textMuted : COLORS.textDim;
+                ctx.font = this._canvasSansFont(Math.round((fs ? 10 : 8) * hs), 500);
                 ctx.textAlign = "left";
                 const labelText = entry.label;
                 const maxLabelW = headerW - curX - 2;
@@ -3850,7 +3873,7 @@ export class EditorWidget {
 
         // Header/timeline boundary separator (draggable)
         const bx = this._labelW;
-        ctx.strokeStyle = "#555";
+        ctx.strokeStyle = COLORS.trackBorder;
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(bx, 0);
@@ -3951,8 +3974,8 @@ export class EditorWidget {
             const badgeW = Math.min(w - 4, Math.max(24, label.length * 6 + 8));
             const badgeH = Math.min(14, h - 4);
             ctx.fillRect(x + 3, y + 3, badgeW, badgeH);
-            ctx.fillStyle = "#e8edf2";
-            ctx.font = `${Math.max(8, Math.round(8 * this._scaleTimeline))}px sans-serif`;
+            ctx.fillStyle = COLORS.text;
+            ctx.font = this._canvasSansFont(Math.max(8, Math.round(8 * this._scaleTimeline)), 500);
             ctx.textAlign = "left";
             ctx.fillText(label, x + 7, y + 3 + badgeH - 4);
         }
@@ -3981,29 +4004,58 @@ export class EditorWidget {
             // Diamond marker
             const isSelectedGuide = this._isSelected("guide", guide.frame_index);
             const guideHidden = trackHidden || !!guide.muted;
+            const markerHalfW = Math.max(7, Math.round(8 * this._scaleTimeline));
+            const markerTop = y + Math.max(4, Math.round(4 * this._scaleTimeline));
+            const markerBottom = y + h - Math.max(4, Math.round(4 * this._scaleTimeline));
+            const markerCenterY = y + h / 2;
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(this._labelW, y, Math.max(0, width - this._labelW), h);
+            ctx.clip();
             ctx.globalAlpha = guideHidden ? 0.42 : 1.0;
             ctx.fillStyle = isMissingGuide
-                ? (isSelectedGuide ? "#ffb18c" : "#c97a59")
+                ? (isSelectedGuide ? COLORS.missingMediaSelected : COLORS.missingMedia)
                 : (isSelectedGuide ? COLORS.guideSelected : COLORS.guide);
             ctx.beginPath();
-            ctx.moveTo(x, y + 4);
-            ctx.lineTo(x + 8, y + h / 2);
-            ctx.lineTo(x, y + h - 4);
-            ctx.lineTo(x - 8, y + h / 2);
+            ctx.moveTo(x, markerTop);
+            ctx.lineTo(x + markerHalfW, markerCenterY);
+            ctx.lineTo(x, markerBottom);
+            ctx.lineTo(x - markerHalfW, markerCenterY);
             ctx.closePath();
             ctx.fill();
             if (guideHidden) {
-                ctx.strokeStyle = "rgba(255,255,255,0.45)";
+                ctx.strokeStyle = "rgba(231,236,242,0.42)";
                 ctx.lineWidth = 1;
+                ctx.stroke();
+            } else {
+                ctx.strokeStyle = isMissingGuide
+                    ? COLORS.missingMediaBorder
+                    : (isSelectedGuide ? COLORS.accent : COLORS.guideBorder);
+                ctx.lineWidth = isSelectedGuide ? 2 : 1;
                 ctx.stroke();
             }
             ctx.globalAlpha = 1.0;
 
-            // Label
-            ctx.fillStyle = guideHidden ? COLORS.textDim : COLORS.text;
-            ctx.font = `${Math.round(8 * this._scaleTimeline)}px monospace`;
-            ctx.textAlign = "center";
-            ctx.fillText(`f${idx}`, x, y + h + Math.round(10 * this._scaleTimeline));
+            // Frame label, kept inside the guide row so it cannot overlap Prompt.
+            const label = `f${idx}`;
+            const labelFontSize = Math.max(10, Math.round(8 * this._scaleTimeline));
+            ctx.fillStyle = isMissingGuide ? COLORS.missingMediaText : (guideHidden ? COLORS.textDim : COLORS.text);
+            ctx.font = this._canvasMonoFont(labelFontSize, 500);
+            ctx.textAlign = "left";
+            const labelPadX = Math.max(3, Math.round(3 * this._scaleTimeline));
+            const labelGap = Math.max(4, Math.round(4 * this._scaleTimeline));
+            const labelW = Math.ceil(ctx.measureText(label).width) + labelPadX * 2;
+            const labelH = labelFontSize + Math.max(3, Math.round(3 * this._scaleTimeline));
+            let labelX = x + markerHalfW + labelGap;
+            if (labelX + labelW > width - 2) labelX = x - markerHalfW - labelGap - labelW;
+            const labelY = Math.round(y + h / 2 + labelFontSize * 0.35);
+            if (labelX + labelW > this._labelW && labelX < width) {
+                ctx.fillStyle = COLORS.guideLabelBg;
+                ctx.fillRect(labelX, labelY - labelFontSize, labelW, labelH);
+                ctx.fillStyle = isMissingGuide ? COLORS.missingMediaText : (guideHidden ? COLORS.textDim : COLORS.text);
+                ctx.fillText(label, labelX + labelPadX, labelY);
+            }
+            ctx.restore();
         }
     }
 
@@ -4053,15 +4105,17 @@ export class EditorWidget {
                 const baseAlpha = (laneHidden || clipMuted) ? 0.3 : (opacity < 1.0 ? Math.max(0.3, opacity) : 1.0);
                 const clipAsset = this._getAssetForSourcePath(clip.source_path);
                 const isMissingClip = !clipAsset || !!clipAsset.missing;
-                const laneBaseColor = _vlEntry.color || (isMotionDriverLane ? COLORS.motionDriver : COLORS.clip);
+                const roleBaseColor = isMotionDriverLane ? COLORS.motionDriver : COLORS.clip;
+                const roleSelectedColor = isMotionDriverLane ? COLORS.motionDriverSelected : COLORS.clipSelected;
+                const laneAccentColor = this._timelineLaneAccent(_vlEntry);
                 const clipFillColor = isSelectedClip
-                    ? (isMotionDriverLane ? COLORS.motionDriverSelected : lightenColor(laneBaseColor, 0.3))
-                    : laneBaseColor;
+                    ? roleSelectedColor
+                    : roleBaseColor;
                 ctx.globalAlpha = baseAlpha;
 
                 // Draw base fill
                 ctx.fillStyle = isMissingClip
-                    ? (isSelectedClip ? "#c97a59" : "#6d3f33")
+                    ? (isSelectedClip ? COLORS.missingMediaSelected : COLORS.missingMedia)
                     : clipFillColor;
                 ctx.fillRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
 
@@ -4095,14 +4149,16 @@ export class EditorWidget {
                             ctx.drawImage(strip.img, sx, 0, srcDrawW, strip.img.naturalHeight,
                                           x1 + 1 + px, videoY + 2, drawW, destH);
                         }
-
-                        // Tint overlay — use lane color if available, fallback to default blue
                         ctx.restore();
                     }
                 }
-                    // No thumbnail — apply lane color tint directly on base fill
+                this._drawTimelineItemRail(ctx, x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4, laneAccentColor);
                 if (isSelectedClip) {
-                    ctx.strokeStyle = isMissingClip ? "#ffd0bc" : lightenColor(laneBaseColor, 0.45);
+                    ctx.strokeStyle = COLORS.accent;
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
+                } else if (isMissingClip) {
+                    ctx.strokeStyle = COLORS.missingMediaBorder;
                     ctx.lineWidth = 1;
                     ctx.strokeRect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
                 }
@@ -4129,11 +4185,17 @@ export class EditorWidget {
                 // Clip label
                 const label = this._formatClipTimelineLabel(clip, clipAsset, isMissingClip);
                 if (label) {
-                    ctx.fillStyle = isMissingClip ? "#ffd0bc" : COLORS.text;
-                    ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
+                    ctx.fillStyle = isMissingClip ? COLORS.missingMediaText : COLORS.text;
+                    ctx.font = this._canvasSansFont(Math.round(9 * this._scaleTimeline), 600);
                     ctx.textAlign = "left";
-                    const labelX = isMotionDriverLane ? x1 + Math.round(26 * this._scaleTimeline) : x1 + 4;
+                    const railPad = Math.round(9 * this._scaleTimeline);
+                    const labelX = isMotionDriverLane ? x1 + Math.round(30 * this._scaleTimeline) : x1 + railPad;
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(labelX, videoY + 2, Math.max(0, x2 - labelX - 4), videoH - 4);
+                    ctx.clip();
                     ctx.fillText(label, labelX, videoY + videoH / 2 + Math.round(3 * this._scaleTimeline));
+                    ctx.restore();
                 }
 
                 if (isMotionDriverLane && (x2 - x1) > 24) {
@@ -4144,8 +4206,8 @@ export class EditorWidget {
                     ctx.globalAlpha = baseAlpha;
                     ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
                     ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
-                    ctx.fillStyle = "#d8ffff";
-                    ctx.font = `${Math.round(8 * this._scaleTimeline)}px sans-serif`;
+                    ctx.fillStyle = COLORS.text;
+                    ctx.font = this._canvasSansFont(Math.round(8 * this._scaleTimeline), 600);
                     ctx.textAlign = "center";
                     ctx.fillText("MD", badgeX + badgeW / 2, badgeY + badgeH - Math.round(3 * this._scaleTimeline));
                 }
@@ -4155,7 +4217,7 @@ export class EditorWidget {
                     ctx.beginPath();
                     ctx.rect(x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4);
                     ctx.clip();
-                    ctx.strokeStyle = "rgba(255,208,188,0.35)";
+                    ctx.strokeStyle = "rgba(223,177,177,0.32)";
                     ctx.lineWidth = 1;
                     for (let lx = x1 - videoH; lx < x2 + videoH; lx += 8) {
                         ctx.beginPath();
@@ -4180,21 +4242,21 @@ export class EditorWidget {
                     if (leftTrimmed > 0) {
                         const ghostX = this._frameToX(clip.timeline_start_frame - leftTrimmed);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = laneBaseColor;
+                        ctx.fillStyle = roleBaseColor;
                         ctx.fillRect(ghostX + 1, videoY + 2, x1 - ghostX - 1, videoH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                     if (rightTrimmed > 0) {
                         const ghostX2 = this._frameToX(clip.timeline_end_frame + rightTrimmed);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = laneBaseColor;
+                        ctx.fillStyle = roleBaseColor;
                         ctx.fillRect(x2 - 1, videoY + 2, ghostX2 - x2, videoH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                 }
 
                 // Active trim drag ghost (during edge-drag)
-                if (this.dragType === "trimEdge") drawTrimGhost(clip, videoY, videoH, laneBaseColor);
+                if (this.dragType === "trimEdge") drawTrimGhost(clip, videoY, videoH, roleBaseColor);
             }
             ctx.globalAlpha = 1.0;
         }
@@ -4218,13 +4280,15 @@ export class EditorWidget {
                 const audioAsset = this._getAssetForSourcePath(track.source_path);
                 const isMissingAudio = !audioAsset || !!audioAsset.missing;
                 const audioMuted = audioLaneHidden || !!track.muted;
-                const laneBaseColor = _alEntry.color || COLORS.audioClip;
-                const audioFillColor = isSelectedAudio ? lightenColor(laneBaseColor, 0.3) : laneBaseColor;
+                const roleBaseColor = COLORS.audioClip;
+                const laneAccentColor = this._timelineLaneAccent(_alEntry);
+                const audioFillColor = isSelectedAudio ? COLORS.audioClipSelected : roleBaseColor;
                 ctx.globalAlpha = audioMuted ? 0.3 : 1.0;
                 ctx.fillStyle = isMissingAudio
-                    ? (isSelectedAudio ? "#c97a59" : "#5f4038")
+                    ? (isSelectedAudio ? COLORS.missingMediaSelected : COLORS.missingMedia)
                     : audioFillColor;
                 ctx.fillRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
+                this._drawTimelineItemRail(ctx, x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4, laneAccentColor);
 
                 // Waveform visualization
                 if (audioAsset && !isMissingAudio && (x2 - x1) > 6) {
@@ -4249,7 +4313,7 @@ export class EditorWidget {
                         const endBucket = Math.ceil(endFrac * waveform.numBuckets);
                         const bucketSpan = Math.max(1, endBucket - startBucket);
 
-                        ctx.strokeStyle = track.muted ? "rgba(180,180,180,0.5)" : this._waveformAccentColor();
+                        ctx.strokeStyle = track.muted ? "rgba(182,191,203,0.35)" : this._waveformAccentColor();
                         ctx.lineWidth = 1;
                         ctx.beginPath();
                         for (let px = 0; px < clipW; px++) {
@@ -4267,7 +4331,11 @@ export class EditorWidget {
                 }
 
                 if (isSelectedAudio) {
-                    ctx.strokeStyle = isMissingAudio ? "#ffd0bc" : lightenColor(laneBaseColor, 0.45);
+                    ctx.strokeStyle = COLORS.accent;
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
+                } else if (isMissingAudio) {
+                    ctx.strokeStyle = COLORS.missingMediaBorder;
                     ctx.lineWidth = 1;
                     ctx.strokeRect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
                 }
@@ -4275,7 +4343,7 @@ export class EditorWidget {
                 // Volume indicator: thin bar at bottom of audio clip
                 if (vol < 1.0 && !track.muted) {
                     const volBarW = (x2 - x1 - 4) * vol;
-                    ctx.fillStyle = "rgba(255,255,255,0.2)";
+                    ctx.fillStyle = "rgba(231,236,242,0.22)";
                     ctx.fillRect(x1 + 2, audioY + audioH - 5, volBarW, 2);
                 }
 
@@ -4283,10 +4351,16 @@ export class EditorWidget {
                 if ((x2 - x1) > 30) {
                     const audioLabel = this._formatAudioTimelineLabel(track, audioAsset, isMissingAudio);
                     if (audioLabel) {
-                        ctx.fillStyle = isMissingAudio ? "#ffd0bc" : COLORS.text;
-                        ctx.font = `${Math.round(8 * this._scaleTimeline)}px sans-serif`;
+                        ctx.fillStyle = isMissingAudio ? COLORS.missingMediaText : COLORS.text;
+                        ctx.font = this._canvasSansFont(Math.round(8 * this._scaleTimeline), 600);
                         ctx.textAlign = "left";
-                        ctx.fillText(audioLabel, x1 + 4, audioY + audioH / 2 + Math.round(3 * this._scaleTimeline));
+                        const labelX = x1 + Math.round(9 * this._scaleTimeline);
+                        ctx.save();
+                        ctx.beginPath();
+                        ctx.rect(labelX, audioY + 2, Math.max(0, x2 - labelX - 4), audioH - 4);
+                        ctx.clip();
+                        ctx.fillText(audioLabel, labelX, audioY + audioH / 2 + Math.round(3 * this._scaleTimeline));
+                        ctx.restore();
                     }
                 }
 
@@ -4295,7 +4369,7 @@ export class EditorWidget {
                     ctx.beginPath();
                     ctx.rect(x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4);
                     ctx.clip();
-                    ctx.strokeStyle = "rgba(255,208,188,0.35)";
+                    ctx.strokeStyle = "rgba(223,177,177,0.32)";
                     ctx.lineWidth = 1;
                     for (let lx = x1 - audioH; lx < x2 + audioH; lx += 8) {
                         ctx.beginPath();
@@ -4320,21 +4394,21 @@ export class EditorWidget {
                     if (audioLeftTrim > 0) {
                         const ghostX = this._frameToX(track.timeline_start_frame - audioLeftTrim);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = laneBaseColor;
+                        ctx.fillStyle = roleBaseColor;
                         ctx.fillRect(ghostX + 1, audioY + 2, x1 - ghostX - 1, audioH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                     if (audioRightTrim > 0) {
                         const ghostX2 = this._frameToX(track.timeline_end_frame + audioRightTrim);
                         ctx.globalAlpha = 0.15;
-                        ctx.fillStyle = laneBaseColor;
+                        ctx.fillStyle = roleBaseColor;
                         ctx.fillRect(x2 - 1, audioY + 2, ghostX2 - x2, audioH - 4);
                         ctx.globalAlpha = 1.0;
                     }
                 }
 
                 // Active trim drag ghost
-                if (this.dragType === "trimEdge") drawTrimGhost(track, audioY, audioH, laneBaseColor);
+                if (this.dragType === "trimEdge") drawTrimGhost(track, audioY, audioH, roleBaseColor);
             }
             ctx.globalAlpha = 1.0;
         }
@@ -4358,23 +4432,24 @@ export class EditorWidget {
                     sections[this._selectedPromptIdx] === section);
 
                 ctx.globalAlpha = promptHidden ? 0.42 : 1.0;
-                ctx.fillStyle = isSelected ? "rgba(180, 120, 255, 0.4)" : COLORS.promptSection;
+                ctx.fillStyle = isSelected ? COLORS.promptSectionSelected : COLORS.promptSection;
                 ctx.fillRect(x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4);
+                this._drawTimelineItemRail(ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, COLORS.lanePrompt);
 
-                ctx.strokeStyle = isSelected ? "rgba(180, 120, 255, 0.9)" : COLORS.promptBorder;
-                ctx.lineWidth = 1;
+                ctx.strokeStyle = isSelected ? COLORS.accent : COLORS.promptBorder;
+                ctx.lineWidth = isSelected ? 1.5 : 1;
                 ctx.strokeRect(x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4);
 
                 // Prompt text label (truncated)
                 if (section.prompt && (x2 - x1) > 20) {
                     ctx.fillStyle = COLORS.text;
-                    ctx.font = `${Math.round(9 * this._scaleTimeline)}px sans-serif`;
+                    ctx.font = this._canvasSansFont(Math.round(9 * this._scaleTimeline), 500);
                     ctx.textAlign = "left";
                     ctx.save();
                     ctx.beginPath();
                     ctx.rect(x1 + 3, promptY + 2, x2 - x1 - 6, promptH - 4);
                     ctx.clip();
-                    ctx.fillText(section.prompt, x1 + 4, promptY + promptH / 2 + Math.round(3 * this._scaleTimeline));
+                    ctx.fillText(section.prompt, x1 + Math.round(9 * this._scaleTimeline), promptY + promptH / 2 + Math.round(3 * this._scaleTimeline));
                     ctx.restore();
                 }
                 ctx.globalAlpha = 1.0;
@@ -4383,7 +4458,7 @@ export class EditorWidget {
                 }
 
                 // Trim ghost
-                if (this.dragType === "trimEdge") drawTrimGhost(section, promptY, promptH, "rgba(180, 120, 255, 0.5)");
+                if (this.dragType === "trimEdge") drawTrimGhost(section, promptY, promptH, COLORS.motionDriver);
             }
         }
     }
@@ -4421,7 +4496,7 @@ export class EditorWidget {
         const x = this._frameToX(this._snapIndicator);
         if (x < 0 || x > width) return;
 
-        ctx.strokeStyle = "#ffff00";
+        ctx.strokeStyle = COLORS.snapIndicator;
         ctx.lineWidth = 1;
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
@@ -8382,10 +8457,8 @@ export class EditorWidget {
         const sceneBarH = SCENE_BAR_HEIGHT * st;
         const toolbarH = 24 * st;
         const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * st;
-        const guideLabelReserve = this._timelineGuideLabelReserve();
-
         // Timeline height — canvas renders at 1:1 now (individual elements scale themselves)
-        this._timelineHeight = Math.max(100, bottomH - sceneBarH - toolbarH - editorsH - guideLabelReserve);
+        this._timelineHeight = Math.max(100, bottomH - sceneBarH - toolbarH - editorsH);
         this._clampScrollY();
         // Gallery is in the sidebar now, doesn't need height calc
         this._galleryHeight = GALLERY_HEIGHT; // Not used in fullscreen layout
@@ -10828,19 +10901,19 @@ export class EditorWidget {
         const ctx = this._vpCtx;
         const w = this._vpCanvas.width;
         const h = this._vpCanvas.height;
-        ctx.fillStyle = "#120c09";
+        ctx.fillStyle = COLORS.bg;
         ctx.fillRect(0, 0, w, h);
-        ctx.strokeStyle = "rgba(255,177,140,0.35)";
+        ctx.strokeStyle = COLORS.missingMediaBorder;
         ctx.lineWidth = 2;
         ctx.strokeRect(10, 10, Math.max(0, w - 20), Math.max(0, h - 20));
-        ctx.fillStyle = "#ffb18c";
-        ctx.font = `${Math.max(16, h / 14)}px sans-serif`;
+        ctx.fillStyle = COLORS.missingMediaText;
+        ctx.font = this._canvasSansFont(Math.max(16, h / 14), 600);
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillText(title || "Missing asset", w / 2, h / 2 - 12);
         if (subtitle) {
-            ctx.fillStyle = "rgba(255,220,204,0.8)";
-            ctx.font = `${Math.max(11, h / 24)}px sans-serif`;
+            ctx.fillStyle = COLORS.textDim;
+            ctx.font = this._canvasSansFont(Math.max(11, h / 24), 400);
             ctx.fillText(subtitle, w / 2, h / 2 + 14);
         }
     }
@@ -10956,10 +11029,10 @@ export class EditorWidget {
 
         if (playableClips.length === 0 && missingClips.length === 0 && !guide) {
             // No clip and no guide — show frame number centered
-            ctx.fillStyle = "#000";
+            ctx.fillStyle = COLORS.bg;
             ctx.fillRect(0, 0, w, h);
-            ctx.fillStyle = "rgba(255,255,255,0.15)";
-            ctx.font = `${Math.max(16, h / 12)}px monospace`;
+            ctx.fillStyle = COLORS.textMuted;
+            ctx.font = this._canvasMonoFont(Math.max(16, h / 12), 400);
             ctx.textAlign = "center";
             ctx.textBaseline = "middle";
             ctx.fillText(`Frame ${this.playhead}`, w / 2, h / 2);
@@ -11010,10 +11083,10 @@ export class EditorWidget {
                     this._seekVideoAndDraw(video, sourceTime);
                 }
             } else {
-                ctx.fillStyle = "#000";
+                ctx.fillStyle = COLORS.bg;
                 ctx.fillRect(0, 0, w, h);
-                ctx.fillStyle = "rgba(255,255,255,0.3)";
-                ctx.font = "14px sans-serif";
+                ctx.fillStyle = COLORS.textDim;
+                ctx.font = this._canvasSansFont(14, 500);
                 ctx.textAlign = "center";
                 ctx.textBaseline = "middle";
                 ctx.fillText("Loading video...", w / 2, h / 2);
@@ -11032,7 +11105,7 @@ export class EditorWidget {
         // Multi-layer compositing: multiple clips at this frame
         if (this.isPlaying) {
             // During playback — draw all layers using current video frame positions
-            ctx.fillStyle = "#000";
+            ctx.fillStyle = COLORS.bg;
             ctx.fillRect(0, 0, w, h);
             for (const clip of clips) {
                 const video = this._getOrCreateVideo(clip.source_path);
@@ -11081,7 +11154,7 @@ export class EditorWidget {
         this._seekAbort = null;
 
         // Clear + draw all layers
-        ctx.fillStyle = "#000";
+        ctx.fillStyle = COLORS.bg;
         ctx.fillRect(0, 0, w, h);
 
         for (let i = 0; i < clips.length; i++) {
@@ -11210,7 +11283,7 @@ export class EditorWidget {
             dh = ch; dw = ch * iAspect; dx = (cw - dw) / 2; dy = 0;
         }
 
-        ctx.fillStyle = "#000";
+        ctx.fillStyle = COLORS.bg;
         ctx.fillRect(0, 0, cw, ch);
         try { ctx.drawImage(img, dx, dy, dw, dh); } catch (e) {}
     }
@@ -11240,7 +11313,7 @@ export class EditorWidget {
             dy = 0;
         }
 
-        ctx.fillStyle = "#000";
+        ctx.fillStyle = COLORS.bg;
         ctx.fillRect(0, 0, cw, ch);
         const opacity = this._viewportClipOpacity ?? 1.0;
         if (opacity < 1.0) ctx.globalAlpha = opacity;

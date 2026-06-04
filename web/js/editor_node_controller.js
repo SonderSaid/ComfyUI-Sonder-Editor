@@ -414,7 +414,7 @@ function consumeDormantPointer(event, { preventDefault = false } = {}) {
 function clearDormantCanvas(canvas) {
     const ctx = canvas?.getContext?.("2d");
     if (!ctx || !canvas) return;
-    ctx.fillStyle = "#000";
+    ctx.fillStyle = THEME.bg0;
     ctx.fillRect(0, 0, Math.max(1, canvas.width || 1), Math.max(1, canvas.height || 1));
 }
 
@@ -426,12 +426,12 @@ function drawDormantCanvasMessage(canvas, title, subtitle = "") {
     clearDormantCanvas(canvas);
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillStyle = "rgba(255,255,255,0.24)";
-    ctx.font = `${Math.max(16, Math.floor(height / 12))}px monospace`;
+    ctx.fillStyle = THEME.fg3;
+    ctx.font = `400 ${Math.max(16, Math.floor(height / 12))}px ${FONT.mono}`;
     ctx.fillText(title, width / 2, height / 2 - (subtitle ? 12 : 0));
     if (subtitle) {
-        ctx.fillStyle = "rgba(255,255,255,0.62)";
-        ctx.font = `${Math.max(11, Math.floor(height / 24))}px sans-serif`;
+        ctx.fillStyle = THEME.fg2;
+        ctx.font = `400 ${Math.max(11, Math.floor(height / 24))}px ${FONT.sans}`;
         ctx.fillText(subtitle, width / 2, height / 2 + 16);
     }
 }

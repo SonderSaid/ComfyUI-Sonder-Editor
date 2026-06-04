@@ -1,3 +1,5 @@
+import { FONT, THEME } from "./editor_theme.js";
+
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
@@ -472,7 +474,7 @@ export function createViewportSurface(options = {}) {
     function drawBlack() {
         const ctx = getCanvasContext();
         if (!ctx || !state.canvas) return null;
-        ctx.fillStyle = "#000";
+        ctx.fillStyle = THEME.bg0;
         ctx.fillRect(0, 0, state.canvas.width, state.canvas.height);
         return ctx;
     }
@@ -484,12 +486,12 @@ export function createViewportSurface(options = {}) {
         const height = state.canvas.height;
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillStyle = palette.titleColor || "rgba(255,255,255,0.18)";
-        ctx.font = `${Math.max(16, height / 12)}px monospace`;
+        ctx.fillStyle = palette.titleColor || THEME.fg3;
+        ctx.font = `400 ${Math.max(16, height / 12)}px ${FONT.mono}`;
         ctx.fillText(title, width / 2, height / 2 - (subtitle ? 12 : 0));
         if (subtitle) {
-            ctx.fillStyle = palette.subtitleColor || "rgba(255,255,255,0.56)";
-            ctx.font = `${Math.max(11, height / 24)}px sans-serif`;
+            ctx.fillStyle = palette.subtitleColor || THEME.fg2;
+            ctx.font = `400 ${Math.max(11, height / 24)}px ${FONT.sans}`;
             ctx.fillText(subtitle, width / 2, height / 2 + 16);
         }
     }
@@ -1647,8 +1649,8 @@ export function createViewportSurface(options = {}) {
                 || missingSourceName
                 || "Missing clip";
             drawViewportText("Missing clip", missingName, {
-                titleColor: "#ffb18c",
-                subtitleColor: "rgba(255,220,204,0.82)",
+                titleColor: "#dfb1b1",
+                subtitleColor: THEME.fg2,
             });
             return;
         }

@@ -14,7 +14,15 @@ import {
     trackedFieldMatchForEntry,
     TRACKED_RENDERERS,
 } from "./tracked_metadata_renderers.js";
-import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
+import {
+    CHROME_SCROLLBAR_CLASS,
+    EDITOR_CHROME as CHROME,
+    FONT,
+    THEME,
+    chromeScrollbarCss,
+    installChromeScrollbarStyles,
+    statusPillCss,
+} from "./editor_theme.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_INSPECTOR_SETTINGS = DEFAULT_EDITOR_SETTINGS.inspector;
@@ -47,6 +55,13 @@ export const INSPECT_OVERLAY_SHORTCUTS = Object.freeze([
 
 function style(el, cssText) {
     el.style.cssText = cssText;
+    return el;
+}
+
+function chromeScroller(el) {
+    if (!el?.classList) return el;
+    installChromeScrollbarStyles(el.ownerDocument);
+    el.classList.add(CHROME_SCROLLBAR_CLASS);
     return el;
 }
 
@@ -751,11 +766,11 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     const listPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:6px;min-height:0;overflow:hidden;`);
     const bulkToolbarHost = style(document.createElement("div"), `display:none;flex:0 0 auto;`);
-    const listScroller = style(document.createElement("div"), `overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:2px;min-height:0;outline:none;${options.maxListHeight ? `max-height:${options.maxListHeight}px;` : "flex:1 1 0;"}`);
+    const listScroller = chromeScroller(style(document.createElement("div"), `overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:2px;min-height:0;outline:none;${chromeScrollbarCss()}${options.maxListHeight ? `max-height:${options.maxListHeight}px;` : "flex:1 1 0;"}`));
     listScroller.tabIndex = 0;
     listPane.append(bulkToolbarHost, listScroller);
 
-    const detailPane = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:8px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.border};min-height:0;overflow:auto;`);
+    const detailPane = chromeScroller(style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:8px;padding:8px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.border};min-height:0;overflow:auto;${chromeScrollbarCss()}`));
     // Inspector contextmenu floor: stop right-clicks inside the inspector from
     // bubbling up to the gallery surface (where the folder pane's menu lives).
     // Per-cell handlers stopPropagation themselves; this catches anything that
@@ -2426,7 +2441,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const panelFlex = isCompareSide
             ? `flex:0 0 min(300px,22vw);max-width:340px;min-width:220px;`
             : `flex:0 0 min(360px,32vw);max-width:420px;min-width:260px;`;
-        const panel = style(document.createElement("div"), `${panelFlex}min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:10px;border-radius:10px;background:rgba(10,15,20,0.72);border:1px solid ${CHROME.border};`);
+        const panel = chromeScroller(style(document.createElement("div"), `${panelFlex}min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:10px;border-radius:10px;background:rgba(10,15,20,0.72);border:1px solid ${CHROME.border};${chromeScrollbarCss()}`));
         const header = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;color:#f1f5f8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
         if (isCompareSide) {
             const sideBadge = style(document.createElement("span"), `padding:2px 6px;border-radius:999px;font-size:9px;font-weight:800;letter-spacing:0.06em;background:${role === "A" ? "rgba(143,192,240,0.18)" : "rgba(232,184,109,0.18)"};color:${role === "A" ? "#c5dff7" : "#f0d8a8"};border:1px solid ${role === "A" ? "rgba(143,192,240,0.4)" : "rgba(232,184,109,0.4)"};`);
@@ -2943,7 +2958,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         const backdrop = style(document.createElement("div"), `position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,0.46);display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;`);
         backdrop.dataset.sonderInspectHelp = "1";
-        const panel = style(document.createElement("div"), `width:min(520px,100%);max-height:min(680px,90vh);overflow:auto;border-radius:12px;background:${CHROME.panelRaised};border:1px solid ${CHROME.borderStrong};box-shadow:0 18px 60px rgba(0,0,0,0.48);padding:16px;box-sizing:border-box;`);
+        const panel = chromeScroller(style(document.createElement("div"), `width:min(520px,100%);max-height:min(680px,90vh);overflow:auto;border-radius:12px;background:${CHROME.panelRaised};border:1px solid ${CHROME.borderStrong};box-shadow:0 18px 60px rgba(0,0,0,0.48);padding:16px;box-sizing:border-box;${chromeScrollbarCss()}`));
         const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;`);
         const title = style(document.createElement("div"), `color:${CHROME.text};font-size:13px;font-weight:700;`);
         title.textContent = "Inspect Overlay Shortcuts";
@@ -3390,7 +3405,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 if (stackedLayout) {
                     ctx.globalAlpha = 0.8;
                     ctx.fillStyle = colors?.[datasetIndex] || "#7fc0ff";
-                    ctx.font = "10px sans-serif";
+                    ctx.font = `500 10px ${FONT.sans}`;
                     ctx.fillText(row.label, 8, row.y + 14);
                     ctx.globalAlpha = 0.22;
                     ctx.strokeStyle = "#ffffff";
@@ -3747,7 +3762,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             ? state.overlayState.comparePickerSortMode
             : DEFAULT_SORT_MODE;
         controls.append(search, sort);
-        const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;`);
+        const list = chromeScroller(style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;${chromeScrollbarCss()}`));
 
         const sortedAssets = () => sortAssetsByMode(
             assets.filter((entry) => assetMatchesParsedQuery(entry, parseAssetSearchQuery(state.overlayState[queryRef] || ""))),

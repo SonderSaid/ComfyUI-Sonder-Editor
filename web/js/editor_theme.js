@@ -80,12 +80,12 @@ export function scaleColor(hex, factor) {
 }
 
 export const LANE_PALETTE = Object.freeze([
-    "#3a6ea5",
-    "#6a8e3e",
-    "#a05a2c",
-    "#7e4a8a",
-    "#8a6b3e",
-    "#3a8a7a",
+    "#5d8aa0",
+    "#7a8e8e",
+    "#8a7fa0",
+    "#6b7280",
+    "#6f8c63",
+    "#8b7f6b",
 ]);
 
 export const EDITOR_COLORS = Object.freeze({
@@ -100,24 +100,36 @@ export const EDITOR_COLORS = Object.freeze({
     track: THEME.bg2,
     trackBorder: THEME.line2,
 
-    // Phase 0 freezes clip/lane/guide identity until the Phase C canvas pass.
-    clip: "#3a7ca5",
-    clipSelected: "#5aacd5",
-    motionDriver: "#e8a030",
-    motionDriverSelected: "#ffcc44",
-    audioClip: "#5a8a5a",
-    audioClipSelected: "#7aba7a",
-    guide: "#e8a030",
-    guideSelected: "#ffcc44",
-    selection: "rgba(100, 180, 255, 0.14)",
-    selectionBorder: "rgba(100, 180, 255, 0.58)",
-    selectionContext: "rgba(100, 180, 255, 0.07)",
-    selectionContextBorder: "rgba(100, 180, 255, 0.24)",
-    maskOffset: "rgba(255, 190, 80, 0.11)",
-    maskOffsetBorder: "rgba(255, 190, 80, 0.34)",
-    playhead: "#ff4444",
-    promptSection: "rgba(180, 120, 255, 0.2)",
-    promptBorder: "rgba(180, 120, 255, 0.5)",
+    clip: "#2c3a47",
+    clipSelected: "#43505c",
+    motionDriver: "#352f3e",
+    motionDriverSelected: "#4d4655",
+    audioClip: "#2f3a36",
+    audioClipSelected: "#46514d",
+    guide: "#435f78",
+    guideSelected: "#5d7f9c",
+    guideBorder: "#89a4bc",
+    guideLabelBg: "rgba(12, 16, 21, 0.68)",
+    promptSection: "rgba(53, 47, 62, 0.72)",
+    promptSectionSelected: "rgba(77, 70, 85, 0.86)",
+    promptBorder: "rgba(138, 127, 160, 0.54)",
+    laneVideo: "#5d8aa0",
+    laneAudio: "#7a8e8e",
+    laneDriver: "#8a7fa0",
+    laneGuide: "#5d7f9c",
+    lanePrompt: "#8a7fa0",
+    missingMedia: "#3d272c",
+    missingMediaSelected: "#56353b",
+    missingMediaBorder: THEME.statusFailed,
+    missingMediaText: "#dfb1b1",
+    selection: "rgba(102, 134, 163, 0.13)",
+    selectionBorder: "rgba(102, 134, 163, 0.62)",
+    selectionContext: "rgba(102, 134, 163, 0.07)",
+    selectionContextBorder: "rgba(102, 134, 163, 0.24)",
+    maskOffset: "rgba(138, 127, 160, 0.10)",
+    maskOffsetBorder: "rgba(138, 127, 160, 0.36)",
+    playhead: THEME.accentHi,
+    snapIndicator: THEME.accent,
 
     galleryBg: THEME.bg1,
     galleryItem: THEME.bg2,
@@ -150,6 +162,8 @@ export const EDITOR_COLORS = Object.freeze({
 });
 
 export const EDITOR_CHROME = EDITOR_COLORS;
+
+export const CHROME_SCROLLBAR_CLASS = "sonder-chrome-scrollbar";
 
 const BUTTON_VARIANTS = Object.freeze({
     primary: {
@@ -293,6 +307,42 @@ export function chromeInputCss({ minWidth = "0", padding = "6px 8px", fontSize =
 
 export function chromeSelectCss(options = {}) {
     return `${chromeInputCss(options)}cursor:pointer;`;
+}
+
+export function chromeScrollbarCss() {
+    return `
+        scrollbar-width: thin;
+        scrollbar-color: ${THEME.fg3} ${THEME.bg0};
+    `;
+}
+
+export function installChromeScrollbarStyles(targetDocument = null) {
+    const doc = targetDocument || (typeof document !== "undefined" ? document : null);
+    if (!doc?.head || doc.getElementById("sonder-editor-scrollbar-styles")) return;
+    const styleEl = doc.createElement("style");
+    styleEl.id = "sonder-editor-scrollbar-styles";
+    styleEl.textContent = `
+        .${CHROME_SCROLLBAR_CLASS}::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        .${CHROME_SCROLLBAR_CLASS}::-webkit-scrollbar-track {
+            background: ${THEME.bg0};
+            border-left: 1px solid ${THEME.line1};
+        }
+        .${CHROME_SCROLLBAR_CLASS}::-webkit-scrollbar-thumb {
+            background: ${THEME.fg3};
+            border: 2px solid ${THEME.bg0};
+            border-radius: 999px;
+        }
+        .${CHROME_SCROLLBAR_CLASS}::-webkit-scrollbar-thumb:hover {
+            background: ${THEME.accent};
+        }
+        .${CHROME_SCROLLBAR_CLASS}::-webkit-scrollbar-corner {
+            background: ${THEME.bg0};
+        }
+    `;
+    doc.head.appendChild(styleEl);
 }
 
 export function statusPillCss({ state = "idle", padding = "4px 8px" } = {}) {
