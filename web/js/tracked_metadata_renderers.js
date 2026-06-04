@@ -94,6 +94,41 @@ function powerLoraRowName(row) {
     return String(row?.name || row?.lora || row?.label || "-");
 }
 
+// Strength values are usually numbers but can arrive as strings; normalize so 0.80 and 0.8
+// (or 1 and 1.0) compare equal. Non-numeric values pass through lowercased for stable matching.
+function normPowerLoraStrength(value) {
+    const num = Number(value);
+    return Number.isFinite(num) ? String(num) : String(value).toLowerCase();
+}
+
+const POWER_LORA_STRENGTH_KEYS = [["strength", "s"], ["model_strength", "m"], ["clip_strength", "c"]];
+
+// Encode a Power LoRA row into the `field:power_loras=` token value so the filter distinguishes
+// exact configs (same LoRA at the same strength + on/off), not just the name. Compact JSON survives
+// the gallery query parser's decodeURIComponent + lowercase, and encodeURIComponent keeps the token
+// whitespace-free so the query tokenizer treats it as one term. The matcher below parses the same shape.
+function encodePowerLoraFilterValue(row) {
+    const payload = { n: powerLoraRowName(row), e: row?.enabled === false ? 0 : 1 };
+    for (const [key, short] of POWER_LORA_STRENGTH_KEYS) {
+        if (row && row[key] != null && row[key] !== "") payload[short] = normPowerLoraStrength(row[key]);
+    }
+    return JSON.stringify(payload);
+}
+
+// Parse a structured power_loras filter value (already lowercased by the query parser). Returns the
+// decoded object, or null when the value is a plain name (manually-typed `field:power_loras=name`).
+function parsePowerLoraFilterValue(value) {
+    const raw = String(value || "").trim();
+    if (!raw.startsWith("{")) return null;
+    try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && typeof parsed.n === "string") return parsed;
+    } catch (_err) {
+        // not structured — fall through to legacy name matching
+    }
+    return null;
+}
+
 function renderPowerLoraBody(entry, ctx) {
     const rows = Array.isArray(entry?.fields?.power_loras)
         ? entry.fields.power_loras.filter((row) => row && typeof row === "object")
@@ -110,7 +145,8 @@ function renderPowerLoraBody(entry, ctx) {
 
     for (const row of rows) {
         const name = powerLoraRowName(row);
-        const token = fieldSearchToken("power_loras", name);
+        const filterValue = encodePowerLoraFilterValue(row);
+        const token = fieldSearchToken("power_loras", filterValue);
         const activeA = tokenActiveA ? tokenActiveA(token) : false;
         const activeB = tokenActiveB ? tokenActiveB(token) : false;
         const enabled = row.enabled !== false;
@@ -160,7 +196,7 @@ function renderPowerLoraBody(entry, ctx) {
         const cellInfo = {
             entry,
             fieldKey: "power_loras",
-            value: name,
+            value: filterValue,
             displayKind: "power_lora_row",
             rowMeta: row,
         };
@@ -178,6 +214,26 @@ function matchPowerLoraField(entry, fieldKey, value) {
     if (fieldKey !== "power_loras") return null; // generic matcher handles enabled_lora_count etc.
     const rows = entry?.fields?.power_loras;
     if (!Array.isArray(rows)) return null;
+    const structured = parsePowerLoraFilterValue(value);
+    if (structured) {
+        // Strict config match: same LoRA name, same on/off state, and every strength present in the
+        // token must match. Returning false here intentionally blocks the generic fallback for this
+        // entry — the structured matcher is authoritative for the power_loras field.
+        for (const row of rows) {
+            if (!row) continue;
+            if (powerLoraRowName(row).toLowerCase() !== structured.n) continue;
+            if ((row.enabled === false ? 0 : 1) !== (structured.e ? 1 : 0)) continue;
+            let strengthMatch = true;
+            for (const [key, short] of POWER_LORA_STRENGTH_KEYS) {
+                if (structured[short] == null) continue;
+                const rowVal = (row[key] != null && row[key] !== "") ? normPowerLoraStrength(row[key]) : null;
+                if (rowVal !== structured[short]) { strengthMatch = false; break; }
+            }
+            if (strengthMatch) return true;
+        }
+        return false;
+    }
+    // Legacy / manually-typed `field:power_loras=name`: substring match on the LoRA name only.
     const needle = String(value || "").toLowerCase();
     if (!needle) return false;
     for (const row of rows) {

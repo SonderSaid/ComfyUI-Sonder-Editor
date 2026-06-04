@@ -215,6 +215,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         sideBySideLinkZoom: true,
         audioCompareWaveformLayout: "stacked",
         audioCompareMonitor: "a",
+        compareCycleSide: "B",
     },
 };
 
@@ -244,6 +245,7 @@ export function normalizeModelTemplateId(id) {
 const VALID_COMPARE_LAYOUTS = new Set(["divider", "sideBySide"]);
 const VALID_AUDIO_COMPARE_WAVEFORM_LAYOUTS = new Set(["stacked", "overlay"]);
 const VALID_AUDIO_COMPARE_MONITORS = new Set(["a", "b", "both", "mute"]);
+const VALID_COMPARE_CYCLE_SIDES = new Set(["A", "B"]);
 export const VALID_TAKE_PLACEMENT_MODES = new Set(TAKE_PLACEMENT_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_CUSTOM_CONTAINERS = new Set(CUSTOM_CONTAINER_OPTIONS);
 const VALID_CUSTOM_VIDEO_CODECS = new Set(CUSTOM_VIDEO_CODEC_OPTIONS);
@@ -788,6 +790,9 @@ function normalizeEditorSettings(source = null) {
             audioCompareMonitor: VALID_AUDIO_COMPARE_MONITORS.has(stored?.inspector?.audioCompareMonitor)
                 ? stored.inspector.audioCompareMonitor
                 : defaults.inspector.audioCompareMonitor,
+            compareCycleSide: VALID_COMPARE_CYCLE_SIDES.has(stored?.inspector?.compareCycleSide)
+                ? stored.inspector.compareCycleSide
+                : defaults.inspector.compareCycleSide,
         },
     };
 }

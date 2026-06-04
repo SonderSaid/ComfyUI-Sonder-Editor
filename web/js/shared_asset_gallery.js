@@ -42,6 +42,7 @@ export const INSPECT_OVERLAY_SHORTCUTS = Object.freeze([
     ["ArrowLeft / ArrowRight", "Cycle assets; step one frame in video compare"],
     ["Shift + ArrowLeft / ArrowRight", "Step -/+10 frames in video compare"],
     ["Ctrl + ArrowLeft / ArrowRight", "Step -/+1 second in video compare"],
+    ["ArrowUp / ArrowDown", "Compare mode: cycle the active side's asset (A/B)"],
     ["Space", "Play / Pause"],
     ["Right-drag video", "Scrub from current playhead"],
     ["1 / 2 / 3 / 0", "Monitor A / B / Both / Mute in audio compare"],
@@ -678,10 +679,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             metadataScrollTopSingle: 0,
             metadataScrollTopA: 0,
             metadataScrollTopB: 0,
+            // Per-side compare-chooser scrollTop, kept across the overlay rebuild that assignSlot/cycle triggers.
+            compareChooserScrollA: 0,
+            compareChooserScrollB: 0,
             compareLayout: initialInspectorSettings.compareLayout || DEFAULT_INSPECTOR_SETTINGS.compareLayout,
             sideBySideLinkZoom: initialInspectorSettings.sideBySideLinkZoom !== false,
             audioCompareWaveformLayout: initialInspectorSettings.audioCompareWaveformLayout || DEFAULT_INSPECTOR_SETTINGS.audioCompareWaveformLayout,
             audioCompareMonitor: initialInspectorSettings.audioCompareMonitor || DEFAULT_INSPECTOR_SETTINGS.audioCompareMonitor,
+            compareCycleSide: initialInspectorSettings.compareCycleSide || DEFAULT_INSPECTOR_SETTINGS.compareCycleSide,
             audioTempFlip: false,
             dividerRatio: 0.5,
             audioFocus: "none",
@@ -867,6 +872,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.sideBySideLinkZoom = inspector.sideBySideLinkZoom !== false;
         state.overlayState.audioCompareWaveformLayout = inspector.audioCompareWaveformLayout || DEFAULT_INSPECTOR_SETTINGS.audioCompareWaveformLayout;
         state.overlayState.audioCompareMonitor = inspector.audioCompareMonitor || DEFAULT_INSPECTOR_SETTINGS.audioCompareMonitor;
+        state.overlayState.compareCycleSide = inspector.compareCycleSide || DEFAULT_INSPECTOR_SETTINGS.compareCycleSide;
         updateControlState();
         if (!skipRender && !state.destroyed) {
             render();
@@ -3597,6 +3603,33 @@ export function mountSharedAssetGallery(container, options = {}) {
         renderInspectOverlay();
     }
 
+    // The compare candidates for one side, filtered + sorted exactly as that side's chooser shows them.
+    // Single source of truth so up/down cycling walks the same list the user sees (and composes with
+    // each side's own search query, including the strength/toggle-aware power_loras filter).
+    function compareFilteredCandidates(side) {
+        const parsed = parseAssetSearchQuery(state.overlayState[compareQueryRef(side)] || "");
+        return sortAssetsByMode(
+            sameTypeOverlayAssets(currentOverlayAsset()).filter((entry) => assetMatchesParsedQuery(entry, parsed)),
+            state.overlayState.comparePickerSortMode || DEFAULT_SORT_MODE,
+        );
+    }
+
+    // Up/Down in compare mode: cycle the active side's asset within that side's filtered list, keeping
+    // compare on and the other side pinned. Which side cycles is the sticky compareCycleSide preference.
+    function cycleCompareSlot(direction) {
+        if (!compareModeActive()) return;
+        const side = state.overlayState.compareCycleSide === "A" ? "A" : "B";
+        const slotKey = side === "B" ? "compareRightAssetId" : "compareLeftAssetId";
+        const list = compareFilteredCandidates(side);
+        if (!list.length) return;
+        const currentIndex = list.findIndex((entry) => entry.asset_id === state.overlayState[slotKey]);
+        const nextIndex = currentIndex < 0
+            ? (direction > 0 ? 0 : list.length - 1)
+            : (currentIndex + direction + list.length) % list.length;
+        state.overlayState[slotKey] = list[nextIndex].asset_id;
+        renderInspectOverlay();
+    }
+
     function ensureCompareDefaults(asset) {
         const candidates = sameTypeOverlayAssets(asset);
         if (!candidates.length) return;
@@ -3740,6 +3773,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function renderCompareChooser(assets, slotLabel, selectedId, onAssign, requestRefresh = () => {}, side = "A") {
         const queryRef = side === "B" ? "comparePickerQueryB" : "comparePickerQuery";
+        const scrollKey = side === "B" ? "compareChooserScrollB" : "compareChooserScrollA";
         const sideAccent = side === "B" ? "#e8b86d" : "#7fc0ff";
         const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;min-width:0;height:100%;padding:10px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);overflow:hidden;`);
         const title = style(document.createElement("div"), `color:#d7e5f1;font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;`);
@@ -3763,11 +3797,13 @@ export function mountSharedAssetGallery(container, options = {}) {
             : DEFAULT_SORT_MODE;
         controls.append(search, sort);
         const list = chromeScroller(style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;${chromeScrollbarCss()}`));
+        // Persist scroll across the full overlay rebuild that assignSlot triggers (each rebuild makes
+        // a fresh list element). renderRows restores from here; this keeps it fresh as the user scrolls.
+        list.addEventListener("scroll", () => {
+            state.overlayState[scrollKey] = list.scrollTop;
+        }, { passive: true });
 
-        const sortedAssets = () => sortAssetsByMode(
-            assets.filter((entry) => assetMatchesParsedQuery(entry, parseAssetSearchQuery(state.overlayState[queryRef] || ""))),
-            state.overlayState.comparePickerSortMode || DEFAULT_SORT_MODE,
-        );
+        const sortedAssets = () => compareFilteredCandidates(side);
 
         // Each pinned asset gets an L (left/A) or R (right/B) badge so users can tell at a glance
         // which slot it occupies. The natural-position copy keeps the same badge.
@@ -3854,6 +3890,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         };
 
         const renderRows = () => {
+            // Capture the live scroll before clearing (innerHTML="" clamps it to 0). On a full overlay
+            // rebuild the list isn't mounted yet, so fall back to the stored position. Restore after layout.
+            const desiredScroll = list.isConnected ? list.scrollTop : (state.overlayState[scrollKey] || 0);
             list.innerHTML = "";
             search.value = state.overlayState[queryRef] || "";
             sort.value = COMPARE_SORT_OPTIONS.some((entry) => entry.value === state.overlayState.comparePickerSortMode)
@@ -3868,6 +3907,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 empty.textContent = "No matching assets.";
                 list.appendChild(empty);
             }
+            requestAnimationFrame(() => { list.scrollTop = desiredScroll; });
         };
 
         search.addEventListener("input", () => {
@@ -3914,9 +3954,21 @@ export function mountSharedAssetGallery(container, options = {}) {
         layout.appendChild(chooserA.el);
 
         const center = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0;`);
-        const hint = style(document.createElement("div"), `color:#8ea0af;font-size:11px;flex:0 0 auto;`);
+        const legendRow = style(document.createElement("div"), `display:flex;align-items:center;gap:10px;flex:0 0 auto;flex-wrap:wrap;`);
+        const hint = style(document.createElement("div"), `color:#8ea0af;font-size:11px;`);
         hint.textContent = "Left click = A | Right click = B";
-        center.appendChild(hint);
+        // The toggle doubles as the up/down legend: it shows which side ↑/↓ cycles and switches it on click.
+        const cycleToggle = makeActionButton("subtle");
+        cycleToggle.textContent = `↑ / ↓ cycle: ${state.overlayState.compareCycleSide === "A" ? "A" : "B"}`;
+        cycleToggle.title = "Up/Down arrows cycle this side's asset in compare mode (click to switch side)";
+        cycleToggle.addEventListener("click", () => {
+            const next = state.overlayState.compareCycleSide === "A" ? "B" : "A";
+            state.overlayState.compareCycleSide = next;
+            persistInspectorSetting("compareCycleSide", next);
+            renderInspectOverlay();
+        });
+        legendRow.append(hint, cycleToggle);
+        center.appendChild(legendRow);
 
         const makeSegmentButton = (label, active, onClick, title = "") => {
             const btn = makeActionButton(active ? "active" : "subtle");
@@ -4287,6 +4339,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                 showInspectOverlayShortcutHelp();
                 return true;
             }
+            if (overlay.compareMode && event.key === "ArrowUp") { cycleCompareSlot(-1); return true; }
+            if (overlay.compareMode && event.key === "ArrowDown") { cycleCompareSlot(1); return true; }
             if (event.key === "ArrowLeft") { cycleOverlayAsset(-1); return true; }
             if (event.key === "ArrowRight") { cycleOverlayAsset(1); return true; }
             if (event.key === "f" || event.key === "F" || event.key === "0") {
