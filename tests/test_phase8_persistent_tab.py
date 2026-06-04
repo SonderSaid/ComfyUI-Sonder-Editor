@@ -34,7 +34,7 @@ from server.session_registry import (
     unregister_canvas_host,
     update_widget_state,
 )
-from server.timeline_state import Asset, AudioTrack, ClipReference, LaneConfig, Scene
+from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, LaneConfig, Scene
 
 
 async def _claim_tab_owner(project_id: str, host_id: str, source_node_id: str = "node-a", session_id: str = "tab-1"):
@@ -102,6 +102,216 @@ def test_generated_commit_merges_into_newer_editor_version():
         assert restored.get_scene("scene-1").name == "Edited Scene"
         assert restored.get_asset("asset-1") is not None
         assert restored.get_scene("scene-1").clips[0].clip_id == "clip-1"
+
+
+def test_generated_commit_upgrades_same_path_auto_sync_placeholder_and_remaps_ids():
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Same Path Placeholder", base_dir=base_dir)
+        project.scenes.append(Scene(scene_id="scene-1", name="Scene", duration_frames=12))
+        project.generation_queue.append(GenerationJob(job_id="job-1", status="running"))
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+        before = snapshot_item_ids(produced)
+
+        generated_video = Asset(
+            asset_id="generated-video",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            folder="Takes/Scene",
+            prompt="generated prompt",
+            width=128,
+            height=72,
+            frame_count=12,
+            fps=24.0,
+            generation_params={
+                "editor_export": {"produced_by": {"node": "SonderSaveVideo"}},
+            },
+        )
+        generated_audio = Asset(
+            asset_id="generated-audio",
+            name="take.wav",
+            asset_type="audio",
+            path=os.path.join("media", "take.wav"),
+            folder="Takes/Scene",
+            generation_params={"source_video_asset_id": "generated-video"},
+        )
+        produced.assets.extend([generated_video, generated_audio])
+        produced_scene = produced.get_scene("scene-1")
+        produced_scene.clips.append(ClipReference(
+            clip_id="generated-clip",
+            source_path=generated_video.path,
+            timeline_start_frame=0,
+            timeline_end_frame=12,
+            is_generated=True,
+            take_metadata={"source": "save-video"},
+        ))
+        produced_scene.audio_tracks.append(AudioTrack(
+            track_id="generated-audio-track",
+            source_path=generated_audio.path,
+            timeline_start_frame=0,
+            timeline_end_frame=12,
+        ))
+        produced.generation_queue[0].status = "completed"
+        produced.generation_queue[0].progress = 1.0
+        produced.generation_queue[0].result_asset_id = "generated-video"
+        created = created_ids_since(before, produced)
+
+        current = load_project(project.project_dir)
+        current.assets.append(Asset(
+            asset_id="auto-sync-video",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            width=128,
+            height=72,
+        ))
+        save_project(current, expected_modified_at=base_version)
+
+        committed = save_generated_project(produced, base_version, created_ids=created)
+        restored = load_project(project.project_dir)
+
+        same_path = [
+            asset for asset in restored.assets
+            if asset.path.replace("\\", "/") == "media/take.mp4"
+        ]
+        assert [asset.asset_id for asset in same_path] == ["auto-sync-video"]
+        upgraded = same_path[0]
+        assert upgraded.folder == "Takes/Scene"
+        assert upgraded.prompt == "generated prompt"
+        assert upgraded.generation_params["editor_export"]["produced_by"]["node"] == "SonderSaveVideo"
+        assert restored.get_asset("generated-video") is None
+        assert restored.get_asset("generated-audio").generation_params["source_video_asset_id"] == "auto-sync-video"
+        assert restored.get_scene("scene-1").clips[0].clip_id == "generated-clip"
+        assert restored.get_scene("scene-1").audio_tracks[0].track_id == "generated-audio-track"
+        assert restored.generation_queue[0].result_asset_id == "auto-sync-video"
+        assert getattr(committed, "_asset_id_remap") == {"generated-video": "auto-sync-video"}
+
+
+def test_generated_commit_upgrades_same_id_auto_sync_placeholder_after_conflict():
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Same Id Placeholder", base_dir=base_dir)
+        project.assets.append(Asset(
+            asset_id="auto-sync-video",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            width=128,
+            height=72,
+        ))
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+        before = snapshot_item_ids(produced)
+        produced_asset = produced.get_asset("auto-sync-video")
+        produced_asset.folder = "Takes/Scene"
+        produced_asset.prompt = "generated prompt"
+        produced_asset.generation_params = {
+            "editor_export": {"produced_by": {"node": "SonderSaveBridge"}},
+        }
+        created = created_ids_since(before, produced)
+
+        current = load_project(project.project_dir)
+        current.assets.append(Asset(
+            asset_id="user-asset",
+            name="other.png",
+            asset_type="image",
+            path=os.path.join("media", "other.png"),
+        ))
+        save_project(current, expected_modified_at=base_version)
+
+        committed = save_generated_project(produced, base_version, created_ids=created)
+        restored = load_project(project.project_dir)
+
+        upgraded = restored.get_asset("auto-sync-video")
+        assert upgraded.folder == "Takes/Scene"
+        assert upgraded.prompt == "generated prompt"
+        assert upgraded.generation_params["editor_export"]["produced_by"]["node"] == "SonderSaveBridge"
+        assert restored.get_asset("user-asset") is not None
+        assert getattr(committed, "_asset_id_remap") == {}
+
+
+def test_generated_commit_same_path_does_not_overwrite_user_visible_current_asset():
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Same Path User Edit", base_dir=base_dir)
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+        before = snapshot_item_ids(produced)
+        produced.assets.append(Asset(
+            asset_id="generated-asset",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            folder="Generated Folder",
+            prompt="generated prompt",
+            generation_params={"editor_export": {"source": "generated"}},
+        ))
+        created = created_ids_since(before, produced)
+
+        current = load_project(project.project_dir)
+        current.assets.append(Asset(
+            asset_id="user-visible-asset",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            folder="User Folder",
+        ))
+        save_project(current, expected_modified_at=base_version)
+
+        committed = save_generated_project(produced, base_version, created_ids=created)
+        restored = load_project(project.project_dir)
+
+        assert len([asset for asset in restored.assets if asset.path.replace("\\", "/") == "media/take.mp4"]) == 1
+        kept = restored.get_asset("user-visible-asset")
+        assert kept.folder == "User Folder"
+        assert kept.prompt == ""
+        assert kept.generation_params == {}
+        assert restored.get_asset("generated-asset") is None
+        assert getattr(committed, "_asset_id_remap") == {"generated-asset": "user-visible-asset"}
+
+
+def test_generated_commit_same_path_does_not_resurrect_trashed_asset():
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Same Path Trash", base_dir=base_dir)
+        save_project(project)
+
+        produced = load_project(project.project_dir)
+        base_version = produced.modified_at
+        before = snapshot_item_ids(produced)
+        produced.assets.append(Asset(
+            asset_id="generated-asset",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            folder="Generated Folder",
+            generation_params={"editor_export": {"source": "generated"}},
+        ))
+        created = created_ids_since(before, produced)
+
+        current = load_project(project.project_dir)
+        current.assets.append(Asset(
+            asset_id="trashed-asset",
+            name="take.mp4",
+            asset_type="video",
+            path=os.path.join("media", "take.mp4"),
+            trashed_at="2026-06-01T12:00:00",
+            trash_previous_folder="Old Folder",
+        ))
+        save_project(current, expected_modified_at=base_version)
+
+        save_generated_project(produced, base_version, created_ids=created)
+        restored = load_project(project.project_dir)
+
+        kept = restored.get_asset("trashed-asset")
+        assert kept.trashed_at == "2026-06-01T12:00:00"
+        assert kept.folder == ""
+        assert kept.generation_params == {}
+        assert restored.get_asset("generated-asset") is None
 
 
 def test_generated_commit_does_not_resurrect_empty_tail_lanes():

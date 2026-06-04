@@ -1569,16 +1569,20 @@ def _sync_media_folder(
     project: TimelineProject,
     trash_retention_days: int = TRASH_RETENTION_DAYS,
     trash_max_size_mb: float | None = None,
+    *,
+    purge_trashed: bool = True,
 ) -> bool:
     """Scan media/ folder for files not yet in the asset registry and add them.
 
     Returns True if any changes were made (new assets discovered or repaired).
     """
-    changed = _purge_expired_trashed_assets(
-        project,
-        retention_days=trash_retention_days,
-        max_size_mb=trash_max_size_mb,
-    )
+    changed = False
+    if purge_trashed:
+        changed = _purge_expired_trashed_assets(
+            project,
+            retention_days=trash_retention_days,
+            max_size_mb=trash_max_size_mb,
+        )
     media_dir = os.path.join(project.project_dir, "media")
     if not os.path.isdir(media_dir):
         return changed
@@ -1706,6 +1710,60 @@ def _sync_media_folder(
                         logger.info("Repaired audio track duration: %d frames (%s)", new_duration, track.source_path)
 
     return changed
+
+
+def _save_versioned_sync_phase(project: TimelineProject, sync_fn, reload_project) -> TimelineProject:
+    for _attempt in range(3):
+        base_modified_at = str(getattr(project, "modified_at", "") or "")
+        changed = sync_fn(project)
+        if not changed:
+            return project
+        try:
+            save_project(project, expected_modified_at=base_modified_at)
+            return project
+        except ProjectVersionConflict:
+            project = reload_project()
+    base_modified_at = str(getattr(project, "modified_at", "") or "")
+    changed = sync_fn(project)
+    if changed:
+        save_project(project, expected_modified_at=base_modified_at)
+    return project
+
+
+def _sync_media_folder_versioned(
+    project: TimelineProject,
+    trash_retention_days: int = TRASH_RETENTION_DAYS,
+    trash_max_size_mb: float | None = None,
+    *,
+    reload_project=None,
+) -> TimelineProject:
+    if reload_project is None:
+        reload_project = lambda: load_project(project.project_dir)
+
+    project = _save_versioned_sync_phase(
+        project,
+        lambda sync_project: _sync_media_folder(
+            sync_project,
+            trash_retention_days,
+            trash_max_size_mb,
+            purge_trashed=False,
+        ),
+        reload_project,
+    )
+
+    # Trash purge can delete media files, so run it against a fresh project
+    # snapshot after the non-destructive scan/repair phase instead of against a
+    # request object that may have spent seconds ffprobing.
+    project = reload_project()
+    return _save_versioned_sync_phase(
+        project,
+        lambda sync_project: _purge_expired_trashed_assets(
+            sync_project,
+            retention_days=trash_retention_days,
+            max_size_mb=trash_max_size_mb,
+        ),
+        reload_project,
+    )
 
 
 
@@ -2978,11 +3036,14 @@ if routes is not None:
         # canvas-host / session TTLs and triggers spurious disconnects. Run
         # it on a worker thread so heartbeats and the sweeper keep firing.
         # BUG-4 fix: persist newly discovered assets so IDs remain stable.
-        changed = await asyncio.to_thread(
-            _sync_media_folder, project, trash_retention_days, trash_max_size_mb
+        project = await asyncio.to_thread(
+            _sync_media_folder_versioned,
+            project,
+            trash_retention_days,
+            trash_max_size_mb,
+            reload_project=lambda: _load_project_from_request(request),
         )
-        if changed:
-            await asyncio.to_thread(save_project, project)
+        _remember_request_project(request, project)
 
         asset_type = request.query.get("type", "")
         include_trashed = _query_flag(request.query.get("include_trashed"))

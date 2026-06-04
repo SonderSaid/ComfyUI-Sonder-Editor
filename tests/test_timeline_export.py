@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server
 import server.routes as routes
 from server.project_manager import load_project, save_project
-from server.timeline_export import TimelineExportManager
+from server.timeline_export import TimelineExportManager, _resolve_committed_asset_id
 from server.timeline_renderer import TimelineRenderCancelled, render_scene_frames
 from server.timeline_state import Asset, AudioTrack, ClipReference, GuideFrame, LaneConfig, Scene, TimelineProject, classify_asset_path
 
@@ -49,6 +49,14 @@ def _response_json(response):
 
 def test_m4a_classifies_as_audio():
     assert classify_asset_path("media/export.m4a") == ("audio", "")
+
+
+def test_timeline_export_resolves_committed_asset_id_remap():
+    project = TimelineProject()
+    setattr(project, "_asset_id_remap", {"produced-id": "committed-id"})
+
+    assert _resolve_committed_asset_id(project, "produced-id") == "committed-id"
+    assert _resolve_committed_asset_id(project, "other-id") == "other-id"
 
 
 def test_render_scene_frames_cancel_avoids_cache_commit(tmp_path):

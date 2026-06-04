@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
+from server.project_manager import create_project, load_project, save_project
 from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, Scene, TimelineProject
 
 
@@ -201,6 +202,146 @@ def test_sync_media_folder_reprobes_when_media_signature_changes(tmp_path, monke
     assert project.assets[0].has_audio is True
     assert project.assets[0].media_probe_signature != first_signature
     assert len(calls) == 2
+
+
+def test_versioned_media_sync_does_not_stale_overwrite_generated_registration(tmp_path, monkeypatch):
+    base_dir = tmp_path / "projects"
+    project = create_project("Asset Sync Race", base_dir=str(base_dir))
+    media_rel_path = os.path.join("media", "bridge.png")
+    _write_project_file(project, media_rel_path, b"image")
+
+    monkeypatch.setattr(routes, "ensure_thumbnail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", lambda *args, **kwargs: {
+        "width": 64,
+        "height": 64,
+        "frame_count": 0,
+        "fps": 0.0,
+        "duration_sec": 0.0,
+        "sample_rate": 0,
+        "has_audio": False,
+    })
+
+    stale = load_project(project.project_dir)
+    base_version = stale.modified_at
+    real_save = routes.save_project
+    injected = {"done": False}
+
+    def racing_save(project_to_save, *args, **kwargs):
+        if not injected["done"]:
+            injected["done"] = True
+            current = load_project(project.project_dir)
+            current.assets.append(Asset(
+                asset_id="bridge-asset",
+                name="bridge.png",
+                asset_type="image",
+                path=media_rel_path,
+                folder="Test Transfer",
+                generation_params={"editor_export": {"produced_by": {"node": "SonderSaveBridge"}}},
+            ))
+            real_save(current, expected_modified_at=base_version)
+        return real_save(project_to_save, *args, **kwargs)
+
+    monkeypatch.setattr(routes, "save_project", racing_save)
+
+    result = routes._sync_media_folder_versioned(
+        stale,
+        reload_project=lambda: load_project(project.project_dir),
+    )
+    restored = load_project(project.project_dir)
+
+    same_path = [
+        asset for asset in restored.assets
+        if asset.path.replace("\\", "/") == "media/bridge.png"
+    ]
+    assert [asset.asset_id for asset in same_path] == ["bridge-asset"]
+    assert same_path[0].folder == "Test Transfer"
+    assert same_path[0].generation_params["editor_export"]["produced_by"]["node"] == "SonderSaveBridge"
+    assert result.get_asset("bridge-asset") is not None
+
+
+def test_versioned_media_sync_saves_fresh_repairs_after_conflict(tmp_path, monkeypatch):
+    base_dir = tmp_path / "projects"
+    project = create_project("Asset Sync Repair Race", base_dir=str(base_dir))
+    _write_project_file(project, "media/new.png", b"image")
+    _write_project_file(project, "media/clip.mp4", b"video")
+
+    monkeypatch.setattr(routes, "ensure_thumbnail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", lambda *args, **kwargs: {
+        "width": 64,
+        "height": 64,
+        "frame_count": 0,
+        "fps": 0.0,
+        "duration_sec": 0.0,
+        "sample_rate": 0,
+        "has_audio": False,
+    })
+    monkeypatch.setattr(routes, "_video_has_audio", lambda _filepath: True)
+
+    stale = load_project(project.project_dir)
+    base_version = stale.modified_at
+    real_save = routes.save_project
+    injected = {"done": False}
+
+    def racing_save(project_to_save, *args, **kwargs):
+        if not injected["done"]:
+            injected["done"] = True
+            current = load_project(project.project_dir)
+            current.assets.append(Asset(
+                asset_id="video-asset",
+                name="clip.mp4",
+                asset_type="video",
+                path=os.path.join("media", "clip.mp4"),
+                has_audio=False,
+                has_audio_checked=False,
+            ))
+            real_save(current, expected_modified_at=base_version)
+        return real_save(project_to_save, *args, **kwargs)
+
+    monkeypatch.setattr(routes, "save_project", racing_save)
+
+    routes._sync_media_folder_versioned(
+        stale,
+        reload_project=lambda: load_project(project.project_dir),
+    )
+    restored = load_project(project.project_dir)
+
+    assert restored.get_asset("video-asset").has_audio is True
+    assert restored.get_asset("video-asset").has_audio_checked is True
+    assert any(asset.path.replace("\\", "/") == "media/new.png" for asset in restored.assets)
+
+
+def test_versioned_media_sync_purges_trash_only_after_reloading_current_project(tmp_path):
+    base_dir = tmp_path / "projects"
+    project = create_project("Asset Sync Trash Race", base_dir=str(base_dir))
+    media_rel_path = os.path.join("media", "keep.mp4")
+    media_abs_path = _write_project_file(project, media_rel_path, b"video")
+    project.assets.append(Asset(
+        asset_id="keep-asset",
+        name="keep.mp4",
+        asset_type="video",
+        path=media_rel_path,
+        trashed_at=(datetime.now() - timedelta(days=10)).isoformat(),
+        trash_previous_folder="Shots",
+    ))
+    save_project(project)
+
+    stale = load_project(project.project_dir)
+    current = load_project(project.project_dir)
+    current.assets[0].trashed_at = ""
+    current.assets[0].trash_previous_folder = ""
+    current.assets[0].folder = "Shots"
+    save_project(current, expected_modified_at=stale.modified_at)
+
+    routes._sync_media_folder_versioned(
+        stale,
+        trash_retention_days=7,
+        reload_project=lambda: load_project(project.project_dir),
+    )
+    restored = load_project(project.project_dir)
+
+    assert os.path.exists(media_abs_path)
+    assert restored.get_asset("keep-asset").trashed_at == ""
+    assert restored.get_asset("keep-asset").folder == "Shots"
 
 
 def test_find_asset_usages_returns_unified_usage_list(tmp_path):
@@ -683,10 +824,11 @@ def test_asset_list_route_forwards_trash_retention_query_params(tmp_path, monkey
     project = _make_project(tmp_path)
     captured = {}
 
-    def fake_sync(sync_project, retention_days, max_size_mb):
+    def fake_sync(sync_project, retention_days, max_size_mb, *, purge_trashed=True):
         captured["project"] = sync_project
         captured["retention_days"] = retention_days
         captured["max_size_mb"] = max_size_mb
+        captured["purge_trashed"] = purge_trashed
         return False
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
@@ -703,4 +845,5 @@ def test_asset_list_route_forwards_trash_retention_query_params(tmp_path, monkey
         "project": project,
         "retention_days": 7,
         "max_size_mb": 1.5,
+        "purge_trashed": False,
     }

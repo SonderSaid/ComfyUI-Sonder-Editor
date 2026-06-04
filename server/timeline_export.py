@@ -475,6 +475,11 @@ def _register_export_asset(
     return asset
 
 
+def _resolve_committed_asset_id(committed_project: TimelineProject, asset_id: str) -> str:
+    asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) or {}
+    return asset_id_remap.get(asset_id, asset_id)
+
+
 class TimelineExportManager:
     def __init__(self, *, max_workers: int = 2, ttl_seconds: int = 10 * 60):
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sonder-export")
@@ -753,11 +758,15 @@ class TimelineExportManager:
                         logger.warning("Timeline export take audio extraction failed: %s", exc)
                         job.warnings.append("Placed video take, but embedded audio extraction failed.")
 
-            save_generated_project(current_project, base_modified_at, created_ids=created_ids_since(_pre_item_ids, current_project))
+            committed_project = save_generated_project(
+                current_project,
+                base_modified_at,
+                created_ids=created_ids_since(_pre_item_ids, current_project),
+            )
             cleanup_paths.remove(final_output_path)
             if placed_audio_cleanup_path and placed_audio_cleanup_path in cleanup_paths:
                 cleanup_paths.remove(placed_audio_cleanup_path)
-            job.result_asset_id = asset.asset_id
+            job.result_asset_id = _resolve_committed_asset_id(committed_project, asset.asset_id)
             job.status = "completed"
             job.phase = "done"
             job.message = "Done"

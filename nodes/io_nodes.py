@@ -20,7 +20,13 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server.project_manager import load_project, save_project
-from ..server.project_commit import created_ids_since, save_generated_project, snapshot_item_ids
+from ..server.project_commit import (
+    _copy_generated_asset_registration,
+    _same_path_placeholder_can_upgrade,
+    created_ids_since,
+    save_generated_project,
+    snapshot_item_ids,
+)
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
@@ -815,6 +821,24 @@ def _cleanup_bridge_output_dir(bridge_dir: str) -> None:
         shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
+def _normalize_asset_path_for_compare(path: str) -> str:
+    return str(path or "").replace("\\", "/").strip()
+
+
+def _upgrade_bridge_placeholder_asset(project, source_asset: Asset) -> tuple[Asset, bool]:
+    source_path = _normalize_asset_path_for_compare(source_asset.path)
+    if not source_path:
+        return source_asset, False
+    for existing in getattr(project, "assets", []) or []:
+        if _normalize_asset_path_for_compare(existing.path) != source_path:
+            continue
+        if not _same_path_placeholder_can_upgrade(existing):
+            continue
+        _copy_generated_asset_registration(existing, source_asset)
+        return existing, True
+    return source_asset, False
+
+
 def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     project = load_project(entry["project_dir"])
     _pre_item_ids = snapshot_item_ids(project)
@@ -835,6 +859,24 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     os.makedirs(media_dir, exist_ok=True)
 
     counter = 0
+    planned_final_names = set()
+    pending_moves = []
+
+    def _reserve_final_name(target_basename: str) -> str:
+        final_name = _bridge_unique_media_name(media_dir, target_basename)
+        if final_name not in planned_final_names:
+            planned_final_names.add(final_name)
+            return final_name
+        stem, ext = os.path.splitext(target_basename)
+        suffix = 1
+        while True:
+            candidate = f"{stem}_{suffix}{ext}"
+            final_name = _bridge_unique_media_name(media_dir, candidate)
+            if final_name not in planned_final_names:
+                planned_final_names.add(final_name)
+                return final_name
+            suffix += 1
+
     for rel_path in new_files:
         source_path = os.path.join(bridge_dir, rel_path)
         if not os.path.isfile(source_path):
@@ -844,15 +886,14 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         source_basename = os.path.basename(source_path)
         _stem_part, ext = os.path.splitext(source_basename)
         target_basename = f"{naming_stem}_{counter:04d}{ext}"
-        final_name = _bridge_unique_media_name(media_dir, target_basename)
+        final_name = _reserve_final_name(target_basename)
         final_path = os.path.join(media_dir, final_name)
-        shutil.move(source_path, final_path)
 
         asset_type, artifact_kind = classify_asset_path(final_path)
-        metadata = _extract_bridge_asset_metadata(final_path, asset_type)
+        metadata = _extract_bridge_asset_metadata(source_path, asset_type)
         generation_params = _generation_params_with_detected_workflow(
             dict(entry.get("generation_params") or {}),
-            final_path,
+            source_path,
         )
         asset = Asset(
             name=final_name,
@@ -870,11 +911,15 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
             has_audio=metadata["has_audio"],
             folder=target_folder,
         )
-        project.add_asset(asset)
-        if asset_type in {"video", "image", "audio"}:
-            from ..server.thumbnail_service import ensure_thumbnail
-            thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
-            ensure_thumbnail(asset_type, final_path, thumb_path)
+        asset, upgraded_placeholder = _upgrade_bridge_placeholder_asset(project, asset)
+        if not upgraded_placeholder:
+            project.add_asset(asset)
+        pending_moves.append({
+            "asset": asset,
+            "asset_type": asset_type,
+            "source_path": source_path,
+            "final_path": final_path,
+        })
         registered_assets.append((rel_path, asset))
 
     changed = bool(registered_assets)
@@ -903,7 +948,16 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         )
 
     if changed:
-        _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
+        committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
+        asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) if committed_project is not None else {}
+        for pending in pending_moves:
+            shutil.move(pending["source_path"], pending["final_path"])
+            if pending["asset_type"] in {"video", "image", "audio"}:
+                from ..server.thumbnail_service import ensure_thumbnail
+                asset = pending["asset"]
+                committed_asset_id = asset_id_remap.get(asset.asset_id, asset.asset_id)
+                thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{committed_asset_id}.png")
+                ensure_thumbnail(pending["asset_type"], pending["final_path"], thumb_path)
 
     logger.info(
         "Bridge finalize: prompt=%s node=%s moved=%d target_folder=%s stem=%s",

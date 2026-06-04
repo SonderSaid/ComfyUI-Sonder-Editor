@@ -106,6 +106,36 @@ def test_bridge_registers_image_output(tmp_path, monkeypatch):
     assert asset.path.endswith("_0001.png")
 
 
+def test_bridge_upgrades_blank_same_path_placeholder(tmp_path, monkeypatch):
+    io_nodes, timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "_build_bridge_naming_stem", lambda *args, **kwargs: "fixed_stem")
+
+    placeholder_path = os.path.join("media", "fixed_stem_0001.png")
+    project.assets.append(timeline_state.Asset(
+        asset_id="auto-sync-placeholder",
+        name="fixed_stem_0001.png",
+        asset_type="image",
+        path=placeholder_path,
+    ))
+    project_manager.save_project(project)
+
+    bridge = io_nodes.SonderSaveBridge()
+    output_dir, _filename_prefix = bridge.prepare_output(project, target_folder="Test Transfer", prompt={}, unique_id="bridge-1")
+    _write_png(Path(output_dir) / "out.png")
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    same_path = [asset for asset in restored.assets if asset.path == placeholder_path]
+    assert [asset.asset_id for asset in same_path] == ["auto-sync-placeholder"]
+    upgraded = same_path[0]
+    assert upgraded.folder == "Test Transfer"
+    assert upgraded.generation_params["editor_export"]["produced_by"]["tool"] == "sonder-editor"
+
+
 def test_bridge_marks_asset_workflow_when_downstream_file_embeds_it(tmp_path, monkeypatch):
     io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
     _clear_bridge_state(io_nodes)
