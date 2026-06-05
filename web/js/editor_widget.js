@@ -133,6 +133,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 }
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { mountSharedRenderQueue, queueBatchIds } from "./shared_render_queue.js";
 import { createViewportSurface } from "./viewport_surface.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -3260,12 +3261,7 @@ export class EditorWidget {
     }
 
     _currentRenderQueueBatchIds(queue = this._renderQueue) {
-        return new Set(
-            this._groupRenderQueueJobs(queue || [])
-                .filter((entry) => entry.type === "batch")
-                .map((entry) => entry.batchId)
-                .filter(Boolean)
-        );
+        return queueBatchIds(queue || []);
     }
 
     _applyStoredQueueBatchCollapseState(settings = this._settings) {
@@ -3297,14 +3293,16 @@ export class EditorWidget {
         });
     }
 
-    _setQueueBatchExpanded(batchId, expanded, options = {}) {
-        if (!batchId) return;
-        const { persist = false, render = true } = options;
-        if (expanded) {
-            delete this._queueBatchExpanded[batchId];
-        } else {
-            this._queueBatchExpanded[batchId] = false;
+    _setQueueBatchCollapsedIds(collapsedIds, options = {}) {
+        const { persist = false, render = false } = options;
+        const validBatchIds = this._currentRenderQueueBatchIds();
+        const nextBatchExpanded = {};
+        for (const batchId of (collapsedIds instanceof Set ? collapsedIds : [])) {
+            if (validBatchIds.has(batchId)) {
+                nextBatchExpanded[batchId] = false;
+            }
         }
+        this._queueBatchExpanded = nextBatchExpanded;
         if (persist) {
             this._persistQueueBatchCollapseState();
         }
@@ -9959,6 +9957,7 @@ export class EditorWidget {
         } catch (e) {
             console.error("Clear completed renders failed:", e);
             this._showToast(e?.message || "Clear completed renders failed.");
+            throw e;
         }
     }
 
@@ -10006,243 +10005,21 @@ export class EditorWidget {
         }
     }
 
-    _createRenderQueueActiveControl() {
-        const row = document.createElement("label");
-        row.style.cssText = `
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-            padding: 7px 8px;
-            border-bottom: 1px solid ${COLORS.borderSoft};
-            color: ${COLORS.textMuted};
-            font-size: 10px;
-            cursor: pointer;
-            user-select: none;
-        `;
-        row.title = "Toggle whether queued jobs drive editor execution";
-
-        const label = document.createElement("span");
-        label.textContent = "Queue Active";
-        label.style.cssText = `font-weight: 700; color: ${COLORS.text};`;
-
-        const right = document.createElement("span");
-        right.style.cssText = `display: flex; align-items: center; gap: 6px;`;
-
-        const status = document.createElement("span");
-        status.textContent = this.renderQueueActive === false ? "Off" : "On";
-        status.style.cssText = `color: ${COLORS.textDim}; font-size: 10px;`;
-
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = this.renderQueueActive !== false;
-        checkbox.title = row.title;
-        checkbox.style.cssText = `margin: 0;`;
-        checkbox.addEventListener("click", (event) => event.stopPropagation());
-        checkbox.addEventListener("change", () => this._setRenderQueueActive(checkbox.checked));
-
-        right.append(status, checkbox);
-        row.append(label, right);
-        return row;
-    }
-
-    _groupRenderQueueJobs(queue) {
-        const groups = [];
-        let index = 0;
-        while (index < queue.length) {
-            const job = queue[index];
-            const batchId = String(job?.batch_id || "");
-            if (!batchId) {
-                groups.push({ type: "single", job });
-                index += 1;
-                continue;
+    async _deleteRenderQueueJob(job) {
+        if (!this._projectDirName() || !job?.job_id) return;
+        try {
+            const dirName = encodeURIComponent(this._projectDirName());
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
+            if (!resp.ok) {
+                const message = await this._readQueueError(resp, `Delete queue job failed: ${resp.status}`);
+                throw new Error(message);
             }
-
-            const jobs = [job];
-            index += 1;
-            while (index < queue.length && String(queue[index]?.batch_id || "") === batchId) {
-                jobs.push(queue[index]);
-                index += 1;
-            }
-
-            if (jobs.length === 1) {
-                groups.push({ type: "single", job });
-                continue;
-            }
-            groups.push({ type: "batch", batchId, jobs });
+            await this._fetchRenderQueue();
+        } catch (e) {
+            console.error("Delete queue job failed:", e);
+            this._showToast(e?.message || "Delete queue job failed.");
+            throw e;
         }
-        return groups;
-    }
-
-    _formatQueueStatusLabel(status) {
-        const raw = String(status || "pending").trim().toLowerCase();
-        if (!raw) return "Pending";
-        return raw.charAt(0).toUpperCase() + raw.slice(1);
-    }
-
-    _formatQueueSelectionSummary(job) {
-        const start = Math.max(0, parseInt(job?.selection_start, 10) || 0);
-        const end = Math.max(start, parseInt(job?.selection_end, 10) || 0);
-        const duration = end - start;
-        const preContext = Math.max(0, parseInt(job?.pre_context_frames, 10) || 0);
-        const postContext = Math.max(0, parseInt(job?.post_context_frames, 10) || 0);
-        const maskPre = Math.max(0, parseInt(job?.mask_pre_offset, 10) || 0);
-        const maskPost = Math.max(0, parseInt(job?.mask_post_offset, 10) || 0);
-        return `In: ${this._frameToTimecode(start)} Out: ${this._frameToTimecode(end)} (${this._frameToTimecode(duration)}) | Ctx: -${preContext}/+${postContext} | Mask Offset: -${maskPre}/+${maskPost}`;
-    }
-
-    _createQueueRow(job, { title = "", nested = false } = {}) {
-        const item = document.createElement("div");
-        item.style.cssText = `
-            padding: 6px 8px${nested ? " 6px 18px" : ""};
-            border-bottom: 1px solid ${COLORS.borderSoft};
-            display: grid;
-            grid-template-columns: auto minmax(0, 1fr) auto;
-            gap: 8px;
-            font-size: 10px;
-            color: ${COLORS.text};
-            background: ${nested ? COLORS.panel : COLORS.panelMuted};
-            align-items: start;
-        `;
-
-        const badge = document.createElement("span");
-        const colors = {
-            pending: COLORS.textMuted,
-            running: lightenColor(COLORS.sceneBtnActive, 0.15),
-            completed: "#68a376",
-            failed: "#c66d76",
-        };
-        badge.style.cssText = `
-            width: 8px;
-            height: 8px;
-            margin-top: 4px;
-            border-radius: 50%;
-            background: ${colors[job.status] || "#888"};
-            flex-shrink: 0;
-        `;
-        badge.title = job.status;
-        item.appendChild(badge);
-
-        const content = document.createElement("div");
-        content.style.cssText = "min-width:0;display:flex;flex-direction:column;gap:2px;";
-        if (job.prompt) content.title = job.prompt;
-
-        const headingRow = document.createElement("div");
-        headingRow.style.cssText = "display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0;";
-
-        const heading = document.createElement("div");
-        heading.style.cssText = `
-            color: ${COLORS.text};
-            font-size: 11px;
-            font-weight: 600;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            min-width: 0;
-        `;
-        heading.textContent = title || job.scene_name || "Scene";
-
-        const statusLabel = document.createElement("div");
-        statusLabel.style.cssText = `
-            color: ${COLORS.textMuted};
-            font-size: 10px;
-            flex-shrink: 0;
-            white-space: nowrap;
-        `;
-        statusLabel.textContent = this._formatQueueStatusLabel(job?.status);
-
-        const selectionSummary = document.createElement("div");
-        selectionSummary.style.cssText = `
-            color: ${COLORS.textDim};
-            font-size: 10px;
-            line-height: 1.35;
-            white-space: normal;
-            overflow-wrap: anywhere;
-        `;
-        selectionSummary.textContent = this._formatQueueSelectionSummary(job);
-
-        headingRow.append(heading, statusLabel);
-        content.append(headingRow, selectionSummary);
-        item.appendChild(content);
-
-        const delBtn = document.createElement("span");
-        delBtn.textContent = "x";
-        delBtn.style.cssText = `color: ${COLORS.textMuted}; cursor: pointer; padding: 0 2px; font-size: 9px;`;
-        delBtn.addEventListener("click", async () => {
-            try {
-                const dirName = encodeURIComponent(this._projectDirName());
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
-                await this._fetchRenderQueue();
-            } catch (e) {
-                console.error("Delete queue job failed:", e);
-            }
-        });
-        item.appendChild(delBtn);
-
-        return item;
-    }
-
-    _renderQueueBatchGroup(entry) {
-        const batchTotal = Math.max(
-            entry.jobs.length,
-            ...entry.jobs.map((job) => Math.max(0, parseInt(job.batch_total, 10) || 0)),
-        );
-        const shortId = entry.batchId.slice(0, 8);
-        const isOpen = this._queueBatchExpanded[entry.batchId] !== false;
-
-        const group = document.createElement("div");
-        group.style.cssText = `border-bottom: 1px solid ${COLORS.borderSoft}; background: ${COLORS.panelMuted};`;
-
-        const header = document.createElement("button");
-        header.type = "button";
-        header.style.cssText = `
-            width: 100%;
-            padding: 6px 8px;
-            background: ${COLORS.panelMuted};
-            border: none;
-            border-bottom: 1px solid ${COLORS.borderSoft};
-            color: ${COLORS.text};
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-            cursor: pointer;
-            font-size: 10px;
-            font-weight: 700;
-            text-align: left;
-        `;
-
-        const countLabel = entry.jobs.length === batchTotal
-            ? `${batchTotal} chunk${batchTotal === 1 ? "" : "s"}`
-            : `${entry.jobs.length} of ${batchTotal} chunks`;
-
-        const headerLabel = document.createElement("span");
-        headerLabel.textContent = `${isOpen ? "v" : ">"} Batch ${shortId} - ${countLabel}`;
-
-        const headerScene = document.createElement("span");
-        headerScene.style.cssText = `color:${COLORS.textMuted};font-weight:600;`;
-        headerScene.textContent = entry.jobs[0]?.scene_name || "Scene";
-
-        header.append(headerLabel, headerScene);
-        header.addEventListener("click", () => {
-            this._setQueueBatchExpanded(entry.batchId, !isOpen, { persist: true });
-        });
-        group.appendChild(header);
-
-        if (isOpen) {
-            const nested = document.createElement("div");
-            nested.style.cssText = "display:flex;flex-direction:column;";
-            entry.jobs.forEach((job, index) => {
-                const chunkIndex = Math.max(1, (parseInt(job.batch_index, 10) || index) + 1);
-                nested.appendChild(this._createQueueRow(job, {
-                    title: `Chunk ${chunkIndex} of ${batchTotal}`,
-                    nested: true,
-                }));
-            });
-            group.appendChild(nested);
-        }
-
-        return group;
     }
 
     _renderQueuePanel() {
@@ -10250,53 +10027,28 @@ export class EditorWidget {
         this._queueContainer.innerHTML = "";
         this._updateQueueHeaderLabel();
         this._updateQueueChromeStatus();
-
-        const queue = this._renderQueue || [];
-        this._queueContainer.appendChild(this._createRenderQueueActiveControl());
-        if (queue.length === 0) {
-            const emptyEl = document.createElement("div");
-            emptyEl.style.cssText = `padding: 10px; color: ${COLORS.textMuted}; font-style: italic; font-size: 10px;`;
-            emptyEl.textContent = "Queue empty - use + Queue or + Batch to add jobs";
-            this._queueContainer.appendChild(emptyEl);
-            return;
-        }
-
-        const completedCount = queue.filter((job) => String(job?.status || "").toLowerCase() === "completed").length;
-        if (completedCount > 0) {
-            const actions = document.createElement("div");
-            actions.style.cssText = `
-                display: flex;
-                justify-content: flex-end;
-                align-items: center;
-                gap: 6px;
-                padding: 6px 8px;
-                border-bottom: 1px solid ${COLORS.borderSoft};
-                background: ${COLORS.panelMuted};
-            `;
-            const clearBtn = document.createElement("button");
-            clearBtn.type = "button";
-            clearBtn.textContent = "Clear Completed Renders";
-            clearBtn.title = `Remove ${completedCount} completed render${completedCount === 1 ? "" : "s"} from the queue`;
-            clearBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "4px 8px", fontSize: "10px", radius: "6px" });
-            clearBtn.addEventListener("click", async (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                clearBtn.disabled = true;
-                clearBtn.style.opacity = "0.65";
-                await this._clearCompletedRenderQueue();
-            });
-            actions.appendChild(clearBtn);
-            this._queueContainer.appendChild(actions);
-        }
-
-        const groups = this._groupRenderQueueJobs(queue);
-        for (const entry of groups) {
-            if (entry.type === "single") {
-                this._queueContainer.appendChild(this._createQueueRow(entry.job));
-                continue;
-            }
-            this._queueContainer.appendChild(this._renderQueueBatchGroup(entry));
-        }
+        const collapsedIds = new Set(
+            Array.from(this._currentRenderQueueBatchIds())
+                .filter((batchId) => this._queueBatchExpanded[batchId] === false)
+        );
+        mountSharedRenderQueue(this._queueContainer, {
+            jobs: this._renderQueue || [],
+            queueActive: this.renderQueueActive !== false,
+            surface: "fullscreen",
+            projectKey: this._queueBatchCollapseProjectKey(),
+            timecodeMode: this._timecodeMode,
+            fallbackFps: this._effectiveFps,
+            collapsedBatchIds: collapsedIds,
+            emptyText: "Queue empty - use + Queue or + Batch to add jobs",
+            showDeleteJob: true,
+            showClearCompleted: true,
+            onSetQueueActive: (active) => this._setRenderQueueActive(active),
+            onDeleteJob: async (job) => await this._deleteRenderQueueJob(job),
+            onClearCompleted: async () => await this._clearCompletedRenderQueue(),
+            onBatchCollapsedChange: (nextCollapsedIds) => {
+                this._setQueueBatchCollapsedIds(nextCollapsedIds, { persist: true });
+            },
+        });
     }
 
     // ── Undo / Redo ───────────────────────────────────────────────────

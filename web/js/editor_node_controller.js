@@ -21,6 +21,11 @@ import {
 import { connectProjectSync } from "./cross_tab_sync.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import {
+    mountSharedRenderQueue,
+    persistQueueBatchCollapseState,
+    readQueueBatchCollapseState,
+} from "./shared_render_queue.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEYBOARD_PRIORITY } from "./keyboard_ownership.js";
 import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
 
@@ -144,14 +149,6 @@ function makeStatusPill(text, state = "idle", { fontSize = "10px", padding = "2p
     return pill;
 }
 
-function statusStateForQueue(status) {
-    const normalized = String(status || "pending").trim().toLowerCase();
-    if (normalized === "running") return "running";
-    if (normalized === "pending") return "pending";
-    if (normalized === "failed") return "failed";
-    return "idle";
-}
-
 function iconForAssetType(type) {
     if (type === "video") return "🎬";
     if (type === "image") return "🖼";
@@ -189,90 +186,6 @@ function formatCountLabel(prefix, value) {
 function formatDurationFrames(frameCount) {
     if (!Number.isFinite(frameCount) || frameCount <= 0) return "0f";
     return `${frameCount}f`;
-}
-
-function formatQueueStatusLabel(status) {
-    const raw = String(status || "pending").trim().toLowerCase();
-    if (!raw) return "Pending";
-    return raw.charAt(0).toUpperCase() + raw.slice(1);
-}
-
-function formatQueueTime(frame, fps, mode = "frames") {
-    const safeFrame = Math.max(0, parseInt(frame, 10) || 0);
-    if (mode !== "timecode") return String(safeFrame);
-    const safeFps = Math.max(1, Number(fps) || 24);
-    const totalSeconds = safeFrame / safeFps;
-    const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = Math.floor(totalSeconds % 60);
-    const f = Math.floor(safeFrame % safeFps);
-    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}:${String(f).padStart(2, "0")}`;
-    return `${m}:${String(s).padStart(2, "0")}:${String(f).padStart(2, "0")}`;
-}
-
-function formatQueueSelectionSummary(job, options = {}) {
-    const start = Math.max(0, parseInt(job?.selection_start, 10) || 0);
-    const end = Math.max(start, parseInt(job?.selection_end, 10) || 0);
-    const duration = end - start;
-    const preContext = Math.max(0, parseInt(job?.pre_context_frames, 10) || 0);
-    const postContext = Math.max(0, parseInt(job?.post_context_frames, 10) || 0);
-    const fps = Math.max(1, Number(job?.scene_fps) || Number(options.fps) || 24);
-    const mode = options.mode === "timecode" ? "timecode" : "frames";
-    return `In: ${formatQueueTime(start, fps, mode)} Out: ${formatQueueTime(end, fps, mode)} (${formatQueueTime(duration, fps, mode)}) | Ctx: -${preContext}/+${postContext}`;
-}
-
-function groupQueueJobs(queue) {
-    const groups = [];
-    let index = 0;
-    while (index < queue.length) {
-        const job = queue[index];
-        const batchId = String(job?.batch_id || "");
-        if (!batchId) {
-            groups.push({ type: "single", job });
-            index += 1;
-            continue;
-        }
-
-        const jobs = [job];
-        index += 1;
-        while (index < queue.length && String(queue[index]?.batch_id || "") === batchId) {
-            jobs.push(queue[index]);
-            index += 1;
-        }
-
-        if (jobs.length === 1) {
-            groups.push({ type: "single", job });
-            continue;
-        }
-        groups.push({ type: "batch", batchId, jobs });
-    }
-    return groups;
-}
-
-function readQueueBatchCollapseState(projectDir, settings = getEditorSettings()) {
-    const projectKey = projectIdFromDir(projectDir);
-    const collapsedByProject = settings?.layout?.queueBatchCollapsedByProject;
-    const collapsedIds = projectKey && collapsedByProject && typeof collapsedByProject === "object"
-        ? collapsedByProject[projectKey]
-        : null;
-    if (!Array.isArray(collapsedIds)) {
-        return new Set();
-    }
-    return new Set(collapsedIds.filter((value) => typeof value === "string" && value));
-}
-
-function persistQueueBatchCollapseState(projectDir, collapsedIds) {
-    const projectKey = projectIdFromDir(projectDir);
-    if (!projectKey) return;
-    updateEditorSettings({
-        layout: {
-            queueBatchCollapsedByProject: {
-                [projectKey]: Array.from(collapsedIds)
-                    .filter((value) => typeof value === "string" && value)
-                    .sort(),
-            },
-        },
-    });
 }
 
 function formatClockTime(seconds) {
@@ -3878,316 +3791,50 @@ export class EditorNodeController {
     }
 
     _mountQueueModule(container, data) {
-        const wrap = style(document.createElement("div"), `
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            flex: 1 1 auto;
-            min-height: 0;
-            height: 100%;
-            overflow-y: auto;
-            padding-right: 2px;
-            box-sizing: border-box;
-        `);
-        container.appendChild(wrap);
-
-        const activeRow = style(document.createElement("label"), `
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-            padding: 7px 8px;
-            border-radius: 6px;
-            background: rgba(255,255,255,0.03);
-            border: 1px solid ${CHROME.borderSoft};
-            color: ${CHROME.text};
-            font-size: 10px;
-            font-weight: 700;
-            cursor: pointer;
-            user-select: none;
-        `);
-        activeRow.title = "Toggle whether queued jobs drive editor execution";
-        const activeLabel = style(document.createElement("span"), `min-width: 0;`);
-        activeLabel.textContent = "Queue Active";
-        const activeRight = style(document.createElement("span"), `
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            color: ${CHROME.textDim};
-            font-size: 10px;
-            font-weight: 600;
-        `);
-        const activeStatus = document.createElement("span");
-        const activeCheckbox = document.createElement("input");
-        activeCheckbox.type = "checkbox";
-        activeCheckbox.checked = this.state.renderQueueActive !== false;
-        activeCheckbox.style.cssText = "margin: 0;";
-        activeStatus.textContent = activeCheckbox.checked ? "On" : "Off";
-        activeRow.addEventListener("pointerdown", (event) => consumeDormantPointer(event));
-        activeRow.addEventListener("mousedown", (event) => consumeDormantPointer(event));
-        activeRow.addEventListener("click", (event) => consumeDormantPointer(event));
-        activeCheckbox.addEventListener("click", (event) => event.stopPropagation());
-        activeCheckbox.addEventListener("change", (event) => {
-            event.stopPropagation();
-            const nextActive = activeCheckbox.checked;
-            activeStatus.textContent = nextActive ? "On" : "Off";
-            this._setWidgetValue("render_queue_active", nextActive);
-            this.state.renderQueueActive = nextActive;
-            this._seedWidgetState({ render_queue_active: nextActive }, { seed: false });
-            this._schedulePreviewStateRefresh(["queue", "preview"]);
-            this.fullscreenSession?.editor?._setRenderQueueActive?.(nextActive, { syncWidget: false });
-        });
-        activeRight.append(activeStatus, activeCheckbox);
-        activeRow.append(activeLabel, activeRight);
-        wrap.appendChild(activeRow);
-
-        const allJobs = Array.isArray(data) ? data : [];
-        const completedCount = allJobs.filter((job) => String(job?.status || "").toLowerCase() === "completed").length;
-        const jobs = allJobs;
-        if (!jobs.length) {
-            const emptyEl = style(document.createElement("div"), `
-                padding: 10px;
-                border-radius: 6px;
-                background: rgba(255,255,255,0.04);
-                border: 1px solid ${CHROME.borderSoft};
-                color: ${CHROME.textDim};
-            `);
-            emptyEl.textContent = "Render queue is empty.";
-            wrap.appendChild(emptyEl);
-            return null;
-        }
-
-        if (completedCount > 0) {
-            const actions = style(document.createElement("div"), `
-                display: flex;
-                justify-content: flex-end;
-                align-items: center;
-                gap: 6px;
-                padding-bottom: 2px;
-            `);
-            const clearCompleted = style(document.createElement("button"), buttonStyle("subtle", {
-                padding: "4px 7px",
-                radius: "6px",
-                fontSize: "10px",
-                fontWeight: "700",
-            }));
-            clearCompleted.type = "button";
-            clearCompleted.textContent = "Clear Completed Renders";
-            clearCompleted.title = `Remove ${completedCount} completed render${completedCount === 1 ? "" : "s"} from the queue`;
-            clearCompleted.addEventListener("pointerdown", (event) => consumeDormantPointer(event, { preventDefault: true }));
-            clearCompleted.addEventListener("mousedown", (event) => consumeDormantPointer(event, { preventDefault: true }));
-            clearCompleted.addEventListener("click", async (event) => {
-                consumeDormantPointer(event, { preventDefault: true });
-                clearCompleted.disabled = true;
-                clearCompleted.style.opacity = "0.65";
-                try {
-                    const response = await fetch(buildQueueUrl(this.state.projectDir), { method: "DELETE" });
-                    if (!response.ok) {
-                        throw new Error(`Clear completed renders failed: ${response.status}`);
-                    }
-                    await this.refreshSummary();
-                    this._invalidateModules(["queue", "preview"]);
-                    this._reloadExpandedModuleIfNeeded(["queue", "preview"]);
-                    this.fullscreenSession?.refresh(["queue"]);
-                } catch (error) {
-                    console.warn("[Sonder] Failed to clear completed renders:", error);
-                }
-            });
-            actions.appendChild(clearCompleted);
-            wrap.appendChild(actions);
-        }
-
         const settings = getEditorSettings();
         const timecodeMode = settings?.timelineBehavior?.timecodeMode === "timecode" ? "timecode" : "frames";
-        const collapsedBatchIds = readQueueBatchCollapseState(this.state.projectDir, settings);
+        const projectKey = projectIdFromDir(this.state.projectDir);
+        const collapsedBatchIds = readQueueBatchCollapseState(projectKey, settings);
         const fallbackFps = Math.max(
             1,
             Number(this.state?.dormantSummary?.active_scene?.effective_fps)
                 || Number(this.state?.dormantSummary?.fps)
                 || 24
         );
-        const createQueueRow = (job, options = {}) => {
-            const statusState = statusStateForQueue(job?.status);
-            const row = style(document.createElement("div"), `
-                display: grid;
-                grid-template-columns: auto minmax(0, 1fr);
-                gap: 8px;
-                padding: 7px 8px${options.nested ? " 7px 18px" : ""};
-                border-radius: 6px;
-                background: ${options.nested ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)"};
-                border: 1px solid ${CHROME.borderSoft};
-                align-items: start;
-            `);
-
-            const dot = style(document.createElement("span"), `
-                width: 8px;
-                height: 8px;
-                margin-top: 4px;
-                border-radius: 50%;
-                background: ${statusState === "running"
-                    ? THEME.statusRunning
-                    : statusState === "pending"
-                        ? THEME.statusPending
-                        : statusState === "failed"
-                            ? THEME.statusFailed
-                            : THEME.statusIdle};
-            `);
-
-            const text = style(document.createElement("div"), `
-                min-width: 0;
-                display: flex;
-                flex-direction: column;
-                gap: 2px;
-            `);
-            if (job.prompt) {
-                text.title = job.prompt;
-            }
-
-            const headingRow = style(document.createElement("div"), `
-                display: flex;
-                align-items: baseline;
-                justify-content: space-between;
-                gap: 8px;
-                min-width: 0;
-            `);
-
-            const title = style(document.createElement("div"), `
-                color: ${CHROME.text};
-                font-size: 11px;
-                font-weight: 600;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                min-width: 0;
-            `);
-            title.textContent = options.title || job.scene_name || "Scene";
-
-            const status = makeStatusPill(formatQueueStatusLabel(job?.status), statusState, {
-                fontSize: "10px",
-                padding: "1px 7px",
-            });
-            status.style.flexShrink = "0";
-            status.style.whiteSpace = "nowrap";
-
-            const selectionSummary = style(document.createElement("div"), `
-                color: ${CHROME.textDim};
-                font-size: 10px;
-                line-height: 1.35;
-                white-space: normal;
-                overflow-wrap: anywhere;
-            `);
-            selectionSummary.textContent = formatQueueSelectionSummary(job, {
-                fps: fallbackFps,
-                mode: timecodeMode,
-            });
-
-            headingRow.append(title, status);
-            text.append(headingRow, selectionSummary);
-            row.append(dot, text);
-            return row;
-        };
-
-        const groups = groupQueueJobs(jobs);
-        for (const entry of groups) {
-            if (entry.type === "single") {
-                wrap.appendChild(createQueueRow(entry.job));
-                continue;
-            }
-
-            const batchTotal = Math.max(
-                entry.jobs.length,
-                ...entry.jobs.map((job) => Math.max(0, parseInt(job?.batch_total, 10) || 0)),
-            );
-            const countLabel = entry.jobs.length === batchTotal
-                ? `${batchTotal} chunk${batchTotal === 1 ? "" : "s"}`
-                : `${entry.jobs.length} of ${batchTotal} chunks`;
-            const isOpen = !collapsedBatchIds.has(entry.batchId);
-
-            const group = style(document.createElement("div"), `
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-                padding: 0;
-                border-radius: 6px;
-                background: rgba(255,255,255,0.02);
-                border: 1px solid ${CHROME.borderSoft};
-            `);
-
-            const header = style(document.createElement("button"), `
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 8px;
-                width: 100%;
-                padding: 7px 8px;
-                background: rgba(255,255,255,0.03);
-                border-bottom: 1px solid ${CHROME.borderSoft};
-                color: ${CHROME.text};
-                font-size: 10px;
-                font-weight: 700;
-                cursor: pointer;
-                border-top: none;
-                border-left: none;
-                border-right: none;
-                border-bottom-left-radius: 0;
-                border-bottom-right-radius: 0;
-                text-align: left;
-            `);
-            header.type = "button";
-            header.setAttribute("aria-expanded", isOpen ? "true" : "false");
-
-            const label = style(document.createElement("span"), `
-                min-width: 0;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-            `);
-            label.textContent = `${isOpen ? "v" : ">"} Batch ${entry.batchId.slice(0, 8)} - ${countLabel}`;
-
-            const scene = style(document.createElement("span"), `
-                color: ${CHROME.textMuted};
-                font-weight: 600;
-                flex-shrink: 0;
-            `);
-            scene.textContent = entry.jobs[0]?.scene_name || "Scene";
-
-            header.append(label, scene);
-            group.appendChild(header);
-            header.addEventListener("pointerdown", (event) => consumeDormantPointer(event, { preventDefault: true }));
-            header.addEventListener("mousedown", (event) => consumeDormantPointer(event, { preventDefault: true }));
-
-            const rows = style(document.createElement("div"), `
-                display: ${isOpen ? "flex" : "none"};
-                flex-direction: column;
-                gap: 4px;
-                padding: 0 0 4px;
-            `);
-            entry.jobs.forEach((job, index) => {
-                const chunkIndex = Math.max(1, (parseInt(job?.batch_index, 10) || index) + 1);
-                rows.appendChild(createQueueRow(job, {
-                    title: `Chunk ${chunkIndex} of ${batchTotal}`,
-                    nested: true,
-                }));
-            });
-            group.appendChild(rows);
-
-            header.addEventListener("click", (event) => {
-                consumeDormantPointer(event, { preventDefault: true });
-                const nextOpen = rows.style.display === "none";
-                rows.style.display = nextOpen ? "flex" : "none";
-                header.setAttribute("aria-expanded", nextOpen ? "true" : "false");
-                label.textContent = `${nextOpen ? "v" : ">"} Batch ${entry.batchId.slice(0, 8)} - ${countLabel}`;
-                if (nextOpen) {
-                    collapsedBatchIds.delete(entry.batchId);
-                } else {
-                    collapsedBatchIds.add(entry.batchId);
+        const handle = mountSharedRenderQueue(container, {
+            jobs: Array.isArray(data) ? data : [],
+            queueActive: this.state.renderQueueActive !== false,
+            surface: "dormant",
+            projectKey,
+            timecodeMode,
+            fallbackFps,
+            collapsedBatchIds,
+            emptyText: "Render queue is empty.",
+            showDeleteJob: false,
+            showClearCompleted: true,
+            consumePointer: consumeDormantPointer,
+            onSetQueueActive: (nextActive) => {
+                this._setWidgetValue("render_queue_active", nextActive);
+                this.state.renderQueueActive = nextActive;
+                this._seedWidgetState({ render_queue_active: nextActive }, { seed: false });
+                this._schedulePreviewStateRefresh(["queue", "preview"]);
+                this.fullscreenSession?.editor?._setRenderQueueActive?.(nextActive, { syncWidget: false });
+            },
+            onClearCompleted: async () => {
+                const response = await fetch(buildQueueUrl(this.state.projectDir), { method: "DELETE" });
+                if (!response.ok) {
+                    throw new Error(`Clear completed renders failed: ${response.status}`);
                 }
-                persistQueueBatchCollapseState(this.state.projectDir, collapsedBatchIds);
-            });
+                await this.refreshSummary();
+                this._invalidateModules(["queue", "preview"]);
+                this._reloadExpandedModuleIfNeeded(["queue", "preview"]);
+                this.fullscreenSession?.refresh(["queue"]);
+            },
+            onBatchCollapsedChange: (nextCollapsedIds) => {
+                persistQueueBatchCollapseState(projectKey, nextCollapsedIds, updateEditorSettings);
+            },
+        });
 
-            wrap.appendChild(group);
-        }
-
-        return null;
+        return () => handle.destroy();
     }
 }

@@ -20,6 +20,7 @@ export const THEME = Object.freeze({
     accentBg: "#1a2530",
     statusIdle: "#7e8896",
     statusRunning: "#6b9e7a",
+    statusCompleted: "#6b9e7a",
     statusPending: "#c98a4b",
     statusFailed: "#b26464",
 });
@@ -349,6 +350,7 @@ export function statusPillCss({ state = "idle", padding = "4px 8px" } = {}) {
     const color = {
         idle: THEME.statusIdle,
         running: THEME.statusRunning,
+        completed: THEME.statusCompleted,
         pending: THEME.statusPending,
         failed: THEME.statusFailed,
     }[state] || THEME.statusIdle;
