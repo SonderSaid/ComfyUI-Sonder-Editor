@@ -79,6 +79,73 @@ def test_asset_payload_marks_missing_from_disk(tmp_path):
     assert routes._asset_payload(project, missing)["missing"] is True
 
 
+def test_asset_payloads_use_shared_media_and_thumbnail_snapshots(tmp_path):
+    project = _make_project(tmp_path)
+    _write_project_file(project, "media/existing.png", b"image-bytes")
+    _write_project_file(project, "cache/thumbnails/img1.png", b"thumb")
+    existing = Asset(asset_id="img1", asset_type="image", path="media/existing.png")
+    missing = Asset(asset_id="img2", asset_type="image", path="media/missing.png")
+
+    payloads = {
+        payload["asset_id"]: payload
+        for payload in routes._asset_payloads(project, [existing, missing])
+    }
+
+    assert payloads["img1"]["missing"] is False
+    assert payloads["img1"]["has_thumbnail"] is True
+    assert payloads["img1"]["size_bytes"] == len(b"image-bytes")
+    assert payloads["img2"]["missing"] is True
+    assert payloads["img2"]["has_thumbnail"] is False
+    assert payloads["img2"]["size_bytes"] == 0
+
+
+def test_fast_cached_asset_response_serves_direct_cache_hit(tmp_path, monkeypatch):
+    base_dir = tmp_path / "projects"
+    project_dir = base_dir / "Project A"
+    cache_dir = project_dir / "cache" / "thumbnails"
+    cache_dir.mkdir(parents=True)
+    cached_file = cache_dir / "asset123.png"
+    cached_file.write_bytes(b"thumb")
+    monkeypatch.setattr(routes, "_get_base_dir", lambda: str(base_dir))
+
+    request = DummyRequest(
+        match_info={"project_id": "Project A", "asset_id": "asset123"},
+        query={},
+    )
+
+    response = routes._fast_cached_asset_response(request, "thumbnails", "asset123.png")
+
+    assert isinstance(response, web.FileResponse)
+    assert response.headers["Cache-Control"] == "public, max-age=0, must-revalidate"
+
+
+def test_fast_cached_asset_response_falls_back_for_path_query(tmp_path, monkeypatch):
+    base_dir = tmp_path / "projects"
+    project_dir = base_dir / "Project A"
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True)
+    monkeypatch.setattr(routes, "_get_base_dir", lambda: str(base_dir))
+    request = DummyRequest(
+        match_info={"project_id": "Project A", "asset_id": "asset123"},
+        query={"path": str(project_dir)},
+    )
+
+    assert routes._fast_cached_asset_response(request, "thumbnails", "asset123.png") is None
+
+
+def test_fast_cached_asset_response_rejects_traversal(tmp_path, monkeypatch):
+    base_dir = tmp_path / "projects"
+    project_dir = base_dir / "Project A"
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True)
+    monkeypatch.setattr(routes, "_get_base_dir", lambda: str(base_dir))
+    request = DummyRequest(
+        match_info={"project_id": "Project A", "asset_id": "asset123"},
+        query={},
+    )
+
+    with pytest.raises(ValueError):
+        routes._fast_cached_asset_response(request, "thumbnails", "../asset123.png")
+
+
 def test_video_has_audio_uses_extraction_fallback(tmp_path, monkeypatch):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")

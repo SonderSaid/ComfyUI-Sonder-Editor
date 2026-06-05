@@ -54,6 +54,9 @@ from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 
 logger = logging.getLogger("sonder_editor")
 _TIMELINE_EXPORTS = TimelineExportManager()
+_ASSET_DERIVED_CACHE_HEADERS = {
+    "Cache-Control": "public, max-age=0, must-revalidate",
+}
 
 # Defer route registration until ComfyUI's PromptServer is available.
 try:
@@ -1058,6 +1061,54 @@ def _normalize_project_relpath(path: str) -> str:
     return str(path or "").replace("\\", "/").strip("/")
 
 
+def _media_probe_signature_from_stat(stat_result) -> str:
+    try:
+        return f"{stat_result.st_size}:{stat_result.st_mtime_ns}"
+    except Exception:
+        return ""
+
+
+def _snapshot_files_under(root_dir: str, rel_prefix: str = "") -> dict[str, dict]:
+    root_dir = os.path.abspath(root_dir)
+    if not os.path.isdir(root_dir):
+        return {}
+
+    root_rel = _normalize_project_relpath(rel_prefix)
+    snapshot: dict[str, dict] = {}
+    stack = [(root_dir, root_rel)]
+    while stack:
+        current_dir, current_rel = stack.pop()
+        try:
+            with os.scandir(current_dir) as scan:
+                for entry in scan:
+                    rel_path = _normalize_project_relpath(os.path.join(current_rel, entry.name))
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append((entry.path, rel_path))
+                            continue
+                        if not entry.is_file(follow_symlinks=True):
+                            continue
+                        stat_result = entry.stat(follow_symlinks=True)
+                    except OSError:
+                        continue
+                    snapshot[rel_path] = {
+                        "path": entry.path,
+                        "size": int(getattr(stat_result, "st_size", 0) or 0),
+                        "signature": _media_probe_signature_from_stat(stat_result),
+                    }
+        except OSError:
+            continue
+    return snapshot
+
+
+def _project_media_snapshot(project: TimelineProject) -> dict[str, dict]:
+    return _snapshot_files_under(os.path.join(project.project_dir, "media"), "media")
+
+
+def _project_thumbnail_snapshot(project: TimelineProject) -> dict[str, dict]:
+    return _snapshot_files_under(os.path.join(project.project_dir, "cache", "thumbnails"))
+
+
 def _project_asset_for_source_path(project: TimelineProject, source_path: str) -> Asset | None:
     normalized = _normalize_project_relpath(source_path)
     abs_source = source_path if os.path.isabs(source_path) else os.path.abspath(os.path.join(project.project_dir, source_path))
@@ -1073,19 +1124,50 @@ def _project_asset_for_source_path(project: TimelineProject, source_path: str) -
     return None
 
 
-def _asset_payload(project: TimelineProject, asset: Asset) -> dict:
+def _asset_payload(
+    project: TimelineProject,
+    asset: Asset,
+    *,
+    media_snapshot: dict[str, dict] | None = None,
+    thumbnail_snapshot: dict[str, dict] | None = None,
+) -> dict:
     payload = asset.to_dict()
     source_path = _asset_abspath(project, asset)
+    source_rel = _normalize_project_relpath(getattr(asset, "path", "") or "")
     thumb_path = os.path.join(
         project.project_dir, "cache", "thumbnails",
         f"{asset.asset_id}.png"
     )
-    payload["has_thumbnail"] = os.path.isfile(thumb_path)
-    payload["missing"] = _asset_missing(project, asset)
+    thumb_key = _normalize_project_relpath(f"{asset.asset_id}.png")
+    payload["has_thumbnail"] = (
+        thumb_key in thumbnail_snapshot
+        if thumbnail_snapshot is not None
+        else os.path.isfile(thumb_path)
+    )
+    if media_snapshot is not None and source_rel.startswith("media/"):
+        source_info = media_snapshot.get(source_rel)
+        payload["missing"] = source_info is None
+        payload["size_bytes"] = int(source_info.get("size", 0)) if source_info else 0
+    else:
+        payload["missing"] = _asset_missing(project, asset)
+        payload["size_bytes"] = _asset_file_size(source_path) if source_path else 0
     payload["trashed_at"] = getattr(asset, "trashed_at", "") or ""
-    payload["size_bytes"] = _asset_file_size(source_path) if source_path else 0
     payload["extension"] = os.path.splitext(getattr(asset, "path", "") or "")[1].lower()
     return payload
+
+
+def _asset_payloads(project: TimelineProject, assets) -> list[dict]:
+    media_snapshot = _project_media_snapshot(project)
+    thumbnail_snapshot = _project_thumbnail_snapshot(project)
+    return [
+        _asset_payload(
+            project,
+            asset,
+            media_snapshot=media_snapshot,
+            thumbnail_snapshot=thumbnail_snapshot,
+        )
+        for asset in assets
+    ]
 
 
 def _parse_metadata_json(value):
@@ -1586,6 +1668,7 @@ def _sync_media_folder(
     media_dir = os.path.join(project.project_dir, "media")
     if not os.path.isdir(media_dir):
         return changed
+    media_snapshot = _project_media_snapshot(project)
 
     def _mark_probe_state(asset: Asset, signature: str, *, has_audio: bool | None = None, duration: bool | None = None) -> bool:
         probe_changed = False
@@ -1602,13 +1685,14 @@ def _sync_media_folder(
 
     # Build set of known relative paths
     known_paths = {str(a.path or "").replace("\\", "/") for a in project.assets}
-    for filename in os.listdir(media_dir):
-        filepath = os.path.join(media_dir, filename)
-        if not os.path.isfile(filepath):
+    for rel_path, file_info in media_snapshot.items():
+        media_child = rel_path[len("media/"):] if rel_path.startswith("media/") else rel_path
+        if "/" in media_child:
             continue
 
-        rel_path = os.path.join("media", filename)
-        if rel_path.replace("\\", "/") in known_paths:
+        filepath = file_info.get("path") or os.path.join(project.project_dir, rel_path)
+        filename = os.path.basename(rel_path)
+        if rel_path in known_paths:
             continue
 
         asset_type, artifact_kind = _classify_asset_for_registration(filename)
@@ -1630,7 +1714,7 @@ def _sync_media_folder(
             has_audio=metadata["has_audio"],
             has_audio_checked=asset_type == "video",
             duration_checked=asset_type == "audio",
-            media_probe_signature=_media_probe_signature(filepath),
+            media_probe_signature=file_info.get("signature") or _media_probe_signature(filepath),
         )
         project.add_asset(asset)
 
@@ -1648,10 +1732,12 @@ def _sync_media_folder(
     for asset in project.assets:
         if asset.asset_type != "video":
             continue
-        filepath = os.path.join(project.project_dir, asset.path)
-        if not os.path.isfile(filepath):
+        rel_path = _normalize_project_relpath(getattr(asset, "path", "") or "")
+        file_info = media_snapshot.get(rel_path)
+        if not file_info:
             continue
-        signature = _media_probe_signature(filepath)
+        filepath = file_info.get("path") or os.path.join(project.project_dir, rel_path)
+        signature = file_info.get("signature") or _media_probe_signature(filepath)
         checked = bool(getattr(asset, "has_audio_checked", False))
         stored_signature = getattr(asset, "media_probe_signature", "") or ""
         signature_changed = bool(stored_signature and signature and stored_signature != signature)
@@ -1675,10 +1761,12 @@ def _sync_media_folder(
     for asset in project.assets:
         if asset.asset_type != "audio":
             continue
-        filepath = os.path.join(project.project_dir, asset.path)
-        if not os.path.isfile(filepath):
+        rel_path = _normalize_project_relpath(getattr(asset, "path", "") or "")
+        file_info = media_snapshot.get(rel_path)
+        if not file_info:
             continue
-        signature = _media_probe_signature(filepath)
+        filepath = file_info.get("path") or os.path.join(project.project_dir, rel_path)
+        signature = file_info.get("signature") or _media_probe_signature(filepath)
         checked = bool(getattr(asset, "duration_checked", False))
         stored_signature = getattr(asset, "media_probe_signature", "") or ""
         signature_changed = bool(stored_signature and signature and stored_signature != signature)
@@ -1774,6 +1862,70 @@ def _get_base_dir() -> str:
         return os.path.join(folder_paths.get_output_directory(), "sonder-projects")
     except Exception:
         return ""
+
+
+def _path_within(parent: str, child: str) -> bool:
+    try:
+        parent_real = os.path.realpath(parent)
+        child_real = os.path.realpath(child)
+        return os.path.commonpath([parent_real, child_real]) == parent_real
+    except (OSError, ValueError):
+        return False
+
+
+def _safe_route_token(value: str, label: str) -> str:
+    value = str(value or "").strip()
+    if not value or "/" in value or "\\" in value or "\x00" in value or ".." in value:
+        raise ValueError(f"Invalid {label}")
+    return value
+
+
+def _direct_project_dir_for_cached_asset(request: web.Request) -> str | None:
+    if request.query.get("path"):
+        return None
+    project_id = _safe_route_token(request.match_info.get("project_id", ""), "project id")
+    base_dir = _get_base_dir()
+    if not base_dir:
+        return None
+    project_dir = os.path.join(base_dir, project_id)
+    if not os.path.isdir(project_dir):
+        return None
+    project_real = os.path.realpath(project_dir)
+    base_real = os.path.realpath(base_dir)
+    if not _path_within(base_real, project_real):
+        return None
+    return project_real
+
+
+def _cached_asset_file_response(
+    path: str,
+    *,
+    content_type: str | None = None,
+) -> web.FileResponse:
+    headers = dict(_ASSET_DERIVED_CACHE_HEADERS)
+    if content_type:
+        headers["Content-Type"] = content_type
+    return web.FileResponse(path, headers=headers)
+
+
+def _fast_cached_asset_response(
+    request: web.Request,
+    cache_subdir: str,
+    filename: str,
+    *,
+    content_type: str | None = None,
+) -> web.FileResponse | None:
+    project_dir = _direct_project_dir_for_cached_asset(request)
+    if not project_dir:
+        return None
+    _safe_route_token(request.match_info.get("asset_id", ""), "asset id")
+    cache_dir = os.path.realpath(os.path.join(project_dir, "cache", cache_subdir))
+    target_path = os.path.realpath(os.path.join(cache_dir, filename))
+    if not _path_within(project_dir, cache_dir) or not _path_within(cache_dir, target_path):
+        raise ValueError("Invalid cached asset path")
+    if not os.path.isfile(target_path):
+        return None
+    return _cached_asset_file_response(target_path, content_type=content_type)
 
 
 def _request_if_match(request: web.Request) -> str:
@@ -3054,7 +3206,7 @@ if routes is not None:
         if not include_trashed:
             assets = [asset for asset in assets if not _asset_is_trashed(asset)]
 
-        result = [_asset_payload(project, asset) for asset in assets]
+        result = await asyncio.to_thread(_asset_payloads, project, assets)
 
         return web.json_response({
             "project_id": project.project_id,
@@ -3073,7 +3225,7 @@ if routes is not None:
 
         include_trashed = _query_flag(request.query.get("include_trashed"))
         assets = project.assets if include_trashed else [asset for asset in project.assets if not _asset_is_trashed(asset)]
-        result = [_asset_payload(project, asset) for asset in assets]
+        result = await asyncio.to_thread(_asset_payloads, project, assets)
 
         return web.json_response({
             "project_id": project.project_id,
@@ -3755,11 +3907,18 @@ if routes is not None:
     async def api_get_thumbnail(request: web.Request) -> web.Response:
         """Serve a thumbnail image for an asset."""
         try:
+            asset_id = _safe_route_token(request.match_info["asset_id"], "asset id")
+            fast_response = _fast_cached_asset_response(request, "thumbnails", f"{asset_id}.png")
+        except ValueError as e:
+            return _json_error(str(e), 400)
+        if fast_response is not None:
+            return fast_response
+
+        try:
             project = _load_project_from_request(request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        asset_id = request.match_info["asset_id"]
         asset = project.get_asset(asset_id)
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
@@ -3769,7 +3928,7 @@ if routes is not None:
             f"{asset_id}.png"
         )
         if os.path.isfile(thumb_path):
-            return web.FileResponse(thumb_path)
+            return _cached_asset_file_response(thumb_path)
 
         source_path = _asset_abspath(project, asset)
         if not source_path or not os.path.isfile(source_path):
@@ -3780,17 +3939,32 @@ if routes is not None:
         if not ok:
             return _json_error("Failed to generate thumbnail", 500)
 
-        return web.FileResponse(thumb_path)
+        return _cached_asset_file_response(thumb_path)
 
     @routes.get("/sonder-editor/project/{project_id}/thumbnail_strip/{asset_id}")
     async def api_get_thumbnail_strip(request: web.Request) -> web.Response:
         """Serve a filmstrip thumbnail for a video asset (tiled frames)."""
         try:
+            asset_id = _safe_route_token(request.match_info["asset_id"], "asset id")
+            if request.query.get("info"):
+                fast_response = _fast_cached_asset_response(
+                    request,
+                    "thumbnails",
+                    f"{asset_id}_strip.jpg.json",
+                    content_type="application/json",
+                )
+            else:
+                fast_response = _fast_cached_asset_response(request, "thumbnails", f"{asset_id}_strip.jpg")
+        except ValueError as e:
+            return _json_error(str(e), 400)
+        if fast_response is not None:
+            return fast_response
+
+        try:
             project = _load_project_from_request(request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        asset_id = request.match_info["asset_id"]
         asset = project.get_asset(asset_id)
         if not asset or asset.asset_type != "video":
             return _json_error(f"Video asset not found: {asset_id}", 404)
@@ -3817,20 +3991,32 @@ if routes is not None:
         # Return info JSON or image
         if request.query.get("info"):
             if os.path.isfile(info_path):
-                return web.FileResponse(info_path, headers={"Content-Type": "application/json"})
+                return _cached_asset_file_response(info_path, content_type="application/json")
             return _json_error("Strip info not found", 404)
 
-        return web.FileResponse(strip_path)
+        return _cached_asset_file_response(strip_path)
 
     @routes.get("/sonder-editor/project/{project_id}/waveform/{asset_id}")
     async def api_get_waveform(request: web.Request) -> web.Response:
         """Serve waveform peaks data for an audio asset or a video asset with audio."""
         try:
+            asset_id = _safe_route_token(request.match_info["asset_id"], "asset id")
+            fast_response = _fast_cached_asset_response(
+                request,
+                "waveforms",
+                f"{asset_id}.json",
+                content_type="application/json",
+            )
+        except ValueError as e:
+            return _json_error(str(e), 400)
+        if fast_response is not None:
+            return fast_response
+
+        try:
             project = _load_project_from_request(request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        asset_id = request.match_info["asset_id"]
         asset = project.get_asset(asset_id)
         if not asset or asset.asset_type not in {"audio", "video"}:
             return _json_error(f"Audio-capable asset not found: {asset_id}", 404)
@@ -3862,7 +4048,7 @@ if routes is not None:
             if not data:
                 return _json_error("Failed to generate waveform data", 500)
 
-        return web.FileResponse(waveform_path, headers={"Content-Type": "application/json"})
+        return _cached_asset_file_response(waveform_path, content_type="application/json")
 
     # -----------------------------------------------------------------------
     # Scene CRUD

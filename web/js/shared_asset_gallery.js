@@ -32,6 +32,7 @@ const SORT_OPTIONS = GALLERY_SORT_OPTIONS;
 const COMPARE_SORT_OPTIONS = GALLERY_SORT_OPTIONS.filter((entry) => entry.value !== "type");
 const AUDIO_DUCK_VOLUME = Math.pow(10, -3 / 20);
 const LIST_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
+const OVERLAY_MEDIA_CACHE_LIMIT = 8;
 const THUMBNAIL_SIZE_CONFIG = {
     small: { thumbWidth: 60, thumbHeight: 44, gap: 6, padding: 5, nameFont: 10, metaFont: 9 },
     medium: { thumbWidth: 72, thumbHeight: 54, gap: 8, padding: 6, nameFont: 11, metaFont: 10 },
@@ -702,6 +703,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         },
     };
     const data = { assets: [], folders: [] };
+    const overlayMediaCache = new Map();
     const root = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;flex:1 1 auto;min-width:0;min-height:0;width:100%;height:100%;box-sizing:border-box;overflow:hidden;`);
     container.appendChild(root);
 
@@ -797,6 +799,155 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function currentProjectId() {
         return projectIdFromDir(currentProjectDir()) || "default";
+    }
+
+    function assetMediaCacheKey(asset) {
+        if (!asset) return "";
+        return [
+            currentProjectId(),
+            asset.asset_id || "",
+            asset.path || "",
+            asset.media_probe_signature || "",
+            asset.size_bytes || "",
+            asset.width || "",
+            asset.height || "",
+            asset.frame_count || "",
+            asset.duration_sec || "",
+            asset.imported_at || "",
+        ].join("|");
+    }
+
+    function revokeOverlayMediaEntry(entry) {
+        if (!entry || entry.revoked) return;
+        entry.revoked = true;
+        entry.controller?.abort?.();
+        if (entry.blobUrl) {
+            URL.revokeObjectURL(entry.blobUrl);
+            entry.blobUrl = null;
+        }
+        overlayMediaCache.delete(entry.key);
+    }
+
+    function pruneOverlayMediaCache() {
+        while (overlayMediaCache.size > OVERLAY_MEDIA_CACHE_LIMIT) {
+            const oldest = overlayMediaCache.values().next().value;
+            if (!oldest) break;
+            revokeOverlayMediaEntry(oldest);
+        }
+    }
+
+    function clearOverlayMediaCache() {
+        for (const entry of Array.from(overlayMediaCache.values())) {
+            revokeOverlayMediaEntry(entry);
+        }
+    }
+
+    function loadGalleryMediaAsBlob(asset, mediaEl) {
+        const url = buildAssetViewUrl(currentProjectDir(), asset?.path);
+        if (!url || !mediaEl) return { cleanup: () => {} };
+        const key = assetMediaCacheKey(asset);
+        let entry = overlayMediaCache.get(key);
+        if (!entry || entry.revoked) {
+            const controller = typeof AbortController === "function" ? new AbortController() : null;
+            entry = {
+                key,
+                url,
+                blobUrl: null,
+                revoked: false,
+                controller,
+                promise: null,
+            };
+            entry.promise = fetch(url, controller ? { signal: controller.signal } : undefined)
+                .then((resp) => {
+                    if (!resp.ok) throw new Error(`media fetch failed: ${resp.status}`);
+                    return resp.blob();
+                })
+                .then((blob) => {
+                    entry.controller = null;
+                    if (entry.revoked) return null;
+                    entry.blobUrl = URL.createObjectURL(blob);
+                    pruneOverlayMediaCache();
+                    return entry.blobUrl;
+                })
+                .catch((error) => {
+                    entry.controller = null;
+                    if (entry.revoked || error?.name === "AbortError") return null;
+                    overlayMediaCache.delete(key);
+                    return url;
+                });
+            overlayMediaCache.set(key, entry);
+        } else {
+            overlayMediaCache.delete(key);
+            overlayMediaCache.set(key, entry);
+        }
+
+        let active = true;
+        entry.promise.then((src) => {
+            if (!active || entry.revoked || !src) return;
+            mediaEl.src = src;
+        });
+        return {
+            cleanup() {
+                active = false;
+            },
+        };
+    }
+
+    function applyThumbnailPlaceholder(surface, asset) {
+        if (!surface || !asset?.has_thumbnail) return;
+        surface.style.backgroundImage = `url("${buildThumbnailUrl(currentProjectDir(), asset.asset_id)}")`;
+        surface.style.backgroundSize = "contain";
+        surface.style.backgroundPosition = "center";
+        surface.style.backgroundRepeat = "no-repeat";
+    }
+
+    function clearThumbnailPlaceholder(surface) {
+        if (!surface) return;
+        surface.style.backgroundImage = "";
+        surface.style.backgroundSize = "";
+        surface.style.backgroundPosition = "";
+        surface.style.backgroundRepeat = "";
+    }
+
+    function revealImageAfterDecode(img, onReveal = null) {
+        let cancelled = false;
+        let loadHandler = null;
+        let errorHandler = null;
+        const reveal = ({ clearPlaceholder = true } = {}) => {
+            if (!cancelled && img.isConnected) {
+                img.style.opacity = "1";
+                if (clearPlaceholder) onReveal?.();
+            }
+        };
+        const decodeAndReveal = () => {
+            if (typeof img.decode === "function") {
+                img.decode().then(reveal).catch(reveal);
+            } else {
+                reveal();
+            }
+        };
+        if (img.complete && img.naturalWidth > 0) {
+            decodeAndReveal();
+        } else {
+            loadHandler = () => decodeAndReveal();
+            errorHandler = () => reveal({ clearPlaceholder: false });
+            img.addEventListener("load", loadHandler, { once: true });
+            img.addEventListener("error", errorHandler, { once: true });
+        }
+        return () => {
+            cancelled = true;
+            if (loadHandler) img.removeEventListener("load", loadHandler);
+            if (errorHandler) img.removeEventListener("error", errorHandler);
+        };
+    }
+
+    function configureDecodedImage(img, asset, { highPriority = false, placeholderSurface = null } = {}) {
+        img.decoding = "async";
+        if (highPriority) img.fetchPriority = "high";
+        img.style.opacity = "0";
+        img.style.transition = "opacity 140ms ease";
+        img.src = buildAssetViewUrl(currentProjectDir(), asset.path);
+        return revealImageAfterDecode(img, () => clearThumbnailPlaceholder(placeholderSurface));
     }
 
     function storageKey(suffix) {
@@ -3059,6 +3210,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.applyAudioMonitor = null;
         state.overlayState.overlayEl?.remove();
         state.overlayState.overlayEl = null;
+        clearOverlayMediaCache();
+        if (!state.destroyed && !state.inspectorCollapsed) {
+            renderDetail(selectedAsset());
+        }
     }
 
     function attachZoomPan(surface, targets, options = {}) {
@@ -3672,12 +3827,13 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (asset.asset_type === "image") {
             const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
+            applyThumbnailPlaceholder(stage, asset);
             const img = style(document.createElement("img"), `max-width:100%;max-height:100%;display:block;user-select:none;pointer-events:none;`);
             img.draggable = false;
-            img.src = buildAssetViewUrl(projectDir, asset.path);
             img.alt = assetDisplayName(asset);
+            const imageRevealCleanup = configureDecodedImage(img, asset, { highPriority: true, placeholderSurface: stage });
             stage.appendChild(img);
-            state.overlayState.cleanupFns.push(attachZoomPan(stage, img));
+            state.overlayState.cleanupFns.push(imageRevealCleanup, attachZoomPan(stage, img));
             content.appendChild(stage);
             return;
         }
@@ -3689,7 +3845,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             video.preload = "auto";
             video.playsInline = true;
             if (asset.has_thumbnail) video.poster = buildThumbnailUrl(projectDir, asset.asset_id);
-            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), video);
+            const blobHandle = loadGalleryMediaAsBlob(asset, video);
             const togglePlayback = () => {
                 if (video.paused) {
                     void video.play();
@@ -3748,7 +3904,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const card = style(document.createElement("div"), `display:flex;flex-direction:column;gap:12px;max-width:900px;width:100%;margin:auto;padding:18px;border-radius:12px;background:#04090d;border:1px solid #24323e;`);
             const audio = document.createElement("audio");
             audio.preload = "auto";
-            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), audio);
+            const blobHandle = loadGalleryMediaAsBlob(asset, audio);
             const toggleAudio = () => {
                 if (audio.paused) void audio.play();
                 else audio.pause();
@@ -3849,6 +4005,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             const thumb = style(document.createElement("div"), `height:40px;border-radius:6px;background:#111;border:1px solid #293542;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#7f93a5;font-size:10px;`);
             if (asset.has_thumbnail) {
                 const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+                img.loading = "lazy";
+                img.decoding = "async";
                 img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
                 thumb.appendChild(img);
             } else {
@@ -3987,8 +4145,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             const controls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
             const audioA = new Audio();
             const audioB = new Audio();
-            const blobHandleA = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareA.path), audioA);
-            const blobHandleB = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareB.path), audioB);
+            const blobHandleA = loadGalleryMediaAsBlob(compareA, audioA);
+            const blobHandleB = loadGalleryMediaAsBlob(compareB, audioB);
             audioA.preload = "auto";
             audioB.preload = "auto";
             const transport = createLinkedMediaTransport([audioA, audioB], {
@@ -4077,8 +4235,6 @@ export function mountSharedAssetGallery(container, options = {}) {
             layerA.draggable = false;
             layerB.draggable = false;
             if (asset.asset_type === "image") {
-                layerA.src = buildAssetViewUrl(currentProjectDir(), compareA.path);
-                layerB.src = buildAssetViewUrl(currentProjectDir(), compareB.path);
                 layerA.alt = assetDisplayName(compareA);
                 layerB.alt = assetDisplayName(compareB);
             } else {
@@ -4086,8 +4242,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                 layerB.preload = "auto";
                 layerA.playsInline = true;
                 layerB.playsInline = true;
-                const blobHandleA = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareA.path), layerA);
-                const blobHandleB = loadMediaAsBlob(buildAssetViewUrl(currentProjectDir(), compareB.path), layerB);
+                const blobHandleA = loadGalleryMediaAsBlob(compareA, layerA);
+                const blobHandleB = loadGalleryMediaAsBlob(compareB, layerB);
                 state.overlayState.cleanupFns.push(blobHandleA.cleanup, blobHandleB.cleanup);
                 layerA.muted = state.overlayState.audioFocus !== "a";
                 layerB.muted = state.overlayState.audioFocus !== "b";
@@ -4095,6 +4251,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             const groupStyle = `position:absolute;inset:0;width:100%;height:100%;pointer-events:none;`;
             const contentGroupA = style(document.createElement("div"), groupStyle);
             const contentGroupB = style(document.createElement("div"), groupStyle);
+            if (asset.asset_type === "image") {
+                applyThumbnailPlaceholder(contentGroupA, compareA);
+                applyThumbnailPlaceholder(contentGroupB, compareB);
+                state.overlayState.cleanupFns.push(
+                    configureDecodedImage(layerA, compareA, { highPriority: true, placeholderSurface: contentGroupA }),
+                    configureDecodedImage(layerB, compareB, { highPriority: true, placeholderSurface: contentGroupB }),
+                );
+            }
             contentGroupA.appendChild(layerA);
             contentGroupB.appendChild(layerB);
             let transport = null;
@@ -4754,7 +4918,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             video.preload = "metadata";
             video.playsInline = true;
             if (asset.has_thumbnail) video.poster = buildThumbnailUrl(projectDir, asset.asset_id);
-            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), video);
+            const blobHandle = loadGalleryMediaAsBlob(asset, video);
             previewSurface.appendChild(video);
             state.liveMedia = video;
             const scrubBar = renderMediaScrubBar(video);
@@ -4768,7 +4932,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const audio = style(document.createElement("audio"), `width:100%;display:block;`);
             audio.controls = true;
             audio.preload = "metadata";
-            const blobHandle = loadMediaAsBlob(buildAssetViewUrl(projectDir, asset.path), audio);
+            const blobHandle = loadGalleryMediaAsBlob(asset, audio);
             audioWrap.append(audioLabel, audio);
             previewSurface.appendChild(audioWrap);
             state.liveMedia = audio;
@@ -5346,16 +5510,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
     }
 
-    function render() {
-        if (state.destroyed) return;
-        ensureProjectPrefs();
-        updateControlState();
-        updateLayout();
-        updateFolderOptions();
-        renderBulkToolbar();
+    function renderTabs() {
         tabsRow.innerHTML = "";
-        listScroller.innerHTML = "";
-
         const activeAssets = data.assets.filter((asset) => !isTrashed(asset));
         const counts = {
             all: activeAssets.length,
@@ -5382,6 +5538,132 @@ export function mountSharedAssetGallery(container, options = {}) {
             });
             tabsRow.appendChild(tab);
         }
+    }
+
+    function renderActiveAssetRow(asset, visibleAssets, thumbConfig) {
+        const isSelected = state.selectedAssetIds.has(asset.asset_id);
+        const isPrimary = state.selectedAssetId === asset.asset_id;
+        const isFocused = state.focusedAssetId === asset.asset_id;
+        const isMissing = assetIsMissing(asset);
+        const borderColor = isSelected
+            ? (isMissing ? THEME.statusFailed : (isPrimary ? CHROME.accentHi : CHROME.accentBorder))
+            : (isMissing ? `${THEME.statusFailed}66` : (isFocused ? THEME.fg2 : CHROME.borderSoft));
+        const background = isSelected
+            ? (isMissing ? `${THEME.statusFailed}22` : CHROME.accentSoft)
+            : (isMissing ? `${THEME.statusFailed}18` : (isFocused ? CHROME.galleryItemHover : CHROME.galleryItem));
+        const focusRing = isPrimary
+            ? `box-shadow:inset 0 0 0 1px ${THEME.accent}73;`
+            : (isFocused ? `box-shadow:inset 0 0 0 1px ${THEME.accent}40;` : "");
+        const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
+        row.dataset.assetRow = asset.asset_id;
+        row.draggable = state.manageMode ? !!options.onBulkMoveAssets : true;
+        row.title = state.manageMode
+            ? "Click to inspect. Drag onto a folder header to move assets."
+            : (asset.asset_type === "artifact"
+                ? "Click to inspect. Artifact graph-drop support is deferred."
+                : "Click to inspect. Drag onto the graph to create a loader node.");
+        row.addEventListener("click", (event) => {
+            handleAssetActivation(asset.asset_id, event, visibleAssets, { focusList: true, scrollIntoView: true });
+        });
+        row.addEventListener("dblclick", () => {
+            openInspectOverlay(asset);
+        });
+        row.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!(state.selectedAssetIds.has(asset.asset_id) && selectedAssetIdsList().length > 1)) {
+                selectAsset(asset.asset_id, { focusList: true });
+            }
+            showContextMenu(event.clientX, event.clientY, assetContextMenuItems(asset));
+        });
+        row.addEventListener("dragstart", (event) => {
+            if (state.manageMode) {
+                if (!options.onBulkMoveAssets) {
+                    event.preventDefault();
+                    return;
+                }
+                const moveIds = state.selectedAssetIds.has(asset.asset_id)
+                    ? selectedAssetIdsList()
+                    : [asset.asset_id];
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("application/x-sonder-asset-move", JSON.stringify({
+                    assetIds: moveIds,
+                    primaryAssetId: state.selectedAssetIds.has(asset.asset_id)
+                        ? (state.selectedAssetId || asset.asset_id)
+                        : asset.asset_id,
+                }));
+                event.dataTransfer.setData("text/plain", moveIds.length > 1 ? `${moveIds.length} assets` : assetDisplayName(asset));
+                return;
+            }
+            const payload = JSON.stringify({ ...asset, _projectDir: projectIdFromDir(currentProjectDir()) });
+            event.dataTransfer.effectAllowed = "copy";
+            event.dataTransfer.setData("application/x-sonder-asset", payload);
+            event.dataTransfer.setData("text/plain", assetDisplayName(asset));
+        });
+        row.addEventListener("dragend", () => {
+            root.style.outline = "none";
+            clearDropFolderHighlight();
+        });
+
+        if (state.manageMode) {
+            const checkboxWrap = style(document.createElement("div"), `display:flex;align-items:center;justify-content:center;`);
+            checkboxWrap.addEventListener("mousedown", (event) => {
+                event.stopPropagation();
+            });
+            const checkbox = style(document.createElement("input"), `margin:0;cursor:pointer;`);
+            checkbox.type = "checkbox";
+            checkbox.checked = isSelected;
+            checkbox.addEventListener("click", (event) => {
+                event.stopPropagation();
+            });
+            checkbox.addEventListener("change", (event) => {
+                event.stopPropagation();
+                toggleAssetSelection(asset.asset_id, { focusList: true });
+            });
+            checkboxWrap.appendChild(checkbox);
+            row.appendChild(checkboxWrap);
+        }
+
+        const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${isMissing ? THEME.bg2 : THEME.bg0};border:1px solid ${isMissing ? `${THEME.statusFailed}66` : THEME.line2};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? THEME.statusFailed : THEME.fg2};font-size:${thumbConfig.metaFont}px;`);
+        if (isMissing) {
+            thumb.textContent = "Missing";
+        } else if (asset.has_thumbnail) {
+            const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+            img.loading = "lazy";
+            img.decoding = "async";
+            img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
+            img.alt = assetDisplayName(asset);
+            img.draggable = false;
+            thumb.appendChild(img);
+        } else {
+            thumb.textContent = assetFallbackGlyph(asset.asset_type);
+        }
+
+        const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
+        const name = style(document.createElement("div"), `color:${THEME.fg0};font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        name.textContent = assetDisplayName(asset);
+        if (isMissing) name.style.color = THEME.statusFailed;
+        const meta = style(document.createElement("div"), `color:${THEME.fg2};font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        let metaLabel = asset.asset_type === "artifact"
+            ? `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${String(asset.artifact_kind || "other")} | ${assetExtension(asset) ? `.${assetExtension(asset)}` : "no ext"}`
+            : `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
+        const workflowMeta = workflowStatusMeta(asset);
+        if (workflowMeta) metaLabel += ` | ${workflowMeta}`;
+        meta.textContent = metaLabel;
+        text.append(name, meta);
+        row.append(thumb, text);
+        return row;
+    }
+
+    function render() {
+        if (state.destroyed) return;
+        ensureProjectPrefs();
+        updateControlState();
+        updateLayout();
+        updateFolderOptions();
+        renderBulkToolbar();
+        renderTabs();
+        listScroller.innerHTML = "";
 
         const assets = filteredAssets();
         const visibleAssets = navigableAssets();
@@ -5496,6 +5778,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                     thumb.textContent = "Missing";
                 } else if (asset.has_thumbnail) {
                     const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+                    img.loading = "lazy";
+                    img.decoding = "async";
                     img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
                     img.alt = assetDisplayName(asset);
                     img.draggable = false;
@@ -5571,6 +5855,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${THEME.bg2};border:1px solid ${THEME.statusPending}55;display:flex;align-items:center;justify-content:center;overflow:hidden;color:${THEME.statusPending};font-size:${thumbConfig.metaFont}px;`);
                     if (asset.has_thumbnail) {
                         const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;opacity:0.74;filter:saturate(0.6);`);
+                        img.loading = "lazy";
+                        img.decoding = "async";
                         img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
                         img.alt = assetDisplayName(asset);
                         img.draggable = false;
@@ -5824,10 +6110,143 @@ export function mountSharedAssetGallery(container, options = {}) {
         : null;
     resizeObserver?.observe(root);
 
+    function assetRefreshSignature(asset) {
+        return JSON.stringify({
+            asset_id: asset?.asset_id || "",
+            name: asset?.name || "",
+            asset_type: asset?.asset_type || "",
+            artifact_kind: asset?.artifact_kind || "",
+            path: asset?.path || "",
+            folder: normalizeFolderName(asset?.folder || ""),
+            trashed_at: asset?.trashed_at || "",
+            trash_previous_folder: asset?.trash_previous_folder || "",
+            width: asset?.width || 0,
+            height: asset?.height || 0,
+            frame_count: asset?.frame_count || 0,
+            fps: asset?.fps || 0,
+            duration_sec: asset?.duration_sec || 0,
+            sample_rate: asset?.sample_rate || 0,
+            has_audio: !!asset?.has_audio,
+            has_thumbnail: !!asset?.has_thumbnail,
+            missing: !!asset?.missing,
+            size_bytes: asset?.size_bytes || 0,
+            extension: asset?.extension || "",
+            media_probe_signature: asset?.media_probe_signature || "",
+            imported_at: asset?.imported_at || "",
+            generation_params: asset?.generation_params || {},
+        });
+    }
+
+    function foldersRefreshSignature(folders) {
+        return (folders || []).map(normalizeFolderName).filter(Boolean).sort(compareStrings).join("\n");
+    }
+
+    function additiveRefreshAssets(previousAssets, nextAssets, previousFolders, nextFolders) {
+        if (!previousAssets.length || nextAssets.length <= previousAssets.length) return [];
+        if (foldersRefreshSignature(previousFolders) !== foldersRefreshSignature(nextFolders)) return [];
+        const previousById = new Map(previousAssets.map((asset) => [asset.asset_id, asset]));
+        const added = [];
+        for (const asset of nextAssets) {
+            const previous = previousById.get(asset.asset_id);
+            if (!previous) {
+                added.push(asset);
+                continue;
+            }
+            if (assetRefreshSignature(previous) !== assetRefreshSignature(asset)) {
+                return [];
+            }
+        }
+        return added.length === nextAssets.length - previousAssets.length ? added : [];
+    }
+
+    function folderHeaderElement(folderName) {
+        const key = normalizeFolderName(folderName) || "__root__";
+        return Array.from(listScroller.querySelectorAll("[data-folder-header]"))
+            .find((el) => el.dataset.folderHeader === key) || null;
+    }
+
+    function assetRowElement(assetId) {
+        return Array.from(listScroller.querySelectorAll("[data-asset-row]"))
+            .find((el) => el.dataset.assetRow === assetId) || null;
+    }
+
+    function activeFolderCountFrom(assets, folderName) {
+        const normalized = normalizeFolderName(folderName);
+        return assets.filter((asset) => (
+            !isTrashed(asset)
+            && assetMatchesCurrentFilter(asset)
+            && normalizeFolderName(asset.folder || "") === normalized
+        )).length;
+    }
+
+    function updateFolderHeaderCount(folderName, count) {
+        const header = folderHeaderElement(folderName);
+        if (!header?.lastElementChild) return false;
+        header.lastElementChild.textContent = String(count);
+        return true;
+    }
+
+    function tryRenderAdditiveData(addedAssets, previousAssets) {
+        if (!addedAssets.length || !state.selectedAssetId || !listScroller.children.length) return false;
+        if (addedAssets.some((asset) => isTrashed(asset))) return false;
+
+        const addedIds = new Set(addedAssets.map((asset) => asset.asset_id));
+        const visibleAdded = filteredAssets().filter((asset) => addedIds.has(asset.asset_id));
+        renderTabs();
+        if (!visibleAdded.length) {
+            queueResize();
+            return true;
+        }
+
+        const touchedFolders = new Set(visibleAdded.map((asset) => normalizeFolderName(asset.folder || "")));
+        for (const folderName of touchedFolders) {
+            if (isFolderCollapsed(folderName) || isAncestorCollapsed(folderName)) return false;
+            if (activeFolderCountFrom(previousAssets, folderName) <= 0) return false;
+            if (!folderHeaderElement(folderName)) return false;
+        }
+
+        const visibleAssets = navigableAssets();
+        const thumbConfig = thumbnailSizeConfig(state.thumbnailSize);
+        for (const asset of visibleAdded) {
+            const folderName = normalizeFolderName(asset.folder || "");
+            const inFolder = folderAssets(folderName, filteredAssets());
+            const assetIndex = inFolder.findIndex((entry) => entry.asset_id === asset.asset_id);
+            if (assetIndex < 0) return false;
+
+            const nextRow = inFolder
+                .slice(assetIndex + 1)
+                .map((entry) => assetRowElement(entry.asset_id))
+                .find(Boolean);
+            const row = renderActiveAssetRow(asset, visibleAssets, thumbConfig);
+            if (nextRow) {
+                listScroller.insertBefore(row, nextRow);
+            } else {
+                let anchor = folderHeaderElement(folderName);
+                for (const prior of inFolder.slice(0, assetIndex)) {
+                    const priorRow = assetRowElement(prior.asset_id);
+                    if (priorRow) anchor = priorRow;
+                }
+                if (!anchor) return false;
+                anchor.after(row);
+            }
+        }
+
+        for (const folderName of touchedFolders) {
+            updateFolderHeaderCount(folderName, activeFolderCountFrom(data.assets, folderName));
+        }
+        queueResize();
+        return true;
+    }
+
     function setData(nextData) {
         const payload = Array.isArray(nextData) ? { assets: nextData, folders: [] } : (nextData || {});
-        data.assets = Array.isArray(payload.assets) ? [...payload.assets] : [];
-        data.folders = Array.isArray(payload.folders) ? payload.folders.map(normalizeFolderName).filter(Boolean) : [];
+        const previousAssets = data.assets;
+        const previousFolders = data.folders;
+        const nextAssets = Array.isArray(payload.assets) ? [...payload.assets] : [];
+        const nextFolders = Array.isArray(payload.folders) ? payload.folders.map(normalizeFolderName).filter(Boolean) : [];
+        const additiveAssets = additiveRefreshAssets(previousAssets, nextAssets, previousFolders, nextFolders);
+        data.assets = nextAssets;
+        data.folders = nextFolders;
         const preservedSelection = selectedAssetIdsList();
         const fallbackId = data.assets.some((asset) => asset.asset_id === state.selectedAssetId)
             ? state.selectedAssetId
@@ -5840,7 +6259,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearUsageView();
         }
         state.allowAutoFocus = true;
-        render();
+        if (!tryRenderAdditiveData(additiveAssets, previousAssets)) {
+            render();
+        }
     }
 
     function destroy() {
@@ -5851,6 +6272,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         unsubscribeSettings();
         resizeObserver?.disconnect();
         closeInspectOverlay();
+        clearOverlayMediaCache();
         hideContextMenu();
         destroyLiveMedia();
     }
