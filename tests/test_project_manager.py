@@ -134,6 +134,27 @@ def test_route_project_lookup_reads_utf8_index_by_folder_and_project_id(monkeypa
         assert by_project_id.project_dir == project.project_dir
 
 
+def test_route_project_lookup_uses_direct_folder_without_scanning(monkeypatch):
+    from server import routes
+
+    class DummyRequest:
+        def __init__(self, project_id):
+            self.match_info = {"project_id": project_id}
+            self.query = {}
+            self.method = "GET"
+
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Direct Folder", base_dir=base_dir)
+        folder_id = os.path.basename(os.path.normpath(project.project_dir))
+
+        monkeypatch.setattr(routes, "_get_base_dir", lambda: base_dir)
+        monkeypatch.setattr(os, "listdir", lambda _path: (_ for _ in ()).throw(AssertionError("scan should not run")))
+
+        by_folder = routes._load_project_from_request(DummyRequest(folder_id))
+
+        assert by_folder.project_dir == project.project_dir
+
+
 def test_project_saved_event_publishes_canonical_and_folder_aliases(monkeypatch):
     from server import routes
 

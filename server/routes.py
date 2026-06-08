@@ -985,6 +985,18 @@ def _apply_delete_prompt_section(scene: Scene, index: int, expected: dict | None
     scene.prompt_sections.pop(index)
 
 
+def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
+    _require_lane_unlocked(scene, "prompt")
+    section = PromptSection(
+        start_frame=_mutation_int(fields.get("start_frame", 0), "start_frame", 0),
+        end_frame=_mutation_int(fields.get("end_frame", 0), "end_frame", 0),
+        prompt=str(fields.get("prompt", "") or ""),
+    )
+    scene.prompt_sections.append(section)
+    scene.prompt_sections.sort(key=lambda s: s.start_frame)
+    return section
+
+
 def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict) -> dict:
     if not isinstance(op, dict):
         _mutation_error("Mutation operation must be an object", 400)
@@ -1045,7 +1057,80 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         index = _mutation_int(op.get("index"), "index")
         _apply_delete_prompt_section(scene, index, op.get("expected"))
         return {"type": op_type, "index": index}
+    if op_type == "create_prompt_section":
+        section = _apply_create_prompt_section(scene, op.get("fields", {}))
+        return {"type": op_type, "start_frame": section.start_frame, "end_frame": section.end_frame}
     _mutation_error(f"Unsupported mutation operation: {op_type}", 400, "unsupported_project_mutation")
+
+
+def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations: list) -> tuple[TimelineProject, dict]:
+    project = _load_project_from_request(request)
+    scene = project.get_scene(scene_id)
+    if not scene:
+        _mutation_error(f"Scene not found: {scene_id}", 404, "item_not_found")
+
+    results = [
+        _apply_scene_mutation_operation(project, scene, operation)
+        for operation in operations
+    ]
+
+    save_project(project)
+    return project, {
+        "status": "ok",
+        "scene_id": scene_id,
+        "operation_count": len(operations),
+        "results": results,
+        "scene": scene.to_dict(),
+    }
+
+
+def _queue_job_from_body(body: dict) -> GenerationJob:
+    raw_params = body.get("params", {}) or {}
+    params = dict(raw_params) if isinstance(raw_params, dict) else {}
+    if any(field in body for field in (
+        "pre_context_frames",
+        "post_context_frames",
+        "guide_frame_snapshots",
+        "prompt_sections",
+        "scene_width",
+        "scene_height",
+        "scene_fps",
+        "template_id",
+        "mask_pre_offset",
+        "mask_post_offset",
+    )):
+        params["snapshot_version"] = 1
+
+    raw_take_placement_mode = body.get("take_placement_mode", "trimmed")
+    take_placement_mode = raw_take_placement_mode if raw_take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
+
+    raw_frame_constraint = body.get("frame_constraint")
+    frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
+
+    return GenerationJob(
+        scene_id=body.get("scene_id", ""),
+        scene_name=body.get("scene_name", ""),
+        selection_start=int(body.get("selection_start", 0)),
+        selection_end=int(body.get("selection_end", 0)),
+        batch_id=str(body.get("batch_id", "") or ""),
+        batch_total=int(body.get("batch_total", 0)),
+        batch_index=int(body.get("batch_index", 0)),
+        prompt=body.get("prompt", ""),
+        context_frames=int(body.get("context_frames", 0)),
+        pre_context_frames=int(body.get("pre_context_frames", 0)),
+        post_context_frames=int(body.get("post_context_frames", 0)),
+        mask_pre_offset=int(body.get("mask_pre_offset", 0)),
+        mask_post_offset=int(body.get("mask_post_offset", 0)),
+        guide_frame_snapshots=list(body.get("guide_frame_snapshots", []) or []),
+        prompt_sections=list(body.get("prompt_sections", []) or []),
+        scene_width=int(body.get("scene_width", 0)),
+        scene_height=int(body.get("scene_height", 0)),
+        scene_fps=float(body.get("scene_fps", 0.0) or 0.0),
+        template_id=str(body.get("template_id", "free") or "free"),
+        frame_constraint=frame_constraint,
+        take_placement_mode=take_placement_mode,
+        params=params,
+    )
 
 
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
@@ -1897,6 +1982,25 @@ def _direct_project_dir_for_cached_asset(request: web.Request) -> str | None:
     return project_real
 
 
+def _direct_project_dir_from_request(request: web.Request) -> str | None:
+    if request.query.get("path"):
+        return None
+    try:
+        project_id = _safe_route_token(request.match_info.get("project_id", ""), "project id")
+    except ValueError:
+        return None
+    base_dir = _get_base_dir()
+    if not base_dir:
+        return None
+    base_real = os.path.realpath(base_dir)
+    project_dir = os.path.realpath(os.path.join(base_dir, project_id))
+    if not _path_within(base_real, project_dir):
+        return None
+    if not os.path.isfile(os.path.join(project_dir, "project.json")):
+        return None
+    return project_dir
+
+
 def _cached_asset_file_response(
     path: str,
     *,
@@ -1959,6 +2063,8 @@ def _load_project_from_request(request: web.Request) -> TimelineProject:
     """Load project from project_id path parameter."""
     project_id = request.match_info.get("project_id", "")
     project_dir = request.query.get("path", "")
+    if not project_dir:
+        project_dir = _direct_project_dir_from_request(request) or ""
     if not project_dir:
         base_dir = _get_base_dir()
         if base_dir:
@@ -4207,16 +4313,6 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations")
     async def api_apply_scene_mutations(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
-        scene_id = request.match_info["scene_id"]
-        scene = project.get_scene(scene_id)
-        if not scene:
-            return _json_error(f"Scene not found: {scene_id}", 404)
-
-        try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
@@ -4226,21 +4322,19 @@ if routes is not None:
             return _json_error("operations must be a list", 400)
 
         try:
-            results = [
-                _apply_scene_mutation_operation(project, scene, operation)
-                for operation in operations
-            ]
+            project, payload = await asyncio.to_thread(
+                _apply_scene_mutations_sync,
+                request,
+                request.match_info["scene_id"],
+                operations,
+            )
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
         except ProjectMutationRequestError as exc:
             return _mutation_json_error(exc)
 
-        save_project(project)
-        return web.json_response({
-            "status": "ok",
-            "scene_id": scene_id,
-            "operation_count": len(operations),
-            "results": results,
-            "scene": scene.to_dict(),
-        })
+        _remember_request_project(request, project)
+        return web.json_response(payload)
 
     @routes.delete("/sonder-editor/project/{project_id}/scenes/{scene_id}")
     async def api_delete_scene(request: web.Request) -> web.Response:
@@ -5230,7 +5324,7 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/queue")
     async def api_list_queue(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -5239,131 +5333,141 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/queue")
     async def api_add_queue_job(request: web.Request) -> web.Response:
         try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+
+        def add_one() -> tuple[TimelineProject, dict]:
             project = _load_project_from_request(request)
+            job = _queue_job_from_body(body)
+            project.generation_queue.append(job)
+            save_project(project)
+            return project, job.to_dict()
+
+        try:
+            project, payload = await asyncio.to_thread(add_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
+        _remember_request_project(request, project)
+        return web.json_response(payload)
+
+    @routes.post("/sonder-editor/project/{project_id}/queue/batch")
+    async def api_add_queue_batch(request: web.Request) -> web.Response:
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        raw_params = body.get("params", {}) or {}
-        params = dict(raw_params) if isinstance(raw_params, dict) else {}
-        if any(field in body for field in (
-            "pre_context_frames",
-            "post_context_frames",
-            "guide_frame_snapshots",
-            "prompt_sections",
-            "scene_width",
-            "scene_height",
-            "scene_fps",
-            "template_id",
-            "mask_pre_offset",
-            "mask_post_offset",
-        )):
-            params["snapshot_version"] = 1
+        raw_jobs = body.get("jobs", [])
+        if not isinstance(raw_jobs, list):
+            return _json_error("jobs must be a list", 400)
+        if not raw_jobs:
+            return _json_error("jobs must not be empty", 400)
+        if not all(isinstance(item, dict) for item in raw_jobs):
+            return _json_error("Each batch job must be an object", 400)
 
-        raw_take_placement_mode = body.get("take_placement_mode", "trimmed")
-        take_placement_mode = raw_take_placement_mode if raw_take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
+        def add_batch() -> tuple[TimelineProject, dict]:
+            project = _load_project_from_request(request)
+            jobs = [_queue_job_from_body(item) for item in raw_jobs]
+            project.generation_queue.extend(jobs)
+            save_project(project)
+            return project, {
+                "status": "ok",
+                "count": len(jobs),
+                "jobs": [job.to_dict() for job in jobs],
+            }
 
-        raw_frame_constraint = body.get("frame_constraint")
-        frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
+        try:
+            project, payload = await asyncio.to_thread(add_batch)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
 
-        job = GenerationJob(
-            scene_id=body.get("scene_id", ""),
-            scene_name=body.get("scene_name", ""),
-            selection_start=int(body.get("selection_start", 0)),
-            selection_end=int(body.get("selection_end", 0)),
-            batch_id=str(body.get("batch_id", "") or ""),
-            batch_total=int(body.get("batch_total", 0)),
-            batch_index=int(body.get("batch_index", 0)),
-            prompt=body.get("prompt", ""),
-            context_frames=int(body.get("context_frames", 0)),
-            pre_context_frames=int(body.get("pre_context_frames", 0)),
-            post_context_frames=int(body.get("post_context_frames", 0)),
-            mask_pre_offset=int(body.get("mask_pre_offset", 0)),
-            mask_post_offset=int(body.get("mask_post_offset", 0)),
-            guide_frame_snapshots=list(body.get("guide_frame_snapshots", []) or []),
-            prompt_sections=list(body.get("prompt_sections", []) or []),
-            scene_width=int(body.get("scene_width", 0)),
-            scene_height=int(body.get("scene_height", 0)),
-            scene_fps=float(body.get("scene_fps", 0.0) or 0.0),
-            template_id=str(body.get("template_id", "free") or "free"),
-            frame_constraint=frame_constraint,
-            take_placement_mode=take_placement_mode,
-            params=params,
-        )
-        project.generation_queue.append(job)
-        save_project(project)
-        return web.json_response(job.to_dict())
+        _remember_request_project(request, project)
+        return web.json_response(payload, status=201)
 
     @routes.put("/sonder-editor/project/{project_id}/queue/{job_id}")
     async def api_update_queue_job(request: web.Request) -> web.Response:
-        try:
-            project = _load_project_from_request(request)
-        except FileNotFoundError as e:
-            return _json_error(str(e), 404)
-
         job_id = request.match_info["job_id"]
-        job = next((j for j in project.generation_queue if j.job_id == job_id), None)
-        if not job:
-            return _json_error(f"Job not found: {job_id}", 404)
 
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        if "status" in body:
-            job.status = body["status"]
-        if "progress" in body:
-            job.progress = float(body["progress"])
-        if "error" in body:
-            job.error = body["error"]
-        if "result_asset_id" in body:
-            job.result_asset_id = body["result_asset_id"]
-        if "completed_at" in body:
-            job.completed_at = body["completed_at"]
+        def update_one() -> tuple[TimelineProject, dict | None]:
+            project = _load_project_from_request(request)
+            job = next((j for j in project.generation_queue if j.job_id == job_id), None)
+            if not job:
+                return project, None
+            if "status" in body:
+                job.status = body["status"]
+            if "progress" in body:
+                job.progress = float(body["progress"])
+            if "error" in body:
+                job.error = body["error"]
+            if "result_asset_id" in body:
+                job.result_asset_id = body["result_asset_id"]
+            if "completed_at" in body:
+                job.completed_at = body["completed_at"]
+            save_project(project)
+            return project, job.to_dict()
 
-        save_project(project)
-        return web.json_response(job.to_dict())
+        try:
+            project, payload = await asyncio.to_thread(update_one)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        if payload is None:
+            return _json_error(f"Job not found: {job_id}", 404)
+        _remember_request_project(request, project)
+        return web.json_response(payload)
 
     @routes.delete("/sonder-editor/project/{project_id}/queue/{job_id}")
     async def api_delete_queue_job(request: web.Request) -> web.Response:
-        try:
+        job_id = request.match_info["job_id"]
+
+        def delete_one() -> tuple[TimelineProject, bool]:
             project = _load_project_from_request(request)
+            before = len(project.generation_queue)
+            project.generation_queue = [j for j in project.generation_queue if j.job_id != job_id]
+            if len(project.generation_queue) == before:
+                return project, False
+            save_project(project)
+            return project, True
+
+        try:
+            project, deleted = await asyncio.to_thread(delete_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        job_id = request.match_info["job_id"]
-        before = len(project.generation_queue)
-        project.generation_queue = [j for j in project.generation_queue if j.job_id != job_id]
-        if len(project.generation_queue) == before:
+        if not deleted:
             return _json_error(f"Job not found: {job_id}", 404)
-
-        save_project(project)
+        _remember_request_project(request, project)
         return web.json_response({"status": "deleted"})
 
     @routes.delete("/sonder-editor/project/{project_id}/queue")
     async def api_clear_queue(request: web.Request) -> web.Response:
         """Clear completed jobs, or all if ?all=1."""
-        try:
+        clear_all = request.query.get("all") == "1"
+
+        def clear_queue() -> tuple[TimelineProject, int]:
             project = _load_project_from_request(request)
+            before = len(project.generation_queue)
+            if clear_all:
+                project.generation_queue.clear()
+            else:
+                project.generation_queue = [
+                    j for j in project.generation_queue
+                    if str(getattr(j, "status", "") or "").lower() != "completed"
+                ]
+            removed = before - len(project.generation_queue)
+            save_project(project)
+            return project, removed
+
+        try:
+            project, removed = await asyncio.to_thread(clear_queue)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-
-        before = len(project.generation_queue)
-        if request.query.get("all") == "1":
-            project.generation_queue.clear()
-        else:
-            project.generation_queue = [
-                j for j in project.generation_queue
-                if str(getattr(j, "status", "") or "").lower() != "completed"
-            ]
-        removed = before - len(project.generation_queue)
-
-        save_project(project)
+        _remember_request_project(request, project)
         return web.json_response({"status": "cleared", "removed": removed})
 
     # -----------------------------------------------------------------------

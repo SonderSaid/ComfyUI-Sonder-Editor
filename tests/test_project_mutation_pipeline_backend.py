@@ -142,3 +142,123 @@ def test_scene_mutation_guide_identity_mismatch_rejects_before_save(monkeypatch,
     assert payload["code"] == "identity_mismatch"
     assert saves == []
     assert [(guide.frame_index, guide.asset_id) for guide in scene.guide_frames] == [(5, "asset-a")]
+
+
+def test_scene_mutation_move_guide_replaces_destination_frame(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.guide_frames = [
+        GuideFrame(frame_index=5, asset_id="asset-a", strength=0.7),
+        GuideFrame(frame_index=8, asset_id="asset-b", strength=0.4),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
+    )
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={
+            "operations": [{
+                "type": "move_guide",
+                "from_frame_index": 5,
+                "to_frame_index": 8,
+                "expected": {"frame_index": 5, "asset_id": "asset-a"},
+                "asset_id": "asset-a",
+                "source": "asset",
+                "strength": 0.7,
+            }],
+        },
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert [(guide.frame_index, guide.asset_id) for guide in scene.guide_frames] == [(8, "asset-a")]
+    assert [(guide["frame_index"], guide["asset_id"]) for guide in payload["scene"]["guide_frames"]] == [(8, "asset-a")]
+
+
+def test_scene_mutation_create_prompt_section_returns_reconciled_scene(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
+    )
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={
+            "operations": [{
+                "type": "create_prompt_section",
+                "fields": {"start_frame": 10, "end_frame": 20, "prompt": "hello"},
+            }],
+        },
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert payload["scene"]["prompt_sections"] == [
+        {"start_frame": 10, "end_frame": 20, "prompt": "hello"}
+    ]
+
+
+def test_queue_batch_route_appends_all_jobs_with_single_save(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/queue/batch",
+    )
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={
+            "jobs": [
+                {
+                    "scene_id": "scene-1",
+                    "selection_start": 0,
+                    "selection_end": 16,
+                    "batch_id": "batch-1",
+                    "batch_total": 2,
+                    "batch_index": 0,
+                    "template_id": "ltx-2.3",
+                    "frame_constraint": {"step": 8, "offset": 1},
+                },
+                {
+                    "scene_id": "scene-1",
+                    "selection_start": 16,
+                    "selection_end": 32,
+                    "batch_id": "batch-1",
+                    "batch_total": 2,
+                    "batch_index": 1,
+                    "template_id": "ltx-2.3",
+                    "frame_constraint": {"step": 8, "offset": 1},
+                },
+            ],
+        },
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 201
+    assert payload["count"] == 2
+    assert len(payload["jobs"]) == 2
+    assert len(project.generation_queue) == 2
+    assert len(saves) == 1
+    assert [job.batch_index for job in project.generation_queue] == [0, 1]
+    assert all(job.frame_constraint == {"step": 8, "offset": 1} for job in project.generation_queue)

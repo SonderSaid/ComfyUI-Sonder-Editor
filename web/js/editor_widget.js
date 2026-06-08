@@ -744,10 +744,10 @@ export class EditorWidget {
         replay();
     }
 
-    _shouldDeferSceneRefresh({ ignoreMutationGate = false } = {}) {
+    _shouldDeferSceneRefresh({ ignoreMutationGate = false, ignoreTimelineGate = false } = {}) {
         return !!(
             this.isDragging
-            || (!ignoreMutationGate && this._timelineMutationDepth > 0)
+            || (!ignoreMutationGate && !ignoreTimelineGate && this._timelineMutationDepth > 0)
             || (!ignoreMutationGate && this._hasPendingProjectMutations())
         );
     }
@@ -1360,11 +1360,8 @@ export class EditorWidget {
 
             if (!resp.ok) return;
             const newScene = await resp.json();
-            const newId = newScene.scene_id;
-
-            await this._fetchScenes();
-            const copied = this.scenes.find(s => s.scene_id === newId);
-            if (copied) this._setActiveScene(copied);
+            this.scenes.push(newScene);
+            this._setActiveScene(newScene);
         } catch (e) {
             console.warn("[Sonder] Failed to duplicate scene:", e);
         }
@@ -1825,7 +1822,16 @@ export class EditorWidget {
         }
     }
 
-    _queueProjectMutation({ key, label, coalesce = true, merge = null, intent = null, run, refreshScenes = true }) {
+    _queueProjectMutation({
+        key,
+        label,
+        coalesce = true,
+        merge = null,
+        intent = null,
+        run,
+        refreshScenes = true,
+        reconcileFromResult = null,
+    }) {
         const promise = this._projectMutationQueue.enqueue({
             key,
             label,
@@ -1835,8 +1841,13 @@ export class EditorWidget {
             run: async (queuedIntent) => run(queuedIntent),
         });
         promise.then(
-            () => {
-                if (refreshScenes) this._schedulePostMutationSceneRefresh(label || key);
+            (result) => {
+                if (!refreshScenes) return;
+                const reconciler = typeof reconcileFromResult === "function"
+                    ? reconcileFromResult
+                    : (mutationResult) => this._reconcileActiveSceneFromMutation(mutationResult, { reason: label || key });
+                const handled = reconciler(result) === true;
+                if (!handled) this._schedulePostMutationSceneRefresh(label || key);
             },
             (error) => {
                 console.warn(`[Sonder] Project mutation failed (${label || key}):`, error);
@@ -1852,6 +1863,7 @@ export class EditorWidget {
         coalesce = true,
         merge = null,
         refreshScenes = true,
+        reconcileFromResult = null,
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -1866,6 +1878,7 @@ export class EditorWidget {
             merge,
             intent,
             refreshScenes,
+            reconcileFromResult,
             run: async (queuedIntent) => {
                 return await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
@@ -1878,6 +1891,319 @@ export class EditorWidget {
                 );
             },
         });
+    }
+
+    _replaceSceneInList(scene) {
+        if (!scene?.scene_id) return;
+        const idx = this.scenes.findIndex((candidate) => candidate.scene_id === scene.scene_id);
+        if (idx >= 0) {
+            this.scenes[idx] = scene;
+        } else {
+            this.scenes.push(scene);
+        }
+    }
+
+    _reconcileActiveSceneFromMutation(result, {
+        reason = "mutation_reconcile",
+        ignoreMutationGate = false,
+        ignoreTimelineGate = false,
+    } = {}) {
+        const scene = result?.payload?.scene;
+        if (!scene || scene.scene_id !== this.activeSceneId) {
+            return false;
+        }
+        if (this._shouldDeferSceneRefresh({ ignoreMutationGate, ignoreTimelineGate })) {
+            this._deferProjectBackedRefresh(["scenes"], reason);
+            return true;
+        }
+        this._sceneFetchSeq += 1;
+        this._pendingScenesRefresh = false;
+        this._replaceSceneInList(scene);
+        this._setActiveScene(scene);
+        this._renderTimeline();
+        this._renderViewportFrame();
+        return true;
+    }
+
+    _discardLastUndo(label = "") {
+        if (!this._undoStack?.length) return false;
+        const entry = this._undoStack[this._undoStack.length - 1];
+        if (label && entry?.label !== label) return false;
+        this._undoStack.pop();
+        return true;
+    }
+
+    _trimLocalLaneConfigs(configs, removedIndex, targetCount) {
+        if (!Array.isArray(configs)) return [];
+        if (removedIndex >= 0 && removedIndex < configs.length) {
+            configs.splice(removedIndex, 1);
+        }
+        while (configs.length > targetCount) configs.pop();
+        while (configs.length < targetCount) configs.push(this._defaultLaneConfig());
+        return configs;
+    }
+
+    _compactEmptyMediaLaneLocal(laneType, laneIndex) {
+        if (!this.activeScene) return false;
+        laneIndex = parseInt(laneIndex, 10);
+        if (!Number.isFinite(laneIndex) || laneIndex < 0) return false;
+        if (laneType === "video") {
+            const laneCount = Math.max(1, parseInt(this.activeScene.video_lane_count, 10) || 1);
+            if (laneCount <= 1 || laneIndex >= laneCount) return false;
+            if ((this.activeScene.clips || []).some((clip) => this._isRenderClip(clip) && (clip.track_index || 0) === laneIndex)) {
+                return false;
+            }
+            for (const clip of (this.activeScene.clips || [])) {
+                if (this._isRenderClip(clip) && (clip.track_index || 0) > laneIndex) {
+                    clip.track_index = Math.max(0, (clip.track_index || 0) - 1);
+                }
+            }
+            this.activeScene.video_lane_count = laneCount - 1;
+            this.activeScene.video_lane_configs = this._trimLocalLaneConfigs(
+                this.activeScene.video_lane_configs || [],
+                laneIndex,
+                this.activeScene.video_lane_count,
+            );
+            return true;
+        }
+        if (laneType === "audio") {
+            const laneCount = Math.max(1, parseInt(this.activeScene.audio_lane_count, 10) || 1);
+            if (laneCount <= 1 || laneIndex >= laneCount) return false;
+            if ((this.activeScene.audio_tracks || []).some((track) => (track.lane_index || 0) === laneIndex)) {
+                return false;
+            }
+            for (const track of (this.activeScene.audio_tracks || [])) {
+                if ((track.lane_index || 0) > laneIndex) {
+                    track.lane_index = Math.max(0, (track.lane_index || 0) - 1);
+                }
+            }
+            this.activeScene.audio_lane_count = laneCount - 1;
+            this.activeScene.audio_lane_configs = this._trimLocalLaneConfigs(
+                this.activeScene.audio_lane_configs || [],
+                laneIndex,
+                this.activeScene.audio_lane_count,
+            );
+            return true;
+        }
+        return false;
+    }
+
+    _renderSceneAfterLocalMutation({ viewport = true } = {}) {
+        this._reconcileSelection();
+        this._buildTrackLayout();
+        this._renderTimeline();
+        if (viewport) this._renderViewportFrame();
+    }
+
+    _applyLocalSetLaneCount(laneType, count) {
+        if (!this.activeScene) return;
+        count = Math.max(1, parseInt(count, 10) || 1);
+        if (laneType === "video") {
+            this.activeScene.video_lane_count = count;
+            this.activeScene.video_lane_configs = this._trimLocalLaneConfigs(this.activeScene.video_lane_configs || [], -1, count);
+        } else if (laneType === "audio") {
+            this.activeScene.audio_lane_count = count;
+            this.activeScene.audio_lane_configs = this._trimLocalLaneConfigs(this.activeScene.audio_lane_configs || [], -1, count);
+        } else if (laneType === "motion_driver") {
+            this.activeScene.motion_driver_lane_count = count;
+            this.activeScene.motion_driver_lane_configs = this._trimLocalLaneConfigs(this.activeScene.motion_driver_lane_configs || [], -1, count);
+        }
+    }
+
+    _applyLocalRemoveLane(laneType, laneIndex, itemPolicy = "require_empty", targetLane = null) {
+        if (!this.activeScene || !["video", "audio"].includes(laneType)) return false;
+        laneIndex = parseInt(laneIndex, 10);
+        if (!Number.isFinite(laneIndex)) return false;
+        const isVideo = laneType === "video";
+        const currentCount = isVideo
+            ? Math.max(1, parseInt(this.activeScene.video_lane_count, 10) || 1)
+            : Math.max(1, parseInt(this.activeScene.audio_lane_count, 10) || 1);
+        if (currentCount <= 1 || laneIndex < 0 || laneIndex >= currentCount) return false;
+        const laneItems = isVideo
+            ? (this.activeScene.clips || []).filter((clip) => this._isRenderClip(clip) && (clip.track_index || 0) === laneIndex)
+            : (this.activeScene.audio_tracks || []).filter((track) => (track.lane_index || 0) === laneIndex);
+        if (laneItems.length && itemPolicy === "require_empty") return false;
+        if (laneItems.length && itemPolicy === "move_items") {
+            const nextTarget = targetLane == null ? (laneIndex > 0 ? laneIndex - 1 : 1) : parseInt(targetLane, 10);
+            if (!Number.isFinite(nextTarget) || nextTarget < 0 || nextTarget >= currentCount || nextTarget === laneIndex) return false;
+            for (const item of laneItems) {
+                if (isVideo) item.track_index = nextTarget;
+                else item.lane_index = nextTarget;
+            }
+        } else if (laneItems.length && itemPolicy === "delete_items") {
+            if (isVideo) {
+                const deleting = new Set(laneItems.map((item) => item.clip_id));
+                this.activeScene.clips = (this.activeScene.clips || []).filter((clip) => !deleting.has(clip.clip_id));
+            } else {
+                const deleting = new Set(laneItems.map((item) => item.track_id));
+                this.activeScene.audio_tracks = (this.activeScene.audio_tracks || []).filter((track) => !deleting.has(track.track_id));
+            }
+        } else if (laneItems.length) {
+            return false;
+        }
+
+        if (isVideo) {
+            for (const clip of (this.activeScene.clips || [])) {
+                if (this._isRenderClip(clip) && (clip.track_index || 0) > laneIndex) {
+                    clip.track_index = Math.max(0, (clip.track_index || 0) - 1);
+                }
+            }
+            this.activeScene.video_lane_count = currentCount - 1;
+            this.activeScene.video_lane_configs = this._trimLocalLaneConfigs(
+                this.activeScene.video_lane_configs || [],
+                laneIndex,
+                this.activeScene.video_lane_count,
+            );
+        } else {
+            for (const track of (this.activeScene.audio_tracks || [])) {
+                if ((track.lane_index || 0) > laneIndex) {
+                    track.lane_index = Math.max(0, (track.lane_index || 0) - 1);
+                }
+            }
+            this.activeScene.audio_lane_count = currentCount - 1;
+            this.activeScene.audio_lane_configs = this._trimLocalLaneConfigs(
+                this.activeScene.audio_lane_configs || [],
+                laneIndex,
+                this.activeScene.audio_lane_count,
+            );
+        }
+        return true;
+    }
+
+    _remapSelectedItem(type, oldId, newId, data) {
+        const update = (item) => {
+            if (item?.type !== type || item.id !== oldId) return item;
+            return { type, id: newId, data };
+        };
+        this.selectedItems = (this.selectedItems || []).map(update);
+        if (this.selectedItem?.type === type && this.selectedItem.id === oldId) {
+            this.selectedItem = { type, id: newId, data };
+        }
+    }
+
+    _applyLocalMoveGuide(oldFrame, newFrame, guideData, fields = {}) {
+        if (!this.activeScene) return null;
+        oldFrame = parseInt(oldFrame, 10);
+        newFrame = parseInt(newFrame, 10);
+        if (!Number.isFinite(oldFrame) || !Number.isFinite(newFrame)) return null;
+        const moved = {
+            ...(guideData || {}),
+            frame_index: newFrame,
+            asset_id: fields.asset_id ?? guideData?.asset_id ?? "",
+            source: fields.source ?? guideData?.source ?? "asset",
+            strength: fields.strength ?? guideData?.strength ?? 1.0,
+            muted: fields.muted ?? guideData?.muted ?? false,
+        };
+        delete moved._previewFrameIndex;
+        this.activeScene.guide_frames = (this.activeScene.guide_frames || [])
+            .filter((guide) => guide.frame_index !== oldFrame && guide.frame_index !== newFrame);
+        this.activeScene.guide_frames.push(moved);
+        this.activeScene.guide_frames.sort((a, b) => (a.frame_index || 0) - (b.frame_index || 0));
+        this._remapSelectedItem("guide", oldFrame, newFrame, moved);
+        return moved;
+    }
+
+    _applyLocalCreateGuide(fields = {}) {
+        if (!this.activeScene) return null;
+        const frameIndex = parseInt(fields.frame_index, 10);
+        if (!Number.isFinite(frameIndex)) return null;
+        const guide = {
+            frame_index: frameIndex,
+            asset_id: fields.asset_id || "",
+            source: fields.source || "asset",
+            strength: fields.strength ?? this._defaultGuideStrength(),
+            muted: !!fields.muted,
+        };
+        this.activeScene.guide_frames = (this.activeScene.guide_frames || [])
+            .filter((current) => current.frame_index !== frameIndex);
+        this.activeScene.guide_frames.push(guide);
+        this.activeScene.guide_frames.sort((a, b) => (a.frame_index || 0) - (b.frame_index || 0));
+        return guide;
+    }
+
+    _applyLocalPromptCreate(fields = {}) {
+        if (!this.activeScene) return null;
+        const section = {
+            start_frame: parseInt(fields.start_frame, 10) || 0,
+            end_frame: parseInt(fields.end_frame, 10) || 0,
+            prompt: String(fields.prompt || ""),
+        };
+        this.activeScene.prompt_sections = this.activeScene.prompt_sections || [];
+        this.activeScene.prompt_sections.push(section);
+        this.activeScene.prompt_sections.sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
+        return section;
+    }
+
+    _applyLocalPromptUpdate(index, fields = {}) {
+        if (!this.activeScene) return null;
+        const section = (this.activeScene.prompt_sections || [])[index];
+        if (!section) return null;
+        Object.assign(section, fields);
+        this.activeScene.prompt_sections.sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
+        return section;
+    }
+
+    _applyLocalPromptDelete(index) {
+        if (!this.activeScene || !Array.isArray(this.activeScene.prompt_sections)) return false;
+        if (index < 0 || index >= this.activeScene.prompt_sections.length) return false;
+        this.activeScene.prompt_sections.splice(index, 1);
+        if (this._selectedPromptIdx === index) this._selectedPromptIdx = null;
+        return true;
+    }
+
+    _applyLocalBulkDeleteItems(items = [], { preserveLanes = false } = {}) {
+        if (!this.activeScene || !Array.isArray(items)) return false;
+        const videoLanes = [];
+        const audioLanes = [];
+        const guideFrames = new Set();
+        const promptIndexes = [];
+        const clipIds = new Set();
+        const audioIds = new Set();
+
+        for (const item of items) {
+            if (!item || typeof item !== "object") continue;
+            const preserveLane = !!(item.preserve_lane || preserveLanes);
+            if (item.type === "clip") {
+                const clip = (this.activeScene.clips || []).find((candidate) => candidate.clip_id === item.id);
+                if (!clip) continue;
+                clipIds.add(clip.clip_id);
+                if (!preserveLane) videoLanes.push(parseInt(clip.track_index, 10) || 0);
+            } else if (item.type === "audio") {
+                const track = (this.activeScene.audio_tracks || []).find((candidate) => candidate.track_id === item.id);
+                if (!track) continue;
+                audioIds.add(track.track_id);
+                if (!preserveLane) audioLanes.push(parseInt(track.lane_index, 10) || 0);
+            } else if (item.type === "guide") {
+                const frameIndex = parseInt(item.id, 10);
+                if (Number.isFinite(frameIndex)) guideFrames.add(frameIndex);
+            } else if (item.type === "prompt") {
+                const idx = parseInt(item.id, 10);
+                if (Number.isFinite(idx)) promptIndexes.push(idx);
+            }
+        }
+
+        if (clipIds.size) {
+            this.activeScene.clips = (this.activeScene.clips || []).filter((clip) => !clipIds.has(clip.clip_id));
+        }
+        if (audioIds.size) {
+            this.activeScene.audio_tracks = (this.activeScene.audio_tracks || []).filter((track) => !audioIds.has(track.track_id));
+        }
+        if (guideFrames.size) {
+            this.activeScene.guide_frames = (this.activeScene.guide_frames || [])
+                .filter((guide) => !guideFrames.has(parseInt(guide.frame_index, 10)));
+        }
+        for (const idx of Array.from(new Set(promptIndexes)).sort((a, b) => b - a)) {
+            if (idx >= 0 && idx < (this.activeScene.prompt_sections || []).length) {
+                this.activeScene.prompt_sections.splice(idx, 1);
+            }
+        }
+        for (const lane of Array.from(new Set(videoLanes)).sort((a, b) => b - a)) {
+            this._compactEmptyMediaLaneLocal("video", lane);
+        }
+        for (const lane of Array.from(new Set(audioLanes)).sort((a, b) => b - a)) {
+            this._compactEmptyMediaLaneLocal("audio", lane);
+        }
+        return true;
     }
 
     _buildAssetItem(asset) {
@@ -4733,6 +5059,22 @@ export class EditorWidget {
             if (hasOverlap) {
                 this._showToast("Only the earliest overlapping motion driver will be used.");
             }
+            const tempClipId = `temp-driver-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+            this.activeScene.clips = this.activeScene.clips || [];
+            this.activeScene.clips.push({
+                clip_id: tempClipId,
+                source_path: assetObj?.path || asset.path || "",
+                timeline_start_frame: frame,
+                timeline_end_frame: dropEnd,
+                source_in_frame: 0,
+                source_out_frame: dropDuration,
+                total_source_frames: dropDuration,
+                track_index: targetMotionDriverLane,
+                role: "motion_driver",
+                strength: this._defaultMotionDriverStrength(),
+                muted: false,
+            });
+            this._renderSceneAfterLocalMutation();
             try {
                 const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
                     method: "POST",
@@ -4748,19 +5090,22 @@ export class EditorWidget {
                 });
                 if (!resp.ok) {
                     console.warn("[Sonder] Motion-driver clip creation failed:", resp.status, await resp.text());
+                    this._discardLastUndo("add motion driver");
+                    await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
                     return;
                 }
-                await this._fetchAssets();
-                await this._fetchScenes();
-                this._renderTimeline();
-                this._renderViewportFrame();
+                const createdClip = await resp.json();
+                const clipIdx = (this.activeScene.clips || []).findIndex((clip) => clip.clip_id === tempClipId);
+                if (clipIdx >= 0) this.activeScene.clips[clipIdx] = createdClip;
+                this._renderSceneAfterLocalMutation();
+                this._deferProjectBackedRefresh(["scenes"], "motion_driver_drop_reconcile");
             } catch (e) {
+                this._discardLastUndo("add motion driver");
+                await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
                 console.warn("[Sonder] Failed to drop motion driver:", e);
             }
             return;
         }
-
-        this._pushUndo("add asset");
 
         const _findAsset = (id) => {
             for (const type of ["video", "image", "audio", "artifact"]) {
@@ -4784,6 +5129,28 @@ export class EditorWidget {
             if (this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
         }
 
+        this._pushUndo("add asset");
+
+        const persistSceneLaneCounts = async (fields, reason) => {
+            try {
+                const laneResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(fields),
+                });
+                if (laneResp.ok) return true;
+                const message = await laneResp.text();
+                console.warn("[Sonder] Auto-add lane failed:", laneResp.status, message);
+            } catch (error) {
+                console.warn("[Sonder] Auto-add lane failed:", error);
+            }
+            this._discardLastUndo("add asset");
+            await this._fetchScenes({ ignoreMutationGate: true, reason });
+            return false;
+        };
+
+        const laneCountFields = {};
+
         // Auto-add lane if target lane has overlapping items at the drop frame
         if (asset.asset_type === "video") {
             const assetObj = _findAsset(asset.asset_id);
@@ -4799,13 +5166,10 @@ export class EditorWidget {
                 // Auto-add a new video lane and place clip there
                 const newCount = (this.activeScene.video_lane_count || 1) + 1;
                 targetVideoLane = newCount - 1; // highest lane = top
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ video_lane_count: newCount }),
-                });
                 this.activeScene.video_lane_count = newCount;
                 this._buildTrackLayout();
+                this._renderTimeline();
+                laneCountFields.video_lane_count = newCount;
             }
             // Only videos with embedded audio can create paired audio tracks.
             if (videoHasAudio) {
@@ -4818,13 +5182,10 @@ export class EditorWidget {
                 if (hasAudioOverlap) {
                     const newAudioCount = (this.activeScene.audio_lane_count || 1) + 1;
                     targetAudioLane = newAudioCount - 1;
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
-                        method: "PUT",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ audio_lane_count: newAudioCount }),
-                    });
                     this.activeScene.audio_lane_count = newAudioCount;
                     this._buildTrackLayout();
+                    this._renderTimeline();
+                    laneCountFields.audio_lane_count = newAudioCount;
                 }
             }
         } else if (asset.asset_type === "audio") {
@@ -4839,39 +5200,89 @@ export class EditorWidget {
             if (hasOverlap) {
                 const newCount = (this.activeScene.audio_lane_count || 1) + 1;
                 targetAudioLane = newCount - 1;
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ audio_lane_count: newCount }),
-                });
                 this.activeScene.audio_lane_count = newCount;
                 this._buildTrackLayout();
+                this._renderTimeline();
+                laneCountFields.audio_lane_count = newCount;
             }
         }
 
+        if (Object.keys(laneCountFields).length > 0) {
+            const lanesPersisted = await persistSceneLaneCounts(laneCountFields, "drop_lane_count_error");
+            if (!lanesPersisted) return;
+        }
+
         let resp;
+        let optimisticClipId = "";
+        let optimisticAudioId = "";
+        let droppedVideoHasAudio = false;
         try {
             if (asset.asset_type === "image") {
                 // Images always create guide frames (regardless of which track they're dropped on)
+                const guideFields = {
+                    frame_index: frame,
+                    asset_id: asset.asset_id,
+                    source: "asset",
+                    strength: this._defaultGuideStrength(),
+                };
+                this._applyLocalCreateGuide(guideFields);
+                this._renderSceneAfterLocalMutation();
                 resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        frame_index: frame,
-                        asset_id: asset.asset_id,
-                        source: "asset",
-                        strength: this._defaultGuideStrength(),
-                    }),
+                    body: JSON.stringify(guideFields),
                 });
                 if (!resp.ok) {
                     console.warn("[Sonder] Guide creation failed:", resp.status, await resp.text());
+                    this._discardLastUndo("add asset");
+                    await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_guide_error" });
                     return;
+                }
+                const guidePayload = await resp.json();
+                if (guidePayload?.frame_index !== undefined) {
+                    this._applyLocalCreateGuide(guidePayload);
+                    this._renderSceneAfterLocalMutation();
                 }
                 console.log("[Sonder] Guide frame created at frame", frame);
             } else if (asset.asset_type === "video") {
                 // Drop video = create clip on target video lane (+ audio track if video has audio)
                 const assetObj = _findAsset(asset.asset_id);
                 const videoHasAudio = assetObj?.has_audio === true || asset?.has_audio === true;
+                droppedVideoHasAudio = videoHasAudio;
+                const frameCount = Math.max(1, parseInt(assetObj?.frame_count ?? asset.frame_count ?? 0, 10) || 30);
+                optimisticClipId = `temp-clip-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+                const optimisticClip = {
+                    clip_id: optimisticClipId,
+                    source_path: assetObj?.path || asset.path || "",
+                    timeline_start_frame: frame,
+                    timeline_end_frame: frame + frameCount,
+                    source_in_frame: 0,
+                    source_out_frame: frameCount,
+                    total_source_frames: frameCount,
+                    track_index: targetVideoLane,
+                    role: "render",
+                    opacity: 1.0,
+                    muted: false,
+                };
+                this.activeScene.clips = this.activeScene.clips || [];
+                this.activeScene.clips.push(optimisticClip);
+                if (videoHasAudio) {
+                    optimisticAudioId = `temp-audio-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+                    const optimisticAudio = {
+                        track_id: optimisticAudioId,
+                        source_path: "",
+                        timeline_start_frame: frame,
+                        timeline_end_frame: frame + frameCount,
+                        source_in_frame: 0,
+                        total_source_frames: frameCount,
+                        lane_index: targetAudioLane,
+                        volume: 1.0,
+                        muted: false,
+                    };
+                    this.activeScene.audio_tracks = this.activeScene.audio_tracks || [];
+                    this.activeScene.audio_tracks.push(optimisticAudio);
+                }
+                this._renderSceneAfterLocalMutation();
                 const clipBody = {
                     asset_id: asset.asset_id,
                     timeline_start_frame: frame,
@@ -4886,10 +5297,45 @@ export class EditorWidget {
                 });
                 if (!resp.ok) {
                     console.warn("[Sonder] Clip creation failed:", resp.status, await resp.text());
+                    this._discardLastUndo("add asset");
+                    await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_clip_error" });
                     return;
                 }
+                const clipPayload = await resp.json();
+                const { audio_track: createdAudioTrack, ...createdClip } = clipPayload || {};
+                const clipIdx = (this.activeScene.clips || []).findIndex((clip) => clip.clip_id === optimisticClipId);
+                if (clipIdx >= 0) {
+                    this.activeScene.clips[clipIdx] = createdClip;
+                }
+                if (optimisticAudioId) {
+                    if (createdAudioTrack) {
+                        const audioIdx = (this.activeScene.audio_tracks || []).findIndex((track) => track.track_id === optimisticAudioId);
+                        if (audioIdx >= 0) this.activeScene.audio_tracks[audioIdx] = createdAudioTrack;
+                    } else {
+                        this.activeScene.audio_tracks = (this.activeScene.audio_tracks || []).filter((track) => track.track_id !== optimisticAudioId);
+                    }
+                }
+                this._renderSceneAfterLocalMutation();
             } else if (asset.asset_type === "audio") {
                 // Drop audio = create audio track on target audio lane
+                const assetObj = _findAsset(asset.asset_id);
+                const fps = this._effectiveFps;
+                const durationFrames = Math.max(1, Math.round((assetObj?.duration_sec || asset.duration_sec || 1) * fps));
+                optimisticAudioId = `temp-audio-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+                const optimisticAudio = {
+                    track_id: optimisticAudioId,
+                    source_path: assetObj?.path || asset.path || "",
+                    timeline_start_frame: frame,
+                    timeline_end_frame: frame + durationFrames,
+                    source_in_frame: 0,
+                    total_source_frames: durationFrames,
+                    lane_index: targetAudioLane,
+                    volume: 1.0,
+                    muted: false,
+                };
+                this.activeScene.audio_tracks = this.activeScene.audio_tracks || [];
+                this.activeScene.audio_tracks.push(optimisticAudio);
+                this._renderSceneAfterLocalMutation();
                 resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks`), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -4901,15 +5347,23 @@ export class EditorWidget {
                 });
                 if (!resp.ok) {
                     console.warn("[Sonder] Audio track creation failed:", resp.status, await resp.text());
+                    this._discardLastUndo("add asset");
+                    await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_audio_error" });
                     return;
                 }
+                const audioPayload = await resp.json();
+                const audioIdx = (this.activeScene.audio_tracks || []).findIndex((track) => track.track_id === optimisticAudioId);
+                if (audioIdx >= 0) this.activeScene.audio_tracks[audioIdx] = audioPayload;
+                this._renderSceneAfterLocalMutation();
             }
 
-            // Refresh both assets and scenes because dual-drop can create a new extracted audio asset.
-            await this._fetchAssets();
-            await this._fetchScenes();
-            this._renderTimeline();
+            if (droppedVideoHasAudio) {
+                this._deferProjectBackedRefresh(["assets"], "dual_drop_asset_refresh");
+            }
+            this._deferProjectBackedRefresh(["scenes"], "asset_drop_reconcile");
         } catch (e) {
+            this._discardLastUndo("add asset");
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "asset_drop_error" });
             console.warn("[Sonder] Failed to drop asset:", e);
         }
     }
@@ -5229,8 +5683,11 @@ export class EditorWidget {
         const nextCount = isVideo
             ? (this.activeScene.video_lane_count || 1) + 1
             : (this.activeScene.audio_lane_count || 1) + 1;
+        const undoLabel = "add lane";
+        this._pushUndo(undoLabel);
+        this._applyLocalSetLaneCount(isVideo ? "video" : "audio", nextCount);
+        this._renderSceneAfterLocalMutation({ viewport: false });
         try {
-            this._pushUndo("add lane");
             await this._runSceneMutation(
                 [{ type: "set_lane_count", lane_type: isVideo ? "video" : "audio", count: nextCount }],
                 {
@@ -5242,6 +5699,8 @@ export class EditorWidget {
             this._buildTrackLayout();
             this._renderTimeline();
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "add_lane_error" });
             console.warn("[Sonder] Failed to add lane:", e);
         }
     }
@@ -5268,16 +5727,23 @@ export class EditorWidget {
             : `This ${label} lane has ${items.length} item(s). Delete them and remove this lane?`;
         if (!confirm(msg)) return;
 
+        const undoLabel = "remove lane";
+        const operation = {
+            type: "remove_lane",
+            lane_type: isVideo ? "video" : "audio",
+            lane_index: laneIndex,
+            item_policy: willMove ? "move_items" : "delete_items",
+            target_lane: targetLane,
+        };
+
         try {
-            this._pushUndo("remove lane");
+            this._pushUndo(undoLabel);
+            this._applyLocalRemoveLane(operation.lane_type, laneIndex, operation.item_policy, targetLane);
+            this._clearSelection();
+            this._hideItemEditor();
+            this._renderSceneAfterLocalMutation();
             await this._runSceneMutation(
-                [{
-                    type: "remove_lane",
-                    lane_type: isVideo ? "video" : "audio",
-                    lane_index: laneIndex,
-                    item_policy: willMove ? "move_items" : "delete_items",
-                    target_lane: targetLane,
-                }],
+                [operation],
                 {
                     key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-remove-lane:${laneIndex}`,
                     label: "remove lane",
@@ -5285,6 +5751,8 @@ export class EditorWidget {
                 }
             );
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "remove_lane_error" });
             console.warn("[Sonder] Failed to remove lane with items:", e);
         }
     }
@@ -5306,30 +5774,34 @@ export class EditorWidget {
         }
         if (!confirm(`Delete ${items.length} ${label} item(s) on lane ${laneIndex + 1}? The lane will remain.`)) return;
 
+        const undoLabel = "delete lane items";
+        const operation = {
+            type: "bulk_delete_items",
+            preserve_lanes: true,
+            items: items.map((item) => ({
+                type: isVideo ? "clip" : "audio",
+                id: isVideo ? item.clip_id : item.track_id,
+                preserve_lane: true,
+            })),
+        };
+
         try {
-            this._pushUndo("delete lane items");
+            this._pushUndo(undoLabel);
+            this._applyLocalBulkDeleteItems(operation.items, { preserveLanes: true });
+            this._clearSelection();
+            this._hideItemEditor();
+            this._renderSceneAfterLocalMutation();
             await this._runSceneMutation(
-                [{
-                    type: "bulk_delete_items",
-                    preserve_lanes: true,
-                    items: items.map((item) => ({
-                        type: isVideo ? "clip" : "audio",
-                        id: isVideo ? item.clip_id : item.track_id,
-                        preserve_lane: true,
-                    })),
-                }],
+                [operation],
                 {
                     key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-delete-lane-items:${laneIndex}`,
                     label: "delete lane items",
                     coalesce: false,
                 }
             );
-            this._clearSelection();
-            this._hideItemEditor();
-            this._buildTrackLayout();
-            this._renderTimeline();
-            this._renderViewportFrame();
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_lane_items_error" });
             console.warn("[Sonder] Failed to delete lane items:", e);
         }
     }
@@ -5345,24 +5817,31 @@ export class EditorWidget {
             ? (this.activeScene.video_lane_count || 1)
             : (this.activeScene.audio_lane_count || 1);
         if (currentCount <= 1) return;
+        const undoLabel = "remove lane";
+        const operation = {
+            type: "remove_lane",
+            lane_type: isVideo ? "video" : "audio",
+            lane_index: laneIndex,
+            item_policy: "require_empty",
+        };
         try {
-            this._pushUndo("remove lane");
+            this._pushUndo(undoLabel);
+            if (!this._applyLocalRemoveLane(operation.lane_type, laneIndex, operation.item_policy)) {
+                this._discardLastUndo(undoLabel);
+                return;
+            }
+            this._renderSceneAfterLocalMutation({ viewport: false });
             await this._runSceneMutation(
-                [{
-                    type: "remove_lane",
-                    lane_type: isVideo ? "video" : "audio",
-                    lane_index: laneIndex,
-                    item_policy: "require_empty",
-                }],
+                [operation],
                 {
                     key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-remove-lane:${laneIndex}`,
                     label: "remove lane",
                     coalesce: false,
                 }
             );
-            this._buildTrackLayout();
-            this._renderTimeline();
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "remove_empty_lane_error" });
             console.warn("[Sonder] Failed to remove lane:", e);
         }
     }
@@ -5438,23 +5917,29 @@ export class EditorWidget {
     async _saveNewPromptSection(startFrame, endFrame, promptText) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
-        this._pushUndo("add prompt");
-        const dirName = this.projectDir.split(/[/\\]/).pop();
+        const undoLabel = "add prompt";
+        const fields = {
+            start_frame: startFrame,
+            end_frame: endFrame,
+            prompt: promptText,
+        };
+        this._pushUndo(undoLabel);
+        this._applyLocalPromptCreate(fields);
+        this._hidePromptEditor();
+        this._renderSceneAfterLocalMutation({ viewport: false });
 
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/prompt_sections`), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    start_frame: startFrame,
-                    end_frame: endFrame,
-                    prompt: promptText,
-                }),
-            });
-            this._hidePromptEditor();
-            await this._fetchScenes();
-            this._renderTimeline();
+            await this._runSceneMutation(
+                [{ type: "create_prompt_section", fields }],
+                {
+                    key: `prompt:${this.activeSceneId}:create:${Date.now()}`,
+                    label: "add prompt",
+                    coalesce: false,
+                }
+            );
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "add_prompt_error" });
             console.warn("[Sonder] Failed to create prompt section:", e);
         }
     }
@@ -5528,18 +6013,23 @@ export class EditorWidget {
     async _updatePromptSection(idx, updates) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
-        this._pushUndo("edit prompt");
+        const undoLabel = "edit prompt";
+        this._pushUndo(undoLabel);
         const section = (this.activeScene.prompt_sections || [])[idx];
+        const expected = section ? {
+            start_frame: section.start_frame,
+            end_frame: section.end_frame,
+        } : undefined;
+        this._applyLocalPromptUpdate(idx, { ...updates });
+        this._selectedPromptIdx = null;
+        this._renderSceneAfterLocalMutation({ viewport: false });
 
         try {
             await this._runSceneMutation(
                 [{
                     type: "update_prompt_section",
                     index: idx,
-                    expected: section ? {
-                        start_frame: section.start_frame,
-                        end_frame: section.end_frame,
-                    } : undefined,
+                    expected,
                     fields: { ...updates },
                 }],
                 {
@@ -5561,9 +6051,9 @@ export class EditorWidget {
                     },
                 }
             );
-            this._selectedPromptIdx = null;
-            this._renderTimeline();
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "edit_prompt_error" });
             console.warn("[Sonder] Failed to update prompt section:", e);
         }
     }
@@ -5571,8 +6061,13 @@ export class EditorWidget {
     async _deletePromptSection(idx) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
-        this._pushUndo("delete prompt");
+        const undoLabel = "delete prompt";
+        this._pushUndo(undoLabel);
         const section = (this.activeScene.prompt_sections || [])[idx];
+        this._applyLocalPromptDelete(idx);
+        this._selectedPromptIdx = null;
+        this._hidePromptEditor();
+        this._renderSceneAfterLocalMutation({ viewport: false });
 
         try {
             await this._runSceneMutation(
@@ -5590,10 +6085,9 @@ export class EditorWidget {
                     coalesce: false,
                 }
             );
-            this._selectedPromptIdx = null;
-            this._hidePromptEditor();
-            this._renderTimeline();
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_prompt_error" });
             console.warn("[Sonder] Failed to delete prompt section:", e);
         }
     }
@@ -5990,8 +6484,19 @@ export class EditorWidget {
     async _moveGuideToFrame(guideData, newIdx, strength = guideData?.strength ?? 1.0) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isGuideTrackLocked()) return;
-        this._pushUndo("move guide");
+        const undoLabel = "move guide";
+        this._pushUndo(undoLabel);
         const oldIdx = guideData.frame_index;
+        const fields = {
+            asset_id: guideData.asset_id,
+            source: guideData.source || "asset",
+            strength,
+            muted: !!guideData.muted,
+        };
+        this._applyLocalMoveGuide(oldIdx, newIdx, guideData, fields);
+        this._clearSelection();
+        this._hideItemEditor();
+        this._renderSceneAfterLocalMutation();
 
         try {
             await this._runSceneMutation(
@@ -6003,10 +6508,7 @@ export class EditorWidget {
                         frame_index: oldIdx,
                         asset_id: guideData.asset_id || "",
                     },
-                    asset_id: guideData.asset_id,
-                    source: guideData.source || "asset",
-                    strength,
-                    muted: !!guideData.muted,
+                    ...fields,
                 }],
                 {
                     key: `guide:${this.activeSceneId}:${oldIdx}:move`,
@@ -6014,10 +6516,9 @@ export class EditorWidget {
                     coalesce: false,
                 }
             );
-            this._clearSelection();
-            this._hideItemEditor();
-            this._renderTimeline();
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "move_guide_error" });
             console.warn("[Sonder] Failed to move guide:", e);
         }
     }
@@ -6220,23 +6721,27 @@ export class EditorWidget {
                 this._showToast("Captured via backend (viewport snapshot unavailable)");
             }
 
-            const guideResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    frame_index: this.playhead,
-                    asset_id: asset.asset_id,
-                    source: "asset",
-                    strength: 1.0,
-                }),
-            });
-            if (!guideResp.ok) {
-                console.warn("[Sonder] Add guide failed:", await guideResp.text());
-                return;
-            }
-
-            await Promise.all([this._fetchAssets(), this._fetchScenes()]);
+            const fields = {
+                frame_index: this.playhead,
+                asset_id: asset.asset_id,
+                source: "asset",
+                strength: 1.0,
+            };
+            this._pushUndo("add guide");
+            this._applyLocalCreateGuide(fields);
+            this._renderSceneAfterLocalMutation();
+            this._deferProjectBackedRefresh(["assets"], "guide_snapshot_asset");
+            await this._runSceneMutation(
+                [{ type: "create_guide", fields }],
+                {
+                    key: `guide:${this.activeSceneId}:${this.playhead}:create`,
+                    label: "add guide",
+                    coalesce: false,
+                }
+            );
         } catch (e) {
+            this._discardLastUndo("add guide");
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "add_guide_error" });
             console.warn("[Sonder] Add frame to guides failed:", e);
         }
     }
@@ -6245,7 +6750,8 @@ export class EditorWidget {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
         this.selectedItems = this.selectedItems.filter((item) => !this._isItemLocked(item));
         if (this.selectedItems.length === 0) return;
-        this._pushUndo("delete items");
+        const undoLabel = "delete items";
+        this._pushUndo(undoLabel);
         const items = this.selectedItems.map((item) => {
             if (item.type === "guide") {
                 return {
@@ -6272,6 +6778,10 @@ export class EditorWidget {
                 id: item.id,
             };
         });
+        this._applyLocalBulkDeleteItems(items);
+        this._clearSelection();
+        this._hideItemEditor();
+        this._renderSceneAfterLocalMutation();
 
         try {
             await this._runSceneMutation(
@@ -6282,170 +6792,11 @@ export class EditorWidget {
                     coalesce: false,
                 }
             );
-            this._clearSelection();
-            this._hideItemEditor();
-            this._renderTimeline();
         } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_items_error" });
             console.warn("[Sonder] Failed to delete items:", e);
         }
-    }
-
-    async _commitItemMoveLegacyBeforeProjectMutationQueue(frameDelta) {
-        if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
-        // Note: _pushUndo already called at drag start (mousedown)
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const sceneId = this.activeSceneId;
-
-        return this._withTimelineMutationCommit("moveItem", async () => {
-            try {
-            const dragItemsOrig = this._dragItemsOrig || [];
-            const draggedClipIds = new Set(dragItemsOrig.filter(o => o.type === "clip").map(o => o.id));
-            const draggedAudioIds = new Set(dragItemsOrig.filter(o => o.type === "audio").map(o => o.id));
-            const origClipLanes = this._origAllClipLanes || {};
-            const origAudioLanes = this._origAllAudioLanes || {};
-            const origClipStarts = this._origAllClipStarts || {};
-            const origAudioStarts = this._origAllAudioStarts || {};
-
-            // Persist the exact previewed state. A non-dragged item is committed when its
-            // lane OR timeline_start changed — supports full position+lane swap from #35.
-            for (const clip of (this.activeScene.clips || [])) {
-                const clipId = clip.clip_id;
-                const isDragged = draggedClipIds.has(clipId);
-                const origLane = origClipLanes[clipId];
-                const laneChanged = origLane !== undefined && (clip.track_index || 0) !== origLane;
-                const origStart = origClipStarts[clipId];
-                const startChanged = origStart !== undefined && (clip.timeline_start_frame || 0) !== origStart;
-                if (!isDragged && !laneChanged && !startChanged) continue;
-                const putBody = { track_index: clip.track_index || 0 };
-                if (isDragged || startChanged) {
-                    putBody.timeline_start_frame = clip.timeline_start_frame;
-                    putBody.timeline_end_frame = clip.timeline_end_frame;
-                }
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${clipId}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(putBody),
-                });
-            }
-
-            for (const track of (this.activeScene.audio_tracks || [])) {
-                const trackId = track.track_id;
-                const isDragged = draggedAudioIds.has(trackId);
-                const origLane = origAudioLanes[trackId];
-                const laneChanged = origLane !== undefined && (track.lane_index || 0) !== origLane;
-                const origStart = origAudioStarts[trackId];
-                const startChanged = origStart !== undefined && (track.timeline_start_frame || 0) !== origStart;
-                if (!isDragged && !laneChanged && !startChanged) continue;
-                const putBody = { lane_index: track.lane_index || 0 };
-                if (isDragged || startChanged) {
-                    putBody.timeline_start_frame = track.timeline_start_frame;
-                    putBody.timeline_end_frame = track.timeline_end_frame;
-                }
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${trackId}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(putBody),
-                });
-            }
-
-            for (const orig of dragItemsOrig) {
-                const { type, id, data } = orig;
-                if (type === "clip" || type === "audio") {
-                    continue;
-                }
-                if (type === "guide") {
-                    if (this._isGuideTrackLocked()) continue;
-                    const oldIdx = orig.origStart;
-                    const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
-                    const newIdx = previewIdx ?? Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
-                    // Move guide = delete old + create new
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides/${oldIdx}`), {
-                        method: "DELETE",
-                    });
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/guides`), {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            frame_index: newIdx,
-                            asset_id: data.asset_id,
-                            source: data.source || "asset",
-                            strength: data.strength ?? 1.0,
-                            muted: !!data.muted,
-                        }),
-                    });
-                    delete data._previewFrameIndex;
-                } else if (type === "prompt") {
-                    if (this._isPromptTrackLocked()) continue;
-                    await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
-                        method: "PUT",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            start_frame: data.start_frame,
-                            end_frame: data.end_frame,
-                        }),
-                    });
-                }
-            }
-
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_commit" });
-            this._renderTimeline();
-            } catch (e) {
-            console.warn("[Sonder] Failed to move items:", e);
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_error" });
-            this._renderTimeline();
-            }
-        });
-    }
-
-    /** Commit a trim operation (edge drag) to the server. */
-    async _commitTrimLegacyBeforeProjectMutationQueue(trimInfo) {
-        if (!this.projectDir || !this.activeScene) return;
-        const dirName = this.projectDir.split(/[/\\]/).pop();
-        const sceneId = this.activeSceneId;
-        const { type, id, data } = trimInfo;
-
-        return this._withTimelineMutationCommit("trimEdge", async () => {
-            try {
-            if (type === "clip") {
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${id}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        timeline_start_frame: data.timeline_start_frame,
-                        timeline_end_frame: data.timeline_end_frame,
-                        source_in_frame: data.source_in_frame || 0,
-                        source_out_frame: data.source_out_frame,
-                    }),
-                });
-            } else if (type === "audio") {
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${id}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        timeline_start_frame: data.timeline_start_frame,
-                        timeline_end_frame: data.timeline_end_frame,
-                        source_in_frame: data.source_in_frame || 0,
-                    }),
-                });
-            } else if (type === "prompt") {
-                if (this._isPromptTrackLocked()) return;
-                await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${sceneId}/prompt_sections/${id}`), {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        start_frame: data.start_frame,
-                        end_frame: data.end_frame,
-                    }),
-                });
-            }
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_commit" });
-            this._renderTimeline();
-            } catch (e) {
-            console.warn("[Sonder] Failed to commit trim:", e);
-            await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_error" });
-            this._renderTimeline();
-            }
-        });
     }
 
     async _commitItemMove(frameDelta) {
@@ -6503,6 +6854,12 @@ export class EditorWidget {
                         const oldIdx = orig.origStart;
                         const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
                         const newIdx = previewIdx ?? Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
+                        const fields = {
+                            asset_id: data.asset_id,
+                            source: data.source || "asset",
+                            strength: data.strength ?? 1.0,
+                            muted: !!data.muted,
+                        };
                         operations.push({
                             type: "move_guide",
                             from_frame_index: oldIdx,
@@ -6511,11 +6868,9 @@ export class EditorWidget {
                                 frame_index: oldIdx,
                                 asset_id: data.asset_id || "",
                             },
-                            asset_id: data.asset_id,
-                            source: data.source || "asset",
-                            strength: data.strength ?? 1.0,
-                            muted: !!data.muted,
+                            ...fields,
                         });
+                        this._applyLocalMoveGuide(oldIdx, newIdx, data, fields);
                         delete data._previewFrameIndex;
                     } else if (type === "prompt") {
                         if (this._isPromptTrackLocked()) continue;
@@ -6535,16 +6890,17 @@ export class EditorWidget {
                 }
 
                 if (operations.length > 0) {
-                    await this._runSceneMutation(operations, {
+                    const result = await this._runSceneMutation(operations, {
                         key: `scene:${sceneId}:move-commit:${Date.now()}`,
                         label: "move item commit",
                         coalesce: false,
                         refreshScenes: false,
                     });
+                    this._reconcileActiveSceneFromMutation(result, { reason: "moveItem_commit", ignoreTimelineGate: true });
                 }
-                await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_commit" });
                 this._renderTimeline();
             } catch (e) {
+                this._discardLastUndo("move items");
                 console.warn("[Sonder] Failed to move items:", e);
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_error" });
                 this._renderTimeline();
@@ -6597,16 +6953,17 @@ export class EditorWidget {
                     });
                 }
                 if (operations.length > 0) {
-                    await this._runSceneMutation(operations, {
+                    const result = await this._runSceneMutation(operations, {
                         key: `scene:${sceneId}:trim-commit:${Date.now()}`,
                         label: "trim commit",
                         coalesce: false,
                         refreshScenes: false,
                     });
+                    this._reconcileActiveSceneFromMutation(result, { reason: "trim_commit", ignoreTimelineGate: true });
                 }
-                await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_commit" });
                 this._renderTimeline();
             } catch (e) {
+                this._discardLastUndo("trim");
                 console.warn("[Sonder] Failed to commit trim:", e);
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_error" });
                 this._renderTimeline();
@@ -6753,7 +7110,18 @@ export class EditorWidget {
             deleteBtn.style.color = COLORS.dangerText;
             deleteBtn.addEventListener("click", async (event) => {
                 event.stopPropagation();
-                this._pushUndo("delete guide");
+                const undoLabel = "delete guide";
+                this._pushUndo(undoLabel);
+                this._applyLocalBulkDeleteItems([{
+                    type: "guide",
+                    id: guide.frame_index,
+                    expected: {
+                        frame_index: guide.frame_index,
+                        asset_id: guide.asset_id || "",
+                    },
+                }]);
+                this._renderSceneAfterLocalMutation();
+                this._showGuideManagementPopup(x, y);
                 try {
                     await this._runSceneMutation(
                         [{
@@ -6771,10 +7139,10 @@ export class EditorWidget {
                             refreshScenes: false,
                         }
                     );
-                    await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_guide" });
-                    this._renderTimeline();
-                    this._showGuideManagementPopup(x, y);
                 } catch (e) {
+                    this._discardLastUndo(undoLabel);
+                    await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_guide_error" });
+                    this._showGuideManagementPopup(x, y);
                     console.warn("[Sonder] Failed to delete guide:", e);
                 }
             });
@@ -7017,7 +7385,18 @@ export class EditorWidget {
             deleteBtn.addEventListener("click", async (event) => {
                 event.stopPropagation();
                 if (locked) return;
-                this._pushUndo("delete guide");
+                const undoLabel = "delete guide";
+                this._pushUndo(undoLabel);
+                this._applyLocalBulkDeleteItems([{
+                    type: "guide",
+                    id: guide.frame_index,
+                    expected: {
+                        frame_index: guide.frame_index,
+                        asset_id: guide.asset_id || "",
+                    },
+                }]);
+                this._renderSceneAfterLocalMutation();
+                this._showGuideManagementPopup(x, y);
                 try {
                     await this._runSceneMutation(
                         [{
@@ -7035,8 +7414,9 @@ export class EditorWidget {
                             refreshScenes: false,
                         }
                     );
-                    await refreshPanel();
                 } catch (e) {
+                    this._discardLastUndo(undoLabel);
+                    await refreshPanel();
                     console.warn("[Sonder] Failed to delete guide:", e);
                 }
             });
@@ -8890,6 +9270,21 @@ export class EditorWidget {
         const snapshot = this._buildQueueSnapshot(range.selStart, range.selEnd);
         if (!snapshot) return;
 
+        const tempId = `temp-queue-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+        const optimisticJob = {
+            ...snapshot,
+            job_id: tempId,
+            status: "pending",
+            progress: 0,
+            error: "",
+            created_at: new Date().toISOString(),
+            completed_at: "",
+            result_asset_id: "",
+        };
+        this._renderQueue = [...(this._renderQueue || []), optimisticJob];
+        this._applyStoredQueueBatchCollapseState();
+        this._renderQueuePanel();
+
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), {
@@ -8898,10 +9293,22 @@ export class EditorWidget {
                 body: JSON.stringify(snapshot),
             });
             if (resp.ok) {
+                const createdJob = await resp.json();
+                this._renderQueue = (this._renderQueue || []).map((job) => job.job_id === tempId ? createdJob : job);
                 this._flashQueueButton(this._queueBtn);
+                this._applyStoredQueueBatchCollapseState();
+                this._renderQueuePanel();
+            } else {
+                this._renderQueue = (this._renderQueue || []).filter((job) => job.job_id !== tempId);
+                this._renderQueuePanel();
                 await this._fetchRenderQueue();
             }
-        } catch (e) { console.error("Add to queue failed:", e); }
+        } catch (e) {
+            this._renderQueue = (this._renderQueue || []).filter((job) => job.job_id !== tempId);
+            this._renderQueuePanel();
+            await this._fetchRenderQueue();
+            console.error("Add to queue failed:", e);
+        }
     }
 
     async _addBatchToRenderQueue() {
@@ -8925,37 +9332,65 @@ export class EditorWidget {
         const batchId = globalThis.crypto?.randomUUID?.()
             || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
 
+        let snapshots = [];
+        let tempJobs = [];
+        let tempIds = new Set();
+
         try {
-            for (let index = 0; index < chunks.length; index += 1) {
-                const chunk = chunks[index];
+            snapshots = chunks.map((chunk, index) => {
                 const snapshot = this._buildQueueSnapshot(chunk.start, chunk.end);
                 if (!snapshot) {
                     throw new Error("Failed to build batch queue snapshot.");
                 }
+                return {
+                    ...snapshot,
+                    batch_id: batchId,
+                    batch_total: chunks.length,
+                    batch_index: index,
+                };
+            });
+            tempJobs = snapshots.map((snapshot, index) => ({
+                ...snapshot,
+                job_id: `temp-batch-${Date.now().toString(36)}-${index}-${Math.random().toString(16).slice(2, 8)}`,
+                status: "pending",
+                progress: 0,
+                error: "",
+                created_at: new Date().toISOString(),
+                completed_at: "",
+                result_asset_id: "",
+            }));
+            tempIds = new Set(tempJobs.map((job) => job.job_id));
+            this._renderQueue = [...(this._renderQueue || []), ...tempJobs];
+            this._applyStoredQueueBatchCollapseState();
+            this._renderQueuePanel();
 
-                const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        ...snapshot,
-                        batch_id: batchId,
-                        batch_total: chunks.length,
-                        batch_index: index,
-                    }),
-                });
-
-                if (!resp.ok) {
-                    const message = await this._readQueueError(resp, `Add batch chunk failed: ${resp.status}`);
-                    await this._fetchRenderQueue();
-                    alert(message);
-                    return;
-                }
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue/batch`), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ jobs: snapshots }),
+            });
+            if (!resp.ok) {
+                const message = await this._readQueueError(resp, `Add batch failed: ${resp.status}`);
+                this._renderQueue = (this._renderQueue || []).filter((job) => !tempIds.has(job.job_id));
+                this._renderQueuePanel();
+                await this._fetchRenderQueue();
+                alert(message);
+                return;
             }
-
+            const payload = await resp.json();
+            const createdJobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
+            this._renderQueue = (this._renderQueue || []).map((job) => {
+                if (!tempIds.has(job.job_id)) return job;
+                const tempIndex = tempJobs.findIndex((temp) => temp.job_id === job.job_id);
+                return createdJobs[tempIndex] || job;
+            });
             this._flashQueueButton(this._batchQueueBtn);
-            await this._fetchRenderQueue();
+            this._applyStoredQueueBatchCollapseState();
+            this._renderQueuePanel();
         } catch (e) {
             console.error("Add batch to queue failed:", e);
+            this._renderQueue = (this._renderQueue || []).filter((job) => !tempIds.has(job.job_id));
+            this._renderQueuePanel();
             await this._fetchRenderQueue();
             alert(e?.message || "Add batch to queue failed.");
         }
@@ -8976,6 +9411,9 @@ export class EditorWidget {
 
     async _clearCompletedRenderQueue() {
         if (!this._projectDirName()) return;
+        const previousQueue = [...(this._renderQueue || [])];
+        this._renderQueue = previousQueue.filter((job) => String(job.status || "").toLowerCase() !== "completed");
+        this._renderQueuePanel();
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), { method: "DELETE" });
@@ -8983,8 +9421,10 @@ export class EditorWidget {
                 const message = await this._readQueueError(resp, `Clear completed renders failed: ${resp.status}`);
                 throw new Error(message);
             }
-            await this._fetchRenderQueue();
         } catch (e) {
+            this._renderQueue = previousQueue;
+            this._renderQueuePanel();
+            await this._fetchRenderQueue();
             console.error("Clear completed renders failed:", e);
             this._showToast(e?.message || "Clear completed renders failed.");
             throw e;
@@ -9037,6 +9477,9 @@ export class EditorWidget {
 
     async _deleteRenderQueueJob(job) {
         if (!this._projectDirName() || !job?.job_id) return;
+        const previousQueue = [...(this._renderQueue || [])];
+        this._renderQueue = previousQueue.filter((candidate) => candidate.job_id !== job.job_id);
+        this._renderQueuePanel();
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
@@ -9044,8 +9487,10 @@ export class EditorWidget {
                 const message = await this._readQueueError(resp, `Delete queue job failed: ${resp.status}`);
                 throw new Error(message);
             }
-            await this._fetchRenderQueue();
         } catch (e) {
+            this._renderQueue = previousQueue;
+            this._renderQueuePanel();
+            await this._fetchRenderQueue();
             console.error("Delete queue job failed:", e);
             this._showToast(e?.message || "Delete queue job failed.");
             throw e;
