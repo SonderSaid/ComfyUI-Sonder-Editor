@@ -13,8 +13,10 @@ import {
     CUSTOM_VIDEO_CODEC_OPTIONS,
     DEFAULT_SAVE_PRESET,
     SAVE_PRESET_OPTIONS,
+    getTemplateById,
     getEditorSettings,
     resolveFrameConstraintForTemplate,
+    snapToConstraint,
 } from "./editor_settings.js";
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
 
@@ -23,6 +25,15 @@ injectSonderFontFaces();
 function style(el, cssText) {
     el.style.cssText = cssText;
     return el;
+}
+
+function snapFpsToTemplate(fps, template) {
+    const numeric = Math.max(0, Number(fps) || 0);
+    const constraint = template?.constraints?.fps;
+    if (template?.id === "free" || !constraint || typeof constraint !== "object") {
+        return numeric;
+    }
+    return Number(snapToConstraint(numeric, constraint).toFixed(3));
 }
 
 // ── Widget hide/show helpers ───────────────────────────────────────────
@@ -203,6 +214,7 @@ async function createProjectFromNode(node, projectWidget) {
     const settings = getEditorSettings();
     const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || 200));
     const templateId = settings.projectDefaults.defaultTemplateId || "free";
+    const template = getTemplateById(templateId, settings);
 
     const projectName = String(projectNameWidget?.value || "").trim();
     if (!projectName) {
@@ -214,7 +226,7 @@ async function createProjectFromNode(node, projectWidget) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             name: projectName,
-            fps: Number(fpsWidget?.value || 24),
+            fps: snapFpsToTemplate(Number(fpsWidget?.value || 24), template),
             width: Number(widthWidget?.value || 768),
             height: Number(heightWidget?.value || 512),
             template_id: templateId,
@@ -270,7 +282,8 @@ function applyProjectCreationDefaults(node) {
     const fpsWidget = node.widgets.find((widget) => widget.name === "fps");
     const widthWidget = node.widgets.find((widget) => widget.name === "width");
     const heightWidget = node.widgets.find((widget) => widget.name === "height");
-    if (fpsWidget) fpsWidget.value = settings.projectDefaults.fps;
+    const template = getTemplateById(settings.projectDefaults.defaultTemplateId || "free", settings);
+    if (fpsWidget) fpsWidget.value = snapFpsToTemplate(settings.projectDefaults.fps, template);
     if (widthWidget) widthWidget.value = settings.projectDefaults.width;
     if (heightWidget) heightWidget.value = settings.projectDefaults.height;
 }

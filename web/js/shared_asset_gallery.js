@@ -3,6 +3,7 @@ const { api } = window.comfyAPI.api;
 import {
     DEFAULT_EDITOR_SETTINGS,
     GALLERY_SORT_OPTIONS,
+    GALLERY_TAB_OPTIONS,
     getEditorSettings,
     migrateLegacyGalleryProjectPrefs,
     subscribeEditorSettings,
@@ -25,10 +26,13 @@ import {
 } from "./editor_theme.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
+const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
 const DEFAULT_INSPECTOR_SETTINGS = DEFAULT_EDITOR_SETTINGS.inspector;
 const ROOT_FOLDER_COLLAPSE_KEY = "__sonder_root__";
 const TRASH_FOLDER_COLLAPSE_KEY = "__sonder_trash__";
 const SORT_OPTIONS = GALLERY_SORT_OPTIONS;
+const TAB_OPTIONS = GALLERY_TAB_OPTIONS;
+const VALID_TAB_VALUES = new Set(TAB_OPTIONS.map((entry) => entry.value));
 const COMPARE_SORT_OPTIONS = GALLERY_SORT_OPTIONS.filter((entry) => entry.value !== "type");
 const AUDIO_DUCK_VOLUME = Math.pow(10, -3 / 20);
 const LIST_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
@@ -358,6 +362,10 @@ function thumbnailSizeConfig(size) {
     return THUMBNAIL_SIZE_CONFIG[size] || THUMBNAIL_SIZE_CONFIG[DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize];
 }
 
+function normalizeGalleryTab(value) {
+    return VALID_TAB_VALUES.has(value) ? value : DEFAULT_GALLERY_TAB;
+}
+
 function formatGenerationValue(value) {
     if (value == null || value === "") return "-";
     if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -625,7 +633,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         : `sonder-gallery-${Math.random().toString(36).slice(2, 8)}`;
     const consumerId = (suffix) => `${ownerId}:${suffix}`;
     const state = {
-        type: "all",
+        type: normalizeGalleryTab(initialSettings.gallery.activeTab),
         query: "",
         selectedAssetId: "",
         selectedAssetIds: new Set(),
@@ -1001,6 +1009,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
     }
 
+    function persistActiveTab() {
+        updateEditorSettings({
+            gallery: {
+                activeTab: normalizeGalleryTab(state.type),
+            },
+        });
+    }
+
     function persistInspectorSetting(key, value) {
         updateEditorSettings({
             inspector: {
@@ -1015,6 +1031,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             ? nextSettings.gallery.sortMode
             : DEFAULT_SORT_MODE;
         state.sortMode = nextSort;
+        state.type = normalizeGalleryTab(nextSettings?.gallery?.activeTab);
         state.inspectorCollapsed = !!nextSettings?.gallery?.inspectorCollapsed;
         state.artifactInspectorExpanded = !!nextSettings?.gallery?.artifactInspectorExpanded;
         state.thumbnailSize = nextSettings?.gallery?.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize;
@@ -4004,7 +4021,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const row = style(document.createElement("div"), `display:grid;grid-template-columns:52px minmax(0,1fr);gap:8px;align-items:center;padding:6px;border-radius:8px;border:1px solid ${isSelected ? sideAccent : "#35414c"};background:${isSelected ? "rgba(78,121,160,0.18)" : "rgba(255,255,255,0.02)"};cursor:pointer;`);
             const thumb = style(document.createElement("div"), `height:40px;border-radius:6px;background:#111;border:1px solid #293542;display:flex;align-items:center;justify-content:center;overflow:hidden;color:#7f93a5;font-size:10px;`);
             if (asset.has_thumbnail) {
-                const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+                const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:contain;display:block;`);
                 img.loading = "lazy";
                 img.decoding = "async";
                 img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
@@ -4903,7 +4920,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             missingWrap.append(missingTitle, missingText);
             previewSurface.appendChild(missingWrap);
         } else if (asset.asset_type === "image") {
-            const img = style(document.createElement("img"), `width:100%;max-height:220px;object-fit:contain;display:block;`);
+            const img = style(document.createElement("img"), `max-width:100%;max-height:220px;width:auto;height:auto;object-fit:contain;display:block;`);
             img.src = buildAssetViewUrl(projectDir, asset.path);
             img.alt = assetDisplayName(asset);
             previewSurface.appendChild(img);
@@ -5520,21 +5537,15 @@ export function mountSharedAssetGallery(container, options = {}) {
             audio: activeAssets.filter((asset) => asset.asset_type === "audio").length,
             artifact: activeAssets.filter((asset) => asset.asset_type === "artifact").length,
         };
-        const tabs = [
-            ["all", `All (${counts.all})`],
-            ["video", `Videos (${counts.video})`],
-            ["image", `Images (${counts.image})`],
-            ["audio", `Audio (${counts.audio})`],
-            ["artifact", `Artifacts (${counts.artifact})`],
-        ];
-        for (const [type, label] of tabs) {
+        for (const { value: type, label } of TAB_OPTIONS) {
             const isActive = state.type === type;
             const tab = setActionButtonVariant(document.createElement("button"), isActive ? "active" : "subtle", "padding:5px 8px;font-size:10px;");
-            tab.textContent = label;
+            tab.textContent = `${label} (${counts[type] ?? 0})`;
             tab.addEventListener("click", () => {
+                if (state.type === type) return;
                 state.type = type;
                 state.allowAutoFocus = true;
-                render();
+                persistActiveTab();
             });
             tabsRow.appendChild(tab);
         }
@@ -5628,7 +5639,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (isMissing) {
             thumb.textContent = "Missing";
         } else if (asset.has_thumbnail) {
-            const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+            const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:contain;display:block;`);
             img.loading = "lazy";
             img.decoding = "async";
             img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
@@ -5777,7 +5788,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 if (isMissing) {
                     thumb.textContent = "Missing";
                 } else if (asset.has_thumbnail) {
-                    const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;`);
+                    const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:contain;display:block;`);
                     img.loading = "lazy";
                     img.decoding = "async";
                     img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
@@ -5854,7 +5865,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
                     const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${THEME.bg2};border:1px solid ${THEME.statusPending}55;display:flex;align-items:center;justify-content:center;overflow:hidden;color:${THEME.statusPending};font-size:${thumbConfig.metaFont}px;`);
                     if (asset.has_thumbnail) {
-                        const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:cover;display:block;opacity:0.74;filter:saturate(0.6);`);
+                        const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:contain;display:block;opacity:0.74;filter:saturate(0.6);`);
                         img.loading = "lazy";
                         img.decoding = "async";
                         img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);

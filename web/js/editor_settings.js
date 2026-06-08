@@ -17,6 +17,14 @@ export const GALLERY_THUMBNAIL_SIZE_OPTIONS = [
     { value: "large", label: "Large" },
 ];
 
+export const GALLERY_TAB_OPTIONS = [
+    { value: "all", label: "All" },
+    { value: "video", label: "Videos" },
+    { value: "image", label: "Images" },
+    { value: "audio", label: "Audio" },
+    { value: "artifact", label: "Artifacts" },
+];
+
 export const PLAYBACK_RESOLUTION_OPTIONS = [
     { value: "full", label: "Full" },
     { value: "half", label: "Half" },
@@ -206,6 +214,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     gallery: {
         sortMode: "newest",
+        activeTab: "all",
         inspectorCollapsed: false,
         thumbnailSize: "medium",
         artifactInspectorExpanded: false,
@@ -221,6 +230,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
 
 const VALID_SORT_MODES = new Set(GALLERY_SORT_OPTIONS.map((entry) => entry.value));
 const VALID_THUMBNAIL_SIZES = new Set(GALLERY_THUMBNAIL_SIZE_OPTIONS.map((entry) => entry.value));
+const VALID_GALLERY_TABS = new Set(GALLERY_TAB_OPTIONS.map((entry) => entry.value));
 const VALID_PLAYBACK_RESOLUTIONS = new Set(PLAYBACK_RESOLUTION_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
@@ -767,6 +777,9 @@ function normalizeEditorSettings(source = null) {
             sortMode: VALID_SORT_MODES.has(stored?.gallery?.sortMode)
                 ? stored.gallery.sortMode
                 : defaults.gallery.sortMode,
+            activeTab: VALID_GALLERY_TABS.has(stored?.gallery?.activeTab)
+                ? stored.gallery.activeTab
+                : defaults.gallery.activeTab,
             inspectorCollapsed: stored?.gallery?.inspectorCollapsed == null
                 ? defaults.gallery.inspectorCollapsed
                 : !!stored.gallery.inspectorCollapsed,

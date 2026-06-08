@@ -1,4 +1,4 @@
-import { ASPECT_RATIO_PRESETS, snapToConstraint } from "./editor_settings.js";
+import { ASPECT_RATIO_PRESETS } from "./editor_settings.js";
 import {
     EDITOR_COLORS as COLORS,
     FONT,
@@ -353,9 +353,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget._fpsInput.addEventListener("change", () => {
         const template = widget._getActiveTemplate();
         const rawValue = parseFloat(widget._fpsInput.value) || 0;
-        const value = template.id === "free"
-            ? rawValue
-            : Number(snapToConstraint(rawValue, template?.constraints?.fps).toFixed(3));
+        const value = widget._snapSceneFpsToTemplate(rawValue, template);
         widget._fpsInput.value = value || "";
         if (widget.activeScene) {
             widget._updateSceneFps(value);
