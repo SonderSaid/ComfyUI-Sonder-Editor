@@ -27,7 +27,7 @@ from ..server.project_commit import (
     save_generated_project,
     snapshot_item_ids,
 )
-from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY
+from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY, collector_chain_for_consumer
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
     CUSTOM_CONTAINER_OPTIONS,
@@ -138,11 +138,9 @@ def _produced_by_metadata() -> dict:
     }
 
 
-def _tracked_metadata_from_context(context: dict) -> list:
-    tracked = (context or {}).get(TRACKED_METADATA_CONTEXT_KEY, [])
-    if not isinstance(tracked, list):
-        return []
-    return [_json_clone(item) for item in tracked if isinstance(item, dict)]
+def _tracked_metadata_from_context(context: dict, prompt=None, consumer_unique_id=None) -> list:
+    chain = collector_chain_for_consumer(context, prompt, consumer_unique_id)
+    return [_json_clone(item) for item in chain if isinstance(item, dict)]
 
 
 def _workflow_from_extra_pnginfo(extra_pnginfo):
@@ -161,7 +159,7 @@ def _workflow_digest(workflow) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _compact_editor_export(project, context: dict, *, has_embedded_workflow=False, workflow=None) -> dict:
+def _compact_editor_export(project, context: dict, *, has_embedded_workflow=False, workflow=None, prompt=None, consumer_unique_id=None) -> dict:
     export = {
         "schema_version": EDITOR_EXPORT_SCHEMA_VERSION,
         # Additive fields stay at schema 1.0; bump only for shape-breaking changes.
@@ -170,7 +168,7 @@ def _compact_editor_export(project, context: dict, *, has_embedded_workflow=Fals
         "project_name": getattr(project, "name", ""),
         "scene_id": str(context.get("scene_id") or ""),
         "scene_name": str(context.get("scene_name") or ""),
-        "tracked_metadata": _tracked_metadata_from_context(context),
+        "tracked_metadata": _tracked_metadata_from_context(context, prompt, consumer_unique_id),
         "has_embedded_workflow": bool(has_embedded_workflow),
     }
     digest = _workflow_digest(workflow) if has_embedded_workflow else ""
@@ -179,7 +177,7 @@ def _compact_editor_export(project, context: dict, *, has_embedded_workflow=Fals
     return export
 
 
-def _bridge_generation_params(project, context: dict) -> dict:
+def _bridge_generation_params(project, context: dict, prompt=None, consumer_unique_id=None) -> dict:
     return {
         "scene_id": str((context or {}).get("scene_id") or ""),
         "scene_name": str((context or {}).get("scene_name") or ""),
@@ -188,6 +186,8 @@ def _bridge_generation_params(project, context: dict) -> dict:
             context,
             has_embedded_workflow=False,
             workflow=None,
+            prompt=prompt,
+            consumer_unique_id=consumer_unique_id,
         ),
     }
 
@@ -1203,6 +1203,8 @@ class SonderSaveVideo:
                 execution_context,
                 has_embedded_workflow=embed_metadata_enabled and workflow is not None,
                 workflow=workflow,
+                prompt=prompt,
+                consumer_unique_id=unique_id,
             )
             editor_export.update({
                 "fps": fps,
@@ -1519,7 +1521,7 @@ class SonderSaveBridge:
         prompt_key, prompt_key_source = _resolve_bridge_prompt_key(prompt)
         bridge_node_id = str(unique_id or uuid.uuid4().hex[:8])
         execution_context = _copy_execution_context(project)
-        generation_params = _bridge_generation_params(project, execution_context)
+        generation_params = _bridge_generation_params(project, execution_context, prompt=prompt, consumer_unique_id=bridge_node_id)
         naming_stem = _build_bridge_naming_stem(project, execution_context, prefix)
         output_dir, filename_prefix = _prepare_bridge_output_dir(project, prompt_key, bridge_node_id, naming_stem)
 

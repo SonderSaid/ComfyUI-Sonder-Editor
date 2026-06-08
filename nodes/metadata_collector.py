@@ -14,6 +14,12 @@ class _AnyType(str):
 
 
 _ANY = _AnyType("*")
+# Internal execution-context sentinel. Holds a dict keyed by each collector's canonical
+# prompt key: {owner_key: [section, ...]}, where each list is the full branch chain
+# accumulated up to and including that collector (its parent collector's chain + its own
+# sections). Never serialized into project.json: the key is "_"-prefixed so
+# `_public_execution_context` strips it; the public `editor_export.tracked_metadata` is
+# derived per consumer at asset-write time via `collector_chain_for_consumer`.
 TRACKED_METADATA_CONTEXT_KEY = "_tracked_metadata_internal"
 FIELD_VALUE_LIMIT = 2048
 TRUNCATED_MARKER = "... [truncated, full in raw_widget_text]"
@@ -55,50 +61,11 @@ def _node_id(node: dict | None) -> str:
     return _as_id((node or {}).get("id"))
 
 
-def _node_inputs(node: dict | None) -> list[dict]:
-    inputs = (node or {}).get("inputs")
-    return [item for item in inputs if isinstance(item, dict)] if isinstance(inputs, list) else []
-
-
-def _node_outputs(node: dict | None) -> list[dict]:
-    outputs = (node or {}).get("outputs")
-    return [item for item in outputs if isinstance(item, dict)] if isinstance(outputs, list) else []
-
-
-def _output_link_ids(output: dict) -> list[str]:
-    links = output.get("links")
-    if isinstance(links, list):
-        return [_as_id(link_id) for link_id in links if link_id is not None]
-    if output.get("link") is not None:
-        return [_as_id(output.get("link"))]
-    return []
-
-
-def _find_input_link_id(node: dict | None, input_name: str) -> str:
-    for entry in _node_inputs(node):
-        if entry.get("name") == input_name and entry.get("link") is not None:
-            return _as_id(entry.get("link"))
-    return ""
-
-
 def _find_node_by_id(nodes: list[dict], node_id: str) -> dict | None:
     for node in nodes:
         if _node_id(node) == node_id:
             return node
     return None
-
-
-def _main_subgraph_parent_ids(nodes: list[dict]) -> dict[str, str]:
-    parent_ids: dict[str, str] = {}
-    for node in nodes:
-        node_id = _node_id(node)
-        if not node_id:
-            continue
-        for key in ("type", "class_type"):
-            value = node.get(key)
-            if value is not None:
-                parent_ids[_as_id(value)] = node_id
-    return parent_ids
 
 
 def _subgraph_type_keys(subgraph: dict) -> list[str]:
@@ -108,36 +75,6 @@ def _subgraph_type_keys(subgraph: dict) -> list[str]:
         if value is not None:
             keys.append(_as_id(value))
     return keys
-
-
-def _build_origin_link_map(workflow: dict | None) -> dict[str, tuple[str, dict]]:
-    main_nodes = _workflow_nodes(workflow)
-    result: dict[str, tuple[str, dict]] = {}
-    for node in main_nodes:
-        node_id = _node_id(node)
-        if not node_id:
-            continue
-        for output in _node_outputs(node):
-            for link_id in _output_link_ids(output):
-                result[link_id] = (node_id, node)
-
-    parent_ids = _main_subgraph_parent_ids(main_nodes)
-    for subgraph in _workflow_subgraphs(workflow):
-        parent_id = ""
-        for key in _subgraph_type_keys(subgraph):
-            parent_id = parent_ids.get(key, "")
-            if parent_id:
-                break
-        sub_nodes = _workflow_nodes(subgraph)
-        for node in sub_nodes:
-            child_id = _node_id(node)
-            if not child_id:
-                continue
-            prompt_key = f"{parent_id}:{child_id}" if parent_id else child_id
-            for output in _node_outputs(node):
-                for link_id in _output_link_ids(output):
-                    result[link_id] = (prompt_key, node)
-    return result
 
 
 def _find_collector_workflow_node(workflow: dict | None, unique_id: str) -> dict | None:
@@ -349,6 +286,33 @@ def _section_from_origin(prompt_key: str, prompt_entry: dict, workflow_node: dic
     }
 
 
+def _project_input_origin_id(inputs: dict | None) -> str:
+    project_ref = (inputs or {}).get("project")
+    if isinstance(project_ref, list) and project_ref:
+        return _as_id(project_ref[0])
+    return ""
+
+
+def collector_chain_for_consumer(context: dict | None, prompt: dict | None, consumer_unique_id) -> list:
+    """Branch-correct tracked-metadata sections for a node that consumes a project (e.g. a
+    save node). Returns the chain accumulated by the collector directly feeding the
+    consumer's project input, in editor->leaf order; [] when no such collector exists or
+    the wiring cannot be resolved from the prompt."""
+    chains = (context or {}).get(TRACKED_METADATA_CONTEXT_KEY)
+    if not isinstance(chains, dict):
+        return []
+    _consumer_key, consumer_entry = _prompt_node(prompt, _as_id(consumer_unique_id))
+    consumer_inputs = consumer_entry.get("inputs") if isinstance(consumer_entry, dict) else None
+    parent_key, _parent_entry = _prompt_node(
+        prompt,
+        _project_input_origin_id(consumer_inputs if isinstance(consumer_inputs, dict) else {}),
+    )
+    chain = chains.get(parent_key) if parent_key else None
+    if not isinstance(chain, list):
+        return []
+    return [section for section in chain if isinstance(section, dict)]
+
+
 class SonderMetadataCollector:
     CATEGORY = "Sonder/IO"
     FUNCTION = "collect"
@@ -408,32 +372,42 @@ class SonderMetadataCollector:
             project._execution_context = context
 
         workflow = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
-        collector_node = _find_collector_workflow_node(workflow, _as_id(unique_id))
-        link_map = _build_origin_link_map(workflow)
-        sections = context.setdefault(TRACKED_METADATA_CONTEXT_KEY, [])
-        if not isinstance(sections, list):
-            sections = []
-            context[TRACKED_METADATA_CONTEXT_KEY] = sections
+        chains = context.setdefault(TRACKED_METADATA_CONTEXT_KEY, {})
+        if not isinstance(chains, dict):
+            chains = {}
+            context[TRACKED_METADATA_CONTEXT_KEY] = chains
+
+        # Resolve THIS collector's own inputs from the executed prompt. ComfyUI has already
+        # collapsed Set/Get/Reroute indirection into prompt links, so a wired value_N is
+        # [origin_id, slot] pointing at the real upstream node -- unlike the workflow link
+        # graph, which still contains the virtual indirection node.
+        owner_key, my_entry = _prompt_node(prompt, _as_id(unique_id))
+        my_inputs = my_entry.get("inputs") if isinstance(my_entry, dict) else None
+        my_inputs = my_inputs if isinstance(my_inputs, dict) else {}
+
+        # Inherit the upstream branch chain so each consumer sees only its own lineage;
+        # overwriting our own entry keeps re-runs idempotent (no duplicate sections).
+        parent_key, _parent_entry = _prompt_node(prompt, _project_input_origin_id(my_inputs))
+        own_chain = list(chains.get(parent_key, [])) if parent_key else []
 
         for index in range(MAX_COLLECTOR_INPUTS):
             value_name = f"value_{index}"
             if value_name not in kwargs:
                 continue
-            link_id = _find_input_link_id(collector_node, value_name)
-            if not link_id:
+            origin_ref = my_inputs.get(value_name)
+            if not (isinstance(origin_ref, list) and origin_ref):
                 continue
-            origin = link_map.get(link_id)
-            if not origin:
-                continue
-            origin_prompt_key, origin_workflow_node = origin
-            resolved_key, prompt_entry = _prompt_node(prompt, origin_prompt_key)
+            resolved_key, prompt_entry = _prompt_node(prompt, _as_id(origin_ref[0]))
             if not prompt_entry:
                 continue
+            origin_workflow_node = _find_collector_workflow_node(workflow, resolved_key)
             section = _section_from_origin(
                 resolved_key,
                 prompt_entry,
                 origin_workflow_node,
                 kwargs.get(f"label_{index}", ""),
             )
-            sections.append(section)
+            own_chain.append(section)
+
+        chains[owner_key] = own_chain
         return (project,)

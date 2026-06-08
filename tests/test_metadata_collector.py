@@ -31,40 +31,54 @@ def _project(tmp_path):
     return timeline_state.TimelineProject(project_dir=str(tmp_path), name="Collector Test")
 
 
-def _workflow(upstream=None, collector=None):
-    return {
-        "nodes": [
-            upstream or {
-                "id": 10,
-                "type": "TestNode",
-                "outputs": [{"name": "out", "links": [1]}],
-            },
-            collector or {
-                "id": 20,
-                "type": "SonderMetadataCollector",
-                "inputs": [{"name": "project", "link": 2}, {"name": "value_0", "link": 1}],
-            },
-        ]
-    }
+# --- Fixtures -------------------------------------------------------------------------
+# The collector now resolves its OWN inputs from the executed prompt (ComfyUI has already
+# collapsed Set/Get/Reroute indirection there), so every prompt fixture must include the
+# collector node keyed by its unique_id with resolved `value_N`/`project` links.
+
+def _collector_prompt(*, collector_id="20", project=None, values=None, upstreams=None):
+    """Build a prompt containing the upstream origin node(s) AND the collector entry."""
+    prompt = {}
+    for origin_id, spec in (upstreams or {}).items():
+        prompt[origin_id] = spec
+    collector_inputs = {}
+    if project is not None:
+        collector_inputs["project"] = project
+    for index, link in (values or {}).items():
+        collector_inputs[f"value_{index}"] = link
+    prompt[collector_id] = {"class_type": "SonderMetadataCollector", "inputs": collector_inputs}
+    return prompt
 
 
-def _prompt(inputs=None, class_type="TestNode", node_id="10"):
-    return {node_id: {"class_type": class_type, "inputs": inputs or {"strength": 1.0}}}
+def _origin(class_type="TestNode", inputs=None):
+    return {"class_type": class_type, "inputs": inputs if inputs is not None else {"strength": 1.0}}
 
+
+def _run(module, project, prompt, *, unique_id="20", workflow=None, **kwargs):
+    return module.SonderMetadataCollector().collect(
+        project,
+        prompt=prompt,
+        extra_pnginfo={"workflow": workflow or {}},
+        unique_id=unique_id,
+        **kwargs,
+    )
+
+
+def _chain(project, module, owner="20"):
+    return project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][owner]
+
+
+# --- Single-input resolution ----------------------------------------------------------
 
 def test_collector_single_input_default_label(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    result = module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(class_type="Sampler"),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("Sampler")})
+
+    result = _run(module, project, prompt, value_0="connected")
 
     assert result[0] is project
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    section = _chain(project, module)[0]
     assert section["label"] == "Sampler"
     assert section["source_node_id"] == "10"
     assert section["fields"] == {"strength": 1.0}
@@ -73,32 +87,23 @@ def test_collector_single_input_default_label(tmp_path):
 def test_collector_user_label_overrides(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-        label_0="My LoRAs",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin()})
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
-    assert section["label"] == "My LoRAs"
+    _run(module, project, prompt, value_0="connected", label_0="My LoRAs")
+
+    assert _chain(project, module)[0]["label"] == "My LoRAs"
 
 
 def test_collector_fallback_to_title(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    upstream = {"id": 10, "type": "TestNode", "title": "Power LoRAs", "outputs": [{"links": [1]}]}
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(class_type="Power Lora Loader"),
-        extra_pnginfo={"workflow": _workflow(upstream=upstream)},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("Power Lora Loader")})
+    # Title is recovered from the ORIGIN node in the workflow, by prompt-resolved id.
+    workflow = {"nodes": [{"id": 10, "type": "Power Lora Loader", "title": "Power LoRAs"}]}
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    _run(module, project, prompt, workflow=workflow, value_0="connected")
+
+    section = _chain(project, module)[0]
     assert section["label"] == "Power LoRAs"
     assert section["source_node_title"] == "Power LoRAs"
 
@@ -106,26 +111,22 @@ def test_collector_fallback_to_title(tmp_path):
 def test_collector_power_lora_loader_adds_readable_summary(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(
-            {
-                "lora_1": "detail_boost.safetensors",
-                "strength_1": 0.8,
-                "on_1": True,
-                "lora_2": "disabled_style.safetensors",
-                "strength_model_2": 0.45,
-                "strength_clip_2": 0.25,
-                "on_2": False,
-            },
-            class_type="Power Lora Loader (rgthree)",
-        ),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
+    prompt = _collector_prompt(
+        values={0: ["10", 0]},
+        upstreams={"10": _origin("Power Lora Loader (rgthree)", {
+            "lora_1": "detail_boost.safetensors",
+            "strength_1": 0.8,
+            "on_1": True,
+            "lora_2": "disabled_style.safetensors",
+            "strength_model_2": 0.45,
+            "strength_clip_2": 0.25,
+            "on_2": False,
+        })},
     )
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    _run(module, project, prompt, value_0="connected")
+
+    section = _chain(project, module)[0]
     assert section["fields"] == {
         "power_loras": [
             {"slot": 1, "name": "detail_boost.safetensors", "enabled": True, "strength": 0.8},
@@ -145,24 +146,20 @@ def test_collector_power_lora_loader_adds_readable_summary(tmp_path):
 def test_collector_power_lora_loader_supports_nested_slot_objects(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(
-            {
-                "PowerLoraLoaderHeaderWidget": {"type": "PowerLoraLoader"},
-                "lora_1": {"on": True, "lora": "flux_detail.safetensors", "strength": 0.7},
-                "lora_2": {"on": False, "lora": "flux_style.safetensors", "strength_model": 0.4, "strength_clip": 0.2},
-                "Add Lora": "",
-                "model": ["100", 0],
-            },
-            class_type="Power Lora Loader (rgthree)",
-        ),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
+    prompt = _collector_prompt(
+        values={0: ["10", 0]},
+        upstreams={"10": _origin("Power Lora Loader (rgthree)", {
+            "PowerLoraLoaderHeaderWidget": {"type": "PowerLoraLoader"},
+            "lora_1": {"on": True, "lora": "flux_detail.safetensors", "strength": 0.7},
+            "lora_2": {"on": False, "lora": "flux_style.safetensors", "strength_model": 0.4, "strength_clip": 0.2},
+            "Add Lora": "",
+            "model": ["100", 0],
+        })},
     )
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    _run(module, project, prompt, value_0="connected")
+
+    section = _chain(project, module)[0]
     assert section["fields"] == {
         "power_loras": [
             {"slot": 1, "name": "flux_detail.safetensors", "enabled": True, "strength": 0.7},
@@ -184,133 +181,179 @@ def test_collector_power_lora_loader_supports_nested_slot_objects(tmp_path):
 def test_collector_multiple_inputs_preserve_order(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    workflow = {
-        "nodes": [
-            {"id": 10, "type": "A", "outputs": [{"links": [1]}]},
-            {"id": 11, "type": "B", "outputs": [{"links": [2]}]},
-            {"id": 12, "type": "C", "outputs": [{"links": [3]}]},
-            {"id": 20, "type": "SonderMetadataCollector", "inputs": [
-                {"name": "value_0", "link": 1},
-                {"name": "value_1", "link": 2},
-                {"name": "value_2", "link": 3},
-            ]},
-        ]
-    }
-    prompt = {
-        "10": {"class_type": "A", "inputs": {"a": 1}},
-        "11": {"class_type": "B", "inputs": {"b": 2}},
-        "12": {"class_type": "C", "inputs": {"c": 3}},
-    }
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=prompt,
-        extra_pnginfo={"workflow": workflow},
-        unique_id="20",
-        value_0="a",
-        value_1="b",
-        value_2="c",
+    prompt = _collector_prompt(
+        values={0: ["10", 0], 1: ["11", 0], 2: ["12", 0]},
+        upstreams={
+            "10": _origin("A", {"a": 1}),
+            "11": _origin("B", {"b": 2}),
+            "12": _origin("C", {"c": 3}),
+        },
     )
 
-    sections = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY]
+    _run(module, project, prompt, value_0="a", value_1="b", value_2="c")
+
+    sections = _chain(project, module)
     assert [section["source_node_id"] for section in sections] == ["10", "11", "12"]
 
 
 def test_collector_subgraph_prompt_key(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    workflow = {
-        "nodes": [{"id": 100, "type": "subgraph-1"}],
-        "definitions": {
-            "subgraphs": [{
-                "id": "subgraph-1",
-                "nodes": [
-                    {"id": 10, "type": "InnerNode", "outputs": [{"links": [5]}]},
-                    {"id": 20, "type": "SonderMetadataCollector", "inputs": [{"name": "value_0", "link": 5}]},
-                ],
-            }]
-        },
-    }
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt={"100:10": {"class_type": "InnerNode", "inputs": {"inner": True}}},
-        extra_pnginfo={"workflow": workflow},
-        unique_id="100:20",
-        value_0="connected",
+    # Subgraph node ids are namespaced parent:child in both unique_id and prompt keys.
+    prompt = _collector_prompt(
+        collector_id="100:20",
+        values={0: ["100:10", 0]},
+        upstreams={"100:10": _origin("InnerNode", {"inner": True})},
     )
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    _run(module, project, prompt, unique_id="100:20", value_0="connected")
+
+    section = _chain(project, module, owner="100:20")[0]
     assert section["source_node_id"] == "100:10"
     assert section["fields"] == {"inner": True}
 
 
-def test_collector_chained_appends(tmp_path):
+def test_collector_reruns_are_idempotent(tmp_path):
+    # Re-running the same collector (e.g. across queued prompts on a reused context)
+    # overwrites its own chain rather than appending duplicates.
     module = _import_collector()
     project = _project(tmp_path)
-    collector = module.SonderMetadataCollector()
-    collector.collect(project, prompt=_prompt({"a": 1}), extra_pnginfo={"workflow": _workflow()}, unique_id="20", value_0="x")
-    collector.collect(project, prompt=_prompt({"b": 2}), extra_pnginfo={"workflow": _workflow()}, unique_id="20", value_0="x")
+    prompt_a = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("A", {"a": 1})})
+    prompt_b = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("B", {"b": 2})})
 
-    sections = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY]
-    assert [section["fields"] for section in sections] == [{"a": 1}, {"b": 2}]
+    _run(module, project, prompt_a, value_0="x")
+    _run(module, project, prompt_b, value_0="x")
+
+    chain = _chain(project, module)
+    assert [section["fields"] for section in chain] == [{"b": 2}]
+
+
+def test_collector_chain_inherits_parent(tmp_path):
+    # A downstream collector inherits the upstream collector's chain (parent + own),
+    # in editor->leaf order.
+    module = _import_collector()
+    project = _project(tmp_path)
+    prompt = {
+        "A": _origin("A", {"a": 1}),
+        "464": {"class_type": "SonderMetadataCollector", "inputs": {"value_0": ["A", 0]}},
+        "B": _origin("B", {"b": 2}),
+        "481": {"class_type": "SonderMetadataCollector", "inputs": {"project": ["464", 0], "value_0": ["B", 0]}},
+    }
+
+    _run(module, project, prompt, unique_id="464", value_0="x")
+    _run(module, project, prompt, unique_id="481", value_0="y")
+
+    parent_chain = _chain(project, module, owner="464")
+    child_chain = _chain(project, module, owner="481")
+    assert [s["source_node_id"] for s in parent_chain] == ["A"]
+    assert [s["source_node_id"] for s in child_chain] == ["A", "B"]
+
+
+def test_fan_out_branch_isolation(tmp_path):
+    # editor -> 464 -> 481 -> {479, 477}; each save consumer sees ONLY its own branch.
+    module = _import_collector()
+    project = _project(tmp_path)
+    project._execution_context = {}
+    prompt = {
+        "E": {"class_type": "SonderEditor", "inputs": {}},
+        "A": _origin("A", {"a": 1}),
+        "B": _origin("B", {"b": 2}),
+        "C479": _origin("Ident479", {"x": 479}),
+        "C477": _origin("Ident477", {"x": 477}),
+        "464": {"class_type": "SonderMetadataCollector", "inputs": {"project": ["E", 0], "value_0": ["A", 0]}},
+        "481": {"class_type": "SonderMetadataCollector", "inputs": {"project": ["464", 0], "value_0": ["B", 0]}},
+        "479": {"class_type": "SonderMetadataCollector", "inputs": {"project": ["481", 0], "value_0": ["C479", 0]}},
+        "477": {"class_type": "SonderMetadataCollector", "inputs": {"project": ["481", 0], "value_0": ["C477", 0]}},
+        "SAVE479": {"class_type": "SonderSaveBridge", "inputs": {"project": ["479", 0]}},
+        "SAVE477": {"class_type": "SonderSaveBridge", "inputs": {"project": ["477", 0]}},
+    }
+    for uid in ["464", "481", "479", "477"]:
+        _run(module, project, prompt, unique_id=uid, value_0="c")
+
+    chain479 = module.collector_chain_for_consumer(project._execution_context, prompt, "SAVE479")
+    chain477 = module.collector_chain_for_consumer(project._execution_context, prompt, "SAVE477")
+
+    assert [s["source_node_id"] for s in chain479] == ["A", "B", "C479"]
+    assert [s["source_node_id"] for s in chain477] == ["A", "B", "C477"]
+    # No sibling cross-contamination.
+    assert "C477" not in [s["source_node_id"] for s in chain479]
+    assert "C479" not in [s["source_node_id"] for s in chain477]
+
+
+def test_collector_resolves_value_through_indirection(tmp_path):
+    # Headline fix: the workflow link points at a virtual GetNode (absent from the prompt),
+    # but the executed prompt resolves value_0 to the real origin -> section is emitted.
+    module = _import_collector()
+    project = _project(tmp_path)
+    prompt = _collector_prompt(values={0: ["405", 0]}, upstreams={"405": _origin("Power Lora Loader (rgthree)", {"lora_1": "a.safetensors", "strength_1": 1.0, "on_1": True})})
+    # Workflow still contains the virtual GetNode the value wire physically passes through.
+    workflow = {"nodes": [
+        {"id": 418, "type": "GetNode", "title": "Get_Identity"},
+        {"id": 20, "type": "SonderMetadataCollector", "inputs": [{"name": "value_0", "link": 3787}]},
+    ]}
+
+    _run(module, project, prompt, workflow=workflow, value_0="connected", label_0="Feature Transfer")
+
+    section = _chain(project, module)[0]
+    assert section["label"] == "Feature Transfer"
+    assert section["source_node_id"] == "405"
+    assert section["display_type"] == "power_loras"
+
+
+def test_consumer_with_no_collector_parent_is_empty(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    project._execution_context = {}
+    prompt = {
+        "E": {"class_type": "SonderEditor", "inputs": {}},
+        "SAVE_EDITOR": {"class_type": "SonderSaveBridge", "inputs": {"project": ["E", 0]}},
+        "SAVE_NONE": {"class_type": "SonderSaveBridge", "inputs": {}},
+    }
+    assert module.collector_chain_for_consumer(project._execution_context, prompt, "SAVE_EDITOR") == []
+    assert module.collector_chain_for_consumer(project._execution_context, prompt, "SAVE_NONE") == []
 
 
 def test_collector_raw_widget_text_format(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt({"seed": 123, "cfg": 7}),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("Node", {"seed": 123, "cfg": 7})})
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
-    assert section["raw_widget_text"] == "seed: 123, cfg: 7"
+    _run(module, project, prompt, value_0="connected")
+
+    assert _chain(project, module)[0]["raw_widget_text"] == "seed: 123, cfg: 7"
 
 
 def test_collector_field_size_cap(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
     long_value = "x" * 3000
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt({"prompt": long_value}),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("Node", {"prompt": long_value})})
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    _run(module, project, prompt, value_0="connected")
+
+    section = _chain(project, module)[0]
     assert module.TRUNCATED_MARKER in section["fields"]["prompt"]
     assert long_value in section["raw_widget_text"]
 
 
 def test_collector_missing_upstream(tmp_path):
+    # Collector is in the prompt but its value origin is not -> no sections emitted.
     module = _import_collector()
     project = _project(tmp_path)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt={},
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={})  # no "10" entry
 
-    assert project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY] == []
+    _run(module, project, prompt, value_0="connected")
+
+    assert _chain(project, module) == []
 
 
 def test_collector_passes_project_through_without_persisted_mutation(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
     before = project.to_dict()
-    result = module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin()})
+
+    result = _run(module, project, prompt, value_0="connected")
 
     assert result[0] is project
     assert project.to_dict() == before
@@ -319,34 +362,24 @@ def test_collector_passes_project_through_without_persisted_mutation(tmp_path):
 def test_section_carries_display_type_for_known_class(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(
-            {"lora_1": "a.safetensors", "strength_1": 1.0, "on_1": True},
-            class_type="Power Lora Loader (rgthree)",
-        ),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
+    prompt = _collector_prompt(
+        values={0: ["10", 0]},
+        upstreams={"10": _origin("Power Lora Loader (rgthree)", {"lora_1": "a.safetensors", "strength_1": 1.0, "on_1": True})},
     )
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
-    assert section["display_type"] == "power_loras"
+    _run(module, project, prompt, value_0="connected")
+
+    assert _chain(project, module)[0]["display_type"] == "power_loras"
 
 
 def test_section_display_type_none_for_unknown_class(tmp_path):
     module = _import_collector()
     project = _project(tmp_path)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(class_type="Sampler"),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("Sampler")})
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
-    assert section["display_type"] is None
+    _run(module, project, prompt, value_0="connected")
+
+    assert _chain(project, module)[0]["display_type"] is None
 
 
 def test_registry_first_match_wins(tmp_path):
@@ -359,20 +392,15 @@ def test_registry_first_match_wins(tmp_path):
     }
     module.COMPAT_HANDLERS.insert(0, stub)
     try:
-        module.SonderMetadataCollector().collect(
-            project,
-            prompt=_prompt(
-                {"lora_1": "a.safetensors", "strength_1": 1.0, "on_1": True},
-                class_type="Power Lora Loader (rgthree)",
-            ),
-            extra_pnginfo={"workflow": _workflow()},
-            unique_id="20",
-            value_0="connected",
+        prompt = _collector_prompt(
+            values={0: ["10", 0]},
+            upstreams={"10": _origin("Power Lora Loader (rgthree)", {"lora_1": "a.safetensors", "strength_1": 1.0, "on_1": True})},
         )
+        _run(module, project, prompt, value_0="connected")
     finally:
         module.COMPAT_HANDLERS.remove(stub)
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    section = _chain(project, module)[0]
     assert section["display_type"] == "stub_first"
     assert section["fields"] == {"stub": "yes"}
 
@@ -385,15 +413,11 @@ def test_power_lora_large_stack_preserves_list_shape(tmp_path):
         inputs[f"lora_{slot}"] = f"FluxKlein\\very_long_lora_filename_for_slot_{slot:03d}.safetensors"
         inputs[f"strength_{slot}"] = round(0.1 * (slot % 9 + 1), 2)
         inputs[f"on_{slot}"] = bool(slot % 2)
-    module.SonderMetadataCollector().collect(
-        project,
-        prompt=_prompt(inputs, class_type="Power Lora Loader (rgthree)"),
-        extra_pnginfo={"workflow": _workflow()},
-        unique_id="20",
-        value_0="connected",
-    )
+    prompt = _collector_prompt(values={0: ["10", 0]}, upstreams={"10": _origin("Power Lora Loader (rgthree)", inputs)})
 
-    section = project._execution_context[module.TRACKED_METADATA_CONTEXT_KEY][0]
+    _run(module, project, prompt, value_0="connected")
+
+    section = _chain(project, module)[0]
     assert isinstance(section["fields"]["power_loras"], list), "structured cap must preserve list shape for matcher"
     assert len(section["fields"]["power_loras"]) == 50
     first = section["fields"]["power_loras"][0]

@@ -126,10 +126,11 @@ def test_save_video_tracked_metadata_propagates(tmp_path, monkeypatch):
     _patch_save_deps(io_nodes, monkeypatch, calls)
     project = _project(tmp_path)
     project._execution_context = {
-        io_nodes.TRACKED_METADATA_CONTEXT_KEY: [{"label": "Sampler", "fields": {"cfg": 7}}],
+        io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [{"label": "Sampler", "fields": {"cfg": 7}}]},
     }
+    prompt = {"S": {"class_type": "SonderSaveVideo", "inputs": {"project": ["C", 0]}}}
 
-    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False)
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False, prompt=prompt, unique_id="S")
 
     tracked = project.assets[0].generation_params["editor_export"]["tracked_metadata"]
     assert tracked == [{"label": "Sampler", "fields": {"cfg": 7}}]
@@ -150,9 +151,10 @@ def test_save_video_display_type_propagates(tmp_path, monkeypatch):
         "fields": {"power_loras": [{"slot": 1, "name": "a.safetensors", "enabled": True}]},
         "display_type": "power_loras",
     }
-    project._execution_context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: [section]}
+    project._execution_context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [section]}}
+    prompt = {"S": {"class_type": "SonderSaveVideo", "inputs": {"project": ["C", 0]}}}
 
-    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False)
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False, prompt=prompt, unique_id="S")
 
     tracked = project.assets[0].generation_params["editor_export"]["tracked_metadata"]
     assert tracked[0]["display_type"] == "power_loras"
@@ -170,10 +172,11 @@ def test_save_video_take_mode_does_not_leak_sentinel(tmp_path, monkeypatch):
         "scene_name": "Scene 1",
         "selection_start": 0,
         "selection_end": 1,
-        io_nodes.TRACKED_METADATA_CONTEXT_KEY: [{"label": "Tracked"}],
+        io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [{"label": "Tracked"}]},
     }
+    prompt = {"S": {"class_type": "SonderSaveVideo", "inputs": {"project": ["C", 0]}}}
 
-    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), mode="Take", embed_metadata=False)
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), mode="Take", embed_metadata=False, prompt=prompt, unique_id="S")
 
     params = project.assets[0].generation_params
     assert io_nodes.TRACKED_METADATA_CONTEXT_KEY not in params
@@ -190,9 +193,9 @@ def test_save_bridge_does_not_cache_prompt_workflow(tmp_path, monkeypatch):
         "selection_start": 4,
         "selection_end": 8,
         "prompt": "editor prompt should not become bridge asset prompt",
-        io_nodes.TRACKED_METADATA_CONTEXT_KEY: [{"label": "Bridge Tracked"}],
+        io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [{"label": "Bridge Tracked"}]},
     }
-    prompt = {"1": {"class_type": "SonderSaveBridge", "inputs": {}}}
+    prompt = {"bridge-1": {"class_type": "SonderSaveBridge", "inputs": {"project": ["C", 0]}}}
 
     io_nodes.SonderSaveBridge().prepare_output(project, prompt=prompt, unique_id="bridge-1")
     entry = next(value for key, value in io_nodes._BRIDGE_REGISTRY.items() if key[1] == "bridge-1")

@@ -171,10 +171,11 @@ def test_bridge_section_display_type_propagates(tmp_path, monkeypatch):
         "fields": {"power_loras": [{"slot": 1, "name": "a.safetensors", "enabled": True}]},
         "display_type": "power_loras",
     }
-    project._execution_context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: [section]}
+    project._execution_context = {io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [section]}}
+    prompt = {"bridge-1": {"class_type": "SonderSaveBridge", "inputs": {"project": ["C", 0]}}}
 
     bridge = io_nodes.SonderSaveBridge()
-    output_dir, _filename_prefix = bridge.prepare_output(project, prompt={}, unique_id="bridge-1")
+    output_dir, _filename_prefix = bridge.prepare_output(project, prompt=prompt, unique_id="bridge-1")
     _write_png(Path(output_dir) / "out.png")
     prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
     io_nodes._finalize_prompt_bridges(prompt_key)
