@@ -4920,6 +4920,11 @@ export function mountSharedAssetGallery(container, options = {}) {
             missingWrap.append(missingTitle, missingText);
             previewSurface.appendChild(missingWrap);
         } else if (asset.asset_type === "image") {
+            // Pin the surface so it cannot flex-shrink inside the height-bounded
+            // detail grid cell; otherwise overflow:hidden clips the centered image
+            // top/bottom and the preview stops respecting aspect ratio (it should
+            // letterbox like the thumbnails). The video branch below does the same.
+            previewSurface.style.flex = "0 0 auto";
             const img = style(document.createElement("img"), `max-width:100%;max-height:220px;width:auto;height:auto;object-fit:contain;display:block;`);
             img.src = buildAssetViewUrl(projectDir, asset.path);
             img.alt = assetDisplayName(asset);
