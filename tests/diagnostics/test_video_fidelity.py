@@ -876,7 +876,8 @@ def test_encode_video_streaming_timer_timeout_reaps_process(tmp_path, monkeypatc
     assert exc_info.value.stderr == b"timer fired"
 
 
-def test_encode_video_streaming_broken_pipe_reports_ffmpeg_failure(tmp_path, monkeypatch):
+def test_encode_video_streaming_broken_pipe_with_failure_exit_reports_error(tmp_path, monkeypatch):
+    # A broken pipe together with a NON-ZERO ffmpeg exit is a real failure.
     _ensure_test_package()
     media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
     np = pytest.importorskip("numpy")
@@ -885,7 +886,7 @@ def test_encode_video_streaming_broken_pipe_reports_ffmpeg_failure(tmp_path, mon
     _install_fake_streaming_popen(
         media_helpers,
         monkeypatch,
-        returncode=0,
+        returncode=1,
         stderr=b"pipe closed",
         write_error=BrokenPipeError(),
     )
@@ -897,6 +898,32 @@ def test_encode_video_streaming_broken_pipe_reports_ffmpeg_failure(tmp_path, mon
             output_path=str(tmp_path / "pipe.mp4"),
             fps=24,
         )
+
+
+def test_encode_video_streaming_broken_pipe_with_clean_exit_is_success(tmp_path, monkeypatch):
+    # A broken pipe with a ZERO exit code is a benign shutdown race (ffmpeg
+    # closed stdin via -shortest or a fast black-frame drain before the writer
+    # finished) — ffmpeg produced a valid file, so encode_video must NOT raise.
+    # Regression for the empty-space export failure (sonder_editor_bugs.md).
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    _install_fake_streaming_popen(
+        media_helpers,
+        monkeypatch,
+        returncode=0,
+        stderr=b"",
+        write_error=BrokenPipeError(),
+    )
+
+    media_helpers.encode_video(
+        np.zeros((1, 2, 2, 3), dtype=np.uint8),
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "pipe.mp4"),
+        fps=24,
+    )
 
 
 def test_save_video_custom_png_sequence_registers_image_assets(tmp_path, monkeypatch):

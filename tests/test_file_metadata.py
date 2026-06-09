@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,7 +48,7 @@ def test_encode_video_metadata_command_assembled(tmp_path, monkeypatch):
     media = _import_media_helpers()
     captured = {}
 
-    def fake_run(cmd, frames, timeout=90, cancel_event=None):
+    def fake_run(cmd, frames, timeout=90, cancel_event=None, progress_callback=None):
         captured["cmd"] = list(cmd)
         Path(tmp_path / "out.mp4").write_bytes(b"video")
 
@@ -75,7 +76,7 @@ def test_encode_video_metadata_with_audio_map_intact(tmp_path, monkeypatch):
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"audio")
 
-    def fake_run(cmd, frames, timeout=90, cancel_event=None):
+    def fake_run(cmd, frames, timeout=90, cancel_event=None, progress_callback=None):
         captured["cmd"] = list(cmd)
 
     monkeypatch.setattr(media, "_run_ffmpeg_streaming_frames", fake_run)
@@ -103,7 +104,7 @@ def test_encode_video_no_metadata_kwarg_keeps_old_command(tmp_path, monkeypatch)
     media = _import_media_helpers()
     captured = {}
 
-    def fake_run(cmd, frames, timeout=90, cancel_event=None):
+    def fake_run(cmd, frames, timeout=90, cancel_event=None, progress_callback=None):
         captured["cmd"] = list(cmd)
 
     monkeypatch.setattr(media, "_run_ffmpeg_streaming_frames", fake_run)
@@ -123,3 +124,66 @@ def test_ffmeta_escaping():
     media = _import_media_helpers()
 
     assert media._escape_ffmetadata("\\=;#\n\r") == "\\\\\\=\\;\\#\\n\\r"
+
+
+class _FakeStdin:
+    def __init__(self, fail_after):
+        self.calls = 0
+        self.fail_after = fail_after
+
+    def write(self, _data):
+        self.calls += 1
+        if self.calls > self.fail_after:
+            raise BrokenPipeError()
+
+    def close(self):
+        pass
+
+
+class _FakeProc:
+    """Minimal subprocess.Popen stand-in for the streaming encoder tests."""
+
+    def __init__(self, returncode, fail_after):
+        self.stdin = _FakeStdin(fail_after)
+        self._rc = returncode
+
+    def wait(self, timeout=None):
+        return self._rc
+
+    def poll(self):
+        return self._rc
+
+    def kill(self):
+        pass
+
+
+def test_streaming_broken_pipe_with_zero_exit_is_success(monkeypatch):
+    # Black/empty-frame exports can make ffmpeg close stdin (via -shortest or a
+    # fast drain) before the writer loop finishes. A BrokenPipeError with a 0
+    # exit code is a benign shutdown race, not a failure.
+    media = _import_media_helpers()
+    frames = np.zeros((5, 2, 2, 3), dtype=np.uint8)
+    monkeypatch.setattr(media.subprocess, "Popen", lambda *a, **k: _FakeProc(0, fail_after=1))
+    # Must NOT raise.
+    media._run_ffmpeg_streaming_frames(["ffmpeg"], frames, timeout=30)
+
+
+def test_streaming_broken_pipe_with_nonzero_exit_raises(monkeypatch):
+    media = _import_media_helpers()
+    frames = np.zeros((5, 2, 2, 3), dtype=np.uint8)
+    monkeypatch.setattr(media.subprocess, "Popen", lambda *a, **k: _FakeProc(1, fail_after=1))
+    with pytest.raises(RuntimeError):
+        media._run_ffmpeg_streaming_frames(["ffmpeg"], frames, timeout=30)
+
+
+def test_ffmpeg_failed_message_prefers_error_lines():
+    media = _import_media_helpers()
+    stderr = (
+        b"ffmpeg version 4.2.2 Copyright (c) the FFmpeg developers\n"
+        b"  configuration: --enable-gpl --enable-libx264\n"
+        b"[libx264 @ 0x1] kb/s:83.34\n"
+        b"Conversion failed!\n"
+    )
+    msg = media._ffmpeg_failed_message(stderr)
+    assert "Conversion failed!" in msg
+    assert "ffmpeg version 4.2.2" not in msg

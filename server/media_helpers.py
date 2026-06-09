@@ -687,8 +687,29 @@ def _read_process_stderr(stderr_file) -> bytes:
         return b""
 
 
+_FFMPEG_ERROR_MARKERS = (
+    "error", "invalid", "could not", "cannot", "unable", "failed",
+    "no such", "not found", "denied", "unsupported", "conversion failed",
+    "broken pipe", "permission",
+)
+
+
 def _ffmpeg_failed_message(stderr: bytes) -> str:
-    return f"ffmpeg failed: {stderr.decode(errors='replace')[:500]}"
+    text = stderr.decode(errors="replace").strip()
+    if not text:
+        return "ffmpeg failed (no stderr captured)."
+    # The old head slice only showed ffmpeg's version/configuration banner. A
+    # blind tail is also unreliable: per-encoder summary statistics (coded %,
+    # kb/s, Qavg) trail AFTER the fatal reason, so the real error gets pushed out
+    # of the window. Prefer lines that carry an error marker; fall back to the
+    # tail when none are found.
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    err_lines = [ln for ln in lines if any(m in ln.lower() for m in _FFMPEG_ERROR_MARKERS)]
+    chosen = err_lines[-6:] if err_lines else lines[-6:]
+    out = "\n".join(chosen)
+    if len(out) > 600:
+        out = out[-600:]
+    return f"ffmpeg failed: {out}"
 
 
 def _timeout_expired(cmd: list, timeout: int | float | None, stderr_file) -> subprocess.TimeoutExpired:
@@ -770,6 +791,7 @@ def _run_ffmpeg_streaming_frames(
     *,
     timeout: int | float | None,
     cancel_event=None,
+    progress_callback=None,
 ) -> None:
     deadline = time.perf_counter() + float(timeout) if timeout is not None else None
     with tempfile.TemporaryFile() as stderr_file:
@@ -798,6 +820,7 @@ def _run_ffmpeg_streaming_frames(
             if proc.stdin is None:
                 raise RuntimeError("ffmpeg failed: stdin pipe was not available")
 
+            written = 0
             for frame in frames:
                 if _cancel_requested(cancel_event):
                     _terminate_process(proc)
@@ -809,6 +832,12 @@ def _run_ffmpeg_streaming_frames(
                 except (BrokenPipeError, OSError):
                     broken_pipe = True
                     break
+                written += 1
+                if progress_callback is not None:
+                    try:
+                        progress_callback(written)
+                    except Exception:
+                        pass
 
             try:
                 proc.stdin.close()
@@ -855,8 +884,22 @@ def _run_ffmpeg_streaming_frames(
                 _raise_stream_timeout(proc, cmd, timeout, stderr_file)
 
             stderr = _read_process_stderr(stderr_file)
-            if broken_pipe or returncode != 0:
+            if returncode != 0:
                 raise RuntimeError(_ffmpeg_failed_message(stderr))
+            if broken_pipe:
+                # ffmpeg closed stdin before the writer loop finished, but exited
+                # 0 — it produced a valid file. This is a benign shutdown race:
+                # with `-shortest` ffmpeg stops at the (shorter) audio boundary,
+                # and fast black/empty-frame encodes drain stdin and finish before
+                # Python sends the last frames. Treating broken_pipe as a failure
+                # here is what made empty-space/short exports fail with a bogus
+                # "ffmpeg failed: <encoder summary stats>" message. Trust the exit
+                # code; only log the early close for observability.
+                logger.warning(
+                    "ffmpeg closed input early (wrote %d/%d frames) but exited 0; treating encode as success",
+                    written,
+                    len(frames),
+                )
         finally:
             if timer is not None:
                 timer.cancel()
@@ -1046,6 +1089,7 @@ def encode_video(
     timeout: int = 90,
     cancel_event=None,
     embed_metadata: dict[str, str] | None = None,
+    progress_callback=None,
 ) -> dict:
     preset_id = normalize_save_preset(preset_id)
     if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
@@ -1096,7 +1140,7 @@ def encode_video(
 
     started_at = time.perf_counter()
     try:
-        _run_ffmpeg_streaming_frames(cmd, frames, timeout=timeout, cancel_event=cancel_event)
+        _run_ffmpeg_streaming_frames(cmd, frames, timeout=timeout, cancel_event=cancel_event, progress_callback=progress_callback)
     except subprocess.TimeoutExpired:
         logger.warning("ffmpeg timeout: encode_video output=%s", output_path)
         raise
