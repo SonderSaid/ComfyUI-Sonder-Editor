@@ -15,12 +15,74 @@ import {
     SAVE_PRESET_OPTIONS,
     getTemplateById,
     getEditorSettings,
+    notificationCoreConfig,
     resolveFrameConstraintForTemplate,
     snapToConstraint,
+    subscribeEditorSettings,
 } from "./editor_settings.js";
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
+import { mountToastStack } from "./editor_toast_stack.js";
+import { notifyProgress, configureNotifications } from "./editor_notifications.js";
 
 injectSonderFontFaces();
+
+// ── Encode progress → notification foreground pill ───────────────────────────
+// ComfyUI fires a native "progress" event for the executing node (every node
+// emits it), so we filter to SonderSaveVideo nodes only and map their progress
+// into a Core foreground notification keyed by node id. The tab page never
+// receives these (its api shim's addEventListener is a no-op) — canvas only.
+const _sonderEncodeNotifs = new Map(); // nodeId(string) -> notification handle
+
+function _sonderSaveNodeInfo(nodeId) {
+    try {
+        const node = app.graph?.getNodeById?.(Number(nodeId)) || app.graph?._nodes_by_id?.[nodeId];
+        if (node && (node.type === "SonderSaveVideo" || node.comfyClass === "SonderSaveVideo")) {
+            return { title: node.title || "Save Video" };
+        }
+    } catch (_) {}
+    return null;
+}
+
+function _sonderHandleProgressEvent(detail) {
+    const nodeId = detail?.node;
+    if (nodeId == null) return;
+    const info = _sonderSaveNodeInfo(nodeId);
+    if (!info) return; // not a Sonder save node
+    const key = String(nodeId);
+    const max = Number(detail?.max) || 0;
+    const value = Number(detail?.value) || 0;
+    const progress = max > 0 ? { current: value, total: max, unit: "f" } : null;
+    let handle = _sonderEncodeNotifs.get(key);
+    if (!handle) {
+        handle = notifyProgress({ verb: "Encoding", message: info.title, progress, foreground: true, source: `encode:${key}` });
+        _sonderEncodeNotifs.set(key, handle);
+    } else {
+        handle.update({ progress });
+    }
+    if (max > 0 && value >= max) {
+        handle.resolve({ message: "Encode complete" });
+        _sonderEncodeNotifs.delete(key);
+    }
+}
+
+// Execution moved on (or finished): resolve any encode notif whose node is no
+// longer executing — it finished without the WS hitting max.
+function _sonderResolveEncodeExcept(activeNodeId) {
+    const activeKey = activeNodeId == null ? null : String(activeNodeId);
+    for (const [key, handle] of [..._sonderEncodeNotifs]) {
+        if (key === activeKey) continue;
+        handle.resolve({ message: "Encode complete" });
+        _sonderEncodeNotifs.delete(key);
+    }
+}
+
+function _sonderClearEncodeNotifs({ error = false, message = "" } = {}) {
+    for (const [key, handle] of [..._sonderEncodeNotifs]) {
+        if (error) handle.resolve({ tier: "error", message: message || "Encode failed." });
+        else handle.dismiss();
+        _sonderEncodeNotifs.delete(key);
+    }
+}
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -1224,6 +1286,15 @@ app.registerExtension({
     setup() {
         installGraphLoadGuard();
         installComfyGraphUndoGuard();
+        // Page-level notification toast stack (canvas page). Mounted once for the
+        // page lifetime — visible whether the editor is dormant or fullscreen,
+        // since fullscreen is an overlay on this same document.body.
+        if (!document.querySelector("[data-sonder-toast-stack]")) {
+            mountToastStack(document.body);
+        }
+        // Push browser-local toast durations into the Core, and keep them synced.
+        configureNotifications(notificationCoreConfig());
+        subscribeEditorSettings(() => configureNotifications(notificationCoreConfig()));
         if (typeof api.addEventListener === "function") {
             api.addEventListener("status", (event) => {
                 const remaining = Number(event?.detail?.exec_info?.queue_remaining);
@@ -1231,6 +1302,17 @@ app.registerExtension({
                 if (!getActiveEditorNodes().some(editorNodeHasQueuedWork) && !pendingBridgeEditorNodeIds.size) return;
                 schedulePostPromptRefresh();
             });
+            // Map SonderSaveVideo native progress → notification foreground pill.
+            api.addEventListener("progress", (event) => {
+                try { _sonderHandleProgressEvent(event?.detail); } catch (_) {}
+            });
+            api.addEventListener("executing", (event) => {
+                const d = event?.detail;
+                const nodeId = (d && typeof d === "object") ? (d.node ?? null) : (d ?? null);
+                _sonderResolveEncodeExcept(nodeId);
+            });
+            api.addEventListener("execution_error", () => _sonderClearEncodeNotifs({ error: true }));
+            api.addEventListener("execution_interrupted", () => _sonderClearEncodeNotifs());
         }
         // ── Global drop interceptor: asset gallery → ComfyUI graph ───────
         // HTML5 drag can't carry File objects, so we intercept drops with our

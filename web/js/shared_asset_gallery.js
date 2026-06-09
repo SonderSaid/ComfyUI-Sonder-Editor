@@ -10,6 +10,7 @@ import {
     updateEditorSettings,
 } from "./editor_settings.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
+import { notifyError } from "./editor_notifications.js";
 import {
     renderTrackedSectionBody,
     trackedFieldMatchForEntry,
@@ -1999,7 +2000,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 await options.onRefresh?.();
             } catch (error) {
                 console.warn("[Sonder] Failed to move selected assets:", error);
-                alert(error?.message || "Failed to move selected assets.");
+                notifyError(error?.message || "Failed to move selected assets.");
             }
         });
     }
@@ -2039,7 +2040,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to trash selected assets:", error);
-            alert(error?.message || "Failed to move selected assets to Trash.");
+            notifyError(error?.message || "Failed to move selected assets to Trash.");
         }
     }
 
@@ -2058,7 +2059,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to restore asset:", error);
-            alert(error?.message || "Failed to restore asset.");
+            notifyError(error?.message || "Failed to restore asset.");
         }
     }
 
@@ -2081,7 +2082,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to restore selected assets:", error);
-            alert(error?.message || "Failed to restore selected assets.");
+            notifyError(error?.message || "Failed to restore selected assets.");
         }
     }
 
@@ -2127,7 +2128,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to permanently delete asset:", error);
-            alert(error?.message || "Failed to permanently delete asset.");
+            notifyError(error?.message || "Failed to permanently delete asset.");
         }
     }
 
@@ -2167,7 +2168,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to permanently delete selected assets:", error);
-            alert(error?.message || "Failed to permanently delete selected assets.");
+            notifyError(error?.message || "Failed to permanently delete selected assets.");
         }
     }
 
@@ -2183,7 +2184,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to empty trash:", error);
-            alert(error?.message || "Failed to empty trash.");
+            notifyError(error?.message || "Failed to empty trash.");
         }
     }
 
@@ -5187,7 +5188,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to trash asset:", error);
-            alert(error?.message || "Failed to move asset to Trash.");
+            notifyError(error?.message || "Failed to move asset to Trash.");
         }
     }
 
@@ -5205,7 +5206,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to rename folder:", error);
-            alert(error?.message || "Failed to rename folder.");
+            notifyError(error?.message || "Failed to rename folder.");
         }
     }
 
@@ -5236,7 +5237,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             render();
         } catch (error) {
             console.warn("[Sonder] Failed to trash folder:", error);
-            alert(error?.message || "Failed to move folder to Trash.");
+            notifyError(error?.message || "Failed to move folder to Trash.");
         }
     }
 
@@ -5463,7 +5464,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 await options.onRefresh?.();
             } catch (error) {
                 console.warn("[Sonder] Failed to drop-move assets:", error);
-                alert(error?.message || "Failed to move selected assets.");
+                notifyError(error?.message || "Failed to move selected assets.");
             }
         });
         return header;

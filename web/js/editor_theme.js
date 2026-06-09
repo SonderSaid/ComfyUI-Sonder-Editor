@@ -353,8 +353,13 @@ export function statusPillCss({ state = "idle", padding = "4px 8px" } = {}) {
         completed: THEME.statusCompleted,
         pending: THEME.statusPending,
         failed: THEME.statusFailed,
+        progress: THEME.accent,
     }[state] || THEME.statusIdle;
-    const glow = state === "running" ? `box-shadow:0 0 0 1px ${THEME.statusRunning}44;` : "";
+    const glow = state === "running"
+        ? `box-shadow:0 0 0 1px ${THEME.statusRunning}44;`
+        : state === "progress"
+            ? `box-shadow:0 0 0 1px ${THEME.accent}44;`
+            : "";
     return `
         display: inline-flex;
         align-items: center;

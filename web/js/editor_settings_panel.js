@@ -939,6 +939,37 @@ function showSettingsPanel() {
         }
     );
 
+    const notificationsSection = createSection(
+        "Notifications",
+        "Toast auto-dismiss timing. Hovering a toast pauses its countdown."
+    );
+    createNumberInput(
+        notificationsSection,
+        "toastDurationMs",
+        "Toast Duration (ms)",
+        "How long info and success toasts stay before auto-dismissing.",
+        {
+            min: 1000,
+            max: 30000,
+            step: 250,
+            getter: () => this._settings.notifications?.toastDurationMs ?? DEFAULT_EDITOR_SETTINGS.notifications.toastDurationMs,
+            onChange: (value) => updateCategory("notifications", "toastDurationMs", Math.max(1000, Math.round(value))),
+        }
+    );
+    createNumberInput(
+        notificationsSection,
+        "errorToastDurationMs",
+        "Error Toast Duration (ms)",
+        "How long error toasts stay before auto-dismissing. 0 keeps them until dismissed.",
+        {
+            min: 0,
+            max: 120000,
+            step: 500,
+            getter: () => this._settings.notifications?.errorToastDurationMs ?? DEFAULT_EDITOR_SETTINGS.notifications.errorToastDurationMs,
+            onChange: (value) => updateCategory("notifications", "errorToastDurationMs", Math.max(0, Math.round(value))),
+        }
+    );
+
     const renderSection = createSection(
         "Render",
         "Take placement, cache retention, trash cleanup, and batch render defaults."

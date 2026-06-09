@@ -67,6 +67,8 @@ class TimelineExportJob:
     result_scene_id: str = ""
     placed_clip: dict | None = None
     warnings: list[str] = field(default_factory=list)
+    frames_done: int = 0
+    frames_total: int = 0
     created_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
     cancel_event: threading.Event = field(default_factory=threading.Event)
@@ -80,6 +82,9 @@ class TimelineExportJob:
         }
         if self.message:
             payload["message"] = self.message
+        if self.frames_total > 0:
+            payload["frames_done"] = self.frames_done
+            payload["frames_total"] = self.frames_total
         if self.status == "failed":
             payload["code"] = self.code or "export_failed"
             payload["error"] = self.error or "Export failed"
@@ -662,6 +667,10 @@ class TimelineExportManager:
                     height,
                     custom_options,
                 )
+                # Determinate frame counter for the export status poll (the
+                # frontend maps frames_done/frames_total → "Exporting: 312/720f").
+                job.frames_total = int(frame_count)
+                job.frames_done = 0
                 encode_metadata = encode_video(
                     rgb_frames,
                     preset_id=preset_id,
@@ -671,6 +680,7 @@ class TimelineExportManager:
                     custom_options=custom_options,
                     timeout=encode_timeout,
                     cancel_event=job.cancel_event,
+                    progress_callback=lambda done: setattr(job, "frames_done", min(int(done), int(frame_count))),
                 )
             else:
                 if not mixed_audio_path or not os.path.isfile(mixed_audio_path):

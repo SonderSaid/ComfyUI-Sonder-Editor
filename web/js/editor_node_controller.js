@@ -27,6 +27,7 @@ import {
     readQueueBatchCollapseState,
 } from "./shared_render_queue.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEYBOARD_PRIORITY } from "./keyboard_ownership.js";
+import { notifyProgress, notifyInfo } from "./editor_notifications.js";
 import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
 
 // Session-diagnostic mode is gated by `window.SONDER_DEBUG_SESSION === true`.
@@ -2440,15 +2441,30 @@ export class EditorNodeController {
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
     }
 
-    async handleBridgeExecutionSettled({ allowRollback = false } = {}) {
+    async handleBridgeExecutionSettled({ allowRollback = false, attemptIndex = 0 } = {}) {
         if (this._destroyed || !this.state.projectDir) {
             return this.state.dormantSummary?.queue_counts || {};
         }
         this.syncStateFromWidgets();
+        // Bridge-asset-arrival info toast (observe-only — does NOT touch the
+        // rollback ladder logic). Baseline the asset total at the first rung of
+        // the settle session, then announce once when a new asset registers.
+        if (attemptIndex === 0) {
+            this._bridgeSettleBaselineTotal = this.state.dormantSummary?.asset_counts?.total ?? 0;
+            this._bridgeArrivalAnnounced = false;
+        }
         const refreshed = await this.refreshSummary({ syncAssets: true });
         if (refreshed) {
             this._invalidateModules(["assets", "scene", "queue", "preview"]);
             this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue", "preview"]);
+        }
+        if (!this._bridgeArrivalAnnounced && typeof this._bridgeSettleBaselineTotal === "number") {
+            const newTotal = this.state.dormantSummary?.asset_counts?.total ?? 0;
+            const added = newTotal - this._bridgeSettleBaselineTotal;
+            if (added > 0) {
+                notifyInfo(added > 1 ? `${added} bridge assets saved` : "Bridge asset saved");
+                this._bridgeArrivalAnnounced = true;
+            }
         }
         const counts = this.state.dormantSummary?.queue_counts || {};
         this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
@@ -2511,17 +2527,47 @@ export class EditorNodeController {
     async importFiles(files, folder = "") {
         if (this._destroyed || !this.state.projectDir || !files?.length) return false;
 
-        let importedAny = false;
-        for (const file of files) {
-            if (await importFileIntoProject(this.state.projectDir, file, folder)) {
-                importedAny = true;
-            }
-        }
+        const list = Array.from(files);
+        const total = list.length;
+        const handle = notifyProgress({
+            verb: "Importing",
+            message: total > 1 ? `0/${total} files` : (list[0]?.name || "1 file"),
+            progress: total > 1 ? { current: 0, total, unit: "" } : null,
+            foreground: true,
+            source: "import",
+        });
 
-        if (importedAny) {
-            this._invalidateModules(["assets", "scene"]);
-            this._reloadExpandedModuleIfNeeded(["assets", "scene"]);
-            await this.refreshSummary({ syncAssets: true });
+        let importedAny = false;
+        let done = 0;
+        let imported = 0;
+        try {
+            for (const file of list) {
+                if (await importFileIntoProject(this.state.projectDir, file, folder)) {
+                    importedAny = true;
+                    imported += 1;
+                }
+                done += 1;
+                handle.update({
+                    message: total > 1 ? `${done}/${total} files` : (file?.name || ""),
+                    progress: total > 1 ? { current: done, total, unit: "" } : null,
+                });
+            }
+
+            if (importedAny) {
+                this._invalidateModules(["assets", "scene"]);
+                this._reloadExpandedModuleIfNeeded(["assets", "scene"]);
+                await this.refreshSummary({ syncAssets: true });
+            }
+            if (imported === total) {
+                handle.resolve({ message: `Imported ${imported} file${imported === 1 ? "" : "s"}` });
+            } else if (imported > 0) {
+                handle.resolve({ message: `Imported ${imported} of ${total} files` });
+            } else {
+                handle.resolve({ tier: "warning", message: "No files imported." });
+            }
+        } catch (e) {
+            console.error("[Sonder] Import failed:", e);
+            handle.resolve({ tier: "error", message: e?.message || "Import failed." });
         }
 
         return importedAny;

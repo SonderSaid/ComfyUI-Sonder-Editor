@@ -167,6 +167,10 @@ export const DEFAULT_EDITOR_SETTINGS = {
         prebufferEnabled: true,
         prebufferLookaheadMs: 5000,
     },
+    notifications: {
+        toastDurationMs: 4000,
+        errorToastDurationMs: 0, // 0 = stay until dismissed
+    },
     appearance: {
         waveformAccent: "#dcffdc",
         timelineBrightness: 100,
@@ -666,6 +670,22 @@ function normalizeEditorSettings(source = null) {
                 true,
             ),
         },
+        notifications: {
+            toastDurationMs: clampNumber(
+                stored?.notifications?.toastDurationMs,
+                1000,
+                30000,
+                defaults.notifications.toastDurationMs,
+                true,
+            ),
+            errorToastDurationMs: clampNumber(
+                stored?.notifications?.errorToastDurationMs,
+                0,
+                120000,
+                defaults.notifications.errorToastDurationMs,
+                true,
+            ),
+        },
         appearance: {
             waveformAccent: isHexColor(stored?.appearance?.waveformAccent)
                 ? stored.appearance.waveformAccent
@@ -849,6 +869,19 @@ let currentSettings = normalizeEditorSettings(readStoredSettings());
 
 export function getEditorSettings() {
     return clone(currentSettings);
+}
+
+// Maps browser-local notification settings to the editor_notifications Core
+// config shape (ms; 0 = sticky). `toastDurationMs` drives info+success;
+// `errorToastDurationMs` drives error (0 = stay until dismissed). Warnings stay
+// sticky by design. Callers push this into `configureNotifications()`.
+export function notificationCoreConfig(settings = currentSettings) {
+    const n = settings?.notifications || DEFAULT_EDITOR_SETTINGS.notifications;
+    return {
+        info: n.toastDurationMs,
+        success: n.toastDurationMs,
+        error: n.errorToastDurationMs,
+    };
 }
 
 export function updateEditorSettings(partial) {

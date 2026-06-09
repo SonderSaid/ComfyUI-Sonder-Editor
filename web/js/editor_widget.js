@@ -133,6 +133,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 }
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { mountSharedRenderQueue, queueBatchIds } from "./shared_render_queue.js";
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
 import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
@@ -830,13 +831,7 @@ export class EditorWidget {
             getProjectDir: () => this.projectDir,
             initialData: { assets: [], folders: [] },
             onImportFiles: async (files, folder) => {
-                let importedAny = false;
-                for (const file of files) {
-                    if (await importFileIntoProject(this.projectDir, file, folder)) {
-                        importedAny = true;
-                    }
-                }
-                if (importedAny) await this._fetchAssets();
+                await this._importFilesWithProgress(Array.from(files || []), folder);
             },
             onUpdateAsset: async (assetId, updates) => await this._updateAssetMetadata(assetId, updates),
             onGetAssetUsages: async (assetId) => await this._getAssetUsages(assetId),
@@ -858,7 +853,20 @@ export class EditorWidget {
                 const handled = await window.__SONDER_OPEN_SOURCE_WORKFLOW__?.(this.projectDir, asset);
                 if (!handled) this._showToast?.("Source workflow unavailable");
             },
-            onRefresh: async () => await this._fetchAssets(),
+            onRefresh: async () => {
+                // Indeterminate progress only when the refresh is slow (>500ms);
+                // a fast refresh stays silent (result is visible inline).
+                let handle = null;
+                const timer = window.setTimeout(() => {
+                    handle = notifyProgress({ verb: "Refreshing", message: "Refreshing assets…", progress: null, source: "refresh" });
+                }, 500);
+                try {
+                    await this._fetchAssets();
+                } finally {
+                    window.clearTimeout(timer);
+                    if (handle) handle.resolve({ tier: "info", message: "Assets refreshed" });
+                }
+            },
         });
 
         // Render Queue section (collapsible)
@@ -902,40 +910,13 @@ export class EditorWidget {
         return btn;
     }
 
-    _showToast(message, { duration = 2200 } = {}) {
+    // Legacy entry point — now a thin forwarder to the notification Core
+    // (durable_rules.md > Notification System). Existing call sites pass refused/
+    // advisory messages, which map to the `warning` tier. The old single-slot
+    // bottom-center DOM is gone; the page-level toast stack renders these.
+    _showToast(message) {
         if (!message) return;
-        if (this._toastTimer) {
-            window.clearTimeout(this._toastTimer);
-            this._toastTimer = null;
-        }
-        if (!this._toastEl) {
-            this._toastEl = document.createElement("div");
-            this._toastEl.style.cssText = `
-                position: fixed;
-                left: 50%;
-                bottom: 24px;
-                transform: translateX(-50%);
-                z-index: 10020;
-                max-width: min(420px, calc(100vw - 32px));
-                padding: 10px 14px;
-                border-radius: 10px;
-                background: rgba(18, 24, 32, 0.96);
-                border: 1px solid ${COLORS.warningBorder};
-                color: ${COLORS.warningText};
-                box-shadow: 0 16px 34px rgba(0, 0, 0, 0.36);
-                font-size: 11px;
-                font-weight: 600;
-                letter-spacing: 0.01em;
-                pointer-events: none;
-            `;
-            document.body.appendChild(this._toastEl);
-        }
-        this._toastEl.textContent = message;
-        this._toastEl.style.opacity = "1";
-        this._toastTimer = window.setTimeout(() => {
-            if (!this._toastEl) return;
-            this._toastEl.style.opacity = "0";
-        }, duration);
+        notifyWarning(message);
     }
 
     // ── Scene Management ───────────────────────────────────────────────
@@ -5449,7 +5430,7 @@ export class EditorWidget {
         } catch (e) {
             Object.assign(clip, oldState);
             console.warn("[Sonder] Failed to convert clip role:", e);
-            this._showToast("Failed to convert clip role.");
+            notifyError("Failed to convert clip role.");
             this._renderTimeline();
         }
     }
@@ -6733,7 +6714,7 @@ export class EditorWidget {
                     source_frame: sourceFrame,
                     target_long_edge: targetLongEdge,
                 });
-                this._showToast("Captured via backend (viewport snapshot unavailable)");
+                notifyInfo("Captured via backend (viewport snapshot unavailable)");
             }
 
             const fields = {
@@ -8567,8 +8548,14 @@ export class EditorWidget {
             });
             if (resp.ok) {
                 await this._fetchScenes();
+                notifySuccess(`Saved selection "${name.trim()}"`);
+            } else {
+                notifyError("Failed to save selection.");
             }
-        } catch (e) { console.error("Save selection failed:", e); }
+        } catch (e) {
+            console.error("Save selection failed:", e);
+            notifyError("Failed to save selection.");
+        }
     }
 
     _recallSavedSelection(sel) {
@@ -8694,6 +8681,13 @@ export class EditorWidget {
     }
 
     _hideExportPanel() {
+        // Closing the panel cancels any in-flight job below, so drop a lingering
+        // progress notification (completion nulls it first, so this only fires on
+        // genuine close/cancel).
+        if (this._exportNotif) {
+            this._exportNotif.dismiss();
+            this._exportNotif = null;
+        }
         const jobId = this._exportJobId;
         if (jobId) this._postExportCancel(jobId);
         if (this._exportPollTimer) {
@@ -8741,6 +8735,17 @@ export class EditorWidget {
         return "Exporting...";
     }
 
+    // Determinate frame counter from the export status payload, or null
+    // (indeterminate) when the backend hasn't reported frame counts.
+    _exportProgressFromData(data) {
+        const total = Number(data?.frames_total);
+        const done = Number(data?.frames_done);
+        if (Number.isFinite(total) && total > 0 && Number.isFinite(done)) {
+            return { current: Math.max(0, Math.min(total, done)), total, unit: "f" };
+        }
+        return null;
+    }
+
     async _startTimelineExport(payload, ui) {
         const token = this._exportPanelToken;
         this._exportStartPending = true;
@@ -8778,6 +8783,15 @@ export class EditorWidget {
                 throw new Error("Export did not start.");
             }
             this._exportJobId = jobId;
+            // Global progress surface (toast + foreground pill) for the export.
+            // The panel's own progressEl stays as the modal-local affordance.
+            this._exportNotif = notifyProgress({
+                verb: "Exporting",
+                message: this._exportPhaseMessage(data),
+                progress: this._exportProgressFromData(data),
+                foreground: true,
+                source: "export",
+            });
             ui.progressEl.textContent = this._exportPhaseMessage(data);
             this._pollTimelineExport(ui);
         } catch (error) {
@@ -8787,8 +8801,13 @@ export class EditorWidget {
             this._exportCancelRequested = false;
             this._exportJobId = "";
             if (cancelRequested) {
+                if (this._exportNotif) { this._exportNotif.dismiss(); this._exportNotif = null; }
                 this._resetExportControlsAfterCancel(ui);
                 return;
+            }
+            if (this._exportNotif) {
+                this._exportNotif.resolve({ tier: "error", message: error?.message || "Export failed." });
+                this._exportNotif = null;
             }
             ui.errorEl.textContent = error?.message || "Export failed.";
             this._restoreExportControls(ui);
@@ -8811,6 +8830,10 @@ export class EditorWidget {
                 const data = await resp.json();
                 if (this._exportPanelToken !== token) return;
                 ui.progressEl.textContent = this._exportPhaseMessage(data);
+                this._exportNotif?.update({
+                    message: this._exportPhaseMessage(data),
+                    progress: this._exportProgressFromData(data),
+                });
                 if (data.status === "completed") {
                     await this._handleTimelineExportComplete(data);
                     return;
@@ -8820,6 +8843,7 @@ export class EditorWidget {
                 }
                 if (data.status === "cancelled") {
                     this._exportJobId = "";
+                    if (this._exportNotif) { this._exportNotif.dismiss(); this._exportNotif = null; }
                     this._resetExportControlsAfterCancel(ui);
                     return;
                 }
@@ -8827,6 +8851,10 @@ export class EditorWidget {
             } catch (error) {
                 if (this._exportPanelToken !== token) return;
                 this._exportJobId = "";
+                if (this._exportNotif) {
+                    this._exportNotif.resolve({ tier: "error", message: error?.message || "Export failed." });
+                    this._exportNotif = null;
+                }
                 ui.errorEl.textContent = error?.message || "Export failed.";
                 this._restoreExportControls(ui);
             }
@@ -8859,8 +8887,16 @@ export class EditorWidget {
     async _handleTimelineExportComplete(data) {
         const asset = data?.result?.asset || null;
         this._exportJobId = "";
+        const msg = asset?.name ? `Exported ${asset.name}` : "Export complete";
+        // Resolve (and detach) the progress handle before hiding the panel so the
+        // hide-path's cancel cleanup does not dismiss the success toast.
+        if (this._exportNotif) {
+            this._exportNotif.resolve({ message: msg });
+            this._exportNotif = null;
+        } else {
+            notifySuccess(msg);
+        }
         this._hideExportPanel();
-        this._showToast(asset?.name ? `Exported ${asset.name}` : "Export complete");
         await Promise.all([this._fetchAssets(), this._fetchScenes()]);
         if (asset?.asset_id) {
             this._inspectAssetInGallery(asset.asset_id);
@@ -9129,7 +9165,7 @@ export class EditorWidget {
                 this._renderQueue = (this._renderQueue || []).filter((job) => !tempIds.has(job.job_id));
                 this._renderQueuePanel();
                 await this._fetchRenderQueue();
-                alert(message);
+                notifyError(message);
                 return;
             }
             const payload = await resp.json();
@@ -9147,7 +9183,9 @@ export class EditorWidget {
             this._renderQueue = (this._renderQueue || []).filter((job) => !tempIds.has(job.job_id));
             this._renderQueuePanel();
             await this._fetchRenderQueue();
-            alert(e?.message || "Add batch to queue failed.");
+            notifyError(e?.message || "Add batch to queue failed.", {
+                onRetry: () => { this._addBatchToRenderQueue().catch(() => {}); },
+            });
         }
     }
 
@@ -9181,7 +9219,9 @@ export class EditorWidget {
             this._renderQueuePanel();
             await this._fetchRenderQueue();
             console.error("Clear completed renders failed:", e);
-            this._showToast(e?.message || "Clear completed renders failed.");
+            notifyError(e?.message || "Clear completed renders failed.", {
+                onRetry: () => { this._clearCompletedRenderQueue().catch(() => {}); },
+            });
             throw e;
         }
     }
@@ -9247,7 +9287,9 @@ export class EditorWidget {
             this._renderQueuePanel();
             await this._fetchRenderQueue();
             console.error("Delete queue job failed:", e);
-            this._showToast(e?.message || "Delete queue job failed.");
+            notifyError(e?.message || "Delete queue job failed.", {
+                onRetry: () => { this._deleteRenderQueueJob(job).catch(() => {}); },
+            });
             throw e;
         }
     }
@@ -10623,6 +10665,44 @@ export class EditorWidget {
         }
     }
 
+    // Import N files with a foreground progress notification (count-based for
+    // multi-file, indeterminate for a single file), resolving to success/error.
+    async _importFilesWithProgress(files, folder = "") {
+        const list = Array.isArray(files) ? files : Array.from(files || []);
+        if (!list.length) return;
+        const total = list.length;
+        const handle = notifyProgress({
+            verb: "Importing",
+            message: total > 1 ? `0/${total} files` : (list[0]?.name || "1 file"),
+            progress: total > 1 ? { current: 0, total, unit: "" } : null,
+            foreground: true,
+            source: "import",
+        });
+        let done = 0;
+        let imported = 0;
+        try {
+            for (const file of list) {
+                if (await importFileIntoProject(this.projectDir, file, folder)) imported += 1;
+                done += 1;
+                handle.update({
+                    message: total > 1 ? `${done}/${total} files` : (file?.name || ""),
+                    progress: total > 1 ? { current: done, total, unit: "" } : null,
+                });
+            }
+            if (imported) await this._fetchAssets();
+            if (imported === total) {
+                handle.resolve({ message: `Imported ${imported} file${imported === 1 ? "" : "s"}` });
+            } else if (imported > 0) {
+                handle.resolve({ message: `Imported ${imported} of ${total} files` });
+            } else {
+                handle.resolve({ tier: "warning", message: "No files imported." });
+            }
+        } catch (e) {
+            console.error("[Sonder] Import failed:", e);
+            handle.resolve({ tier: "error", message: e?.message || "Import failed." });
+        }
+    }
+
     async _importFile(file, folder = "") {
         if (!this.projectDir) return;
         try {
@@ -10731,13 +10811,9 @@ export class EditorWidget {
         if (this._exportPanelHandle || this._exportPanelEl || this._exportJobId || this._exportPollTimer || this._exportStartPending) {
             this._hideExportPanel();
         }
-        if (this._toastTimer) {
-            window.clearTimeout(this._toastTimer);
-            this._toastTimer = null;
-        }
-        if (this._toastEl) {
-            this._toastEl.remove();
-            this._toastEl = null;
+        if (this._foregroundPillUnsub) {
+            this._foregroundPillUnsub();
+            this._foregroundPillUnsub = null;
         }
         if (this._fullscreenPlaceholder) {
             this._fullscreenPlaceholder.remove();

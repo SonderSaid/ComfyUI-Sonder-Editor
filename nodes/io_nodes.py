@@ -1269,6 +1269,19 @@ class SonderSaveVideo:
             has_audio,
             encode_timeout,
         )
+        # ComfyUI native progress bar — emits "progress" WS events keyed to this
+        # executing SonderSaveVideo node. The editor's extension.js maps those
+        # (filtered to Sonder save nodes) into the notification foreground pill.
+        encode_pbar = None
+        try:
+            import comfy.utils
+            encode_pbar = comfy.utils.ProgressBar(len(rgb_frames))
+        except Exception:
+            encode_pbar = None
+        encode_progress_cb = None
+        if encode_pbar is not None:
+            _encode_total = len(rgb_frames)
+            encode_progress_cb = lambda done: encode_pbar.update_absolute(min(int(done), _encode_total))
         try:
             encode_metadata = encode_video(
                 rgb_frames,
@@ -1279,6 +1292,7 @@ class SonderSaveVideo:
                 custom_options=custom_options if custom_spec else None,
                 timeout=encode_timeout,
                 embed_metadata=file_metadata,
+                progress_callback=encode_progress_cb,
             )
         except subprocess.TimeoutExpired:
             logger.warning(

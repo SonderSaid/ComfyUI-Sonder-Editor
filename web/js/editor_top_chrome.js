@@ -1,4 +1,5 @@
 import { ASPECT_RATIO_PRESETS } from "./editor_settings.js";
+import { subscribeForeground, formatProgress } from "./editor_notifications.js";
 import {
     EDITOR_COLORS as COLORS,
     FONT,
@@ -150,6 +151,47 @@ function makeStatusPill({ text, state }) {
     label.textContent = text;
     pill.append(dot, label);
     return pill;
+}
+
+// Foreground-progress pill: a single toolbar pill showing the highest-priority
+// active foreground progress (encode/export/bridge). Coexists with — never
+// replaces — the Idle/Running/Pending queue pills. Driven by the notification
+// Core's subscribeForeground (most-recent foreground progress wins).
+function makeForegroundPill() {
+    const pill = document.createElement("span");
+    pill.dataset.sonderForegroundPill = "1";
+    pill.style.cssText = `${statusPillCss({ state: "progress", padding: "2px 7px" })}font-size:${TYPE.t10}px;line-height:1.35;margin-left:6px;display:none;max-width:200px;`;
+    const dot = document.createElement("span");
+    dot.style.cssText = `width:6px;height:6px;border-radius:999px;background:var(--sonder-status-color);flex:0 0 auto;`;
+    const label = document.createElement("span");
+    label.style.cssText = `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
+    pill.append(dot, label);
+    pill._label = label;
+    return pill;
+}
+
+function updateForegroundPill(widget, item) {
+    const pill = widget._foregroundPill;
+    if (!pill) return;
+    if (!item) {
+        pill.style.display = "none";
+        return;
+    }
+    const prog = formatProgress(item.progress);
+    let text;
+    if (item.verb) text = prog ? `${item.verb}: ${prog}` : `${item.verb}…`;
+    else text = item.message || "Working…";
+    pill._label.textContent = text;
+    pill.title = text;
+    pill.style.display = "inline-flex";
+}
+
+function wireForegroundPill(widget) {
+    if (widget._foregroundPillUnsub) {
+        widget._foregroundPillUnsub();
+        widget._foregroundPillUnsub = null;
+    }
+    widget._foregroundPillUnsub = subscribeForeground((item) => updateForegroundPill(widget, item));
 }
 
 export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
@@ -523,6 +565,8 @@ export function buildEditorToolbar(widget) {
     `;
     widget._queueStatusWrap.title = "Queue status";
 
+    widget._foregroundPill = makeForegroundPill();
+
     widget._exportBtn = makeButton("Export", "Export the current scene timeline", BUTTON_OPTIONS.primary, "white-space:nowrap;");
     widget._exportBtn.addEventListener("click", () => widget._showExportPanel());
 
@@ -546,12 +590,13 @@ export function buildEditorToolbar(widget) {
         undoBtn, redoBtn, makeDivider(), widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn, makeDivider(),
         frameLabel, widget._playheadFrameInput, inLabel, widget._selectionStartInput, outLabel, widget._selectionEndInput,
         clearSelBtn, widget._bookmarkBtn, makeDivider(), fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic,
-        widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._exportBtn, spacer,
+        widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn, spacer,
         zoomOut, zoomIn, widget._fullscreenBtn, helpBtn, settingsBtn
     );
 
     widget._toolbar = toolbar;
     widget.container.appendChild(toolbar);
+    wireForegroundPill(widget);
     updateEditorToolbar(widget);
     return toolbar;
 }

@@ -1,5 +1,8 @@
 import { installComfyApiShim } from "./comfy_api_shim.js";
 import { FONT, THEME, injectSonderFontFaces, statusPillCss } from "./editor_theme.js";
+import { mountToastStack } from "./editor_toast_stack.js";
+import { configureNotifications } from "./editor_notifications.js";
+import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
@@ -343,6 +346,12 @@ async function main() {
     editor.applyWidgetState(host.values);
     editor._enterFullscreen();
     document.body.classList.add("ready");
+    // Page-level notification toast stack (tab page), mounted once.
+    if (!document.querySelector("[data-sonder-toast-stack]")) {
+        mountToastStack(document.body);
+    }
+    configureNotifications(notificationCoreConfig());
+    subscribeEditorSettings(() => configureNotifications(notificationCoreConfig()));
     if (sessionWindowName) {
         try {
             window.name = sessionWindowName;
