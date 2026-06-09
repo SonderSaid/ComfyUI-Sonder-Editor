@@ -135,6 +135,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { mountSharedRenderQueue, queueBatchIds } from "./shared_render_queue.js";
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
+import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
 import * as TimelineCanvas from "./editor_timeline_canvas.js";
 import { RULER_HEIGHT, TIMELINE_HEIGHT, TRACK_TYPE } from "./editor_timeline_constants.js";
 import { createViewportSurface } from "./viewport_surface.js";
@@ -160,16 +161,9 @@ import {
 } from "./keyboard_ownership.js";
 import {
     ASPECT_RATIO_PRESETS,
-    CUSTOM_AUDIO_CODEC_OPTIONS,
-    CUSTOM_CONTAINER_OPTIONS,
-    CUSTOM_ENCODER_PRESET_OPTIONS,
     CUSTOM_OUTPUT_KIND_VIDEO,
-    CUSTOM_PIX_FMT_OPTIONS,
-    CUSTOM_VIDEO_CODEC_OPTIONS,
-    DEFAULT_SAVE_PRESET,
     DEFAULT_EDITOR_SETTINGS,
     RESOLUTION_TIERS,
-    SAVE_PRESET_OPTIONS,
     computeResolutionFromTier,
     frameConstraintsEqual,
     getEditorSettings,
@@ -478,8 +472,13 @@ export class EditorWidget {
         this._exportBtn = null;
         this._exportPanelEl = null;
         this._exportPanelKeyOff = null;
+        this._exportPanelHandle = null;
         this._exportPollTimer = null;
         this._exportJobId = "";
+        this._exportPanelSeq = 0;
+        this._exportPanelToken = 0;
+        this._exportStartPending = false;
+        this._exportCancelRequested = false;
         this.renderQueueActive = coerceBoolean(this._getWidgetValue("render_queue_active", true), true);
         this._savedSelDropdown = null;
 
@@ -8655,358 +8654,69 @@ export class EditorWidget {
     }
 
     _showExportPanel() {
-        if (this._exportPanelEl || !this.activeScene || !this.projectDir) return;
-        const rangeInfo = this._resolveQueueSelectionRange();
-        if (!rangeInfo) return;
+        if (this._exportPanelHandle || this._exportPanelEl) return;
+        if (!this.activeScene || !this.projectDir) return;
+        const handle = mountTimelineExportPanel(this);
+        if (!handle) return;
+        this._exportPanelHandle = handle;
+        this._exportPanelEl = handle.element;
+        this._exportPanelKeyOff = handle.unregisterKeyboard || null;
+        this._exportPanelToken = handle.token;
+        this._exportStartPending = false;
+        this._exportCancelRequested = false;
+    }
 
-        const settings = this._exportSettings();
-        const customState = this._defaultCustomExportOptions();
-        let sourceMode = rangeInfo.hasSelection ? "selection" : "scene";
-        const customDescriptions = {
-            custom_container: "Output file wrapper. MP4 is safest for browser playback, MOV suits ProRes/PCM handoff, and MKV suits FFV1/FLAC archival exports.",
-            custom_video_codec: "Video encoder. H.264 is most compatible, H.265 is smaller but slower, ProRes is editing-friendly, and FFV1 is lossless archival.",
-            custom_pix_fmt: "Pixel format and chroma layout. yuv420p previews broadly, yuv444p keeps more chroma detail, yuv422p10le suits ProRes, and gbrp preserves RGB for FFV1.",
-            custom_encoder_preset: "Speed/compression tradeoff for encoders that support presets. Slower presets usually make smaller files but take longer.",
-            custom_audio_codec: "Audio stream codec. AAC previews broadly, PCM is editing-friendly in MOV, FLAC is lossless in MKV, and none omits audio.",
-            custom_crf: "Quality target for CRF encoders. Lower is higher quality and larger; higher is smaller and more compressed.",
-            custom_audio_bitrate_kbps: "AAC bitrate in kilobits per second when AAC audio is selected.",
-        };
-        const customOptionDescriptions = {
-            custom_container: {
-                mp4: "Browser-friendly container for H.264/H.265 and AAC.",
-                mov: "Editing handoff container, especially for ProRes or PCM audio.",
-                mkv: "Flexible archival container, useful for FFV1 and FLAC.",
-            },
-            custom_video_codec: {
-                libx264: "H.264 encoder with the broadest preview and sharing compatibility.",
-                libx265: "H.265 encoder for smaller files, with slower encoding and weaker compatibility.",
-                prores_ks: "ProRes encoder for editing handoff; use MOV and yuv422p10le.",
-                ffv1: "Lossless FFV1 encoder for archival or diagnostic files; use MKV and gbrp.",
-            },
-            custom_pix_fmt: {
-                yuv420p: "Most compatible 8-bit 4:2:0 format for browser playback.",
-                yuv444p: "8-bit 4:4:4 format with more chroma detail; preview support varies.",
-                yuv422p10le: "10-bit 4:2:2 format used by ProRes handoff files.",
-                gbrp: "Planar RGB format used for lossless FFV1 exports.",
-            },
-            custom_encoder_preset: Object.fromEntries(CUSTOM_ENCODER_PRESET_OPTIONS.map((value) => [
-                value,
-                `${value}: encoder speed/compression preset. Slower usually means smaller output and longer export time.`,
-            ])),
-            custom_audio_codec: {
-                aac: "Compressed audio for MP4/browser playback.",
-                pcm_s16le: "Uncompressed 16-bit PCM audio for editing handoff.",
-                flac: "Lossless compressed audio, usually paired with MKV.",
-                none: "Do not include an audio stream.",
-            },
-        };
+    _postExportCancel(jobId) {
+        if (!jobId || !this._projectDirName()) return;
+        const dirName = encodeURIComponent(this._projectDirName());
+        fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${jobId}/cancel`), {
+            method: "POST",
+        }).catch((error) => console.warn("[Sonder] Export cancel failed:", error));
+    }
 
-        const backdrop = document.createElement("div");
-        backdrop.style.cssText = `
-            position: fixed; inset: 0; z-index: 10001;
-            background: rgba(7,10,14,0.78);
-            display: flex; align-items: center; justify-content: center;
-            padding: 24px;
-        `;
-
-        const panel = document.createElement("div");
-        panel.style.cssText = `${chromeOverlayPanelCss({ width: "min(620px, 96vw)", maxWidth: "620px", maxHeight: "min(760px, 88vh)", padding: "0", fontFamily: "'Segoe UI', Arial, sans-serif" })}`;
-        panel.addEventListener("click", (event) => event.stopPropagation());
-
-        const header = document.createElement("div");
-        header.style.cssText = `display:flex;align-items:center;justify-content:space-between;gap:14px;padding:16px 20px 12px;border-bottom:1px solid ${COLORS.border};position:sticky;top:0;background:${COLORS.panel};z-index:1;`;
-        const title = document.createElement("div");
-        title.innerHTML = `<div style="font-size:15px;font-weight:700;color:#fff;">Export Timeline</div>`;
-        const closeBtn = document.createElement("button");
-        closeBtn.textContent = "Close";
-        closeBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "6px 12px", fontSize: "11px", radius: "7px" });
-        closeBtn.addEventListener("click", () => this._hideExportPanel());
-        header.append(title, closeBtn);
-        panel.appendChild(header);
-
-        const body = document.createElement("div");
-        body.style.cssText = "padding:16px 20px 18px;display:flex;flex-direction:column;gap:12px;";
-        panel.appendChild(body);
-
-        const makeRow = (labelText, description = "") => {
-            const row = document.createElement("label");
-            row.style.cssText = "display:grid;grid-template-columns:140px minmax(0,1fr);gap:12px;align-items:center;";
-            if (description) row.title = description;
-            const label = document.createElement("div");
-            label.textContent = labelText;
-            label.style.cssText = `font-size:11px;color:${COLORS.textMuted};font-weight:700;`;
-            if (description) label.title = description;
-            const control = document.createElement("div");
-            control.style.cssText = "min-width:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap;";
-            if (description) control.title = description;
-            row.append(label, control);
-            body.appendChild(row);
-            return control;
-        };
-
-        const sourceWrap = makeRow("Source", "Export either the entire active scene or the current In/Out selection.");
-        const sourceRadioName = `${this._keyboardConsumerId("export-source")}`;
-        const sceneRadio = document.createElement("input");
-        sceneRadio.type = "radio";
-        sceneRadio.name = sourceRadioName;
-        sceneRadio.value = "scene";
-        sceneRadio.title = "Use the full active scene duration.";
-        const sceneLabel = document.createElement("span");
-        sceneLabel.textContent = "Full scene";
-        sceneLabel.style.cssText = "font-size:11px;color:#dbe3ea;";
-        sceneLabel.title = sceneRadio.title;
-        const selectionRadio = document.createElement("input");
-        selectionRadio.type = "radio";
-        selectionRadio.name = sourceRadioName;
-        selectionRadio.value = "selection";
-        selectionRadio.disabled = !rangeInfo.hasSelection;
-        selectionRadio.title = rangeInfo.hasSelection ? "Use the current In/Out selection." : "Set an In/Out selection to export only part of the scene.";
-        const selectionLabel = document.createElement("span");
-        selectionLabel.textContent = "Active selection";
-        selectionLabel.style.cssText = `font-size:11px;color:${rangeInfo.hasSelection ? "#dbe3ea" : COLORS.textMuted};`;
-        selectionLabel.title = selectionRadio.title;
-        sceneRadio.checked = sourceMode === "scene";
-        selectionRadio.checked = sourceMode === "selection";
-        sourceWrap.append(sceneRadio, sceneLabel, selectionRadio, selectionLabel);
-
-        const prefixInput = document.createElement("input");
-        prefixInput.type = "text";
-        prefixInput.value = settings.filenamePrefix || "";
-        prefixInput.placeholder = "export";
-        prefixInput.maxLength = 64;
-        prefixInput.style.cssText = `${chromeInputCss({ fontSize: "11px", padding: "6px 8px", textAlign: "left" })} width:100%;`;
-        prefixInput.title = "Filename stem used before the scene name and timestamp.";
-        makeRow("Filename prefix", prefixInput.title).appendChild(prefixInput);
-
-        const presetSelect = document.createElement("select");
-        presetSelect.style.cssText = `${chromeInputCss({ fontSize: "11px", padding: "6px 8px", textAlign: "left" })} min-width:190px;`;
-        for (const option of SAVE_PRESET_OPTIONS) {
-            const opt = document.createElement("option");
-            opt.value = option.value;
-            opt.textContent = option.label;
-            opt.title = option.description || "";
-            presetSelect.appendChild(opt);
+    _restoreExportControls(ui) {
+        if (!ui) return;
+        ui.controls.forEach((control) => { control.disabled = false; });
+        if (ui.exportBtn) ui.exportBtn.disabled = false;
+        if (ui.closeBtn) ui.closeBtn.disabled = false;
+        if (ui.cancelBtn) {
+            ui.cancelBtn.textContent = "Cancel";
+            ui.cancelBtn.onclick = () => this._hideExportPanel();
         }
-        presetSelect.value = SAVE_PRESET_OPTIONS.some((option) => option.value === settings.lastPreset)
-            ? settings.lastPreset
-            : DEFAULT_SAVE_PRESET;
-        const presetWrap = makeRow("Save preset", "Choose the output container, codecs, pixel format, and compatibility target.");
-        presetWrap.style.flexDirection = "column";
-        presetWrap.style.alignItems = "stretch";
-        presetWrap.appendChild(presetSelect);
-        const presetHelp = document.createElement("div");
-        presetHelp.style.cssText = `font-size:10px;color:${COLORS.textMuted};line-height:1.35;`;
-        presetWrap.appendChild(presetHelp);
-        const syncPresetDescription = () => {
-            const option = SAVE_PRESET_OPTIONS.find((entry) => entry.value === presetSelect.value);
-            const description = option?.description || "Custom allowlisted encode settings.";
-            presetHelp.textContent = description;
-            presetHelp.title = description;
-            presetSelect.title = description;
-        };
+        ui.syncState?.();
+    }
 
-        const customPanel = document.createElement("div");
-        customPanel.style.cssText = `display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px;border:1px solid ${COLORS.borderSoft};border-radius:8px;background:${COLORS.panelMuted};`;
-        body.appendChild(customPanel);
-
-        const customControls = [];
-        const makeCustomSelect = (key, labelText, options) => {
-            const wrap = document.createElement("label");
-            wrap.style.cssText = "display:flex;flex-direction:column;gap:4px;min-width:0;";
-            wrap.title = customDescriptions[key] || "";
-            const label = document.createElement("span");
-            label.textContent = labelText;
-            label.style.cssText = `font-size:10px;color:${COLORS.textMuted};`;
-            label.title = wrap.title;
-            const select = document.createElement("select");
-            select.style.cssText = chromeInputCss({ fontSize: "10px", padding: "5px 7px", textAlign: "left" });
-            for (const value of options) {
-                const opt = document.createElement("option");
-                opt.value = value;
-                opt.textContent = value;
-                opt.title = customOptionDescriptions[key]?.[value] || wrap.title;
-                select.appendChild(opt);
-            }
-            select.value = customState[key];
-            const syncTitle = () => {
-                select.title = customOptionDescriptions[key]?.[select.value] || wrap.title;
-            };
-            select.addEventListener("change", () => {
-                customState[key] = select.value;
-                syncTitle();
-            });
-            wrap.append(label, select);
-            customPanel.appendChild(wrap);
-            customControls.push(select);
-            syncTitle();
-            return select;
-        };
-        const makeCustomNumber = (key, labelText, min, max) => {
-            const wrap = document.createElement("label");
-            wrap.style.cssText = "display:flex;flex-direction:column;gap:4px;min-width:0;";
-            wrap.title = customDescriptions[key] || "";
-            const label = document.createElement("span");
-            label.textContent = labelText;
-            label.style.cssText = `font-size:10px;color:${COLORS.textMuted};`;
-            label.title = wrap.title;
-            const input = document.createElement("input");
-            input.type = "number";
-            input.min = String(min);
-            input.max = String(max);
-            input.step = "1";
-            input.value = String(customState[key]);
-            input.style.cssText = chromeInputCss({ fontSize: "10px", padding: "5px 7px", textAlign: "right" });
-            input.title = wrap.title;
-            input.addEventListener("change", () => {
-                const numeric = Number(input.value);
-                customState[key] = Number.isFinite(numeric) ? Math.max(min, Math.min(max, Math.round(numeric))) : customState[key];
-                input.value = String(customState[key]);
-            });
-            wrap.append(label, input);
-            customPanel.appendChild(wrap);
-            customControls.push(input);
-            return input;
-        };
-        makeCustomSelect("custom_container", "Container", CUSTOM_CONTAINER_OPTIONS);
-        makeCustomSelect("custom_video_codec", "Video codec", CUSTOM_VIDEO_CODEC_OPTIONS);
-        makeCustomSelect("custom_pix_fmt", "Pixel format", CUSTOM_PIX_FMT_OPTIONS);
-        makeCustomSelect("custom_encoder_preset", "Encoder preset", CUSTOM_ENCODER_PRESET_OPTIONS);
-        makeCustomSelect("custom_audio_codec", "Audio codec", CUSTOM_AUDIO_CODEC_OPTIONS);
-        makeCustomNumber("custom_crf", "CRF", 0, 51);
-        makeCustomNumber("custom_audio_bitrate_kbps", "AAC kbps", 1, 10000);
-
-        const makeCheckboxRow = (labelText, checked, description = "") => {
-            const input = document.createElement("input");
-            input.type = "checkbox";
-            input.checked = !!checked;
-            input.title = description;
-            makeRow(labelText, description).appendChild(input);
-            return input;
-        };
-        const includeVideo = makeCheckboxRow("Include video", settings.includeVideo !== false, "Encode the visible timeline video layers into the export.");
-        const includeAudio = makeCheckboxRow("Include audio", settings.includeAudio !== false && this._sceneHasAudio(), "Mix unmuted, visible audio lanes into the export when the scene has audio.");
-        const placeAsTake = makeCheckboxRow("Place as take", settings.placeAsTake !== false, "After export, place the video result onto a fresh timeline lane in the active scene.");
-
-        const errorEl = document.createElement("div");
-        errorEl.style.cssText = `min-height:16px;font-size:11px;color:${COLORS.warningText};`;
-        body.appendChild(errorEl);
-        const progressEl = document.createElement("div");
-        progressEl.style.cssText = `display:none;font-size:11px;color:${COLORS.textMuted};padding:8px 10px;border:1px solid ${COLORS.borderSoft};border-radius:8px;background:${COLORS.panelMuted};`;
-        body.appendChild(progressEl);
-
-        const footer = document.createElement("div");
-        footer.style.cssText = `display:flex;justify-content:flex-end;gap:8px;padding:12px 20px 16px;border-top:1px solid ${COLORS.border};`;
-        const cancelBtn = document.createElement("button");
-        cancelBtn.textContent = "Cancel";
-        cancelBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "6px 12px", fontSize: "11px", radius: "7px" });
-        cancelBtn.onclick = () => this._hideExportPanel();
-        const exportBtn = document.createElement("button");
-        exportBtn.textContent = "Export";
-        exportBtn.style.cssText = chromeButtonCss({ variant: "primary", padding: "6px 12px", fontSize: "11px", radius: "7px" });
-        footer.append(cancelBtn, exportBtn);
-        panel.appendChild(footer);
-
-        const controls = [sceneRadio, selectionRadio, prefixInput, presetSelect, includeVideo, includeAudio, placeAsTake, ...customControls];
-        const syncState = () => {
-            syncPresetDescription();
-            customPanel.style.display = presetSelect.value === "Custom" ? "grid" : "none";
-            includeAudio.disabled = !this._sceneHasAudio();
-            if (!this._sceneHasAudio()) includeAudio.checked = false;
-            placeAsTake.disabled = !includeVideo.checked;
-            if (!includeVideo.checked) placeAsTake.checked = false;
-            const valid = includeVideo.checked || includeAudio.checked;
-            errorEl.textContent = valid ? "" : "Enable video or audio to export";
-            exportBtn.disabled = !valid;
-            setButtonVariant(exportBtn, valid ? "primary" : "muted");
-        };
-        sceneRadio.addEventListener("change", () => { if (sceneRadio.checked) sourceMode = "scene"; });
-        selectionRadio.addEventListener("change", () => { if (selectionRadio.checked) sourceMode = "selection"; });
-        presetSelect.addEventListener("change", syncState);
-        includeVideo.addEventListener("change", syncState);
-        includeAudio.addEventListener("change", syncState);
-        syncState();
-
-        exportBtn.addEventListener("click", async () => {
-            const sceneDuration = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || 0);
-            const useSelection = sourceMode === "selection" && rangeInfo.hasSelection;
-            const start = useSelection ? rangeInfo.selStart : 0;
-            const end = useSelection ? rangeInfo.selEnd : sceneDuration;
-            const customOptions = presetSelect.value === "Custom"
-                ? { ...customState, custom_output_kind: CUSTOM_OUTPUT_KIND_VIDEO }
-                : null;
-            this._updateExportSettings({
-                lastPreset: presetSelect.value,
-                lastCustomEncode: customOptions,
-                filenamePrefix: prefixInput.value,
-                includeVideo: includeVideo.checked,
-                includeAudio: includeAudio.checked,
-                placeAsTake: placeAsTake.checked,
-            });
-            controls.forEach((control) => { control.disabled = true; });
-            exportBtn.disabled = true;
-            closeBtn.disabled = true;
-            progressEl.style.display = "";
-            progressEl.textContent = "Starting export...";
-            errorEl.textContent = "";
-            cancelBtn.textContent = "Cancel Export";
-            cancelBtn.onclick = () => this._cancelTimelineExport(progressEl);
-            await this._startTimelineExport({
-                scene_id: this.activeScene.scene_id,
-                range: { start, end },
-                filename_prefix: prefixInput.value,
-                save_preset: presetSelect.value,
-                custom_options: customOptions,
-                include_video: includeVideo.checked,
-                include_audio: includeAudio.checked,
-                place_as_take: placeAsTake.checked,
-            }, { errorEl, progressEl, controls, exportBtn, closeBtn, cancelBtn, syncState });
-        });
-
-        backdrop.appendChild(panel);
-        backdrop.addEventListener("click", () => {
-            if (this._exportJobId) {
-                progressEl.textContent = "Export running. Use Cancel Export to stop it.";
-                return;
-            }
-            this._hideExportPanel();
-        });
-        document.body.appendChild(backdrop);
-        this._exportPanelEl = backdrop;
-        this._exportPanelKeyOff = registerKeyboardConsumer({
-            id: this._keyboardConsumerId("export"),
-            priority: KEY_PRIORITY.OVERLAY,
-            keydown: (event) => {
-                if (event.key !== "Escape") return false;
-                if (this._exportJobId) {
-                    progressEl.textContent = "Export running. Use Cancel Export to stop it.";
-                    return true;
-                }
-                this._hideExportPanel();
-                return true;
-            },
-        });
+    _resetExportControlsAfterCancel(ui) {
+        if (!ui) return;
+        if (ui.progressEl) ui.progressEl.style.display = "none";
+        if (ui.errorEl) ui.errorEl.textContent = "";
+        this._restoreExportControls(ui);
     }
 
     _hideExportPanel() {
         const jobId = this._exportJobId;
-        if (jobId && this._projectDirName()) {
-            const dirName = encodeURIComponent(this._projectDirName());
-            fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${jobId}/cancel`), {
-                method: "POST",
-            }).catch((error) => console.warn("[Sonder] Export cancel failed:", error));
-        }
+        if (jobId) this._postExportCancel(jobId);
         if (this._exportPollTimer) {
             window.clearTimeout(this._exportPollTimer);
             this._exportPollTimer = null;
         }
         this._exportJobId = "";
-        if (this._exportPanelEl) {
-            this._exportPanelEl.remove();
-            this._exportPanelEl = null;
-        }
+        this._exportStartPending = false;
+        this._exportCancelRequested = false;
+        // Invalidate the mounted token so any in-flight start/poll callbacks
+        // (which captured the prior token) bail instead of touching torn-down UI.
+        this._exportPanelToken = 0;
         if (this._exportPanelKeyOff) {
             this._exportPanelKeyOff();
             this._exportPanelKeyOff = null;
+        }
+        if (this._exportPanelHandle) {
+            this._exportPanelHandle.cleanup();
+            this._exportPanelHandle = null;
+        }
+        if (this._exportPanelEl) {
+            this._exportPanelEl.remove();
+            this._exportPanelEl = null;
         }
     }
 
@@ -9032,6 +8742,9 @@ export class EditorWidget {
     }
 
     async _startTimelineExport(payload, ui) {
+        const token = this._exportPanelToken;
+        this._exportStartPending = true;
+        this._exportCancelRequested = false;
         try {
             const dirName = encodeURIComponent(this._projectDirName());
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline`), {
@@ -9044,31 +8757,59 @@ export class EditorWidget {
                 throw new Error(message);
             }
             const data = await resp.json();
-            this._exportJobId = data.job_id || "";
+            const jobId = data.job_id || "";
+            this._exportStartPending = false;
+            // Panel torn down, or the user pressed Cancel before the job id
+            // arrived: do not adopt the job into (possibly stale) UI; cancel it
+            // on the backend so it cannot run orphaned, and reset if still open.
+            if (this._exportPanelToken !== token || this._exportCancelRequested) {
+                const cancelRequested = this._exportCancelRequested;
+                this._exportCancelRequested = false;
+                if (jobId) this._postExportCancel(jobId);
+                if (cancelRequested && this._exportPanelToken === token) {
+                    this._exportJobId = "";
+                    this._resetExportControlsAfterCancel(ui);
+                }
+                return;
+            }
+            if (!jobId) {
+                // A 200 with no job id cannot be polled; fail loud so controls
+                // re-enable instead of leaving the panel wedged on "Starting...".
+                throw new Error("Export did not start.");
+            }
+            this._exportJobId = jobId;
             ui.progressEl.textContent = this._exportPhaseMessage(data);
             this._pollTimelineExport(ui);
         } catch (error) {
+            this._exportStartPending = false;
+            if (this._exportPanelToken !== token) return;
+            const cancelRequested = this._exportCancelRequested;
+            this._exportCancelRequested = false;
+            this._exportJobId = "";
+            if (cancelRequested) {
+                this._resetExportControlsAfterCancel(ui);
+                return;
+            }
             ui.errorEl.textContent = error?.message || "Export failed.";
-            ui.controls.forEach((control) => { control.disabled = false; });
-            ui.exportBtn.disabled = false;
-            ui.closeBtn.disabled = false;
-            ui.cancelBtn.textContent = "Cancel";
-            ui.cancelBtn.onclick = () => this._hideExportPanel();
-            ui.syncState();
+            this._restoreExportControls(ui);
         }
     }
 
     _pollTimelineExport(ui) {
         if (!this._exportJobId) return;
+        const token = this._exportPanelToken;
         this._exportPollTimer = window.setTimeout(async () => {
+            if (this._exportPanelToken !== token || !this._exportJobId) return;
             try {
                 const dirName = encodeURIComponent(this._projectDirName());
                 const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/render_timeline/${this._exportJobId}`));
+                if (this._exportPanelToken !== token) return;
                 if (!resp.ok) {
                     const message = await this._readExportError(resp, `Export status failed: ${resp.status}`);
                     throw new Error(message);
                 }
                 const data = await resp.json();
+                if (this._exportPanelToken !== token) return;
                 ui.progressEl.textContent = this._exportPhaseMessage(data);
                 if (data.status === "completed") {
                     await this._handleTimelineExportComplete(data);
@@ -9079,29 +8820,27 @@ export class EditorWidget {
                 }
                 if (data.status === "cancelled") {
                     this._exportJobId = "";
-                    ui.progressEl.style.display = "none";
-                    ui.errorEl.textContent = "";
-                    ui.controls.forEach((control) => { control.disabled = false; });
-                    ui.closeBtn.disabled = false;
-                    ui.cancelBtn.textContent = "Cancel";
-                    ui.cancelBtn.onclick = () => this._hideExportPanel();
-                    ui.syncState();
+                    this._resetExportControlsAfterCancel(ui);
                     return;
                 }
                 this._pollTimelineExport(ui);
             } catch (error) {
+                if (this._exportPanelToken !== token) return;
                 this._exportJobId = "";
                 ui.errorEl.textContent = error?.message || "Export failed.";
-                ui.controls.forEach((control) => { control.disabled = false; });
-                ui.closeBtn.disabled = false;
-                ui.cancelBtn.textContent = "Cancel";
-                ui.cancelBtn.onclick = () => this._hideExportPanel();
-                ui.syncState();
+                this._restoreExportControls(ui);
             }
         }, 650);
     }
 
     async _cancelTimelineExport(progressEl) {
+        // Cancel pressed before the backend returned a job id: flag it so the
+        // pending start cancels the late job and resets the panel.
+        if (this._exportStartPending && !this._exportJobId) {
+            this._exportCancelRequested = true;
+            if (progressEl) progressEl.textContent = "Cancelling...";
+            return;
+        }
         if (!this._exportJobId) {
             this._hideExportPanel();
             return;
@@ -10989,7 +10728,7 @@ export class EditorWidget {
             this._shortcutOverlayEl.remove();
             this._shortcutOverlayEl = null;
         }
-        if (this._exportPanelEl || this._exportJobId || this._exportPollTimer) {
+        if (this._exportPanelHandle || this._exportPanelEl || this._exportJobId || this._exportPollTimer || this._exportStartPending) {
             this._hideExportPanel();
         }
         if (this._toastTimer) {
