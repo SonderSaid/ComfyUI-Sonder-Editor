@@ -210,8 +210,355 @@ def test_scene_mutation_create_prompt_section_returns_reconciled_scene(monkeypat
     assert response.status == 200
     assert len(saves) == 1
     assert payload["scene"]["prompt_sections"] == [
-        {"start_frame": 10, "end_frame": 20, "prompt": "hello"}
+        {
+            "start_frame": 10,
+            "end_frame": 20,
+            "channels": {"visual": "hello", "speech": "", "sounds": ""},
+            "prompt": "hello",
+        }
     ]
+
+
+def _mutation_handler(route_module):
+    return _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
+    )
+
+
+def _prompt_scene_project(monkeypatch, route_module, tmp_path, sections):
+    from server.timeline_state import PromptSection
+
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.prompt_sections = [PromptSection(**fields) for fields in sections]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    return scene, project, saves
+
+
+def test_scene_mutation_prompt_overlap_rejected(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene, _project, saves = _prompt_scene_project(
+        monkeypatch, route_module, tmp_path,
+        [{"start_frame": 0, "end_frame": 20, "prompt": "a"}],
+    )
+    handler = _mutation_handler(route_module)
+
+    # Overlapping create → 409 prompt_overlap, nothing saved
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "create_prompt_section",
+            "fields": {"start_frame": 10, "end_frame": 30, "prompt": "b"},
+        }]},
+    )))
+    assert response.status == 409
+    assert _response_json(response)["code"] == "prompt_overlap"
+    assert saves == []
+    assert len(scene.prompt_sections) == 1
+
+    # Abutting create (half-open) is fine
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "create_prompt_section",
+            "fields": {"start_frame": 20, "end_frame": 30, "prompt": "b"},
+        }]},
+    )))
+    assert response.status == 200
+    assert len(scene.prompt_sections) == 2
+
+    # Range update creating an overlap → 409; text-only update on the same
+    # section passes (legacy stored overlaps stay editable)
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_prompt_section",
+            "index": 1,
+            "fields": {"start_frame": 15},
+            "expected": {"start_frame": 20, "end_frame": 30},
+        }]},
+    )))
+    assert response.status == 409
+    assert _response_json(response)["code"] == "prompt_overlap"
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_prompt_section",
+            "index": 1,
+            "fields": {"channels": {"visual": "updated", "speech": "say", "sounds": ""}},
+            "expected": {"start_frame": 20, "end_frame": 30},
+        }]},
+    )))
+    assert response.status == 200
+    assert scene.prompt_sections[1].channels == {"visual": "updated", "speech": "say", "sounds": ""}
+
+
+def test_scene_mutation_swap_prompt_sections_atomic(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene, _project, saves = _prompt_scene_project(
+        monkeypatch, route_module, tmp_path,
+        [
+            {"start_frame": 0, "end_frame": 10, "prompt": "first"},
+            {"start_frame": 40, "end_frame": 80, "prompt": "second"},
+        ],
+    )
+    handler = _mutation_handler(route_module)
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "swap_prompt_sections",
+            "index_a": 0,
+            "index_b": 1,
+            "expected_a": {"start_frame": 0, "end_frame": 10},
+            "expected_b": {"start_frame": 40, "end_frame": 80},
+            # Exact previewed final ranges (frontend computes the preview)
+            "fields_a": {"start_frame": 40, "end_frame": 50},
+            "fields_b": {"start_frame": 0, "end_frame": 40},
+        }]},
+    )))
+    assert response.status == 200
+    assert len(saves) == 1
+    # Array re-sorted by start: "second" now leads, "first" follows — no
+    # stale-index intermediate state ever existed
+    assert [(s.prompt, s.start_frame, s.end_frame) for s in scene.prompt_sections] == [
+        ("second", 0, 40),
+        ("first", 40, 50),
+    ]
+
+    # Overlapping final state → 409, untouched
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "swap_prompt_sections",
+            "index_a": 0,
+            "index_b": 1,
+            "fields_a": {"start_frame": 0, "end_frame": 45},
+            "fields_b": {"start_frame": 40, "end_frame": 50},
+        }]},
+    )))
+    assert response.status == 409
+    assert _response_json(response)["code"] == "prompt_overlap"
+
+
+def test_scene_mutation_global_prompt_lock_guard(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene, _project, saves = _prompt_scene_project(monkeypatch, route_module, tmp_path, [])
+    scene.global_prompt_track_config = LaneConfig(locked=True)
+    handler = _mutation_handler(route_module)
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_scene_fields",
+            "fields": {"prompt": "new global"},
+        }]},
+    )))
+    assert response.status == 409
+    assert _response_json(response)["code"] == "track_locked"
+    assert saves == []
+    assert scene.prompt == ""
+
+    # global_prompt_track_config persists through update_lane_configs
+    scene.global_prompt_track_config = LaneConfig()
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_lane_configs",
+            "fields": {"global_prompt_track_config": {"hidden": True, "locked": False}},
+        }]},
+    )))
+    assert response.status == 200
+    assert scene.global_prompt_track_config.hidden is True
+
+
+def test_queue_route_constructor_carries_scene_prompt(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/queue",
+    )
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={
+            "scene_id": "scene-1",
+            "selection_start": 0,
+            "selection_end": 16,
+            "prompt": "global text [VISUAL]: action",
+            "scene_prompt": "global text",
+            "prompt_sections": [
+                {"start_frame": 0, "end_frame": 16,
+                 "channels": {"visual": "action", "speech": "", "sounds": ""},
+                 "prompt": "action"},
+            ],
+        },
+    )))
+    assert response.status == 200
+    job = project.generation_queue[0]
+    # The route constructor allowlist must carry the frozen global text and
+    # flag the snapshot version — not just GenerationJob.from_dict
+    assert job.scene_prompt == "global text"
+    assert job.params.get("snapshot_version") == 1
+    assert job.prompt_sections[0]["channels"]["visual"] == "action"
+    # Prompt Saver: history captured in the SAME save as the enqueue
+    assert len(saves) == 1
+    history = project.metadata.get("prompt_history")
+    assert len(history) == 1
+    assert history[0]["global"] == "global text"
+    assert history[0]["sections"][0]["channels"]["visual"] == "action"
+
+
+def test_queue_route_composes_frozen_prompt_server_side(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    # No matching scene on the project — compose must come from job fields +
+    # project metadata only (the frozen envelope is the authority)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project.metadata["prompt_section_delimiter"] = ","
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/queue",
+    )
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={
+            "scene_id": "scene-1",
+            "selection_start": 10,
+            "selection_end": 60,
+            "pre_context_frames": 5,
+            "post_context_frames": 5,
+            "prompt": "CLIENT DISPLAY VALUE",
+            "scene_prompt": "global",
+            "prompt_sections": [
+                {"start_frame": 0, "end_frame": 30,
+                 "channels": {"visual": "first", "speech": "", "sounds": ""}},
+                {"start_frame": 30, "end_frame": 80,
+                 "channels": {"visual": "second", "speech": "", "sounds": ""}},
+                # Section entirely outside the raw window [5, 65) — the
+                # window-drift pin (audit F3): just-outside is absent
+                {"start_frame": 90, "end_frame": 100,
+                 "channels": {"visual": "outside", "speech": "", "sounds": ""}},
+            ],
+        },
+    )))
+    assert response.status == 200
+    job = project.generation_queue[0]
+    # Server-side override: multi-segment compose with the project delimiter
+    # and channel-grouped labels, NOT the client display value
+    assert job.prompt == "global [VISUAL]: first, second"
+    assert job.params["prompt_section_delimiter"] == ","
+    # Legacy non-snapshot body keeps the client value
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={"scene_id": "scene-1", "selection_start": 0, "selection_end": 16,
+              "prompt": "legacy client prompt"},
+    )))
+    assert response.status == 200
+    assert project.generation_queue[1].prompt == "legacy client prompt"
+
+
+def test_queue_batch_chunks_get_differing_composed_prompts(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/queue/batch",
+    )
+    # Two chunks whose windows cross DIFFERENT sections (per-chunk freezing:
+    # each chunk's snapshot carries only its window-overlapping sections)
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={"jobs": [
+            {
+                "scene_id": "scene-1", "selection_start": 0, "selection_end": 40,
+                "batch_id": "b1", "batch_total": 2, "batch_index": 0,
+                "scene_prompt": "g",
+                "prompt_sections": [
+                    {"start_frame": 0, "end_frame": 40,
+                     "channels": {"visual": "chunk one action", "speech": "", "sounds": ""}},
+                ],
+            },
+            {
+                "scene_id": "scene-1", "selection_start": 40, "selection_end": 80,
+                "batch_id": "b1", "batch_total": 2, "batch_index": 1,
+                "scene_prompt": "g",
+                "prompt_sections": [
+                    {"start_frame": 40, "end_frame": 80,
+                     "channels": {"visual": "chunk two action", "speech": "", "sounds": ""}},
+                ],
+            },
+        ]},
+    )))
+    assert response.status == 201
+    assert len(saves) == 1
+    prompts = [job.prompt for job in project.generation_queue]
+    assert prompts == ["g [VISUAL]: chunk one action", "g [VISUAL]: chunk two action"]
+
+
+def test_queue_prompt_history_dedup_and_cap(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/queue",
+    )
+
+    def enqueue(prompt_text):
+        return asyncio.run(handler(DummyRequest(
+            match_info={"project_id": "proj"},
+            body={
+                "scene_id": "scene-1",
+                "selection_start": 0,
+                "selection_end": 16,
+                "scene_prompt": "global",
+                "prompt_sections": [
+                    {"start_frame": 0, "end_frame": 16,
+                     "channels": {"visual": prompt_text, "speech": "", "sounds": ""}},
+                ],
+            },
+        )))
+
+    # Same payload twice → one entry, ts bumped; new payload → second entry
+    enqueue("same")
+    first_ts = project.metadata["prompt_history"][0]["ts"]
+    enqueue("same")
+    assert len(project.metadata["prompt_history"]) == 1
+    assert project.metadata["prompt_history"][0]["ts"] >= first_ts
+    enqueue("different")
+    assert len(project.metadata["prompt_history"]) == 2
+
+    # Cap: newest entries survive
+    cap = route_module.PROMPT_HISTORY_CAP
+    for i in range(cap + 5):
+        enqueue(f"prompt {i}")
+    history = project.metadata["prompt_history"]
+    assert len(history) == cap
+    assert any(f"prompt {cap + 4}" in (e["sections"][0]["channels"]["visual"]) for e in history[-1:])
 
 
 def test_queue_batch_route_appends_all_jobs_with_single_save(monkeypatch, tmp_path):

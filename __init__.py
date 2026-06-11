@@ -7,6 +7,7 @@ try:
     from .nodes.io_nodes import SonderSaveBridge, SonderSaveVideo, SonderPreviewVideo
     from .nodes.bridge_nodes import SonderGuidesBridgeStart, SonderGuidesBridgeEnd
     from .nodes.metadata_collector import SonderMetadataCollector
+    from .nodes.prompt_bridge import SonderPromptRelayBridge
 
     NODE_CLASS_MAPPINGS = {
         "SonderEditor": SonderEditor,
@@ -16,6 +17,7 @@ try:
         "SonderPreviewVideo": SonderPreviewVideo,
         "SonderGuidesBridgeStart": SonderGuidesBridgeStart,
         "SonderGuidesBridgeEnd": SonderGuidesBridgeEnd,
+        "SonderPromptRelayBridge": SonderPromptRelayBridge,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
@@ -26,6 +28,7 @@ try:
         "SonderPreviewVideo": "Sonder Preview Video",
         "SonderGuidesBridgeStart": "Sonder Guides Bridge Start",
         "SonderGuidesBridgeEnd": "Sonder Guides Bridge End",
+        "SonderPromptRelayBridge": "Sonder Prompt Relay Bridge",
     }
 
     WEB_DIRECTORY = "./web"

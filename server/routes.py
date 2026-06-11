@@ -51,6 +51,7 @@ from .timeline_state import (
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
+from . import prompt_payload
 
 logger = logging.getLogger("sonder_editor")
 _TIMELINE_EXPORTS = TimelineExportManager()
@@ -568,6 +569,10 @@ def _require_lane_unlocked(scene: Scene, lane_type: str, lane_index: int | None 
         if _is_lane_config_locked(getattr(scene, "prompt_track_config", None)):
             _mutation_error("Prompt track is locked", 409, "track_locked")
         return
+    if lane_type == "prompt_global":
+        if _is_lane_config_locked(getattr(scene, "global_prompt_track_config", None)):
+            _mutation_error("Global prompt track is locked", 409, "track_locked")
+        return
     if lane_index is None:
         return
     if _is_lane_config_locked(_lane_config(scene, lane_type, lane_index)):
@@ -654,6 +659,36 @@ def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> 
     for key, current in checks.items():
         if key in expected and not _expected_matches(current, expected[key]):
             _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    if "channels" in expected:
+        expected_channels = prompt_payload.normalize_channels(expected.get("channels"))
+        if expected_channels != getattr(section, "channels", None):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+
+
+def _require_no_prompt_overlap(scene: Scene, start_frame: int, end_frame: int,
+                               ignore=None) -> None:
+    """Reject a section range that intersects another section (half-open).
+
+    `ignore` may be a PromptSection (range updates) or a set of sections
+    (swap final-state validation). Pre-existing stored overlaps are not
+    auto-mutated — the resolver's first-wins clipping covers them at read
+    time — but no NEW overlap may be created.
+    """
+    if end_frame <= start_frame:
+        _mutation_error("Prompt section range is invalid", 400, "invalid_range")
+    if isinstance(ignore, (list, tuple)):
+        ignored = list(ignore)
+    elif ignore is None:
+        ignored = []
+    else:
+        ignored = [ignore]
+    for other in scene.prompt_sections:
+        # Identity comparison only — PromptSection __eq__ is value-based and
+        # would skip a different-but-identical section.
+        if any(other is item for item in ignored):
+            continue
+        if other.start_frame < end_frame and other.end_frame > start_frame:
+            _mutation_error("Prompt sections cannot overlap", 409, "prompt_overlap")
 
 
 def _apply_scene_fields(scene: Scene, fields: dict) -> None:
@@ -664,6 +699,7 @@ def _apply_scene_fields(scene: Scene, fields: dict) -> None:
     if "duration_frames" in fields:
         scene.duration_frames = max(0, int(fields["duration_frames"]))
     if "prompt" in fields:
+        _require_lane_unlocked(scene, "prompt_global")
         scene.prompt = str(fields["prompt"])
     if "generation_params" in fields:
         scene.generation_params = fields["generation_params"] if isinstance(fields["generation_params"], dict) else {}
@@ -695,6 +731,8 @@ def _apply_lane_configs(scene: Scene, fields: dict) -> None:
         scene.guide_track_config = LaneConfig.from_dict(fields["guide_track_config"])
     if "prompt_track_config" in fields:
         scene.prompt_track_config = LaneConfig.from_dict(fields["prompt_track_config"])
+    if "global_prompt_track_config" in fields:
+        scene.global_prompt_track_config = LaneConfig.from_dict(fields["global_prompt_track_config"])
     _ensure_scene_lane_config_lengths(scene)
 
 
@@ -968,11 +1006,19 @@ def _apply_update_prompt_section(scene: Scene, index: int, fields: dict, expecte
     _require_lane_unlocked(scene, "prompt")
     section = _find_prompt_section(scene, index)
     _validate_prompt_identity(section, expected)
-    if "start_frame" in fields:
-        section.start_frame = int(fields["start_frame"])
-    if "end_frame" in fields:
-        section.end_frame = int(fields["end_frame"])
-    if "prompt" in fields:
+    range_changed = "start_frame" in fields or "end_frame" in fields
+    new_start = int(fields["start_frame"]) if "start_frame" in fields else section.start_frame
+    new_end = int(fields["end_frame"]) if "end_frame" in fields else section.end_frame
+    if range_changed:
+        # Text-only updates skip the overlap check so legacy stored overlaps
+        # stay editable; only a range change may not create a NEW overlap.
+        _require_no_prompt_overlap(scene, new_start, new_end, ignore=section)
+    section.start_frame = new_start
+    section.end_frame = new_end
+    raw_channels = fields.get("channels")
+    if isinstance(raw_channels, dict):
+        section.channels = prompt_payload.normalize_channels(raw_channels)
+    elif "prompt" in fields:
         section.prompt = str(fields["prompt"])
     scene.prompt_sections.sort(key=lambda s: s.start_frame)
     return section
@@ -987,14 +1033,57 @@ def _apply_delete_prompt_section(scene: Scene, index: int, expected: dict | None
 
 def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
     _require_lane_unlocked(scene, "prompt")
+    raw_channels = fields.get("channels")
+    start_frame = _mutation_int(fields.get("start_frame", 0), "start_frame", 0)
+    end_frame = _mutation_int(fields.get("end_frame", 0), "end_frame", 0)
+    _require_no_prompt_overlap(scene, start_frame, end_frame)
     section = PromptSection(
-        start_frame=_mutation_int(fields.get("start_frame", 0), "start_frame", 0),
-        end_frame=_mutation_int(fields.get("end_frame", 0), "end_frame", 0),
+        start_frame=start_frame,
+        end_frame=end_frame,
         prompt=str(fields.get("prompt", "") or ""),
+        channels=raw_channels if isinstance(raw_channels, dict) else None,
     )
     scene.prompt_sections.append(section)
     scene.prompt_sections.sort(key=lambda s: s.start_frame)
     return section
+
+
+def _apply_swap_prompt_sections(scene: Scene, op: dict) -> tuple:
+    """Atomically exchange two sections' ranges (threshold-swap commit).
+
+    A swap cannot be two update ops: sections are index-keyed, the array
+    re-sorts after every apply, and the overlap check would reject the
+    intermediate state. The frontend sends the exact previewed final ranges
+    for both sections (mirrors the clip-swap commit rule); only the final
+    state is validated.
+    """
+    _require_lane_unlocked(scene, "prompt")
+    index_a = _mutation_int(op.get("index_a"), "index_a")
+    index_b = _mutation_int(op.get("index_b"), "index_b")
+    if index_a == index_b:
+        _mutation_error("swap_prompt_sections requires two distinct sections", 400)
+    section_a = _find_prompt_section(scene, index_a)
+    section_b = _find_prompt_section(scene, index_b)
+    _validate_prompt_identity(section_a, op.get("expected_a"))
+    _validate_prompt_identity(section_b, op.get("expected_b"))
+
+    fields_a = op.get("fields_a") if isinstance(op.get("fields_a"), dict) else {}
+    fields_b = op.get("fields_b") if isinstance(op.get("fields_b"), dict) else {}
+    # Default (no explicit fields): exchange the two ranges verbatim.
+    a_start = int(fields_a.get("start_frame", section_b.start_frame))
+    a_end = int(fields_a.get("end_frame", section_b.end_frame))
+    b_start = int(fields_b.get("start_frame", section_a.start_frame))
+    b_end = int(fields_b.get("end_frame", section_a.end_frame))
+
+    if a_start < b_end and a_end > b_start:
+        _mutation_error("Prompt sections cannot overlap", 409, "prompt_overlap")
+    _require_no_prompt_overlap(scene, a_start, a_end, ignore=[section_a, section_b])
+    _require_no_prompt_overlap(scene, b_start, b_end, ignore=[section_a, section_b])
+
+    section_a.start_frame, section_a.end_frame = a_start, a_end
+    section_b.start_frame, section_b.end_frame = b_start, b_end
+    scene.prompt_sections.sort(key=lambda s: s.start_frame)
+    return section_a, section_b
 
 
 def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict) -> dict:
@@ -1060,6 +1149,13 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     if op_type == "create_prompt_section":
         section = _apply_create_prompt_section(scene, op.get("fields", {}))
         return {"type": op_type, "start_frame": section.start_frame, "end_frame": section.end_frame}
+    if op_type == "swap_prompt_sections":
+        section_a, section_b = _apply_swap_prompt_sections(scene, op)
+        return {
+            "type": op_type,
+            "a": {"start_frame": section_a.start_frame, "end_frame": section_a.end_frame},
+            "b": {"start_frame": section_b.start_frame, "end_frame": section_b.end_frame},
+        }
     _mutation_error(f"Unsupported mutation operation: {op_type}", 400, "unsupported_project_mutation")
 
 
@@ -1092,6 +1188,7 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         "post_context_frames",
         "guide_frame_snapshots",
         "prompt_sections",
+        "scene_prompt",
         "scene_width",
         "scene_height",
         "scene_fps",
@@ -1116,6 +1213,7 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         batch_total=int(body.get("batch_total", 0)),
         batch_index=int(body.get("batch_index", 0)),
         prompt=body.get("prompt", ""),
+        scene_prompt=str(body.get("scene_prompt", "") or ""),
         context_frames=int(body.get("context_frames", 0)),
         pre_context_frames=int(body.get("pre_context_frames", 0)),
         post_context_frames=int(body.get("post_context_frames", 0)),
@@ -1131,6 +1229,111 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         take_placement_mode=take_placement_mode,
         params=params,
     )
+
+
+PROMPT_HISTORY_CAP = 200  # conscious hard-code; revisit if projects bloat
+
+
+def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> None:
+    """Server-side frozen-prompt compose at enqueue (single source of truth).
+
+    For snapshot jobs (snapshot_version > 0) the client-sent `prompt` is a
+    best-effort display value only — override it with the authoritative
+    multi-segment compose over the job's own frozen fields. Uses ONLY job
+    fields + project metadata (no scene lookup; the frozen envelope is the
+    authority). Accepted window drift: this is the RAW context window, while
+    execution grid-snap can extend it — a section starting wholly inside the
+    snap extension is equally absent from the frozen prompt_sections, so the
+    relay payload agrees with the string.
+    """
+    params = getattr(job, "params", {}) or {}
+    if not isinstance(params, dict):
+        return
+    try:
+        snapshot_version = int(params.get("snapshot_version", 0) or 0)
+    except (TypeError, ValueError):
+        snapshot_version = 0
+    if snapshot_version <= 0:
+        return
+    metadata = getattr(project, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    labels_on = params.get(
+        "prompt_channel_labels",
+        metadata.get("prompt_channel_labels", True),
+    ) is not False
+    delimiter = str(metadata.get("prompt_section_delimiter",
+                                 prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
+    params["prompt_section_delimiter"] = delimiter  # frozen for reproducibility
+    job.params = params
+    window_start = max(0, int(getattr(job, "selection_start", 0) or 0)
+                       - int(getattr(job, "pre_context_frames", 0) or 0))
+    window_end = (int(getattr(job, "selection_end", 0) or 0)
+                  + int(getattr(job, "post_context_frames", 0) or 0))
+    job.prompt = prompt_payload.compose_range_prompt(
+        getattr(job, "scene_prompt", "") or "",
+        getattr(job, "prompt_sections", []) or [],
+        window_start, window_end,
+        labels_on=labels_on, delimiter=delimiter,
+    )
+
+
+def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
+    """Capture executed prompt material at enqueue (Prompt Saver).
+
+    Runs inside the same load/save as the queue append (no extra save). One
+    entry per distinct prompt content: sha256 over global + section
+    ranges/channels; duplicates bump `ts` instead of appending. Capped to the
+    newest PROMPT_HISTORY_CAP entries. Live non-queue runs are deliberately
+    NOT captured — execution-time project writes would fight the
+    generated-commit path.
+    """
+    import hashlib
+    from datetime import datetime as _dt
+
+    if not isinstance(getattr(project, "metadata", None), dict):
+        return
+    history = project.metadata.get("prompt_history")
+    if not isinstance(history, list):
+        history = []
+
+    for job in jobs or []:
+        sections = [
+            {
+                "start_frame": int(s.get("start_frame", 0)),
+                "end_frame": int(s.get("end_frame", 0)),
+                "channels": prompt_payload.normalize_channels(
+                    s.get("channels"), legacy_prompt=s.get("prompt", "")
+                ),
+            }
+            for s in (getattr(job, "prompt_sections", []) or [])
+            if isinstance(s, dict)
+        ]
+        global_text = str(getattr(job, "scene_prompt", "") or "")
+        if not global_text and not sections:
+            continue
+        digest = hashlib.sha256(json.dumps(
+            {"global": global_text, "sections": sections}, sort_keys=True
+        ).encode("utf-8")).hexdigest()[:16]
+        timestamp = _dt.now().isoformat()
+        existing = next((entry for entry in history
+                         if isinstance(entry, dict) and entry.get("hash") == digest), None)
+        if existing is not None:
+            existing["ts"] = timestamp
+            continue
+        history.append({
+            "hash": digest,
+            "ts": timestamp,
+            "scene_id": str(getattr(job, "scene_id", "") or ""),
+            "window": [int(getattr(job, "selection_start", 0) or 0),
+                       int(getattr(job, "selection_end", 0) or 0)],
+            "global": global_text,
+            "sections": sections,
+        })
+
+    history.sort(key=lambda entry: str(entry.get("ts", "")) if isinstance(entry, dict) else "")
+    if len(history) > PROMPT_HISTORY_CAP:
+        history = history[-PROMPT_HISTORY_CAP:]
+    project.metadata["prompt_history"] = history
 
 
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
@@ -2223,6 +2426,19 @@ def _build_dormant_summary(
             pre_context_frames=pre_context_frames,
             post_context_frames=post_context_frames,
         )
+        # Live resolved prompt over the context-expanded window (full-scene
+        # fallback lives in _build_selection_summary). Snapshot jobs carry
+        # their own frozen preview_prompt — see _dormant_queue_job_payload.
+        metadata = project.metadata if isinstance(getattr(project, "metadata", None), dict) else {}
+        labels_on = metadata.get("prompt_channel_labels", True) is not False
+        delimiter = str(metadata.get("prompt_section_delimiter",
+                                     prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
+        preview_prompt = active_scene.get_prompt_for_range(
+            selection["context_start_frame"],
+            selection["context_end_frame"],
+            labels_on=labels_on,
+            delimiter=delimiter,
+        )
         active_scene_payload = {
             "scene_id": active_scene.scene_id,
             "name": active_scene.name,
@@ -2235,6 +2451,7 @@ def _build_dormant_summary(
             "guide_count": len(active_scene.guide_frames),
             "prompt_section_count": len(active_scene.prompt_sections),
             "selection": selection,
+            "preview_prompt": preview_prompt,
         }
     else:
         active_scene_payload = None
@@ -2278,6 +2495,10 @@ def _dormant_queue_job_payload(job: GenerationJob | None) -> dict | None:
         "scene_width": int(getattr(job, "scene_width", 0) or 0),
         "scene_height": int(getattr(job, "scene_height", 0) or 0),
         "scene_fps": float(getattr(job, "scene_fps", 0.0) or 0.0),
+        # Frozen job.prompt verbatim — after the server-side enqueue compose
+        # this IS the executed slot-9 string; recomposing here would lie for
+        # pre-upgrade jobs (audit F4)
+        "preview_prompt": str(getattr(job, "prompt", "") or ""),
     }
 
 
@@ -4264,6 +4485,8 @@ if routes is not None:
         if "duration_frames" in body:
             scene.duration_frames = int(body["duration_frames"])
         if "prompt" in body:
+            if getattr(scene.global_prompt_track_config, "locked", False):
+                return _json_error("Global prompt track is locked", 409)
             scene.prompt = body["prompt"]
         if "prompt_sections" in body:
             scene.prompt_sections = [
@@ -4293,6 +4516,8 @@ if routes is not None:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
         if "prompt_track_config" in body:
             scene.prompt_track_config = LaneConfig.from_dict(body["prompt_track_config"])
+        if "global_prompt_track_config" in body:
+            scene.global_prompt_track_config = LaneConfig.from_dict(body["global_prompt_track_config"])
         if "width" in body:
             scene.width = int(body["width"])
         if "height" in body:
@@ -4561,6 +4786,80 @@ if routes is not None:
             "source": source_label,
             "guides": rows,
             "all_guide_keys": all_guide_keys,
+        })
+
+    @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-payload")
+    async def api_prompt_payload(request: web.Request) -> web.Response:
+        """Resolved prompt segments + PromptRelay payload preview for this scene.
+
+        - Snapshot-vs-live mirrors `bridge-guides`: a running snapshot_version>0
+          job for the scene wins, else live scene state with per-lane hidden
+          composition and the project-durable labels toggle.
+        - Window is the FULL scene (`[0, duration_frames)`), so this is a
+          structural preview: execution payloads rebase tags/lengths to the
+          render window and will not textually match this response.
+        """
+        try:
+            # Project load is filesystem work — keep it off the event loop.
+            project = await asyncio.to_thread(_load_project_from_request, request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene_id = request.match_info["scene_id"]
+        scene = project.get_scene(scene_id)
+        if not scene:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+
+        duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+
+        active_job = None
+        for job in getattr(project, "generation_queue", []) or []:
+            if getattr(job, "scene_id", "") != scene_id:
+                continue
+            if str(getattr(job, "status", "") or "").lower() != "running":
+                continue
+            params = getattr(job, "params", {}) or {}
+            try:
+                snap_ver = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
+            except (TypeError, ValueError):
+                snap_ver = 0
+            if snap_ver > 0:
+                active_job = job
+                break
+
+        if active_job is not None:
+            params = getattr(active_job, "params", {}) or {}
+            labels_on = params.get("prompt_channel_labels", True) is not False \
+                if isinstance(params, dict) else True
+            global_text = str(getattr(active_job, "scene_prompt", "") or "")
+            sections = list(getattr(active_job, "prompt_sections", []) or [])
+            source_label = "snapshot"
+        else:
+            metadata = getattr(project, "metadata", None)
+            labels_on = metadata.get("prompt_channel_labels", True) is not False \
+                if isinstance(metadata, dict) else True
+            global_hidden = bool(getattr(scene.global_prompt_track_config, "hidden", False))
+            sections_hidden = bool(getattr(scene.prompt_track_config, "hidden", False))
+            global_text = "" if global_hidden else (scene.prompt or "")
+            sections = [] if sections_hidden else list(scene.prompt_sections or [])
+            source_label = "live"
+
+        segments = prompt_payload.resolve_segments(sections, 0, duration, labels_on)
+        relay = prompt_payload.build_relay_payload(global_text, segments)
+        return web.json_response({
+            "window_start": 0,
+            "window_end": duration,
+            "scene_name": getattr(scene, "name", "") or scene_id,
+            "source": source_label,
+            "labels_on": labels_on,
+            "global_prompt": relay["global_prompt"],
+            "segments": relay["segments"],
+            "relay": {
+                "global_prompt": relay["global_prompt"],
+                "smart_prompt": relay["smart_prompt"],
+                "local_prompts": relay["local_prompts"],
+                "segment_lengths": relay["segment_lengths"],
+            },
         })
 
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/guides/swap")
@@ -5150,10 +5449,22 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
+        start_frame = int(body.get("start_frame", 0))
+        end_frame = int(body.get("end_frame", 0))
+        if end_frame <= start_frame:
+            return _json_error("Prompt section range is invalid", 400)
+        overlapping = any(
+            other.start_frame < end_frame and other.end_frame > start_frame
+            for other in scene.prompt_sections
+        )
+        if overlapping:
+            return _json_error("Prompt sections cannot overlap", 409)
+        raw_channels = body.get("channels")
         section = PromptSection(
-            start_frame=int(body.get("start_frame", 0)),
-            end_frame=int(body.get("end_frame", 0)),
+            start_frame=start_frame,
+            end_frame=end_frame,
             prompt=body.get("prompt", ""),
+            channels=raw_channels if isinstance(raw_channels, dict) else None,
         )
         scene.prompt_sections.append(section)
         scene.prompt_sections.sort(key=lambda s: s.start_frame)
@@ -5185,11 +5496,25 @@ if routes is not None:
             return _json_error("Invalid JSON body", 400)
 
         section = scene.prompt_sections[idx]
-        if "start_frame" in body:
-            section.start_frame = int(body["start_frame"])
-        if "end_frame" in body:
-            section.end_frame = int(body["end_frame"])
-        if "prompt" in body:
+        range_changed = "start_frame" in body or "end_frame" in body
+        new_start = int(body["start_frame"]) if "start_frame" in body else section.start_frame
+        new_end = int(body["end_frame"]) if "end_frame" in body else section.end_frame
+        if range_changed:
+            if new_end <= new_start:
+                return _json_error("Prompt section range is invalid", 400)
+            overlapping = any(
+                other is not section
+                and other.start_frame < new_end and other.end_frame > new_start
+                for other in scene.prompt_sections
+            )
+            if overlapping:
+                return _json_error("Prompt sections cannot overlap", 409)
+        section.start_frame = new_start
+        section.end_frame = new_end
+        raw_channels = body.get("channels")
+        if isinstance(raw_channels, dict):
+            section.channels = prompt_payload.normalize_channels(raw_channels)
+        elif "prompt" in body:
             section.prompt = body["prompt"]
 
         scene.prompt_sections.sort(key=lambda s: s.start_frame)
@@ -5340,7 +5665,9 @@ if routes is not None:
         def add_one() -> tuple[TimelineProject, dict]:
             project = _load_project_from_request(request)
             job = _queue_job_from_body(body)
+            _compose_frozen_job_prompt(project, job)
             project.generation_queue.append(job)
+            _record_prompt_history(project, [job])
             save_project(project)
             return project, job.to_dict()
 
@@ -5370,7 +5697,10 @@ if routes is not None:
         def add_batch() -> tuple[TimelineProject, dict]:
             project = _load_project_from_request(request)
             jobs = [_queue_job_from_body(item) for item in raw_jobs]
+            for job in jobs:
+                _compose_frozen_job_prompt(project, job)
             project.generation_queue.extend(jobs)
+            _record_prompt_history(project, jobs)
             save_project(project)
             return project, {
                 "status": "ok",

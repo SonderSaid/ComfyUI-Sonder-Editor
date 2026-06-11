@@ -678,6 +678,34 @@ def test_prompt_section_roundtrip():
     assert restored.start_frame == 0
     assert restored.end_frame == 100
     assert restored.prompt == "girl feeds dog"
+    # Legacy flat prompt seeds the visual channel
+    assert restored.channels == {"visual": "girl feeds dog", "speech": "", "sounds": ""}
+
+
+def test_prompt_section_channels_roundtrip():
+    ps = PromptSection(start_frame=5, end_frame=20,
+                       channels={"visual": "close-up", "speech": "hello", "sounds": "rain"})
+    data = ps.to_dict()
+    assert data["channels"] == {"visual": "close-up", "speech": "hello", "sounds": "rain"}
+    # Serialized prompt mirror is the label-free compose
+    assert data["prompt"] == "close-up hello rain"
+    restored = PromptSection.from_dict(data)
+    assert restored.channels == ps.channels
+    # channels wins over the prompt mirror on load
+    assert restored.prompt == "close-up hello rain"
+
+
+def test_prompt_section_legacy_write_contract():
+    # Legacy kwarg construction still works (routes + old tests construct this way)
+    ps = PromptSection(start_frame=0, end_frame=10, prompt="flat text")
+    assert ps.channels["visual"] == "flat text"
+    # Assigning .prompt replaces the whole section text: visual set, others cleared
+    ps.channels = {"visual": "v", "speech": "s", "sounds": "n"}
+    ps.prompt = "replacement"
+    assert ps.channels == {"visual": "replacement", "speech": "", "sounds": ""}
+    # Reading .prompt composes label-free
+    ps.channels = {"visual": "a", "speech": "b", "sounds": ""}
+    assert ps.prompt == "a b"
 
 
 def test_scene_with_prompt_sections():
@@ -703,56 +731,126 @@ def test_scene_with_prompt_sections():
 
 def test_scene_get_prompt_at_frame():
     scene = Scene(
-        prompt="fallback",
+        prompt="global style",
         prompt_sections=[
             PromptSection(start_frame=0, end_frame=100, prompt="section A"),
             PromptSection(start_frame=100, end_frame=200, prompt="section B"),
         ],
     )
 
-    assert scene.get_prompt_at_frame(0) == "section A"
-    assert scene.get_prompt_at_frame(50) == "section A"
-    assert scene.get_prompt_at_frame(99) == "section A"
-    assert scene.get_prompt_at_frame(100) == "section B"
-    assert scene.get_prompt_at_frame(150) == "section B"
-    # Frame outside all sections falls back to scene prompt
-    assert scene.get_prompt_at_frame(200) == "fallback"
-    assert scene.get_prompt_at_frame(999) == "fallback"
+    # Composed output: global lane text + covering section (labels on by default)
+    assert scene.get_prompt_at_frame(0) == "global style [VISUAL]: section A"
+    assert scene.get_prompt_at_frame(99) == "global style [VISUAL]: section A"
+    assert scene.get_prompt_at_frame(100) == "global style [VISUAL]: section B"
+    # Hold-until-next: the last section's tail extends past its drawn end
+    assert scene.get_prompt_at_frame(200) == "global style [VISUAL]: section B"
+    assert scene.get_prompt_at_frame(999) == "global style [VISUAL]: section B"
+    # Labels off
+    assert scene.get_prompt_at_frame(0, labels_on=False) == "global style section A"
 
 
 def test_scene_get_prompt_for_range():
     scene = Scene(
-        prompt="fallback",
+        prompt="global style",
         prompt_sections=[
             PromptSection(start_frame=0, end_frame=100, prompt="section A"),
             PromptSection(start_frame=100, end_frame=200, prompt="section B"),
         ],
     )
 
-    # Range fully within section A
-    assert scene.get_prompt_for_range(0, 100) == "section A"
-    # Range fully within section B
-    assert scene.get_prompt_for_range(100, 200) == "section B"
-    # Range overlapping both — returns first matching
-    assert scene.get_prompt_for_range(50, 150) == "section A"
-    # Range outside all sections
-    assert scene.get_prompt_for_range(200, 300) == "fallback"
-
-
-def test_hidden_prompt_track_outputs_empty_prompt():
-    scene = Scene(
-        prompt="fallback",
-        prompt_track_config=LaneConfig(hidden=True),
-        prompt_sections=[
-            PromptSection(start_frame=0, end_frame=100, prompt="section A"),
-        ],
+    assert scene.get_prompt_for_range(0, 100) == "global style [VISUAL]: section A"
+    assert scene.get_prompt_for_range(100, 200) == "global style [VISUAL]: section B"
+    # Range spanning both — ALL window segments concatenated in temporal
+    # order, joined by the section-seam delimiter (default "."). Labels are
+    # channel-grouped: one [VISUAL]: prefix, never repeated per segment.
+    assert scene.get_prompt_for_range(50, 150) == (
+        "global style [VISUAL]: section A. section B"
     )
+    assert scene.get_prompt_for_range(50, 150, delimiter=",") == (
+        "global style [VISUAL]: section A, section B"
+    )
+    # Range past the last drawn end — the last section holds (single segment)
+    assert scene.get_prompt_for_range(200, 300) == "global style [VISUAL]: section B"
 
+
+def test_scene_prompt_hidden_matrix():
+    def build():
+        return Scene(
+            prompt="global style",
+            prompt_sections=[
+                PromptSection(start_frame=0, end_frame=100, prompt="section A"),
+            ],
+        )
+
+    # Segment lane hidden → global only
+    scene = build()
+    scene.prompt_track_config = LaneConfig(hidden=True)
+    assert scene.get_prompt_at_frame(50) == "global style"
+    assert scene.get_prompt_for_range(0, 100) == "global style"
+
+    # Global lane hidden → section only
+    scene = build()
+    scene.global_prompt_track_config = LaneConfig(hidden=True)
+    assert scene.get_prompt_for_range(0, 100) == "[VISUAL]: section A"
+
+    # Both hidden → empty (matches the legacy single-track rule)
+    scene = build()
+    scene.prompt_track_config = LaneConfig(hidden=True)
+    scene.global_prompt_track_config = LaneConfig(hidden=True)
     assert scene.get_prompt_at_frame(50) == ""
     assert scene.get_prompt_for_range(0, 100) == ""
+
+
+def test_global_prompt_config_migration_seed():
+    # Pre-upgrade scene dict: hidden prompt track muted ALL prompt output.
+    # The absent global config must seed hidden from the legacy flag so
+    # slot 9 does not start re-emitting the old fallback text after upgrade.
+    legacy = Scene.from_dict({
+        "prompt": "old fallback",
+        "prompt_track_config": {"hidden": True},
+    })
+    assert legacy.global_prompt_track_config.hidden is True
+    assert legacy.get_prompt_for_range(0, 100) == ""
+
+    # Visible legacy track seeds a visible global lane
+    visible = Scene.from_dict({"prompt": "old fallback"})
+    assert visible.global_prompt_track_config.hidden is False
+    assert visible.get_prompt_for_range(0, 100) == "old fallback"
+
+    # An explicit stored global config wins over the seed
+    explicit = Scene.from_dict({
+        "prompt_track_config": {"hidden": True},
+        "global_prompt_track_config": {"hidden": False, "locked": True},
+    })
+    assert explicit.global_prompt_track_config.hidden is False
+    assert explicit.global_prompt_track_config.locked is True
 
 
 def test_scene_no_prompt_sections_uses_fallback():
     scene = Scene(prompt="the only prompt", prompt_sections=[])
     assert scene.get_prompt_at_frame(0) == "the only prompt"
     assert scene.get_prompt_for_range(0, 100) == "the only prompt"
+
+
+def test_content_hash_excludes_prompt_state():
+    # Prompts never affect rendered_frames (slot 9 is a sibling output), so
+    # prompt fields stay OUT of the render-cache hash — including the new
+    # channel + global-lane state.
+    scene = Scene(prompt="one", duration_frames=100)
+    base = scene.content_hash()
+    scene.prompt = "completely different"
+    scene.prompt_sections = [PromptSection(0, 50, channels={"visual": "x", "speech": "y", "sounds": ""})]
+    scene.prompt_track_config = LaneConfig(hidden=True)
+    scene.global_prompt_track_config = LaneConfig(hidden=True)
+    assert scene.content_hash() == base
+
+
+def test_generation_job_scene_prompt_roundtrip():
+    job = GenerationJob(scene_id="s1", prompt="composed", scene_prompt="global text")
+    data = job.to_dict()
+    assert data["scene_prompt"] == "global text"
+    restored = GenerationJob.from_dict(data)
+    assert restored.scene_prompt == "global text"
+    # Legacy job dicts without the field default to ""
+    legacy = GenerationJob.from_dict({"scene_id": "s1", "prompt": "p"})
+    assert legacy.scene_prompt == ""

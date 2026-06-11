@@ -2951,10 +2951,17 @@ export class EditorNodeController {
         const queueFps = queuePreviewActive ? Number(activeQueueJob.scene_fps) : 0;
         const queueWidth = queuePreviewActive ? parseInt(activeQueueJob.scene_width, 10) : 0;
         const queueHeight = queuePreviewActive ? parseInt(activeQueueJob.scene_height, 10) : 0;
+        // Resolved executing prompt, matching the range source: queue jobs
+        // carry their frozen prompt verbatim; live falls back to the scene
+        // payload's context-window compose
+        const previewPrompt = queuePreviewActive
+            ? String(activeQueueJob.preview_prompt ?? "")
+            : String(summary?.active_scene?.preview_prompt ?? "");
         return {
             kind: "viewport",
             label: "Viewport Preview",
             subtitle: previewSource === "queue" ? `${sourceLabel} - Queue` : sourceLabel,
+            previewPrompt,
             scene,
             assets,
             fps: Math.max(
@@ -3067,6 +3074,24 @@ export class EditorNodeController {
         `);
         subtitle.textContent = data.subtitle || "";
         header.append(title, subtitle);
+        if (data.previewPrompt) {
+            // Resolved executing prompt (frozen job prompt on queue source,
+            // live context-window compose otherwise); 2-line clamp, full
+            // text on hover
+            const promptLine = style(document.createElement("div"), `
+                color: ${CHROME.textDim};
+                font-size: 10px;
+                line-height: 1.35;
+                word-break: break-word;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+            `);
+            promptLine.textContent = data.previewPrompt;
+            promptLine.title = data.previewPrompt;
+            header.appendChild(promptLine);
+        }
         wrap.appendChild(header);
 
         const surface = style(document.createElement("div"), `

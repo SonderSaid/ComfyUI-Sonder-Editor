@@ -255,7 +255,8 @@ export function _drawTracks(host, ctx, width) {
 
                     // 3. Hide/Mute icon
                     const visibilityState = host._trackVisibilityState(entry);
-                    const isAudioLike = entry.type === TRACK_TYPE.AUDIO || entry.type === TRACK_TYPE.PROMPT;
+                    const isAudioLike = entry.type === TRACK_TYPE.AUDIO || entry.type === TRACK_TYPE.PROMPT
+                        || entry.type === TRACK_TYPE.PROMPT_GLOBAL;
                     ctx.fillStyle = visibilityState === "hidden"
                         ? COLORS.dangerText
                         : visibilityState === "partial"
@@ -269,6 +270,16 @@ export function _drawTracks(host, ctx, width) {
                         y + h / 2 + Math.round((fs ? 4 : 3) * hs)
                     );
                     curX += iconSize + Math.round(1 * hs);
+
+                    // 3b. Manage icon (☰) — fixed tracks only; opens the
+                    // guide/prompt management panel. Advance matches the
+                    // hit-test zone width exactly so glyph and zone align.
+                    if (!isLane) {
+                        ctx.fillStyle = COLORS.textMuted;
+                        ctx.font = host._canvasSansFont(iconSize - Math.round(2 * hs), 500);
+                        ctx.fillText("☰", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
+                        curX += iconSize + Math.round(1 * hs);
+                    }
 
                     // 4. Color bar
                     if (isLane && entry.color) {
@@ -842,6 +853,45 @@ export function _drawClips(host, ctx, width) {
             ctx.globalAlpha = 1.0;
         }
 
+        // Global prompt lane — one full-width non-draggable item showing the
+        // scene-global prompt text (Scene.prompt)
+        const gpi = host._globalPromptLayoutIdx();
+        if (gpi >= 0 && !host._trackLayout[gpi].collapsed) {
+            const globalY = host._trackY(gpi);
+            const globalH = host._trackH(gpi);
+            const globalHidden = !!host._trackLayout[gpi]?.hidden;
+            const gx1 = host._frameToX(0);
+            const gx2 = host._frameToX(host.totalFrames || host.activeScene.duration_frames || 0);
+            if (gx2 >= 0 && gx1 <= width) {
+                const globalText = String(host.activeScene.prompt || "");
+                const isSelected = host._isSelected("prompt_global", 0);
+                ctx.globalAlpha = globalHidden ? 0.42 : 1.0;
+                ctx.fillStyle = isSelected ? COLORS.promptSectionSelected : COLORS.promptSection;
+                ctx.fillRect(gx1 + 1, globalY + 2, gx2 - gx1 - 2, globalH - 4);
+                host._drawTimelineItemRail(ctx, gx1 + 1, globalY + 2, gx2 - gx1 - 2, globalH - 4, COLORS.lanePrompt);
+                ctx.strokeStyle = isSelected ? COLORS.accent : COLORS.promptBorder;
+                ctx.lineWidth = isSelected ? 1.5 : 1;
+                ctx.strokeRect(gx1 + 1, globalY + 2, gx2 - gx1 - 2, globalH - 4);
+                if ((gx2 - gx1) > 20) {
+                    ctx.fillStyle = COLORS.text;
+                    ctx.font = host._canvasSansFont(Math.round(9 * host._scaleTimeline), 500);
+                    ctx.textAlign = "left";
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(gx1 + 3, globalY + 2, gx2 - gx1 - 6, globalH - 4);
+                    ctx.clip();
+                    const labelText = globalText || "Global prompt (empty)";
+                    ctx.globalAlpha = (globalHidden ? 0.42 : 1.0) * (globalText ? 1.0 : 0.55);
+                    ctx.fillText(labelText, gx1 + Math.round(9 * host._scaleTimeline), globalY + globalH / 2 + Math.round(3 * host._scaleTimeline));
+                    ctx.restore();
+                }
+                ctx.globalAlpha = 1.0;
+                if (globalHidden) {
+                    host._drawMutedOverlay(ctx, gx1 + 1, globalY + 2, gx2 - gx1 - 2, globalH - 4, "Hidden");
+                }
+            }
+        }
+
         // Prompt sections
         const pi = host._promptLayoutIdx();
         if (pi >= 0 && !host._trackLayout[pi].collapsed) {
@@ -980,6 +1030,13 @@ export function _hitTestTrackHeader(host, x, rawY) {
         if (x < zoneEnd) return { layoutIdx, zone: "lock" };
         zoneEnd += iconSize + Math.round(1 * hs);
         if (x < zoneEnd) return { layoutIdx, zone: "hide" };
+        // Fixed tracks carry a 4th "manage" icon (☰) opening the respective
+        // management panel — discoverability for the guide/prompt tooling
+        if (entry.type === TRACK_TYPE.GUIDES || entry.type === TRACK_TYPE.PROMPT
+            || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
+            zoneEnd += iconSize + Math.round(1 * hs);
+            if (x < zoneEnd) return { layoutIdx, zone: "manage" };
+        }
         return { layoutIdx, zone: "label" };
     }
 
@@ -1059,8 +1116,20 @@ export function _hitTestPrompt(host, x, rawY) {
         return null;
     }
 
+export function _hitTestGlobalPrompt(host, x, rawY) {
+        if (!host.activeScene) return null;
+        const gpi = host._globalPromptLayoutIdx();
+        if (gpi < 0 || host._trackLayout[gpi].collapsed || host._layoutIndexFromRawY(rawY) !== gpi) return null;
+        const x1 = host._frameToX(0);
+        const x2 = host._frameToX(host.totalFrames || host.activeScene.duration_frames || 0);
+        if (x >= x1 && x <= x2) {
+            return { type: "prompt_global", id: 0, data: { prompt: host.activeScene.prompt || "" } };
+        }
+        return null;
+    }
+
 export function _hitTestItem(host, x, rawY) {
-        return host._hitTestClip(x, rawY) || host._hitTestAudio(x, rawY) || host._hitTestGuide(x, rawY) || host._hitTestPrompt(x, rawY);
+        return host._hitTestClip(x, rawY) || host._hitTestAudio(x, rawY) || host._hitTestGuide(x, rawY) || host._hitTestPrompt(x, rawY) || host._hitTestGlobalPrompt(x, rawY);
     }
 
 export function _hitTestEdge(host, x, rawY) {

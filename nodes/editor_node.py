@@ -802,12 +802,24 @@ class SonderEditor:
                 strengths_str = ""
 
             # --- Get prompt for render range ---
+            # Channel-label + delimiter composition honors the project-durable
+            # knobs; queued jobs use their frozen composed prompt instead.
+            prompt_labels_on = True
+            prompt_delimiter = "."
+            proj_metadata = getattr(proj, "metadata", None)
+            if isinstance(proj_metadata, dict):
+                prompt_labels_on = proj_metadata.get("prompt_channel_labels", True) is not False
+                prompt_delimiter = str(proj_metadata.get("prompt_section_delimiter", ".") or "")
             if queue_job:
                 prompt_text = getattr(queue_job, "prompt", "")
                 if snapshot_version <= 0 and not prompt_text:
-                    prompt_text = scene.get_prompt_for_range(render_start, render_end)
+                    prompt_text = scene.get_prompt_for_range(
+                        render_start, render_end,
+                        labels_on=prompt_labels_on, delimiter=prompt_delimiter)
             else:
-                prompt_text = scene.get_prompt_for_range(render_start, render_end)
+                prompt_text = scene.get_prompt_for_range(
+                    render_start, render_end,
+                    labels_on=prompt_labels_on, delimiter=prompt_delimiter)
 
             # --- Load audio from scene's audio tracks for the render range ---
             audio = self._load_scene_audio(proj, scene, render_start, render_end)
@@ -842,7 +854,13 @@ class SonderEditor:
                 "frame_count_padding": frame_count_padding,
                 "take_placement_mode": take_placement_mode,
                 "prompt": prompt_text,
+                # Consume-only completion handle for save nodes — do NOT set on peek
                 "queue_job_id": queue_job.job_id if queue_job and queue_job_consumed else "",
+                # Snapshot reference for read-only consumers (prompt relay bridge):
+                # set on BOTH peek and consume. Peek runs (queue-active, no Sonder
+                # terminal save) are the mainline relay workflow; keying off the
+                # consume-only handle would silently resolve LIVE prompt state.
+                "queue_job_ref_id": queue_job.job_id if queue_job else "",
                 "base_modified_at": execution_base_modified_at,
             }
             logger.info(

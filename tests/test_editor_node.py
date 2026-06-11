@@ -97,7 +97,7 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"prompt:{start_frame}-{end_frame}"
 
     class DummyProject:
@@ -165,7 +165,7 @@ class _FrameConstraintScene:
     guide_frames = []
 
     @staticmethod
-    def get_prompt_for_range(start_frame, end_frame):
+    def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
         return f"prompt:{start_frame}-{end_frame}"
 
 
@@ -1221,7 +1221,7 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1306,6 +1306,8 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
     assert result[14] == pytest.approx(4 / 24.0)
     assert result[15] == pytest.approx(24 / 24.0)
     assert project._execution_context["queue_job_id"] == ""
+    # Snapshot reference for read-only consumers (prompt relay bridge) IS set on peek
+    assert project._execution_context["queue_job_ref_id"] == "job-1"
     assert project._execution_context["take_placement_mode"] == "untrimmed"
 
 
@@ -1327,7 +1329,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1428,6 +1430,8 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     assert result[14] == pytest.approx(4 / 30.0)
     assert result[15] == pytest.approx(24 / 30.0)
     assert project._execution_context["queue_job_id"] == "job-1"
+    # Consume also carries the read-only snapshot reference
+    assert project._execution_context["queue_job_ref_id"] == "job-1"
     assert project._execution_context["take_placement_mode"] == "untrimmed"
 
 
@@ -1445,7 +1449,7 @@ def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1539,7 +1543,7 @@ def test_unmarked_save_with_active_queue_peeks_without_completion(tmp_path, monk
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1633,7 +1637,7 @@ def test_render_queue_inactive_ignores_terminal_save_queue(tmp_path, monkeypatch
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1804,7 +1808,7 @@ def test_no_active_queue_runs_full_scene(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     class DummyProject:
@@ -1876,7 +1880,7 @@ def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -2319,7 +2323,7 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(

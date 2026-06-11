@@ -1097,6 +1097,67 @@ function showSettingsPanel() {
         }
     );
 
+    const promptsSection = createSection(
+        "Prompts",
+        "Prompt lane behavior. The first two controls are PROJECT-WIDE and change the text sent to the model; the rest are browser-local preferences."
+    );
+    // — Project-wide (host-owned versioned project PUTs, not settings writes).
+    //   syncSettingsPanelControls only syncs settings-backed controls, so
+    //   these two read host getters directly at build time.
+    createCheckbox(
+        promptsSection,
+        "promptChannelLabels",
+        "Channel Labels (project-wide)",
+        "Prefix channels as [VISUAL]: / [SPEECH]: / [SOUNDS]: in composed prompt output. Saved into the project.",
+        () => this._promptChannelLabels !== false,
+        (checked) => {
+            Promise.resolve(this._togglePromptChannelLabels(checked)).catch(() => {});
+        }
+    );
+    {
+        const delimiterControls = createRow(
+            promptsSection,
+            "Section Delimiter (project-wide)",
+            "Seam inserted between prompt sections in the composed output (default \".\"). Empty = plain space. Saved into the project."
+        );
+        const delimiterInput = document.createElement("input");
+        delimiterInput.type = "text";
+        delimiterInput.maxLength = 8;
+        delimiterInput.value = String(this._promptSectionDelimiter ?? ".");
+        delimiterInput.style.cssText = chromeInputCss({ width: "72px", textAlign: "center" });
+        const commitDelimiter = () => {
+            Promise.resolve(this._setPromptSectionDelimiter(delimiterInput.value))
+                .then(() => { delimiterInput.value = String(this._promptSectionDelimiter ?? "."); })
+                .catch(() => { delimiterInput.value = String(this._promptSectionDelimiter ?? "."); });
+        };
+        delimiterInput.addEventListener("change", commitDelimiter);
+        delimiterInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") commitDelimiter();
+            e.stopPropagation();
+        });
+        delimiterControls.appendChild(delimiterInput);
+    }
+    // — Browser-local preferences
+    createCheckbox(
+        promptsSection,
+        "queueSectionBatch",
+        "Queue Sections as Batch",
+        "On: Queue Prompt Section auto-chunks past the batch budget. Off: one job for the whole range.",
+        () => this._settings.prompts?.queueSectionBatch !== false,
+        (checked) => updateCategory("prompts", "queueSectionBatch", checked)
+    );
+    createCheckbox(
+        promptsSection,
+        "promptHoverPreviewEnabled",
+        "Prompt Hover Preview",
+        "Show the full composed prompt text when hovering sections or the global item on the timeline.",
+        () => this._settings.prompts?.hoverPreviewEnabled !== false,
+        (checked) => {
+            updateCategory("prompts", "hoverPreviewEnabled", checked);
+            if (!checked) this._hidePromptHoverPreview();
+        }
+    );
+
     const appearanceSection = createSection(
         "Appearance",
         "Non-destructive visual preferences for timeline readability."

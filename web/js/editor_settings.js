@@ -207,6 +207,16 @@ export const DEFAULT_EDITOR_SETTINGS = {
     modelTemplates: {
         customTemplates: [],
     },
+    promptTemplates: [],
+    prompts: {
+        queueSectionBatch: true,
+        hoverPreviewEnabled: true,
+        panelMode: "structured",
+        panelChannelBoxHeight: 0,
+        panelGlobalBoxHeight: 0,
+        panelDraftBoxHeight: 0,
+        writingDraftByProjectScene: {},
+    },
     projectDefaults: {
         fps: 24,
         width: 768,
@@ -399,6 +409,87 @@ function normalizeCustomTemplates(templates) {
         }
         usedIds.add(template.id);
         normalized.push(template);
+    }
+    return normalized;
+}
+
+// Writing-mode drafts: authoring scratch keyed `project::scene`. Unknown keys
+// pass through untouched (same policy as activeSelectionByProjectScene);
+// dirty flags must survive cross-tab re-normalization. LRU by `ts`, capped.
+// NOTE: defined ABOVE the eager normalizeEditorSettings init (TDZ trap).
+const WRITING_DRAFT_MAP_CAP = 40;
+const WRITING_DRAFT_TEXT_CAP = 20000;
+
+function normalizeWritingDrafts(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const entries = [];
+    for (const [key, value] of Object.entries(raw)) {
+        if (!value || typeof value !== "object") continue;
+        entries.push([key, {
+            ts: Number(value.ts) || 0,
+            draft: String(value.draft ?? "").slice(0, WRITING_DRAFT_TEXT_CAP),
+            allocations: Array.isArray(value.allocations)
+                ? value.allocations.map((a) => ({
+                    length: Math.max(0, parseInt(a?.length, 10) || 0),
+                    dirty: !!a?.dirty,
+                }))
+                : [],
+        }]);
+    }
+    entries.sort((a, b) => a[1].ts - b[1].ts);
+    return Object.fromEntries(entries.slice(-WRITING_DRAFT_MAP_CAP));
+}
+
+function normalizePromptsSettings(stored, defaults) {
+    const raw = stored && typeof stored === "object" ? stored : {};
+    const clampHeight = (value) => {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n) || n <= 0) return 0;
+        return Math.max(40, Math.min(800, n));
+    };
+    return {
+        queueSectionBatch: raw.queueSectionBatch == null ? defaults.queueSectionBatch : !!raw.queueSectionBatch,
+        hoverPreviewEnabled: raw.hoverPreviewEnabled == null ? defaults.hoverPreviewEnabled : !!raw.hoverPreviewEnabled,
+        panelMode: raw.panelMode === "writing" ? "writing" : "structured",
+        panelChannelBoxHeight: clampHeight(raw.panelChannelBoxHeight),
+        panelGlobalBoxHeight: clampHeight(raw.panelGlobalBoxHeight),
+        panelDraftBoxHeight: clampHeight(raw.panelDraftBoxHeight),
+        writingDraftByProjectScene: normalizeWritingDrafts(raw.writingDraftByProjectScene),
+    };
+}
+
+// Prompt templates: browser-local reusable prompt setups (global text +
+// channel-bearing sections). Applying a template materializes concrete text
+// into scene state, so project truth never depends on this library.
+// NOTE: defined ABOVE the eager normalizeEditorSettings init (TDZ trap —
+// durable_rules.md > Technical Traps).
+function normalizePromptTemplates(templates) {
+    if (!Array.isArray(templates)) return [];
+    const normalized = [];
+    for (let index = 0; index < templates.length; index += 1) {
+        const raw = templates[index];
+        if (!raw || typeof raw !== "object") continue;
+        const name = String(raw.name || "").trim();
+        if (!name) continue;
+        const sections = Array.isArray(raw.sections)
+            ? raw.sections
+                .filter((s) => s && typeof s === "object")
+                .map((s) => ({
+                    start_frame: Math.max(0, parseInt(s.start_frame, 10) || 0),
+                    end_frame: Math.max(0, parseInt(s.end_frame, 10) || 0),
+                    channels: {
+                        visual: String(s.channels?.visual ?? s.prompt ?? ""),
+                        speech: String(s.channels?.speech ?? ""),
+                        sounds: String(s.channels?.sounds ?? ""),
+                    },
+                }))
+            : [];
+        normalized.push({
+            id: String(raw.id || `prompt-template-${index}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`),
+            name,
+            global: String(raw.global ?? ""),
+            sections,
+        });
     }
     return normalized;
 }
@@ -766,6 +857,8 @@ function normalizeEditorSettings(source = null) {
         modelTemplates: {
             customTemplates,
         },
+        promptTemplates: normalizePromptTemplates(stored?.promptTemplates),
+        prompts: normalizePromptsSettings(stored?.prompts, defaults.prompts),
         projectDefaults: {
             fps: clampNumber(stored?.projectDefaults?.fps, 1, 240, defaults.projectDefaults.fps),
             width: clampNumber(stored?.projectDefaults?.width, 64, 8192, defaults.projectDefaults.width, true),

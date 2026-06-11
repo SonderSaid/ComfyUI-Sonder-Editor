@@ -5,6 +5,8 @@ from datetime import datetime
 import os
 from typing import Any
 
+from . import prompt_payload
+
 logger = logging.getLogger("sonder_editor")
 
 
@@ -283,26 +285,65 @@ class LaneConfig:
 # Scene — a composition segment (e.g., "dog eating", "bridge shot")
 # ---------------------------------------------------------------------------
 
-@dataclass
 class PromptSection:
-    """A prompt assigned to a range of frames within a scene."""
-    start_frame: int = 0
-    end_frame: int = 0
-    prompt: str = ""
+    """A prompt assigned to a range of frames within a scene.
+
+    `channels` ({visual, speech, sounds}) is the source of truth. The legacy
+    flat `prompt` stays as a compatibility surface: constructing with
+    `prompt=...` seeds the visual channel, assigning `.prompt` replaces the
+    whole section text (visual = value, speech/sounds cleared), and reading
+    `.prompt` composes label-free. Bracket labels are applied only at the
+    composition points (slot 9 / snapshot freeze / bridge payload), never
+    stored here.
+    """
+
+    def __init__(self, start_frame: int = 0, end_frame: int = 0,
+                 prompt: str = "", channels: dict | None = None):
+        self.start_frame = start_frame
+        self.end_frame = end_frame
+        if isinstance(channels, dict):
+            self.channels = prompt_payload.normalize_channels(channels)
+        else:
+            self.channels = prompt_payload.normalize_channels(None, legacy_prompt=prompt)
+
+    @property
+    def prompt(self) -> str:
+        return prompt_payload.compose_section_text(self.channels, labels_on=False)
+
+    @prompt.setter
+    def prompt(self, value):
+        self.channels = prompt_payload.normalize_channels(None, legacy_prompt=value)
+
+    def __eq__(self, other):
+        if not isinstance(other, PromptSection):
+            return NotImplemented
+        return (self.start_frame == other.start_frame
+                and self.end_frame == other.end_frame
+                and self.channels == other.channels)
+
+    def __repr__(self):
+        return (f"PromptSection(start_frame={self.start_frame}, "
+                f"end_frame={self.end_frame}, channels={self.channels!r})")
 
     def to_dict(self) -> dict:
         return {
             "start_frame": self.start_frame,
             "end_frame": self.end_frame,
+            "channels": dict(self.channels),
+            # Label-free composed mirror for older readers / downgrades.
             "prompt": self.prompt,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "PromptSection":
+        if not isinstance(data, dict):
+            data = {}
+        raw_channels = data.get("channels")
         return cls(
             start_frame=data.get("start_frame", 0),
             end_frame=data.get("end_frame", 0),
             prompt=data.get("prompt", ""),
+            channels=raw_channels if isinstance(raw_channels, dict) else None,
         )
 
 
@@ -313,7 +354,7 @@ class Scene:
     name: str = "Untitled Scene"
     order: int = 0                          # position in the main composition
     duration_frames: int = 0                # desired total length (0 = empty/placeholder)
-    prompt: str = ""                        # fallback prompt when no sections defined
+    prompt: str = ""                        # scene-global prompt (always-on; also the fallback when no sections exist)
     prompt_sections: list = field(default_factory=list)  # list[PromptSection]
     generation_params: dict = field(default_factory=dict)  # seed, cfg, sampler, model, etc.
     batch_config: BatchConfig = field(default_factory=BatchConfig)
@@ -330,6 +371,7 @@ class Scene:
     audio_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     guide_track_config: LaneConfig = field(default_factory=LaneConfig)
     prompt_track_config: LaneConfig = field(default_factory=LaneConfig)
+    global_prompt_track_config: LaneConfig = field(default_factory=LaneConfig)
     width: int = 0                              # 0 = inherit from project
     height: int = 0                             # 0 = inherit from project
     fps: float = 0.0                            # 0 = inherit from project
@@ -380,25 +422,30 @@ class Scene:
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
-    def get_prompt_at_frame(self, frame: int) -> str:
-        """Return the prompt for a given frame. Falls back to scene-level prompt."""
-        if getattr(self.prompt_track_config, "hidden", False):
-            return ""
-        for section in self.prompt_sections:
-            if section.start_frame <= frame < section.end_frame:
-                return section.prompt
-        return self.prompt
+    def get_prompt_at_frame(self, frame: int, labels_on: bool = True,
+                            delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER) -> str:
+        """Composed prompt (global + covering section) for a single frame."""
+        return self.get_prompt_for_range(frame, frame + 1, labels_on=labels_on,
+                                         delimiter=delimiter)
 
-    def get_prompt_for_range(self, start: int, end: int) -> str:
-        """Return the prompt covering a frame range. Uses first matching section."""
-        if getattr(self.prompt_track_config, "hidden", False):
-            return ""
-        for section in self.prompt_sections:
-            if section.start_frame <= start and section.end_frame >= end:
-                return section.prompt
-            if section.start_frame < end and section.end_frame > start:
-                return section.prompt
-        return self.prompt
+    def get_prompt_for_range(self, start: int, end: int, labels_on: bool = True,
+                             delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER) -> str:
+        """Composed single-string prompt for a frame range.
+
+        Global lane text + ALL segments overlapping the window in temporal
+        order, joined by the section-seam delimiter (sections hold until the
+        next section starts; the first also covers anything before it).
+        Per-lane hidden semantics: global hidden zeroes the global part,
+        segment lane hidden zeroes the section part, both hidden yields "".
+        """
+        global_hidden = getattr(self.global_prompt_track_config, "hidden", False)
+        sections_hidden = getattr(self.prompt_track_config, "hidden", False)
+        global_text = "" if global_hidden else (self.prompt or "")
+        sections = [] if sections_hidden else self.prompt_sections
+        return prompt_payload.compose_range_prompt(
+            global_text, sections, start, end,
+            labels_on=labels_on, delimiter=delimiter,
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -423,6 +470,7 @@ class Scene:
             "audio_lane_configs": [c.to_dict() for c in self.audio_lane_configs],
             "guide_track_config": self.guide_track_config.to_dict(),
             "prompt_track_config": self.prompt_track_config.to_dict(),
+            "global_prompt_track_config": self.global_prompt_track_config.to_dict(),
             "width": self.width,
             "height": self.height,
             "fps": self.fps,
@@ -496,6 +544,17 @@ class Scene:
             scene.audio_lane_configs.append(LaneConfig())
         scene.guide_track_config = LaneConfig.from_dict(data.get("guide_track_config", {}))
         scene.prompt_track_config = LaneConfig.from_dict(data.get("prompt_track_config", {}))
+        raw_global_config = data.get("global_prompt_track_config")
+        if isinstance(raw_global_config, dict):
+            scene.global_prompt_track_config = LaneConfig.from_dict(raw_global_config)
+        else:
+            # Migration seed: the legacy single prompt track's hidden flag muted
+            # ALL prompt output including the fallback text. A pre-upgrade
+            # hidden prompt track must not start re-emitting the old fallback
+            # on slot 9 after the lane split.
+            scene.global_prompt_track_config = LaneConfig(
+                hidden=scene.prompt_track_config.hidden
+            )
         return scene
 
 
@@ -652,6 +711,7 @@ class GenerationJob:
     selection_start: int = 0
     selection_end: int = 0
     prompt: str = ""
+    scene_prompt: str = ""                  # frozen global lane text ("" when global hidden at enqueue)
     scene_name: str = ""
     context_frames: int = 0
     pre_context_frames: int = 0
@@ -686,6 +746,7 @@ class GenerationJob:
             "selection_start": self.selection_start,
             "selection_end": self.selection_end,
             "prompt": self.prompt,
+            "scene_prompt": self.scene_prompt,
             "scene_name": self.scene_name,
             "context_frames": self.context_frames,
             "pre_context_frames": self.pre_context_frames,
@@ -727,6 +788,7 @@ class GenerationJob:
             selection_start=data.get("selection_start", 0),
             selection_end=data.get("selection_end", 0),
             prompt=data.get("prompt", ""),
+            scene_prompt=data.get("scene_prompt", ""),
             scene_name=data.get("scene_name", ""),
             context_frames=legacy_context,
             pre_context_frames=pre_context,

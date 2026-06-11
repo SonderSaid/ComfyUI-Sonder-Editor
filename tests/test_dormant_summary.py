@@ -162,6 +162,7 @@ def test_build_dormant_summary_reports_counts_and_effective_scene_values():
         "scene_width": 1280,
         "scene_height": 720,
         "scene_fps": 24.0,
+        "preview_prompt": "",
     }
 
     active = summary["active_scene"]
@@ -207,3 +208,47 @@ def test_build_dormant_summary_ignores_completed_and_failed_queue_jobs():
     summary = _build_dormant_summary(project, scene_id="scene-1")
 
     assert summary["active_queue_job"] is None
+
+
+def test_dormant_queue_job_preview_prompt_is_frozen_verbatim():
+    # Snapshot jobs carry their frozen prompt VERBATIM — after the server-side
+    # enqueue compose this IS the executed slot-9 string; recomposing here
+    # would lie for pre-upgrade jobs (audit F4)
+    project = _make_project()
+    project.generation_queue[1].prompt = "frozen executed string"
+
+    summary = _build_dormant_summary(project, scene_id="scene-1")
+
+    assert summary["active_queue_job"]["preview_prompt"] == "frozen executed string"
+
+
+def test_dormant_live_preview_prompt_over_context_window():
+    project = _make_project()
+    project.metadata["prompt_section_delimiter"] = ","
+    scene = project.scenes[0]
+    scene.prompt = "global"
+    scene.prompt_sections = [
+        PromptSection(start_frame=0, end_frame=40, prompt="first"),
+        PromptSection(start_frame=40, end_frame=120, prompt="second"),
+    ]
+
+    # Selection 30-50 with pre/post 10 → context window [20, 60) spans both
+    summary = _build_dormant_summary(
+        project, scene_id="scene-1",
+        selection_start=30, selection_end=50,
+        pre_context_frames=10, post_context_frames=10,
+    )
+    assert summary["active_scene"]["preview_prompt"] == (
+        "global [VISUAL]: first, second"
+    )
+
+    # Empty selection params → full-scene fallback compose
+    summary = _build_dormant_summary(project, scene_id="scene-1")
+    assert summary["active_scene"]["preview_prompt"] == (
+        "global [VISUAL]: first, second"
+    )
+
+    # Hidden lanes are honored on the live branch
+    scene.prompt_track_config.hidden = True
+    summary = _build_dormant_summary(project, scene_id="scene-1")
+    assert summary["active_scene"]["preview_prompt"] == "global"

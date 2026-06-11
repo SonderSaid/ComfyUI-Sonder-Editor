@@ -134,9 +134,11 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
+import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
 import { mountSharedRenderQueue, queueBatchIds } from "./shared_render_queue.js";
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
 import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
+import { mountPromptManagementPanel } from "./editor_prompt_panel.js";
 import * as TimelineCanvas from "./editor_timeline_canvas.js";
 import { RULER_HEIGHT, TIMELINE_HEIGHT, TRACK_TYPE } from "./editor_timeline_constants.js";
 import { createViewportSurface } from "./viewport_surface.js";
@@ -2075,10 +2077,13 @@ export class EditorWidget {
 
     _applyLocalPromptCreate(fields = {}) {
         if (!this.activeScene) return null;
+        const channels = normalizeChannels(fields.channels, fields.prompt || "");
         const section = {
             start_frame: parseInt(fields.start_frame, 10) || 0,
             end_frame: parseInt(fields.end_frame, 10) || 0,
-            prompt: String(fields.prompt || ""),
+            channels,
+            // Label-free composed mirror, matching backend to_dict
+            prompt: composeSectionText(channels, false),
         };
         this.activeScene.prompt_sections = this.activeScene.prompt_sections || [];
         this.activeScene.prompt_sections.push(section);
@@ -2090,7 +2095,15 @@ export class EditorWidget {
         if (!this.activeScene) return null;
         const section = (this.activeScene.prompt_sections || [])[index];
         if (!section) return null;
-        Object.assign(section, fields);
+        const { channels, prompt, ...rest } = fields || {};
+        Object.assign(section, rest);
+        if (channels && typeof channels === "object") {
+            section.channels = normalizeChannels(channels);
+            section.prompt = composeSectionText(section.channels, false);
+        } else if (prompt !== undefined) {
+            section.channels = normalizeChannels(null, prompt);
+            section.prompt = composeSectionText(section.channels, false);
+        }
         this.activeScene.prompt_sections.sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
         return section;
     }
@@ -3100,7 +3113,8 @@ export class EditorWidget {
     }
 
     _isHeaderControllableTrackType(type) {
-        return this._isLaneTrackType(type) || type === TRACK_TYPE.GUIDES || type === TRACK_TYPE.PROMPT;
+        return this._isLaneTrackType(type) || type === TRACK_TYPE.GUIDES
+            || type === TRACK_TYPE.PROMPT || type === TRACK_TYPE.PROMPT_GLOBAL;
     }
 
     _defaultLaneConfig(overrides = {}) {
@@ -3110,6 +3124,7 @@ export class EditorWidget {
     _trackConfigForFixedType(type) {
         if (type === TRACK_TYPE.GUIDES) return this.activeScene?.guide_track_config || this._defaultLaneConfig();
         if (type === TRACK_TYPE.PROMPT) return this.activeScene?.prompt_track_config || this._defaultLaneConfig();
+        if (type === TRACK_TYPE.PROMPT_GLOBAL) return this.activeScene?.global_prompt_track_config || this._defaultLaneConfig();
         return this._defaultLaneConfig();
     }
 
@@ -3133,7 +3148,7 @@ export class EditorWidget {
     _trackVisibilityState(entry) {
         if (!entry) return "visible";
         const items = this._trackItemsForEntry(entry);
-        if (entry.type === TRACK_TYPE.PROMPT) {
+        if (entry.type === TRACK_TYPE.PROMPT || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
             return entry.hidden ? "hidden" : "visible";
         }
         const mutedCount = items.filter((item) => !!item.muted).length;
@@ -3167,12 +3182,23 @@ export class EditorWidget {
         return idx >= 0 && !!this._trackLayout[idx]?.hidden;
     }
 
+    _isGlobalPromptTrackLocked() {
+        const idx = this._globalPromptLayoutIdx();
+        return idx >= 0 && !!this._trackLayout[idx]?.locked;
+    }
+
+    _isGlobalPromptTrackHidden() {
+        const idx = this._globalPromptLayoutIdx();
+        return idx >= 0 && !!this._trackLayout[idx]?.hidden;
+    }
+
     _isItemLocked(item) {
         if (!item) return false;
         if (item.type === "clip") return this._isLaneLocked(this._clipTrackType(item.data), item.data.track_index || 0);
         if (item.type === "audio") return this._isLaneLocked(TRACK_TYPE.AUDIO, item.data.lane_index || 0);
         if (item.type === "guide") return this._isGuideTrackLocked();
         if (item.type === "prompt") return this._isPromptTrackLocked();
+        if (item.type === "prompt_global") return this._isGlobalPromptTrackLocked();
         return false;
     }
 
@@ -3302,6 +3328,17 @@ export class EditorWidget {
             locked: !!guideCfg.locked,
             hidden: !!guideCfg.hidden,
         });
+        const globalPromptCfg = this._trackConfigForFixedType(TRACK_TYPE.PROMPT_GLOBAL);
+        layout.push({
+            type: TRACK_TYPE.PROMPT_GLOBAL,
+            label: "Global",
+            customName: "",
+            laneIndex: 0,
+            collapsed: isStored ? storedCollapsed.has(TRACK_TYPE.PROMPT_GLOBAL + ":0") : false,
+            color: "",
+            locked: !!globalPromptCfg.locked,
+            hidden: !!globalPromptCfg.hidden,
+        });
         const promptCfg = this._trackConfigForFixedType(TRACK_TYPE.PROMPT);
         layout.push({
             type: TRACK_TYPE.PROMPT,
@@ -3347,6 +3384,11 @@ export class EditorWidget {
     /** Find layout index for prompt */
     _promptLayoutIdx() {
         return this._trackLayout.findIndex(e => e.type === TRACK_TYPE.PROMPT);
+    }
+
+    /** Find layout index for the global prompt lane */
+    _globalPromptLayoutIdx() {
+        return this._trackLayout.findIndex(e => e.type === TRACK_TYPE.PROMPT_GLOBAL);
     }
 
     _trackY(layoutIdx) {
@@ -3735,7 +3777,14 @@ export class EditorWidget {
             _trashRetentionDays: (...args) => editor._trashRetentionDays(...args),
             _guideHoverPreviewSize: () => editor._guideHoverPreviewSize(),
             _hideGuideHoverPreview: () => editor._hideGuideHoverPreview(),
+            _hidePromptHoverPreview: () => editor._hidePromptHoverPreview(),
             _deleteCustomModelTemplate: (templateId) => editor._deleteCustomModelTemplate(templateId),
+            // Prompts section — project-wide knobs are host-owned versioned
+            // project PUTs (not settings writes); getters back their sync
+            get _promptChannelLabels() { return editor._promptChannelLabels; },
+            get _promptSectionDelimiter() { return editor._promptSectionDelimiter; },
+            _togglePromptChannelLabels: (on) => editor._togglePromptChannelLabels(on),
+            _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
             _keyboardConsumerId: (suffix) => editor._keyboardConsumerId(suffix),
             _hideSettingsPanel: () => editor._hideSettingsPanel(),
         };
@@ -4013,6 +4062,10 @@ export class EditorWidget {
         return TimelineCanvas._hitTestGuide(this, x, rawY);
     }
 
+    _hitTestGlobalPrompt(x, rawY) {
+        return TimelineCanvas._hitTestGlobalPrompt(this, x, rawY);
+    }
+
     _hitTestPrompt(x, rawY) {
         return TimelineCanvas._hitTestPrompt(this, x, rawY);
     }
@@ -4251,6 +4304,13 @@ export class EditorWidget {
                         this._pushUndo("toggle track visibility");
                         void this._toggleHeaderVisibility(entry);
                         break;
+                    case "manage":
+                        if (entry.type === TRACK_TYPE.GUIDES) {
+                            this._showGuideManagementPopup(e.clientX, e.clientY);
+                        } else if (entry.type === TRACK_TYPE.PROMPT || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
+                            this._showPromptManagementPanel();
+                        }
+                        break;
                 }
                 this._renderTimeline();
                 this._renderViewportFrame();
@@ -4300,6 +4360,15 @@ export class EditorWidget {
 
                     // Check if clicking on a timeline item
                     const hit = this._hitTestItem(x, rawY);
+                    if (hit && hit.type === "prompt_global") {
+                        // Global prompt lane: one non-draggable full-width item.
+                        // Single click is a no-op (matching section semantics);
+                        // double-click opens the inline editor.
+                        this._clearSelection();
+                        this._hideItemEditor();
+                        this._renderTimeline();
+                        return;
+                    }
                     if (hit) {
                         if (e.ctrlKey || e.metaKey) {
                             // Ctrl+click = toggle item in selection
@@ -4359,6 +4428,16 @@ export class EditorWidget {
                             this._origAllAudioStarts[a.track_id] = a.timeline_start_frame || 0;
                             this._origAllAudioEnds[a.track_id] = a.timeline_end_frame || 0;
                         }
+                        // Snapshot ALL prompt section ranges (by object reference —
+                        // indices are unstable identity) for no-overlap hold-preview
+                        // restore and swap commit `expected` ranges.
+                        this._origAllPromptRanges = (this.activeScene?.prompt_sections || []).map((s) => ({
+                            data: s,
+                            start: s.start_frame || 0,
+                            end: s.end_frame || 0,
+                        }));
+                        this._dragPromptSwap = null;
+                        this._dragPromptHold = null;
                     } else {
                         // Click on empty space — deselect all
                         this._clearSelection();
@@ -4379,6 +4458,14 @@ export class EditorWidget {
                 } else {
                     this._hideGuideHoverPreview();
                 }
+                // Prompt hover preview (sections + global item) mirrors guides
+                const promptHoverHit = guideHit ? null
+                    : (this._hitTestPrompt(x, rawY) || this._hitTestGlobalPrompt(x, rawY));
+                if (promptHoverHit) {
+                    this._showPromptHoverPreview(promptHoverHit, e.clientX, e.clientY);
+                } else {
+                    this._hidePromptHoverPreview();
+                }
                 // Update cursor based on position
                 if (this._hitTestHeaderEdge(x, y)) {
                     canvas.style.cursor = "col-resize";
@@ -4394,6 +4481,7 @@ export class EditorWidget {
                 return;
             }
             this._hideGuideHoverPreview();
+            this._hidePromptHoverPreview();
 
             // Header resize drag
             if (this.dragType === "headerResize") {
@@ -4422,11 +4510,23 @@ export class EditorWidget {
                 const item = this._trimItem;
 
                 if (item.type === "prompt") {
-                    // Prompts have no source media — just resize freely
+                    // Prompts have no source media — resize freely but clamp to
+                    // neighbor boundaries (no-overlap invariant; backend 409 is
+                    // the safety net for races)
+                    const otherSections = (this.activeScene?.prompt_sections || [])
+                        .filter((s) => s !== item.data);
                     if (item.edge === "left") {
-                        item.data.start_frame = Math.max(0, Math.min(item.origEnd - 1, snappedFrame));
+                        let leftBound = 0;
+                        for (const s of otherSections) {
+                            if ((s.end_frame || 0) <= item.origStart) leftBound = Math.max(leftBound, s.end_frame || 0);
+                        }
+                        item.data.start_frame = Math.max(leftBound, Math.min(item.origEnd - 1, snappedFrame));
                     } else {
-                        item.data.end_frame = Math.max(item.origStart + 1, Math.min(this.totalFrames, snappedFrame));
+                        let rightBound = this.totalFrames;
+                        for (const s of otherSections) {
+                            if ((s.start_frame || 0) >= item.origEnd) rightBound = Math.min(rightBound, s.start_frame || 0);
+                        }
+                        item.data.end_frame = Math.max(item.origStart + 1, Math.min(rightBound, snappedFrame));
                     }
                 } else {
                     // Clips and audio — clamp to source media bounds
@@ -4499,6 +4599,12 @@ export class EditorWidget {
                         a.timeline_start_frame = this._origAllAudioStarts[a.track_id];
                         a.timeline_end_frame = this._origAllAudioEnds[a.track_id];
                     }
+                }
+                // Restore ALL prompt section ranges from the mousedown snapshot
+                // (canonical baseline for the no-overlap/swap preview below)
+                for (const snap of (this._origAllPromptRanges || [])) {
+                    snap.data.start_frame = snap.start;
+                    snap.data.end_frame = snap.end;
                 }
 
                 const draggedClipIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "clip").map(o => o.id));
@@ -4645,13 +4751,9 @@ export class EditorWidget {
                     if (orig.type === "guide") {
                         const newIdx = Math.max(0, Math.min(this.totalFrames - 1, orig.origStart + frameDelta));
                         orig.data._previewFrameIndex = newIdx;
-                    } else if (orig.type === "prompt") {
-                        const duration = orig.origEnd - orig.origStart;
-                        const newStart = Math.max(0, orig.origStart + frameDelta);
-                        orig.data.start_frame = newStart;
-                        orig.data.end_frame = newStart + duration;
                     }
                 }
+                this._previewPromptDrag(frameDelta, x, rawY);
             }
 
             this._renderTimeline();
@@ -4685,7 +4787,7 @@ export class EditorWidget {
                 // Use the snapped delta (stored during mousemove), not raw mouse position
                 const frameDelta = this._lastSnappedDelta || 0;
 
-                if (frameDelta !== 0 || this._dragLaneChanged || this._dragSwapTarget) {
+                if (frameDelta !== 0 || this._dragLaneChanged || this._dragSwapTarget || this._dragPromptSwap) {
                     commitPromise = this._commitItemMove(frameDelta);
                 } else {
                     // Click without drag = show properties editor (single item only)
@@ -4693,12 +4795,12 @@ export class EditorWidget {
                     if (this._undoStack.length > 0) this._undoStack.pop();
                     if (this.selectedItems.length === 1) {
                         if (this.selectedItem?.type === "prompt") {
-                            // Show prompt text editor for prompt sections
+                            // Single click only SELECTS a prompt section —
+                            // double-click opens the editor (B7 semantics)
                             const sections = this.activeScene?.prompt_sections || [];
                             const idx = this.selectedItem.id;
                             if (idx >= 0 && idx < sections.length) {
                                 this._selectedPromptIdx = idx;
-                                this._showPromptEditor(sections[idx], idx);
                             }
                         } else {
                             this._showItemEditor();
@@ -4740,7 +4842,10 @@ export class EditorWidget {
 
         canvas.addEventListener("mouseup", onMouseUp);
         canvas.addEventListener("mouseleave", onMouseUp);
-        canvas.addEventListener("mouseleave", () => this._hideGuideHoverPreview());
+        canvas.addEventListener("mouseleave", () => {
+            this._hideGuideHoverPreview();
+            this._hidePromptHoverPreview();
+        });
 
         // Scroll to pan
         canvas.addEventListener("wheel", (e) => {
@@ -4812,9 +4917,25 @@ export class EditorWidget {
         // Double-click on Prompt track = create prompt section
         canvas.addEventListener("dblclick", (e) => {
             const { x, rawY } = this._canvasMouseCoords(e);
+            const globalLayoutIdx = this._globalPromptLayoutIdx();
+            if (globalLayoutIdx >= 0 && this._layoutIndexFromRawY(rawY) === globalLayoutIdx) {
+                if (this._isGlobalPromptTrackLocked()) return;
+                this._showGlobalPromptEditor();
+                return;
+            }
             const promptLayoutIdx = this._promptLayoutIdx();
             if (promptLayoutIdx >= 0 && this._layoutIndexFromRawY(rawY) === promptLayoutIdx) {
                 if (this._isPromptTrackLocked()) return;
+                // Double-click on an existing section EDITS it; empty lane
+                // space creates (B7 — fixes dblclick-on-section warning)
+                const sectionHit = this._hitTestPrompt(x, rawY);
+                if (sectionHit) {
+                    const idx = sectionHit.id;
+                    this._selectedPromptIdx = idx;
+                    this._showPromptEditor(sectionHit.data, idx);
+                    this._renderTimeline();
+                    return;
+                }
                 const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
                 this._createPromptSection(frame);
             }
@@ -4850,7 +4971,25 @@ export class EditorWidget {
             if (headerHit) {
                 const entry = this._trackLayout[headerHit.layoutIdx];
                 if (entry.type === TRACK_TYPE.GUIDES) {
-                    this._showGuideManagementPopup(e.clientX, e.clientY);
+                    // Explicit menu entry — auto-open removed (ux_patterns
+                    // follow-up direction); the header ☰ icon is the primary path
+                    menuItems.push({ label: "Open Guide Management", action: () => this._showGuideManagementPopup(e.clientX, e.clientY) });
+                    this._showContextMenu(e.clientX, e.clientY, menuItems);
+                    return;
+                }
+                if (entry.type === TRACK_TYPE.PROMPT || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
+                    // Explicit menu action (ux_patterns follow-up direction) —
+                    // do not copy the guides auto-open.
+                    menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
+                    if (entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
+                        const globalLocked = this._isGlobalPromptTrackLocked();
+                        menuItems.push({
+                            label: globalLocked ? "Edit Global Prompt (locked)" : "Edit Global Prompt",
+                            action: globalLocked ? () => {} : () => this._showGlobalPromptEditor(),
+                            disabled: globalLocked,
+                        });
+                    }
+                    this._showContextMenu(e.clientX, e.clientY, menuItems);
                     return;
                 }
                 if (this._isLaneTrackType(entry.type)) {
@@ -4887,6 +5026,18 @@ export class EditorWidget {
 
             // Check for timeline item hits
             const hit = this._hitTestItem(x, rawY);
+            if (hit && hit.type === "prompt_global") {
+                // Never enters selectedItems (bulk paths don't know the type)
+                const globalLocked = this._isGlobalPromptTrackLocked();
+                menuItems.push({
+                    label: globalLocked ? "Edit Global Prompt (locked)" : "Edit Global Prompt",
+                    action: globalLocked ? () => {} : () => this._showGlobalPromptEditor(),
+                    disabled: globalLocked,
+                });
+                menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
+                this._showContextMenu(e.clientX, e.clientY, menuItems);
+                return;
+            }
             if (hit) {
                 if (!this._isSelected(hit.type, hit.id)) {
                     this._selectItem(hit);
@@ -4939,6 +5090,10 @@ export class EditorWidget {
                     menuItems.push({ label: itemLocked ? "Delete Clip (locked)" : "Delete Clip", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "audio") {
                     menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+                    menuItems.push({
+                        label: "Set Selection to Audio",
+                        action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
+                    });
                     // Extend scene to audio end
                     const audioEnd = hit.data.timeline_end_frame || 0;
                     const audioSceneDur = this.activeScene?.duration_frames || 0;
@@ -4976,6 +5131,15 @@ export class EditorWidget {
                         this._showPromptEditor(sections[idx], idx);
                         this._renderTimeline();
                     }});
+                    menuItems.push({
+                        label: "Set Selection to Prompt",
+                        action: () => this._setSelectionToFrameRange(sections[idx].start_frame || 0, sections[idx].end_frame || 0),
+                    });
+                    menuItems.push({
+                        label: "Queue Prompt Section",
+                        action: () => { this._queuePromptSection(sections[idx]).catch(() => {}); },
+                    });
+                    menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
                     const promptLocked = this._isPromptTrackLocked();
                     menuItems.push({ label: promptLocked ? "Delete Prompt (locked)" : "Delete Prompt", action: promptLocked ? () => {} : () => {
                         if (confirm("Delete this prompt section?")) this._deletePromptSection(idx);
@@ -5622,6 +5786,7 @@ export class EditorWidget {
         const audioConfigs = [];
         let guideTrackConfig = this._defaultLaneConfig();
         let promptTrackConfig = this._defaultLaneConfig();
+        let globalPromptTrackConfig = this._defaultLaneConfig();
         for (const e of this._trackLayout) {
             if (e.type === TRACK_TYPE.VIDEO) {
                 videoConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
@@ -5633,6 +5798,8 @@ export class EditorWidget {
                 guideTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
             } else if (e.type === TRACK_TYPE.PROMPT) {
                 promptTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
+            } else if (e.type === TRACK_TYPE.PROMPT_GLOBAL) {
+                globalPromptTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
             }
         }
         // Fill any sparse gaps
@@ -5645,6 +5812,7 @@ export class EditorWidget {
             audio_lane_configs: audioConfigs,
             guide_track_config: guideTrackConfig,
             prompt_track_config: promptTrackConfig,
+            global_prompt_track_config: globalPromptTrackConfig,
         };
         try {
             await this._runSceneMutation(
@@ -5663,6 +5831,7 @@ export class EditorWidget {
                 sceneRef.audio_lane_configs = audioConfigs;
                 sceneRef.guide_track_config = guideTrackConfig;
                 sceneRef.prompt_track_config = promptTrackConfig;
+                sceneRef.global_prompt_track_config = globalPromptTrackConfig;
             }
         } catch (e) {
             console.warn("[Sonder] Failed to save lane config:", e);
@@ -5856,8 +6025,86 @@ export class EditorWidget {
             endFrame = this.totalFrames;
         }
 
+        // Clamp the requested range into the free gap around the click point —
+        // sections cannot overlap (backend 409 is the safety net)
+        const anchor = Number.isFinite(frame)
+            ? Math.max(startFrame, Math.min(endFrame - 1, frame))
+            : startFrame;
+        const sections = this.activeScene.prompt_sections || [];
+        let gapStart = 0;
+        let gapEnd = this.totalFrames;
+        for (const s of sections) {
+            const sStart = s.start_frame || 0;
+            const sEnd = s.end_frame || 0;
+            if (sStart <= anchor && anchor < sEnd) {
+                notifyWarning("Prompt sections cannot overlap — pick a free spot on the lane.", { source: "prompt-create-overlap" });
+                return;
+            }
+            if (sEnd <= anchor) gapStart = Math.max(gapStart, sEnd);
+            if (sStart > anchor) gapEnd = Math.min(gapEnd, sStart);
+        }
+        startFrame = Math.max(startFrame, gapStart);
+        endFrame = Math.min(endFrame, gapEnd);
+        if (endFrame - startFrame < 1) {
+            notifyWarning("No free room for a prompt section at this position.", { source: "prompt-create-overlap" });
+            return;
+        }
+
         // Show inline editor for the new prompt section
         this._showPromptCreator(startFrame, endFrame);
+    }
+
+    /** Auto-growing prompt textarea for inline bars: Enter commits,
+     *  Shift+Enter inserts a newline, Esc cancels. */
+    _makePromptTextarea({ value = "", placeholder = "", title = "", flex = 1 }, onEnter, onEscape) {
+        const area = document.createElement("textarea");
+        area.rows = 2;
+        area.placeholder = placeholder;
+        area.title = title ? `${title} — Enter commits, Shift+Enter inserts a newline` : "Enter commits, Shift+Enter inserts a newline";
+        area.value = value;
+        area.style.cssText = `flex: ${flex}; min-width: 40px; resize: none; overflow-y: auto; line-height: 1.35; ${chromeInputCss({ fontSize: "11px", padding: "3px 6px", textAlign: "left" })}`;
+        const grow = () => {
+            area.style.height = "auto";
+            const maxPx = Math.round(6 * 15 + 10); // ~6 lines
+            area.style.height = `${Math.min(area.scrollHeight, maxPx)}px`;
+        };
+        area.addEventListener("input", grow);
+        setTimeout(grow, 0);
+        area.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                onEnter();
+            } else if (e.key === "Escape") {
+                onEscape();
+            }
+            e.stopPropagation();
+        });
+        return area;
+    }
+
+    /** Three channel textareas (Visual/Speech/Sounds) for inline prompt bars. */
+    _buildChannelInputs(initialChannels, onEnter, onEscape) {
+        const channels = normalizeChannels(initialChannels);
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "display: flex; gap: 4px; flex: 1; min-width: 0; align-items: flex-start;";
+        const inputs = {};
+        const placeholders = { visual: "Visual…", speech: "Speech…", sounds: "Sounds…" };
+        for (const key of ["visual", "speech", "sounds"]) {
+            const input = this._makePromptTextarea({
+                value: channels[key] || "",
+                placeholder: placeholders[key],
+                title: `${key[0].toUpperCase()}${key.slice(1)} channel`,
+                flex: key === "visual" ? 2 : 1,
+            }, onEnter, onEscape);
+            inputs[key] = input;
+            wrap.appendChild(input);
+        }
+        const read = () => ({
+            visual: inputs.visual.value.trim(),
+            speech: inputs.speech.value.trim(),
+            sounds: inputs.sounds.value.trim(),
+        });
+        return { wrap, inputs, read };
     }
 
     _showPromptCreator(startFrame, endFrame) {
@@ -5875,49 +6122,40 @@ export class EditorWidget {
         label.style.cssText = `font-size: 10px; color: ${COLORS.promptBorder}; white-space: nowrap;`;
         label.textContent = `New [${startFrame}-${endFrame}]:`;
 
-        const input = document.createElement("input");
-        input.type = "text";
-        input.placeholder = "Enter prompt for this section...";
-        input.style.cssText = `flex: 1; ${chromeInputCss({ fontSize: "11px", padding: "3px 6px", textAlign: "left" })}`;
-        input.addEventListener("keydown", (e) => {
-            if (e.key === "Enter" && input.value.trim()) {
-                this._saveNewPromptSection(startFrame, endFrame, input.value.trim());
-            } else if (e.key === "Escape") {
-                this._hidePromptEditor();
+        const commit = () => {
+            const channels = channelInputs.read();
+            if (channels.visual || channels.speech || channels.sounds) {
+                this._saveNewPromptSection(startFrame, endFrame, channels);
             }
-            e.stopPropagation();
-        });
+        };
+        const channelInputs = this._buildChannelInputs(null, commit, () => this._hidePromptEditor());
 
         const createBtn = this._makeBtn("Create", "Create prompt section");
         setButtonVariant(createBtn, "primary");
         createBtn.dataset.sonderHoverVariant = "primary";
-        createBtn.addEventListener("click", () => {
-            if (input.value.trim()) {
-                this._saveNewPromptSection(startFrame, endFrame, input.value.trim());
-            }
-        });
+        createBtn.addEventListener("click", commit);
 
         const cancelBtn = this._makeBtn("Cancel", "Cancel");
         setButtonVariant(cancelBtn, "subtle");
         cancelBtn.dataset.sonderHoverVariant = "subtle";
         cancelBtn.addEventListener("click", () => this._hidePromptEditor());
 
-        editor.append(label, input, createBtn, cancelBtn);
+        editor.append(label, channelInputs.wrap, createBtn, cancelBtn);
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
         this._refreshTimelineLayout();
 
-        setTimeout(() => input.focus(), 50);
+        setTimeout(() => channelInputs.inputs.visual.focus(), 50);
     }
 
-    async _saveNewPromptSection(startFrame, endFrame, promptText) {
+    async _saveNewPromptSection(startFrame, endFrame, channels) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
         const undoLabel = "add prompt";
         const fields = {
             start_frame: startFrame,
             end_frame: endFrame,
-            prompt: promptText,
+            channels: normalizeChannels(channels),
         };
         this._pushUndo(undoLabel);
         this._applyLocalPromptCreate(fields);
@@ -5935,6 +6173,7 @@ export class EditorWidget {
             );
         } catch (e) {
             this._discardLastUndo(undoLabel);
+            notifyWarning(e?.message || "Prompt section was refused.", { source: "prompt-create-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "add_prompt_error" });
             console.warn("[Sonder] Failed to create prompt section:", e);
         }
@@ -5955,29 +6194,24 @@ export class EditorWidget {
         label.style.cssText = `font-size: 10px; color: ${COLORS.promptBorder}; white-space: nowrap;`;
         label.textContent = `Prompt [${section.start_frame}-${section.end_frame}]:`;
 
-        const input = document.createElement("input");
-        input.type = "text";
-        input.value = section.prompt;
-        input.style.cssText = `flex: 1; ${chromeInputCss({ fontSize: "11px", padding: "3px 6px", textAlign: "left" })}`;
-        input.addEventListener("keydown", (e) => {
-            if (e.key === "Enter") {
-                this._updatePromptSection(idx, { prompt: input.value });
-                this._hidePromptEditor();
-            } else if (e.key === "Escape") {
+        const commit = () => {
+            this._updatePromptSection(idx, { channels: channelInputs.read() });
+            this._hidePromptEditor();
+        };
+        const channelInputs = this._buildChannelInputs(
+            normalizeChannels(section.channels, section.prompt),
+            commit,
+            () => {
                 this._hidePromptEditor();
                 this._selectedPromptIdx = null;
                 this._renderTimeline();
             }
-            e.stopPropagation();
-        });
+        );
 
         const saveBtn = this._makeBtn("Save", "Save prompt");
         setButtonVariant(saveBtn, "primary");
         saveBtn.dataset.sonderHoverVariant = "primary";
-        saveBtn.addEventListener("click", () => {
-            this._updatePromptSection(idx, { prompt: input.value });
-            this._hidePromptEditor();
-        });
+        saveBtn.addEventListener("click", commit);
 
         const deleteBtn = this._makeBtn("Delete", "Delete this prompt section");
         setButtonVariant(deleteBtn, "danger");
@@ -5988,14 +6222,342 @@ export class EditorWidget {
             }
         });
 
-        editor.append(label, input, saveBtn, deleteBtn);
+        editor.append(label, channelInputs.wrap, saveBtn, deleteBtn);
         // Insert after timeline canvas
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
         this._refreshTimelineLayout();
 
         // Focus input
+        setTimeout(() => channelInputs.inputs.visual.focus(), 50);
+    }
+
+    /** Inline editor bar for the scene-global prompt lane (Scene.prompt).
+     *  Auto-commits on Enter/blur (no Save button); Esc cancels — the cancel
+     *  path must beat the removal-triggered blur via the suppress flag. */
+    _showGlobalPromptEditor() {
+        if (!this.activeScene) return;
+        if (this._isGlobalPromptTrackLocked()) return;
+        this._hidePromptEditor();
+
+        const editor = document.createElement("div");
+        editor.style.cssText = `
+            display: flex; gap: 4px; padding: 4px 6px;
+            background: ${COLORS.panel}; border-top: 1px solid ${COLORS.promptBorder};
+            align-items: flex-start;
+        `;
+
+        const label = document.createElement("span");
+        label.style.cssText = `font-size: 10px; color: ${COLORS.promptBorder}; white-space: nowrap; padding-top: 5px;`;
+        label.textContent = "Global:";
+
+        let suppressBlurCommit = false;
+        const commit = () => {
+            if (suppressBlurCommit) return;
+            this._updateScenePrompt(input.value);
+        };
+        const input = this._makePromptTextarea({
+            value: this.activeScene.prompt || "",
+            placeholder: "Scene-global prompt (style, identity, location)…",
+            title: "Global prompt — auto-commits on Enter or focus loss; Esc cancels",
+        }, () => {
+            commit();
+            this._hidePromptEditor();
+        }, () => {
+            suppressBlurCommit = true;
+            this._hidePromptEditor();
+        });
+        input.addEventListener("blur", () => {
+            commit();
+            // Blur from clicking elsewhere closes the bar; the hide itself
+            // re-triggers no commit because the element is already detached
+            if (this._promptEditorEl === editor) this._hidePromptEditor();
+        });
+
+        editor.append(label, input);
+        this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
+        this._promptEditorEl = editor;
+        this._refreshTimelineLayout();
+
         setTimeout(() => input.focus(), 50);
+    }
+
+    /** Durable write of the scene-global prompt via the mutation pipeline. */
+    async _updateScenePrompt(value) {
+        if (!this.activeScene || !this.projectDir) return;
+        if (this._isGlobalPromptTrackLocked()) return;
+        const sceneRef = this.activeScene;
+        const sceneId = this.activeSceneId;
+        const next = String(value ?? "");
+        const prev = sceneRef.prompt || "";
+        if (next === prev) return;
+        const undoLabel = "edit global prompt";
+        this._pushUndo(undoLabel);
+        sceneRef.prompt = next;
+        this._renderSceneAfterLocalMutation({ viewport: false });
+        try {
+            await this._runSceneMutation(
+                [{ type: "update_scene_fields", fields: { prompt: next } }],
+                {
+                    key: `scene:${sceneId}:prompt`,
+                    label: "global prompt",
+                    coalesce: true,
+                    refreshScenes: false,
+                }
+            );
+        } catch (e) {
+            this._discardLastUndo(undoLabel);
+            if (sceneRef === this.activeScene) sceneRef.prompt = prev;
+            notifyWarning(e?.message || "Global prompt edit was refused.", { source: "prompt-global-refused" });
+            console.warn("[Sonder] Failed to update global prompt:", e);
+            this._renderTimeline();
+        }
+    }
+
+    /** Open (or refresh) the Prompt Management panel. */
+    _showPromptManagementPanel() {
+        if (this._promptPanelHandle?.isMounted?.()) {
+            this._promptPanelHandle.refresh();
+            return;
+        }
+        this._promptPanelHandle = mountPromptManagementPanel(this);
+    }
+
+    /** Project-durable channel-labels toggle.
+     *  Deliberately OUTSIDE the ProjectMutationQueue (documented exemption):
+     *  project-level metadata — not a scene mutation op — an infrequent single
+     *  toggle following the asset_folders precedent; not undo-enrolled. */
+    async _togglePromptChannelLabels(on) {
+        const dirName = this._projectDirName();
+        if (!dirName) return;
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ metadata: { prompt_channel_labels: !!on } }),
+                },
+                { projectId: dirName }
+            );
+            this._promptChannelLabels = !!on;
+        } catch (e) {
+            notifyWarning(e?.message || "Failed to update channel-labels setting.", { source: "prompt-labels-refused" });
+            throw e;
+        }
+    }
+
+    /** Project-durable section-seam delimiter (changes model-visible text).
+     *  Same documented ProjectMutationQueue exemption as the labels toggle:
+     *  project-level metadata, infrequent single control, asset_folders
+     *  precedent; not undo-enrolled. */
+    async _setPromptSectionDelimiter(value) {
+        const dirName = this._projectDirName();
+        if (!dirName) return;
+        const delimiter = String(value ?? "").trim().slice(0, 8);
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ metadata: { prompt_section_delimiter: delimiter } }),
+                },
+                { projectId: dirName }
+            );
+            this._promptSectionDelimiter = delimiter;
+        } catch (e) {
+            notifyWarning(e?.message || "Failed to update section delimiter.", { source: "prompt-delimiter-refused" });
+            throw e;
+        }
+    }
+
+    /** Resolved relay payload preview for the panel (full-scene window). */
+    async _fetchPromptPayload() {
+        const dirName = this._projectDirName();
+        const sceneId = this.activeSceneId;
+        if (!dirName || !sceneId) return null;
+        try {
+            const resp = await fetch(api.apiURL(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-payload`
+            ));
+            if (!resp.ok) return null;
+            return await resp.json();
+        } catch (e) {
+            console.warn("[Sonder] Failed to fetch prompt payload:", e);
+            return null;
+        }
+    }
+
+    /** Queue a prompt-bounded range as the unit of work: set the selection to
+     *  the section's range (snap policy applies) and route through the
+     *  existing enqueue paths. The sticky `prompts.queueSectionBatch` toggle
+     *  picks the path: on → auto-chunked batch (degrades to single when the
+     *  range fits one chunk); off → ONE job for the whole range (backend
+     *  frame round-up applies — the user's explicit choice). */
+    async _queuePromptSection(section) {
+        if (!section || !this.activeScene) return;
+        const start = section.start_frame || 0;
+        const end = section.end_frame || 0;
+        if (end <= start) {
+            notifyWarning("Prompt section has no frames to queue.", { source: "queue-prompt-section" });
+            return;
+        }
+        this._setSelectionToFrameRange(start, end);
+        if (this._settings?.prompts?.queueSectionBatch !== false) {
+            await this._addBatchToRenderQueue();
+        } else {
+            await this._addToRenderQueue();
+        }
+    }
+
+    /** Insert an empty section directly after the given one, filling the gap
+     *  to the next section / scene end (min 1 frame; warns when no room). */
+    async _addPromptSectionAfter(index) {
+        const scene = this.activeScene;
+        if (!scene || this._isPromptTrackLocked()) return false;
+        const sections = scene.prompt_sections || [];
+        const section = sections[index];
+        if (!section) return false;
+        const duration = scene.duration_frames || this.totalFrames || 0;
+        const gapStart = section.end_frame || 0;
+        const next = sections[index + 1];
+        const gapEnd = Math.min(next ? (next.start_frame || 0) : duration, duration);
+        if (gapEnd - gapStart < 1) {
+            notifyWarning("No free room after this section.", { source: "prompt-add-section" });
+            return false;
+        }
+        await this._saveNewPromptSection(gapStart, gapEnd, { visual: "", speech: "", sounds: "" });
+        return true;
+    }
+
+    /** Create an empty section in the FIRST free gap scanning from frame 0
+     *  (whole gap, min 1 frame; warns when the lane is full). */
+    async _addPromptSectionInFirstGap() {
+        const scene = this.activeScene;
+        if (!scene || this._isPromptTrackLocked()) return false;
+        const duration = scene.duration_frames || this.totalFrames || 0;
+        const sections = [...(scene.prompt_sections || [])]
+            .sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
+        let cursor = 0;
+        let gap = null;
+        for (const section of sections) {
+            const start = section.start_frame || 0;
+            if (start - cursor >= 1) {
+                gap = [cursor, start];
+                break;
+            }
+            cursor = Math.max(cursor, section.end_frame || 0);
+        }
+        if (!gap && duration - cursor >= 1) gap = [cursor, duration];
+        if (!gap) {
+            notifyWarning("No free room on the prompt lane.", { source: "prompt-add-section" });
+            return false;
+        }
+        await this._saveNewPromptSection(gap[0], gap[1], { visual: "", speech: "", sounds: "" });
+        return true;
+    }
+
+    /** Prompt history entries (Prompt Saver, captured server-side at enqueue), newest first. */
+    async _fetchPromptHistory() {
+        const dirName = this._projectDirName();
+        if (!dirName) return [];
+        try {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`));
+            if (!resp.ok) return [];
+            const data = await resp.json();
+            const history = data?.metadata?.prompt_history;
+            return Array.isArray(history) ? history.slice().reverse() : [];
+        } catch (e) {
+            console.warn("[Sonder] Failed to fetch prompt history:", e);
+            return [];
+        }
+    }
+
+    /** Replace the scene's prompt state with a history entry / template:
+     *  ONE mutation request (deletes high-index-first, then creates, then the
+     *  global text) so the apply is a single save and a single undo step. */
+    async _applyPromptSetup({ global: globalText, sections } = {}) {
+        if (!this.activeScene || !this.projectDir) return;
+        if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
+            notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
+            return;
+        }
+        const sceneRef = this.activeScene;
+        const undoLabel = "apply prompt setup";
+        this._pushUndo(undoLabel);
+        const current = sceneRef.prompt_sections || [];
+        const operations = [];
+        for (let i = current.length - 1; i >= 0; i--) {
+            operations.push({
+                type: "delete_prompt_section",
+                index: i,
+                expected: { start_frame: current[i].start_frame, end_frame: current[i].end_frame },
+            });
+        }
+        const nextSections = (sections || [])
+            .filter((s) => (s?.end_frame || 0) > (s?.start_frame || 0))
+            .map((s) => {
+                const channels = normalizeChannels(s.channels, s.prompt);
+                return {
+                    start_frame: s.start_frame || 0,
+                    end_frame: s.end_frame || 0,
+                    channels,
+                    prompt: composeSectionText(channels, false),
+                };
+            });
+        for (const s of nextSections) {
+            operations.push({
+                type: "create_prompt_section",
+                fields: { start_frame: s.start_frame, end_frame: s.end_frame, channels: s.channels },
+            });
+        }
+        operations.push({ type: "update_scene_fields", fields: { prompt: String(globalText ?? "") } });
+
+        sceneRef.prompt = String(globalText ?? "");
+        sceneRef.prompt_sections = [...nextSections].sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
+        this._renderSceneAfterLocalMutation({ viewport: false });
+        try {
+            await this._runSceneMutation(operations, {
+                key: `prompt:${this.activeSceneId}:apply:${Date.now()}`,
+                label: "apply prompt setup",
+                coalesce: false,
+            });
+        } catch (e) {
+            this._discardLastUndo(undoLabel);
+            notifyWarning(e?.message || "Apply prompt setup was refused.", { source: "prompt-apply-refused" });
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "apply_prompt_error" });
+        }
+    }
+
+    /** Browser-local prompt template library (cross-project; applying
+     *  materializes concrete text into scene state). */
+    _getPromptTemplates() {
+        return this._settings?.promptTemplates || [];
+    }
+
+    _savePromptTemplate(name) {
+        const scene = this.activeScene;
+        const trimmed = String(name || "").trim();
+        if (!scene || !trimmed) return;
+        const template = {
+            id: `pt-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`,
+            name: trimmed,
+            global: scene.prompt || "",
+            sections: (scene.prompt_sections || []).map((s) => ({
+                start_frame: s.start_frame || 0,
+                end_frame: s.end_frame || 0,
+                channels: normalizeChannels(s.channels, s.prompt),
+            })),
+        };
+        this._updateSettings({ promptTemplates: [...this._getPromptTemplates(), template] });
+        notifySuccess(`Prompt template "${trimmed}" saved.`);
+    }
+
+    _deletePromptTemplate(templateId) {
+        this._updateSettings({
+            promptTemplates: this._getPromptTemplates().filter((t) => t.id !== templateId),
+        });
     }
 
     _hidePromptEditor() {
@@ -6049,6 +6611,7 @@ export class EditorWidget {
             );
         } catch (e) {
             this._discardLastUndo(undoLabel);
+            notifyWarning(e?.message || "Prompt edit was refused.", { source: "prompt-edit-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "edit_prompt_error" });
             console.warn("[Sonder] Failed to update prompt section:", e);
         }
@@ -6083,6 +6646,7 @@ export class EditorWidget {
             );
         } catch (e) {
             this._discardLastUndo(undoLabel);
+            notifyWarning(e?.message || "Prompt delete was refused.", { source: "prompt-delete-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_prompt_error" });
             console.warn("[Sonder] Failed to delete prompt section:", e);
         }
@@ -6627,6 +7191,128 @@ export class EditorWidget {
         preview.style.top = `${top}px`;
     }
 
+    _promptHoverPreviewEnabled() {
+        return this._settings?.prompts?.hoverPreviewEnabled !== false;
+    }
+
+    _hidePromptHoverPreview() {
+        if (this._promptPreviewEl) {
+            this._promptPreviewEl.remove();
+            this._promptPreviewEl = null;
+        }
+    }
+
+    /** Full-text hover preview for prompt sections + the global item,
+     *  mirroring the guide hover system (reused fixed div, estimate clamp). */
+    _showPromptHoverPreview(hit, clientX, clientY) {
+        if (!hit || !this._promptHoverPreviewEnabled()) {
+            this._hidePromptHoverPreview();
+            return;
+        }
+        const labelsOn = this._promptChannelLabels !== false;
+        const isGlobal = hit.type === "prompt_global";
+        const hidden = isGlobal ? this._isGlobalPromptTrackHidden() : this._isPromptTrackHidden();
+        const width = 360;
+
+        let tag, rangeText, lines;
+        if (isGlobal) {
+            tag = "Global";
+            rangeText = "scene-wide";
+            const text = (this.activeScene?.prompt || "").trim();
+            lines = text ? [text] : ["(empty global prompt)"];
+        } else {
+            const section = hit.data;
+            tag = "Prompt";
+            const start = section.start_frame || 0;
+            // Display the INCLUSIVE last covered frame (ranges are half-open
+            // [start, end) in data) so abutting sections never appear to
+            // share a frame — f0–f119, f120–f239 instead of f0–f120, f120–f240
+            const lastFrame = Math.max(start, (section.end_frame || 0) - 1);
+            rangeText = this._timecodeMode === "timecode"
+                ? `${this._frameToTimecode(start)}–${this._frameToTimecode(lastFrame)}`
+                : `f${start}–f${lastFrame}`;
+            const channels = normalizeChannels(section.channels, section.prompt);
+            lines = [];
+            for (const key of ["visual", "speech", "sounds"]) {
+                const text = (channels[key] || "").trim();
+                if (text) lines.push(labelsOn ? `[${key.toUpperCase()}]: ${text}` : text);
+            }
+            if (!lines.length) lines = ["(empty section)"];
+        }
+
+        let preview = this._promptPreviewEl;
+        if (!preview) {
+            preview = document.createElement("div");
+            preview.style.cssText = `
+                position: fixed; z-index: 10030; pointer-events: none;
+                border-radius: 8px; overflow: hidden;
+                box-shadow: 0 18px 42px rgba(0,0,0,0.52);
+                font-family: ${FONT.sans};
+            `;
+            document.body.appendChild(preview);
+            this._promptPreviewEl = preview;
+        }
+        preview.innerHTML = "";
+        preview.style.width = `${width}px`;
+        preview.style.background = hidden ? "rgba(31, 25, 20, 0.98)" : "rgba(15, 19, 24, 0.98)";
+        preview.style.border = hidden ? `1px solid ${COLORS.warningBorder}` : `1px solid ${COLORS.borderStrong}`;
+        preview.style.opacity = hidden ? "0.88" : "1";
+
+        const meta = document.createElement("div");
+        meta.style.cssText = "padding:7px 10px 4px;display:flex;align-items:center;gap:8px;";
+        const tagEl = document.createElement("div");
+        tagEl.textContent = tag;
+        tagEl.style.cssText = `font-size:10px;font-weight:700;color:${COLORS.textMuted};text-transform:uppercase;letter-spacing:0.06em;`;
+        const rangeEl = document.createElement("div");
+        rangeEl.textContent = rangeText;
+        rangeEl.style.cssText = `font-size:11px;color:${COLORS.guideSelected};font-family:${FONT.mono};`;
+        meta.append(tagEl, rangeEl);
+        if (hidden) {
+            const badge = document.createElement("div");
+            badge.textContent = "Hidden";
+            badge.style.cssText = `
+                margin-left:auto;padding:2px 7px;border-radius:999px;
+                background:rgba(0,0,0,0.68);border:1px solid ${COLORS.warningBorder};
+                color:${COLORS.warningText};font-size:10px;font-weight:700;
+            `;
+            meta.appendChild(badge);
+        }
+        const bodyEl = document.createElement("div");
+        // ~12 lines clamp; long prompts cut off rather than overflow the screen
+        bodyEl.style.cssText = `
+            padding:4px 10px 9px;display:flex;flex-direction:column;gap:4px;
+            max-height:190px;overflow:hidden;
+        `;
+        for (const line of lines) {
+            const lineEl = document.createElement("div");
+            lineEl.textContent = line;
+            lineEl.style.cssText = `font-size:11px;line-height:1.4;color:${COLORS.text};word-break:break-word;white-space:pre-wrap;`;
+            bodyEl.appendChild(lineEl);
+        }
+        preview.append(meta, bodyEl);
+
+        const margin = 12;
+        const estimatedHeight = Math.min(230, 36 + lines.length * 30);
+        let left = clientX + 18;
+        let top = clientY - estimatedHeight - 14;
+        if (left + width + margin > window.innerWidth) left = clientX - width - 18;
+        if (top < margin) top = clientY + 18;
+        left = Math.max(margin, Math.min(window.innerWidth - width - margin, left));
+        top = Math.max(margin, Math.min(window.innerHeight - estimatedHeight - margin, top));
+        preview.style.left = `${left}px`;
+        preview.style.top = `${top}px`;
+        // Wrapped lines can exceed the estimate — re-clamp with the REAL
+        // rect after layout (same pattern as the context-menu edge clamp)
+        requestAnimationFrame(() => {
+            if (this._promptPreviewEl !== preview) return;
+            const rect = preview.getBoundingClientRect();
+            const clampedLeft = Math.max(margin, Math.min(window.innerWidth - rect.width - margin, rect.left));
+            const clampedTop = Math.max(margin, Math.min(window.innerHeight - rect.height - margin, rect.top));
+            preview.style.left = `${clampedLeft}px`;
+            preview.style.top = `${clampedTop}px`;
+        });
+    }
+
     _resolveGuideSnapshotTargetLongEdge(clip) {
         const asset = this._getAssetForSourcePath(clip?.source_path || "");
         const sourceLong = Math.max(
@@ -6795,6 +7481,98 @@ export class EditorWidget {
         }
     }
 
+    /** No-overlap prompt-lane drag preview: all-or-nothing linear move with
+     *  hold-at-last-valid, plus a duration-preserving threshold swap on
+     *  single-item drags. Assumes all section ranges were just restored from
+     *  the mousedown snapshot; sections compare by object reference because
+     *  array indices are re-sorted identity. */
+    _previewPromptDrag(frameDelta, x, rawY) {
+        const draggedPrompts = (this._dragItemsOrig || []).filter((o) => o.type === "prompt");
+        if (!draggedPrompts.length) return;
+        const sections = this.activeScene?.prompt_sections || [];
+        const draggedSet = new Set(draggedPrompts.map((o) => o.data));
+        const totalFrames = this.totalFrames || 0;
+
+        const overlapsOther = (start, end, extraIgnore = null) => sections.some((s) => {
+            if (draggedSet.has(s) || s === extraIgnore) return false;
+            return (s.start_frame || 0) < end && (s.end_frame || 0) > start;
+        });
+
+        // Swap candidate: exactly one dragged item, cursor over another section
+        let swap = null;
+        if (draggedPrompts.length === 1 && (this._dragItemsOrig || []).length === 1) {
+            const candidate = this._hitTestPrompt(x, rawY);
+            if (candidate && !draggedSet.has(candidate.data)) {
+                const dragged = draggedPrompts[0];
+                const target = candidate.data;
+                const dDur = dragged.origEnd - dragged.origStart;
+                const tDur = (target.end_frame || 0) - (target.start_frame || 0);
+                // Duration-preserving: dragged takes the target's start, target
+                // takes the dragged origin. Different durations near other
+                // sections can make the swap invalid — then it refuses (hold).
+                const dStart = target.start_frame || 0;
+                const dEnd = dStart + dDur;
+                const tStart = dragged.origStart;
+                const tEnd = tStart + tDur;
+                const pairOverlap = dStart < tEnd && dEnd > tStart;
+                if (!pairOverlap && dEnd <= totalFrames && tEnd <= totalFrames
+                    && !overlapsOther(dStart, dEnd, target) && !overlapsOther(tStart, tEnd, target)) {
+                    swap = { dragged, target, dStart, dEnd, tStart, tEnd };
+                }
+            }
+        }
+
+        if (swap) {
+            swap.dragged.data.start_frame = swap.dStart;
+            swap.dragged.data.end_frame = swap.dEnd;
+            swap.target.start_frame = swap.tStart;
+            swap.target.end_frame = swap.tEnd;
+            this._dragPromptSwap = swap;
+            this._dragPromptHold = { swap };
+            return;
+        }
+
+        // Linear move: all-or-nothing across the dragged set so a group drag
+        // never splits its relative layout
+        const proposals = draggedPrompts.map((orig) => {
+            const duration = orig.origEnd - orig.origStart;
+            const maxStart = Math.max(0, totalFrames - duration);
+            const newStart = Math.max(0, Math.min(maxStart, orig.origStart + frameDelta));
+            return { orig, newStart, newEnd: newStart + duration };
+        });
+        if (proposals.every((p) => !overlapsOther(p.newStart, p.newEnd))) {
+            for (const p of proposals) {
+                p.orig.data.start_frame = p.newStart;
+                p.orig.data.end_frame = p.newEnd;
+            }
+            this._dragPromptSwap = null;
+            this._dragPromptHold = {
+                proposals: proposals.map((p) => ({ data: p.orig.data, start: p.newStart, end: p.newEnd })),
+            };
+            return;
+        }
+
+        // Invalid — hold the last valid preview (swap or linear); with no
+        // prior valid state the snapshot restore above already shows origins
+        const hold = this._dragPromptHold;
+        if (hold?.swap) {
+            const s = hold.swap;
+            s.dragged.data.start_frame = s.dStart;
+            s.dragged.data.end_frame = s.dEnd;
+            s.target.start_frame = s.tStart;
+            s.target.end_frame = s.tEnd;
+            this._dragPromptSwap = s;
+        } else if (hold?.proposals) {
+            for (const p of hold.proposals) {
+                p.data.start_frame = p.start;
+                p.data.end_frame = p.end;
+            }
+            this._dragPromptSwap = null;
+        } else {
+            this._dragPromptSwap = null;
+        }
+    }
+
     async _commitItemMove(frameDelta) {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
         const sceneId = this.activeSceneId;
@@ -6870,18 +7648,42 @@ export class EditorWidget {
                         delete data._previewFrameIndex;
                     } else if (type === "prompt") {
                         if (this._isPromptTrackLocked()) continue;
-                        operations.push({
-                            type: "update_prompt_section",
-                            index: id,
-                            expected: {
-                                start_frame: orig.origStart,
-                                end_frame: orig.origEnd,
-                            },
-                            fields: {
-                                start_frame: data.start_frame,
-                                end_frame: data.end_frame,
-                            },
-                        });
+                        const swap = this._dragPromptSwap;
+                        if (swap && swap.dragged.data === data) {
+                            // Threshold swap commits atomically — two update ops
+                            // would go stale on the server-side re-sort and trip
+                            // the overlap validation's intermediate state.
+                            const sections = this.activeScene?.prompt_sections || [];
+                            const indexA = sections.indexOf(data);
+                            const indexB = sections.indexOf(swap.target);
+                            const targetSnap = (this._origAllPromptRanges || []).find((s) => s.data === swap.target);
+                            if (indexA >= 0 && indexB >= 0) {
+                                operations.push({
+                                    type: "swap_prompt_sections",
+                                    index_a: indexA,
+                                    index_b: indexB,
+                                    expected_a: { start_frame: orig.origStart, end_frame: orig.origEnd },
+                                    expected_b: targetSnap
+                                        ? { start_frame: targetSnap.start, end_frame: targetSnap.end }
+                                        : undefined,
+                                    fields_a: { start_frame: data.start_frame, end_frame: data.end_frame },
+                                    fields_b: { start_frame: swap.target.start_frame, end_frame: swap.target.end_frame },
+                                });
+                            }
+                        } else {
+                            operations.push({
+                                type: "update_prompt_section",
+                                index: id,
+                                expected: {
+                                    start_frame: orig.origStart,
+                                    end_frame: orig.origEnd,
+                                },
+                                fields: {
+                                    start_frame: data.start_frame,
+                                    end_frame: data.end_frame,
+                                },
+                            });
+                        }
                     }
                 }
 
@@ -6898,8 +7700,12 @@ export class EditorWidget {
             } catch (e) {
                 this._discardLastUndo("move items");
                 console.warn("[Sonder] Failed to move items:", e);
+                notifyWarning(e?.message || "Move was refused — timeline restored.", { source: "timeline-move-refused" });
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "moveItem_error" });
                 this._renderTimeline();
+            } finally {
+                this._dragPromptSwap = null;
+                this._dragPromptHold = null;
             }
         });
     }
@@ -6961,6 +7767,7 @@ export class EditorWidget {
             } catch (e) {
                 this._discardLastUndo("trim");
                 console.warn("[Sonder] Failed to commit trim:", e);
+                notifyWarning(e?.message || "Trim was refused — timeline restored.", { source: "timeline-trim-refused" });
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "trim_error" });
                 this._renderTimeline();
             }
@@ -7479,6 +8286,18 @@ export class EditorWidget {
 
         document.body.appendChild(menu);
         this._contextMenuEl = menu;
+
+        // Clamp into the viewport after mount (shortest distance back inside)
+        // — same rAF pattern as the gallery's showContextMenu. Fixes menus
+        // opened near the right/bottom screen edges getting cropped.
+        requestAnimationFrame(() => {
+            if (this._contextMenuEl !== menu) return;
+            const rect = menu.getBoundingClientRect();
+            const clampedX = Math.max(4, Math.min(x, window.innerWidth - rect.width - 4));
+            const clampedY = Math.max(4, Math.min(y, window.innerHeight - rect.height - 4));
+            menu.style.left = `${clampedX}px`;
+            menu.style.top = `${clampedY}px`;
+        });
 
         // Close on outside click or Escape (Escape is owned by KeyboardOwnership
         // OVERLAY consumer so it beats LiteGraph and the EDITOR consumer).
@@ -8919,20 +9738,34 @@ export class EditorWidget {
         const snapshotEnd = Math.min(sceneDuration, clampedEnd + postContextFrames);
 
         const promptHidden = !!this.activeScene.prompt_track_config?.hidden;
-        let prompt = promptHidden ? "" : (this.activeScene.prompt || "");
+        const globalHidden = !!this.activeScene.global_prompt_track_config?.hidden;
+        const labelsOn = this._promptChannelLabels !== false;
+        const scenePrompt = globalHidden ? "" : (this.activeScene.prompt || "");
         const sections = promptHidden ? [] : (this.activeScene.prompt_sections || []);
+        // Freeze ALL window-overlapping sections (channel-bearing) — the relay
+        // bridge consumes them; the single `prompt` string is the composed
+        // selector mirror (global + section covering the window start).
+        // Known accepted mismatch: this filter window is selection ± raw
+        // context, while backend grid-snap can extend the executed window.
         const promptSections = [];
         for (const s of sections) {
             if (s.start_frame < snapshotEnd && s.end_frame > snapshotStart) {
                 promptSections.push({
                     start_frame: s.start_frame,
                     end_frame: s.end_frame,
-                    prompt: s.prompt,
+                    channels: normalizeChannels(s.channels, s.prompt),
+                    prompt: s.prompt || "",
                 });
             }
-            if (s.start_frame <= snapshotStart && s.end_frame >= snapshotEnd) { prompt = s.prompt; break; }
-            if (s.start_frame < snapshotEnd && s.end_frame > snapshotStart) { prompt = s.prompt; break; }
         }
+        // DISPLAY-ONLY best-effort concat for the optimistic temp queue rows.
+        // The authoritative frozen prompt is composed SERVER-SIDE at enqueue
+        // (multi-segment + delimiter, channel-grouped labels) and returns in
+        // the response jobs, which replace the temp rows. A stale delimiter
+        // stash is cosmetic only — never block enqueue on it.
+        const displaySectionText = composeSectionsDisplayText(
+            promptSections, labelsOn, this._promptSectionDelimiter ?? ".");
+        const prompt = [scenePrompt.trim(), displaySectionText].filter(Boolean).join(" ");
 
         const guideFrameSnapshots = [];
         const guideTrackHidden = !!this.activeScene.guide_track_config?.hidden;
@@ -8956,6 +9789,7 @@ export class EditorWidget {
             selection_start: clampedStart,
             selection_end: clampedEnd,
             prompt,
+            scene_prompt: scenePrompt,
             context_frames: Math.max(preContextFrames, postContextFrames),
             pre_context_frames: preContextFrames,
             post_context_frames: postContextFrames,
@@ -8969,6 +9803,8 @@ export class EditorWidget {
             template_id: this._templateId || "free",
             frame_constraint: this._resolveFrameConstraintForTemplate(this._templateId),
             take_placement_mode: this._settings?.render?.takePlacementMode ?? "trimmed",
+            // Labels toggle frozen for reproducibility (read by the relay bridge)
+            params: { prompt_channel_labels: labelsOn },
         };
     }
 
@@ -9654,6 +10490,10 @@ export class EditorWidget {
                     this.sceneHeight = data.resolution[1] || 512;
                 }
                 this._templateId = getTemplateById(data.template_id, this._settings).id;
+                // Project-durable channel-labels toggle (render-affecting; default true)
+                this._promptChannelLabels = data.metadata?.prompt_channel_labels !== false;
+                // Project-durable section-seam delimiter (render-affecting; default ".")
+                this._promptSectionDelimiter = String(data.metadata?.prompt_section_delimiter ?? ".");
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 this._syncSceneResolutionControls();
                 this._updateViewportHeader();
@@ -10777,6 +11617,8 @@ export class EditorWidget {
         if (this._contextMenuKeyOff) { this._contextMenuKeyOff(); this._contextMenuKeyOff = null; }
         this._hideGuideManagementPopup();
         this._hideGuideHoverPreview();
+        this._hidePromptHoverPreview();
+        if (this._promptPanelHandle) { this._promptPanelHandle.cleanup(); this._promptPanelHandle = null; }
         if (this._contextMenuMouseOff) { this._contextMenuMouseOff(); this._contextMenuMouseOff = null; }
         if (this._focusHandler) {
             document.removeEventListener("mousedown", this._focusHandler, true);
