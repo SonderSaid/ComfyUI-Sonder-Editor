@@ -6,7 +6,7 @@ import {
     resolveFrameConstraintForTemplate,
     updateEditorSettings,
 } from "./editor_settings.js";
-import { installProjectVersionFetchPatch } from "./api_client.js";
+import { installProjectVersionFetchPatch, getProjectVersion } from "./api_client.js";
 import {
     claimEditorSession,
     createEditorHandoff,
@@ -79,6 +79,8 @@ const EDITOR_WIDGET_FIELDS = [
     "mask_pre_offset",
     "mask_post_offset",
     "take_placement_mode",
+    "take_placement_linked",
+    "take_placement_muted",
     "render_queue_active",
 ];
 
@@ -1530,8 +1532,10 @@ export class EditorNodeController {
         for (const name of EDITOR_WIDGET_FIELDS) {
             const fallback = name === "scene_id" ? ""
                 : name === "take_placement_mode" ? "trimmed"
-                    : name === "render_queue_active" ? true
-                        : 0;
+                    : name === "take_placement_linked" ? true
+                        : name === "take_placement_muted" ? false
+                            : name === "render_queue_active" ? true
+                                : 0;
             values[name] = this._getWidgetValue(name, fallback);
         }
         return values;
@@ -1547,6 +1551,9 @@ export class EditorNodeController {
         clearInterval(this._widgetStatePollTimer);
         this._widgetStatePollTimer = null;
         this._widgetStatePollInFlight = false;
+        clearTimeout(this._projectUpdatedDebounceTimer);
+        this._projectUpdatedDebounceTimer = null;
+        this._pendingProjectUpdatedEvent = null;
         this._syncSubscribed = false;
         this._stopOwnerPolling();
         if (this._syncConnection) {
@@ -1753,8 +1760,33 @@ export class EditorNodeController {
 
     _handleProjectUpdatedFromSync(event) {
         if (!event || event.project_id !== this._projectId()) return;
-        this._refreshSummaryThenReloadModules(["project", "assets", "scene", "queue", "preview"], { syncAssets: true });
-        this.fullscreenSession?.refresh(["project", "assets", "scenes", "queue"]);
+        // Debounced self-echo guard (mutation-integrity F4): the WS broadcast of
+        // our own save always arrives BEFORE the mutation response that records
+        // the new version in the client map, so an immediate version compare
+        // misfires every time. Stash the latest event and re-check after 250 ms
+        // (timer re-armed per event, fires once) — by then own-save responses
+        // have landed and the guard filters correctly; event bursts coalesce to
+        // one fanout; genuinely-remote updates (take arrival, queue completion)
+        // refresh with an imperceptible +250 ms. 250 ms is a conscious
+        // hard-code (transport tuning, not a user preference).
+        this._pendingProjectUpdatedEvent = event;
+        clearTimeout(this._projectUpdatedDebounceTimer);
+        this._projectUpdatedDebounceTimer = setTimeout(() => {
+            this._projectUpdatedDebounceTimer = null;
+            const pending = this._pendingProjectUpdatedEvent;
+            this._pendingProjectUpdatedEvent = null;
+            if (!pending || pending.project_id !== this._projectId()) return;
+            const currentVersion = getProjectVersion(pending.project_id);
+            const shouldRefresh = !!(pending.modified_at && pending.modified_at !== currentVersion);
+            this._recordDiagEvent("project_updated_recv", {
+                event_modified_at: pending.modified_at || "",
+                current_version: currentVersion || "",
+                refresh: shouldRefresh,
+            });
+            if (!shouldRefresh) return;
+            this._refreshSummaryThenReloadModules(["project", "assets", "scene", "queue", "preview"], { syncAssets: true });
+            this.fullscreenSession?.refresh(["project", "assets", "scenes", "queue"]);
+        }, 250);
     }
 
     _handleWidgetStateChanged(event) {

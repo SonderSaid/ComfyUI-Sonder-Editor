@@ -1376,6 +1376,8 @@ class SonderSaveVideo:
                 ))
                 frame_count_padding = max(0, context_int("frame_count_padding", 0))
                 take_placement_mode = ctx.get("take_placement_mode", "trimmed")
+                take_placement_linked = ctx.get("take_placement_linked", True) is not False
+                take_placement_muted = bool(ctx.get("take_placement_muted", False))
 
                 mask_pre = max(0, min(actual_pre, context_int("mask_pre_offset", 0)))
                 mask_post = max(0, min(actual_post, context_int("mask_post_offset", 0)))
@@ -1426,11 +1428,13 @@ class SonderSaveVideo:
                     total_source_frames=clip_total_source_frames,
                     source_origin_frame=source_origin_frame,
                     track_index=new_lane,
+                    muted=take_placement_muted,
                     is_generated=True,
                     generation_params=dict(take_generation_params),
                     take_metadata=dict(take_generation_params),
                 )
                 scene.clips.append(clip)
+                placed_audio_track = None
                 if has_audio and audio is not None:
                     audio_filename = f"{os.path.splitext(output_filename)[0]}_audio.wav"
                     audio_rel_path = os.path.join("media", audio_filename)
@@ -1471,19 +1475,33 @@ class SonderSaveVideo:
                                 f"audio invariant: total_source_frames {clip_total_source_frames} != total_frames - padding {max(0, total_frames - frame_count_padding)}"
                             )
 
-                        scene.audio_tracks.append(AudioTrack(
+                        placed_audio_track = AudioTrack(
                             source_path=audio_rel_path,
                             timeline_start_frame=timeline_start_frame,
                             timeline_end_frame=timeline_end_frame,
                             source_in_frame=source_in_frame,
                             total_source_frames=clip_total_source_frames,
                             source_origin_frame=source_origin_frame,
+                            muted=take_placement_muted,
                             lane_index=new_audio_lane,
-                        ))
+                        )
+                        scene.audio_tracks.append(placed_audio_track)
                         logger.info("Take audio auto-placed on lane %d at frames %d-%d", new_audio_lane, timeline_start_frame, timeline_end_frame)
                     except Exception as e:
                         logger.warning("Take mode audio auto-placement failed for %s: %s", output_filename, e)
-                logger.info("Take auto-placed on lane %d at frames %d-%d (mode=%s)", new_lane, timeline_start_frame, timeline_end_frame, take_placement_mode)
+                if take_placement_linked and placed_audio_track is not None:
+                    scene.linked_item_groups.append({
+                        "group_id": uuid.uuid4().hex[:8],
+                        "items": [
+                            {"type": "clip", "id": clip.clip_id},
+                            {"type": "audio", "id": placed_audio_track.track_id},
+                        ],
+                    })
+                logger.info(
+                    "Take auto-placed on lane %d at frames %d-%d (mode=%s linked=%s muted=%s)",
+                    new_lane, timeline_start_frame, timeline_end_frame,
+                    take_placement_mode, take_placement_linked, take_placement_muted,
+                )
             else:
                 logger.warning("Take mode: scene_id '%s' not found, skipping auto-placement", ctx.get("scene_id", ""))
 

@@ -404,6 +404,8 @@ function buildExportPanel(host) {
     const includeVideo = makeCheckboxRow("Include video", settings.includeVideo !== false, "Encode the visible timeline video layers into the export.");
     const includeAudio = makeCheckboxRow("Include audio", settings.includeAudio !== false && host._sceneHasAudio(), "Mix unmuted, visible audio lanes into the export when the scene has audio.");
     const placeAsTake = makeCheckboxRow("Place as take", settings.placeAsTake !== false, "After export, place the video result onto a fresh timeline lane in the active scene.");
+    const linkedTakePlacement = makeCheckboxRow("Link take video + audio", host._settings?.render?.linkedTakePlacement !== false, "When an exported take includes embedded audio, link the placed video and audio items.");
+    const takePlacementMuted = makeCheckboxRow("New take starts muted", !!host._settings?.render?.takePlacementMuted, "Place exported takes muted so they do not affect the active composite until enabled.");
 
     const errorEl = document.createElement("div");
     errorEl.style.cssText = `min-height:16px;font-size:11px;color:${COLORS.warningText};`;
@@ -424,7 +426,7 @@ function buildExportPanel(host) {
     footer.append(cancelBtn, exportBtn);
     panel.appendChild(footer);
 
-    const controls = [sceneRadio, selectionRadio, prefixInput, presetSelect, includeVideo, includeAudio, placeAsTake, ...customControls];
+    const controls = [sceneRadio, selectionRadio, prefixInput, presetSelect, includeVideo, includeAudio, placeAsTake, linkedTakePlacement, takePlacementMuted, ...customControls];
     const syncState = () => {
         syncPresetDescription();
         customPanel.style.display = presetSelect.value === "Custom" ? "grid" : "none";
@@ -432,6 +434,8 @@ function buildExportPanel(host) {
         if (!host._sceneHasAudio()) includeAudio.checked = false;
         placeAsTake.disabled = !includeVideo.checked;
         if (!includeVideo.checked) placeAsTake.checked = false;
+        linkedTakePlacement.disabled = !placeAsTake.checked;
+        takePlacementMuted.disabled = !placeAsTake.checked;
         const valid = includeVideo.checked || includeAudio.checked;
         errorEl.textContent = valid ? "" : "Enable video or audio to export";
         exportBtn.disabled = !valid;
@@ -442,6 +446,7 @@ function buildExportPanel(host) {
     presetSelect.addEventListener("change", syncState);
     includeVideo.addEventListener("change", syncState);
     includeAudio.addEventListener("change", syncState);
+    placeAsTake.addEventListener("change", syncState);
     syncState();
 
     const ui = { errorEl, progressEl, controls, exportBtn, closeBtn, cancelBtn, syncState };
@@ -462,6 +467,12 @@ function buildExportPanel(host) {
             includeAudio: includeAudio.checked,
             placeAsTake: placeAsTake.checked,
         });
+        host._updateSettings({
+            render: {
+                linkedTakePlacement: linkedTakePlacement.checked,
+                takePlacementMuted: takePlacementMuted.checked,
+            },
+        });
         controls.forEach((control) => { control.disabled = true; });
         exportBtn.disabled = true;
         closeBtn.disabled = true;
@@ -479,6 +490,8 @@ function buildExportPanel(host) {
             include_video: includeVideo.checked,
             include_audio: includeAudio.checked,
             place_as_take: placeAsTake.checked,
+            take_placement_linked: linkedTakePlacement.checked,
+            take_placement_muted: takePlacementMuted.checked,
         }, ui);
     });
 

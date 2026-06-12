@@ -107,6 +107,22 @@ export function _renderTimeline(host) {
         host._drawRuler(ctx, width);
         host._drawPlayheadTriangle(ctx, width);
 
+        // Drag-drop new-lane cue: the ruler strip is the explicit
+        // lane-creation drop zone (zone-model targeting).
+        if (host._dropHoverTarget?.kind === "ruler") {
+            ctx.save();
+            ctx.fillStyle = "rgba(99, 179, 237, 0.16)";
+            ctx.fillRect(0, 0, width, rulerH);
+            ctx.strokeStyle = COLORS.accent;
+            ctx.lineWidth = 1;
+            ctx.strokeRect(0.5, 0.5, Math.max(0, width - 1), Math.max(0, rulerH - 1));
+            ctx.fillStyle = COLORS.text;
+            ctx.font = host._canvasSansFont(Math.max(9, Math.round(10 * host._scaleTimeline)), 600);
+            ctx.textAlign = "center";
+            ctx.fillText("Drop here: new lane", width / 2, rulerH / 2 + 4);
+            ctx.restore();
+        }
+
         ctx.save();
         ctx.beginPath();
         ctx.rect(0, rulerH, width, Math.max(0, canvasH - rulerH));
@@ -119,6 +135,7 @@ export function _renderTimeline(host) {
         host._drawPlayheadLine(ctx, width);
         ctx.restore();
 
+        host._drawDragSelectOverlay?.(ctx, width, canvasH);
         host._drawSnapIndicator(ctx, width, canvasH);
         host._drawVerticalScrollbar(ctx, width, canvasH);
         ctx.restore();
@@ -219,6 +236,26 @@ export function _drawTracks(host, ctx, width) {
                     ctx.fillRect(0, y, width, h);
                     ctx.restore();
                 }
+            }
+            if (host._isLaneSelected?.(entry)) {
+                ctx.save();
+                ctx.fillStyle = "rgba(99, 179, 237, 0.16)";
+                ctx.fillRect(0, y, width, h);
+                ctx.strokeStyle = COLORS.accent;
+                ctx.lineWidth = 1;
+                ctx.strokeRect(0.5, y + 0.5, Math.max(0, headerW - 1), Math.max(0, h - 1));
+                ctx.restore();
+            }
+            // Drag-drop landing preview: same visual as lane selection, full-row
+            // outline so the user sees exactly which lane the drop will land on.
+            if (host._dropHoverTarget?.kind === "lane" && host._dropHoverTarget.layoutIdx === i) {
+                ctx.save();
+                ctx.fillStyle = "rgba(99, 179, 237, 0.16)";
+                ctx.fillRect(0, y, width, h);
+                ctx.strokeStyle = COLORS.accent;
+                ctx.lineWidth = 1;
+                ctx.strokeRect(0.5, y + 0.5, Math.max(0, width - 1), Math.max(0, h - 1));
+                ctx.restore();
             }
 
             if (collapsed) {
@@ -422,6 +459,33 @@ export function _drawMutedOverlay(host, ctx, x, y, w, h, label = "Hidden") {
         ctx.restore();
     }
 
+function drawLinkBadge(host, ctx, x, y, w, h, group) {
+        if (w <= 22 || h <= 12) return;
+        // Group identity label (A..Z, AA..) instead of a generic "link" tag;
+        // a group containing a locked member shows a lock glyph in danger color
+        // on EVERY member so effective lock is visible group-wide.
+        const label = (group && host._linkGroupLabel?.(group)) || "link";
+        const locked = !!(group && host._isLinkGroupLocked?.(group));
+        const text = locked ? `🔒${label}` : label;
+        ctx.save();
+        ctx.font = host._canvasSansFont(Math.max(7, Math.round(7 * host._scaleTimeline)), 700);
+        const textW = ctx.measureText(text).width;
+        const badgeW = Math.min(w - 4, Math.max(18, Math.ceil(textW) + 10));
+        const badgeH = Math.min(13, Math.max(10, h - 6));
+        const badgeX = x + w - badgeW - 4;
+        const badgeY = y + 4;
+        ctx.globalAlpha = Math.min(1, ctx.globalAlpha * 0.95);
+        ctx.fillStyle = "rgba(4, 8, 14, 0.68)";
+        ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
+        ctx.strokeStyle = locked ? COLORS.dangerText : COLORS.accent;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(badgeX + 0.5, badgeY + 0.5, badgeW - 1, badgeH - 1);
+        ctx.fillStyle = locked ? COLORS.dangerText : COLORS.text;
+        ctx.textAlign = "center";
+        ctx.fillText(text, badgeX + badgeW / 2, badgeY + badgeH - 3);
+        ctx.restore();
+    }
+
 export function _drawGuideMarkers(host, ctx, width) {
         if (!host.activeScene) return;
         const gi = host._guidesLayoutIdx();
@@ -494,6 +558,10 @@ export function _drawGuideMarkers(host, ctx, width) {
                 ctx.fillRect(labelX, labelY - labelFontSize, labelW, labelH);
                 ctx.fillStyle = isMissingGuide ? COLORS.missingMediaText : (guideHidden ? COLORS.textDim : COLORS.text);
                 ctx.fillText(label, labelX + labelPadX, labelY);
+            }
+            {
+                const linkGroup = host._linkGroupForItem?.({ type: "guide", id: guide.frame_index, data: guide });
+                if (linkGroup) drawLinkBadge(host, ctx, x - markerHalfW - 6, markerTop, markerHalfW * 2 + 12, markerBottom - markerTop, linkGroup);
             }
             ctx.restore();
         }
@@ -671,6 +739,10 @@ export function _drawClips(host, ctx, width) {
                 if (clipMuted) {
                     host._drawMutedOverlay(ctx, x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4, "Hidden");
                 }
+                {
+                    const linkGroup = host._linkGroupForItem?.({ type: "clip", id: clip.clip_id, data: clip });
+                    if (linkGroup) drawLinkBadge(host, ctx, x1 + 1, videoY + 2, x2 - x1 - 2, videoH - 4, linkGroup);
+                }
 
                 // Permanent trim ghost
                 const clipOrigin = clip.source_origin_frame || 0;
@@ -823,6 +895,10 @@ export function _drawClips(host, ctx, width) {
                 if (track.muted) {
                     host._drawMutedOverlay(ctx, x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4, "Muted");
                 }
+                {
+                    const linkGroup = host._linkGroupForItem?.({ type: "audio", id: track.track_id, data: track });
+                    if (linkGroup) drawLinkBadge(host, ctx, x1 + 1, audioY + 2, x2 - x1 - 2, audioH - 4, linkGroup);
+                }
 
                 // Permanent trim ghost for audio
                 const audioOrigin = track.source_origin_frame || 0;
@@ -909,8 +985,10 @@ export function _drawClips(host, ctx, width) {
                     (host._selectedPromptIdx !== null &&
                     host._selectedPromptIdx < sections.length &&
                     sections[host._selectedPromptIdx] === section);
+                const sectionMuted = !!section.muted;
+                const sectionHidden = promptHidden || sectionMuted;
 
-                ctx.globalAlpha = promptHidden ? 0.42 : 1.0;
+                ctx.globalAlpha = sectionHidden ? 0.42 : 1.0;
                 ctx.fillStyle = isSelected ? COLORS.promptSectionSelected : COLORS.promptSection;
                 ctx.fillRect(x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4);
                 host._drawTimelineItemRail(ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, COLORS.lanePrompt);
@@ -932,8 +1010,12 @@ export function _drawClips(host, ctx, width) {
                     ctx.restore();
                 }
                 ctx.globalAlpha = 1.0;
-                if (promptHidden) {
-                    host._drawMutedOverlay(ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, "Hidden");
+                if (sectionHidden) {
+                    host._drawMutedOverlay(ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, sectionMuted ? "Muted" : "Hidden");
+                }
+                {
+                    const linkGroup = host._linkGroupForItem?.({ type: "prompt", id: si, data: section });
+                    if (linkGroup) drawLinkBadge(host, ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, linkGroup);
                 }
 
                 // Trim ghost

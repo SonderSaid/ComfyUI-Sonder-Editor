@@ -132,7 +132,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
     sessionDiagRecord(`${kind}_end`, { marker_id: markerId, ...(payload || {}) });
 }
 
-import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
 import { mountSharedRenderQueue, queueBatchIds } from "./shared_render_queue.js";
@@ -179,7 +179,7 @@ import {
     subscribeEditorSettings,
     updateEditorSettings,
 } from "./editor_settings.js";
-import { fetchProjectJson, rememberProjectVersionFromPayload } from "./api_client.js";
+import { fetchProjectJson, rememberProjectVersionFromPayload, getProjectVersion } from "./api_client.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
 
 function describeKeyboardDebugElement(element) {
@@ -488,9 +488,13 @@ export class EditorWidget {
         // Prompt section state
         this._selectedPromptIdx = null;
 
-        // Selected timeline items: array of { type: "clip"|"guide"|"audio", id: string|number, data: object }
+        // Selected timeline items: array of { type: "clip"|"guide"|"audio"|"prompt", id: string|number, data: object }
         this.selectedItems = [];
         this.selectedItem = null; // Primary (most recently clicked) — used for properties editor
+        this._selectedLanes = [];
+        this._dragSelectRect = null;
+        this._dragSelectBaseItems = [];
+        this._dragSelectBaseLanes = [];
 
         // Razor / trim mode
         this._razorMode = false;
@@ -942,6 +946,12 @@ export class EditorWidget {
         const fetchSeq = ++this._sceneFetchSeq;
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
+            // Version-aware apply (mutation-integrity F2): capture the known
+            // committed version BEFORE the GET — the page fetch patch records
+            // each response's own header version into the shared map before
+            // this await resumes, so a post-fetch read would compare a stale
+            // header against itself and always pass.
+            const knownVersion = getProjectVersion(dirName);
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`));
             if (resp.ok) {
                 const data = await resp.json();
@@ -951,6 +961,29 @@ export class EditorWidget {
                         fetch_seq: fetchSeq,
                         current_seq: this._sceneFetchSeq,
                     });
+                    // A mutation (or newer fetch) invalidated this payload while
+                    // it was in flight; defer a replay so the discarded refresh
+                    // still converges after the queue drains.
+                    this._deferProjectBackedRefresh(["scenes"], "scene_refresh_stale_replay");
+                    return;
+                }
+                // Commit-order race guard: a GET served by the backend BEFORE
+                // our latest mutation committed can resolve after every client
+                // gate has reopened. Discard payloads strictly OLDER than the
+                // version we already held when dispatching; equal passes, so
+                // the post-drain replay always applies (no starvation).
+                const headerProjectId = resp.headers.get("X-Sonder-Project-Id") || "";
+                const headerVersion = resp.headers.get("X-Sonder-Project-Modified-At") || "";
+                const compareVersion = headerProjectId && headerProjectId !== dirName
+                    ? (getProjectVersion(headerProjectId) || knownVersion)
+                    : knownVersion;
+                if (headerVersion && compareVersion && headerVersion < compareVersion) {
+                    sessionDiagRecord("scene_refresh_stale_version", {
+                        reason,
+                        header_version: headerVersion,
+                        known_version: compareVersion,
+                    });
+                    this._deferProjectBackedRefresh(["scenes"], "scene_refresh_stale_version_replay");
                     return;
                 }
                 if (this._shouldDeferSceneRefresh({ ignoreMutationGate })) {
@@ -1013,7 +1046,7 @@ export class EditorWidget {
 
         if (!isSameScene) {
             if (this._animaticMode && this._restoreAnimaticState()) {
-                this._saveLaneConfig();
+                this._saveLaneConfig(this._trackLayout.filter((e) => e.type === TRACK_TYPE.VIDEO));
             }
             this._animaticMode = false;
             this._preAnimaticHidden = null;
@@ -1714,7 +1747,15 @@ export class EditorWidget {
     }
 
     _replayDeferredProjectBackedRefresh() {
-        if (this._destroyed || this._hasPendingProjectMutations()) return;
+        if (this._destroyed) return;
+        if (this._hasPendingProjectMutations()) {
+            // Flicker-audit fix #3 (2026-06-11): a mutation enqueued between
+            // drain-resolve and replay used to strand the deferred keys with
+            // _pendingProjectRefreshDrain stuck true, so no future drain waiter
+            // was ever scheduled. Re-arm instead; converges when the queue idles.
+            this._projectMutationQueue?.drain?.("deferred_replay_rearm").then(() => this._replayDeferredProjectBackedRefresh());
+            return;
+        }
         const keys = this._pendingProjectRefreshKeys;
         this._pendingProjectRefreshKeys = null;
         this._pendingProjectRefreshDrain = false;
@@ -1786,6 +1827,12 @@ export class EditorWidget {
         refreshScenes = true,
         reconcileFromResult = null,
     }) {
+        // Flicker-audit fix #1 (2026-06-11): invalidate any in-flight scenes GET
+        // the moment a mutation is enqueued — its payload predates this local
+        // intent and must never apply (the _fetchScenes seq check discards it at
+        // apply time; the discard path defers a replay so state still converges).
+        // The reconcile path's bump only covers refreshScenes:true mutations.
+        this._sceneFetchSeq += 1;
         const promise = this._projectMutationQueue.enqueue({
             key,
             label,
@@ -1805,6 +1852,12 @@ export class EditorWidget {
             },
             (error) => {
                 console.warn(`[Sonder] Project mutation failed (${label || key}):`, error);
+                // Notification-rule compliance (mutation-integrity F6): a finally-
+                // dropped mutation is silent data loss without this. Conscious
+                // omission of onRetry — failure paths auto-resync to authoritative
+                // state, so a retry would re-issue stale intent; source-coalesced
+                // so a burst of failures yields one counted toast.
+                notifyError(`${label || "Project change"} failed — timeline restored.`, { source: "project-mutation-failed" });
                 if (refreshScenes) this._deferProjectBackedRefresh(["scenes"], `${label || key}_error`);
             }
         );
@@ -2042,6 +2095,7 @@ export class EditorWidget {
         if (!Number.isFinite(oldFrame) || !Number.isFinite(newFrame)) return null;
         const moved = {
             ...(guideData || {}),
+            guide_id: fields.guide_id ?? guideData?.guide_id ?? this._newLocalItemId("guide"),
             frame_index: newFrame,
             asset_id: fields.asset_id ?? guideData?.asset_id ?? "",
             source: fields.source ?? guideData?.source ?? "asset",
@@ -2054,6 +2108,7 @@ export class EditorWidget {
         this.activeScene.guide_frames.push(moved);
         this.activeScene.guide_frames.sort((a, b) => (a.frame_index || 0) - (b.frame_index || 0));
         this._remapSelectedItem("guide", oldFrame, newFrame, moved);
+        this._pruneLocalLinkedGroups();
         return moved;
     }
 
@@ -2062,6 +2117,7 @@ export class EditorWidget {
         const frameIndex = parseInt(fields.frame_index, 10);
         if (!Number.isFinite(frameIndex)) return null;
         const guide = {
+            guide_id: fields.guide_id || this._newLocalItemId("guide"),
             frame_index: frameIndex,
             asset_id: fields.asset_id || "",
             source: fields.source || "asset",
@@ -2072,6 +2128,7 @@ export class EditorWidget {
             .filter((current) => current.frame_index !== frameIndex);
         this.activeScene.guide_frames.push(guide);
         this.activeScene.guide_frames.sort((a, b) => (a.frame_index || 0) - (b.frame_index || 0));
+        this._pruneLocalLinkedGroups();
         return guide;
     }
 
@@ -2079,11 +2136,13 @@ export class EditorWidget {
         if (!this.activeScene) return null;
         const channels = normalizeChannels(fields.channels, fields.prompt || "");
         const section = {
+            prompt_id: fields.prompt_id || this._newLocalItemId("prompt"),
             start_frame: parseInt(fields.start_frame, 10) || 0,
             end_frame: parseInt(fields.end_frame, 10) || 0,
             channels,
             // Label-free composed mirror, matching backend to_dict
             prompt: composeSectionText(channels, false),
+            muted: !!fields.muted,
         };
         this.activeScene.prompt_sections = this.activeScene.prompt_sections || [];
         this.activeScene.prompt_sections.push(section);
@@ -2104,6 +2163,7 @@ export class EditorWidget {
             section.channels = normalizeChannels(null, prompt);
             section.prompt = composeSectionText(section.channels, false);
         }
+        if (fields.prompt_id && !section.prompt_id) section.prompt_id = fields.prompt_id;
         this.activeScene.prompt_sections.sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
         return section;
     }
@@ -2113,6 +2173,7 @@ export class EditorWidget {
         if (index < 0 || index >= this.activeScene.prompt_sections.length) return false;
         this.activeScene.prompt_sections.splice(index, 1);
         if (this._selectedPromptIdx === index) this._selectedPromptIdx = null;
+        this._pruneLocalLinkedGroups();
         return true;
     }
 
@@ -2168,6 +2229,7 @@ export class EditorWidget {
         for (const lane of Array.from(new Set(audioLanes)).sort((a, b) => b - a)) {
             this._compactEmptyMediaLaneLocal("audio", lane);
         }
+        this._pruneLocalLinkedGroups();
         return true;
     }
 
@@ -3202,6 +3264,226 @@ export class EditorWidget {
         return false;
     }
 
+    _newLocalItemId(prefix = "item") {
+        return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+    }
+
+    _linkableItemTypes() {
+        return new Set(["clip", "audio", "guide", "prompt"]);
+    }
+
+    _selectionItemKey(item) {
+        return `${item?.type || ""}:${String(item?.id ?? "")}`;
+    }
+
+    _linkRefKey(ref) {
+        return `${ref?.type || ""}:${String(ref?.id ?? "")}`;
+    }
+
+    _linkRefForItem(item) {
+        if (!item || !this._linkableItemTypes().has(item.type)) return null;
+        const data = item.data || {};
+        if (item.type === "clip") return { type: "clip", id: String(data.clip_id ?? item.id ?? "") };
+        if (item.type === "audio") return { type: "audio", id: String(data.track_id ?? item.id ?? "") };
+        if (item.type === "guide") return { type: "guide", id: String(data.guide_id ?? item.id ?? data.frame_index ?? "") };
+        if (item.type === "prompt") return { type: "prompt", id: String(data.prompt_id ?? item.id ?? "") };
+        return null;
+    }
+
+    _findSceneItemForLinkRef(ref) {
+        if (!this.activeScene || !ref) return null;
+        const itemType = String(ref.type || "");
+        const itemId = String(ref.id ?? "");
+        if (itemType === "clip") {
+            const clip = (this.activeScene.clips || []).find((item) => String(item.clip_id) === itemId);
+            return clip ? { type: "clip", id: clip.clip_id, data: clip } : null;
+        }
+        if (itemType === "audio") {
+            const track = (this.activeScene.audio_tracks || []).find((item) => String(item.track_id) === itemId);
+            return track ? { type: "audio", id: track.track_id, data: track } : null;
+        }
+        if (itemType === "guide") {
+            const guide = (this.activeScene.guide_frames || []).find((item) =>
+                String(item.guide_id || "") === itemId || String(item.frame_index) === itemId
+            );
+            return guide ? { type: "guide", id: guide.frame_index, data: guide } : null;
+        }
+        if (itemType === "prompt") {
+            const sections = this.activeScene.prompt_sections || [];
+            const idx = sections.findIndex((item, index) =>
+                String(item.prompt_id || "") === itemId || String(index) === itemId
+            );
+            return idx >= 0 ? { type: "prompt", id: idx, data: sections[idx] } : null;
+        }
+        return null;
+    }
+
+    _linkGroupForItem(item) {
+        const ref = this._linkRefForItem(item);
+        if (!ref) return null;
+        const key = this._linkRefKey(ref);
+        return (this.activeScene?.linked_item_groups || []).find((group) =>
+            (group?.items || []).some((candidate) => this._linkRefKey(candidate) === key)
+        ) || null;
+    }
+
+    _isLinkedItem(item) {
+        return !!this._linkGroupForItem(item);
+    }
+
+    /** Stable display label for a link group: A..Z, AA, AB... by group order. */
+    _linkGroupLabel(group) {
+        if (!group) return "";
+        const groups = this.activeScene?.linked_item_groups || [];
+        let idx = groups.indexOf(group);
+        if (idx < 0 && group.group_id) {
+            idx = groups.findIndex((candidate) => candidate?.group_id === group.group_id);
+        }
+        if (idx < 0) return "";
+        let label = "";
+        let n = idx + 1;
+        while (n > 0) {
+            label = String.fromCharCode(65 + ((n - 1) % 26)) + label;
+            n = Math.floor((n - 1) / 26);
+        }
+        return label;
+    }
+
+    /** A link group is effectively locked when any member sits on a locked lane/track. */
+    _isLinkGroupLocked(group) {
+        if (!group) return false;
+        return (group.items || []).some((ref) => {
+            const item = this._findSceneItemForLinkRef(ref);
+            return item ? this._isItemLocked(item) : false;
+        });
+    }
+
+    _expandItemsWithLinked(items = this.selectedItems) {
+        const expanded = [];
+        const seen = new Set();
+        const addHit = (hit) => {
+            if (!hit) return;
+            const key = this._selectionItemKey(hit);
+            if (seen.has(key)) return;
+            expanded.push(hit);
+            seen.add(key);
+        };
+        for (const item of items || []) {
+            const current = this._findSceneItemBySelection(item.type, item.id) || item;
+            addHit(current);
+            const group = this._linkGroupForItem(current);
+            for (const ref of group?.items || []) {
+                addHit(this._findSceneItemForLinkRef(ref));
+            }
+        }
+        return expanded;
+    }
+
+    _expandedLinkedRefs(items = this.selectedItems) {
+        const refs = [];
+        const seen = new Set();
+        for (const item of this._expandItemsWithLinked(items)) {
+            const ref = this._linkRefForItem(item);
+            if (!ref) continue;
+            const key = this._linkRefKey(ref);
+            if (seen.has(key)) continue;
+            refs.push(ref);
+            seen.add(key);
+        }
+        return refs;
+    }
+
+    _selectedLinkableItems() {
+        return (this.selectedItems || []).filter((item) => item && this._linkableItemTypes().has(item.type));
+    }
+
+    _mutationItemFromSelection(item) {
+        if (!item) return null;
+        if (item.type === "guide") {
+            return {
+                type: "guide",
+                id: item.id,
+                expected: {
+                    frame_index: item.data?.frame_index ?? item.id,
+                    asset_id: item.data?.asset_id || "",
+                    guide_id: item.data?.guide_id || "",
+                },
+            };
+        }
+        if (item.type === "prompt") {
+            return {
+                type: "prompt",
+                id: item.id,
+                expected: {
+                    start_frame: item.data?.start_frame,
+                    end_frame: item.data?.end_frame,
+                    prompt_id: item.data?.prompt_id || "",
+                },
+            };
+        }
+        if (item.type === "clip" || item.type === "audio") {
+            return { type: item.type, id: item.id };
+        }
+        return null;
+    }
+
+    _pruneLocalLinkedGroups() {
+        if (!this.activeScene) return;
+        const groups = this.activeScene.linked_item_groups || [];
+        const next = [];
+        for (const group of groups) {
+            const items = [];
+            const seen = new Set();
+            for (const ref of group?.items || []) {
+                const hit = this._findSceneItemForLinkRef(ref);
+                if (!hit) continue;
+                const stableRef = this._linkRefForItem(hit);
+                if (!stableRef) continue;
+                const key = this._linkRefKey(stableRef);
+                if (seen.has(key)) continue;
+                items.push(stableRef);
+                seen.add(key);
+            }
+            if (items.length >= 2) next.push({ group_id: group.group_id || this._newLocalItemId("link"), items });
+        }
+        this.activeScene.linked_item_groups = next;
+    }
+
+    _laneRefForEntry(entry) {
+        if (!entry || !this._isHeaderControllableTrackType(entry.type)) return null;
+        return {
+            type: entry.type,
+            laneIndex: this._isLaneTrackType(entry.type) ? (entry.laneIndex || 0) : 0,
+        };
+    }
+
+    _laneRefKey(ref) {
+        return `${ref?.type || ""}:${Number(ref?.laneIndex || 0)}`;
+    }
+
+    _isLaneSelected(entryOrRef) {
+        const ref = entryOrRef?.type ? this._laneRefForEntry(entryOrRef) || entryOrRef : null;
+        if (!ref) return false;
+        const key = this._laneRefKey(ref);
+        return (this._selectedLanes || []).some((candidate) => this._laneRefKey(candidate) === key);
+    }
+
+    _clearLaneSelection() {
+        this._selectedLanes = [];
+    }
+
+    _setSelectedLanes(lanes = []) {
+        const next = [];
+        const seen = new Set();
+        for (const lane of lanes || []) {
+            const key = this._laneRefKey(lane);
+            if (!lane?.type || seen.has(key)) continue;
+            next.push({ type: lane.type, laneIndex: Number(lane.laneIndex || 0) });
+            seen.add(key);
+        }
+        this._selectedLanes = next;
+    }
+
     _isRenderClip(clip) {
         return !clip?.role || clip.role === "render";
     }
@@ -3248,7 +3530,7 @@ export class EditorWidget {
             this._animaticMode = true;
         }
 
-        await this._saveLaneConfig();
+        await this._saveLaneConfig(this._trackLayout.filter((e) => e.type === TRACK_TYPE.VIDEO));
         this._renderTimeline();
         this._renderViewportFrame();
         this._updateToolbar();
@@ -3530,6 +3812,8 @@ export class EditorWidget {
     _syncTakePlacementModeWidget(settings = this._settings) {
         const mode = settings?.render?.takePlacementMode === "untrimmed" ? "untrimmed" : "trimmed";
         this._setWidgetValue("take_placement_mode", mode);
+        this._setWidgetValue("take_placement_linked", settings?.render?.linkedTakePlacement !== false);
+        this._setWidgetValue("take_placement_muted", !!settings?.render?.takePlacementMuted);
     }
 
     _trackCollapseSceneKey(scene = this.activeScene) {
@@ -4077,20 +4361,25 @@ export class EditorWidget {
     _findSceneItemBySelection(type, id) {
         if (!this.activeScene) return null;
         if (type === "clip") {
-            const clip = (this.activeScene.clips || []).find((item) => item.clip_id === id);
+            const clip = (this.activeScene.clips || []).find((item) => String(item.clip_id) === String(id));
             return clip ? { type, id, data: clip } : null;
         }
         if (type === "audio") {
-            const track = (this.activeScene.audio_tracks || []).find((item) => item.track_id === id);
+            const track = (this.activeScene.audio_tracks || []).find((item) => String(item.track_id) === String(id));
             return track ? { type, id, data: track } : null;
         }
         if (type === "guide") {
-            const guide = (this.activeScene.guide_frames || []).find((item) => item.frame_index === id);
-            return guide ? { type, id, data: guide } : null;
+            const guide = (this.activeScene.guide_frames || []).find((item) =>
+                String(item.frame_index) === String(id) || String(item.guide_id || "") === String(id)
+            );
+            return guide ? { type, id: guide.frame_index, data: guide } : null;
         }
         if (type === "prompt") {
-            const section = (this.activeScene.prompt_sections || [])[id];
-            return section ? { type, id, data: section } : null;
+            const sections = this.activeScene.prompt_sections || [];
+            const idx = sections.findIndex((item, index) =>
+                String(index) === String(id) || String(item.prompt_id || "") === String(id)
+            );
+            return idx >= 0 ? { type, id: idx, data: sections[idx] } : null;
         }
         return null;
     }
@@ -4137,6 +4426,7 @@ export class EditorWidget {
 
     /** Select a single item (replaces selection). */
     _selectItem(hit) {
+        this._clearLaneSelection();
         this.selectedItems = [hit];
         this.selectedItem = hit;
     }
@@ -4152,6 +4442,7 @@ export class EditorWidget {
 
     /** Toggle an item in the selection (Ctrl+click). */
     _toggleSelectItem(hit) {
+        this._clearLaneSelection();
         const idx = this.selectedItems.findIndex(s => s.type === hit.type && s.id === hit.id);
         if (idx >= 0) {
             this.selectedItems.splice(idx, 1);
@@ -4164,6 +4455,7 @@ export class EditorWidget {
 
     /** Add an item to the selection (Shift+click). */
     _addToSelection(hit) {
+        this._clearLaneSelection();
         if (!this._isSelected(hit.type, hit.id)) {
             this.selectedItems.push(hit);
         } else {
@@ -4171,6 +4463,192 @@ export class EditorWidget {
             return;
         }
         this.selectedItem = hit;
+    }
+
+    _dedupeSelectionItems(items = []) {
+        const next = [];
+        const seen = new Set();
+        for (const item of items || []) {
+            if (!item) continue;
+            const key = this._selectionItemKey(item);
+            if (seen.has(key)) continue;
+            next.push(item);
+            seen.add(key);
+        }
+        return next;
+    }
+
+    _startItemDragSelect(x, rawY, event) {
+        const additive = !!(event?.shiftKey || event?.ctrlKey || event?.metaKey);
+        this.isDragging = true;
+        this.dragType = "boxSelect";
+        this._dragSelectRect = {
+            kind: "items",
+            startX: x,
+            startRawY: rawY,
+            currentX: x,
+            currentRawY: rawY,
+            additive,
+            activated: false,
+        };
+        this._dragSelectBaseItems = additive ? [...(this.selectedItems || [])] : [];
+        this._clearLaneSelection();
+        if (!additive) {
+            this._clearSelection();
+            this._hideItemEditor();
+            this._hidePromptEditor();
+        }
+    }
+
+    _startLaneDragSelect(headerHit, rawY, event) {
+        const additive = !!(event?.shiftKey || event?.ctrlKey || event?.metaKey);
+        this.isDragging = true;
+        this.dragType = "laneSelect";
+        this._dragSelectRect = {
+            kind: "lanes",
+            startX: 0,
+            startRawY: rawY,
+            currentX: this._labelW,
+            currentRawY: rawY,
+            additive,
+            activated: false,
+        };
+        this._dragSelectBaseLanes = additive ? [...(this._selectedLanes || [])] : [];
+        this._clearSelection();
+        this._hideItemEditor();
+        this._hidePromptEditor();
+        const entry = this._trackLayout[headerHit?.layoutIdx];
+        const ref = this._laneRefForEntry(entry);
+        this._setSelectedLanes(ref ? [...this._dragSelectBaseLanes, ref] : this._dragSelectBaseLanes);
+    }
+
+    _timelineItemsInRect(rect) {
+        if (!this.activeScene || !rect) return [];
+        const minX = Math.min(rect.startX, rect.currentX);
+        const maxX = Math.max(rect.startX, rect.currentX);
+        const minY = Math.min(rect.startRawY, rect.currentRawY);
+        const maxY = Math.max(rect.startRawY, rect.currentRawY);
+        if (maxX < this._labelW) return [];
+        const intersectsRow = (layoutIdx) => {
+            if (layoutIdx < 0 || this._trackLayout[layoutIdx]?.collapsed) return false;
+            const top = this._trackY(layoutIdx) - this.scrollY;
+            const bottom = top + this._trackH(layoutIdx);
+            return top <= maxY && bottom >= minY;
+        };
+        const intersectsFrames = (startFrame, endFrame) => {
+            const x1 = this._frameToX(startFrame);
+            const x2 = this._frameToX(endFrame);
+            return x1 <= maxX && x2 >= minX;
+        };
+        const hits = [];
+        for (const clip of (this.activeScene.clips || [])) {
+            const layoutIdx = this._isMotionDriverClip(clip)
+                ? this._motionDriverLaneLayoutIdx(clip.track_index || 0)
+                : this._videoLaneLayoutIdx(clip.track_index || 0);
+            if (intersectsRow(layoutIdx) && intersectsFrames(clip.timeline_start_frame || 0, clip.timeline_end_frame || 0)) {
+                hits.push({ type: "clip", id: clip.clip_id, data: clip });
+            }
+        }
+        for (const track of (this.activeScene.audio_tracks || [])) {
+            const layoutIdx = this._audioLaneLayoutIdx(track.lane_index || 0);
+            if (intersectsRow(layoutIdx) && intersectsFrames(track.timeline_start_frame || 0, track.timeline_end_frame || 0)) {
+                hits.push({ type: "audio", id: track.track_id, data: track });
+            }
+        }
+        const guideIdx = this._guidesLayoutIdx();
+        if (intersectsRow(guideIdx)) {
+            for (const guide of (this.activeScene.guide_frames || [])) {
+                const frame = guide.frame_index === -1 ? Math.max(0, this.totalFrames - 1) : guide.frame_index;
+                const x = this._frameToX(frame);
+                if (x + 10 >= minX && x - 10 <= maxX) {
+                    hits.push({ type: "guide", id: guide.frame_index, data: guide });
+                }
+            }
+        }
+        const promptIdx = this._promptLayoutIdx();
+        if (intersectsRow(promptIdx)) {
+            const sections = this.activeScene.prompt_sections || [];
+            for (let i = 0; i < sections.length; i++) {
+                const section = sections[i];
+                if (intersectsFrames(section.start_frame || 0, section.end_frame || 0)) {
+                    hits.push({ type: "prompt", id: i, data: section });
+                }
+            }
+        }
+        // Locked items are not selectable by any gesture (locked-selection rule);
+        // box select skips them like background.
+        return this._dedupeSelectionItems(hits.filter((hit) => !this._isItemLocked(hit)));
+    }
+
+    _lanesInRawRange(rect) {
+        if (!rect) return [];
+        const minY = Math.min(rect.startRawY, rect.currentRawY);
+        const maxY = Math.max(rect.startRawY, rect.currentRawY);
+        const lanes = [];
+        for (let i = 0; i < (this._trackLayout || []).length; i++) {
+            const entry = this._trackLayout[i];
+            if (!this._isHeaderControllableTrackType(entry.type)) continue;
+            const top = this._trackY(i) - this.scrollY;
+            const bottom = top + this._trackH(i);
+            if (top <= maxY && bottom >= minY) {
+                const ref = this._laneRefForEntry(entry);
+                if (ref) lanes.push(ref);
+            }
+        }
+        return lanes;
+    }
+
+    _updateDragSelect(x, rawY) {
+        const rect = this._dragSelectRect;
+        if (!rect) return;
+        rect.currentX = x;
+        rect.currentRawY = rawY;
+        if (Math.abs(rect.currentX - rect.startX) > 3 || Math.abs(rect.currentRawY - rect.startRawY) > 3) {
+            rect.activated = true;
+        }
+        if (rect.kind === "lanes") {
+            this._setSelectedLanes([...(this._dragSelectBaseLanes || []), ...this._lanesInRawRange(rect)]);
+            return;
+        }
+        if (rect.kind === "items") {
+            const hits = rect.activated ? this._timelineItemsInRect(rect) : [];
+            const next = rect.additive ? [...(this._dragSelectBaseItems || []), ...hits] : hits;
+            this.selectedItems = this._dedupeSelectionItems(next);
+            this.selectedItem = this.selectedItems[this.selectedItems.length - 1] || null;
+        }
+    }
+
+    _finishDragSelect() {
+        const rect = this._dragSelectRect;
+        if (rect?.kind === "items" && !rect.activated && !rect.additive) {
+            this._clearSelection();
+        }
+        this._dragSelectRect = null;
+        this._dragSelectBaseItems = [];
+        this._dragSelectBaseLanes = [];
+        this._updateToolbar();
+    }
+
+    _drawDragSelectOverlay(ctx, width, height) {
+        const rect = this._dragSelectRect;
+        if (!rect) return;
+        const x1 = rect.kind === "lanes" ? 0 : Math.min(rect.startX, rect.currentX);
+        const x2 = rect.kind === "lanes" ? this._labelW : Math.max(rect.startX, rect.currentX);
+        const y1 = Math.min(rect.startRawY, rect.currentRawY);
+        const y2 = Math.max(rect.startRawY, rect.currentRawY);
+        if (x2 - x1 < 1 || y2 - y1 < 1) return;
+        ctx.save();
+        ctx.fillStyle = "rgba(99, 179, 237, 0.16)";
+        ctx.strokeStyle = COLORS.accent;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 3]);
+        const drawX = Math.max(0, x1);
+        const drawY = Math.max(0, y1);
+        const drawW = Math.max(0, Math.min(width, x2) - drawX);
+        const drawH = Math.max(0, Math.min(height, y2) - drawY);
+        ctx.fillRect(drawX, drawY, drawW, drawH);
+        ctx.strokeRect(drawX + 0.5, drawY + 0.5, drawW, drawH);
+        ctx.restore();
     }
 
     /** Snap a frame to nearby edges (clip edges, guide frames, playhead, selection bounds).
@@ -4290,19 +4768,30 @@ export class EditorWidget {
             } else if (this._hitTestTrackHeader(x, rawY)) {
                 const headerHit = this._hitTestTrackHeader(x, rawY);
                 const entry = this._trackLayout[headerHit.layoutIdx];
+                // Bulk apply (#18): when the clicked lane is part of the lane
+                // selection, collapse/lock/hide apply the clicked lane's NEW
+                // state uniformly to every selected lane. Manage/label/rename
+                // keep single-lane behavior.
+                const bulkEntries = this._isLaneSelected(entry)
+                    ? (this._trackLayout || []).filter((candidate) => this._isLaneSelected(candidate))
+                    : [entry];
                 switch (headerHit.zone) {
-                    case "collapse":
-                        entry.collapsed = !entry.collapsed;
+                    case "collapse": {
+                        const nextCollapsed = !entry.collapsed;
+                        for (const target of bulkEntries) target.collapsed = nextCollapsed;
                         this._persistTrackCollapseState();
                         break;
-                    case "lock":
+                    }
+                    case "lock": {
                         this._pushUndo("toggle track lock");
-                        entry.locked = !entry.locked;
-                        this._saveLaneConfig();
+                        const nextLocked = !entry.locked;
+                        for (const target of bulkEntries) target.locked = nextLocked;
+                        this._saveLaneConfig(bulkEntries);
                         break;
+                    }
                     case "hide":
                         this._pushUndo("toggle track visibility");
-                        void this._toggleHeaderVisibility(entry);
+                        void this._applyHeaderVisibilityBulk(bulkEntries, this._trackVisibilityState(entry) === "visible");
                         break;
                     case "manage":
                         if (entry.type === TRACK_TYPE.GUIDES) {
@@ -4310,6 +4799,9 @@ export class EditorWidget {
                         } else if (entry.type === TRACK_TYPE.PROMPT || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
                             this._showPromptManagementPanel();
                         }
+                        break;
+                    case "label":
+                        this._startLaneDragSelect(headerHit, rawY, e);
                         break;
                 }
                 this._renderTimeline();
@@ -4319,7 +4811,7 @@ export class EditorWidget {
                 if (this._razorMode) {
                     // Razor mode: split clip or audio at click position
                     const hit = this._hitTestItem(x, rawY);
-                    if (hit && (hit.type === "clip" || hit.type === "audio")) {
+                    if (hit && (hit.type === "clip" || hit.type === "audio" || hit.type === "prompt")) {
                         this._splitClipAtFrame(hit, frame);
                     }
                     return;
@@ -4360,6 +4852,11 @@ export class EditorWidget {
 
                     // Check if clicking on a timeline item
                     const hit = this._hitTestItem(x, rawY);
+                    // Locked items are not selectable by any gesture (locked-selection
+                    // rule): clicking one is a no-op rather than a select-then-refuse.
+                    if (hit && hit.type !== "prompt_global" && this._isItemLocked(hit)) {
+                        return;
+                    }
                     if (hit && hit.type === "prompt_global") {
                         // Global prompt lane: one non-draggable full-width item.
                         // Single click is a no-op (matching section semantics);
@@ -4383,6 +4880,8 @@ export class EditorWidget {
                             // Plain click on already-selected item = keep selection (for drag)
                             this._refreshSelectedHit(hit);
                         }
+                        this.selectedItems = this._expandItemsWithLinked(this.selectedItems);
+                        this.selectedItem = this._findSceneItemBySelection(hit.type, hit.id) || hit;
                         this._hideItemEditor(); // Will show on mouseup if no drag
                         // Block drag if any selected item is on a locked lane
                         const anyLocked = this.selectedItems.some(s => this._isItemLocked(s));
@@ -4392,9 +4891,11 @@ export class EditorWidget {
                         this.dragType = "moveItem";
                         this._dragStartFrame = frame;
                         this._lastSnappedDelta = 0; // Track snapped delta for commit
+                        this._dragLastValidDelta = 0; // Group hold delta (linked collision)
                         this._dragItemOrigStart = hit.data.timeline_start_frame ?? hit.data.start_frame ?? hit.data.frame_index ?? 0;
                         this._dragItemOrigEnd = hit.data.timeline_end_frame ?? hit.data.end_frame ?? this._dragItemOrigStart;
                         // Anchor lane/type for per-item lane-delta calculation (#15)
+                        this._dragAnchorType = hit.type;
                         this._dragAnchorId = hit.id;
                         this._dragAnchorOrigLane = hit.type === "clip" ? (hit.data.track_index || 0)
                             : (hit.type === "audio" ? (hit.data.lane_index || 0) : 0);
@@ -4440,8 +4941,7 @@ export class EditorWidget {
                         this._dragPromptHold = null;
                     } else {
                         // Click on empty space — deselect all
-                        this._clearSelection();
-                        this._hideItemEditor();
+                        this._startItemDragSelect(x, rawY, e);
                     }
                 }
             }
@@ -4495,6 +4995,12 @@ export class EditorWidget {
                 } else {
                     this._labelWidthUser = baseW;
                 }
+                this._renderTimeline();
+                return;
+            }
+            if (this.dragType === "boxSelect" || this.dragType === "laneSelect") {
+                canvas.style.cursor = this.dragType === "laneSelect" ? "default" : "crosshair";
+                this._updateDragSelect(x, rawY);
                 this._renderTimeline();
                 return;
             }
@@ -4566,7 +5072,21 @@ export class EditorWidget {
                 }
                 const primaryNewStart = Math.max(0, this._dragItemOrigStart + rawDelta);
                 const snappedStart = this._snapFrame(primaryNewStart, excludeIds, excludeFrames);
-                const frameDelta = snappedStart - this._dragItemOrigStart;
+                let frameDelta = snappedStart - this._dragItemOrigStart;
+                // Group-bounded delta (linked-collision follow-up): every dragged
+                // member shares ONE delta, so a member pinned at a scene bound
+                // stops the whole group instead of letting relative offsets drift.
+                for (const orig of (this._dragItemsOrig || [])) {
+                    if (orig.type === "clip" || orig.type === "audio") {
+                        frameDelta = Math.max(frameDelta, -orig.origStart);
+                    } else if (orig.type === "guide") {
+                        frameDelta = Math.max(frameDelta, -orig.origStart);
+                        frameDelta = Math.min(frameDelta, (this.totalFrames - 1) - orig.origStart);
+                    } else if (orig.type === "prompt") {
+                        frameDelta = Math.max(frameDelta, -orig.origStart);
+                        frameDelta = Math.min(frameDelta, this.totalFrames - orig.origEnd);
+                    }
+                }
                 this._lastSnappedDelta = frameDelta;
 
                 // Detect lane from Y position for cross-lane drag
@@ -4724,6 +5244,7 @@ export class EditorWidget {
                     }
                     this._dragLastValidProposed = proposed;
                     this._dragLastValidSwapTarget = swapTarget;
+                    this._dragLastValidDelta = frameDelta;
                     this._dragLaneChanged = (effectiveLaneDelta !== 0) || swapTarget != null;
                 } else if (this._dragLastValidProposed) {
                     // Hold preview at last valid frame — replay it
@@ -4746,14 +5267,20 @@ export class EditorWidget {
                 }
                 // (else no prior valid state — items already restored to origLane/origStart above)
 
-                // Non-clip/audio items move directly per frameDelta
+                // Linked-collision hold: when clip/audio members are held at the
+                // last valid frame, guides/prompts must hold WITH them — and the
+                // commit delta must match the held preview, not the live cursor.
+                const effectiveDelta = allFitsValid ? frameDelta : (this._dragLastValidDelta ?? 0);
+                if (!allFitsValid) this._lastSnappedDelta = effectiveDelta;
+
+                // Non-clip/audio items move per the shared effective delta
                 for (const orig of (this._dragItemsOrig || [])) {
                     if (orig.type === "guide") {
-                        const newIdx = Math.max(0, Math.min(this.totalFrames - 1, orig.origStart + frameDelta));
+                        const newIdx = Math.max(0, Math.min(this.totalFrames - 1, orig.origStart + effectiveDelta));
                         orig.data._previewFrameIndex = newIdx;
                     }
                 }
-                this._previewPromptDrag(frameDelta, x, rawY);
+                this._previewPromptDrag(effectiveDelta, x, rawY);
             }
 
             this._renderTimeline();
@@ -4778,6 +5305,9 @@ export class EditorWidget {
                 this._renderTimeline();
                 this._flushDeferredDragState();
                 return;
+            } else if (wasDragType === "boxSelect" || wasDragType === "laneSelect") {
+                this._finishDragSelect();
+                canvas.style.cursor = "crosshair";
             } else if (wasDragType === "trimEdge" && this._trimItem) {
                 // Commit trim to server
                 commitPromise = this._commitTrim(this._trimItem);
@@ -4820,6 +5350,8 @@ export class EditorWidget {
                 this._dragSwapTarget = null;
                 this._dragLastValidProposed = null;
                 this._dragLastValidSwapTarget = null;
+                this._dragLastValidDelta = null;
+                this._dragAnchorType = null;
                 this._dragAnchorId = null;
                 this._dragAnchorOrigLane = 0;
                 this._dragAnchorTrackType = "";
@@ -4866,27 +5398,38 @@ export class EditorWidget {
             }
         }, { passive: false });
 
-        // Drop assets onto timeline
+        // Drop assets onto timeline. The dragover cursor + lane highlight are a
+        // best-effort landing preview: same-page gallery drags are type-aware via
+        // getActiveDragAsset() (browsers block getData() during dragover); foreign
+        // drags fall back to a generic media-lane highlight. The authoritative
+        // accept/refuse stays in _handleAssetDrop.
         canvas.addEventListener("dragover", (e) => {
             e.preventDefault();
             e.stopPropagation(); // Prevent ComfyUI from showing its own drop indicator
-            // Best-effort cursor cue: reject when the lane under the cursor is collapsed.
-            // Browsers restrict `getData()` during dragover so we cannot reliably know
-            // the asset type here — image drags over a collapsed non-Guides lane will
-            // still show "no-drop" even though the drop would land on Guides; the
-            // authoritative reject lives in _handleAssetDrop.
             const { rawY } = this._canvasMouseCoords(e);
-            const layoutIdx = this._layoutIndexFromRawY(rawY);
-            if (layoutIdx >= 0 && this._trackLayout[layoutIdx]?.collapsed) {
-                e.dataTransfer.dropEffect = "none";
-                return;
+            const target = this._resolveDropHoverTarget(rawY);
+            e.dataTransfer.dropEffect = target && target.kind !== "invalid" ? "copy" : "none";
+            const prev = this._dropHoverTarget;
+            if (prev?.kind !== target?.kind || prev?.layoutIdx !== target?.layoutIdx) {
+                this._dropHoverTarget = target;
+                this._renderTimeline();
             }
-            e.dataTransfer.dropEffect = "copy";
+        });
+
+        canvas.addEventListener("dragleave", () => {
+            if (this._dropHoverTarget) {
+                this._dropHoverTarget = null;
+                this._renderTimeline();
+            }
         });
 
         canvas.addEventListener("drop", (e) => {
             e.preventDefault();
             e.stopPropagation(); // Prevent ComfyUI from also handling this drop
+            if (this._dropHoverTarget) {
+                this._dropHoverTarget = null;
+                this._renderTimeline();
+            }
             const assetData = e.dataTransfer.getData("application/x-sonder-asset");
             if (!assetData) {
                 // #5 diagnostic: a drop reached the timeline canvas but lacks the asset payload.
@@ -5025,7 +5568,13 @@ export class EditorWidget {
             }
 
             // Check for timeline item hits
-            const hit = this._hitTestItem(x, rawY);
+            let hit = this._hitTestItem(x, rawY);
+            // Locked items are not selectable (locked-selection rule): right-click
+            // falls through to the background menu instead of selecting the item.
+            // prompt_global keeps its own lock-aware menu branch below.
+            if (hit && hit.type !== "prompt_global" && this._isItemLocked(hit)) {
+                hit = null;
+            }
             if (hit && hit.type === "prompt_global") {
                 // Never enters selectedItems (bulk paths don't know the type)
                 const globalLocked = this._isGlobalPromptTrackLocked();
@@ -5047,9 +5596,34 @@ export class EditorWidget {
                 this._renderTimeline();
 
                 const count = this.selectedItems.length;
-                const itemLocked = this._isItemLocked(hit);
+                const expandedMenuItems = this._expandItemsWithLinked(this.selectedItems);
+                const hasLinkedSelection = this.selectedItems.some((item) => this._isLinkedItem(item));
+                const expandedDeleteCount = Math.max(count, expandedMenuItems.length);
+                const itemLocked = expandedMenuItems.some((item) => this._isItemLocked(item));
+                const linkableCount = this._selectedLinkableItems().length;
+                if (linkableCount >= 2) {
+                    menuItems.push({ label: "Link Selected Items", action: () => this._createLinkGroupFromSelection() });
+                }
+                if (hasLinkedSelection) {
+                    menuItems.push({ label: "Select Linked Items", action: () => this._selectLinkedItemsForSelection() });
+                    menuItems.push({ label: "Unlink Linked Items", action: () => this._unlinkSelectedItems() });
+                }
+                // Discoverable mirror of the M shortcut (linked-aware via
+                // _toggleSelectedMute's own expansion + lock refusal).
+                const muteCandidates = expandedMenuItems.filter((item) =>
+                    item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt");
+                if (muteCandidates.length > 0) {
+                    const allMuted = muteCandidates.every((item) => !!item.data?.muted);
+                    const muteLabel = `${allMuted ? "Unmute" : "Mute"} Selected (${muteCandidates.length})`;
+                    menuItems.push({
+                        label: itemLocked ? `${muteLabel} (locked)` : muteLabel,
+                        action: itemLocked ? () => {} : () => void this._toggleSelectedMute(),
+                        disabled: itemLocked,
+                    });
+                }
                 if (count > 1) {
-                    menuItems.push({ label: `Delete ${count} items`, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : `Delete ${count} items`;
+                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "clip") {
                     const clipAsset = this._getAssetForSourcePath(hit.data.source_path);
                     const isMotionDriverClip = this._isMotionDriverClip(hit.data);
@@ -5087,7 +5661,8 @@ export class EditorWidget {
                     if (clipEnd > sceneDur) {
                         menuItems.push({ label: "Extend Scene to Clip End", action: () => this._updateSceneDuration(clipEnd) });
                     }
-                    menuItems.push({ label: itemLocked ? "Delete Clip (locked)" : "Delete Clip", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Clip";
+                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "audio") {
                     menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
                     menuItems.push({
@@ -5104,7 +5679,8 @@ export class EditorWidget {
                     if (audioEnd > audioSceneDur) {
                         menuItems.push({ label: "Extend Scene to Audio End", action: () => this._updateSceneDuration(audioEnd) });
                     }
-                    menuItems.push({ label: itemLocked ? "Delete Audio (locked)" : "Delete Audio Track", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Audio Track";
+                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "guide") {
                     const guideAsset = this._getGuideAsset(hit.data);
                     if (guideAsset?.asset_id) {
@@ -5116,7 +5692,8 @@ export class EditorWidget {
                             action: () => this._setSceneAspectRatioFromDimensions(guideAsset.width, guideAsset.height),
                         });
                     }
-                    menuItems.push({ label: itemLocked ? "Delete Guide (locked)" : "Delete Guide", action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+                    const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Guide";
+                    menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 }
             }
 
@@ -5139,11 +5716,31 @@ export class EditorWidget {
                         label: "Queue Prompt Section",
                         action: () => { this._queuePromptSection(sections[idx]).catch(() => {}); },
                     });
+                    menuItems.push({
+                        label: sections[idx].muted ? "Unmute Section" : "Mute Section",
+                        action: () => {
+                            this._selectItem({ type: "prompt", id: idx, data: sections[idx] });
+                            void this._toggleSelectedMute();
+                        },
+                    });
                     menuItems.push({ label: "Open Prompt Management", action: () => this._showPromptManagementPanel() });
                     const promptLocked = this._isPromptTrackLocked();
-                    menuItems.push({ label: promptLocked ? "Delete Prompt (locked)" : "Delete Prompt", action: promptLocked ? () => {} : () => {
-                        if (confirm("Delete this prompt section?")) this._deletePromptSection(idx);
-                    }, danger: true, disabled: promptLocked });
+                    const promptSelected = this.selectedItems.some((item) => item.type === "prompt" && item.id === idx);
+                    const promptLinked = promptSelected && this.selectedItems.some((item) => this._isLinkedItem(item));
+                    const promptExpanded = promptLinked ? this._expandItemsWithLinked(this.selectedItems) : [];
+                    const promptDeleteLocked = promptLinked
+                        ? promptExpanded.some((item) => this._isItemLocked(item))
+                        : promptLocked;
+                    const promptDeleteLabel = promptLinked
+                        ? `Delete Linked Items (${Math.max(1, promptExpanded.length)})`
+                        : "Delete Prompt";
+                    menuItems.push({ label: promptDeleteLocked ? `${promptDeleteLabel} (locked)` : promptDeleteLabel, action: promptDeleteLocked ? () => {} : () => {
+                        if (promptLinked) {
+                            this._deleteSelectedItems();
+                        } else if (confirm("Delete this prompt section?")) {
+                            this._deletePromptSection(idx);
+                        }
+                    }, danger: true, disabled: promptDeleteLocked });
                 }
             }
 
@@ -5151,6 +5748,59 @@ export class EditorWidget {
                 this._showContextMenu(e.clientX, e.clientY, menuItems);
             }
         });
+    }
+
+    /** Landing preview for an in-flight asset drag (zone-model rules).
+     *  Type-aware when the same-page gallery stash knows the dragged asset,
+     *  generic for foreign drags. Returns {kind:"ruler"} | {kind:"lane",
+     *  layoutIdx} | {kind:"invalid"} | null. Advisory only — the authoritative
+     *  accept/refuse lives in _handleAssetDrop. */
+    _resolveDropHoverTarget(rawY) {
+        if (!this.activeScene || rawY === undefined) return null;
+        const dragAsset = getActiveDragAsset?.() || null;
+        const assetType = dragAsset?.asset_type || "";
+        if (assetType === "artifact") return { kind: "invalid" };
+        const guidesTarget = () => {
+            const gi = this._guidesLayoutIdx();
+            if (gi < 0 || this._isGuideTrackLocked() || this._isGuideTrackCollapsed()) {
+                return { kind: "invalid" };
+            }
+            return { kind: "lane", layoutIdx: gi };
+        };
+        // Images land on Guides no matter where the cursor is.
+        if (assetType === "image") return guidesTarget();
+        if (rawY < this._timelineRulerHeight()) {
+            return { kind: "ruler" };
+        }
+        const layoutIdx = this._layoutIndexFromRawY(rawY);
+        if (layoutIdx < 0) return { kind: "invalid" };
+        const entry = this._trackLayout[layoutIdx];
+        if (entry.collapsed) return { kind: "invalid" };
+        const laneValid = () => !this._isLaneLocked(entry.type, entry.laneIndex || 0);
+        if (!assetType) {
+            // Foreign drag (cross-window / OS): generic media-lane highlight.
+            const mediaLane = entry.type === TRACK_TYPE.VIDEO
+                || entry.type === TRACK_TYPE.AUDIO
+                || entry.type === TRACK_TYPE.MOTION_DRIVER;
+            return mediaLane && laneValid() ? { kind: "lane", layoutIdx } : { kind: "invalid" };
+        }
+        if (assetType === "video") {
+            if (entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.MOTION_DRIVER) {
+                return laneValid() ? { kind: "lane", layoutIdx } : { kind: "invalid" };
+            }
+            if (entry.type === TRACK_TYPE.AUDIO) {
+                return dragAsset?.has_audio === true && laneValid()
+                    ? { kind: "lane", layoutIdx }
+                    : { kind: "invalid" };
+            }
+            return { kind: "invalid" };
+        }
+        if (assetType === "audio") {
+            return entry.type === TRACK_TYPE.AUDIO && laneValid()
+                ? { kind: "lane", layoutIdx }
+                : { kind: "invalid" };
+        }
+        return { kind: "invalid" };
     }
 
     async _handleAssetDrop(asset, frame, trackRawY) {
@@ -5181,23 +5831,33 @@ export class EditorWidget {
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
-        // Determine drop target lane from Y position
-        let targetVideoLane = 0;
-        let targetAudioLane = 0;
+        // Zone-model drop targeting (2026-06-11, user-decided rules):
+        //   ruler strip  -> ALWAYS a new lane (the only auto-lane-creation path;
+        //                   dual drop video+audio only happens here);
+        //   lane row     -> that lane, matching asset type only (video on an
+        //                   audio lane places its extracted audio);
+        //   anything else-> refuse with an informational toast.
+        // No implicit lane defaults — placement is always user-expressed.
+        let dropZone = "dead"; // "ruler" | "lane" | "dead"
+        let dropEntry = null;
         let targetMotionDriverLane = -1;
         if (trackRawY !== undefined) {
-            const layoutIdx = this._layoutIndexFromRawY(trackRawY);
-            if (layoutIdx >= 0) {
-                const entry = this._trackLayout[layoutIdx];
-                // #33: reject drops onto any collapsed non-image destination lane.
-                // Image drops were checked against Guides above; for video/audio/
-                // motion-driver we use the lane the cursor is over.
-                if (asset.asset_type !== "image" && entry.collapsed) {
-                    return;
+            if (trackRawY < this._timelineRulerHeight()) {
+                dropZone = "ruler";
+            } else {
+                const layoutIdx = this._layoutIndexFromRawY(trackRawY);
+                if (layoutIdx >= 0) {
+                    const entry = this._trackLayout[layoutIdx];
+                    // #33: reject drops onto any collapsed non-image destination lane.
+                    // Image drops were checked against Guides above; for video/audio/
+                    // motion-driver we use the lane the cursor is over.
+                    if (asset.asset_type !== "image" && entry.collapsed) {
+                        return;
+                    }
+                    dropZone = "lane";
+                    dropEntry = entry;
+                    if (entry.type === TRACK_TYPE.MOTION_DRIVER) targetMotionDriverLane = entry.laneIndex;
                 }
-                if (entry.type === TRACK_TYPE.VIDEO) targetVideoLane = entry.laneIndex;
-                if (entry.type === TRACK_TYPE.AUDIO) targetAudioLane = entry.laneIndex;
-                if (entry.type === TRACK_TYPE.MOTION_DRIVER) targetMotionDriverLane = entry.laneIndex;
             }
         }
 
@@ -5206,7 +5866,10 @@ export class EditorWidget {
                 this._showToast("Motion drivers accept video assets only");
                 return;
             }
-            if (this._isLaneLocked(TRACK_TYPE.MOTION_DRIVER, targetMotionDriverLane)) return;
+            if (this._isLaneLocked(TRACK_TYPE.MOTION_DRIVER, targetMotionDriverLane)) {
+                this._showToast("Target lane is locked.");
+                return;
+            }
             this._pushUndo("add motion driver");
             const assetObj = this._findAssetById(asset.asset_id);
             const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
@@ -5275,18 +5938,88 @@ export class EditorWidget {
             return null;
         };
 
-        // Block drop on locked lanes — only the lane the asset would actually land on.
-        // Image drops always go to the Guides track (its own lock checked above at line 5800),
-        // so the default targetVideoLane/targetAudioLane lock check must not run for images.
-        // (#5/#14b 2026-05-21: image drops were getting blocked when V1 or A1 was locked
-        //  because the lane defaults match that lane.)
-        if (asset.asset_type === "video") {
-            if (this._isLaneLocked(TRACK_TYPE.VIDEO, targetVideoLane)) return;
-            const _assetObjForLock = _findAsset(asset.asset_id);
-            const _videoHasAudio = _assetObjForLock?.has_audio === true || asset?.has_audio === true;
-            if (_videoHasAudio && this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
-        } else if (asset.asset_type === "audio") {
-            if (this._isLaneLocked(TRACK_TYPE.AUDIO, targetAudioLane)) return;
+        // Zone-model target resolution for media drops (images keep their
+        // guides-only routing in the POST branches below).
+        let targetVideoLane = -1;
+        let targetAudioLane = -1;
+        let dualDrop = false;
+        let audioFromVideo = false;
+        const laneCountFields = {};
+        if (asset.asset_type === "video" || asset.asset_type === "audio") {
+            const assetObjForZone = _findAsset(asset.asset_id);
+            const videoHasAudio = asset.asset_type === "video"
+                && (assetObjForZone?.has_audio === true || asset?.has_audio === true);
+            const dropFps = this._effectiveFps;
+            const dropFrames = asset.asset_type === "video"
+                ? Math.max(1, parseInt(assetObjForZone?.frame_count ?? asset.frame_count ?? 0, 10) || 30)
+                : Math.max(1, Math.round((assetObjForZone?.duration_sec || asset.duration_sec || 1) * dropFps));
+            const dropEndFrame = frame + dropFrames;
+            const laneHasOverlap = (laneType, laneIndex) => {
+                if (laneType === TRACK_TYPE.VIDEO) {
+                    return (this.activeScene.clips || []).some(c =>
+                        this._isRenderClip(c) && (c.track_index || 0) === laneIndex &&
+                        c.timeline_start_frame < dropEndFrame && c.timeline_end_frame > frame);
+                }
+                return (this.activeScene.audio_tracks || []).some(a =>
+                    (a.lane_index || 0) === laneIndex &&
+                    a.timeline_start_frame < dropEndFrame && a.timeline_end_frame > frame);
+            };
+
+            if (dropZone === "ruler") {
+                if (asset.asset_type === "video") {
+                    const newVideoCount = (this.activeScene.video_lane_count || 1) + 1;
+                    targetVideoLane = newVideoCount - 1;
+                    laneCountFields.video_lane_count = newVideoCount;
+                    if (videoHasAudio) {
+                        const newAudioCount = (this.activeScene.audio_lane_count || 1) + 1;
+                        targetAudioLane = newAudioCount - 1;
+                        laneCountFields.audio_lane_count = newAudioCount;
+                        dualDrop = true;
+                    }
+                } else {
+                    const newAudioCount = (this.activeScene.audio_lane_count || 1) + 1;
+                    targetAudioLane = newAudioCount - 1;
+                    laneCountFields.audio_lane_count = newAudioCount;
+                }
+            } else if (dropZone === "lane" && dropEntry?.type === TRACK_TYPE.VIDEO) {
+                if (asset.asset_type === "audio") {
+                    this._showToast("Audio assets need an audio lane — drop on one, or on the ruler to add a lane.");
+                    return;
+                }
+                if (this._isLaneLocked(TRACK_TYPE.VIDEO, dropEntry.laneIndex)) {
+                    this._showToast("Target lane is locked.");
+                    return;
+                }
+                if (laneHasOverlap(TRACK_TYPE.VIDEO, dropEntry.laneIndex)) {
+                    this._showToast("Overlaps items on this lane — drop on the ruler to create a new lane.");
+                    return;
+                }
+                targetVideoLane = dropEntry.laneIndex;
+                if (videoHasAudio) {
+                    notifyInfo("Placed video only — drop on the ruler to also bring its audio.", { source: "timeline-drop-zone" });
+                }
+            } else if (dropZone === "lane" && dropEntry?.type === TRACK_TYPE.AUDIO) {
+                if (this._isLaneLocked(TRACK_TYPE.AUDIO, dropEntry.laneIndex)) {
+                    this._showToast("Target lane is locked.");
+                    return;
+                }
+                if (asset.asset_type === "video") {
+                    if (!videoHasAudio) {
+                        this._showToast("This video has no embedded audio to place.");
+                        return;
+                    }
+                    audioFromVideo = true;
+                }
+                if (laneHasOverlap(TRACK_TYPE.AUDIO, dropEntry.laneIndex)) {
+                    this._showToast("Overlaps items on this lane — drop on the ruler to create a new lane.");
+                    return;
+                }
+                targetAudioLane = dropEntry.laneIndex;
+            } else {
+                // Guides/Prompt rows and dead space are not media drop targets.
+                this._showToast("Drop on a matching lane, or on the ruler to create a new lane.");
+                return;
+            }
         }
 
         this._pushUndo("add asset");
@@ -5309,65 +6042,17 @@ export class EditorWidget {
             return false;
         };
 
-        const laneCountFields = {};
-
-        // Auto-add lane if target lane has overlapping items at the drop frame
-        if (asset.asset_type === "video") {
-            const assetObj = _findAsset(asset.asset_id);
-            const videoHasAudio = assetObj?.has_audio === true || asset?.has_audio === true;
-            const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
-            const dropEnd = frame + dropDuration;
-            const hasOverlap = (this.activeScene.clips || []).some(c =>
-                this._isRenderClip(c) &&
-                (c.track_index || 0) === targetVideoLane &&
-                c.timeline_start_frame < dropEnd && c.timeline_end_frame > frame
-            );
-            if (hasOverlap) {
-                // Auto-add a new video lane and place clip there
-                const newCount = (this.activeScene.video_lane_count || 1) + 1;
-                targetVideoLane = newCount - 1; // highest lane = top
-                this.activeScene.video_lane_count = newCount;
-                this._buildTrackLayout();
-                this._renderTimeline();
-                laneCountFields.video_lane_count = newCount;
-            }
-            // Only videos with embedded audio can create paired audio tracks.
-            if (videoHasAudio) {
-                const audioDuration = dropDuration; // video duration = audio duration
-                const audioDropEnd = frame + audioDuration;
-                const hasAudioOverlap = (this.activeScene.audio_tracks || []).some(a =>
-                    (a.lane_index || 0) === targetAudioLane &&
-                    a.timeline_start_frame < audioDropEnd && a.timeline_end_frame > frame
-                );
-                if (hasAudioOverlap) {
-                    const newAudioCount = (this.activeScene.audio_lane_count || 1) + 1;
-                    targetAudioLane = newAudioCount - 1;
-                    this.activeScene.audio_lane_count = newAudioCount;
-                    this._buildTrackLayout();
-                    this._renderTimeline();
-                    laneCountFields.audio_lane_count = newAudioCount;
-                }
-            }
-        } else if (asset.asset_type === "audio") {
-            const fps = this._effectiveFps;
-            const assetObj = _findAsset(asset.asset_id);
-            const dropDuration = assetObj ? Math.max(1, Math.round((assetObj.duration_sec || 1) * fps)) : 30;
-            const dropEnd = frame + dropDuration;
-            const hasOverlap = (this.activeScene.audio_tracks || []).some(a =>
-                (a.lane_index || 0) === targetAudioLane &&
-                a.timeline_start_frame < dropEnd && a.timeline_end_frame > frame
-            );
-            if (hasOverlap) {
-                const newCount = (this.activeScene.audio_lane_count || 1) + 1;
-                targetAudioLane = newCount - 1;
-                this.activeScene.audio_lane_count = newCount;
-                this._buildTrackLayout();
-                this._renderTimeline();
-                laneCountFields.audio_lane_count = newCount;
-            }
-        }
-
+        // Ruler-zone drops create their new lane(s) optimistically, then persist
+        // the counts before item creation (the only auto-lane-creation path).
         if (Object.keys(laneCountFields).length > 0) {
+            if (laneCountFields.video_lane_count) {
+                this.activeScene.video_lane_count = laneCountFields.video_lane_count;
+            }
+            if (laneCountFields.audio_lane_count) {
+                this.activeScene.audio_lane_count = laneCountFields.audio_lane_count;
+            }
+            this._buildTrackLayout();
+            this._renderTimeline();
             const lanesPersisted = await persistSceneLaneCounts(laneCountFields, "drop_lane_count_error");
             if (!lanesPersisted) return;
         }
@@ -5380,6 +6065,7 @@ export class EditorWidget {
             if (asset.asset_type === "image") {
                 // Images always create guide frames (regardless of which track they're dropped on)
                 const guideFields = {
+                    guide_id: this._newLocalItemId("guide"),
                     frame_index: frame,
                     asset_id: asset.asset_id,
                     source: "asset",
@@ -5404,11 +6090,11 @@ export class EditorWidget {
                     this._renderSceneAfterLocalMutation();
                 }
                 console.log("[Sonder] Guide frame created at frame", frame);
-            } else if (asset.asset_type === "video") {
-                // Drop video = create clip on target video lane (+ audio track if video has audio)
+            } else if (asset.asset_type === "video" && !audioFromVideo) {
+                // Drop video = create clip on target video lane (+ paired audio
+                // only for ruler-zone dual drops)
                 const assetObj = _findAsset(asset.asset_id);
-                const videoHasAudio = assetObj?.has_audio === true || asset?.has_audio === true;
-                droppedVideoHasAudio = videoHasAudio;
+                droppedVideoHasAudio = dualDrop;
                 const frameCount = Math.max(1, parseInt(assetObj?.frame_count ?? asset.frame_count ?? 0, 10) || 30);
                 optimisticClipId = `temp-clip-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
                 const optimisticClip = {
@@ -5426,7 +6112,7 @@ export class EditorWidget {
                 };
                 this.activeScene.clips = this.activeScene.clips || [];
                 this.activeScene.clips.push(optimisticClip);
-                if (videoHasAudio) {
+                if (dualDrop) {
                     optimisticAudioId = `temp-audio-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
                     const optimisticAudio = {
                         track_id: optimisticAudioId,
@@ -5447,8 +6133,9 @@ export class EditorWidget {
                     asset_id: asset.asset_id,
                     timeline_start_frame: frame,
                     track_index: targetVideoLane,
-                    audio_lane_index: targetAudioLane,
-                    dual_drop: videoHasAudio,
+                    audio_lane_index: dualDrop ? targetAudioLane : 0,
+                    dual_drop: dualDrop,
+                    link_video_audio: this._settings?.timelineBehavior?.linkedVideoAudioDrop !== false,
                 };
                 resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
                     method: "POST",
@@ -5471,20 +6158,39 @@ export class EditorWidget {
                     if (createdAudioTrack) {
                         const audioIdx = (this.activeScene.audio_tracks || []).findIndex((track) => track.track_id === optimisticAudioId);
                         if (audioIdx >= 0) this.activeScene.audio_tracks[audioIdx] = createdAudioTrack;
+                        if (this._settings?.timelineBehavior?.linkedVideoAudioDrop !== false) {
+                            this.activeScene.linked_item_groups = (this.activeScene.linked_item_groups || [])
+                                .filter((group) => !(group?.group_id || "").startsWith("temp-drop-"));
+                            this.activeScene.linked_item_groups.push({
+                                group_id: `temp-drop-${Date.now().toString(36)}`,
+                                items: [
+                                    { type: "clip", id: createdClip.clip_id },
+                                    { type: "audio", id: createdAudioTrack.track_id },
+                                ],
+                            });
+                        }
                     } else {
                         this.activeScene.audio_tracks = (this.activeScene.audio_tracks || []).filter((track) => track.track_id !== optimisticAudioId);
                     }
                 }
                 this._renderSceneAfterLocalMutation();
-            } else if (asset.asset_type === "audio") {
-                // Drop audio = create audio track on target audio lane
+            } else if (asset.asset_type === "audio" || audioFromVideo) {
+                // Drop audio = create audio track on target audio lane.
+                // audioFromVideo: a video asset dropped on an audio lane places
+                // ONLY its extracted audio (zone-model rule); the backend derives
+                // the audio asset from the video.
                 const assetObj = _findAsset(asset.asset_id);
                 const fps = this._effectiveFps;
-                const durationFrames = Math.max(1, Math.round((assetObj?.duration_sec || asset.duration_sec || 1) * fps));
+                let durationFrames = Math.max(1, Math.round((assetObj?.duration_sec || asset.duration_sec || 1) * fps));
+                if (audioFromVideo) {
+                    const videoFrames = parseInt(assetObj?.frame_count ?? asset.frame_count ?? 0, 10) || 0;
+                    if (videoFrames > 0) durationFrames = videoFrames;
+                    droppedVideoHasAudio = true; // extraction registers a derived audio asset
+                }
                 optimisticAudioId = `temp-audio-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
                 const optimisticAudio = {
                     track_id: optimisticAudioId,
-                    source_path: assetObj?.path || asset.path || "",
+                    source_path: audioFromVideo ? "" : (assetObj?.path || asset.path || ""),
                     timeline_start_frame: frame,
                     timeline_end_frame: frame + durationFrames,
                     source_in_frame: 0,
@@ -5666,23 +6372,42 @@ export class EditorWidget {
                 ? "audio"
                 : entry.type === TRACK_TYPE.GUIDES
                     ? "guide"
-                    : "clip";
+                    : entry.type === TRACK_TYPE.PROMPT
+                        ? "prompt"
+                        : "clip";
             const id = type === "audio"
                 ? item.track_id
                 : type === "guide"
                     ? item.frame_index
-                    : item.clip_id;
+                    : type === "prompt"
+                        ? (this.activeScene.prompt_sections || []).indexOf(item)
+                        : item.clip_id;
             if (type === "clip") {
                 operations.push({ type: "update_clip", clip_id: id, fields: { muted: !!muted } });
             } else if (type === "audio") {
                 operations.push({ type: "update_audio_track", track_id: id, fields: { muted: !!muted } });
             } else {
+                if (type === "prompt") {
+                    if (id < 0) continue;
+                    operations.push({
+                        type: "update_prompt_section",
+                        index: id,
+                        expected: {
+                            start_frame: item.start_frame,
+                            end_frame: item.end_frame,
+                            prompt_id: item.prompt_id || "",
+                        },
+                        fields: { muted: !!muted },
+                    });
+                    continue;
+                }
                 operations.push({
                     type: "update_guide",
                     frame_index: id,
                     expected: {
                         frame_index: item.frame_index,
                         asset_id: item.asset_id || "",
+                        guide_id: item.guide_id || "",
                     },
                     fields: { muted: !!muted },
                 });
@@ -5700,20 +6425,34 @@ export class EditorWidget {
 
     async _toggleHeaderVisibility(entry) {
         if (!entry) return;
-        const state = this._trackVisibilityState(entry);
-        if (state === "visible") {
-            entry.hidden = true;
-            await this._saveLaneConfig();
-        } else {
-            const itemsMuted = this._trackItemsForEntry(entry).some((item) => !!item.muted);
-            entry.hidden = false;
-            await this._saveLaneConfig();
-            if (itemsMuted && !entry.locked) {
-                await this._setTrackItemsMuted(entry, false);
-                await this._fetchScenes();
-                this._reconcileSelection();
-                this._buildTrackLayout();
+        await this._applyHeaderVisibilityBulk([entry], this._trackVisibilityState(entry) === "visible");
+    }
+
+    /** Apply one uniform hidden state to a set of lane header entries.
+     *  Showing a lane keeps the single-lane semantics: muted items on it are
+     *  unmuted unless the lane is locked. One lane-config save covers all. */
+    async _applyHeaderVisibilityBulk(entries, nextHidden) {
+        const targets = (entries || []).filter(Boolean);
+        if (!targets.length) return;
+        const unmuteTargets = [];
+        for (const target of targets) {
+            if (nextHidden) {
+                target.hidden = true;
+            } else {
+                if (!target.locked && this._trackItemsForEntry(target).some((item) => !!item.muted)) {
+                    unmuteTargets.push(target);
+                }
+                target.hidden = false;
             }
+        }
+        await this._saveLaneConfig(targets);
+        if (unmuteTargets.length) {
+            for (const target of unmuteTargets) {
+                await this._setTrackItemsMuted(target, false);
+            }
+            await this._fetchScenes();
+            this._reconcileSelection();
+            this._buildTrackLayout();
         }
         this._renderTimeline();
         this._renderViewportFrame();
@@ -5758,7 +6497,7 @@ export class EditorWidget {
                     : entry.type === TRACK_TYPE.MOTION_DRIVER
                         ? ((this.activeScene?.motion_driver_lane_count || 1) > 1 ? `MD${entry.laneIndex + 1}` : "Driver")
                         : ((this.activeScene?.audio_lane_count || 1) > 1 ? `A${entry.laneIndex + 1}` : "Audio"));
-                this._saveLaneConfig();
+                this._saveLaneConfig([entry]);
                 this._renderTimeline();
             }
             input.remove();
@@ -5776,65 +6515,82 @@ export class EditorWidget {
         input.select();
     }
 
-    /** Persist lane configs (lock/hide/name/color) to server from current _trackLayout */
-    async _saveLaneConfig() {
+    /** Backend lane_type for a _trackLayout entry (note GUIDES is "guides"
+     *  frontend-side but "guide" backend-side). */
+    _laneTypeForEntry(entry) {
+        if (entry?.type === TRACK_TYPE.GUIDES) return "guide";
+        if (entry?.type === TRACK_TYPE.PROMPT) return "prompt";
+        if (entry?.type === TRACK_TYPE.PROMPT_GLOBAL) return "prompt_global";
+        if (entry?.type === TRACK_TYPE.VIDEO || entry?.type === TRACK_TYPE.AUDIO || entry?.type === TRACK_TYPE.MOTION_DRIVER) {
+            return entry.type;
+        }
+        return "";
+    }
+
+    /** Persist lane configs (lock/hide/name) for the CHANGED entries only.
+     *  Per-lane delta ops (mutation-integrity F1): a user action can only ever
+     *  write the lanes it touched, so a transiently-reverted neighbor entry can
+     *  never be persisted by an unrelated toggle (the full-snapshot writes were
+     *  the rapid-toggle data-loss amplifier). */
+    async _saveLaneConfig(changedEntries) {
         if (!this.activeScene || !this.projectDir) return;
+        const entries = (Array.isArray(changedEntries) ? changedEntries : [changedEntries]).filter(Boolean);
+        if (!entries.length) return;
         const sceneId = this.activeSceneId;
         const sceneRef = this.activeScene;
-        const videoConfigs = [];
-        const motionDriverConfigs = [];
-        const audioConfigs = [];
-        let guideTrackConfig = this._defaultLaneConfig();
-        let promptTrackConfig = this._defaultLaneConfig();
-        let globalPromptTrackConfig = this._defaultLaneConfig();
-        for (const e of this._trackLayout) {
-            if (e.type === TRACK_TYPE.VIDEO) {
-                videoConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
-            } else if (e.type === TRACK_TYPE.MOTION_DRIVER) {
-                motionDriverConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
-            } else if (e.type === TRACK_TYPE.AUDIO) {
-                audioConfigs[e.laneIndex] = { name: e.customName || "", color: e.color || "", locked: e.locked, hidden: e.hidden };
-            } else if (e.type === TRACK_TYPE.GUIDES) {
-                guideTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
-            } else if (e.type === TRACK_TYPE.PROMPT) {
-                promptTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
-            } else if (e.type === TRACK_TYPE.PROMPT_GLOBAL) {
-                globalPromptTrackConfig = { name: "", color: "", locked: !!e.locked, hidden: !!e.hidden };
+        const operations = [];
+        for (const e of entries) {
+            const laneType = this._laneTypeForEntry(e);
+            if (!laneType) continue;
+            const laneIndex = e.laneIndex || 0;
+            const fields = { name: e.customName || "", color: e.color || "", locked: !!e.locked, hidden: !!e.hidden };
+            operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields });
+            // Optimistic per-lane scene write (icon-flicker fix, now scoped):
+            // _buildTrackLayout re-derives icon state from scene configs, so any
+            // rebuild during the in-flight window must already see the new value.
+            if (sceneRef) {
+                const cfg = { ...fields };
+                if (laneType === "guide") {
+                    sceneRef.guide_track_config = cfg;
+                } else if (laneType === "prompt") {
+                    sceneRef.prompt_track_config = cfg;
+                } else if (laneType === "prompt_global") {
+                    sceneRef.global_prompt_track_config = cfg;
+                } else {
+                    const listKey = laneType === "video" ? "video_lane_configs"
+                        : laneType === "motion_driver" ? "motion_driver_lane_configs"
+                            : "audio_lane_configs";
+                    const list = Array.isArray(sceneRef[listKey]) ? sceneRef[listKey] : [];
+                    while (list.length <= laneIndex) list.push(this._defaultLaneConfig());
+                    list[laneIndex] = cfg;
+                    sceneRef[listKey] = list;
+                }
             }
         }
-        // Fill any sparse gaps
-        for (let i = 0; i < videoConfigs.length; i++) if (!videoConfigs[i]) videoConfigs[i] = { name: "", color: "", locked: false, hidden: false };
-        for (let i = 0; i < motionDriverConfigs.length; i++) if (!motionDriverConfigs[i]) motionDriverConfigs[i] = { name: "", color: "", locked: false, hidden: false };
-        for (let i = 0; i < audioConfigs.length; i++) if (!audioConfigs[i]) audioConfigs[i] = { name: "", color: "", locked: false, hidden: false };
-        const fields = {
-            video_lane_configs: videoConfigs,
-            motion_driver_lane_configs: motionDriverConfigs,
-            audio_lane_configs: audioConfigs,
-            guide_track_config: guideTrackConfig,
-            prompt_track_config: promptTrackConfig,
-            global_prompt_track_config: globalPromptTrackConfig,
+        if (!operations.length) return;
+        // Coalesce burst toggles by (lane_type, lane_index): each op carries the
+        // lane's full 4-field config, so latest-wins per lane and union across
+        // lanes is exactly right — no cross-lane loss, no field merging needed.
+        const merge = (oldIntent, nextIntent) => {
+            const byLane = new Map();
+            for (const op of [...(oldIntent?.operations || []), ...(nextIntent?.operations || [])]) {
+                byLane.set(`${op.lane_type}:${op.lane_index || 0}`, op);
+            }
+            return { ...nextIntent, operations: [...byLane.values()] };
         };
         try {
-            await this._runSceneMutation(
-                [{ type: "update_lane_configs", fields }],
-                {
-                    key: `scene:${sceneId}:lane-config`,
-                    label: "lane config",
-                    coalesce: true,
-                    refreshScenes: false,
-                }
-            );
-            // Update local scene data
-            if (sceneRef) {
-                sceneRef.video_lane_configs = videoConfigs;
-                sceneRef.motion_driver_lane_configs = motionDriverConfigs;
-                sceneRef.audio_lane_configs = audioConfigs;
-                sceneRef.guide_track_config = guideTrackConfig;
-                sceneRef.prompt_track_config = promptTrackConfig;
-                sceneRef.global_prompt_track_config = globalPromptTrackConfig;
-            }
+            await this._runSceneMutation(operations, {
+                key: `scene:${sceneId}:lane-config`,
+                label: "lane config",
+                coalesce: true,
+                merge,
+                refreshScenes: false,
+            });
         } catch (e) {
             console.warn("[Sonder] Failed to save lane config:", e);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "lane_config_error" });
+            this._buildTrackLayout();
+            this._renderTimeline();
         }
     }
 
@@ -6153,9 +6909,11 @@ export class EditorWidget {
         if (this._isPromptTrackLocked()) return;
         const undoLabel = "add prompt";
         const fields = {
+            prompt_id: this._newLocalItemId("prompt"),
             start_frame: startFrame,
             end_frame: endFrame,
             channels: normalizeChannels(channels),
+            muted: false,
         };
         this._pushUndo(undoLabel);
         this._applyLocalPromptCreate(fields);
@@ -6500,16 +7258,18 @@ export class EditorWidget {
             .map((s) => {
                 const channels = normalizeChannels(s.channels, s.prompt);
                 return {
+                    prompt_id: s.prompt_id || this._newLocalItemId("prompt"),
                     start_frame: s.start_frame || 0,
                     end_frame: s.end_frame || 0,
                     channels,
                     prompt: composeSectionText(channels, false),
+                    muted: !!s.muted,
                 };
             });
         for (const s of nextSections) {
             operations.push({
                 type: "create_prompt_section",
-                fields: { start_frame: s.start_frame, end_frame: s.end_frame, channels: s.channels },
+                fields: { prompt_id: s.prompt_id, start_frame: s.start_frame, end_frame: s.end_frame, channels: s.channels, muted: !!s.muted },
             });
         }
         operations.push({ type: "update_scene_fields", fields: { prompt: String(globalText ?? "") } });
@@ -6926,10 +7686,16 @@ export class EditorWidget {
 
     async _moveItemToFrame(type, id, data, newStart) {
         if (!this.activeScene || !this.projectDir) return;
+        const hit = { type, id, data };
+        const applyLinked = this._isLinkedItem(hit);
+        if (applyLinked && this._expandItemsWithLinked([hit]).some((item) => this._isItemLocked(item))) {
+            notifyWarning("Move refused because one or more linked items are locked.", { source: "timeline-move-refused" });
+            return;
+        }
         this._pushUndo("move item");
         const operation = type === "clip"
-            ? { type: "update_clip", clip_id: id, fields: { timeline_start_frame: newStart } }
-            : { type: "update_audio_track", track_id: id, fields: { timeline_start_frame: newStart } };
+            ? { type: "update_clip", clip_id: id, fields: { timeline_start_frame: newStart }, apply_linked: applyLinked }
+            : { type: "update_audio_track", track_id: id, fields: { timeline_start_frame: newStart }, apply_linked: applyLinked };
 
         try {
             await this._runSceneMutation([operation], {
@@ -6947,9 +7713,32 @@ export class EditorWidget {
 
     async _updateItemProperty(type, id, props, { refresh = true } = {}) {
         if (!this.activeScene || !this.projectDir) return;
+        // Linked mute propagation (manual-test #7): muting one linked member mutes
+        // the whole group atomically. Only `muted` propagates through links —
+        // opacity/volume/strength and other per-item fields stay per-item.
+        let applyLinked = false;
+        if (props && "muted" in props) {
+            const anchor = this._findSceneItemBySelection(type, id);
+            if (anchor && this._isLinkedItem(anchor)) {
+                const members = this._expandItemsWithLinked([anchor]);
+                if (members.some((item) => this._isItemLocked(item))) {
+                    // Callers flip the anchor's local muted before calling; restore it.
+                    if (anchor.data && "muted" in anchor.data) anchor.data.muted = !props.muted;
+                    notifyWarning("Linked mute refused because one or more linked items are locked.", { source: "timeline-mute-refused" });
+                    if (this._itemEditorEl && this.selectedItem) this._showItemEditor();
+                    this._renderTimeline();
+                    this._renderViewportFrame();
+                    return;
+                }
+                applyLinked = true;
+                for (const member of members) {
+                    if (member?.data) member.data.muted = !!props.muted;
+                }
+            }
+        }
         let operation;
         if (type === "clip") {
-            operation = { type: "update_clip", clip_id: id, fields: { ...props } };
+            operation = { type: "update_clip", clip_id: id, fields: { ...props }, apply_linked: applyLinked };
         } else if (type === "guide") {
             const frameIndex = parseInt(id, 10);
             const guide = (this.activeScene.guide_frames || []).find((g) => (g.frame_index || 0) === frameIndex);
@@ -6959,11 +7748,13 @@ export class EditorWidget {
                 expected: guide ? {
                     frame_index: guide.frame_index,
                     asset_id: guide.asset_id || "",
+                    guide_id: guide.guide_id || "",
                 } : undefined,
                 fields: { ...props },
+                apply_linked: applyLinked,
             };
         } else {
-            operation = { type: "update_audio_track", track_id: id, fields: { ...props } };
+            operation = { type: "update_audio_track", track_id: id, fields: { ...props }, apply_linked: applyLinked };
         }
         const fieldNames = Object.keys(props || {}).sort();
         const key = fieldNames.length === 1
@@ -7001,20 +7792,31 @@ export class EditorWidget {
     }
 
     async _toggleSelectedMute() {
-        const targets = this.selectedItems
-            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide")
-            .filter((item) => !this._isItemLocked(item));
+        const targets = this._expandItemsWithLinked(this.selectedItems)
+            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt");
         if (!targets.length) return;
+        if (targets.some((item) => this._isItemLocked(item))) {
+            notifyWarning("Linked mute refused because one or more selected items are locked.", { source: "timeline-mute-refused" });
+            return;
+        }
 
         const nextMuted = !targets.every((item) => !!item.data?.muted);
         this._pushUndo(nextMuted ? "mute items" : "unmute items");
         const operations = [];
+        const emittedLinkedGroups = new Set();
         for (const item of targets) {
             item.data.muted = nextMuted;
+            const group = this._linkGroupForItem(item);
+            const applyLinked = !!group;
+            if (group) {
+                const groupKey = group.group_id || this._linkRefKey(this._linkRefForItem(item));
+                if (emittedLinkedGroups.has(groupKey)) continue;
+                emittedLinkedGroups.add(groupKey);
+            }
             if (item.type === "clip") {
-                operations.push({ type: "update_clip", clip_id: item.id, fields: { muted: nextMuted } });
+                operations.push({ type: "update_clip", clip_id: item.data?.clip_id || item.id, fields: { muted: nextMuted }, apply_linked: applyLinked });
             } else if (item.type === "audio") {
-                operations.push({ type: "update_audio_track", track_id: item.id, fields: { muted: nextMuted } });
+                operations.push({ type: "update_audio_track", track_id: item.data?.track_id || item.id, fields: { muted: nextMuted }, apply_linked: applyLinked });
             } else if (item.type === "guide") {
                 operations.push({
                     type: "update_guide",
@@ -7022,8 +7824,22 @@ export class EditorWidget {
                     expected: {
                         frame_index: item.data?.frame_index ?? item.id,
                         asset_id: item.data?.asset_id || "",
+                        guide_id: item.data?.guide_id || "",
                     },
                     fields: { muted: nextMuted },
+                    apply_linked: applyLinked,
+                });
+            } else if (item.type === "prompt") {
+                operations.push({
+                    type: "update_prompt_section",
+                    index: item.id,
+                    expected: {
+                        start_frame: item.data?.start_frame,
+                        end_frame: item.data?.end_frame,
+                        prompt_id: item.data?.prompt_id || "",
+                    },
+                    fields: { muted: nextMuted },
+                    apply_linked: applyLinked,
                 });
             }
         }
@@ -7041,6 +7857,71 @@ export class EditorWidget {
         this._updateToolbar();
     }
 
+    async _createLinkGroupFromSelection() {
+        if (!this.activeScene || !this.projectDir) return;
+        const items = this._selectedLinkableItems()
+            .map((item) => this._mutationItemFromSelection(item))
+            .filter(Boolean);
+        if (items.length < 2) {
+            notifyWarning("Select at least two timeline items to link.", { source: "timeline-link" });
+            return;
+        }
+        this._pushUndo("link items");
+        try {
+            await this._runSceneMutation(
+                [{ type: "create_link_group", items }],
+                {
+                    key: `scene:${this.activeSceneId}:link-items:${Date.now()}`,
+                    label: "link items",
+                    coalesce: false,
+                }
+            );
+            this._reconcileSelection();
+            this._renderTimeline();
+        } catch (e) {
+            this._discardLastUndo("link items");
+            notifyWarning(e?.message || "Link operation was refused.", { source: "timeline-link-refused" });
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "link_items_error" });
+        }
+    }
+
+    async _unlinkSelectedItems() {
+        if (!this.activeScene || !this.projectDir) return;
+        const items = this._selectedLinkableItems()
+            .filter((item) => this._isLinkedItem(item))
+            .map((item) => this._mutationItemFromSelection(item))
+            .filter(Boolean);
+        if (!items.length) return;
+        this._pushUndo("unlink items");
+        try {
+            await this._runSceneMutation(
+                [{ type: "unlink_items", items, entire_group: true }],
+                {
+                    key: `scene:${this.activeSceneId}:unlink-items:${Date.now()}`,
+                    label: "unlink items",
+                    coalesce: false,
+                }
+            );
+            this._reconcileSelection();
+            this._renderTimeline();
+        } catch (e) {
+            this._discardLastUndo("unlink items");
+            notifyWarning(e?.message || "Unlink operation was refused.", { source: "timeline-unlink-refused" });
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "unlink_items_error" });
+        }
+    }
+
+    _selectLinkedItemsForSelection() {
+        const expanded = this._expandItemsWithLinked(this.selectedItems);
+        if (!expanded.length) return;
+        this._clearLaneSelection();
+        this.selectedItems = expanded;
+        this.selectedItem = expanded[expanded.length - 1] || null;
+        this._hideItemEditor();
+        this._renderTimeline();
+        this._updateToolbar();
+    }
+
     async _moveGuideToFrame(guideData, newIdx, strength = guideData?.strength ?? 1.0) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isGuideTrackLocked()) return;
@@ -7048,6 +7929,7 @@ export class EditorWidget {
         this._pushUndo(undoLabel);
         const oldIdx = guideData.frame_index;
         const fields = {
+            guide_id: guideData.guide_id || this._newLocalItemId("guide"),
             asset_id: guideData.asset_id,
             source: guideData.source || "asset",
             strength,
@@ -7067,6 +7949,7 @@ export class EditorWidget {
                     expected: {
                         frame_index: oldIdx,
                         asset_id: guideData.asset_id || "",
+                        guide_id: guideData.guide_id || "",
                     },
                     ...fields,
                 }],
@@ -7211,7 +8094,8 @@ export class EditorWidget {
         }
         const labelsOn = this._promptChannelLabels !== false;
         const isGlobal = hit.type === "prompt_global";
-        const hidden = isGlobal ? this._isGlobalPromptTrackHidden() : this._isPromptTrackHidden();
+        const hidden = isGlobal ? this._isGlobalPromptTrackHidden() : (this._isPromptTrackHidden() || !!hit.data?.muted);
+        const hiddenLabel = !isGlobal && hit.data?.muted ? "Muted" : "Hidden";
         const width = 360;
 
         let tag, rangeText, lines;
@@ -7269,7 +8153,7 @@ export class EditorWidget {
         meta.append(tagEl, rangeEl);
         if (hidden) {
             const badge = document.createElement("div");
-            badge.textContent = "Hidden";
+            badge.textContent = hiddenLabel;
             badge.style.cssText = `
                 margin-left:auto;padding:2px 7px;border-radius:999px;
                 background:rgba(0,0,0,0.68);border:1px solid ${COLORS.warningBorder};
@@ -7404,6 +8288,7 @@ export class EditorWidget {
             }
 
             const fields = {
+                guide_id: this._newLocalItemId("guide"),
                 frame_index: this.playhead,
                 asset_id: asset.asset_id,
                 source: "asset",
@@ -7430,36 +8315,17 @@ export class EditorWidget {
 
     async _deleteSelectedItems() {
         if (this.selectedItems.length === 0 || !this.activeScene || !this.projectDir) return;
-        this.selectedItems = this.selectedItems.filter((item) => !this._isItemLocked(item));
-        if (this.selectedItems.length === 0) return;
+        const expanded = this._expandItemsWithLinked(this.selectedItems);
+        if (!expanded.length) return;
+        if (expanded.some((item) => this._isItemLocked(item))) {
+            notifyWarning("Delete refused because one or more linked/selected items are locked.", { source: "timeline-delete-refused" });
+            return;
+        }
+        const applyLinked = expanded.length > this.selectedItems.length
+            || this.selectedItems.some((item) => this._isLinkedItem(item));
         const undoLabel = "delete items";
         this._pushUndo(undoLabel);
-        const items = this.selectedItems.map((item) => {
-            if (item.type === "guide") {
-                return {
-                    type: "guide",
-                    id: item.id,
-                    expected: {
-                        frame_index: item.data?.frame_index ?? item.id,
-                        asset_id: item.data?.asset_id || "",
-                    },
-                };
-            }
-            if (item.type === "prompt") {
-                return {
-                    type: "prompt",
-                    id: item.id,
-                    expected: {
-                        start_frame: item.data?.start_frame,
-                        end_frame: item.data?.end_frame,
-                    },
-                };
-            }
-            return {
-                type: item.type,
-                id: item.id,
-            };
-        });
+        const items = expanded.map((item) => this._mutationItemFromSelection(item)).filter(Boolean);
         this._applyLocalBulkDeleteItems(items);
         this._clearSelection();
         this._hideItemEditor();
@@ -7467,7 +8333,7 @@ export class EditorWidget {
 
         try {
             await this._runSceneMutation(
-                [{ type: "bulk_delete_items", items }],
+                [{ type: "bulk_delete_items", items, apply_linked: applyLinked }],
                 {
                     key: `scene:${this.activeSceneId}:delete-selected:${Date.now()}`,
                     label: "delete items",
@@ -7587,6 +8453,24 @@ export class EditorWidget {
                 const origAudioLanes = this._origAllAudioLanes || {};
                 const origClipStarts = this._origAllClipStarts || {};
                 const origAudioStarts = this._origAllAudioStarts || {};
+                const emittedLinkedGroups = new Set();
+                const linkedAwareOperation = (hit, operation) => {
+                    const group = this._linkGroupForItem(hit);
+                    if (!group) return operation;
+                    const anchorType = this._dragAnchorType || "";
+                    const anchorId = String(this._dragAnchorId ?? "");
+                    const groupHasAnchor = anchorType && (group.items || []).some((ref) => {
+                        const anchorHit = this._findSceneItemForLinkRef(ref);
+                        return anchorHit?.type === anchorType && String(anchorHit.id) === anchorId;
+                    });
+                    if (groupHasAnchor && !(hit.type === anchorType && String(hit.id) === anchorId)) {
+                        return null;
+                    }
+                    const groupKey = group.group_id || this._linkRefKey(this._linkRefForItem(hit));
+                    if (emittedLinkedGroups.has(groupKey)) return null;
+                    emittedLinkedGroups.add(groupKey);
+                    return { ...operation, apply_linked: true };
+                };
 
                 for (const clip of (this.activeScene.clips || [])) {
                     const clipId = clip.clip_id;
@@ -7601,7 +8485,11 @@ export class EditorWidget {
                         fields.timeline_start_frame = clip.timeline_start_frame;
                         fields.timeline_end_frame = clip.timeline_end_frame;
                     }
-                    operations.push({ type: "update_clip", clip_id: clipId, fields });
+                    const operation = linkedAwareOperation(
+                        { type: "clip", id: clipId, data: clip },
+                        { type: "update_clip", clip_id: clipId, fields }
+                    );
+                    if (operation) operations.push(operation);
                 }
 
                 for (const track of (this.activeScene.audio_tracks || [])) {
@@ -7617,7 +8505,11 @@ export class EditorWidget {
                         fields.timeline_start_frame = track.timeline_start_frame;
                         fields.timeline_end_frame = track.timeline_end_frame;
                     }
-                    operations.push({ type: "update_audio_track", track_id: trackId, fields });
+                    const operation = linkedAwareOperation(
+                        { type: "audio", id: trackId, data: track },
+                        { type: "update_audio_track", track_id: trackId, fields }
+                    );
+                    if (operation) operations.push(operation);
                 }
 
                 for (const orig of dragItemsOrig) {
@@ -7629,21 +8521,24 @@ export class EditorWidget {
                         const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
                         const newIdx = previewIdx ?? Math.max(0, Math.min(this.totalFrames - 1, oldIdx + frameDelta));
                         const fields = {
+                            guide_id: data.guide_id || "",
                             asset_id: data.asset_id,
                             source: data.source || "asset",
                             strength: data.strength ?? 1.0,
                             muted: !!data.muted,
                         };
-                        operations.push({
+                        const operation = linkedAwareOperation({ type: "guide", id, data }, {
                             type: "move_guide",
                             from_frame_index: oldIdx,
                             to_frame_index: newIdx,
                             expected: {
                                 frame_index: oldIdx,
                                 asset_id: data.asset_id || "",
+                                guide_id: data.guide_id || "",
                             },
                             ...fields,
                         });
+                        if (operation) operations.push(operation);
                         this._applyLocalMoveGuide(oldIdx, newIdx, data, fields);
                         delete data._previewFrameIndex;
                     } else if (type === "prompt") {
@@ -7671,18 +8566,20 @@ export class EditorWidget {
                                 });
                             }
                         } else {
-                            operations.push({
+                            const operation = linkedAwareOperation({ type: "prompt", id, data }, {
                                 type: "update_prompt_section",
                                 index: id,
                                 expected: {
                                     start_frame: orig.origStart,
                                     end_frame: orig.origEnd,
+                                    prompt_id: data.prompt_id || "",
                                 },
                                 fields: {
                                     start_frame: data.start_frame,
                                     end_frame: data.end_frame,
                                 },
                             });
+                            if (operation) operations.push(operation);
                         }
                     }
                 }
@@ -7714,6 +8611,7 @@ export class EditorWidget {
         if (!this.projectDir || !this.activeScene) return;
         const sceneId = this.activeSceneId;
         const { type, id, data, origStart, origEnd } = trimInfo;
+        const applyLinked = this._isLinkedItem(trimInfo);
 
         return this._withTimelineMutationCommit("trimEdge", async () => {
             try {
@@ -7728,6 +8626,7 @@ export class EditorWidget {
                             source_in_frame: data.source_in_frame || 0,
                             source_out_frame: data.source_out_frame,
                         },
+                        apply_linked: applyLinked,
                     });
                 } else if (type === "audio") {
                     operations.push({
@@ -7738,6 +8637,7 @@ export class EditorWidget {
                             timeline_end_frame: data.timeline_end_frame,
                             source_in_frame: data.source_in_frame || 0,
                         },
+                        apply_linked: applyLinked,
                     });
                 } else if (type === "prompt") {
                     if (this._isPromptTrackLocked()) return;
@@ -7747,11 +8647,13 @@ export class EditorWidget {
                         expected: {
                             start_frame: origStart,
                             end_frame: origEnd,
+                            prompt_id: data.prompt_id || "",
                         },
                         fields: {
                             start_frame: data.start_frame,
                             end_frame: data.end_frame,
                         },
+                        apply_linked: applyLinked,
                     });
                 }
                 if (operations.length > 0) {
@@ -7777,28 +8679,48 @@ export class EditorWidget {
     /** Split a clip at the given frame (razor tool). */
     async _splitClipAtFrame(hit, frame) {
         if (!this.projectDir || !this.activeScene) return;
-        if (hit.type !== "clip" && hit.type !== "audio") return;
-        if (frame <= hit.data.timeline_start_frame || frame >= hit.data.timeline_end_frame) return;
+        if (hit.type !== "clip" && hit.type !== "audio" && hit.type !== "prompt") return;
+        const start = hit.type === "prompt" ? hit.data.start_frame : hit.data.timeline_start_frame;
+        const end = hit.type === "prompt" ? hit.data.end_frame : hit.data.timeline_end_frame;
+        if (frame <= start || frame >= end) return;
         // Block split on locked lanes
         if (hit.type === "clip" && this._isLaneLocked(this._clipTrackType(hit.data), hit.data.track_index || 0)) return;
         if (hit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, hit.data.lane_index || 0)) return;
+        if (hit.type === "prompt" && this._isPromptTrackLocked()) return;
+        const applyLinked = this._isLinkedItem(hit);
+        if (applyLinked && this._expandItemsWithLinked([hit]).some((item) => this._isItemLocked(item))) {
+            notifyWarning("Split refused because one or more linked items are locked.", { source: "timeline-split-refused" });
+            return;
+        }
 
         this._pushUndo(`split ${hit.type}`);
-        const dirName = this.projectDir.split(/[/\\]/).pop();
         const sceneId = this.activeSceneId;
+        const operation = hit.type === "clip"
+            ? { type: "split_clip", clip_id: hit.id, frame, apply_linked: applyLinked }
+            : hit.type === "audio"
+                ? { type: "split_audio_track", track_id: hit.id, frame, apply_linked: applyLinked }
+                : {
+                    type: "split_prompt_section",
+                    index: hit.id,
+                    frame,
+                    apply_linked: applyLinked,
+                    expected: {
+                        start_frame: hit.data?.start_frame,
+                        end_frame: hit.data?.end_frame,
+                        prompt_id: hit.data?.prompt_id || "",
+                    },
+                };
 
         try {
-            const endpoint = hit.type === "clip"
-                ? `/sonder-editor/project/${dirName}/scenes/${sceneId}/clips/${hit.id}/split`
-                : `/sonder-editor/project/${dirName}/scenes/${sceneId}/audio_tracks/${hit.id}/split`;
-            await fetch(api.apiURL(endpoint), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ frame }),
+            await this._runSceneMutation([operation], {
+                key: `scene:${sceneId}:split:${hit.type}:${hit.id}:${Date.now()}`,
+                label: `split ${hit.type}`,
+                coalesce: false,
             });
-            await this._fetchScenes();
             this._renderTimeline();
         } catch (e) {
+            this._discardLastUndo(`split ${hit.type}`);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "split_item_error" });
             console.warn(`[Sonder] Failed to split ${hit.type}:`, e);
         }
     }
@@ -7921,6 +8843,7 @@ export class EditorWidget {
                     expected: {
                         frame_index: guide.frame_index,
                         asset_id: guide.asset_id || "",
+                        guide_id: guide.guide_id || "",
                     },
                 }]);
                 this._renderSceneAfterLocalMutation();
@@ -7933,6 +8856,7 @@ export class EditorWidget {
                             expected: {
                                 frame_index: guide.frame_index,
                                 asset_id: guide.asset_id || "",
+                                guide_id: guide.guide_id || "",
                             },
                         }],
                         {
@@ -8196,6 +9120,7 @@ export class EditorWidget {
                     expected: {
                         frame_index: guide.frame_index,
                         asset_id: guide.asset_id || "",
+                        guide_id: guide.guide_id || "",
                     },
                 }]);
                 this._renderSceneAfterLocalMutation();
@@ -8208,6 +9133,7 @@ export class EditorWidget {
                             expected: {
                                 frame_index: guide.frame_index,
                                 asset_id: guide.asset_id || "",
+                                guide_id: guide.guide_id || "",
                             },
                         }],
                         {
@@ -8352,6 +9278,8 @@ export class EditorWidget {
                 ["I", "Set in-point"],
                 ["O", "Set out-point"],
                 ["X", "Clear selection"],
+                ["Drag empty timeline", "Select items in area"],
+                ["Drag lane header", "Select lanes in area"],
             ]) +
             this._shortcutSection("Tools", [
                 ["C", "Toggle razor / cut mode"],
@@ -8900,8 +9828,9 @@ export class EditorWidget {
             // ── Escape ──
             if (key === "Escape") {
                 if (this.isFullscreen) { void this._requestExitFullscreen({ reason: "escape" }); return true; }
-                if (this.selectedItems.length > 0) {
+                if (this.selectedItems.length > 0 || (this._selectedLanes || []).length > 0) {
                     this.selectedItems = [];
+                    this._clearLaneSelection();
                     this._renderTimeline();
                     this._updateToolbar();
                     return true;
@@ -8932,9 +9861,7 @@ export class EditorWidget {
                 // Defer to gallery if it owns the current selection focus.
                 if (this._assetGallery?.hasSelectionOwnership?.()) return false;
                 if (this.selectedItems.length > 0) {
-                    // Filter out locked-lane items before delete
-                    this.selectedItems = this.selectedItems.filter(s => !this._isItemLocked(s));
-                    if (this.selectedItems.length > 0) this._deleteSelectedItems();
+                    this._deleteSelectedItems();
                 }
                 return true; // consume even when nothing was deletable, so ComfyUI does not delete the node
             }
@@ -9751,9 +10678,11 @@ export class EditorWidget {
         for (const s of sections) {
             if (s.start_frame < snapshotEnd && s.end_frame > snapshotStart) {
                 promptSections.push({
+                    prompt_id: s.prompt_id || "",
                     start_frame: s.start_frame,
                     end_frame: s.end_frame,
                     channels: normalizeChannels(s.channels, s.prompt),
+                    muted: !!s.muted,
                     prompt: s.prompt || "",
                 });
             }
@@ -9774,6 +10703,7 @@ export class EditorWidget {
             if (frameIndex === -1) frameIndex = Math.max(0, sceneDuration - 1);
             if (snapshotStart <= frameIndex && frameIndex < snapshotEnd) {
                 guideFrameSnapshots.push({
+                    guide_id: guide.guide_id || "",
                     frame_index: frameIndex,
                     asset_id: guide.asset_id,
                     source: guide.source || "asset",
@@ -9803,6 +10733,9 @@ export class EditorWidget {
             template_id: this._templateId || "free",
             frame_constraint: this._resolveFrameConstraintForTemplate(this._templateId),
             take_placement_mode: this._settings?.render?.takePlacementMode ?? "trimmed",
+            // take_placement_linked / take_placement_muted intentionally NOT
+            // snapshotted: they resolve from live settings/widgets at execution
+            // (user decision 2026-06-11).
             // Labels toggle frozen for reproducibility (read by the relay bridge)
             params: { prompt_channel_labels: labelsOn },
         };

@@ -618,10 +618,31 @@ def _find_guide(scene: Scene, frame_index: int) -> GuideFrame:
     return guide
 
 
+def _find_guide_by_id(scene: Scene, guide_id: str) -> GuideFrame:
+    guide = next((g for g in scene.guide_frames if getattr(g, "guide_id", "") == guide_id), None)
+    if not guide:
+        _mutation_error(f"Guide not found: {guide_id}", 404, "item_not_found")
+    return guide
+
+
 def _find_prompt_section(scene: Scene, index: int) -> PromptSection:
     if index < 0 or index >= len(scene.prompt_sections):
         _mutation_error(f"Prompt section index out of range: {index}", 404, "item_not_found")
     return scene.prompt_sections[index]
+
+
+def _find_prompt_section_by_id(scene: Scene, prompt_id: str) -> PromptSection:
+    section = next((p for p in scene.prompt_sections if getattr(p, "prompt_id", "") == prompt_id), None)
+    if not section:
+        _mutation_error(f"Prompt section not found: {prompt_id}", 404, "item_not_found")
+    return section
+
+
+def _prompt_section_index(scene: Scene, section: PromptSection) -> int:
+    for index, current in enumerate(scene.prompt_sections):
+        if current is section:
+            return index
+    _mutation_error("Prompt section not found", 404, "item_not_found")
 
 
 def _expected_matches(value, expected) -> bool:
@@ -637,6 +658,7 @@ def _validate_guide_identity(guide: GuideFrame, expected: dict | None) -> None:
     if not isinstance(expected, dict):
         return
     checks = {
+        "guide_id": getattr(guide, "guide_id", ""),
         "frame_index": getattr(guide, "frame_index", 0),
         "asset_id": getattr(guide, "asset_id", ""),
         "source": getattr(guide, "source", ""),
@@ -652,9 +674,11 @@ def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> 
     if not isinstance(expected, dict):
         return
     checks = {
+        "prompt_id": getattr(section, "prompt_id", ""),
         "start_frame": getattr(section, "start_frame", 0),
         "end_frame": getattr(section, "end_frame", 0),
         "prompt": getattr(section, "prompt", ""),
+        "muted": bool(getattr(section, "muted", False)),
     }
     for key, current in checks.items():
         if key in expected and not _expected_matches(current, expected[key]):
@@ -689,6 +713,482 @@ def _require_no_prompt_overlap(scene: Scene, start_frame: int, end_frame: int,
             continue
         if other.start_frame < end_frame and other.end_frame > start_frame:
             _mutation_error("Prompt sections cannot overlap", 409, "prompt_overlap")
+
+
+LINK_ITEM_TYPES = {"clip", "audio", "guide", "prompt"}
+
+
+def _link_ref(item_type: str, item_id) -> dict:
+    return {"type": str(item_type or ""), "id": str(item_id or "")}
+
+
+def _link_ref_key(ref: dict) -> tuple[str, str]:
+    return (str(ref.get("type", "") or ""), str(ref.get("id", "") or ""))
+
+
+def _scene_existing_link_ids(scene: Scene) -> dict[str, set[str]]:
+    return {
+        "clip": {clip.clip_id for clip in getattr(scene, "clips", []) or []},
+        "audio": {track.track_id for track in getattr(scene, "audio_tracks", []) or []},
+        "guide": {getattr(guide, "guide_id", "") for guide in getattr(scene, "guide_frames", []) or []},
+        "prompt": {getattr(section, "prompt_id", "") for section in getattr(scene, "prompt_sections", []) or []},
+    }
+
+
+def _prune_linked_item_groups(scene: Scene) -> None:
+    groups = getattr(scene, "linked_item_groups", None)
+    if not isinstance(groups, list):
+        scene.linked_item_groups = []
+        return
+    existing = _scene_existing_link_ids(scene)
+    normalized = []
+    seen_group_ids = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("group_id", "") or "")
+        if not group_id or group_id in seen_group_ids:
+            group_id = uuid.uuid4().hex[:8]
+        items = []
+        seen_items = set()
+        for item in group.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            item_type, item_id = _link_ref_key(item)
+            key = (item_type, item_id)
+            if item_type in LINK_ITEM_TYPES and item_id in existing.get(item_type, set()) and key not in seen_items:
+                items.append(_link_ref(item_type, item_id))
+                seen_items.add(key)
+        if len(items) >= 2:
+            normalized.append({"group_id": group_id, "items": items})
+            seen_group_ids.add(group_id)
+    scene.linked_item_groups = normalized
+
+
+def _resolve_link_ref(scene: Scene, item_type: str, item_id: str):
+    if item_type == "clip":
+        return _find_clip(scene, item_id)
+    if item_type == "audio":
+        return _find_audio_track(scene, item_id)
+    if item_type == "guide":
+        return _find_guide_by_id(scene, item_id)
+    if item_type == "prompt":
+        return _find_prompt_section_by_id(scene, item_id)
+    _mutation_error(f"Unsupported linked item type: {item_type}", 400, "invalid_link_type")
+
+
+def _item_ref_from_selection(scene: Scene, item: dict) -> dict:
+    if not isinstance(item, dict):
+        _mutation_error("Linked item must be an object", 400)
+    item_type = str(item.get("type", "") or "")
+    if item_type not in LINK_ITEM_TYPES:
+        _mutation_error(f"Unsupported linked item type: {item_type}", 400, "invalid_link_type")
+    raw_id = item.get("id")
+    if item_type == "guide" and not item.get("id") and "frame_index" in item:
+        guide = _find_guide(scene, _mutation_int(item.get("frame_index"), "guide frame_index"))
+        return _link_ref("guide", getattr(guide, "guide_id", ""))
+    if item_type == "prompt" and not item.get("id") and "index" in item:
+        section = _find_prompt_section(scene, _mutation_int(item.get("index"), "prompt index"))
+        return _link_ref("prompt", getattr(section, "prompt_id", ""))
+    if item_type == "prompt" and raw_id is not None:
+        raw_id_str = str(raw_id)
+        if raw_id_str.isdigit() and not any(getattr(p, "prompt_id", "") == raw_id_str for p in scene.prompt_sections):
+            section = _find_prompt_section(scene, int(raw_id_str))
+            return _link_ref("prompt", getattr(section, "prompt_id", ""))
+    if item_type == "guide" and raw_id is not None:
+        raw_id_str = str(raw_id)
+        if not any(getattr(g, "guide_id", "") == raw_id_str for g in scene.guide_frames):
+            try:
+                guide = _find_guide(scene, int(raw_id_str))
+                return _link_ref("guide", getattr(guide, "guide_id", ""))
+            except (TypeError, ValueError):
+                pass
+    item_id = str(raw_id or "")
+    _resolve_link_ref(scene, item_type, item_id)
+    return _link_ref(item_type, item_id)
+
+
+def _link_group_for_ref(scene: Scene, ref: dict) -> dict | None:
+    key = _link_ref_key(ref)
+    for group in getattr(scene, "linked_item_groups", []) or []:
+        if any(_link_ref_key(item) == key for item in group.get("items", []) or []):
+            return group
+    return None
+
+
+def _expand_linked_refs(scene: Scene, refs: list[dict], apply_linked: bool = True) -> list[dict]:
+    _prune_linked_item_groups(scene)
+    ordered = []
+    seen = set()
+    for ref in refs:
+        key = _link_ref_key(ref)
+        if key not in seen:
+            ordered.append(_link_ref(*key))
+            seen.add(key)
+        if not apply_linked:
+            continue
+        group = _link_group_for_ref(scene, ref)
+        if not group:
+            continue
+        for item in group.get("items", []) or []:
+            item_key = _link_ref_key(item)
+            if item_key not in seen:
+                ordered.append(_link_ref(*item_key))
+                seen.add(item_key)
+    return ordered
+
+
+def _require_link_ref_unlocked(scene: Scene, ref: dict) -> None:
+    item_type, item_id = _link_ref_key(ref)
+    item = _resolve_link_ref(scene, item_type, item_id)
+    if item_type == "clip":
+        _require_clip_unlocked(scene, item)
+    elif item_type == "audio":
+        _require_audio_unlocked(scene, item)
+    elif item_type == "guide":
+        _require_lane_unlocked(scene, "guide")
+    elif item_type == "prompt":
+        _require_lane_unlocked(scene, "prompt")
+
+
+def _require_link_refs_unlocked(scene: Scene, refs: list[dict]) -> None:
+    for ref in refs:
+        _require_link_ref_unlocked(scene, ref)
+
+
+def _item_bounds(scene: Scene, ref: dict) -> tuple[int, int]:
+    item_type, item_id = _link_ref_key(ref)
+    item = _resolve_link_ref(scene, item_type, item_id)
+    if item_type in {"clip", "audio"}:
+        return int(item.timeline_start_frame), int(item.timeline_end_frame)
+    if item_type == "guide":
+        idx = int(item.frame_index)
+        return idx, idx + 1
+    if item_type == "prompt":
+        return int(item.start_frame), int(item.end_frame)
+    _mutation_error(f"Unsupported linked item type: {item_type}", 400, "invalid_link_type")
+
+
+def _add_link_group(scene: Scene, items: list[dict], group_id: str = "") -> dict:
+    refs = []
+    seen = set()
+    for item in items:
+        ref = _item_ref_from_selection(scene, item)
+        key = _link_ref_key(ref)
+        if key not in seen:
+            refs.append(ref)
+            seen.add(key)
+    if len(refs) < 2:
+        _mutation_error("A link group requires at least two existing items", 400, "invalid_link_group")
+    _unlink_refs(scene, refs)
+    group = {"group_id": str(group_id or uuid.uuid4().hex[:8]), "items": refs}
+    scene.linked_item_groups.append(group)
+    _prune_linked_item_groups(scene)
+    return group
+
+
+def _unlink_refs(scene: Scene, refs: list[dict]) -> None:
+    keys = {_link_ref_key(ref) for ref in refs}
+    next_groups = []
+    for group in getattr(scene, "linked_item_groups", []) or []:
+        items = [item for item in group.get("items", []) or [] if _link_ref_key(item) not in keys]
+        if len(items) >= 2:
+            next_groups.append({"group_id": group.get("group_id") or uuid.uuid4().hex[:8], "items": items})
+    scene.linked_item_groups = next_groups
+
+
+def _rewrite_link_groups_for_deleted(scene: Scene, refs: list[dict]) -> None:
+    _unlink_refs(scene, refs)
+    _prune_linked_item_groups(scene)
+
+
+def _validate_prompt_target_ranges(scene: Scene, targets: dict[str, tuple[PromptSection, int, int]]) -> None:
+    sections = [item[0] for item in targets.values()]
+    ranges = []
+    for section, start, end in targets.values():
+        if end <= start:
+            _mutation_error("Prompt section range is invalid", 400, "invalid_range")
+        if start < 0 or (int(getattr(scene, "duration_frames", 0) or 0) > 0 and end > int(scene.duration_frames)):
+            _mutation_error("Prompt section range is outside the scene", 409, "invalid_range")
+        _require_no_prompt_overlap(scene, start, end, ignore=sections)
+        ranges.append((section, start, end))
+    for idx, (section, start, end) in enumerate(ranges):
+        for other, other_start, other_end in ranges[idx + 1:]:
+            if section is other:
+                continue
+            if start < other_end and end > other_start:
+                _mutation_error("Prompt sections cannot overlap", 409, "prompt_overlap")
+
+
+def _apply_ref_muted(scene: Scene, ref: dict, muted: bool) -> None:
+    item_type, item_id = _link_ref_key(ref)
+    item = _resolve_link_ref(scene, item_type, item_id)
+    if item_type in {"clip", "audio", "guide", "prompt"}:
+        item.muted = bool(muted)
+
+
+def _apply_ref_bounds(scene: Scene, ref: dict, start: int, end: int,
+                      old_start: int, old_end: int) -> None:
+    item_type, item_id = _link_ref_key(ref)
+    item = _resolve_link_ref(scene, item_type, item_id)
+    if item_type == "clip":
+        if start < 0 or end <= start:
+            _mutation_error("Clip range is invalid", 400, "invalid_range")
+        left_delta = start - old_start
+        right_delta = end - old_end
+        pure_move = left_delta == right_delta
+        item.timeline_start_frame = start
+        item.timeline_end_frame = end
+        if left_delta and not pure_move:
+            item.source_in_frame = int(getattr(item, "source_in_frame", 0) or 0) + left_delta
+        if right_delta and not pure_move:
+            item.source_out_frame = int(getattr(item, "source_out_frame", 0) or 0) + right_delta
+        return
+    if item_type == "audio":
+        if start < 0 or end <= start:
+            _mutation_error("Audio range is invalid", 400, "invalid_range")
+        left_delta = start - old_start
+        right_delta = end - old_end
+        pure_move = left_delta == right_delta
+        item.timeline_start_frame = start
+        item.timeline_end_frame = end
+        if left_delta and not pure_move:
+            item.source_in_frame = int(getattr(item, "source_in_frame", 0) or 0) + left_delta
+        return
+    if item_type == "guide":
+        frame = start
+        duration = int(getattr(scene, "duration_frames", 0) or 0)
+        if frame < 0 or (duration > 0 and frame >= duration):
+            _mutation_error("Guide frame is outside the scene", 409, "invalid_range")
+        item.frame_index = frame
+        return
+    if item_type == "prompt":
+        item.start_frame = start
+        item.end_frame = end
+        scene.prompt_sections.sort(key=lambda section: section.start_frame)
+        return
+
+
+def _apply_linked_bounds_update(project: TimelineProject, scene: Scene, anchor_ref: dict, fields: dict) -> None:
+    if not isinstance(fields, dict):
+        _mutation_error("Linked update requires fields", 400)
+    refs = _expand_linked_refs(scene, [anchor_ref], True)
+    _require_link_refs_unlocked(scene, refs)
+
+    item_type, item_id = _link_ref_key(anchor_ref)
+    old_bounds = {tuple(_link_ref_key(ref)): _item_bounds(scene, ref) for ref in refs}
+    anchor_old_start, anchor_old_end = old_bounds[(item_type, item_id)]
+
+    if set(fields.keys()) <= {"muted"} and "muted" in fields:
+        for ref in refs:
+            _apply_ref_muted(scene, ref, bool(fields["muted"]))
+        return
+
+    if item_type == "clip":
+        anchor_new_start = max(0, int(fields.get("timeline_start_frame", anchor_old_start)))
+        anchor_new_end = int(fields.get("timeline_end_frame", anchor_old_end + (anchor_new_start - anchor_old_start)))
+    elif item_type == "audio":
+        anchor_new_start = max(0, int(fields.get("timeline_start_frame", anchor_old_start)))
+        anchor_new_end = int(fields.get("timeline_end_frame", anchor_old_end + (anchor_new_start - anchor_old_start)))
+    elif item_type == "guide":
+        anchor_new_start = _mutation_int(fields.get("frame_index", anchor_old_start), "frame_index")
+        anchor_new_end = anchor_new_start + 1
+    elif item_type == "prompt":
+        anchor_new_start = int(fields.get("start_frame", anchor_old_start))
+        anchor_new_end = int(fields.get("end_frame", anchor_old_end))
+    else:
+        _mutation_error(f"Unsupported linked item type: {item_type}", 400)
+
+    delta_start = anchor_new_start - anchor_old_start
+    delta_end = anchor_new_end - anchor_old_end
+    pure_move = delta_start == delta_end
+    prompt_targets = {}
+    target_bounds = {}
+    for ref in refs:
+        key = tuple(_link_ref_key(ref))
+        ref_type, ref_id = key
+        old_start, old_end = old_bounds[key]
+        if pure_move:
+            next_start = old_start + delta_start
+            next_end = old_end + delta_end
+        else:
+            next_start = old_start + delta_start if old_start == anchor_old_start else old_start
+            next_end = old_end + delta_end if old_end == anchor_old_end else old_end
+            if next_start == old_start and next_end == old_end:
+                continue
+        target_bounds[key] = (next_start, next_end)
+        if ref_type == "prompt":
+            prompt_targets[ref_id] = (_resolve_link_ref(scene, ref_type, ref_id), next_start, next_end)
+
+    _validate_prompt_target_ranges(scene, prompt_targets)
+    for ref in refs:
+        key = tuple(_link_ref_key(ref))
+        if key not in target_bounds:
+            continue
+        old_start, old_end = old_bounds[key]
+        next_start, next_end = target_bounds[key]
+        _apply_ref_bounds(scene, ref, next_start, next_end, old_start, old_end)
+
+    # Apply non-temporal anchor fields after linked temporal propagation.
+    if item_type == "clip":
+        anchor = _find_clip(scene, item_id)
+        remaining = {key: value for key, value in fields.items()
+                     if key not in {"timeline_start_frame", "timeline_end_frame", "muted"}}
+        _apply_update_clip(project, scene, item_id, remaining)
+        if "muted" in fields:
+            anchor.muted = bool(fields["muted"])
+    elif item_type == "audio":
+        remaining = {key: value for key, value in fields.items()
+                     if key not in {"timeline_start_frame", "timeline_end_frame", "muted"}}
+        _apply_update_audio_track(scene, item_id, remaining)
+        if "muted" in fields:
+            _find_audio_track(scene, item_id).muted = bool(fields["muted"])
+    elif item_type == "guide":
+        guide = _find_guide_by_id(scene, item_id)
+        for field in ("asset_id", "source", "strength", "muted"):
+            if field in fields:
+                setattr(guide, field, bool(fields[field]) if field == "muted" else fields[field])
+    elif item_type == "prompt":
+        section = _find_prompt_section_by_id(scene, item_id)
+        if isinstance(fields.get("channels"), dict):
+            section.channels = prompt_payload.normalize_channels(fields["channels"])
+        elif "prompt" in fields:
+            section.prompt = str(fields["prompt"])
+        if "muted" in fields:
+            section.muted = bool(fields["muted"])
+
+
+def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int) -> ClipReference:
+    if split_frame <= clip.timeline_start_frame or split_frame >= clip.timeline_end_frame:
+        _mutation_error("Split frame must be within clip range", 400, "invalid_range")
+    source_offset = split_frame - clip.timeline_start_frame
+    source_split = (clip.source_in_frame or 0) + source_offset
+    orig_source_out = clip.source_out_frame or clip.timeline_end_frame - clip.timeline_start_frame
+    left_source_in = clip.source_in_frame or 0
+    right = ClipReference(
+        source_path=clip.source_path,
+        timeline_start_frame=split_frame,
+        timeline_end_frame=clip.timeline_end_frame,
+        source_in_frame=source_split,
+        source_out_frame=orig_source_out,
+        total_source_frames=orig_source_out - source_split,
+        source_origin_frame=source_split,
+        opacity=getattr(clip, "opacity", 1.0),
+        track_index=clip.track_index,
+        role=getattr(clip, "role", "render"),
+        strength=getattr(clip, "strength", 1.0),
+        muted=getattr(clip, "muted", False),
+        prompt=getattr(clip, "prompt", ""),
+        is_generated=getattr(clip, "is_generated", False),
+        generation_params=dict(getattr(clip, "generation_params", {}) or {}),
+        takes=list(getattr(clip, "takes", []) or []),
+        active_take=int(getattr(clip, "active_take", 0) or 0),
+        take_metadata=dict(getattr(clip, "take_metadata", {}) or {}),
+    )
+    clip.timeline_end_frame = split_frame
+    clip.source_out_frame = source_split
+    clip.total_source_frames = source_split - left_source_in
+    clip.source_origin_frame = left_source_in
+    scene.clips.append(right)
+    return right
+
+
+def _split_audio_object(scene: Scene, track: AudioTrack, split_frame: int) -> AudioTrack:
+    if split_frame <= track.timeline_start_frame or split_frame >= track.timeline_end_frame:
+        _mutation_error("Split frame must be within track range", 400, "invalid_range")
+    source_offset = split_frame - track.timeline_start_frame
+    source_split = (track.source_in_frame or 0) + source_offset
+    orig_end_frame = track.timeline_end_frame
+    right_duration = orig_end_frame - split_frame
+    left_duration = split_frame - track.timeline_start_frame
+    right = AudioTrack(
+        source_path=track.source_path,
+        timeline_start_frame=split_frame,
+        timeline_end_frame=orig_end_frame,
+        source_in_frame=source_split,
+        total_source_frames=right_duration,
+        source_origin_frame=source_split,
+        volume=getattr(track, "volume", 1.0),
+        muted=getattr(track, "muted", False),
+        lane_index=track.lane_index,
+    )
+    track.timeline_end_frame = split_frame
+    track.total_source_frames = left_duration
+    track.source_origin_frame = track.source_in_frame or 0
+    scene.audio_tracks.append(right)
+    return right
+
+
+def _split_prompt_object(scene: Scene, section: PromptSection, split_frame: int) -> PromptSection:
+    if split_frame <= section.start_frame or split_frame >= section.end_frame:
+        _mutation_error("Split frame must be within prompt section range", 400, "invalid_range")
+    right = PromptSection(
+        start_frame=split_frame,
+        end_frame=section.end_frame,
+        channels=dict(getattr(section, "channels", {}) or {}),
+        muted=bool(getattr(section, "muted", False)),
+    )
+    section.end_frame = split_frame
+    scene.prompt_sections.append(right)
+    scene.prompt_sections.sort(key=lambda item: item.start_frame)
+    return right
+
+
+def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int, apply_linked: bool = True) -> dict:
+    refs = _expand_linked_refs(scene, [anchor_ref], apply_linked)
+    _require_link_refs_unlocked(scene, refs)
+    split_frame = _mutation_int(split_frame, "frame")
+    left_refs = []
+    right_refs = []
+    split_results = {}
+
+    for ref in refs:
+        item_type, item_id = _link_ref_key(ref)
+        start, end = _item_bounds(scene, ref)
+        if start < split_frame < end:
+            if item_type == "clip":
+                right = _split_clip_object(scene, _find_clip(scene, item_id), split_frame)
+                left_refs.append(ref)
+                right_ref = _link_ref("clip", right.clip_id)
+                right_refs.append(right_ref)
+                split_results[item_id] = {"left": ref, "right": right_ref}
+            elif item_type == "audio":
+                right = _split_audio_object(scene, _find_audio_track(scene, item_id), split_frame)
+                left_refs.append(ref)
+                right_ref = _link_ref("audio", right.track_id)
+                right_refs.append(right_ref)
+                split_results[item_id] = {"left": ref, "right": right_ref}
+            elif item_type == "prompt":
+                right = _split_prompt_object(scene, _find_prompt_section_by_id(scene, item_id), split_frame)
+                left_refs.append(ref)
+                right_ref = _link_ref("prompt", right.prompt_id)
+                right_refs.append(right_ref)
+                split_results[item_id] = {"left": ref, "right": right_ref}
+            else:
+                left_refs.append(ref)
+        else:
+            left_overlap = max(0, min(end, split_frame) - start)
+            right_overlap = max(0, end - max(start, split_frame))
+            if right_overlap > left_overlap:
+                right_refs.append(ref)
+            else:
+                left_refs.append(ref)
+
+    if apply_linked:
+        _unlink_refs(scene, refs)
+        if len(left_refs) >= 2:
+            scene.linked_item_groups.append({"group_id": uuid.uuid4().hex[:8], "items": left_refs})
+        if len(right_refs) >= 2:
+            scene.linked_item_groups.append({"group_id": uuid.uuid4().hex[:8], "items": right_refs})
+        _prune_linked_item_groups(scene)
+
+    return {
+        "type": "split_linked_items" if apply_linked else "split_item",
+        "frame": split_frame,
+        "split_count": len(split_results),
+        "left_items": left_refs,
+        "right_items": right_refs,
+    }
 
 
 def _apply_scene_fields(scene: Scene, fields: dict) -> None:
@@ -734,6 +1234,50 @@ def _apply_lane_configs(scene: Scene, fields: dict) -> None:
     if "global_prompt_track_config" in fields:
         scene.global_prompt_track_config = LaneConfig.from_dict(fields["global_prompt_track_config"])
     _ensure_scene_lane_config_lengths(scene)
+
+
+_FIXED_TRACK_CONFIG_ATTRS = {
+    "guide": "guide_track_config",
+    "prompt": "prompt_track_config",
+    "prompt_global": "global_prompt_track_config",
+}
+
+
+def _apply_lane_config(scene: Scene, op: dict) -> dict:
+    """Scoped per-lane config update (mutation-integrity F1).
+
+    Unlike the legacy full-replace `update_lane_configs`, this writes exactly
+    one lane/track config so a client can never clobber lanes it did not touch.
+    Deliberately NO `_require_lane_unlocked`: toggling `locked` itself must
+    work on a locked lane (matches the legacy op, which has no lock gate).
+    """
+    fields = op.get("fields")
+    if not isinstance(fields, dict):
+        _mutation_error("update_lane_config requires fields", 400)
+    lane_type = str(op.get("lane_type", ""))
+    if lane_type in _FIXED_TRACK_CONFIG_ATTRS:
+        attr = _FIXED_TRACK_CONFIG_ATTRS[lane_type]
+        config = getattr(scene, attr, None)
+        if config is None:
+            config = LaneConfig()
+            setattr(scene, attr, config)
+        lane_index = 0
+    elif lane_type in {"video", "motion_driver", "audio"}:
+        lane_index = _mutation_int(op.get("lane_index", 0), "lane_index", 0)
+        if lane_index < 0 or lane_index >= _scene_lane_count(scene, lane_type):
+            _mutation_error(f"Lane index out of range: {lane_index}", 404, "item_not_found")
+        config = _lane_config(scene, lane_type, lane_index)
+    else:
+        _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    if "name" in fields:
+        config.name = str(fields["name"] or "")
+    if "color" in fields:
+        config.color = str(fields["color"] or "")
+    if "locked" in fields:
+        config.locked = bool(fields["locked"])
+    if "hidden" in fields:
+        config.hidden = bool(fields["hidden"])
+    return {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
 
 
 def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_policy: str, target_lane: int | None = None) -> None:
@@ -869,6 +1413,7 @@ def _delete_clip(scene: Scene, clip_id: str, preserve_lane: bool = False) -> Non
     deleted_lane = int(clip.track_index or 0)
     should_compact = _is_render_clip(clip) and not preserve_lane
     scene.clips = [item for item in scene.clips if item.clip_id != clip_id]
+    _rewrite_link_groups_for_deleted(scene, [_link_ref("clip", clip_id)])
     if should_compact:
         _compact_empty_media_lane(scene, "video", deleted_lane)
 
@@ -878,13 +1423,19 @@ def _delete_audio_track(scene: Scene, track_id: str, preserve_lane: bool = False
     _require_audio_unlocked(scene, track)
     deleted_lane = int(track.lane_index or 0)
     scene.audio_tracks = [item for item in scene.audio_tracks if item.track_id != track_id]
+    _rewrite_link_groups_for_deleted(scene, [_link_ref("audio", track_id)])
     if not preserve_lane:
         _compact_empty_media_lane(scene, "audio", deleted_lane)
 
 
-def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = False) -> None:
+def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = False,
+                             apply_linked: bool = False) -> None:
     if not isinstance(items, list):
         _mutation_error("bulk_delete_items requires items", 400)
+    if apply_linked:
+        refs = [_item_ref_from_selection(scene, item) for item in items]
+        _apply_delete_link_refs(scene, refs, preserve_lanes)
+        return
     resolved = []
     for item in items:
         if not isinstance(item, dict):
@@ -945,6 +1496,54 @@ def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = F
         _compact_empty_media_lane(scene, "video", lane)
     for lane in sorted(set(audio_lanes), reverse=True):
         _compact_empty_media_lane(scene, "audio", lane)
+    _prune_linked_item_groups(scene)
+
+
+def _apply_delete_link_refs(scene: Scene, refs: list[dict], preserve_lanes: bool = False) -> None:
+    refs = _expand_linked_refs(scene, refs, True)
+    _require_link_refs_unlocked(scene, refs)
+    video_lanes = []
+    audio_lanes = []
+    prompt_ids = set()
+    guide_ids = set()
+    clip_ids = set()
+    audio_ids = set()
+    for ref in refs:
+        item_type, item_id = _link_ref_key(ref)
+        if item_type == "clip":
+            clip = _find_clip(scene, item_id)
+            if _is_render_clip(clip):
+                video_lanes.append(int(getattr(clip, "track_index", 0) or 0))
+            clip_ids.add(item_id)
+        elif item_type == "audio":
+            track = _find_audio_track(scene, item_id)
+            audio_lanes.append(int(getattr(track, "lane_index", 0) or 0))
+            audio_ids.add(item_id)
+        elif item_type == "guide":
+            _find_guide_by_id(scene, item_id)
+            guide_ids.add(item_id)
+        elif item_type == "prompt":
+            _find_prompt_section_by_id(scene, item_id)
+            prompt_ids.add(item_id)
+
+    if clip_ids:
+        scene.clips = [clip for clip in scene.clips if clip.clip_id not in clip_ids]
+    if audio_ids:
+        scene.audio_tracks = [track for track in scene.audio_tracks if track.track_id not in audio_ids]
+    if guide_ids:
+        scene.guide_frames = [guide for guide in scene.guide_frames if getattr(guide, "guide_id", "") not in guide_ids]
+    if prompt_ids:
+        scene.prompt_sections = [
+            section for section in scene.prompt_sections
+            if getattr(section, "prompt_id", "") not in prompt_ids
+        ]
+
+    if not preserve_lanes:
+        for lane in sorted(set(video_lanes), reverse=True):
+            _compact_empty_media_lane(scene, "video", lane)
+        for lane in sorted(set(audio_lanes), reverse=True):
+            _compact_empty_media_lane(scene, "audio", lane)
+    _rewrite_link_groups_for_deleted(scene, refs)
 
 
 def _apply_move_guide(scene: Scene, op: dict) -> GuideFrame:
@@ -954,18 +1553,26 @@ def _apply_move_guide(scene: Scene, op: dict) -> GuideFrame:
     guide = _find_guide(scene, old_frame)
     _validate_guide_identity(guide, op.get("expected"))
     next_guide = GuideFrame(
+        guide_id=str(op.get("guide_id", getattr(guide, "guide_id", "")) or getattr(guide, "guide_id", "") or uuid.uuid4().hex[:8]),
         frame_index=new_frame,
         asset_id=str(op.get("asset_id", getattr(guide, "asset_id", "")) or ""),
         source=str(op.get("source", getattr(guide, "source", "") or "asset") or "asset"),
         strength=_mutation_float(op.get("strength", getattr(guide, "strength", 1.0)), "strength", 1.0),
         muted=bool(op.get("muted", getattr(guide, "muted", False))),
     )
+    replaced_ids = [
+        getattr(current, "guide_id", "")
+        for current in scene.guide_frames
+        if current.frame_index == new_frame and current is not guide
+    ]
     scene.guide_frames = [
         current for current in scene.guide_frames
         if current.frame_index not in {old_frame, new_frame}
     ]
     scene.guide_frames.append(next_guide)
     scene.guide_frames.sort(key=lambda g: g.frame_index)
+    if replaced_ids:
+        _rewrite_link_groups_for_deleted(scene, [_link_ref("guide", guide_id) for guide_id in replaced_ids])
     return next_guide
 
 
@@ -977,6 +1584,10 @@ def _apply_update_guide(scene: Scene, frame_index: int, fields: dict, expected: 
         guide.strength = float(fields["strength"])
     if "muted" in fields:
         guide.muted = bool(fields["muted"])
+    if "asset_id" in fields:
+        guide.asset_id = str(fields["asset_id"] or "")
+    if "source" in fields:
+        guide.source = str(fields["source"] or "asset")
     return guide
 
 
@@ -985,20 +1596,29 @@ def _apply_delete_guide(scene: Scene, frame_index: int, expected: dict | None = 
     guide = _find_guide(scene, frame_index)
     _validate_guide_identity(guide, expected)
     scene.guide_frames = [current for current in scene.guide_frames if current.frame_index != frame_index]
+    _rewrite_link_groups_for_deleted(scene, [_link_ref("guide", getattr(guide, "guide_id", ""))])
 
 
 def _apply_create_guide(scene: Scene, fields: dict) -> GuideFrame:
     _require_lane_unlocked(scene, "guide")
     guide = GuideFrame(
+        guide_id=str(fields.get("guide_id", "") or uuid.uuid4().hex[:8]),
         frame_index=_mutation_int(fields.get("frame_index", 0), "frame_index", 0),
         asset_id=str(fields.get("asset_id", "") or ""),
         source=str(fields.get("source", "asset") or "asset"),
         strength=_mutation_float(fields.get("strength", 1.0), "strength", 1.0),
         muted=bool(fields.get("muted", False)),
     )
+    replaced_ids = [
+        getattr(current, "guide_id", "")
+        for current in scene.guide_frames
+        if current.frame_index == guide.frame_index
+    ]
     scene.guide_frames = [current for current in scene.guide_frames if current.frame_index != guide.frame_index]
     scene.guide_frames.append(guide)
     scene.guide_frames.sort(key=lambda g: g.frame_index)
+    if replaced_ids:
+        _rewrite_link_groups_for_deleted(scene, [_link_ref("guide", guide_id) for guide_id in replaced_ids])
     return guide
 
 
@@ -1020,6 +1640,8 @@ def _apply_update_prompt_section(scene: Scene, index: int, fields: dict, expecte
         section.channels = prompt_payload.normalize_channels(raw_channels)
     elif "prompt" in fields:
         section.prompt = str(fields["prompt"])
+    if "muted" in fields:
+        section.muted = bool(fields["muted"])
     scene.prompt_sections.sort(key=lambda s: s.start_frame)
     return section
 
@@ -1028,7 +1650,9 @@ def _apply_delete_prompt_section(scene: Scene, index: int, expected: dict | None
     _require_lane_unlocked(scene, "prompt")
     section = _find_prompt_section(scene, index)
     _validate_prompt_identity(section, expected)
+    prompt_id = getattr(section, "prompt_id", "")
     scene.prompt_sections.pop(index)
+    _rewrite_link_groups_for_deleted(scene, [_link_ref("prompt", prompt_id)])
 
 
 def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
@@ -1042,7 +1666,10 @@ def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
         end_frame=end_frame,
         prompt=str(fields.get("prompt", "") or ""),
         channels=raw_channels if isinstance(raw_channels, dict) else None,
+        muted=bool(fields.get("muted", False)),
     )
+    if fields.get("prompt_id"):
+        section.prompt_id = str(fields.get("prompt_id"))
     scene.prompt_sections.append(section)
     scene.prompt_sections.sort(key=lambda s: s.start_frame)
     return section
@@ -1096,6 +1723,8 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     if op_type == "update_lane_configs":
         _apply_lane_configs(scene, op.get("fields", {}))
         return {"type": op_type}
+    if op_type == "update_lane_config":
+        return _apply_lane_config(scene, op)
     if op_type == "set_lane_count":
         lane_type = str(op.get("lane_type", ""))
         _set_scene_lane_count(scene, lane_type, max(1, _mutation_int(op.get("count"), "count")))
@@ -1109,30 +1738,105 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             op.get("target_lane"),
         )
         return {"type": op_type}
+    if op_type == "create_link_group":
+        group = _add_link_group(scene, op.get("items", []), str(op.get("group_id", "") or ""))
+        return {"type": op_type, "group_id": group["group_id"], "count": len(group["items"])}
+    if op_type == "unlink_items":
+        refs = [_item_ref_from_selection(scene, item) for item in op.get("items", []) or []]
+        if op.get("entire_group"):
+            refs = _expand_linked_refs(scene, refs, True)
+        _unlink_refs(scene, refs)
+        _prune_linked_item_groups(scene)
+        return {"type": op_type, "count": len(refs)}
+    if op_type == "delete_link_group":
+        group_id = str(op.get("group_id", "") or "")
+        scene.linked_item_groups = [
+            group for group in getattr(scene, "linked_item_groups", []) or []
+            if str(group.get("group_id", "") or "") != group_id
+        ]
+        return {"type": op_type, "group_id": group_id}
     if op_type == "update_clip":
+        if op.get("apply_linked"):
+            _apply_linked_bounds_update(project, scene, _link_ref("clip", str(op.get("clip_id", ""))), op.get("fields", {}))
+            return {"type": op_type, "clip_id": str(op.get("clip_id", "")), "linked": True}
         clip = _apply_update_clip(project, scene, str(op.get("clip_id", "")), op.get("fields", {}))
         return {"type": op_type, "clip_id": clip.clip_id}
     if op_type == "delete_clip":
+        if op.get("apply_linked"):
+            _apply_delete_link_refs(scene, [_link_ref("clip", str(op.get("clip_id", "")))], bool(op.get("preserve_lane", False)))
+            return {"type": op_type, "clip_id": str(op.get("clip_id", "")), "linked": True}
         _delete_clip(scene, str(op.get("clip_id", "")), bool(op.get("preserve_lane", False)))
         return {"type": op_type, "clip_id": str(op.get("clip_id", ""))}
     if op_type == "update_audio_track":
+        if op.get("apply_linked"):
+            _apply_linked_bounds_update(project, scene, _link_ref("audio", str(op.get("track_id", ""))), op.get("fields", {}))
+            return {"type": op_type, "track_id": str(op.get("track_id", "")), "linked": True}
         track = _apply_update_audio_track(scene, str(op.get("track_id", "")), op.get("fields", {}))
         return {"type": op_type, "track_id": track.track_id}
     if op_type == "delete_audio_track":
+        if op.get("apply_linked"):
+            _apply_delete_link_refs(scene, [_link_ref("audio", str(op.get("track_id", "")))], bool(op.get("preserve_lane", False)))
+            return {"type": op_type, "track_id": str(op.get("track_id", "")), "linked": True}
         _delete_audio_track(scene, str(op.get("track_id", "")), bool(op.get("preserve_lane", False)))
         return {"type": op_type, "track_id": str(op.get("track_id", ""))}
     if op_type == "bulk_delete_items":
-        _apply_bulk_delete_items(scene, op.get("items", []), bool(op.get("preserve_lanes", False)))
+        _apply_bulk_delete_items(
+            scene,
+            op.get("items", []),
+            bool(op.get("preserve_lanes", False)),
+            bool(op.get("apply_linked", False)),
+        )
         return {"type": op_type, "count": len(op.get("items", []) or [])}
+    if op_type == "split_clip":
+        result = _apply_split_linked(
+            scene,
+            _link_ref("clip", str(op.get("clip_id", ""))),
+            op.get("frame", 0),
+            bool(op.get("apply_linked", False)),
+        )
+        return result
+    if op_type == "split_audio_track":
+        result = _apply_split_linked(
+            scene,
+            _link_ref("audio", str(op.get("track_id", ""))),
+            op.get("frame", 0),
+            bool(op.get("apply_linked", False)),
+        )
+        return result
     if op_type == "move_guide":
+        if op.get("apply_linked"):
+            guide = _find_guide(scene, _mutation_int(op.get("from_frame_index"), "from_frame_index"))
+            _validate_guide_identity(guide, op.get("expected"))
+            _apply_linked_bounds_update(
+                project,
+                scene,
+                _link_ref("guide", getattr(guide, "guide_id", "")),
+                {"frame_index": _mutation_int(op.get("to_frame_index"), "to_frame_index")},
+            )
+            return {"type": op_type, "frame_index": int(getattr(guide, "frame_index", 0)), "linked": True}
         guide = _apply_move_guide(scene, op)
         return {"type": op_type, "frame_index": guide.frame_index}
     if op_type == "update_guide":
         frame_index = _mutation_int(op.get("frame_index"), "frame_index")
+        if op.get("apply_linked"):
+            guide = _find_guide(scene, frame_index)
+            _validate_guide_identity(guide, op.get("expected"))
+            _apply_linked_bounds_update(
+                project,
+                scene,
+                _link_ref("guide", getattr(guide, "guide_id", "")),
+                op.get("fields", {}),
+            )
+            return {"type": op_type, "frame_index": frame_index, "linked": True}
         guide = _apply_update_guide(scene, frame_index, op.get("fields", {}), op.get("expected"))
         return {"type": op_type, "frame_index": guide.frame_index}
     if op_type == "delete_guide":
         frame_index = _mutation_int(op.get("frame_index"), "frame_index")
+        if op.get("apply_linked"):
+            guide = _find_guide(scene, frame_index)
+            _validate_guide_identity(guide, op.get("expected"))
+            _apply_delete_link_refs(scene, [_link_ref("guide", getattr(guide, "guide_id", ""))], True)
+            return {"type": op_type, "frame_index": frame_index, "linked": True}
         _apply_delete_guide(scene, frame_index, op.get("expected"))
         return {"type": op_type, "frame_index": frame_index}
     if op_type == "create_guide":
@@ -1140,12 +1844,38 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return {"type": op_type, "frame_index": guide.frame_index}
     if op_type == "update_prompt_section":
         index = _mutation_int(op.get("index"), "index")
+        if op.get("apply_linked"):
+            section = _find_prompt_section(scene, index)
+            _validate_prompt_identity(section, op.get("expected"))
+            _apply_linked_bounds_update(
+                project,
+                scene,
+                _link_ref("prompt", getattr(section, "prompt_id", "")),
+                op.get("fields", {}),
+            )
+            return {"type": op_type, "index": index, "linked": True}
         section = _apply_update_prompt_section(scene, index, op.get("fields", {}), op.get("expected"))
         return {"type": op_type, "index": index, "start_frame": section.start_frame, "end_frame": section.end_frame}
     if op_type == "delete_prompt_section":
         index = _mutation_int(op.get("index"), "index")
+        if op.get("apply_linked"):
+            section = _find_prompt_section(scene, index)
+            _validate_prompt_identity(section, op.get("expected"))
+            _apply_delete_link_refs(scene, [_link_ref("prompt", getattr(section, "prompt_id", ""))], True)
+            return {"type": op_type, "index": index, "linked": True}
         _apply_delete_prompt_section(scene, index, op.get("expected"))
         return {"type": op_type, "index": index}
+    if op_type == "split_prompt_section":
+        index = _mutation_int(op.get("index"), "index")
+        section = _find_prompt_section(scene, index)
+        _validate_prompt_identity(section, op.get("expected"))
+        result = _apply_split_linked(
+            scene,
+            _link_ref("prompt", getattr(section, "prompt_id", "")),
+            op.get("frame", 0),
+            bool(op.get("apply_linked", False)),
+        )
+        return result
     if op_type == "create_prompt_section":
         section = _apply_create_prompt_section(scene, op.get("fields", {}))
         return {"type": op_type, "start_frame": section.start_frame, "end_frame": section.end_frame}
@@ -1200,6 +1930,9 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
 
     raw_take_placement_mode = body.get("take_placement_mode", "trimmed")
     take_placement_mode = raw_take_placement_mode if raw_take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
+    # take_placement_linked / take_placement_muted are deliberately NOT read from
+    # the body: they are live editing preferences resolved from the editor widgets
+    # at execution time, never frozen into the job (user decision 2026-06-11).
 
     raw_frame_constraint = body.get("frame_constraint")
     frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
@@ -1927,6 +2660,61 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
     return False
 
 
+def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset | None:
+    """Extract a video asset's embedded audio into a derived audio asset.
+
+    Shared by dual-drop clip creation and audio-only video drops. Reuses the
+    derived ``media/{asset_id}_audio.wav`` path so repeated drops of the same
+    video dedupe to one audio asset. Returns the audio Asset, or None when the
+    video has no usable audio. Blocking (ffmpeg/ffprobe/thumbnail) — call via
+    asyncio.to_thread from route handlers.
+    """
+    video_path = os.path.join(project.project_dir, asset.path)
+    audio_filename = f"{asset.asset_id}_audio.wav"
+    audio_rel_path = os.path.join("media", audio_filename)
+    audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
+    existing_audio_asset = next(
+        (a for a in project.assets if a.path == audio_rel_path), None
+    )
+
+    extracted = True
+    if not os.path.isfile(audio_abs_path):
+        extracted = _extract_audio_from_video(video_path, audio_abs_path)
+
+    audio_dur = 0.0
+    if (
+        extracted
+        and os.path.isfile(audio_abs_path)
+        and os.path.getsize(audio_abs_path) > 1024
+    ):
+        audio_dur = _get_audio_duration(audio_abs_path)
+
+    if audio_dur > 0:
+        audio_asset = existing_audio_asset
+        if not audio_asset:
+            audio_asset = Asset(
+                name=f"{asset.name} (audio)",
+                asset_type="audio",
+                path=audio_rel_path,
+                duration_sec=audio_dur,
+            )
+            project.add_asset(audio_asset)
+            thumb_path = os.path.join(
+                project.project_dir, "cache", "thumbnails",
+                f"{audio_asset.asset_id}.png"
+            )
+            ensure_thumbnail("audio", audio_abs_path, thumb_path)
+        return audio_asset
+
+    # Empty/failed extraction: clean up the orphan unless an asset references it
+    if os.path.isfile(audio_abs_path) and not existing_audio_asset:
+        try:
+            os.remove(audio_abs_path)
+        except OSError:
+            pass
+    return None
+
+
 def _media_probe_signature(filepath: str) -> str:
     try:
         stat = os.stat(filepath)
@@ -2303,7 +3091,17 @@ def _load_project_from_request(request: web.Request) -> TimelineProject:
                     track.total_source_frames = duration
                     changed = True
     if changed:
-        save_project(project)
+        # Mutation-integrity F5: this is a deterministic back-fill derived from
+        # existing content, not a user edit — save WITHOUT a version bump or a
+        # project_updated broadcast (a bump here would spuriously 409 mutating
+        # requests' If-Match checks and trigger client refresh fanouts), and
+        # best-effort: a contended save must never fail the request that merely
+        # loaded the project (rare GET /scenes 500s came from atomic_replace
+        # PermissionError escaping here). Repair simply re-runs on a later load.
+        try:
+            save_project(project, bump_modified_at=False, notify=False)
+        except (ProjectVersionConflict, PermissionError) as exc:
+            logger.debug("Skipped contended total_source_frames repair save for %s: %s", project_dir, exc)
 
     _validate_request_project_version(request, project)
     _remember_request_project(request, project)
@@ -4384,7 +5182,10 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/scenes")
     async def api_list_scenes(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            # Off-loop load (mutation-integrity F5, parity with api_list_assets):
+            # the loader can run the repair save whose atomic_replace retry
+            # blocks up to ~375 ms — never on the aiohttp event loop.
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -4673,21 +5474,10 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        guide = GuideFrame(
-            frame_index=body.get("frame_index", 0),
-            asset_id=body.get("asset_id", ""),
-            source=body.get("source", "asset"),
-            # Client-authored from the editor guide strength control.
-            strength=body.get("strength", 1.0),
-            muted=bool(body.get("muted", False)),
-        )
-
-        # Replace existing guide at the same frame index
-        scene.guide_frames = [
-            g for g in scene.guide_frames if g.frame_index != guide.frame_index
-        ]
-        scene.guide_frames.append(guide)
-        scene.guide_frames.sort(key=lambda g: g.frame_index)
+        try:
+            guide = _apply_create_guide(scene, body)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         save_project(project)
         return web.json_response(guide.to_dict(), status=201)
@@ -4933,10 +5723,10 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        if "strength" in body:
-            guide.strength = float(body["strength"])
-        if "muted" in body:
-            guide.muted = bool(body["muted"])
+        try:
+            guide = _apply_update_guide(scene, frame_index, body)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         save_project(project)
         return web.json_response(guide.to_dict())
@@ -4956,13 +5746,10 @@ if routes is not None:
             return _json_error("Guide track is locked", 409)
 
         frame_index = int(request.match_info["frame_index"])
-        original_count = len(scene.guide_frames)
-        scene.guide_frames = [
-            g for g in scene.guide_frames if g.frame_index != frame_index
-        ]
-
-        if len(scene.guide_frames) == original_count:
-            return _json_error(f"No guide at frame {frame_index}", 404)
+        try:
+            _apply_delete_guide(scene, frame_index)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         save_project(project)
         return web.json_response({"status": "deleted"})
@@ -5001,6 +5788,14 @@ if routes is not None:
             return _json_error(f"Invalid clip role: {role}", 400)
         if role == "motion_driver" and asset.asset_type != "video":
             return _json_error("Motion-driver clips require video assets", 400)
+        track_index = int(body.get("track_index", 0))
+        audio_lane_idx = int(body.get("audio_lane_index", 0))
+        try:
+            _require_lane_unlocked(scene, "motion_driver" if role == "motion_driver" else "video", track_index)
+            if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video" and asset.has_audio:
+                _require_lane_unlocked(scene, "audio", audio_lane_idx)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         clip = ClipReference(
             source_path=asset.path,
@@ -5009,7 +5804,7 @@ if routes is not None:
             source_in_frame=0,
             source_out_frame=frame_count,
             total_source_frames=frame_count,
-            track_index=int(body.get("track_index", 0)),
+            track_index=track_index,
             role=role,
             strength=float(body.get("strength", 1.0)),
             muted=bool(body.get("muted", False)),
@@ -5021,48 +5816,10 @@ if routes is not None:
         audio_track_dict = None
         if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video" and asset.has_audio:
             try:
-                video_path = os.path.join(project.project_dir, asset.path)
-                audio_filename = f"{asset.asset_id}_audio.wav"
-                audio_rel_path = os.path.join("media", audio_filename)
-                audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
-                existing_audio_asset = next(
-                    (a for a in project.assets if a.path == audio_rel_path), None
-                )
-
-                # Extract audio if not already done
-                extracted = True
-                if not os.path.isfile(audio_abs_path):
-                    extracted = _extract_audio_from_video(video_path, audio_abs_path)
-
-                audio_dur = 0.0
-                if (
-                    extracted
-                    and os.path.isfile(audio_abs_path)
-                    and os.path.getsize(audio_abs_path) > 1024
-                ):
-                    audio_dur = _get_audio_duration(audio_abs_path)
-
-                if audio_dur > 0:
-                    # Find or create audio asset
-                    audio_asset = existing_audio_asset
-                    if not audio_asset:
-                        audio_asset = Asset(
-                            name=f"{asset.name} (audio)",
-                            asset_type="audio",
-                            path=audio_rel_path,
-                            duration_sec=audio_dur,
-                        )
-                        project.add_asset(audio_asset)
-                        # Generate waveform thumbnail
-                        thumb_path = os.path.join(
-                            project.project_dir, "cache", "thumbnails",
-                            f"{audio_asset.asset_id}.png"
-                        )
-                        ensure_thumbnail("audio", audio_abs_path, thumb_path)
-
+                audio_asset = await asyncio.to_thread(_prepare_video_audio_asset, project, asset)
+                if audio_asset:
                     fps = project.fps or 24.0
                     audio_frames = int(audio_asset.duration_sec * fps) if audio_asset.duration_sec > 0 else frame_count
-                    audio_lane_idx = int(body.get("audio_lane_index", 0))
                     audio_track = AudioTrack(
                         source_path=audio_asset.path,
                         timeline_start_frame=start_frame,
@@ -5072,11 +5829,11 @@ if routes is not None:
                     )
                     scene.audio_tracks.append(audio_track)
                     audio_track_dict = audio_track.to_dict()
-                elif os.path.isfile(audio_abs_path) and not existing_audio_asset:
-                    try:
-                        os.remove(audio_abs_path)
-                    except OSError:
-                        pass
+                    if body.get("linked") is not False and body.get("link_video_audio", True):
+                        _add_link_group(scene, [
+                            {"type": "clip", "id": clip.clip_id},
+                            {"type": "audio", "id": audio_track.track_id},
+                        ])
             except Exception as e:
                 logger.warning("Dual drop audio extraction failed: %s", e)
 
@@ -5103,6 +5860,10 @@ if routes is not None:
         clip = next((c for c in scene.clips if c.clip_id == clip_id), None)
         if not clip:
             return _json_error(f"Clip not found: {clip_id}", 404)
+        try:
+            _require_clip_unlocked(scene, clip)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         deleted_lane = clip.track_index or 0
         should_compact_lane = _is_render_clip(clip) and request.query.get("preserve_lane") != "1"
@@ -5139,6 +5900,13 @@ if routes is not None:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        try:
+            _require_clip_unlocked(scene, clip)
+            if "track_index" in body:
+                target_role = body.get("role", getattr(clip, "role", "render"))
+                _require_lane_unlocked(scene, "motion_driver" if target_role == "motion_driver" else "video", int(body["track_index"]))
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         if "timeline_start_frame" in body:
             new_start = int(body["timeline_start_frame"])
@@ -5199,45 +5967,22 @@ if routes is not None:
             return _json_error("Invalid JSON body", 400)
 
         split_frame = int(body.get("frame", 0))
-        if split_frame <= clip.timeline_start_frame or split_frame >= clip.timeline_end_frame:
-            return _json_error("Split frame must be within clip range", 400)
-
-        # Calculate source frame offset at the split point
-        source_offset = split_frame - clip.timeline_start_frame
-        source_split = (clip.source_in_frame or 0) + source_offset
-
-        orig_source_out = clip.source_out_frame or clip.timeline_end_frame - clip.timeline_start_frame
-
-        left_source_in = clip.source_in_frame or 0
-
-        # Create second clip (right half) — each piece is its own complete unit
-        clip2 = ClipReference(
-            source_path=clip.source_path,
-            timeline_start_frame=split_frame,
-            timeline_end_frame=clip.timeline_end_frame,
-            source_in_frame=source_split,
-            source_out_frame=orig_source_out,
-            total_source_frames=orig_source_out - source_split,  # own range = no ghost
-            source_origin_frame=source_split,                    # origin = source_in at split
-            track_index=clip.track_index,
-            role=getattr(clip, "role", "render"),
-            strength=getattr(clip, "strength", 1.0),
-            muted=getattr(clip, "muted", False),
-        )
-
-        # Trim first clip (left half)
-        clip.timeline_end_frame = split_frame
-        clip.source_out_frame = source_split
-        clip.total_source_frames = source_split - left_source_in  # own range = no ghost
-        clip.source_origin_frame = left_source_in                 # origin = source_in at split
-
-        scene.clips.append(clip2)
+        try:
+            result = _apply_split_linked(
+                scene,
+                _link_ref("clip", clip_id),
+                split_frame,
+                bool(body.get("apply_linked", False)),
+            )
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         save_project(project)
 
-        return web.json_response({
-            "left": clip.to_dict(),
-            "right": clip2.to_dict(),
-        })
+        if body.get("apply_linked"):
+            return web.json_response({"scene": scene.to_dict(), **result})
+        right_ref = result.get("right_items", [None])[0]
+        right_clip = _find_clip(scene, right_ref["id"]) if right_ref else None
+        return web.json_response({"left": clip.to_dict(), "right": right_clip.to_dict() if right_clip else None})
 
     # -----------------------------------------------------------------------
     # Audio tracks (audio on timeline)
@@ -5265,6 +6010,26 @@ if routes is not None:
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
+        lane_index = int(body.get("lane_index", 0))
+        try:
+            _require_lane_unlocked(scene, "audio", lane_index)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+
+        # Zone-model audio-only drop: a video asset on an audio lane places its
+        # extracted audio (derived audio asset, deduped by path).
+        if asset.asset_type == "video":
+            if not asset.has_audio:
+                return _json_error("Video has no embedded audio", 400)
+            try:
+                audio_asset = await asyncio.to_thread(_prepare_video_audio_asset, project, asset)
+            except Exception as e:
+                logger.warning("Audio-only drop extraction failed for %s: %s", asset_id, e)
+                audio_asset = None
+            if not audio_asset:
+                return _json_error("Failed to extract audio from video", 500)
+            asset = audio_asset
+
         start_frame = int(body.get("timeline_start_frame", 0))
         # Calculate duration in frames from asset duration
         fps = project.fps or 24.0
@@ -5276,7 +6041,7 @@ if routes is not None:
             timeline_start_frame=start_frame,
             timeline_end_frame=end_frame,
             total_source_frames=duration_frames,
-            lane_index=int(body.get("lane_index", 0)),
+            lane_index=lane_index,
         )
         scene.audio_tracks.append(track)
         save_project(project)
@@ -5299,6 +6064,10 @@ if routes is not None:
         track = next((t for t in scene.audio_tracks if t.track_id == track_id), None)
         if not track:
             return _json_error(f"Audio track not found: {track_id}", 404)
+        try:
+            _require_audio_unlocked(scene, track)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         deleted_lane = track.lane_index or 0
         should_compact_lane = request.query.get("preserve_lane") != "1"
@@ -5335,6 +6104,12 @@ if routes is not None:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        try:
+            _require_audio_unlocked(scene, track)
+            if "lane_index" in body:
+                _require_lane_unlocked(scene, "audio", int(body["lane_index"]))
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         if "timeline_start_frame" in body:
             new_start = int(body["timeline_start_frame"])
@@ -5387,44 +6162,22 @@ if routes is not None:
             return _json_error("Invalid JSON body", 400)
 
         split_frame = int(body.get("frame", 0))
-        if split_frame <= track.timeline_start_frame or split_frame >= track.timeline_end_frame:
-            return _json_error("Split frame must be within track range", 400)
-
-        # Calculate source offset at the split point
-        source_offset = split_frame - track.timeline_start_frame
-        source_split = (track.source_in_frame or 0) + source_offset
-
-        orig_end_frame = track.timeline_end_frame
-        right_duration = orig_end_frame - split_frame
-        left_duration = split_frame - track.timeline_start_frame
-
-        left_source_in = track.source_in_frame or 0
-
-        # Create second track (right half) — each piece is its own complete unit
-        track2 = AudioTrack(
-            source_path=track.source_path,
-            timeline_start_frame=split_frame,
-            timeline_end_frame=orig_end_frame,
-            source_in_frame=source_split,
-            total_source_frames=right_duration,   # own range = no ghost
-            source_origin_frame=source_split,     # origin = source_in at split
-            volume=track.volume,
-            muted=track.muted,
-            lane_index=track.lane_index,          # preserve lane on split
-        )
-
-        # Trim first track (left half)
-        track.timeline_end_frame = split_frame
-        track.total_source_frames = left_duration     # own range = no ghost
-        track.source_origin_frame = left_source_in    # origin = source_in at split
-
-        scene.audio_tracks.append(track2)
+        try:
+            result = _apply_split_linked(
+                scene,
+                _link_ref("audio", track_id),
+                split_frame,
+                bool(body.get("apply_linked", False)),
+            )
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         save_project(project)
 
-        return web.json_response({
-            "left": track.to_dict(),
-            "right": track2.to_dict(),
-        })
+        if body.get("apply_linked"):
+            return web.json_response({"scene": scene.to_dict(), **result})
+        right_ref = result.get("right_items", [None])[0]
+        right_track = _find_audio_track(scene, right_ref["id"]) if right_ref else None
+        return web.json_response({"left": track.to_dict(), "right": right_track.to_dict() if right_track else None})
 
     # -----------------------------------------------------------------------
     # Prompt sections
@@ -5459,15 +6212,10 @@ if routes is not None:
         )
         if overlapping:
             return _json_error("Prompt sections cannot overlap", 409)
-        raw_channels = body.get("channels")
-        section = PromptSection(
-            start_frame=start_frame,
-            end_frame=end_frame,
-            prompt=body.get("prompt", ""),
-            channels=raw_channels if isinstance(raw_channels, dict) else None,
-        )
-        scene.prompt_sections.append(section)
-        scene.prompt_sections.sort(key=lambda s: s.start_frame)
+        try:
+            section = _apply_create_prompt_section(scene, body)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
         save_project(project)
 
         return web.json_response(section.to_dict(), status=201)
@@ -5516,6 +6264,8 @@ if routes is not None:
             section.channels = prompt_payload.normalize_channels(raw_channels)
         elif "prompt" in body:
             section.prompt = body["prompt"]
+        if "muted" in body:
+            section.muted = bool(body["muted"])
 
         scene.prompt_sections.sort(key=lambda s: s.start_frame)
         save_project(project)
@@ -5540,7 +6290,9 @@ if routes is not None:
         if idx < 0 or idx >= len(scene.prompt_sections):
             return _json_error(f"Prompt section index out of range: {idx}", 404)
 
+        prompt_id = getattr(scene.prompt_sections[idx], "prompt_id", "")
         scene.prompt_sections.pop(idx)
+        _rewrite_link_groups_for_deleted(scene, [_link_ref("prompt", prompt_id)])
         save_project(project)
 
         return web.json_response({"status": "deleted"})

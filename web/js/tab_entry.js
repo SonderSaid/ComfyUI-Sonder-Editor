@@ -73,6 +73,8 @@ const DEFAULT_WIDGET_VALUES = {
     mask_post_offset: 0,
     render_queue_active: true,
     take_placement_mode: "trimmed",
+    take_placement_linked: true,
+    take_placement_muted: false,
 };
 
 function setStatus(message) {
@@ -582,18 +584,32 @@ async function main() {
         tabDiagRecord("visibilitychange", { state: document.visibilityState });
     });
 
+    // Debounced self-echo guard (mutation-integrity F4): mirrors
+    // editor_node_controller._handleProjectUpdatedFromSync — the WS echo of an
+    // own save beats the response that records the new version, so re-check
+    // 250 ms later with the latest stashed event (re-armed per event).
+    let projectUpdatedDebounceTimer = null;
+    let pendingProjectUpdatedEvent = null;
     const sync = connectProjectSync(projectId, {
         onProjectUpdated: (event) => {
-            const currentVersion = getProjectVersion(projectId);
-            const shouldRefresh = !!(event.modified_at && event.modified_at !== currentVersion);
-            tabDiagRecord("project_updated_recv", {
-                event_modified_at: event.modified_at || "",
-                current_version: currentVersion || "",
-                refresh: shouldRefresh,
-            });
-            if (shouldRefresh) {
-                editor.refresh(["project", "assets", "scenes", "queue"]);
-            }
+            pendingProjectUpdatedEvent = event;
+            clearTimeout(projectUpdatedDebounceTimer);
+            projectUpdatedDebounceTimer = setTimeout(() => {
+                projectUpdatedDebounceTimer = null;
+                const pending = pendingProjectUpdatedEvent;
+                pendingProjectUpdatedEvent = null;
+                if (!pending) return;
+                const currentVersion = getProjectVersion(projectId);
+                const shouldRefresh = !!(pending.modified_at && pending.modified_at !== currentVersion);
+                tabDiagRecord("project_updated_recv", {
+                    event_modified_at: pending.modified_at || "",
+                    current_version: currentVersion || "",
+                    refresh: shouldRefresh,
+                });
+                if (shouldRefresh) {
+                    editor.refresh(["project", "assets", "scenes", "queue"]);
+                }
+            }, 250);
         },
         onWidgetStateChanged: (event) => {
             if (String(event.host_id || "") !== hostId) return;

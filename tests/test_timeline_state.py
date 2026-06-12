@@ -103,6 +103,7 @@ def test_asset_trash_metadata_roundtrip():
 
 def test_guide_frame_roundtrip():
     gf = GuideFrame(
+        guide_id="guide-123",
         frame_index=123,
         asset_id="img001",
         source="asset",
@@ -112,6 +113,8 @@ def test_guide_frame_roundtrip():
     data = gf.to_dict()
     restored = GuideFrame.from_dict(data)
 
+    assert data["guide_id"] == "guide-123"
+    assert restored.guide_id == "guide-123"
     assert restored.frame_index == 123
     assert restored.asset_id == "img001"
     assert restored.source == "asset"
@@ -203,9 +206,13 @@ def test_scene_roundtrip():
         is_bridge=False,
     )
     scene.guide_frames = [
-        GuideFrame(frame_index=0, asset_id="img001", source="asset"),
-        GuideFrame(frame_index=-1, asset_id="img002", source="asset"),
+        GuideFrame(guide_id="guide-1", frame_index=0, asset_id="img001", source="asset"),
+        GuideFrame(guide_id="guide-2", frame_index=-1, asset_id="img002", source="asset"),
     ]
+    scene.linked_item_groups = [{
+        "group_id": "links-1",
+        "items": [{"type": "guide", "id": "guide-1"}, {"type": "guide", "id": "guide-2"}],
+    }]
     scene.asset_ids = ["img001", "img002", "vid001"]
     scene.saved_selections = [{
         "name": "Main beat",
@@ -226,6 +233,7 @@ def test_scene_roundtrip():
     assert len(restored.guide_frames) == 2
     assert restored.guide_frames[0].frame_index == 0
     assert restored.guide_frames[1].frame_index == -1
+    assert restored.linked_item_groups == scene.linked_item_groups
     assert restored.asset_ids == ["img001", "img002", "vid001"]
     assert restored.saved_selections[0]["pre_context_frames"] == 8
     assert restored.saved_selections[0]["post_context_frames"] == 12
@@ -468,6 +476,8 @@ def test_generation_job_roundtrip():
         template_id="ltx-2.3",
         frame_constraint={"step": 8, "offset": 1, "min": 1, "max": 257},
         take_placement_mode="untrimmed",
+        take_placement_linked=False,
+        take_placement_muted=True,
     )
 
     data = job.to_dict()
@@ -497,6 +507,8 @@ def test_generation_job_roundtrip():
     assert restored.template_id == "ltx-2.3"
     assert restored.frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert restored.take_placement_mode == "untrimmed"
+    assert restored.take_placement_linked is False
+    assert restored.take_placement_muted is True
 
 
 def test_generation_job_legacy_context_frames_migrate_to_pre_and_post():
@@ -673,11 +685,17 @@ def test_project_resolution_tuple_preserved():
 
 def test_prompt_section_roundtrip():
     ps = PromptSection(start_frame=0, end_frame=100, prompt="girl feeds dog")
+    ps.prompt_id = "prompt-123"
+    ps.muted = True
     data = ps.to_dict()
     restored = PromptSection.from_dict(data)
+    assert data["prompt_id"] == "prompt-123"
+    assert data["muted"] is True
+    assert restored.prompt_id == "prompt-123"
     assert restored.start_frame == 0
     assert restored.end_frame == 100
     assert restored.prompt == "girl feeds dog"
+    assert restored.muted is True
     # Legacy flat prompt seeds the visual channel
     assert restored.channels == {"visual": "girl feeds dog", "speech": "", "sounds": ""}
 

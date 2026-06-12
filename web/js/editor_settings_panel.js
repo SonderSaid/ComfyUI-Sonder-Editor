@@ -168,6 +168,7 @@ function syncSettingsPanelControls() {
     if (controls.scaleTrackHeadersLabel) controls.scaleTrackHeadersLabel.textContent = `${Math.round(this._settings.layout.scaleTrackHeaders * 100)}%`;
     if (controls.scaleTimelineLabel) controls.scaleTimelineLabel.textContent = `${Math.round(this._settings.layout.scaleTimeline * 100)}%`;
     if (controls.scaleGalleryLabel) controls.scaleGalleryLabel.textContent = `${Math.round(this._settings.layout.scaleGallery * 100)}%`;
+    if (controls.linkedVideoAudioDrop) controls.linkedVideoAudioDrop.checked = this._settings.timelineBehavior.linkedVideoAudioDrop !== false;
     if (controls.snappingEnabled) controls.snappingEnabled.checked = !!this._settings.timelineBehavior.snappingEnabled;
     if (controls.snapThreshold) controls.snapThreshold.value = String(this._settings.timelineBehavior.snapThreshold);
     for (const option of SNAP_TARGET_OPTIONS) {
@@ -194,6 +195,8 @@ function syncSettingsPanelControls() {
         }
     }
     if (controls.takePlacementMode) controls.takePlacementMode.value = this._settings.render?.takePlacementMode ?? "trimmed";
+    if (controls.linkedTakePlacement) controls.linkedTakePlacement.checked = this._settings.render?.linkedTakePlacement !== false;
+    if (controls.takePlacementMuted) controls.takePlacementMuted.checked = !!this._settings.render?.takePlacementMuted;
     if (controls.defaultSavePreset) {
         controls.defaultSavePreset.value = this._settings.render?.defaultSavePreset ?? DEFAULT_SAVE_PRESET;
         controls.defaultSavePreset._sonderSyncTitle?.();
@@ -833,6 +836,14 @@ function showSettingsPanel() {
     );
     createCheckbox(
         timelineSection,
+        "linkedVideoAudioDrop",
+        "Link Dropped Video + Audio",
+        "Video assets with extracted audio enter the timeline as linked siblings.",
+        () => this._settings.timelineBehavior.linkedVideoAudioDrop !== false,
+        (checked) => updateCategory("timelineBehavior", "linkedVideoAudioDrop", checked)
+    );
+    createCheckbox(
+        timelineSection,
         "snappingEnabled",
         "Enable Snapping By Default",
         "Use snap guides for drag, trim, and move operations unless toggled off.",
@@ -982,6 +993,22 @@ function showSettingsPanel() {
         TAKE_PLACEMENT_MODE_OPTIONS,
         () => this._settings.render?.takePlacementMode ?? "trimmed",
         (value) => updateCategory("render", "takePlacementMode", value)
+    );
+    createCheckbox(
+        renderSection,
+        "linkedTakePlacement",
+        "Link Take Video + Audio",
+        "New take placements link generated video and extracted audio siblings.",
+        () => this._settings.render?.linkedTakePlacement !== false,
+        (checked) => updateCategory("render", "linkedTakePlacement", checked)
+    );
+    createCheckbox(
+        renderSection,
+        "takePlacementMuted",
+        "New Takes Start Muted",
+        "New take placements enter the timeline muted until explicitly enabled.",
+        () => !!this._settings.render?.takePlacementMuted,
+        (checked) => updateCategory("render", "takePlacementMuted", checked)
     );
     createSelect(
         renderSection,

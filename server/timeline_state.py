@@ -126,6 +126,7 @@ class Asset:
 @dataclass
 class GuideFrame:
     """A reference image pinned to a specific frame index within a scene."""
+    guide_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     frame_index: int = 0                    # 0 = first, -1 = last, or any absolute index
     asset_id: str = ""                      # points to an Asset in the project registry
     source: str = ""                        # "asset" | "scene_boundary" (auto from adjacent scene)
@@ -134,6 +135,7 @@ class GuideFrame:
 
     def to_dict(self) -> dict:
         return {
+            "guide_id": self.guide_id,
             "frame_index": self.frame_index,
             "asset_id": self.asset_id,
             "source": self.source,
@@ -144,6 +146,7 @@ class GuideFrame:
     @classmethod
     def from_dict(cls, data: dict) -> "GuideFrame":
         return cls(
+            guide_id=data.get("guide_id", uuid.uuid4().hex[:8]),
             frame_index=data.get("frame_index", 0),
             asset_id=data.get("asset_id", ""),
             source=data.get("source", ""),
@@ -298,9 +301,12 @@ class PromptSection:
     """
 
     def __init__(self, start_frame: int = 0, end_frame: int = 0,
-                 prompt: str = "", channels: dict | None = None):
+                 prompt: str = "", channels: dict | None = None,
+                 muted: bool = False):
+        self.prompt_id = uuid.uuid4().hex[:8]
         self.start_frame = start_frame
         self.end_frame = end_frame
+        self.muted = bool(muted)
         if isinstance(channels, dict):
             self.channels = prompt_payload.normalize_channels(channels)
         else:
@@ -327,9 +333,11 @@ class PromptSection:
 
     def to_dict(self) -> dict:
         return {
+            "prompt_id": self.prompt_id,
             "start_frame": self.start_frame,
             "end_frame": self.end_frame,
             "channels": dict(self.channels),
+            "muted": self.muted,
             # Label-free composed mirror for older readers / downgrades.
             "prompt": self.prompt,
         }
@@ -339,12 +347,15 @@ class PromptSection:
         if not isinstance(data, dict):
             data = {}
         raw_channels = data.get("channels")
-        return cls(
+        section = cls(
             start_frame=data.get("start_frame", 0),
             end_frame=data.get("end_frame", 0),
             prompt=data.get("prompt", ""),
             channels=raw_channels if isinstance(raw_channels, dict) else None,
+            muted=bool(data.get("muted", False)),
         )
+        section.prompt_id = data.get("prompt_id", uuid.uuid4().hex[:8])
+        return section
 
 
 @dataclass
@@ -361,6 +372,7 @@ class Scene:
     guide_frames: list = field(default_factory=list)    # list[GuideFrame]
     clips: list = field(default_factory=list)            # list[ClipReference] — generated segments
     audio_tracks: list = field(default_factory=list)     # list[AudioTrack]
+    linked_item_groups: list = field(default_factory=list)  # list[{group_id, items:[{type,id}]}]
     asset_ids: list = field(default_factory=list)        # references to project-level Assets used
     is_bridge: bool = False                 # True if this is an auto-generated bridge between scenes
     video_lane_count: int = 1               # number of video lanes (multi-layer)
@@ -460,6 +472,7 @@ class Scene:
             "guide_frames": [g.to_dict() for g in self.guide_frames],
             "clips": [c.to_dict() for c in self.clips],
             "audio_tracks": [a.to_dict() for a in self.audio_tracks],
+            "linked_item_groups": list(self.linked_item_groups),
             "asset_ids": list(self.asset_ids),
             "is_bridge": self.is_bridge,
             "video_lane_count": self.video_lane_count,
@@ -526,6 +539,10 @@ class Scene:
         scene.audio_tracks = [
             AudioTrack.from_dict(a) for a in data.get("audio_tracks", [])
         ]
+        scene._ensure_stable_link_item_ids()
+        scene.linked_item_groups = scene._normalize_linked_item_groups(
+            data.get("linked_item_groups", [])
+        )
         # Lane configs — deserialize + auto-pad to match lane counts
         scene.video_lane_configs = [
             LaneConfig.from_dict(c) for c in data.get("video_lane_configs", [])
@@ -556,6 +573,56 @@ class Scene:
                 hidden=scene.prompt_track_config.hidden
             )
         return scene
+
+    def _ensure_stable_link_item_ids(self) -> None:
+        seen_guides = set()
+        for guide in self.guide_frames:
+            guide_id = str(getattr(guide, "guide_id", "") or "")
+            if not guide_id or guide_id in seen_guides:
+                guide_id = uuid.uuid4().hex[:8]
+                guide.guide_id = guide_id
+            seen_guides.add(guide_id)
+
+        seen_prompts = set()
+        for section in self.prompt_sections:
+            prompt_id = str(getattr(section, "prompt_id", "") or "")
+            if not prompt_id or prompt_id in seen_prompts:
+                prompt_id = uuid.uuid4().hex[:8]
+                section.prompt_id = prompt_id
+            seen_prompts.add(prompt_id)
+
+    def _normalize_linked_item_groups(self, groups) -> list:
+        if not isinstance(groups, list):
+            return []
+        existing = {
+            "clip": {clip.clip_id for clip in self.clips},
+            "audio": {track.track_id for track in self.audio_tracks},
+            "guide": {guide.guide_id for guide in self.guide_frames},
+            "prompt": {section.prompt_id for section in self.prompt_sections},
+        }
+        normalized = []
+        seen_group_ids = set()
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_id = str(group.get("group_id", "") or "")
+            if not group_id or group_id in seen_group_ids:
+                group_id = uuid.uuid4().hex[:8]
+            items = []
+            seen_items = set()
+            for item in group.get("items", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type", "") or "")
+                item_id = str(item.get("id", "") or "")
+                key = (item_type, item_id)
+                if item_id and item_id in existing.get(item_type, set()) and key not in seen_items:
+                    items.append({"type": item_type, "id": item_id})
+                    seen_items.add(key)
+            if len(items) >= 2:
+                normalized.append({"group_id": group_id, "items": items})
+                seen_group_ids.add(group_id)
+        return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +793,8 @@ class GenerationJob:
     template_id: str = "free"
     frame_constraint: dict | None = None
     take_placement_mode: str = "trimmed"
+    take_placement_linked: bool = True
+    take_placement_muted: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     base_modified_at: str = ""
     completed_at: str = ""
@@ -761,6 +830,8 @@ class GenerationJob:
             "template_id": self.template_id,
             "frame_constraint": self.frame_constraint,
             "take_placement_mode": self.take_placement_mode,
+            "take_placement_linked": self.take_placement_linked,
+            "take_placement_muted": self.take_placement_muted,
             "created_at": self.created_at,
             "base_modified_at": self.base_modified_at,
             "completed_at": self.completed_at,
@@ -803,6 +874,8 @@ class GenerationJob:
             template_id=data.get("template_id", "free"),
             frame_constraint=data.get("frame_constraint"),
             take_placement_mode=take_placement_mode,
+            take_placement_linked=bool(data.get("take_placement_linked", data.get("take_linked", True))),
+            take_placement_muted=bool(data.get("take_placement_muted", data.get("take_muted", False))),
             created_at=data.get("created_at", ""),
             base_modified_at=data.get("base_modified_at", ""),
             completed_at=data.get("completed_at", ""),

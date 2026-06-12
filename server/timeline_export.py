@@ -312,6 +312,8 @@ def _place_video_take(
     asset: Asset,
     start: int,
     end: int,
+    *,
+    muted: bool = False,
 ) -> ClipReference:
     total_frames = max(1, int(asset.frame_count or (end - start) or 1))
     existing_lanes = [int(getattr(clip, "track_index", 0) or 0) for clip in getattr(scene, "clips", [])]
@@ -330,6 +332,7 @@ def _place_video_take(
         timeline_start_frame=start,
         timeline_end_frame=end,
         track_index=new_lane,
+        muted=bool(muted),
         is_generated=True,
         generation_params=dict(asset.generation_params),
         take_metadata=dict(asset.generation_params),
@@ -347,6 +350,7 @@ def _place_embedded_audio_take(
     folder: str,
     generation_params: dict,
     *,
+    muted: bool = False,
     cancel_event=None,
     cleanup_paths: list[str] | None = None,
 ) -> tuple[AudioTrack, str] | None:
@@ -427,6 +431,7 @@ def _place_embedded_audio_take(
         source_in_frame=0,
         total_source_frames=total_frames,
         source_origin_frame=0,
+        muted=bool(muted),
         lane_index=new_lane,
     )
     scene.audio_tracks.append(track)
@@ -575,6 +580,8 @@ class TimelineExportManager:
             "include_video": include_video,
             "include_audio": include_audio,
             "place_as_take": include_video and _coerce_bool(body.get("place_as_take"), True),
+            "take_placement_linked": _coerce_bool(body.get("take_placement_linked", body.get("take_linked")), True),
+            "take_placement_muted": _coerce_bool(body.get("take_placement_muted", body.get("take_muted")), False),
         }
 
     def _set_phase(self, job: TimelineExportJob, phase: str, message: str) -> None:
@@ -602,6 +609,8 @@ class TimelineExportManager:
             include_video = bool(job.request["include_video"])
             include_audio = bool(job.request["include_audio"])
             place_as_take = bool(job.request["place_as_take"])
+            take_placement_linked = bool(job.request.get("take_placement_linked", True))
+            take_placement_muted = bool(job.request.get("take_placement_muted", False))
             width, height = _scene_resolution(project, scene)
             frame_count = end - start
 
@@ -742,9 +751,17 @@ class TimelineExportManager:
             placed_audio_cleanup_path = ""
             if place_as_take and include_video and current_scene:
                 self._set_phase(job, "placing_take", "Placing take...")
-                clip = _place_video_take(current_project, current_scene, asset, start, end)
+                clip = _place_video_take(
+                    current_project,
+                    current_scene,
+                    asset,
+                    start,
+                    end,
+                    muted=take_placement_muted,
+                )
                 job.placed_clip = clip.to_dict()
                 job.result_scene_id = current_scene.scene_id
+                placed_audio_track = None
                 if asset.has_audio:
                     try:
                         audio_take = _place_embedded_audio_take(
@@ -755,11 +772,12 @@ class TimelineExportManager:
                             end,
                             folder,
                             generation_params,
+                            muted=take_placement_muted,
                             cancel_event=job.cancel_event,
                             cleanup_paths=cleanup_paths,
                         )
                         if audio_take:
-                            _audio_track, placed_audio_cleanup_path = audio_take
+                            placed_audio_track, placed_audio_cleanup_path = audio_take
                         else:
                             job.warnings.append("Placed video take, but embedded audio extraction did not produce a timeline audio track.")
                     except (TimelineRenderCancelled, MediaOperationCancelled):
@@ -767,6 +785,14 @@ class TimelineExportManager:
                     except Exception as exc:
                         logger.warning("Timeline export take audio extraction failed: %s", exc)
                         job.warnings.append("Placed video take, but embedded audio extraction failed.")
+                if take_placement_linked and placed_audio_track is not None:
+                    current_scene.linked_item_groups.append({
+                        "group_id": uuid.uuid4().hex[:8],
+                        "items": [
+                            {"type": "clip", "id": clip.clip_id},
+                            {"type": "audio", "id": placed_audio_track.track_id},
+                        ],
+                    })
 
             committed_project = save_generated_project(
                 current_project,

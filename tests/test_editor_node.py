@@ -142,6 +142,8 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         post_context_frames="4",
         mask_pre_offset="2",
         mask_post_offset="1",
+        take_placement_linked=False,
+        take_placement_muted=True,
     )
 
     assert result[6] == 0
@@ -153,6 +155,8 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     assert project._execution_context["post_context_frames"] == 4
     assert project._execution_context["mask_pre_offset"] == 2
     assert project._execution_context["mask_post_offset"] == 1
+    assert project._execution_context["take_placement_linked"] is False
+    assert project._execution_context["take_placement_muted"] is True
 
 
 class _FrameConstraintScene:
@@ -1352,6 +1356,8 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
         scene_height=6,
         scene_fps=30.0,
         take_placement_mode="untrimmed",
+        take_placement_linked=False,
+        take_placement_muted=True,
     )
 
     class DummyProject:
@@ -1433,6 +1439,11 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     # Consume also carries the read-only snapshot reference
     assert project._execution_context["queue_job_ref_id"] == "job-1"
     assert project._execution_context["take_placement_mode"] == "untrimmed"
+    # take_placement_linked / take_placement_muted are NOT frozen per job
+    # (2026-06-11): the stored job values (False/True above) must be ignored
+    # in favor of the live widget inputs (defaults True/False here).
+    assert project._execution_context["take_placement_linked"] is True
+    assert project._execution_context["take_placement_muted"] is False
 
 
 def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
@@ -2739,6 +2750,8 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
         "selection_end": 12,
         "pre_context_frames": 1,
         "post_context_frames": 1,
+        "take_placement_linked": True,
+        "take_placement_muted": True,
     }
 
     saved_audio_paths = []
@@ -2771,13 +2784,19 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
     assert len(scene.clips) == 2
     assert len(scene.audio_tracks) == 2
     assert scene.clips[-1].track_index == 1
+    assert scene.clips[-1].muted is True
     assert scene.audio_tracks[-1].lane_index == 1
+    assert scene.audio_tracks[-1].muted is True
     assert scene.audio_lane_count == 2
     assert scene.audio_tracks[-1].timeline_start_frame == 8
     assert scene.audio_tracks[-1].timeline_end_frame == 12
     assert scene.audio_tracks[-1].source_in_frame == 1
     assert scene.audio_tracks[-1].source_origin_frame == 0
     assert scene.audio_tracks[-1].total_source_frames == 5
+    assert scene.linked_item_groups[-1]["items"] == [
+        {"type": "clip", "id": scene.clips[-1].clip_id},
+        {"type": "audio", "id": scene.audio_tracks[-1].track_id},
+    ]
     assert any(str(path).endswith("_audio.wav") for path in saved_audio_paths)
 
 

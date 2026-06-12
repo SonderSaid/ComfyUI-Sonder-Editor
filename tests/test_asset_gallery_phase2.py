@@ -630,6 +630,8 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
         "template_id": "ltx-2.3",
         "frame_constraint": {"step": 8, "offset": 1, "min": 1, "max": 257},
         "take_placement_mode": "untrimmed",
+        "take_placement_linked": False,
+        "take_placement_muted": True,
     })
     response = asyncio.run(module.api_add_queue_job(request))
     payload = _response_json(response)
@@ -652,8 +654,15 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     assert payload["template_id"] == "ltx-2.3"
     assert payload["frame_constraint"] == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert payload["take_placement_mode"] == "untrimmed"
+    # take_placement_linked / take_placement_muted are NOT frozen per job
+    # (2026-06-11): the route ignores the body values and the job keeps the
+    # neutral defaults; execution resolves them from live widgets/settings.
+    assert payload["take_placement_linked"] is True
+    assert payload["take_placement_muted"] is False
     assert project.generation_queue[0].frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert project.generation_queue[0].take_placement_mode == "untrimmed"
+    assert project.generation_queue[0].take_placement_linked is True
+    assert project.generation_queue[0].take_placement_muted is False
     assert project.generation_queue[0].mask_pre_offset == 2
     assert project.generation_queue[0].mask_post_offset == 3
     assert payload["params"]["snapshot_version"] == 1

@@ -17,7 +17,17 @@ export function projectIdFromUrl(url) {
 export function rememberProjectVersion(projectId, modifiedAt) {
     const normalizedProjectId = normalizeProjectId(projectId);
     if (!normalizedProjectId || !modifiedAt) return;
-    projectVersions.set(normalizedProjectId, String(modifiedAt));
+    // Monotonic (mutation-integrity F3): the fetch patch records versions from
+    // EVERY response including GETs, so an out-of-order stale GET response must
+    // never move the map backwards (it would regress If-Match headers and
+    // defeat version-gated apply checks). modified_at is an ISO timestamp —
+    // lexicographic compare is order-correct, incl. the zero-microsecond
+    // short form. A legitimate backward jump (none exists today) would need
+    // an explicit map clear.
+    const next = String(modifiedAt);
+    const current = projectVersions.get(normalizedProjectId) || "";
+    if (current && next < current) return;
+    projectVersions.set(normalizedProjectId, next);
 }
 
 export function rememberProjectVersionFromPayload(payload, fallbackProjectId = "") {

@@ -91,7 +91,7 @@ def snapshot_item_ids(project) -> dict:
     """Capture the clip/asset/audio-track ids currently in a project. Diff a
     later snapshot against this to identify items created in between (the basis
     for telling 'generated this run' from 'pre-existing generated, user-deleted')."""
-    clips, assets, audio = set(), set(), set()
+    clips, assets, audio, links = set(), set(), set(), set()
     for asset in getattr(project, "assets", None) or []:
         assets.add(asset.asset_id)
     for scene in getattr(project, "scenes", None) or []:
@@ -99,7 +99,11 @@ def snapshot_item_ids(project) -> dict:
             clips.add(clip.clip_id)
         for track in getattr(scene, "audio_tracks", None) or []:
             audio.add(track.track_id)
-    return {"clips": clips, "assets": assets, "audio": audio}
+        for group in getattr(scene, "linked_item_groups", None) or []:
+            group_id = str(group.get("group_id", "") or "") if isinstance(group, dict) else ""
+            if group_id:
+                links.add(group_id)
+    return {"clips": clips, "assets": assets, "audio": audio, "links": links}
 
 
 def created_ids_since(before: dict, project) -> dict:
@@ -153,6 +157,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
     created_assets = created_ids.get("assets") if created_ids else None
     created_clips = created_ids.get("clips") if created_ids else None
     created_audio = created_ids.get("audio") if created_ids else None
+    created_links = created_ids.get("links") if created_ids else None
 
     if asset_id_remap is None:
         asset_id_remap = {}
@@ -289,6 +294,41 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
             setattr(current_scene, configs_attr, current_configs)
             setattr(current_scene, count_attr, new_count)
             changed = True
+
+        current_link_ids = {
+            str(group.get("group_id", "") or "")
+            for group in getattr(current_scene, "linked_item_groups", []) or []
+            if isinstance(group, dict)
+        }
+        existing_item_ids = {
+            "clip": {clip.clip_id for clip in current_scene.clips},
+            "audio": {track.track_id for track in current_scene.audio_tracks},
+            "guide": {getattr(guide, "guide_id", "") for guide in current_scene.guide_frames},
+            "prompt": {getattr(section, "prompt_id", "") for section in current_scene.prompt_sections},
+        }
+        for group in getattr(produced_scene, "linked_item_groups", []) or []:
+            if not isinstance(group, dict):
+                continue
+            group_id = str(group.get("group_id", "") or "")
+            if not group_id or group_id in current_link_ids:
+                continue
+            if created_links is not None and group_id not in created_links:
+                continue
+            items = []
+            seen_items = set()
+            for item in group.get("items", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type", "") or "")
+                item_id = str(item.get("id", "") or "")
+                key = (item_type, item_id)
+                if item_id in existing_item_ids.get(item_type, set()) and key not in seen_items:
+                    items.append({"type": item_type, "id": item_id})
+                    seen_items.add(key)
+            if len(items) >= 2:
+                current_scene.linked_item_groups.append({"group_id": group_id, "items": items})
+                current_link_ids.add(group_id)
+                changed = True
 
     return changed
 

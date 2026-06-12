@@ -78,6 +78,8 @@ def _section_entries(sections):
     entries = []
     for section in sections or []:
         if isinstance(section, dict):
+            if section.get("muted"):
+                continue
             try:
                 start = int(section.get("start_frame", 0))
                 end = int(section.get("end_frame", 0))
@@ -91,6 +93,8 @@ def _section_entries(sections):
                 start = int(getattr(section, "start_frame", 0))
                 end = int(getattr(section, "end_frame", 0))
             except (TypeError, ValueError):
+                continue
+            if getattr(section, "muted", False):
                 continue
             channels = normalize_channels(getattr(section, "channels", None),
                                           legacy_prompt=getattr(section, "prompt", ""))

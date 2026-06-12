@@ -146,6 +146,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         fullscreenTimelineHeight: 0,
     },
     timelineBehavior: {
+        linkedVideoAudioDrop: true,
         snappingEnabled: true,
         snapThreshold: 5,
         snapTargets: {
@@ -186,6 +187,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     render: {
         takePlacementMode: "trimmed",
+        linkedTakePlacement: true,
+        takePlacementMuted: false,
         defaultSavePreset: DEFAULT_SAVE_PRESET,
         maxRenderCacheEntries: 3,
         trashRetentionDays: 30,
@@ -722,6 +725,9 @@ function normalizeEditorSettings(source = null) {
             ),
         },
         timelineBehavior: {
+            linkedVideoAudioDrop: stored?.timelineBehavior?.linkedVideoAudioDrop == null
+                ? defaults.timelineBehavior.linkedVideoAudioDrop
+                : !!stored.timelineBehavior.linkedVideoAudioDrop,
             snappingEnabled: stored?.timelineBehavior?.snappingEnabled == null
                 ? defaults.timelineBehavior.snappingEnabled
                 : !!stored.timelineBehavior.snappingEnabled,
@@ -806,6 +812,12 @@ function normalizeEditorSettings(source = null) {
             takePlacementMode: VALID_TAKE_PLACEMENT_MODES.has(stored?.render?.takePlacementMode)
                 ? stored.render.takePlacementMode
                 : defaults.render.takePlacementMode,
+            linkedTakePlacement: stored?.render?.linkedTakePlacement == null
+                ? defaults.render.linkedTakePlacement
+                : !!stored.render.linkedTakePlacement,
+            takePlacementMuted: stored?.render?.takePlacementMuted == null
+                ? defaults.render.takePlacementMuted
+                : !!stored.render.takePlacementMuted,
             defaultSavePreset: VALID_SAVE_PRESETS.has(stored?.render?.defaultSavePreset)
                 ? stored.render.defaultSavePreset
                 : defaults.render.defaultSavePreset,

@@ -41,7 +41,9 @@ export function composeSectionText(channels, labelsOn = true) {
 export function composeSectionsDisplayText(sections, labelsOn = true, delimiter = ".") {
     const seam = String(delimiter ?? "").trim();
     const joiner = seam ? `${seam} ` : " ";
-    const list = (sections || []).map((s) => normalizeChannels(s?.channels, s?.prompt));
+    const list = (sections || [])
+        .filter((s) => !s?.muted)
+        .map((s) => normalizeChannels(s?.channels, s?.prompt));
     if (labelsOn) {
         const parts = [];
         for (const key of CHANNEL_ORDER) {

@@ -159,6 +159,14 @@ class SonderEditor:
                     "default": "trimmed",
                     "tooltip": "Take placement mode for non-queued renders. Set by editor settings.",
                 }),
+                "take_placement_linked": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Whether take video/audio siblings are linked when placed on the timeline.",
+                }),
+                "take_placement_muted": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Whether newly placed takes enter the timeline muted.",
+                }),
                 "render_queue_active": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "When enabled, queue jobs drive editor execution. Disable to render the live selection without consuming queue jobs.",
@@ -522,6 +530,7 @@ class SonderEditor:
                 pre_context_frames=0, post_context_frames=0,
                 mask_pre_offset=0, mask_post_offset=0,
                 prompt=None, unique_id=None, take_placement_mode="trimmed",
+                take_placement_linked=True, take_placement_muted=False,
                 render_queue_active=True):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
@@ -532,6 +541,8 @@ class SonderEditor:
         mask_pre_offset = max(0, _coerce_int(mask_pre_offset, 0))
         mask_post_offset = max(0, _coerce_int(mask_post_offset, 0))
         take_placement_mode = take_placement_mode if take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
+        take_placement_linked = self._coerce_bool(take_placement_linked, True)
+        take_placement_muted = self._coerce_bool(take_placement_muted, False)
         render_queue_active = self._coerce_bool(render_queue_active, True)
         proj = None
         queue_job = None
@@ -826,7 +837,9 @@ class SonderEditor:
             if frame_count_padding > 0:
                 audio = self._pad_audio_to_frame_count(audio, frame_count, proj_fps)
 
-            # --- Queue snapshots freeze take placement; normal renders use the hidden widget. ---
+            # --- Queue snapshots freeze take placement MODE only; linked/muted are
+            # live editing preferences resolved from the hidden widgets at execution
+            # (user decision 2026-06-11 — never frozen per job). ---
             if queue_job:
                 raw_mode = getattr(queue_job, "take_placement_mode", None)
                 if raw_mode in ("trimmed", "untrimmed"):
@@ -853,6 +866,8 @@ class SonderEditor:
                 "frame_count": frame_count,
                 "frame_count_padding": frame_count_padding,
                 "take_placement_mode": take_placement_mode,
+                "take_placement_linked": take_placement_linked,
+                "take_placement_muted": take_placement_muted,
                 "prompt": prompt_text,
                 # Consume-only completion handle for save nodes — do NOT set on peek
                 "queue_job_id": queue_job.job_id if queue_job and queue_job_consumed else "",

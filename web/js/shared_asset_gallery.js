@@ -225,6 +225,14 @@ function buildWaveformUrl(projectDir, assetId) {
     return api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/waveform/${assetId}`);
 }
 
+// Active in-page asset drag. Browsers block dataTransfer.getData() during
+// dragover, so same-page drop targets (the timeline) read the dragged asset
+// from here to draw type-aware landing feedback. Cleared on dragend.
+let _activeDragAsset = null;
+export function getActiveDragAsset() {
+    return _activeDragAsset;
+}
+
 export function loadMediaAsBlob(url, mediaEl) {
     if (!url || !mediaEl) return { cleanup: () => {} };
     let blobUrl = null;
@@ -5616,8 +5624,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             event.dataTransfer.effectAllowed = "copy";
             event.dataTransfer.setData("application/x-sonder-asset", payload);
             event.dataTransfer.setData("text/plain", assetDisplayName(asset));
+            _activeDragAsset = asset;
         });
         row.addEventListener("dragend", () => {
+            _activeDragAsset = null;
             root.style.outline = "none";
             clearDropFolderHighlight();
         });
@@ -5765,8 +5775,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                     event.dataTransfer.effectAllowed = "copy";
                     event.dataTransfer.setData("application/x-sonder-asset", payload);
                     event.dataTransfer.setData("text/plain", assetDisplayName(asset));
+                    _activeDragAsset = asset;
                 });
                 row.addEventListener("dragend", () => {
+                    _activeDragAsset = null;
                     root.style.outline = "none";
                     clearDropFolderHighlight();
                 });

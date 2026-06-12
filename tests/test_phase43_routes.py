@@ -448,6 +448,121 @@ def test_dual_drop_skips_audio_when_video_asset_has_no_audio(tmp_path, monkeypat
     assert [asset.asset_id for asset in project.assets] == ["asset-1"]
 
 
+def test_dual_drop_uses_target_audio_lane_lock_only(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "with-audio.mp4").write_bytes(b"video")
+    scene = Scene(
+        scene_id="scene-1",
+        name="Scene",
+        video_lane_count=1,
+        audio_lane_count=2,
+    )
+    scene.video_lane_configs = [LaneConfig(name="Video")]
+    scene.audio_lane_configs = [LaneConfig(name="Locked", locked=True), LaneConfig(name="Target")]
+    video_asset = Asset(
+        asset_id="asset-1",
+        name="with-audio.mp4",
+        asset_type="video",
+        path=os.path.join("media", "with-audio.mp4"),
+        frame_count=12,
+        has_audio=True,
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [video_asset]
+
+    def fake_extract(_video_path, output_path):
+        with open(output_path, "wb") as handle:
+            handle.write(b"a" * 2048)
+        return True
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "_extract_audio_from_video", fake_extract)
+    monkeypatch.setattr(route_module, "_get_audio_duration", lambda *_args, **_kwargs: 1.0)
+    monkeypatch.setattr(route_module, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    add_clip = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+    )
+    response = asyncio.run(add_clip(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={
+            "asset_id": "asset-1",
+            "timeline_start_frame": 3,
+            "dual_drop": True,
+            "audio_lane_index": 1,
+        },
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 201
+    assert payload["audio_track"]["lane_index"] == 1
+    assert len(scene.clips) == 1
+    assert len(scene.audio_tracks) == 1
+    assert scene.audio_tracks[0].lane_index == 1
+    assert len(scene.linked_item_groups) == 1
+
+
+def test_dual_drop_rejects_locked_target_audio_lane_before_clip_creation(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "with-audio.mp4").write_bytes(b"video")
+    scene = Scene(
+        scene_id="scene-1",
+        name="Scene",
+        video_lane_count=1,
+        audio_lane_count=1,
+    )
+    scene.video_lane_configs = [LaneConfig(name="Video")]
+    scene.audio_lane_configs = [LaneConfig(name="Locked", locked=True)]
+    video_asset = Asset(
+        asset_id="asset-1",
+        name="with-audio.mp4",
+        asset_type="video",
+        path=os.path.join("media", "with-audio.mp4"),
+        frame_count=12,
+        has_audio=True,
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [video_asset]
+    save_calls = []
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
+    monkeypatch.setattr(
+        route_module,
+        "_extract_audio_from_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("locked lane must preflight before extraction")),
+    )
+
+    add_clip = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+    )
+    response = asyncio.run(add_clip(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={
+            "asset_id": "asset-1",
+            "timeline_start_frame": 3,
+            "dual_drop": True,
+            "audio_lane_index": 0,
+        },
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["code"] == "track_locked"
+    assert scene.clips == []
+    assert scene.audio_tracks == []
+    assert save_calls == []
+
+
 def test_dual_drop_rejects_partial_audio_extraction(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
-from server.timeline_state import ClipReference, GuideFrame, LaneConfig, Scene, TimelineProject
+from server.timeline_state import AudioTrack, ClipReference, GuideFrame, LaneConfig, PromptSection, Scene, TimelineProject
 
 
 class DummyRequest(dict):
@@ -183,6 +183,100 @@ def test_scene_mutation_move_guide_replaces_destination_frame(monkeypatch, tmp_p
     assert [(guide["frame_index"], guide["asset_id"]) for guide in payload["scene"]["guide_frames"]] == [(8, "asset-a")]
 
 
+def test_scene_mutation_linked_move_propagates_to_mixed_items(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=80)
+    prompt = PromptSection(start_frame=0, end_frame=20, prompt="section")
+    prompt.prompt_id = "prompt-1"
+    scene.clips = [ClipReference(
+        clip_id="clip-1",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=4,
+        source_out_frame=24,
+    )]
+    scene.audio_tracks = [AudioTrack(
+        track_id="audio-1",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=3,
+    )]
+    scene.guide_frames = [GuideFrame(guide_id="guide-1", frame_index=5, asset_id="asset-a")]
+    scene.prompt_sections = [prompt]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _mutation_handler(route_module)
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [
+            {
+                "type": "create_link_group",
+                "items": [
+                    {"type": "clip", "id": "clip-1"},
+                    {"type": "audio", "id": "audio-1"},
+                    {"type": "guide", "id": "guide-1"},
+                    {"type": "prompt", "id": "prompt-1"},
+                ],
+            },
+            {
+                "type": "update_clip",
+                "clip_id": "clip-1",
+                "fields": {"timeline_start_frame": 10, "timeline_end_frame": 30},
+                "apply_linked": True,
+            },
+        ]},
+    )))
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert scene.clips[0].timeline_start_frame == 10
+    assert scene.clips[0].timeline_end_frame == 30
+    assert scene.audio_tracks[0].timeline_start_frame == 10
+    assert scene.audio_tracks[0].timeline_end_frame == 30
+    assert scene.guide_frames[0].frame_index == 15
+    assert scene.prompt_sections[0].start_frame == 10
+    assert scene.prompt_sections[0].end_frame == 30
+    assert scene.clips[0].source_in_frame == 4
+    assert scene.clips[0].source_out_frame == 24
+    assert scene.audio_tracks[0].source_in_frame == 3
+
+
+def test_scene_mutation_linked_move_rejects_locked_member(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.audio_lane_configs = [LaneConfig(locked=True)]
+    scene.clips = [ClipReference(clip_id="clip-1", timeline_start_frame=0, timeline_end_frame=20)]
+    scene.audio_tracks = [AudioTrack(track_id="audio-1", timeline_start_frame=0, timeline_end_frame=20)]
+    scene.linked_item_groups = [{
+        "group_id": "group-1",
+        "items": [{"type": "clip", "id": "clip-1"}, {"type": "audio", "id": "audio-1"}],
+    }]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    handler = _mutation_handler(route_module)
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_clip",
+            "clip_id": "clip-1",
+            "fields": {"timeline_start_frame": 10, "timeline_end_frame": 30},
+            "apply_linked": True,
+        }]},
+    )))
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "track_locked"
+    assert saves == []
+    assert scene.clips[0].timeline_start_frame == 0
+    assert scene.audio_tracks[0].timeline_start_frame == 0
+
+
 def test_scene_mutation_create_prompt_section_returns_reconciled_scene(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
     scene = Scene(scene_id="scene-1", name="Scene")
@@ -209,14 +303,14 @@ def test_scene_mutation_create_prompt_section_returns_reconciled_scene(monkeypat
 
     assert response.status == 200
     assert len(saves) == 1
-    assert payload["scene"]["prompt_sections"] == [
-        {
-            "start_frame": 10,
-            "end_frame": 20,
-            "channels": {"visual": "hello", "speech": "", "sounds": ""},
-            "prompt": "hello",
-        }
-    ]
+    assert len(payload["scene"]["prompt_sections"]) == 1
+    section = payload["scene"]["prompt_sections"][0]
+    assert section["start_frame"] == 10
+    assert section["end_frame"] == 20
+    assert section["channels"] == {"visual": "hello", "speech": "", "sounds": ""}
+    assert section["prompt"] == "hello"
+    assert section["muted"] is False
+    assert section["prompt_id"]
 
 
 def _mutation_handler(route_module):
@@ -609,3 +703,243 @@ def test_queue_batch_route_appends_all_jobs_with_single_save(monkeypatch, tmp_pa
     assert len(saves) == 1
     assert [job.batch_index for job in project.generation_queue] == [0, 1]
     assert all(job.frame_constraint == {"step": 8, "offset": 1} for job in project.generation_queue)
+
+
+def _mutations_handler(route_module):
+    return _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
+    )
+
+
+def _lane_config_project(tmp_path):
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig(name="V0", color="#123", locked=False, hidden=True)]
+    scene.audio_lane_count = 2
+    scene.audio_lane_configs = [LaneConfig(name="A0"), LaneConfig(name="A1", locked=True)]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    return project, scene
+
+
+def test_scene_mutation_update_lane_config_partial_fields(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project, scene = _lane_config_project(tmp_path)
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_lane_config",
+            "lane_type": "video",
+            "lane_index": 0,
+            "fields": {"locked": True},
+        }]},
+    )))
+
+    assert response.status == 200
+    assert len(saves) == 1
+    config = scene.video_lane_configs[0]
+    assert config.locked is True
+    # Partial update: untouched fields survive
+    assert config.name == "V0"
+    assert config.color == "#123"
+    assert config.hidden is True
+
+
+def test_scene_mutation_update_lane_config_pads_short_config_list(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project, scene = _lane_config_project(tmp_path)
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    # lane_count is 3 but the config list only has one entry: index 2 is a
+    # legal lane whose config must be padded into existence.
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_lane_config",
+            "lane_type": "video",
+            "lane_index": 2,
+            "fields": {"hidden": True},
+        }]},
+    )))
+
+    assert response.status == 200
+    assert len(scene.video_lane_configs) >= 3
+    assert scene.video_lane_configs[2].hidden is True
+    assert scene.video_lane_configs[0].name == "V0"
+
+
+def test_scene_mutation_update_lane_config_index_beyond_count_rejects(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project, scene = _lane_config_project(tmp_path)
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_lane_config",
+            "lane_type": "audio",
+            "lane_index": 2,
+            "fields": {"locked": True},
+        }]},
+    )))
+
+    assert response.status == 404
+    assert _response_json(response)["code"] == "item_not_found"
+    assert saves == []
+
+
+def test_scene_mutation_update_lane_config_fixed_tracks(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project, scene = _lane_config_project(tmp_path)
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [
+            {"type": "update_lane_config", "lane_type": "guide", "fields": {"locked": True}},
+            {"type": "update_lane_config", "lane_type": "prompt_global", "fields": {"hidden": True}},
+        ]},
+    )))
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert scene.guide_track_config.locked is True
+    assert scene.global_prompt_track_config.hidden is True
+
+
+def test_scene_mutation_update_lane_config_unlocks_locked_lane(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project, scene = _lane_config_project(tmp_path)
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    # No lock gate: toggling `locked` itself must work on a locked lane.
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_lane_config",
+            "lane_type": "audio",
+            "lane_index": 1,
+            "fields": {"locked": False},
+        }]},
+    )))
+
+    assert response.status == 200
+    assert scene.audio_lane_configs[1].locked is False
+
+
+def test_scene_mutation_update_lane_config_unknown_lane_type_rejects(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project, scene = _lane_config_project(tmp_path)
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_lane_config",
+            "lane_type": "lanes",
+            "lane_index": 0,
+            "fields": {"locked": True},
+        }]},
+    )))
+
+    assert response.status == 400
+    assert saves == []
+
+
+def test_scene_mutation_update_lane_config_multi_op_single_save(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project, scene = _lane_config_project(tmp_path)
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    # Bulk header apply: several lanes toggled in ONE mutation batch/save.
+    response = asyncio.run(_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [
+            {"type": "update_lane_config", "lane_type": "video", "lane_index": 0, "fields": {"locked": True}},
+            {"type": "update_lane_config", "lane_type": "video", "lane_index": 1, "fields": {"locked": True}},
+            {"type": "update_lane_config", "lane_type": "audio", "lane_index": 0, "fields": {"locked": True}},
+        ]},
+    )))
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert scene.video_lane_configs[0].locked is True
+    assert scene.video_lane_configs[1].locked is True
+    assert scene.audio_lane_configs[0].locked is True
+
+
+def test_load_project_repair_save_is_unversioned_and_non_fatal(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.clips = [ClipReference(
+        clip_id="clip-0", timeline_start_frame=0, timeline_end_frame=10,
+        source_out_frame=10, total_source_frames=0, track_index=0,
+    )]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    monkeypatch.setattr(route_module, "load_project", lambda project_dir: project)
+    save_calls = []
+
+    def contended_save(saved_project, **kwargs):
+        save_calls.append(kwargs)
+        raise PermissionError("locked by another writer")
+
+    monkeypatch.setattr(route_module, "save_project", contended_save)
+
+    request = DummyRequest(
+        match_info={"project_id": "proj"},
+        query={"path": str(tmp_path)},
+        method="GET",
+        path="/sonder-editor/project/proj/scenes",
+    )
+    loaded = route_module._load_project_from_request(request)
+
+    # The repair is applied in memory and served despite the contended save,
+    # and the save is a no-bump/no-broadcast back-fill.
+    assert loaded is project
+    assert scene.clips[0].total_source_frames == 10
+    assert save_calls == [{"bump_modified_at": False, "notify": False}]
+
+
+def test_scenes_get_serves_despite_contended_repair_save(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.clips = [ClipReference(
+        clip_id="clip-0", timeline_start_frame=0, timeline_end_frame=10,
+        source_out_frame=10, total_source_frames=0, track_index=0,
+    )]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    monkeypatch.setattr(route_module, "load_project", lambda project_dir: project)
+
+    def contended_save(saved_project, **kwargs):
+        raise PermissionError("locked by another writer")
+
+    monkeypatch.setattr(route_module, "save_project", contended_save)
+
+    handler = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/scenes")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        query={"path": str(tmp_path)},
+        method="GET",
+        path="/sonder-editor/project/proj/scenes",
+    )))
+
+    assert response.status == 200
+    payload = _response_json(response)
+    assert payload["scenes"][0]["scene_id"] == "scene-1"
