@@ -1134,8 +1134,9 @@ class SonderEditor:
                         track.lane_index,
                     )
                     continue
-                # Check if track overlaps selection
-                if track.timeline_end_frame <= sel_start or track.timeline_start_frame >= sel_end:
+                overlap_start = max(sel_start, int(track.timeline_start_frame or 0))
+                overlap_end = min(sel_end, int(track.timeline_end_frame or 0))
+                if overlap_end <= overlap_start:
                     logger.debug(
                         "Skipping scene audio track %s: no overlap with range %d-%d",
                         track.source_path,
@@ -1169,18 +1170,20 @@ class SonderEditor:
                 elif waveform.shape[0] > 2:
                     waveform = waveform[:2]
 
-                # Calculate offset within the mixed buffer
-                track_offset_frames = max(0, track.timeline_start_frame - sel_start)
-                audio_offset_frames = max(0, sel_start - track.timeline_start_frame)
+                # Calculate the overlapping source slice and destination offset.
+                track_offset_frames = overlap_start - sel_start
+                audio_offset_frames = overlap_start - int(track.timeline_start_frame or 0)
+                overlap_frames = overlap_end - overlap_start
 
                 track_offset_samples = int(track_offset_frames / effective_fps * sample_rate)
                 # BUG-3 fix: include source_in_frame for trimmed/split audio tracks
-                source_offset_frames = track.source_in_frame + audio_offset_frames
+                source_offset_frames = int(getattr(track, "source_in_frame", 0) or 0) + audio_offset_frames
                 audio_offset_samples = int(source_offset_frames / effective_fps * sample_rate)
+                overlap_samples = int(overlap_frames / effective_fps * sample_rate)
 
                 # Trim source audio
-                src_audio = waveform[:, audio_offset_samples:]
-                available = total_samples - track_offset_samples
+                src_audio = waveform[:, audio_offset_samples:audio_offset_samples + overlap_samples]
+                available = min(overlap_samples, total_samples - track_offset_samples)
                 if available <= 0:
                     logger.debug(
                         "Skipping scene audio track %s: no buffer space after offsets",

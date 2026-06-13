@@ -2892,6 +2892,53 @@ def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):
     assert tuple(result.shape) == (4, 6, 8, 3)
 
 
+def test_load_scene_audio_caps_track_to_timeline_trim(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    audio_path = media_dir / "audio.wav"
+    audio_path.write_bytes(b"audio")
+
+    sample_rate = 44100
+    fps = 44100.0
+    waveform = (torch.arange(200, dtype=torch.float32) / 1000.0).unsqueeze(0)
+
+    fake_torchaudio = types.SimpleNamespace(
+        load=lambda *_args, **_kwargs: (waveform.clone(), sample_rate)
+    )
+    monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
+
+    track = types.SimpleNamespace(
+        muted=False,
+        lane_index=0,
+        timeline_start_frame=10,
+        timeline_end_frame=20,
+        source_path=os.path.join("media", "audio.wav"),
+        source_in_frame=50,
+        volume=1.0,
+    )
+    scene = types.SimpleNamespace(
+        fps=fps,
+        audio_tracks=[track],
+        audio_lane_configs=[],
+    )
+    project = types.SimpleNamespace(
+        fps=fps,
+        project_dir=str(tmp_path),
+    )
+
+    node = editor_node.SonderEditor()
+    audio = node._load_scene_audio(project, scene, 0, 40)
+
+    mixed = audio["waveform"][0, 0]
+    assert mixed.shape[-1] == 40
+    assert torch.allclose(mixed[:10], torch.zeros(10))
+    assert torch.allclose(mixed[10:20], waveform[0, 50:60])
+    assert torch.allclose(mixed[20:], torch.zeros(20))
+
+
 def test_load_scene_audio_logs_missing_source_and_silent_fallback(tmp_path, monkeypatch, caplog):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
 
