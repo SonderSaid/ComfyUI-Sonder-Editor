@@ -10,6 +10,7 @@ import {
     updateEditorSettings,
 } from "./editor_settings.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
+import { resolveEffectiveStreamingMode } from "./media_streaming.js";
 import { notifyError } from "./editor_notifications.js";
 import {
     renderTrackedSectionBody,
@@ -233,8 +234,16 @@ export function getActiveDragAsset() {
     return _activeDragAsset;
 }
 
-export function loadMediaAsBlob(url, mediaEl) {
+// mode "blob" (default) keeps the legacy whole-file download; "direct" assigns
+// the streaming URL straight to the element (seeking rides HTTP Range).
+// Callers opt into direct explicitly — surfaces never inherit another
+// surface's streaming decision.
+export function loadMediaAsBlob(url, mediaEl, { mode = "blob" } = {}) {
     if (!url || !mediaEl) return { cleanup: () => {} };
+    if (mode === "direct") {
+        mediaEl.src = url;
+        return { cleanup: () => {} };
+    }
     let blobUrl = null;
     let aborted = false;
     fetch(url)
@@ -862,6 +871,35 @@ export function mountSharedAssetGallery(container, options = {}) {
     function loadGalleryMediaAsBlob(asset, mediaEl) {
         const url = buildAssetViewUrl(currentProjectDir(), asset?.path);
         if (!url || !mediaEl) return { cleanup: () => {} };
+        // Video-only direct-streaming branch: no fetch, no LRU entry — the
+        // browser HTTP cache + Range cover overlay re-renders. Audio and
+        // images stay on the blob/LRU path below.
+        if (asset?.asset_type === "video") {
+            let directActive = true;
+            let blobHandle = null;
+            resolveEffectiveStreamingMode(
+                getEditorSettings()?.playback?.streamingMode,
+                () => url,
+            ).then((mode) => {
+                if (!directActive) return;
+                if (mode === "direct") {
+                    mediaEl.src = url;
+                } else {
+                    blobHandle = loadGalleryMediaViaCache(asset, url, mediaEl);
+                    if (!directActive) blobHandle.cleanup();
+                }
+            });
+            return {
+                cleanup() {
+                    directActive = false;
+                    blobHandle?.cleanup?.();
+                },
+            };
+        }
+        return loadGalleryMediaViaCache(asset, url, mediaEl);
+    }
+
+    function loadGalleryMediaViaCache(asset, url, mediaEl) {
         const key = assetMediaCacheKey(asset);
         let entry = overlayMediaCache.get(key);
         if (!entry || entry.revoked) {
@@ -3868,7 +3906,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             const stage = style(document.createElement("div"), `position:relative;flex:1 1 auto;min-height:0;border-radius:12px;background:#020507;border:1px solid #24323e;display:flex;align-items:center;justify-content:center;overflow:hidden;`);
             const video = style(document.createElement("video"), `width:100%;height:100%;object-fit:contain;display:block;background:#000;user-select:none;`);
             video.draggable = false;
-            video.preload = "auto";
+            // metadata, not auto: direct-streamed overlay video must not full-preroll
+            // (the poster covers the stage until play); blob mode is unaffected.
+            video.preload = "metadata";
             video.playsInline = true;
             if (asset.has_thumbnail) video.poster = buildThumbnailUrl(projectDir, asset.asset_id);
             const blobHandle = loadGalleryMediaAsBlob(asset, video);
@@ -4264,8 +4304,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                 layerA.alt = assetDisplayName(compareA);
                 layerB.alt = assetDisplayName(compareB);
             } else {
-                layerA.preload = "auto";
-                layerB.preload = "auto";
+                // metadata, not auto: two simultaneous direct-streamed videos would
+                // otherwise full-preroll in parallel under the HTTP/1.1 6-connection cap.
+                layerA.preload = "metadata";
+                layerB.preload = "metadata";
                 layerA.playsInline = true;
                 layerB.playsInline = true;
                 const blobHandleA = loadGalleryMediaAsBlob(compareA, layerA);

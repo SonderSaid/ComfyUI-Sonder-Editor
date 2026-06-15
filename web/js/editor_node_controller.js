@@ -50,8 +50,21 @@ if (typeof window !== "undefined" && !window.SONDER_DEBUG_SESSION) {
     } catch (_) {}
 }
 
+if (typeof window !== "undefined" && !window.SONDER_DEBUG_PLAYBACK_BOUNDARY) {
+    try {
+        if (window.localStorage?.getItem?.("SONDER_DEBUG_PLAYBACK_BOUNDARY") === "1") {
+            window.SONDER_DEBUG_PLAYBACK_BOUNDARY = true;
+        }
+    } catch (_) {}
+}
+
 function isSessionDiagEnabled() {
     return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
+}
+
+function dormantBoundaryDebugEvent(eventName, details = {}) {
+    if (typeof window === "undefined" || !window.SONDER_DEBUG_PLAYBACK_BOUNDARY) return;
+    console.log("[Sonder Dormant Boundary]", eventName, details);
 }
 
 function style(el, cssText) {
@@ -485,12 +498,41 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
     const assetsById = new Map((assets || []).map(asset => [asset.asset_id, asset]));
     const isMissingAsset = (asset) => !asset || !!asset.missing;
 
-    const activeClips = (scene?.clips || [])
-        .filter(clip => fallbackFrame >= clip.timeline_start_frame && fallbackFrame < clip.timeline_end_frame)
-        .filter(clip => !clip.muted)
-        .filter(clip => !clip.role || clip.role === "render")
-        .filter(clip => !isVideoLaneHidden(scene, clip.track_index || 0))
-        .sort((a, b) => (b.track_index || 0) - (a.track_index || 0));
+    const activeClipRecords = (scene?.clips || [])
+        .map((clip, index) => ({ clip, index }))
+        .filter(({ clip }) => fallbackFrame >= clip.timeline_start_frame && fallbackFrame < clip.timeline_end_frame)
+        .filter(({ clip }) => !clip.muted)
+        .filter(({ clip }) => !clip.role || clip.role === "render")
+        .filter(({ clip }) => !isVideoLaneHidden(scene, clip.track_index || 0));
+    const activeClipByLane = new Map();
+    for (const record of activeClipRecords) {
+        const laneIndex = record.clip?.track_index || 0;
+        const current = activeClipByLane.get(laneIndex);
+        if (!current) {
+            activeClipByLane.set(laneIndex, record);
+            continue;
+        }
+        const nextStart = parseInt(record.clip?.timeline_start_frame, 10) || 0;
+        const currentStart = parseInt(current.clip?.timeline_start_frame, 10) || 0;
+        const nextEnd = parseInt(record.clip?.timeline_end_frame, 10) || 0;
+        const currentEnd = parseInt(current.clip?.timeline_end_frame, 10) || 0;
+        if (
+            nextStart > currentStart
+            || (nextStart === currentStart && nextEnd > currentEnd)
+            || (nextStart === currentStart && nextEnd === currentEnd && record.index > current.index)
+        ) {
+            activeClipByLane.set(laneIndex, record);
+        }
+    }
+    const activeClips = Array.from(activeClipByLane.values())
+        .sort((a, b) => {
+            const trackDelta = (b.clip?.track_index || 0) - (a.clip?.track_index || 0);
+            if (trackDelta) return trackDelta;
+            const startDelta = (b.clip?.timeline_start_frame || 0) - (a.clip?.timeline_start_frame || 0);
+            if (startDelta) return startDelta;
+            return b.index - a.index;
+        })
+        .map(({ clip }) => clip);
 
     let guide = null;
     let guideFrame = -1;
@@ -2989,8 +3031,14 @@ export class EditorNodeController {
         const previewPrompt = queuePreviewActive
             ? String(activeQueueJob.preview_prompt ?? "")
             : String(summary?.active_scene?.preview_prompt ?? "");
+        // Dormant preview is frame-accurate like fullscreen, so auto/blob use
+        // whole-file blob loading. Direct streaming remains an explicit opt-in.
+        const streamingModeSetting = getEditorSettings()?.playback?.streamingMode ?? "auto";
+        const streamingMode = streamingModeSetting === "direct" ? "direct" : "blob";
         return {
             kind: "viewport",
+            streamingMode,
+            streamingModeSetting,
             label: "Viewport Preview",
             subtitle: previewSource === "queue" ? `${sourceLabel} - Queue` : sourceLabel,
             previewPrompt,
@@ -3241,6 +3289,11 @@ export class EditorNodeController {
         transport.appendChild(scrubRow);
 
         const projectDir = this.state.projectDir;
+        const mediaStreamingMode = data.streamingMode === "direct" ? "direct" : "blob";
+        dormantBoundaryDebugEvent("resolved-mode", {
+            mode: mediaStreamingMode,
+            setting: data.streamingModeSetting || "",
+        });
         const assetsByPath = new Map((data.assets || []).map((asset) => [asset.path, asset]));
         const effectiveFps = Math.max(1, Number(data.fps) || 24);
         const totalFrames = Math.max(0, parseInt(data.durationFrames, 10) || 0);
@@ -3281,11 +3334,21 @@ export class EditorNodeController {
         let playbackStartTs = 0;
         let playbackStartFrame = currentFrame;
         let currentTarget = null;
+        let lastTargetSignature = "";
+        let lastCommittedVideoSignature = "";
+        let playbackBlockedSinceMs = 0;
+        let lastPlaybackBlockKey = "";
+        let lastPlaybackFallbackKey = "";
+        let lastPlaybackTimeoutKey = "";
         let activeVideoKeys = new Set();
         let activeAudioKeys = new Set();
         const previewImageCache = new Map();
         const videoEntries = new Map();
         const audioEntries = new Map();
+        const dormantSourceLoadCounts = new Map();
+        const DORMANT_PLAYBACK_DRIFT_SEEK_SEC = 0.35;
+        const DORMANT_PLAYBACK_DRIFT_SEEK_COOLDOWN_MS = 250;
+        const DORMANT_PLAYBACK_BLOCK_HOLD_MS = 400;
 
         const clipPlaybackKey = (clip) => clip?.clip_id || `${clip?.source_path || ""}:${clip?.timeline_start_frame || 0}:${clip?.track_index || 0}`;
         const audioPlaybackKey = (track) => track?.track_id || `${track?.source_path || ""}:${track?.timeline_start_frame || 0}:${track?.lane_index || 0}`;
@@ -3301,6 +3364,26 @@ export class EditorNodeController {
             }
         );
         const getTargetForCurrentFrame = () => getTargetForFrame(renderFrameIndex());
+
+        function targetSignature(target) {
+            if (!target) return "none";
+            if (target.kind === "video") {
+                return `video:${target.key || clipPlaybackKey(target.clip)}:${target.clip?.source_path || ""}`;
+            }
+            if (target.kind === "composite") {
+                const layerKey = (target.layers || [])
+                    .map((layer) => `${layer?.key || clipPlaybackKey(layer?.clip)}:${layer?.sourcePath || layer?.clip?.source_path || ""}`)
+                    .join(",");
+                return `composite:${layerKey}`;
+            }
+            if (target.kind === "image") {
+                return `image:${target.posterUrl || ""}`;
+            }
+            if (target.kind === "missing") {
+                return `missing:${target.subtitle || target.label || ""}`;
+            }
+            return target.kind || "empty";
+        }
 
         const consumePointerOnly = (event) => consumeDormantPointer(event);
         stage.addEventListener("pointerdown", consumePointerOnly);
@@ -3355,7 +3438,7 @@ export class EditorNodeController {
                 0,
                 frame - (parseInt(clip?.timeline_start_frame, 10) || 0) + (parseInt(clip?.source_in_frame, 10) || 0)
             );
-            return sourceFrame / effectiveFps;
+            return (sourceFrame + 0.5) / effectiveFps;
         }
 
         function sourceTimeForAudio(track, frame) {
@@ -3364,6 +3447,187 @@ export class EditorNodeController {
                 frame - (parseInt(track?.timeline_start_frame, 10) || 0) + (parseInt(track?.source_in_frame, 10) || 0)
             );
             return sourceFrame / effectiveFps;
+        }
+
+        function dormantNowMs() {
+            return (typeof performance !== "undefined" && typeof performance.now === "function")
+                ? performance.now()
+                : Date.now();
+        }
+
+        function mediaHasMetadata(mediaEl) {
+            return (mediaEl?.readyState || 0) >= 1 || Number.isFinite(Number(mediaEl?.duration));
+        }
+
+        function mediaIsDrawable(mediaEl) {
+            return !!mediaEl && !mediaEl.seeking && (mediaEl.readyState || 0) >= 2;
+        }
+
+        function mediaTimeMatches(mediaEl, desiredTime, tolerance = 0.08) {
+            return Math.abs((mediaEl?.currentTime || 0) - desiredTime) <= tolerance;
+        }
+
+        function expectedDormantPlaybackTime(entry, frame) {
+            const startedAtFrame = Number.isFinite(entry?.startedAtFrame) ? entry.startedAtFrame : frame;
+            const startedAtMediaTime = Number.isFinite(entry?.startedAtMediaTime) ? entry.startedAtMediaTime : 0;
+            return startedAtMediaTime + ((frame - startedAtFrame) / effectiveFps);
+        }
+
+        function logDormantVideoState(entry, stateName, details = {}) {
+            if (!entry) return;
+            const debugKey = `${stateName}:${details.reason || ""}:${details.targetTime ?? ""}:${details.readyState ?? ""}`;
+            if (entry.lastDebugState === debugKey) return;
+            entry.lastDebugState = debugKey;
+            dormantBoundaryDebugEvent(stateName, {
+                key: entry.key,
+                sourcePath: entry.layer?.sourcePath || entry.layer?.clip?.source_path || "",
+                ...details,
+            });
+        }
+
+        function requestDormantVideoSeek(entry) {
+            const pending = entry?.pendingSeekTarget;
+            const video = entry?.el;
+            if (!pending || !video || !mediaHasMetadata(video)) return false;
+            if (video.seeking && pending.requested) return false;
+            const now = dormantNowMs();
+            if (pending.requested && now - (pending.requestedAtMs || 0) < 150) return false;
+            const desiredTime = clampMediaTime(video, pending.time);
+            if (pending.requested && mediaTimeMatches(video, desiredTime, 0.04)) return false;
+            try {
+                video.currentTime = desiredTime;
+                pending.time = desiredTime;
+                pending.requested = true;
+                pending.requestedAtMs = now;
+                entry.requestedSeekTime = desiredTime;
+                logDormantVideoState(entry, "video-seek-request", {
+                    frame: pending.frame,
+                    reason: pending.reason || "",
+                    targetTime: Number(desiredTime.toFixed(4)),
+                    readyState: video.readyState || 0,
+                });
+                return true;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        function settleDormantVideo(entry) {
+            const pending = entry?.pendingSeekTarget;
+            const video = entry?.el;
+            if (!pending || !video || !mediaIsDrawable(video)) return false;
+            const desiredTime = clampMediaTime(video, pending.time);
+            if (!mediaTimeMatches(video, desiredTime, 0.08)) return false;
+            entry.readyForDraw = true;
+            entry.startedAtFrame = pending.frame;
+            entry.startedAtMediaTime = video.currentTime || desiredTime;
+            entry.lastCommittedFrame = null;
+            entry.lastDrawnMediaTime = null;
+            entry.pendingSeekTarget = null;
+            entry.requestedSeekTime = Number.NaN;
+            entry.lastDebugState = "";
+            dormantBoundaryDebugEvent("video-seek-settled", {
+                key: entry.key,
+                sourcePath: entry.layer?.sourcePath || entry.layer?.clip?.source_path || "",
+                frame: pending.frame,
+                reason: pending.reason || "",
+                mediaTime: Number((video.currentTime || desiredTime).toFixed(4)),
+                readyState: video.readyState || 0,
+            });
+            return true;
+        }
+
+        function prepareDormantVideo(entry, layer, frame, reason, { force = false } = {}) {
+            const video = entry?.el;
+            if (!entry || !video || !layer?.clip) return false;
+            entry.layer = layer;
+
+            if (!force && entry.pendingSeekTarget) {
+                requestDormantVideoSeek(entry);
+                settleDormantVideo(entry);
+                return entry.readyForDraw;
+            }
+
+            const targetTime = clampMediaTime(video, sourceTimeForClip(layer.clip, frame));
+            if (
+                !force
+                && entry.readyForDraw
+                && mediaIsDrawable(video)
+                && mediaTimeMatches(video, targetTime, isPlaying ? 0.25 : 0.04)
+            ) {
+                return true;
+            }
+
+            entry.pendingTime = targetTime;
+            entry.pendingSeekTarget = {
+                time: targetTime,
+                frame,
+                reason,
+                requested: false,
+                requestedAtMs: 0,
+            };
+            entry.readyForDraw = false;
+            entry.startedAtFrame = null;
+            entry.startedAtMediaTime = 0;
+            entry.lastCommittedFrame = null;
+            entry.lastDrawnMediaTime = null;
+            requestDormantVideoSeek(entry);
+            settleDormantVideo(entry);
+            return entry.readyForDraw;
+        }
+
+        function syncDormantVideoPlayback(entry, layer, frame, { forceSeek = false } = {}) {
+            const video = entry?.el;
+            if (!entry || !video) return false;
+            entry.layer = layer;
+
+            if (forceSeek || entry.pendingSeekTarget || !entry.readyForDraw) {
+                prepareDormantVideo(entry, layer, frame, forceSeek ? "force" : "activate", { force: forceSeek });
+            }
+
+            if (!entry.readyForDraw) return false;
+
+            if (mediaIsDrawable(video)) {
+                const expectedTime = clampMediaTime(video, expectedDormantPlaybackTime(entry, frame));
+                const drift = (video.currentTime || 0) - expectedTime;
+                const now = dormantNowMs();
+                if (
+                    Math.abs(drift) > DORMANT_PLAYBACK_DRIFT_SEEK_SEC
+                    && now - (entry.lastDriftSeekAtMs || 0) >= DORMANT_PLAYBACK_DRIFT_SEEK_COOLDOWN_MS
+                ) {
+                    entry.lastDriftSeekAtMs = now;
+                    dormantBoundaryDebugEvent("video-drift-correct", {
+                        key: entry.key,
+                        sourcePath: entry.layer?.sourcePath || entry.layer?.clip?.source_path || "",
+                        frame,
+                        drift: Number(drift.toFixed(4)),
+                        targetTime: Number(expectedTime.toFixed(4)),
+                        currentTime: Number((video.currentTime || 0).toFixed(4)),
+                    });
+                    return prepareDormantVideo(entry, layer, frame, "drift", { force: true });
+                }
+            }
+
+            video.muted = true;
+            if (video.paused) {
+                video.play().catch(() => {});
+            }
+            return true;
+        }
+
+        function isDormantVideoDrawable(entry, layer, frame, { playing = isPlaying } = {}) {
+            const video = entry?.el;
+            if (!entry || !video || !layer?.clip) return false;
+            if (entry.pendingSeekTarget) {
+                requestDormantVideoSeek(entry);
+                settleDormantVideo(entry);
+            }
+            if (!mediaIsDrawable(video)) return false;
+            if (playing) {
+                return !!entry.readyForDraw;
+            }
+            const targetTime = clampMediaTime(video, sourceTimeForClip(layer.clip, frame));
+            return mediaTimeMatches(video, targetTime, 0.04);
         }
 
         function ensureVideoEntry(layer) {
@@ -3376,7 +3640,7 @@ export class EditorNodeController {
             }
 
             const video = document.createElement("video");
-            video.preload = "auto";
+            video.preload = mediaStreamingMode === "direct" ? "metadata" : "auto";
             video.muted = true;
             video.playsInline = true;
 
@@ -3385,23 +3649,36 @@ export class EditorNodeController {
                 layer,
                 el: video,
                 pendingTime: 0,
+                startedAtFrame: null,
+                startedAtMediaTime: 0,
+                lastCommittedFrame: null,
+                pendingSeekTarget: null,
+                readyForDraw: false,
+                lastDrawnMediaTime: null,
+                lastDriftSeekAtMs: 0,
                 cleanupHandle: null,
                 listeners: [],
                 cleanup: null,
+                lastDebugState: "",
+                readyLogged: false,
+                requestedSeekTime: Number.NaN,
             };
 
             const onReady = () => {
                 if (destroyed) return;
-                if (isPlaying && activeVideoKeys.has(key)) {
-                    const desiredTime = clampMediaTime(
-                        video,
-                        entry.pendingTime || sourceTimeForClip(entry.layer?.clip, renderFrameIndex())
-                    );
-                    try {
-                        if (Math.abs((video.currentTime || 0) - desiredTime) > 0.04) {
-                            video.currentTime = desiredTime;
-                        }
-                    } catch (error) {}
+                if ((video.readyState || 0) >= 2 && !entry.readyLogged) {
+                    dormantBoundaryDebugEvent("video-ready", {
+                        key: entry.key,
+                        sourcePath: entry.layer?.sourcePath || entry.layer?.clip?.source_path || "",
+                        readyState: video.readyState || 0,
+                    });
+                    entry.readyLogged = true;
+                }
+                if (entry.pendingSeekTarget) {
+                    requestDormantVideoSeek(entry);
+                    settleDormantVideo(entry);
+                }
+                if (isPlaying && activeVideoKeys.has(entry.key) && entry.readyForDraw) {
                     video.muted = true;
                     video.play().catch(() => {});
                 }
@@ -3415,8 +3692,18 @@ export class EditorNodeController {
 
             entry.cleanupHandle = loadMediaAsBlob(
                 layer.mediaUrl || buildProjectAssetViewURL(projectDir, layer.sourcePath),
-                video
+                video,
+                { mode: mediaStreamingMode }
             );
+            const sourceLoadKey = `${key}:${layer.sourcePath}`;
+            const sourceLoadCount = (dormantSourceLoadCounts.get(sourceLoadKey) || 0) + 1;
+            dormantSourceLoadCounts.set(sourceLoadKey, sourceLoadCount);
+            dormantBoundaryDebugEvent("video-source-created", {
+                key,
+                sourcePath: layer.sourcePath,
+                count: sourceLoadCount,
+                mode: mediaStreamingMode,
+            });
             entry.cleanup = () => {
                 video.pause();
                 entry.cleanupHandle?.cleanup?.();
@@ -3475,9 +3762,12 @@ export class EditorNodeController {
                 entry.listeners.push([eventName, onReady]);
             }
 
+            // Audio stays blob-loaded regardless of streamingMode (small files,
+            // avoids network under-buffer/drift) — matches the fullscreen surface.
             entry.cleanupHandle = loadMediaAsBlob(
                 buildProjectAssetViewURL(projectDir, track.source_path),
-                audio
+                audio,
+                { mode: "blob" }
             );
             entry.cleanup = () => {
                 audio.pause();
@@ -3526,12 +3816,6 @@ export class EditorNodeController {
             if (!target?.guide?.posterUrl) return false;
             const guideImage = loadDormantPreviewImage(previewImageCache, target.guide.posterUrl, () => scheduleRender());
             return !!guideImage && drawDormantCanvasMedia(canvas, guideImage);
-        }
-
-        function drawLayerPoster(layer) {
-            if (!layer?.posterUrl) return false;
-            const poster = loadDormantPreviewImage(previewImageCache, layer.posterUrl, () => scheduleRender());
-            return !!poster && drawDormantCanvasMedia(canvas, poster, { opacity: layer.opacity ?? 1 });
         }
 
         function updateTransport() {
@@ -3615,7 +3899,7 @@ export class EditorNodeController {
             drawDormantCanvasMessage(canvas, target.label || "Preview unavailable", target.subtitle || "");
         }
 
-        function syncVideoPlayback(target, frame) {
+        function syncVideoPlayback(target, frame, { forceSeek = false } = {}) {
             const layers = getTargetLayers(target);
             const nextKeys = new Set(layers.map(layer => layer.key || clipPlaybackKey(layer.clip)));
 
@@ -3629,20 +3913,9 @@ export class EditorNodeController {
                 const entry = ensureVideoEntry(layer);
                 if (!entry) continue;
                 entry.layer = layer;
-                entry.pendingTime = sourceTimeForClip(layer.clip, frame);
-                const video = entry.el;
-                if (video.readyState >= 2) {
-                    const desiredTime = clampMediaTime(video, entry.pendingTime);
-                    if (!activeVideoKeys.has(entry.key) || Math.abs((video.currentTime || 0) - desiredTime) > 0.25) {
-                        try {
-                            video.currentTime = desiredTime;
-                        } catch (error) {}
-                    }
-                    video.muted = true;
-                    if (video.paused) {
-                        video.play().catch(() => {});
-                    }
-                }
+                syncDormantVideoPlayback(entry, layer, frame, {
+                    forceSeek: forceSeek || !activeVideoKeys.has(entry.key),
+                });
             }
 
             activeVideoKeys = nextKeys;
@@ -3685,76 +3958,107 @@ export class EditorNodeController {
         }
 
         function renderVideoTarget(target, { forceSeek = false } = {}) {
-            clearDormantCanvas(canvas);
-            let drewAny = drawGuideBackground(target);
             const frame = renderFrameIndex();
             const layers = getTargetLayers(target);
 
             if (!layers.length) {
-                if (!drewAny) {
+                clearDormantCanvas(canvas);
+                const drewGuide = drawGuideBackground(target);
+                if (!drewGuide) {
                     drawDormantCanvasMessage(canvas, target.label || "No preview", target.subtitle || "");
                 }
+                lastCommittedVideoSignature = "";
+                lastPlaybackBlockKey = "";
+                lastPlaybackFallbackKey = "";
+                lastPlaybackTimeoutKey = "";
                 return;
             }
 
+            if (!isPlaying) {
+                clearDormantCanvas(canvas);
+                let drewAny = drawGuideBackground(target);
+                for (const layer of layers) {
+                    const entry = ensureVideoEntry(layer);
+                    if (!entry) continue;
+                    entry.el.pause();
+                    if (!isDormantVideoDrawable(entry, layer, frame, { playing: false })) {
+                        prepareDormantVideo(entry, layer, frame, "scrub", { force: forceSeek });
+                    }
+                    if (isDormantVideoDrawable(entry, layer, frame, { playing: false })) {
+                        drewAny = drawDormantCanvasMedia(canvas, entry.el, { opacity: layer.opacity ?? 1 }) || drewAny;
+                        entry.lastCommittedFrame = frame;
+                        entry.lastDrawnMediaTime = entry.el.currentTime || 0;
+                    }
+                }
+                if (!drewAny) {
+                    drawDormantCanvasMessage(canvas, "Seeking frame...", target.subtitle || "");
+                }
+                lastCommittedVideoSignature = drewAny ? targetSignature(target) : "";
+                lastPlaybackBlockKey = "";
+                lastPlaybackFallbackKey = "";
+                lastPlaybackTimeoutKey = "";
+                return;
+            }
+
+            const drawableLayers = [];
             for (const layer of layers) {
                 const entry = ensureVideoEntry(layer);
-                if (!entry) {
-                    drewAny = drawLayerPoster(layer) || drewAny;
-                    continue;
-                }
-
-                entry.layer = layer;
-                entry.pendingTime = sourceTimeForClip(layer.clip, frame);
-                const video = entry.el;
-                const desiredTime = clampMediaTime(video, entry.pendingTime);
-
-                if (isPlaying) {
-                    if (video.readyState >= 2) {
-                        const drift = Math.abs((video.currentTime || 0) - desiredTime);
-                        if (forceSeek || drift > 0.25) {
-                            try {
-                                video.currentTime = desiredTime;
-                            } catch (error) {}
-                        }
-                        video.muted = true;
-                        if (video.paused) {
-                            video.play().catch(() => {});
-                        }
-                        if (!forceSeek && !video.seeking) {
-                            drewAny = drawDormantCanvasMedia(canvas, video, { opacity: layer.opacity ?? 1 }) || drewAny;
-                        } else {
-                            drewAny = drawLayerPoster(layer) || drewAny;
-                        }
-                    } else {
-                        drewAny = drawLayerPoster(layer) || drewAny;
-                    }
-                } else {
-                    video.pause();
-                    if (video.readyState >= 2) {
-                        const settled = !forceSeek && !video.seeking && Math.abs((video.currentTime || 0) - desiredTime) < 0.04;
-                        if (!settled) {
-                            try {
-                                video.currentTime = desiredTime;
-                            } catch (error) {}
-                        }
-                        if (settled) {
-                            drewAny = drawDormantCanvasMedia(canvas, video, { opacity: layer.opacity ?? 1 }) || drewAny;
-                        } else {
-                            drewAny = drawLayerPoster(layer) || drewAny;
-                        }
-                    } else {
-                        drewAny = drawLayerPoster(layer) || drewAny;
-                    }
+                if (!entry) continue;
+                syncDormantVideoPlayback(entry, layer, frame, { forceSeek: false });
+                if (isDormantVideoDrawable(entry, layer, frame, { playing: true })) {
+                    drawableLayers.push({ entry, layer });
                 }
             }
 
-            if (!drewAny) {
-                drawDormantCanvasMessage(
-                    canvas,
-                    isPlaying ? "Loading video..." : "Seeking frame...",
-                    target.subtitle || ""
-                );
+            if (drawableLayers.length > 0) {
+                clearDormantCanvas(canvas);
+                let drewAny = drawGuideBackground(target);
+                for (const { entry, layer } of drawableLayers) {
+                    drewAny = drawDormantCanvasMedia(canvas, entry.el, { opacity: layer.opacity ?? 1 }) || drewAny;
+                    entry.lastCommittedFrame = frame;
+                    entry.lastDrawnMediaTime = entry.el.currentTime || 0;
+                }
+                lastCommittedVideoSignature = drewAny ? targetSignature(target) : "";
+                playbackBlockedSinceMs = 0;
+                lastPlaybackBlockKey = "";
+                lastPlaybackFallbackKey = "";
+                lastPlaybackTimeoutKey = "";
+                return;
+            }
+
+            const blockKey = `${targetSignature(target)}:${layers.map(layer => layer.key || clipPlaybackKey(layer.clip)).join(",")}`;
+            const now = dormantNowMs();
+            if (lastPlaybackBlockKey !== blockKey) {
+                playbackBlockedSinceMs = now;
+                lastPlaybackBlockKey = blockKey;
+                dormantBoundaryDebugEvent("video-blocked", {
+                    frame,
+                    targetKind: target?.kind || "",
+                    layerCount: layers.length,
+                });
+            }
+            const blockAgeMs = now - playbackBlockedSinceMs;
+            if (lastCommittedVideoSignature && blockAgeMs < DORMANT_PLAYBACK_BLOCK_HOLD_MS) {
+                return;
+            }
+            if (blockAgeMs >= DORMANT_PLAYBACK_BLOCK_HOLD_MS && lastPlaybackTimeoutKey !== blockKey) {
+                lastPlaybackTimeoutKey = blockKey;
+                dormantBoundaryDebugEvent("video-blocked-timeout", {
+                    frame,
+                    targetKind: target?.kind || "",
+                    layerCount: layers.length,
+                    blockedMs: Math.round(blockAgeMs),
+                });
+            }
+            const fallbackKey = `${blockKey}:${canvas.width}x${canvas.height}`;
+            if (lastPlaybackFallbackKey === fallbackKey) {
+                return;
+            }
+            lastPlaybackFallbackKey = fallbackKey;
+            clearDormantCanvas(canvas);
+            const drewGuide = drawGuideBackground(target);
+            if (!drewGuide) {
+                drawDormantCanvasMessage(canvas, "Loading video...", target.subtitle || "");
             }
         }
 
@@ -3765,23 +4069,47 @@ export class EditorNodeController {
                 updateTransport();
                 return;
             }
-            currentTarget = getTargetForCurrentFrame();
+            const frame = renderFrameIndex();
+            currentTarget = getTargetForFrame(frame);
+            const nextTargetSignature = targetSignature(currentTarget);
+            const targetChanged = nextTargetSignature !== lastTargetSignature;
+            if (targetChanged) {
+                dormantBoundaryDebugEvent("target-transition", {
+                    frame,
+                    from: lastTargetSignature,
+                    to: nextTargetSignature,
+                    kind: currentTarget?.kind || "none",
+                });
+                lastPlaybackBlockKey = "";
+                lastPlaybackFallbackKey = "";
+                lastPlaybackTimeoutKey = "";
+                lastTargetSignature = nextTargetSignature;
+            }
+            const shouldForceSeek = forceSeek || targetChanged;
 
             if (isPlaying) {
                 if (currentTarget?.kind === "video" || currentTarget?.kind === "composite") {
-                    syncVideoPlayback(currentTarget, renderFrameIndex());
+                    syncVideoPlayback(currentTarget, frame, { forceSeek: shouldForceSeek });
                 } else {
                     pauseAllVideos();
+                    lastCommittedVideoSignature = "";
+                    lastPlaybackBlockKey = "";
+                    lastPlaybackFallbackKey = "";
+                    lastPlaybackTimeoutKey = "";
                 }
-                syncAudioPlayback(renderFrameIndex());
+                syncAudioPlayback(frame);
             } else {
                 pauseAllVideos();
                 pauseAllAudios();
             }
 
             if (currentTarget?.kind === "video" || currentTarget?.kind === "composite") {
-                renderVideoTarget(currentTarget, { forceSeek });
+                renderVideoTarget(currentTarget, { forceSeek: shouldForceSeek });
             } else {
+                lastCommittedVideoSignature = "";
+                lastPlaybackBlockKey = "";
+                lastPlaybackFallbackKey = "";
+                lastPlaybackTimeoutKey = "";
                 renderStaticTarget(currentTarget || { kind: "empty", label: "No preview", subtitle: "" });
             }
             updateTransport();

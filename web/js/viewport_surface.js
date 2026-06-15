@@ -5,11 +5,15 @@ function clamp(value, min, max) {
 }
 
 const PLAYBACK_COMMIT_HOLD_MS = 400;
+const PLAYBACK_TAIL_HOLD_MAX_MS = 2000;
 const PLAYBACK_OPAQUE_OPACITY = 0.999;
 const PLAYBACK_COVERAGE_EPSILON = 0.75;
-const PLAYBACK_PREBUFFER_GUARD_MS = 500;
-const PLAYBACK_PREBUFFER_SAFE_LEAD_MS = 2000;
 const PLAYBACK_FIRST_COMMIT_HOLD_MS = 2500;
+// Boundary-count prebuffer: warm the next N distinct clip boundaries ahead
+// (not a millisecond window). prebufferLookaheadMs is only the scan horizon.
+const PLAYBACK_PREBUFFER_BOUNDARY_DEPTH = 2;
+// Hard cap on simultaneously warmed prebuffer video elements (RAM/VRAM budget).
+const PLAYBACK_PREBUFFER_MAX_ENTRIES = 8;
 
 // Session-diagnostic helper: writes to `window.__SONDER_CANVAS_DIAG` populated
 // by editor_widget.js when `window.SONDER_DEBUG_SESSION === true`. Zero-cost
@@ -265,12 +269,18 @@ export function createViewportSurface(options = {}) {
         playbackFirstCommitStartedAt: null,
         playbackFirstCommitFrame: null,
         playbackFirstCommitHoldExpired: false,
+        playbackDecisionLogKeys: new Set(),
+        audioReleasedThisSession: false,
+        audioFreezeLogged: false,
+        audioReleaseLogged: false,
         renderToken: 0,
         sourceUrlCache: new Map(),
         activePlaybackVideos: new Map(),
         activePlaybackAudios: new Map(),
         prebufferCache: new Map(),
-        prebufferSkipLogKeys: new Set(),
+        // Outgoing media elements awaiting release after the next successful
+        // commit (so we never tear down an element still feeding the canvas).
+        pendingRelease: new Set(),
         videoCache: options.videoCache || {},
         audioCache: options.audioCache || {},
         imageCache: options.imageCache || {},
@@ -298,6 +308,7 @@ export function createViewportSurface(options = {}) {
     const buildThumbnailUrl = options.buildThumbnailUrl || (() => null);
     const isPrebufferEnabled = options.isPrebufferEnabled || (() => true);
     const getPrebufferLookaheadMs = options.getPrebufferLookaheadMs || (() => 1000);
+    const getStreamingMode = options.getStreamingMode || (() => "auto");
 
     function currentFrame() {
         return clamp(Math.round(Number(getFrame()) || 0), 0, totalFrames());
@@ -324,6 +335,27 @@ export function createViewportSurface(options = {}) {
         console.debug("[Sonder Playback Boundary]", eventName, details);
     }
 
+    function playbackDebugEvent(eventName, details = {}) {
+        if (typeof window === "undefined" || !window.SONDER_DEBUG_PLAYBACK_BOUNDARY) return;
+        console.log("[Sonder Playback Boundary]", eventName, details);
+    }
+
+    function clearPlaybackDecisionLogs() {
+        state.playbackDecisionLogKeys.clear();
+    }
+
+    function playbackDecisionDebugEvent(eventName, details = {}, keyParts = []) {
+        if (typeof window === "undefined" || !window.SONDER_DEBUG_PLAYBACK_BOUNDARY) return;
+        const logKey = [
+            eventName,
+            state.playbackSessionId,
+            ...keyParts.map((part) => String(part ?? "")),
+        ].join("|");
+        if (state.playbackDecisionLogKeys.has(logKey)) return;
+        state.playbackDecisionLogKeys.add(logKey);
+        playbackDebugEvent(eventName, details);
+    }
+
     function invalidateAsyncPreviewRenders() {
         state.renderToken += 1;
     }
@@ -337,7 +369,6 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedFrame = null;
         state.playbackLastCommittedSignature = "";
         state.playbackLastCommittedSessionId = 0;
-        state.prebufferSkipLogKeys.clear();
     }
 
     function beginFirstCommitHold(timestamp, frame) {
@@ -350,6 +381,26 @@ export function createViewportSurface(options = {}) {
         state.playbackFirstCommitStartedAt = null;
         state.playbackFirstCommitFrame = null;
         state.playbackFirstCommitHoldExpired = false;
+    }
+
+    function resetAudioReleaseLatch() {
+        state.audioReleasedThisSession = false;
+        state.audioFreezeLogged = false;
+        state.audioReleaseLogged = false;
+    }
+
+    function releaseAudioForSession(reason, details = {}) {
+        if (!state.audioReleasedThisSession) {
+            state.audioReleasedThisSession = true;
+            if (!state.audioReleaseLogged) {
+                playbackDebugEvent("audio-released", {
+                    reason,
+                    playbackSessionId: state.playbackSessionId,
+                    ...details,
+                });
+                state.audioReleaseLogged = true;
+            }
+        }
     }
 
     function playbackCanvasStillValid() {
@@ -587,42 +638,82 @@ export function createViewportSurface(options = {}) {
         return null;
     }
 
-    function resolveMediaSourceUrl(sourcePath) {
+    function effectiveSurfaceStreamingMode(forceBlob = false) {
+        if (forceBlob) return "blob";
+        return getStreamingMode() === "direct" ? "direct" : "blob";
+    }
+
+    // forceBlob pins a caller to whole-file blob loading regardless of the
+    // streaming mode (guide-snapshot capture is a frame-accuracy correctness
+    // path). Surface auto/blob loads and forced-blob loads share `blob:...`;
+    // explicit direct opt-in gets its own `direct:...` entry.
+    function resolveMediaSourceUrl(sourcePath, { forceBlob = false } = {}) {
         if (!sourcePath) return Promise.resolve(null);
-        const cached = state.sourceUrlCache.get(sourcePath);
+        const mode = effectiveSurfaceStreamingMode(forceBlob);
+        const cacheKey = `${mode}:${sourcePath}`;
+        const cached = state.sourceUrlCache.get(cacheKey);
         if (cached?.promise) {
             return cached.promise;
         }
         const directUrl = buildViewUrl(sourcePath);
         if (!directUrl) return Promise.resolve(null);
         const entry = {};
-        entry.promise = fetch(directUrl)
-            .then((response) => {
-                if (!response.ok) {
-                    throw new Error(`Failed to fetch media: ${response.status}`);
-                }
-                return response.blob();
-            })
-            .then((blob) => {
-                entry.objectUrl = URL.createObjectURL(blob);
-                entry.usesObjectUrl = true;
-                if (state.sourceUrlCache.get(sourcePath) !== entry || state.destroyed) {
-                    URL.revokeObjectURL(entry.objectUrl);
-                    entry.objectUrl = null;
-                    return null;
-                }
-                return entry.objectUrl;
-            })
-            .catch((error) => {
-                if (state.sourceUrlCache.get(sourcePath) !== entry || state.destroyed) {
-                    return null;
-                }
-                console.warn("[Sonder] Failed to load media as blob, falling back to direct URL:", error);
+        const loadAsBlob = () => {
+            const startedAt = performance.now();
+            return fetch(directUrl)
+                .then((response) => {
+                    if (!response.ok) {
+                        throw new Error(`Failed to fetch media: ${response.status}`);
+                    }
+                    return response.blob();
+                })
+                .then((blob) => {
+                    entry.objectUrl = URL.createObjectURL(blob);
+                    entry.usesObjectUrl = true;
+                    if (state.sourceUrlCache.get(cacheKey) !== entry || state.destroyed) {
+                        URL.revokeObjectURL(entry.objectUrl);
+                        entry.objectUrl = null;
+                        return null;
+                    }
+                    viewportDiagRecord("resolve_media_source", {
+                        source_path: sourcePath,
+                        mode: "blob",
+                        forced: forceBlob,
+                        duration_ms: Math.round(performance.now() - startedAt),
+                        blob_size: blob.size,
+                    });
+                    return entry.objectUrl;
+                })
+                .catch((error) => {
+                    if (state.sourceUrlCache.get(cacheKey) !== entry || state.destroyed) {
+                        return null;
+                    }
+                    console.warn("[Sonder] Failed to load media as blob, falling back to direct URL:", error);
+                    playbackDebugEvent("resolve-media-source-fallback", {
+                        sourcePath,
+                        requestedMode: mode,
+                        forced: forceBlob,
+                        error: String(error?.message || error || ""),
+                    });
+                    entry.objectUrl = directUrl;
+                    entry.usesObjectUrl = false;
+                    return directUrl;
+                });
+        };
+        entry.promise = Promise.resolve().then(() => {
+            if (state.sourceUrlCache.get(cacheKey) !== entry || state.destroyed) {
+                return null;
+            }
+            playbackDebugEvent("resolve-media-source", { sourcePath, mode, forced: forceBlob });
+            if (mode === "direct") {
                 entry.objectUrl = directUrl;
                 entry.usesObjectUrl = false;
+                viewportDiagRecord("resolve_media_source", { source_path: sourcePath, mode: "direct" });
                 return directUrl;
-            });
-        state.sourceUrlCache.set(sourcePath, entry);
+            }
+            return loadAsBlob();
+        });
+        state.sourceUrlCache.set(cacheKey, entry);
         return entry.promise;
     }
 
@@ -630,7 +721,7 @@ export function createViewportSurface(options = {}) {
         if (!layer?.key) return null;
         if (!state.videoCache[layer.key]) {
             const video = document.createElement("video");
-            video.preload = "auto";
+            video.preload = "metadata";
             video.muted = true;
             video.playsInline = true;
             state.videoCache[layer.key] = video;
@@ -650,7 +741,7 @@ export function createViewportSurface(options = {}) {
 
     function createMutedVideoElement() {
         const video = document.createElement("video");
-        video.preload = "auto";
+        video.preload = "metadata";
         video.muted = true;
         video.playsInline = true;
         return video;
@@ -666,6 +757,22 @@ export function createViewportSurface(options = {}) {
         );
     }
 
+    function snapshotHasPlayableVideo(snapshot) {
+        return (snapshot?.playableClipLayers || []).some(isRenderableVideoLayer);
+    }
+
+    function audioPlaybackAllowed(snapshot) {
+        const allowed = state.audioReleasedThisSession || !snapshotHasPlayableVideo(snapshot);
+        if (!allowed && !state.audioFreezeLogged) {
+            playbackDebugEvent("audio-frozen", {
+                frame: snapshot?.frame,
+                playbackSessionId: state.playbackSessionId,
+            });
+            state.audioFreezeLogged = true;
+        }
+        return allowed;
+    }
+
     function prebufferKeyForLayer(layer) {
         if (!isRenderableVideoLayer(layer)) return "";
         return `${layer.key}::${layer.clip.source_path}`;
@@ -674,17 +781,6 @@ export function createViewportSurface(options = {}) {
     function normalizedPrebufferLookaheadMs() {
         const numeric = Number(getPrebufferLookaheadMs());
         return clamp(Number.isFinite(numeric) ? Math.round(numeric) : 1000, 100, 5000);
-    }
-
-    function prebufferGuardFrames() {
-        return Math.max(2, Math.round((PLAYBACK_PREBUFFER_GUARD_MS / 1000) * fps()));
-    }
-
-    function prebufferSafeLeadFrames() {
-        return Math.max(
-            prebufferGuardFrames() + 1,
-            Math.round((PLAYBACK_PREBUFFER_SAFE_LEAD_MS / 1000) * fps()),
-        );
     }
 
     function playbackFrameDistance(fromFrame, targetFrame, endFrame) {
@@ -705,25 +801,32 @@ export function createViewportSurface(options = {}) {
         removeMediaSource(entry.video);
     }
 
+    // Release outgoing elements parked by claimPrebufferedVideo. On a normal
+    // drain (post-commit) skip anything still referenced by an active video;
+    // force=true (teardown) releases everything.
+    function drainPendingReleases(force = false) {
+        if (!state.pendingRelease.size) return;
+        const inUse = new Set();
+        if (!force) {
+            for (const active of state.activePlaybackVideos.values()) inUse.add(active.video);
+        }
+        for (const el of Array.from(state.pendingRelease)) {
+            if (!force && inUse.has(el)) continue;
+            state.pendingRelease.delete(el);
+            removeMediaSource(el);
+        }
+    }
+
     function clearPrebufferCache() {
         for (const [key, entry] of Array.from(state.prebufferCache.entries())) {
             state.prebufferCache.delete(key);
             discardPrebufferEntry(entry);
         }
-        state.prebufferSkipLogKeys.clear();
     }
 
-    function debugPrebufferSkipOnce(eventName, key, details = {}) {
-        const targetFrame = details.targetFrame ?? "";
-        const logKey = `${state.playbackSessionId}:${eventName}:${key}:${targetFrame}`;
-        if (state.prebufferSkipLogKeys.has(logKey)) return;
-        state.prebufferSkipLogKeys.add(logKey);
-        debugPlaybackBoundary(eventName, details);
-    }
-
-    async function ensureMediaElementSource(mediaEl, sourcePath) {
+    async function ensureMediaElementSource(mediaEl, sourcePath, { forceBlob = false } = {}) {
         if (!mediaEl || !sourcePath) return null;
-        const resolvedUrl = await resolveMediaSourceUrl(sourcePath);
+        const resolvedUrl = await resolveMediaSourceUrl(sourcePath, { forceBlob });
         if (!resolvedUrl || state.destroyed) return null;
         if (mediaEl._sonderSourceUrl !== resolvedUrl) {
             mediaEl._sonderSourceUrl = resolvedUrl;
@@ -749,7 +852,7 @@ export function createViewportSurface(options = {}) {
             video.draggable = false;
             state.videoCache[cacheKey] = video;
         }
-        const loaded = await ensureMediaElementSource(video, sourcePath);
+        const loaded = await ensureMediaElementSource(video, sourcePath, { forceBlob: true });
         if (!loaded || state.destroyed) return null;
         await waitForMediaReady(video, 2, 1500);
         const sought = await seekMedia(video, targetTime, {
@@ -817,24 +920,9 @@ export function createViewportSurface(options = {}) {
         return entry.ready ? video : null;
     }
 
-    function ensurePrebufferedLayer(layer, targetFrame, currentFrame, endFrame) {
+    function ensurePrebufferedLayer(layer, targetFrame) {
         const key = prebufferKeyForLayer(layer);
         if (!key || state.activePlaybackVideos.has(layer.key)) return;
-        const leadFrames = playbackFrameDistance(currentFrame, targetFrame, endFrame);
-        const safeLeadFrames = prebufferSafeLeadFrames();
-        if (leadFrames <= safeLeadFrames) {
-            debugPrebufferSkipOnce("skip-unsafe-prebuffer", key, {
-                key,
-                layerKey: layer.key,
-                sourcePath: layer.clip?.source_path || "",
-                frame: currentFrame,
-                targetFrame,
-                leadFrames,
-                safeLeadFrames,
-                guardFrames: prebufferGuardFrames(),
-            });
-            return;
-        }
         const existing = state.prebufferCache.get(key);
         if (existing) {
             existing.layer = layer;
@@ -855,6 +943,12 @@ export function createViewportSurface(options = {}) {
             claimedByActive: false,
             promise: null,
         };
+        playbackDebugEvent("prebuffer-warm-scheduled", {
+            key,
+            layerKey: layer.key,
+            sourcePath: layer.clip.source_path,
+            targetFrame,
+        });
         entry.promise = loadPrebufferEntry(entry)
             .catch(() => null)
             .then((element) => {
@@ -871,6 +965,17 @@ export function createViewportSurface(options = {}) {
         const entry = key ? state.prebufferCache.get(key) : null;
         if (!entry?.video || entry.cancelled) return null;
         if (readyPrebufferEntryForLayerFrame(layer, frame) !== entry) {
+            playbackDebugEvent("claim-miss-discard", {
+                key,
+                layerKey: layer?.key || "",
+                sourcePath: layer?.clip?.source_path || "",
+                frame,
+                targetFrame: entry?.targetFrame,
+                ready: !!entry?.ready,
+                cancelled: !!entry?.cancelled,
+                seeking: !!entry?.video?.seeking,
+                readyState: entry?.video?.readyState || 0,
+            });
             state.prebufferCache.delete(key);
             discardPrebufferEntry(entry);
             return null;
@@ -881,9 +986,18 @@ export function createViewportSurface(options = {}) {
         entry.layer = layer;
         const existing = state.videoCache[layer.key];
         if (existing && existing !== entry.video) {
-            removeMediaSource(existing);
+            // Same-clip re-entry: the outgoing element may still be feeding the
+            // committed canvas. Defer its teardown until after the next commit.
+            state.pendingRelease.add(existing);
         }
         state.videoCache[layer.key] = entry.video;
+        playbackDebugEvent("claim-hit", {
+            key,
+            layerKey: layer.key,
+            sourcePath: layer.clip.source_path,
+            frame,
+            targetFrame: entry.targetFrame,
+        });
         return { entry, video: entry.video, key };
     }
 
@@ -900,30 +1014,74 @@ export function createViewportSurface(options = {}) {
         return loopStart + ((frame - loopEnd) % loopLength);
     }
 
-    function findUpcomingPrebufferLayers(snapshot, endFrame) {
+    // Candidate boundary frames to consider warming: upcoming clip starts (a
+    // not-yet-in-window clip first appears) UNION currently/soon-visible clip
+    // ends (an upper covering clip ending can expose a lower clip) UNION the
+    // loop-wrap frame. Per-candidate buildFrameSnapshot then applies the real
+    // visibility filter stack, so extra candidates are harmlessly filtered out.
+    function collectPrebufferCandidateFrames(currentFrame, endFrame, horizonFrames) {
+        const scene = getScene();
+        const frames = new Set();
+        const loopRange = state.playbackLoopRange;
+        const loopStart = loopRange ? Math.max(0, Math.round(Number(loopRange.start) || 0)) : 0;
+        const loopEnd = loopRange
+            ? Math.max(loopStart + 1, Math.round(Number(endFrame) || Number(loopRange.end) || loopStart + 1))
+            : 0;
+        const consider = (value) => {
+            if (value === null || value === undefined) return;
+            const f = Math.round(Number(value) || 0);
+            // When looping, only frames actually played each cycle are reachable.
+            // A clip whose start sits before loopStart re-enters mid-clip AT
+            // loopStart (covered by the explicit loop-start candidate below), so
+            // its literal start frame must not become a wrongly-targeted candidate
+            // (warming it to the pre-loop frame fails the claim at the wrap).
+            if (loopRange && (f < loopStart || f >= loopEnd)) return;
+            const dist = playbackFrameDistance(currentFrame, f, endFrame);
+            if (dist > 0 && dist <= horizonFrames) frames.add(f);
+        };
+        for (const clip of scene?.clips || []) {
+            consider(clip?.timeline_start_frame);
+            consider(clip?.timeline_end_frame);
+        }
+        if (loopRange) {
+            consider(loopStart);
+        }
+        return Array.from(frames).sort(
+            (a, b) => playbackFrameDistance(currentFrame, a, endFrame)
+                - playbackFrameDistance(currentFrame, b, endFrame),
+        );
+    }
+
+    // Returns up to PLAYBACK_PREBUFFER_BOUNDARY_DEPTH distinct boundaries' worth
+    // of novel video layers to warm, each tagged with its own target frame.
+    function findUpcomingPrebufferTargets(snapshot, endFrame) {
+        const currentFrame = Math.max(0, Math.round(Number(snapshot?.frame) || 0));
         const currentKeys = new Set(
             (snapshot?.playableClipLayers || [])
                 .filter(isRenderableVideoLayer)
                 .map(prebufferKeyForLayer)
         );
-        const startFrame = Math.max(0, Math.round(Number(snapshot?.frame) || 0) + 1);
-        const lookaheadFrames = Math.max(1, Math.round((normalizedPrebufferLookaheadMs() / 1000) * fps()));
-        if (lookaheadFrames <= prebufferSafeLeadFrames()) {
-            return { frame: playbackSearchFrame(startFrame, 0, endFrame) ?? startFrame, layers: [] };
-        }
-        for (let offset = 0; offset < lookaheadFrames; offset += 1) {
-            const frame = playbackSearchFrame(startFrame, offset, endFrame);
-            if (frame === null) break;
+        const horizonFrames = Math.max(1, Math.round((normalizedPrebufferLookaheadMs() / 1000) * fps()));
+        const candidateFrames = collectPrebufferCandidateFrames(currentFrame, endFrame, horizonFrames);
+        const targets = [];
+        const seenKeys = new Set();
+        let boundariesCovered = 0;
+        for (const frame of candidateFrames) {
+            if (boundariesCovered >= PLAYBACK_PREBUFFER_BOUNDARY_DEPTH) break;
             const futureSnapshot = buildFrameSnapshot(frame);
-            const candidates = futureSnapshot.playableClipLayers
-                .filter(isRenderableVideoLayer)
-                .filter((layer) => !currentKeys.has(prebufferKeyForLayer(layer)))
-                .filter((layer) => !state.activePlaybackVideos.has(layer.key));
-            if (candidates.length) {
-                return { frame, layers: candidates };
+            let novelOnThisBoundary = false;
+            for (const layer of futureSnapshot.playableClipLayers) {
+                if (!isRenderableVideoLayer(layer)) continue;
+                const key = prebufferKeyForLayer(layer);
+                if (!key || currentKeys.has(key) || seenKeys.has(key)) continue;
+                if (state.activePlaybackVideos.has(layer.key)) continue;
+                seenKeys.add(key);
+                targets.push({ layer, targetFrame: frame });
+                novelOnThisBoundary = true;
             }
+            if (novelOnThisBoundary) boundariesCovered += 1;
         }
-        return { frame: playbackSearchFrame(startFrame, 0, endFrame) ?? startFrame, layers: [] };
+        return targets;
     }
 
     function schedulePlaybackPrebuffer(snapshot) {
@@ -938,27 +1096,15 @@ export function createViewportSurface(options = {}) {
             clearPrebufferCache();
             return;
         }
-        const upcoming = findUpcomingPrebufferLayers(snapshot, playbackEndFrame);
-        const safeLeadFrames = prebufferSafeLeadFrames();
-        for (const [key, entry] of Array.from(state.prebufferCache.entries())) {
-            const leadFrames = playbackFrameDistance(snapshot?.frame || 0, entry?.targetFrame, playbackEndFrame);
-            if (entry?.ready || leadFrames > safeLeadFrames) continue;
-            state.prebufferCache.delete(key);
-            discardPrebufferEntry(entry);
-            debugPlaybackBoundary("cancel-unsafe-prebuffer", {
-                key,
-                layerKey: entry?.layerKey || "",
-                sourcePath: entry?.sourcePath || "",
-                frame: snapshot?.frame || 0,
-                targetFrame: entry?.targetFrame,
-                leadFrames,
-                safeLeadFrames,
-                guardFrames: prebufferGuardFrames(),
-            });
+        let targets = findUpcomingPrebufferTargets(snapshot, playbackEndFrame);
+        // Memory budget: keep only the nearest warmed elements. Claimed entries
+        // are no longer in prebufferCache, so this bounds RAM/VRAM by count.
+        if (targets.length > PLAYBACK_PREBUFFER_MAX_ENTRIES) {
+            targets = targets.slice(0, PLAYBACK_PREBUFFER_MAX_ENTRIES);
         }
         const desiredKeys = new Set([
             ...(snapshot?.playableClipLayers || []).map(prebufferKeyForLayer).filter(Boolean),
-            ...upcoming.layers.map(prebufferKeyForLayer).filter(Boolean),
+            ...targets.map(({ layer }) => prebufferKeyForLayer(layer)).filter(Boolean),
         ]);
         for (const [key, entry] of Array.from(state.prebufferCache.entries())) {
             if (desiredKeys.has(key)) continue;
@@ -969,8 +1115,8 @@ export function createViewportSurface(options = {}) {
             state.prebufferCache.delete(key);
             discardPrebufferEntry(entry);
         }
-        for (const layer of upcoming.layers) {
-            ensurePrebufferedLayer(layer, upcoming.frame, snapshot?.frame || 0, playbackEndFrame);
+        for (const { layer, targetFrame } of targets) {
+            ensurePrebufferedLayer(layer, targetFrame);
         }
     }
 
@@ -1195,6 +1341,14 @@ export function createViewportSurface(options = {}) {
         active.readyForDraw = false;
         active.playbackSessionId = sessionId;
 
+        playbackDecisionDebugEvent("prepare-start", {
+            layerKey: layer.key,
+            sourcePath,
+            frame,
+            expectedTime,
+            firstDrawComplete: !!active.firstDrawComplete,
+            playbackSessionId: sessionId,
+        }, [layer.key, sourcePath, active.firstDrawComplete ? "warm" : "first"]);
         active.pendingPrepare = ensureMediaElementSource(active.video, sourcePath)
             .then((element) => waitForMediaReady(element, 2))
             .then((element) => seekMedia(element, expectedTime, {
@@ -1222,10 +1376,29 @@ export function createViewportSurface(options = {}) {
                 active.pendingPrepare = null;
                 active.readyForDraw = !!element && playbackVideoAtFrame(active, layer, frame, targetTolerance);
                 if (active.readyForDraw) {
+                    playbackDecisionDebugEvent("prepare-ready", {
+                        layerKey: layer.key,
+                        sourcePath,
+                        frame,
+                        expectedTime,
+                        currentTime: Number(active.video?.currentTime) || 0,
+                        readyState: active.video?.readyState || 0,
+                        playbackSessionId: sessionId,
+                    }, [layer.key, sourcePath]);
                     syncPreparedVideoPlayback(active, layer, frame);
                     renderFrame();
                     return active.video;
                 }
+                playbackDecisionDebugEvent("prepare-timeout-null", {
+                    layerKey: layer.key,
+                    sourcePath,
+                    frame,
+                    expectedTime,
+                    currentTime: Number(active.video?.currentTime) || 0,
+                    readyState: active.video?.readyState || 0,
+                    seeking: !!active.video?.seeking,
+                    playbackSessionId: sessionId,
+                }, [layer.key, sourcePath, active.firstDrawComplete ? "warm" : "first"]);
                 return null;
             })
             .catch(() => {
@@ -1416,6 +1589,22 @@ export function createViewportSurface(options = {}) {
         return { blocked: false, renderables, skippedLayers };
     }
 
+    function hasCurrentLayerPrepareInFlight(snapshot) {
+        const currentPrebufferKeys = new Set(
+            (snapshot?.playableClipLayers || [])
+                .filter(isRenderableVideoLayer)
+                .map(prebufferKeyForLayer)
+        );
+        for (const active of state.activePlaybackVideos.values()) {
+            if (active?.pendingPrepare) return true;
+        }
+        for (const key of currentPrebufferKeys) {
+            const entry = state.prebufferCache.get(key);
+            if (entry && !entry.ready && !entry.cancelled) return true;
+        }
+        return false;
+    }
+
     function commitPlaybackBlocked(snapshot, details, options = {}) {
         const now = performance.now();
         const signature = playbackLayerSignature(snapshot);
@@ -1429,8 +1618,19 @@ export function createViewportSurface(options = {}) {
 
         if (options.suppressFallback && canHoldCanvas) {
             const blockedForMs = state.playbackBlockedSinceMs !== null ? now - state.playbackBlockedSinceMs : 0;
-            debugPlaybackBoundary("hold-previous-composite", { ...details, blockedForMs, suppressedFallback: true });
-            return false;
+            // Tail-frame suppressFallback only fires when the next video is already
+            // ready/covered, so it can hold longer than the generic failure ladder.
+            if (blockedForMs < PLAYBACK_TAIL_HOLD_MAX_MS) {
+                debugPlaybackBoundary("hold-previous-composite", { ...details, blockedForMs, suppressedFallback: true });
+                return false;
+            }
+            playbackDecisionDebugEvent("tail-hold-expired", { ...details, blockedForMs }, [
+                signature,
+                details?.reason,
+                details?.layerKey,
+                details?.sourcePath,
+                details?.prebufferKey,
+            ]);
         }
 
         if (canHoldCanvas && state.playbackBlockedSinceMs !== null) {
@@ -1441,9 +1641,26 @@ export function createViewportSurface(options = {}) {
             }
         }
 
+        if (canHoldCanvas && hasCurrentLayerPrepareInFlight(snapshot)) {
+            playbackDecisionDebugEvent("hold-inflight-prepare", { ...details }, [
+                signature,
+                details?.reason,
+                details?.layerKey,
+                details?.sourcePath,
+                details?.prebufferKey,
+            ]);
+            return false;
+        }
+
         drawViewportText("Loading preview...", "");
         resetPlaybackCompositeState();
-        debugPlaybackBoundary("commit-loading-fallback", details);
+        playbackDecisionDebugEvent("commit-loading-fallback", details, [
+            signature,
+            details?.reason,
+            details?.layerKey,
+            details?.sourcePath,
+            details?.prebufferKey,
+        ]);
         return false;
     }
 
@@ -1535,6 +1752,7 @@ export function createViewportSurface(options = {}) {
             state.activePlaybackVideos.delete(key);
         }
 
+        const canPlayAudioNow = audioPlaybackAllowed(snapshot);
         const desiredAudioKeys = new Set();
         for (const layer of snapshot.audioLayers) {
             desiredAudioKeys.add(layer.key);
@@ -1542,13 +1760,19 @@ export function createViewportSurface(options = {}) {
                 const audio = getOrCreateAudio(layer);
                 if (!audio) continue;
                 state.activePlaybackAudios.set(layer.key, { layer, audio });
-                ensureMediaElementSource(audio, layer.track.source_path)
+                // Audio stays blob-loaded regardless of streamingMode: audio
+                // files are small, and whole-file blob avoids network under-buffer
+                // stalls and drift that direct streaming introduces (matches the
+                // gallery's video-only-direct policy).
+                ensureMediaElementSource(audio, layer.track.source_path, { forceBlob: true })
                     .then((element) => waitForMediaReady(element, 1))
                     .then((element) => {
                         if (!element || !state.isPlaying) return;
                         element.currentTime = audioSourceTime(layer, snapshot.frame);
                         element.volume = clamp(Number(layer.track.volume ?? 1), 0, 1);
-                        element.play().catch(() => {});
+                        if (audioPlaybackAllowed(snapshot)) {
+                            element.play().catch(() => {});
+                        }
                     })
                     .catch(() => {});
                 continue;
@@ -1560,7 +1784,7 @@ export function createViewportSurface(options = {}) {
             if (Math.abs((Number(active.audio.currentTime) || 0) - expectedTime) > 0.35) {
                 active.audio.currentTime = expectedTime;
             }
-            if (active.audio.paused) {
+            if (canPlayAudioNow && active.audio.paused) {
                 active.audio.play().catch(() => {});
             }
         }
@@ -1601,7 +1825,12 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedFrame = snapshot.frame;
         state.playbackLastCommittedSignature = playbackLayerSignature(snapshot);
         state.playbackLastCommittedSessionId = state.playbackSessionId;
+        clearPlaybackDecisionLogs();
+        releaseAudioForSession("first-composite-commit", { frame: snapshot.frame });
         clearFirstCommitHold();
+        // The new frame is committed; outgoing elements parked at claim time are
+        // no longer on screen and can be torn down.
+        drainPendingReleases();
         debugPlaybackBoundary("commit-playback-composite", {
             frame: snapshot.frame,
             drewAny,
@@ -1685,7 +1914,13 @@ export function createViewportSurface(options = {}) {
         const blockedForMs = timestamp - startedAt;
         if (blockedForMs > PLAYBACK_FIRST_COMMIT_HOLD_MS) {
             state.playbackFirstCommitHoldExpired = true;
-            debugPlaybackBoundary("release-first-commit-clock", {
+            releaseAudioForSession("first-commit-hold-expired", {
+                frame: holdFrame,
+                nextFrame,
+                endFrame,
+                blockedForMs,
+            });
+            playbackDebugEvent("release-first-commit-clock", {
                 frame: holdFrame,
                 nextFrame,
                 endFrame,
@@ -1717,6 +1952,7 @@ export function createViewportSurface(options = {}) {
         if (!state.playbackLoopRange) return;
         const hadCommittedFrame = state.playbackCompositeCommitted;
         state.playbackSessionId += 1;
+        clearPlaybackDecisionLogs();
         resetPlaybackCompositeState();
         const nextFrame = applyFrame(state.playbackLoopRange.start, { reason: "playback-loop" });
         state.playbackStartTime = timestamp;
@@ -1767,6 +2003,7 @@ export function createViewportSurface(options = {}) {
             active.audio.pause();
         }
         state.activePlaybackAudios.clear();
+        drainPendingReleases(true);
     }
 
     function stopPlayback({ preservePlayhead = false } = {}) {
@@ -1806,7 +2043,9 @@ export function createViewportSurface(options = {}) {
         state.playbackLoopRange = loopRange;
         state.playbackSessionId += 1;
         invalidateAsyncPreviewRenders();
+        clearPlaybackDecisionLogs();
         resetPlaybackCompositeState();
+        resetAudioReleaseLatch();
         beginFirstCommitHold(state.playbackStartTime, startFrame);
         updatePlaybackState(true);
         const snapshot = buildFrameSnapshot(startFrame);

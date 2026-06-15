@@ -23,6 +23,14 @@ if (typeof window !== "undefined" && !window.SONDER_DEBUG_SESSION) {
     } catch (_) {}
 }
 
+if (typeof window !== "undefined" && !window.SONDER_DEBUG_PLAYBACK_BOUNDARY) {
+    try {
+        if (window.localStorage?.getItem?.("SONDER_DEBUG_PLAYBACK_BOUNDARY") === "1") {
+            window.SONDER_DEBUG_PLAYBACK_BOUNDARY = true;
+        }
+    } catch (_) {}
+}
+
 let _sessionDiagInitialized = false;
 let _sessionDiagLoadMarkerSeq = 0;
 let _sessionDiagInFlightMarkerId = "";
@@ -3950,6 +3958,8 @@ export class EditorWidget {
         const prevRenderCacheLimit = this._renderCacheEntryLimit(this._settings);
         const nextRenderCacheLimit = this._renderCacheEntryLimit(nextSettings);
         const prevTimecodeMode = this._timecodeMode;
+        const prevStreamingMode = this._settings?.playback?.streamingMode ?? "auto";
+        const nextStreamingMode = nextSettings?.playback?.streamingMode ?? "auto";
         const prevLaneTintSignature = JSON.stringify(this._settings?.appearance?.laneTintOverrides || {});
         const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
         this._settings = nextSettings;
@@ -4005,6 +4015,9 @@ export class EditorWidget {
         }
         if (prevRenderCacheLimit !== nextRenderCacheLimit) {
             this._sweepRenderCache();
+        }
+        if (prevStreamingMode !== nextStreamingMode && !this.isPlaying) {
+            this._clearVideoCache();
         }
         if (prevTimecodeMode !== this._timecodeMode && this._itemEditorEl && this.selectedItem) {
             this._showItemEditor();
@@ -11483,6 +11496,7 @@ export class EditorWidget {
             shouldReturnToPlaybackStart: () => !!this._settings?.playback?.returnToPlaybackStart,
             isPrebufferEnabled: () => !!this._settings?.playback?.prebufferEnabled,
             getPrebufferLookaheadMs: () => this._settings?.playback?.prebufferLookaheadMs ?? 1000,
+            getStreamingMode: () => this._settings?.playback?.streamingMode ?? "auto",
             onFrameChange: (frame, meta = {}) => {
                 this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
                 if (meta.reason === "playback" || meta.reason === "playback-loop" || meta.reason === "playback-stop-return") {
@@ -11734,9 +11748,11 @@ export class EditorWidget {
         const url = this._buildViewURL(sourcePath);
         if (!url) return null;
 
-        // Create video element — load as blob for proper seeking support
-        // (ComfyUI's /view endpoint doesn't support HTTP Range requests,
-        //  so browser can't seek streaming video. Blob URLs fix this.)
+        // Legacy fallback path (only runs when viewport-surface creation
+        // failed). Kept on blob loading deliberately: /view DOES honor HTTP
+        // Range (verified ComfyUI 0.20.1) and the surface streams directly per
+        // playback.streamingMode, but this path is not worth the regression
+        // surface — see plans/in-this-session-we-twinkly-barto.md Phase 0.
         const video = document.createElement("video");
         video.preload = "auto";
         video.muted = true;
@@ -11773,7 +11789,7 @@ export class EditorWidget {
         const url = this._buildViewURL(sourcePath);
         if (!url) return null;
 
-        // Load audio as blob for proper seeking support
+        // Legacy fallback path — blob kept deliberately (see _getOrCreateVideo).
         const audio = document.createElement("audio");
         audio.preload = "auto";
 

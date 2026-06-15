@@ -31,6 +31,24 @@ export const PLAYBACK_RESOLUTION_OPTIONS = [
     { value: "quarter", label: "Quarter" },
 ];
 
+export const DIRECT_STREAMING_MODE_EXPERT_FLAG = "SONDER_EXPERT_DIRECT_STREAMING";
+export const DIRECT_STREAMING_MODE_VISIBLE = false;
+
+const INTERNAL_STREAMING_MODE_OPTIONS = [
+    { value: "auto", label: "Auto (recommended)" },
+    { value: "direct", label: "Direct streaming (expert)" },
+    { value: "blob", label: "Full download (blob)" },
+];
+
+export function isDirectStreamingModeEnabled() {
+    if (DIRECT_STREAMING_MODE_VISIBLE) return true;
+    return safeStorageGet(DIRECT_STREAMING_MODE_EXPERT_FLAG) === "1";
+}
+
+export const STREAMING_MODE_OPTIONS = INTERNAL_STREAMING_MODE_OPTIONS.filter(
+    (entry) => entry.value !== "direct" || isDirectStreamingModeEnabled()
+);
+
 export const CLIP_LABEL_MODE_OPTIONS = [
     { value: "name_duration", label: "Name + Duration" },
     { value: "name_only", label: "Name Only" },
@@ -167,6 +185,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         resolution: "full",
         prebufferEnabled: true,
         prebufferLookaheadMs: 5000,
+        streamingMode: "auto",
     },
     notifications: {
         toastDurationMs: 4000,
@@ -249,6 +268,7 @@ const VALID_SORT_MODES = new Set(GALLERY_SORT_OPTIONS.map((entry) => entry.value
 const VALID_THUMBNAIL_SIZES = new Set(GALLERY_THUMBNAIL_SIZE_OPTIONS.map((entry) => entry.value));
 const VALID_GALLERY_TABS = new Set(GALLERY_TAB_OPTIONS.map((entry) => entry.value));
 const VALID_PLAYBACK_RESOLUTIONS = new Set(PLAYBACK_RESOLUTION_OPTIONS.map((entry) => entry.value));
+const VALID_STREAMING_MODES = new Set(INTERNAL_STREAMING_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_SAVE_PRESETS = new Set(SAVE_PRESET_OPTIONS.map((entry) => entry.value));
@@ -653,6 +673,12 @@ function normalizeEditorSettings(source = null) {
         ...BUILTIN_MODEL_TEMPLATE_IDS,
         ...customTemplates.map((template) => template.id),
     ]);
+    const storedStreamingMode = stored?.playback?.streamingMode;
+    const streamingMode = VALID_STREAMING_MODES.has(storedStreamingMode)
+        ? (storedStreamingMode === "direct" && !isDirectStreamingModeEnabled()
+            ? defaults.playback.streamingMode
+            : storedStreamingMode)
+        : defaults.playback.streamingMode;
     return {
         version: SETTINGS_VERSION,
         meta: {
@@ -766,6 +792,7 @@ function normalizeEditorSettings(source = null) {
                 defaults.playback.prebufferLookaheadMs,
                 true,
             ),
+            streamingMode,
         },
         notifications: {
             toastDurationMs: clampNumber(

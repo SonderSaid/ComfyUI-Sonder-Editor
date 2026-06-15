@@ -932,15 +932,15 @@ function showSettingsPanel() {
         playbackSection,
         "prebufferEnabled",
         "Prebuffer Upcoming Clips",
-        "Warm the next viewport video before playback reaches the clip boundary.",
+        "Warm the next couple of clip boundaries ahead so playback crosses them without stalling.",
         () => this._settings.playback.prebufferEnabled,
         (checked) => updateCategory("playback", "prebufferEnabled", checked)
     );
     createNumberInput(
         playbackSection,
         "prebufferLookaheadMs",
-        "Prebuffer Lookahead",
-        "Milliseconds ahead of playback to preroll the next viewport video.",
+        "Prebuffer Horizon",
+        "How far ahead (ms) to look for upcoming clip boundaries to warm. Higher reaches farther boundaries on long clips; short clips are unaffected.",
         {
             min: 100,
             max: 5000,
