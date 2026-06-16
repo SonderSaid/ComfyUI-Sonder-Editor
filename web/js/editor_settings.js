@@ -201,6 +201,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
             audio: "",
             motion_driver: "",
         },
+        editorMargins: { top: 8, bottom: 8, sides: 8 }, // px; `sides` = left & right
     },
     batchRender: {
         maxFramesPerChunk: 0,
@@ -852,6 +853,11 @@ function normalizeEditorSettings(source = null) {
                 ? defaults.appearance.sceneOutline
                 : !!stored.appearance.sceneOutline,
             laneTintOverrides: normalizeLaneTintOverrides(stored?.appearance?.laneTintOverrides),
+            editorMargins: {
+                top: clampNumber(stored?.appearance?.editorMargins?.top, 0, 64, defaults.appearance.editorMargins.top, true),
+                bottom: clampNumber(stored?.appearance?.editorMargins?.bottom, 0, 64, defaults.appearance.editorMargins.bottom, true),
+                sides: clampNumber(stored?.appearance?.editorMargins?.sides, 0, 64, defaults.appearance.editorMargins.sides, true),
+            },
         },
         batchRender: {
             maxFramesPerChunk: clampNumber(

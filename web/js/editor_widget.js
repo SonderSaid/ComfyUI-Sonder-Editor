@@ -3992,6 +3992,9 @@ export class EditorWidget {
         const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
         const prevSceneOutline = this._settings?.appearance?.sceneOutline !== false;
         const nextSceneOutline = nextSettings?.appearance?.sceneOutline !== false;
+        const prevMarginSignature = JSON.stringify(this._settings?.appearance?.editorMargins || {});
+        const nextMarginSignature = JSON.stringify(nextSettings?.appearance?.editorMargins || {});
+        const marginsChanged = prevMarginSignature !== nextMarginSignature;
         this._settings = nextSettings;
         this._syncTakePlacementModeWidget(nextSettings);
         const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
@@ -4059,6 +4062,9 @@ export class EditorWidget {
         if (this._sceneBar) {
             this._applyScales();
         }
+        if (marginsChanged) {
+            this._applyEditorMargins(nextSettings);
+        }
         if (this.isFullscreen) {
             if (this._fsSidebar && nextSettings.layout.fullscreenSidebarWidth > 0) {
                 const sidebarMax = this._computeFullscreenSidebarMaxWidth();
@@ -4069,6 +4075,9 @@ export class EditorWidget {
                 this._fsBottomRow.style.height = `${Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.min(timelineMax, nextSettings.layout.fullscreenTimelineHeight))}px`;
             }
             this._recalcFullscreenHeights();
+            if (marginsChanged) {
+                this._renderTimeline();
+            }
             requestAnimationFrame(() => {
                 if (this._destroyed || !this.isFullscreen) return;
                 this._resizeViewportCanvas();
@@ -4230,11 +4239,15 @@ export class EditorWidget {
     }
 
     _computeFullscreenSidebarMaxWidth() {
-        return Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.floor(window.innerWidth * 0.5));
+        const m = this._settings?.appearance?.editorMargins || { sides: 0 };
+        const avail = Math.max(0, window.innerWidth - (m.sides || 0) * 2);
+        return Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.floor(avail * 0.5));
     }
 
     _computeFullscreenTimelineMaxHeight() {
-        return Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.floor(window.innerHeight * 0.8));
+        const m = this._settings?.appearance?.editorMargins || { top: 0, bottom: 0 };
+        const avail = Math.max(0, window.innerHeight - (m.top || 0) - (m.bottom || 0));
+        return Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.floor(avail * 0.8));
     }
 
     _defaultFullscreenTimelineHeight() {
@@ -7498,7 +7511,7 @@ export class EditorWidget {
 
         const editor = document.createElement("div");
         editor.style.cssText = `
-            display: flex; gap: 6px; padding: 4px 6px;
+            display: flex; gap: 6px; padding: 4px 6px; box-sizing: border-box;
             background: ${COLORS.panel}; border-top: 1px solid ${editorAccent};
             align-items: center; flex-wrap: wrap;
         `;
@@ -9407,6 +9420,7 @@ export class EditorWidget {
                 ["X", "Clear selection"],
                 ["Drag empty timeline", "Select items in area"],
                 ["Drag lane header", "Select lanes in area"],
+                ["Click linked item", "Select the whole linked group"],
             ]) +
             this._shortcutSection("Tools", [
                 ["C", "Toggle razor / cut mode"],
@@ -9417,6 +9431,7 @@ export class EditorWidget {
                 ["Shift+F", "Zoom to selection"],
             ]) +
             this._shortcutSection("Edit", [
+                ["Double-click item", "Open inline editor (isolates a linked member)"],
                 ["Del / Backspace", "Delete selected items"],
                 ["Ctrl+Z", "Undo"],
                 ["Ctrl+Y", "Redo"],
@@ -9670,6 +9685,19 @@ export class EditorWidget {
         overlay.append(toolbar, this._fsContent);
         document.body.appendChild(overlay);
         this._fullscreenOverlay = overlay;
+        this._applyEditorMargins();
+    }
+
+    // Browser-local editor margins (appearance.editorMargins): inset the whole
+    // fullscreen / mounted-tab shell from the screen edges. The overlay is
+    // `inset: 0`, so padding keeps the border-box pinned to the viewport while
+    // insetting the toolbar + content; the band shows COLORS.bg. Shared by both
+    // surfaces because the tab reuses this same overlay.
+    _applyEditorMargins(settings = this._settings) {
+        if (!this._fullscreenOverlay) return;
+        const m = settings?.appearance?.editorMargins || { top: 0, bottom: 0, sides: 0 };
+        this._fullscreenOverlay.style.boxSizing = "border-box";
+        this._fullscreenOverlay.style.padding = `${m.top}px ${m.sides}px ${m.bottom}px ${m.sides}px`;
     }
 
     _setupResizeHandle(handle, target, prop, min, max, invert = false, persistKey = "") {
@@ -9731,12 +9759,19 @@ export class EditorWidget {
 
         // In three-panel layout, timeline height is based on the bottom row height
         const bottomH = this._fsBottomRow ? parseInt(getComputedStyle(this._fsBottomRow).height) || 280 : 280;
-        const st = this._scaleToolbar;
-        const sceneBarH = SCENE_BAR_HEIGHT * st;
-        const toolbarH = 24 * st;
-        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * st;
-        // Timeline height — canvas renders at 1:1 now (individual elements scale themselves)
-        this._timelineHeight = Math.max(100, bottomH - sceneBarH - toolbarH - editorsH);
+        // Derive the timeline canvas height from the container's content box: measure
+        // every non-canvas child (scene bar, toolbar, inline editor bars) and subtract
+        // the container's real vertical padding. Trusting hardcoded scene-bar/toolbar/
+        // editor heights left the container's vertical padding unaccounted, so the
+        // bottom-most child (an inline editor bar) was shaved by overflow:hidden.
+        const cs = getComputedStyle(this.container);
+        const vpad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+        let nonCanvasH = 0;
+        for (const child of this.container.children) {
+            if (child === this.timelineCanvas) continue;
+            nonCanvasH += child.offsetHeight || 0;
+        }
+        this._timelineHeight = Math.max(100, bottomH - vpad - nonCanvasH);
         this._clampScrollY();
         // Gallery is in the sidebar now, doesn't need height calc
         this._galleryHeight = GALLERY_HEIGHT; // Not used in fullscreen layout
@@ -12531,8 +12566,13 @@ export class EditorWidget {
         const sg = this._scaleGallery;
         const barsH = (SCENE_BAR_HEIGHT + 24) * st; // scene bar + toolbar
         const timelineH = this._timelineHeight;
-        const editorsH = ((this._promptEditorEl ? 30 : 0) + (this._itemEditorEl ? 30 : 0)) * st;
-        return barsH + timelineH + (this._galleryHeight * sg) + editorsH;
+        const editorsH = (this._promptEditorEl ? (this._promptEditorEl.offsetHeight || 30) : 0)
+            + (this._itemEditorEl ? (this._itemEditorEl.offsetHeight || 30) : 0);
+        // Account for the container's vertical padding so the bottom-most inline
+        // editor bar isn't clipped when the editor renders as a node DOM widget.
+        const ccs = this.container ? getComputedStyle(this.container) : null;
+        const containerVPad = ccs ? (parseFloat(ccs.paddingTop) || 0) + (parseFloat(ccs.paddingBottom) || 0) : 8;
+        return barsH + timelineH + (this._galleryHeight * sg) + editorsH + containerVPad;
     }
 
     // ── File Import (drag-and-drop files from OS onto node) ────────────

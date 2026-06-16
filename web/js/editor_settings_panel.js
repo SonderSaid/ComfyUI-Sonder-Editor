@@ -197,6 +197,9 @@ function syncSettingsPanelControls() {
             tintInput.dataset.active = stored ? "1" : "0";
         }
     }
+    if (controls.editorMarginTop) controls.editorMarginTop.value = String(this._settings.appearance.editorMargins?.top ?? 0);
+    if (controls.editorMarginBottom) controls.editorMarginBottom.value = String(this._settings.appearance.editorMargins?.bottom ?? 0);
+    if (controls.editorMarginSides) controls.editorMarginSides.value = String(this._settings.appearance.editorMargins?.sides ?? 0);
     if (controls.takePlacementMode) controls.takePlacementMode.value = this._settings.render?.takePlacementMode ?? "trimmed";
     if (controls.linkedTakePlacement) controls.linkedTakePlacement.checked = this._settings.render?.linkedTakePlacement !== false;
     if (controls.takePlacementMuted) controls.takePlacementMuted.checked = !!this._settings.render?.takePlacementMuted;
@@ -1276,6 +1279,46 @@ function showSettingsPanel() {
         row.append(input, resetBtn);
         controls[`laneTintOverride_${spec.key}`] = input;
     }
+
+    createNumberInput(
+        appearanceSection,
+        "editorMarginTop",
+        "Editor Margin — Top",
+        "Inset the fullscreen / mounted-tab editor from the screen edges (px), so controls aren't jammed against the border.",
+        {
+            min: 0,
+            max: 64,
+            step: 1,
+            getter: () => this._settings.appearance.editorMargins?.top ?? 0,
+            onChange: (value) => updateCategory("appearance", "editorMargins", { ...(this._settings.appearance.editorMargins || {}), top: value }),
+        }
+    );
+    createNumberInput(
+        appearanceSection,
+        "editorMarginBottom",
+        "Editor Margin — Bottom",
+        "Bottom inset for the fullscreen / mounted-tab editor (px).",
+        {
+            min: 0,
+            max: 64,
+            step: 1,
+            getter: () => this._settings.appearance.editorMargins?.bottom ?? 0,
+            onChange: (value) => updateCategory("appearance", "editorMargins", { ...(this._settings.appearance.editorMargins || {}), bottom: value }),
+        }
+    );
+    createNumberInput(
+        appearanceSection,
+        "editorMarginSides",
+        "Editor Margin — Sides",
+        "Left & right inset for the fullscreen / mounted-tab editor (px).",
+        {
+            min: 0,
+            max: 64,
+            step: 1,
+            getter: () => this._settings.appearance.editorMargins?.sides ?? 0,
+            onChange: (value) => updateCategory("appearance", "editorMargins", { ...(this._settings.appearance.editorMargins || {}), sides: value }),
+        }
+    );
 
     const projectDefaultsSection = createSection(
         "Project Defaults",
