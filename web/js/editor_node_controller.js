@@ -21,6 +21,7 @@ import {
 import { connectProjectSync } from "./cross_tab_sync.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
+import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import {
     mountSharedRenderQueue,
     persistQueueBatchCollapseState,
@@ -1511,7 +1512,7 @@ export class EditorNodeController {
                 load: async (controller, signal) => await controller._loadDormantAssets(signal),
                 mount: (container, data, controller) => controller._mountAssetsModule(container, data),
                 collapseCleanup: () => {},
-                invalidate: (keys) => keys.some(key => key === "project" || key === "assets"),
+                invalidate: (keys) => keys.some(key => key === "project" || key === "assets" || key === "scene"),
             },
             preview: {
                 id: "preview",
@@ -2984,10 +2985,23 @@ export class EditorNodeController {
     }
 
     async _loadDormantAssets(signal) {
-        const payload = await fetchJson(buildDormantAssetsUrl(this.state.projectDir), signal);
-        return Array.isArray(payload)
+        const sceneId = this.state.sceneId || "";
+        const assetsPromise = fetchJson(buildDormantAssetsUrl(this.state.projectDir), signal);
+        const scenePromise = sceneId
+            ? fetchJson(buildSceneUrl(this.state.projectDir, sceneId), signal).catch((error) => {
+                if (error?.name === "AbortError") throw error;
+                console.warn("[Sonder] Failed to load scene for asset gallery scope:", error);
+                return null;
+            })
+            : Promise.resolve(null);
+        const [payload, scene] = await Promise.all([assetsPromise, scenePromise]);
+        const normalized = Array.isArray(payload)
             ? { assets: payload, folders: [] }
             : { assets: payload.assets || [], folders: payload.folders || [] };
+        return {
+            ...normalized,
+            currentSceneAssetIds: deriveCurrentSceneAssetIds(scene, normalized.assets),
+        };
     }
 
     async _loadQueueModule(signal) {

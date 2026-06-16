@@ -25,6 +25,17 @@ export const GALLERY_TAB_OPTIONS = [
     { value: "artifact", label: "Artifacts" },
 ];
 
+export const GALLERY_SCOPE_OPTIONS = [
+    { value: "all", label: "All" },
+    { value: "favorites", label: "Favorites" },
+    { value: "current_scene", label: "Current Scene" },
+];
+
+export const GALLERY_VIEW_OPTIONS = [
+    { value: "folders", label: "Folders" },
+    { value: "flat", label: "Flat" },
+];
+
 export const PLAYBACK_RESOLUTION_OPTIONS = [
     { value: "full", label: "Full" },
     { value: "half", label: "Half" },
@@ -255,6 +266,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
     gallery: {
         sortMode: "newest",
         activeTab: "all",
+        scopeMode: "all",
+        viewMode: "folders",
         inspectorCollapsed: false,
         thumbnailSize: "medium",
         artifactInspectorExpanded: false,
@@ -271,6 +284,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
 const VALID_SORT_MODES = new Set(GALLERY_SORT_OPTIONS.map((entry) => entry.value));
 const VALID_THUMBNAIL_SIZES = new Set(GALLERY_THUMBNAIL_SIZE_OPTIONS.map((entry) => entry.value));
 const VALID_GALLERY_TABS = new Set(GALLERY_TAB_OPTIONS.map((entry) => entry.value));
+const VALID_GALLERY_SCOPES = new Set(GALLERY_SCOPE_OPTIONS.map((entry) => entry.value));
+const VALID_GALLERY_VIEWS = new Set(GALLERY_VIEW_OPTIONS.map((entry) => entry.value));
 const VALID_PLAYBACK_RESOLUTIONS = new Set(PLAYBACK_RESOLUTION_OPTIONS.map((entry) => entry.value));
 const VALID_STREAMING_MODES = new Set(INTERNAL_STREAMING_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => entry.value));
@@ -971,6 +986,12 @@ function normalizeEditorSettings(source = null) {
             activeTab: VALID_GALLERY_TABS.has(stored?.gallery?.activeTab)
                 ? stored.gallery.activeTab
                 : defaults.gallery.activeTab,
+            scopeMode: VALID_GALLERY_SCOPES.has(stored?.gallery?.scopeMode)
+                ? stored.gallery.scopeMode
+                : defaults.gallery.scopeMode,
+            viewMode: VALID_GALLERY_VIEWS.has(stored?.gallery?.viewMode)
+                ? stored.gallery.viewMode
+                : defaults.gallery.viewMode,
             inspectorCollapsed: stored?.gallery?.inspectorCollapsed == null
                 ? defaults.gallery.inspectorCollapsed
                 : !!stored.gallery.inspectorCollapsed,

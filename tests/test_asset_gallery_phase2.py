@@ -668,6 +668,51 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     assert payload["params"]["snapshot_version"] == 1
 
 
+def test_update_asset_route_accepts_favorite_without_disturbing_name_folder(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    asset = Asset(
+        asset_id="asset-1",
+        name="Clip",
+        asset_type="video",
+        path="media/clip.mp4",
+        folder="Shots",
+    )
+    project.assets = [asset]
+    project.metadata["asset_folders"] = ["Shots"]
+    save_calls = []
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: save_calls.append(project))
+
+    request = DummyRequest(
+        match_info={"project_id": "phase-2", "asset_id": "asset-1"},
+        body={"favorite": True},
+    )
+    response = asyncio.run(module.api_update_asset(request))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert asset.favorite is True
+    assert asset.name == "Clip"
+    assert asset.folder == "Shots"
+    assert payload["favorite"] is True
+    assert save_calls == [project]
+
+    request = DummyRequest(
+        match_info={"project_id": "phase-2", "asset_id": "asset-1"},
+        body={"favorite": False},
+    )
+    response = asyncio.run(module.api_update_asset(request))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert asset.favorite is False
+    assert asset.name == "Clip"
+    assert asset.folder == "Shots"
+    assert payload["favorite"] is False
+
+
 def test_delete_asset_route_soft_deletes_in_use_asset(tmp_path, monkeypatch):
     module = _load_route_module(monkeypatch)
     project = _make_project(tmp_path)

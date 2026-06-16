@@ -64,6 +64,7 @@ class Asset:
     media_probe_signature: str = ""          # file size + mtime marker for cached probes
     imported_at: str = field(default_factory=lambda: datetime.now().isoformat())
     folder: str = ""                            # organizational folder (e.g., "Takes/Scene 1")
+    favorite: bool = False                  # user-pinned in the asset gallery
     trashed_at: str = ""                    # ISO timestamp when moved to trash
     trash_previous_folder: str = ""         # folder before trashing, used for restore
 
@@ -88,6 +89,7 @@ class Asset:
             "media_probe_signature": self.media_probe_signature,
             "imported_at": self.imported_at,
             "folder": self.folder,
+            "favorite": bool(self.favorite),
             "trashed_at": self.trashed_at,
             "trash_previous_folder": self.trash_previous_folder,
         }
@@ -114,6 +116,7 @@ class Asset:
             media_probe_signature=data.get("media_probe_signature", ""),
             imported_at=data.get("imported_at", datetime.now().isoformat()),
             folder=data.get("folder", ""),
+            favorite=bool(data.get("favorite", False)),
             trashed_at=data.get("trashed_at", ""),
             trash_previous_folder=data.get("trash_previous_folder", ""),
         )

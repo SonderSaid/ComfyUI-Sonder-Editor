@@ -99,6 +99,17 @@ def test_asset_trash_metadata_roundtrip():
     assert restored.trash_previous_folder == "Shots"
 
 
+def test_asset_favorite_metadata_roundtrip_and_legacy_default():
+    asset = Asset(asset_id="fav1", asset_type="image", path="media/fav.png", favorite=True)
+    data = asset.to_dict()
+    restored = Asset.from_dict(data)
+    legacy = Asset.from_dict({"asset_id": "legacy", "path": "media/legacy.png"})
+
+    assert data["favorite"] is True
+    assert restored.favorite is True
+    assert legacy.favorite is False
+
+
 # --- GuideFrame ---
 
 def test_guide_frame_roundtrip():

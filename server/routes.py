@@ -4972,6 +4972,8 @@ if routes is not None:
         if "folder" in body:
             asset.folder = _normalize_asset_folder(body["folder"])
             _ensure_asset_folder(project, asset.folder)
+        if "favorite" in body:
+            asset.favorite = bool(body["favorite"])
 
         save_project(project)
         return web.json_response(_asset_payload(project, asset))

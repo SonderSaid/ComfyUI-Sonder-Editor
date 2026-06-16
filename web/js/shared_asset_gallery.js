@@ -2,8 +2,10 @@ const { api } = window.comfyAPI.api;
 
 import {
     DEFAULT_EDITOR_SETTINGS,
+    GALLERY_SCOPE_OPTIONS,
     GALLERY_SORT_OPTIONS,
     GALLERY_TAB_OPTIONS,
+    GALLERY_VIEW_OPTIONS,
     getEditorSettings,
     migrateLegacyGalleryProjectPrefs,
     subscribeEditorSettings,
@@ -11,7 +13,7 @@ import {
 } from "./editor_settings.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
 import { resolveEffectiveStreamingMode } from "./media_streaming.js";
-import { notifyError } from "./editor_notifications.js";
+import { notifyError, notifyInfo, notifySuccess } from "./editor_notifications.js";
 import {
     renderTrackedSectionBody,
     trackedFieldMatchForEntry,
@@ -29,12 +31,18 @@ import {
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
+const DEFAULT_GALLERY_SCOPE = DEFAULT_EDITOR_SETTINGS.gallery.scopeMode;
+const DEFAULT_GALLERY_VIEW = DEFAULT_EDITOR_SETTINGS.gallery.viewMode;
 const DEFAULT_INSPECTOR_SETTINGS = DEFAULT_EDITOR_SETTINGS.inspector;
 const ROOT_FOLDER_COLLAPSE_KEY = "__sonder_root__";
 const TRASH_FOLDER_COLLAPSE_KEY = "__sonder_trash__";
 const SORT_OPTIONS = GALLERY_SORT_OPTIONS;
 const TAB_OPTIONS = GALLERY_TAB_OPTIONS;
+const SCOPE_OPTIONS = GALLERY_SCOPE_OPTIONS;
+const VIEW_OPTIONS = GALLERY_VIEW_OPTIONS;
 const VALID_TAB_VALUES = new Set(TAB_OPTIONS.map((entry) => entry.value));
+const VALID_SCOPE_VALUES = new Set(SCOPE_OPTIONS.map((entry) => entry.value));
+const VALID_VIEW_VALUES = new Set(VIEW_OPTIONS.map((entry) => entry.value));
 const COMPARE_SORT_OPTIONS = GALLERY_SORT_OPTIONS.filter((entry) => entry.value !== "type");
 const AUDIO_DUCK_VOLUME = Math.pow(10, -3 / 20);
 const LIST_NAV_KEYS = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]);
@@ -55,6 +63,8 @@ export const INSPECT_OVERLAY_SHORTCUTS = Object.freeze([
     ["1 / 2 / 3 / 0", "Monitor A / B / Both / Mute in audio compare"],
     ["Shift hold", "Temporarily flip A/B monitor in audio compare"],
     ["C", "Toggle Compare"],
+    ["S", "Favorite / Unfavorite"],
+    ["Delete", "Move asset to Trash"],
     ["F / 0", "Fit"],
     ["+ / -", "Zoom"],
     ["Wheel", "Zoom / waveform zoom"],
@@ -384,6 +394,27 @@ function normalizeGalleryTab(value) {
     return VALID_TAB_VALUES.has(value) ? value : DEFAULT_GALLERY_TAB;
 }
 
+function normalizeGalleryScope(value) {
+    return VALID_SCOPE_VALUES.has(value) ? value : DEFAULT_GALLERY_SCOPE;
+}
+
+function normalizeGalleryView(value) {
+    return VALID_VIEW_VALUES.has(value) ? value : DEFAULT_GALLERY_VIEW;
+}
+
+function normalizeAssetIdSet(value) {
+    if (value instanceof Set) {
+        return new Set(Array.from(value).map((entry) => String(entry || "")).filter(Boolean));
+    }
+    if (Array.isArray(value)) {
+        return new Set(value.map((entry) => String(entry || "")).filter(Boolean));
+    }
+    if (value && typeof value === "object") {
+        return new Set(Object.keys(value).filter((key) => value[key]).map((entry) => String(entry || "")));
+    }
+    return new Set();
+}
+
 function formatGenerationValue(value) {
     if (value == null || value === "") return "-";
     if (typeof value === "number" || typeof value === "boolean") return String(value);
@@ -652,6 +683,8 @@ export function mountSharedAssetGallery(container, options = {}) {
     const consumerId = (suffix) => `${ownerId}:${suffix}`;
     const state = {
         type: normalizeGalleryTab(initialSettings.gallery.activeTab),
+        scopeMode: normalizeGalleryScope(initialSettings.gallery.scopeMode),
+        viewMode: normalizeGalleryView(initialSettings.gallery.viewMode),
         query: "",
         selectedAssetId: "",
         selectedAssetIds: new Set(),
@@ -667,6 +700,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         manageMode: false,
         sortMode: initialSettings.gallery.sortMode || DEFAULT_SORT_MODE,
         thumbnailSize: initialSettings.gallery.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize,
+        currentSceneAssetIds: normalizeAssetIdSet(options.initialData?.currentSceneAssetIds),
         storageProjectId: "",
         contextMenuEl: null,
         contextMenuCleanup: null,
@@ -732,6 +766,14 @@ export function mountSharedAssetGallery(container, options = {}) {
     const overlayMediaCache = new Map();
     const root = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;flex:1 1 auto;min-width:0;min-height:0;width:100%;height:100%;box-sizing:border-box;overflow:hidden;`);
     container.appendChild(root);
+    const galleryStyle = document.createElement("style");
+    galleryStyle.textContent = `
+        [data-asset-row] .sonder-gallery-row-favorite[data-favorite="false"] { display: none; }
+        [data-asset-row] .sonder-gallery-row-favorite[data-favorite="true"],
+        [data-asset-row]:hover .sonder-gallery-row-favorite[data-favorite="false"],
+        [data-asset-row][data-row-focused="true"] .sonder-gallery-row-favorite[data-favorite="false"] { display: inline-flex; }
+    `;
+    root.appendChild(galleryStyle);
 
     const fileInput = document.createElement("input");
     fileInput.type = "file";
@@ -749,6 +791,32 @@ export function mountSharedAssetGallery(container, options = {}) {
     searchInput.type = "search";
     searchInput.placeholder = "Search assets (kind:/ext:/tracked:/field:)";
     controls.appendChild(searchInput);
+
+    const makeLabeledSelect = (labelText, selectEl) => {
+        const wrap = style(document.createElement("label"), `display:flex;align-items:center;gap:4px;color:${CHROME.textDim};font-size:10px;font-weight:700;white-space:nowrap;`);
+        const label = document.createElement("span");
+        label.textContent = labelText;
+        wrap.append(label, selectEl);
+        return wrap;
+    };
+
+    const scopeSelect = style(document.createElement("select"), `flex:0 0 auto;${inputChromeCss({ minWidth: "130px" })}`);
+    for (const option of SCOPE_OPTIONS) {
+        const optionEl = document.createElement("option");
+        optionEl.value = option.value;
+        optionEl.textContent = option.label;
+        scopeSelect.appendChild(optionEl);
+    }
+    controls.appendChild(makeLabeledSelect("Scope", scopeSelect));
+
+    const viewSelect = style(document.createElement("select"), `flex:0 0 auto;${inputChromeCss({ minWidth: "90px" })}`);
+    for (const option of VIEW_OPTIONS) {
+        const optionEl = document.createElement("option");
+        optionEl.value = option.value;
+        optionEl.textContent = option.label;
+        viewSelect.appendChild(optionEl);
+    }
+    controls.appendChild(makeLabeledSelect("View", viewSelect));
 
     const sortSelect = style(document.createElement("select"), `flex:0 0 auto;${inputChromeCss({ minWidth: "110px" })}`);
     for (const option of SORT_OPTIONS) {
@@ -1056,6 +1124,22 @@ export function mountSharedAssetGallery(container, options = {}) {
         });
     }
 
+    function persistScopeMode() {
+        updateEditorSettings({
+            gallery: {
+                scopeMode: normalizeGalleryScope(state.scopeMode),
+            },
+        });
+    }
+
+    function persistViewMode() {
+        updateEditorSettings({
+            gallery: {
+                viewMode: normalizeGalleryView(state.viewMode),
+            },
+        });
+    }
+
     function persistActiveTab() {
         updateEditorSettings({
             gallery: {
@@ -1079,6 +1163,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             : DEFAULT_SORT_MODE;
         state.sortMode = nextSort;
         state.type = normalizeGalleryTab(nextSettings?.gallery?.activeTab);
+        state.scopeMode = normalizeGalleryScope(nextSettings?.gallery?.scopeMode);
+        state.viewMode = normalizeGalleryView(nextSettings?.gallery?.viewMode);
         state.inspectorCollapsed = !!nextSettings?.gallery?.inspectorCollapsed;
         state.artifactInspectorExpanded = !!nextSettings?.gallery?.artifactInspectorExpanded;
         state.thumbnailSize = nextSettings?.gallery?.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize;
@@ -1105,6 +1191,8 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function updateControlState() {
         sortSelect.value = state.sortMode;
+        scopeSelect.value = normalizeGalleryScope(state.scopeMode);
+        viewSelect.value = normalizeGalleryView(state.viewMode);
         inspectorBtn.textContent = state.inspectorCollapsed ? "Show Inspector" : "Hide Inspector";
         manageBtn.textContent = state.manageMode ? "Done" : "Manage";
         setActionButtonVariant(manageBtn, state.manageMode ? "active" : "subtle");
@@ -1299,8 +1387,36 @@ export function mountSharedAssetGallery(container, options = {}) {
         return changed;
     }
 
+    function refreshCurrentSceneAssetIdsFromHost() {
+        if (typeof options.getCurrentSceneAssetIds === "function") {
+            try {
+                state.currentSceneAssetIds = normalizeAssetIdSet(options.getCurrentSceneAssetIds());
+            } catch (error) {
+                console.warn("[Sonder] Failed to derive current-scene assets:", error);
+                state.currentSceneAssetIds = new Set();
+            }
+        }
+        return state.currentSceneAssetIds;
+    }
+
+    function currentSceneAssetIdSet() {
+        return state.currentSceneAssetIds;
+    }
+
+    function assetInCurrentScene(asset) {
+        return currentSceneAssetIdSet().has(String(asset?.asset_id || ""));
+    }
+
+    function assetMatchesCurrentScope(asset) {
+        if (!asset) return false;
+        if (state.scopeMode === "favorites") return !!asset.favorite;
+        if (state.scopeMode === "current_scene") return assetInCurrentScene(asset);
+        return true;
+    }
+
     function assetMatchesCurrentFilter(asset) {
         if (!asset) return false;
+        if (!assetMatchesCurrentScope(asset)) return false;
         if (state.type !== "all" && asset.asset_type !== state.type) return false;
         const query = parseAssetSearchQuery(state.query);
         return assetMatchesParsedQuery(asset, query);
@@ -1618,6 +1734,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function visibleNavigableAssets(assets) {
+        if (state.viewMode === "flat") return assets;
         return assets.filter((asset) => !isFolderCollapsed(asset.folder) && !isAncestorCollapsed(asset.folder));
     }
 
@@ -1625,8 +1742,37 @@ export function mountSharedAssetGallery(container, options = {}) {
         return isFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY) ? [] : trashedAssets();
     }
 
+    function activeNavigableAssets() {
+        return visibleNavigableAssets(filteredAssets());
+    }
+
     function navigableAssets() {
-        return [...visibleNavigableAssets(filteredAssets()), ...visibleTrashedAssets()];
+        return [...activeNavigableAssets(), ...visibleTrashedAssets()];
+    }
+
+    function successorAssetIdAfterRemoval(assetIds, assets = activeNavigableAssets(), anchorAssetId = state.selectedAssetId) {
+        const removedIds = new Set((assetIds || []).filter(Boolean));
+        if (!removedIds.size || !assets.length) return "";
+
+        const removedIndexes = [];
+        for (let index = 0; index < assets.length; index += 1) {
+            if (removedIds.has(assets[index]?.asset_id)) removedIndexes.push(index);
+        }
+        if (!removedIndexes.length) {
+            return assets.find((asset) => !removedIds.has(asset.asset_id))?.asset_id || "";
+        }
+
+        const anchorIndex = removedIds.has(anchorAssetId)
+            ? assets.findIndex((asset) => asset.asset_id === anchorAssetId)
+            : -1;
+        const startIndex = anchorIndex >= 0 ? anchorIndex : Math.max(...removedIndexes);
+        for (let index = startIndex + 1; index < assets.length; index += 1) {
+            if (!removedIds.has(assets[index]?.asset_id)) return assets[index].asset_id;
+        }
+        for (let index = startIndex - 1; index >= 0; index -= 1) {
+            if (!removedIds.has(assets[index]?.asset_id)) return assets[index].asset_id;
+        }
+        return "";
     }
 
     function selectedAssetIdsList() {
@@ -1724,6 +1870,10 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (state.type !== "all" && state.type !== asset.asset_type) {
             state.type = asset.asset_type;
+        }
+        if (!assetMatchesCurrentScope(asset) && state.scopeMode !== "all") {
+            state.scopeMode = "all";
+            persistScopeMode();
         }
         if (!assetMatchesCurrentFilter(asset) && state.query) {
             state.query = "";
@@ -2001,6 +2151,23 @@ export function mountSharedAssetGallery(container, options = {}) {
         render();
     }
 
+    async function handleToggleFavorite(asset, nextFavorite = null) {
+        if (!asset?.asset_id || !options.onUpdateAsset) return false;
+        const desired = typeof nextFavorite === "boolean" ? nextFavorite : !asset.favorite;
+        try {
+            await applyAssetUpdate(asset, { favorite: desired });
+            notifySuccess(desired ? "Added to Favorites" : "Removed from Favorites");
+            if (state.overlayState.open && state.overlayState.assetId === asset.asset_id && !state.overlayState.compareMode) {
+                renderInspectOverlay();
+            }
+            return true;
+        } catch (error) {
+            console.warn("[Sonder] Failed to update favorite:", error);
+            notifyError(error?.message || "Failed to update favorite.");
+            return false;
+        }
+    }
+
     function summarizeAssetTypes(assets) {
         return assets.reduce((counts, asset) => {
             if (asset?.asset_type === "video") counts.video += 1;
@@ -2053,20 +2220,18 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     async function handleBulkDelete(assetIds = selectedAssetIdsList()) {
         const ids = normalizeSelection(assetIds, state.selectedAssetId).ids;
-        if (!ids.length) return;
+        if (!ids.length) return false;
         if (ids.length === 1) {
             const asset = data.assets.find((entry) => entry.asset_id === ids[0]);
             if (asset) {
-                await handleAssetDelete(asset);
+                return await handleAssetDelete(asset);
             }
-            return;
+            return false;
         }
-        if (!options.onBulkDeleteAssets) return;
+        if (!options.onBulkDeleteAssets) return false;
 
+        const nextAssetId = successorAssetIdAfterRemoval(ids);
         try {
-            const message = `Move ${ids.length} selected asset(s) to Trash? You can restore them later until the trash is emptied.`;
-            if (!confirm(message)) return;
-
             const result = await options.onBulkDeleteAssets(ids, false);
             if (result?.status === "conflict") {
                 throw new Error("Bulk trash unexpectedly reported a conflict.");
@@ -2083,10 +2248,15 @@ export function mountSharedAssetGallery(container, options = {}) {
                 });
             }
             clearUsageView();
+            applySelectionState(nextAssetId ? [nextAssetId] : [], nextAssetId);
             render();
+            if (nextAssetId) scrollAssetIntoView(nextAssetId);
+            notifyInfo(`Moved ${ids.length} assets to Trash`);
+            return true;
         } catch (error) {
             console.warn("[Sonder] Failed to trash selected assets:", error);
             notifyError(error?.message || "Failed to move selected assets to Trash.");
+            return false;
         }
     }
 
@@ -4562,6 +4732,14 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
             }
             if (event.ctrlKey || event.metaKey || event.altKey) return shouldCaptureOverlayShortcut(event);
+            if (!overlay.compareMode && (event.key === "s" || event.key === "S")) {
+                void handleToggleFavorite(activeAsset);
+                return true;
+            }
+            if (!overlay.compareMode && event.key === "Delete") {
+                void handleOverlayAssetDelete(activeAsset);
+                return true;
+            }
             if (event.key === "Escape") { closeInspectOverlay(); return true; }
             if (event.key === " " || event.key === "Spacebar") {
                 if (typeof overlay.togglePlayback === "function") overlay.togglePlayback();
@@ -4634,6 +4812,17 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const toolbarActions = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;`);
         const compareCandidates = sameTypeOverlayAssets(asset);
+        if (!overlay.compareMode) {
+            toolbarActions.appendChild(makeFavoriteButton(asset));
+            const trashBtn = makeActionButton("danger");
+            trashBtn.textContent = "Trash";
+            trashBtn.title = "Move to Trash (Delete)";
+            trashBtn.disabled = !options.onDeleteAsset;
+            trashBtn.addEventListener("click", () => {
+                void handleOverlayAssetDelete(asset);
+            });
+            toolbarActions.appendChild(trashBtn);
+        }
         const fitBtn = makeActionButton("subtle");
         fitBtn.textContent = "Fit";
         fitBtn.title = "Fit (F / 0)";
@@ -5218,11 +5407,9 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     async function handleAssetDelete(asset) {
-        if (!asset?.asset_id || !options.onDeleteAsset) return;
+        if (!asset?.asset_id || !options.onDeleteAsset) return false;
+        const nextAssetId = successorAssetIdAfterRemoval([asset.asset_id]);
         try {
-            const message = `Move "${assetDisplayName(asset)}" to Trash? You can restore it later until the trash is emptied.`;
-            if (!confirm(message)) return;
-
             const result = await options.onDeleteAsset(asset.asset_id, false);
             if (result?.status === "conflict") {
                 throw new Error("Asset trash unexpectedly reported a conflict.");
@@ -5235,11 +5422,34 @@ export function mountSharedAssetGallery(container, options = {}) {
                 trash_previous_folder: asset.trash_previous_folder || normalizeFolderName(asset.folder),
             });
             clearUsageView();
+            applySelectionState(nextAssetId ? [nextAssetId] : [], nextAssetId);
             render();
+            if (nextAssetId) scrollAssetIntoView(nextAssetId);
+            notifyInfo("Moved to Trash");
+            return true;
         } catch (error) {
             console.warn("[Sonder] Failed to trash asset:", error);
             notifyError(error?.message || "Failed to move asset to Trash.");
+            return false;
         }
+    }
+
+    async function handleOverlayAssetDelete(asset) {
+        if (state.overlayState.compareMode) return false;
+        const trashed = await handleAssetDelete(asset);
+        if (trashed) {
+            const nextAsset = selectedAsset();
+            if (nextAsset && !isTrashed(nextAsset)) {
+                state.overlayState.assetId = nextAsset.asset_id;
+                state.overlayState.compareMode = false;
+                state.overlayState.showWaveform = false;
+                resetOverlayTransform();
+                renderInspectOverlay();
+            } else {
+                closeInspectOverlay();
+            }
+        }
+        return trashed;
     }
 
     async function promptRenameFolder(folderName) {
@@ -5362,6 +5572,15 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (isTrashed(asset)) {
             return [
                 {
+                    label: asset.favorite ? "Remove from Favorites" : "Add to Favorites",
+                    disabled: !options.onUpdateAsset,
+                    action: async () => {
+                        selectAsset(asset.asset_id, { focusList: true });
+                        await handleToggleFavorite(asset);
+                    },
+                },
+                { type: "separator" },
+                {
                     label: "Restore",
                     disabled: !options.onRestoreAsset,
                     action: async () => {
@@ -5387,6 +5606,14 @@ export function mountSharedAssetGallery(container, options = {}) {
                 action: () => {
                     selectAsset(asset.asset_id, { focusList: true });
                     openInspectOverlay(asset);
+                },
+            },
+            {
+                label: asset.favorite ? "Remove from Favorites" : "Add to Favorites",
+                disabled: !options.onUpdateAsset,
+                action: async () => {
+                    selectAsset(asset.asset_id, { focusList: true });
+                    await handleToggleFavorite(asset);
                 },
             },
             {
@@ -5607,6 +5834,104 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
     }
 
+    function assetRowGridColumns(thumbConfig) {
+        const base = `${thumbConfig.thumbWidth}px minmax(0,1fr)`;
+        return state.manageMode ? `24px ${base}` : base;
+    }
+
+    function makeFavoriteButton(asset, { row = false } = {}) {
+        const favorite = !!asset?.favorite;
+        const btn = style(document.createElement("button"), row ? `
+            width:18px;
+            height:18px;
+            border-radius:5px;
+            border:1px solid ${favorite ? `${THEME.statusPending}aa` : CHROME.border};
+            background:${favorite ? `${THEME.statusPending}24` : CHROME.panelRaised};
+            color:${favorite ? THEME.statusPending : CHROME.textDim};
+            cursor:${options.onUpdateAsset ? "pointer" : "default"};
+            font-size:12px;
+            line-height:1;
+            padding:0;
+            align-items:center;
+            justify-content:center;
+            flex:0 0 auto;
+        ` : `
+            width:22px;
+            height:22px;
+            border-radius:5px;
+            border:1px solid ${favorite ? `${THEME.statusPending}aa` : CHROME.border};
+            background:${favorite ? `${THEME.statusPending}24` : CHROME.panelRaised};
+            color:${favorite ? THEME.statusPending : CHROME.textDim};
+            cursor:${options.onUpdateAsset ? "pointer" : "default"};
+            font-size:14px;
+            line-height:1;
+            padding:0;
+            align-self:center;
+        `);
+        btn.type = "button";
+        if (row) {
+            btn.className = "sonder-gallery-row-favorite";
+            btn.dataset.favorite = favorite ? "true" : "false";
+        }
+        btn.textContent = favorite ? "★" : "☆";
+        btn.title = favorite ? "Remove from Favorites (S)" : "Add to Favorites (S)";
+        btn.setAttribute("aria-label", btn.title);
+        btn.setAttribute("aria-pressed", favorite ? "true" : "false");
+        btn.disabled = !options.onUpdateAsset;
+        btn.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            selectAsset(asset.asset_id, { focusList: true });
+            await handleToggleFavorite(asset);
+        });
+        return btn;
+    }
+
+    function makeCurrentSceneMarker(asset) {
+        if (!assetInCurrentScene(asset)) return null;
+        const marker = style(document.createElement("span"), `
+            flex:0 0 auto;
+            padding:1px 5px;
+            border-radius:999px;
+            border:1px solid ${CHROME.accentBorder};
+            background:${CHROME.accentSoft};
+            color:${CHROME.text};
+            font-size:8px;
+            font-weight:700;
+            text-transform:uppercase;
+            line-height:1.5;
+        `);
+        marker.textContent = "Scene";
+        marker.title = "Referenced by the current scene";
+        return marker;
+    }
+
+    function renderAssetText(asset, thumbConfig, { trashed = false, missing = false } = {}) {
+        const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
+        const nameRow = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;min-width:0;`);
+        const name = style(document.createElement("div"), `color:${trashed ? THEME.fg1 : THEME.fg0};font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto;`);
+        name.textContent = assetDisplayName(asset);
+        if (missing) name.style.color = THEME.statusFailed;
+        nameRow.appendChild(name);
+        const sceneMarker = makeCurrentSceneMarker(asset);
+        if (sceneMarker) nameRow.appendChild(sceneMarker);
+        nameRow.appendChild(makeFavoriteButton(asset, { row: true }));
+
+        const meta = style(document.createElement("div"), `color:${THEME.fg2};font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const workflowMeta = workflowStatusMeta(asset);
+        if (trashed) {
+            meta.textContent = `trashed | ${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatDate(asset.trashed_at)}${workflowMeta ? ` | ${workflowMeta}` : ""}`;
+        } else {
+            let metaLabel = asset.asset_type === "artifact"
+                ? `${missing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${String(asset.artifact_kind || "other")} | ${assetExtension(asset) ? `.${assetExtension(asset)}` : "no ext"}`
+                : `${missing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
+            if (workflowMeta) metaLabel += ` | ${workflowMeta}`;
+            meta.textContent = metaLabel;
+        }
+        text.append(nameRow, meta);
+        return text;
+    }
+
     function renderActiveAssetRow(asset, visibleAssets, thumbConfig) {
         const isSelected = state.selectedAssetIds.has(asset.asset_id);
         const isPrimary = state.selectedAssetId === asset.asset_id;
@@ -5621,8 +5946,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         const focusRing = isPrimary
             ? `box-shadow:inset 0 0 0 1px ${THEME.accent}73;`
             : (isFocused ? `box-shadow:inset 0 0 0 1px ${THEME.accent}40;` : "");
-        const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
+        const row = style(document.createElement("div"), `display:grid;grid-template-columns:${assetRowGridColumns(thumbConfig)};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
         row.dataset.assetRow = asset.asset_id;
+        row.dataset.rowFocused = isFocused ? "true" : "false";
         row.draggable = state.manageMode ? !!options.onBulkMoveAssets : true;
         row.title = state.manageMode
             ? "Click to inspect. Drag onto a folder header to move assets."
@@ -5708,25 +6034,79 @@ export function mountSharedAssetGallery(container, options = {}) {
             thumb.textContent = assetFallbackGlyph(asset.asset_type);
         }
 
-        const text = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:3px;justify-content:center;`);
-        const name = style(document.createElement("div"), `color:${THEME.fg0};font-size:${thumbConfig.nameFont}px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-        name.textContent = assetDisplayName(asset);
-        if (isMissing) name.style.color = THEME.statusFailed;
-        const meta = style(document.createElement("div"), `color:${THEME.fg2};font-size:${thumbConfig.metaFont}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-        let metaLabel = asset.asset_type === "artifact"
-            ? `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${String(asset.artifact_kind || "other")} | ${assetExtension(asset) ? `.${assetExtension(asset)}` : "no ext"}`
-            : `${isMissing ? "missing | " : ""}${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatResolution(asset)} | ${formatDuration(asset)}`;
-        const workflowMeta = workflowStatusMeta(asset);
-        if (workflowMeta) metaLabel += ` | ${workflowMeta}`;
-        meta.textContent = metaLabel;
-        text.append(name, meta);
-        row.append(thumb, text);
+        row.append(thumb, renderAssetText(asset, thumbConfig, { missing: isMissing }));
+        return row;
+    }
+
+    function renderTrashedAssetRow(asset, visibleAssets, thumbConfig) {
+        const isSelected = state.selectedAssetIds.has(asset.asset_id);
+        const isPrimary = state.selectedAssetId === asset.asset_id;
+        const isFocused = state.focusedAssetId === asset.asset_id;
+        const borderColor = isSelected
+            ? (isPrimary ? THEME.statusPending : `${THEME.statusPending}aa`)
+            : (isFocused ? `${THEME.statusPending}88` : `${THEME.statusPending}55`);
+        const background = isSelected
+            ? `${THEME.statusPending}26`
+            : (isFocused ? `${THEME.statusPending}18` : `${THEME.statusPending}12`);
+        const focusRing = isPrimary
+            ? `box-shadow:inset 0 0 0 1px ${THEME.statusPending}6b;`
+            : (isFocused ? `box-shadow:inset 0 0 0 1px ${THEME.statusPending}33;` : "");
+        const row = style(document.createElement("div"), `display:grid;grid-template-columns:${assetRowGridColumns(thumbConfig)};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;opacity:0.92;${focusRing}`);
+        row.dataset.assetRow = asset.asset_id;
+        row.dataset.rowFocused = isFocused ? "true" : "false";
+        row.title = "Trashed asset. Restore to bring it back to its previous folder.";
+        row.addEventListener("click", (event) => {
+            handleAssetActivation(asset.asset_id, event, visibleAssets, { focusList: true, scrollIntoView: true });
+        });
+        row.addEventListener("dblclick", () => {
+            openInspectOverlay(asset);
+        });
+        row.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!(state.selectedAssetIds.has(asset.asset_id) && selectedAssetIdsList().length > 1)) {
+                selectAsset(asset.asset_id, { focusList: true });
+            }
+            showContextMenu(event.clientX, event.clientY, assetContextMenuItems(asset));
+        });
+        if (state.manageMode) {
+            const checkboxWrap = style(document.createElement("div"), `display:flex;align-items:center;justify-content:center;`);
+            checkboxWrap.addEventListener("mousedown", (event) => {
+                event.stopPropagation();
+            });
+            const checkbox = style(document.createElement("input"), `margin:0;cursor:pointer;`);
+            checkbox.type = "checkbox";
+            checkbox.checked = isSelected;
+            checkbox.addEventListener("click", (event) => event.stopPropagation());
+            checkbox.addEventListener("change", (event) => {
+                event.stopPropagation();
+                toggleAssetSelection(asset.asset_id, { focusList: true });
+            });
+            checkboxWrap.appendChild(checkbox);
+            row.appendChild(checkboxWrap);
+        }
+
+        const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${THEME.bg2};border:1px solid ${THEME.statusPending}55;display:flex;align-items:center;justify-content:center;overflow:hidden;color:${THEME.statusPending};font-size:${thumbConfig.metaFont}px;`);
+        if (asset.has_thumbnail) {
+            const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:contain;display:block;opacity:0.74;filter:saturate(0.6);`);
+            img.loading = "lazy";
+            img.decoding = "async";
+            img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
+            img.alt = assetDisplayName(asset);
+            img.draggable = false;
+            thumb.appendChild(img);
+        } else {
+            thumb.textContent = assetFallbackGlyph(asset.asset_type);
+        }
+
+        row.append(thumb, renderAssetText(asset, thumbConfig, { trashed: true }));
         return row;
     }
 
     function render() {
         if (state.destroyed) return;
         ensureProjectPrefs();
+        refreshCurrentSceneAssetIdsFromHost();
         updateControlState();
         updateLayout();
         updateFolderOptions();
@@ -5742,6 +6122,14 @@ export function mountSharedAssetGallery(container, options = {}) {
         const folders = allFolders();
         let renderedAnything = false;
 
+        if (state.viewMode === "flat") {
+            if (assets.length) {
+                renderedAnything = true;
+                for (const asset of assets) {
+                    listScroller.appendChild(renderActiveAssetRow(asset, visibleAssets, thumbConfig));
+                }
+            }
+        } else {
         for (const folderName of folders) {
             if (isAncestorCollapsed(folderName)) continue;
 
@@ -5772,8 +6160,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 const focusRing = isPrimary
                     ? `box-shadow:inset 0 0 0 1px ${THEME.accent}73;`
                     : (isFocused ? `box-shadow:inset 0 0 0 1px ${THEME.accent}40;` : "");
-                const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
+                const row = style(document.createElement("div"), `display:grid;grid-template-columns:${assetRowGridColumns(thumbConfig)};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;${focusRing}`);
                 row.dataset.assetRow = asset.asset_id;
+                row.dataset.rowFocused = isFocused ? "true" : "false";
                 row.draggable = state.manageMode ? !!options.onBulkMoveAssets : true;
                 row.title = state.manageMode
                     ? "Click to inspect. Drag onto a folder header to move assets."
@@ -5871,9 +6260,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                 if (workflowMeta) metaLabel += ` | ${workflowMeta}`;
                 meta.textContent = metaLabel;
                 text.append(name, meta);
-                row.append(thumb, text);
+                row.append(thumb, renderAssetText(asset, thumbConfig, { missing: isMissing }));
                 listScroller.appendChild(row);
             }
+        }
         }
 
         const trashedList = trashedAssets();
@@ -5895,11 +6285,15 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const focusRing = isPrimary
                         ? `box-shadow:inset 0 0 0 1px ${THEME.statusPending}6b;`
                         : (isFocused ? `box-shadow:inset 0 0 0 1px ${THEME.statusPending}33;` : "");
-                    const row = style(document.createElement("div"), `display:grid;grid-template-columns:${state.manageMode ? `24px ${thumbConfig.thumbWidth}px minmax(0,1fr)` : `${thumbConfig.thumbWidth}px minmax(0,1fr)`};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;opacity:0.92;${focusRing}`);
+                    const row = style(document.createElement("div"), `display:grid;grid-template-columns:${assetRowGridColumns(thumbConfig)};gap:${thumbConfig.gap}px;padding:${thumbConfig.padding}px;border-radius:6px;border:1px solid ${borderColor};background:${background};cursor:pointer;opacity:0.92;${focusRing}`);
                     row.dataset.assetRow = asset.asset_id;
+                    row.dataset.rowFocused = isFocused ? "true" : "false";
                     row.title = "Trashed asset. Restore to bring it back to its previous folder.";
                     row.addEventListener("click", (event) => {
                         handleAssetActivation(asset.asset_id, event, visibleAssets, { focusList: true, scrollIntoView: true });
+                    });
+                    row.addEventListener("dblclick", () => {
+                        openInspectOverlay(asset);
                     });
                     row.addEventListener("contextmenu", (event) => {
                         event.preventDefault();
@@ -5943,7 +6337,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const workflowMeta = workflowStatusMeta(asset);
                     meta.textContent = `trashed | ${assetKindLabel(asset.asset_type).toLowerCase()} | ${formatDate(asset.trashed_at)}${workflowMeta ? ` | ${workflowMeta}` : ""}`;
                     text.append(name, meta);
-                    row.append(thumb, text);
+                    row.append(thumb, renderAssetText(asset, thumbConfig, { trashed: true }));
                     listScroller.appendChild(row);
                 }
             }
@@ -5994,6 +6388,19 @@ export function mountSharedAssetGallery(container, options = {}) {
     sortSelect.addEventListener("change", () => {
         state.sortMode = sortSelect.value || DEFAULT_SORT_MODE;
         persistSortMode();
+        render();
+    });
+    scopeSelect.addEventListener("change", () => {
+        state.scopeMode = normalizeGalleryScope(scopeSelect.value);
+        state.allowAutoFocus = true;
+        persistScopeMode();
+        render();
+        invalidateOverlayMetadata();
+    });
+    viewSelect.addEventListener("change", () => {
+        state.viewMode = normalizeGalleryView(viewSelect.value);
+        state.allowAutoFocus = true;
+        persistViewMode();
         render();
     });
     inspectorBtn.addEventListener("click", () => {
@@ -6061,6 +6468,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         return true;
     }
 
+    function handleGalleryFavoriteShortcut() {
+        const asset = selectedAsset() || data.assets.find((entry) => entry.asset_id === state.focusedAssetId);
+        if (!asset) return false;
+        void handleToggleFavorite(asset);
+        return true;
+    }
+
     function handleGallerySelectAll() {
         const visibleAssetList = ensureFocusedAsset(navigableAssets());
         const allVisibleIds = visibleAssetList.map((asset) => asset.asset_id);
@@ -6099,6 +6513,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             const key = event.key;
             if ((event.ctrlKey || event.metaKey) && String(key || "").toLowerCase() === "a") {
                 return handleGallerySelectAll();
+            }
+            if (!event.ctrlKey && !event.metaKey && !event.altKey && String(key || "").toLowerCase() === "s") {
+                return handleGalleryFavoriteShortcut();
             }
             if (key === "Delete") return handleGallerySelectionDelete();
             if (key === "Escape") return handleGalleryEscape();
@@ -6189,6 +6606,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             artifact_kind: asset?.artifact_kind || "",
             path: asset?.path || "",
             folder: normalizeFolderName(asset?.folder || ""),
+            favorite: !!asset?.favorite,
             trashed_at: asset?.trashed_at || "",
             trash_previous_folder: asset?.trash_previous_folder || "",
             width: asset?.width || 0,
@@ -6259,6 +6677,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function tryRenderAdditiveData(addedAssets, previousAssets) {
         if (!addedAssets.length || !state.selectedAssetId || !listScroller.children.length) return false;
+        if (state.viewMode !== "folders") return false;
         if (addedAssets.some((asset) => isTrashed(asset))) return false;
 
         const addedIds = new Set(addedAssets.map((asset) => asset.asset_id));
@@ -6311,6 +6730,9 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function setData(nextData) {
         const payload = Array.isArray(nextData) ? { assets: nextData, folders: [] } : (nextData || {});
+        if (Object.prototype.hasOwnProperty.call(payload, "currentSceneAssetIds")) {
+            state.currentSceneAssetIds = normalizeAssetIdSet(payload.currentSceneAssetIds);
+        }
         const previousAssets = data.assets;
         const previousFolders = data.folders;
         const nextAssets = Array.isArray(payload.assets) ? [...payload.assets] : [];
@@ -6355,6 +6777,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         destroy,
         isInspectOverlayOpen: () => !!state.overlayState.open,
         hasSelectionOwnership,
+        refreshCurrentScene: () => {
+            refreshCurrentSceneAssetIdsFromHost();
+            render();
+        },
         revealAsset,
     };
 }

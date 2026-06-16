@@ -141,6 +141,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 }
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
+import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
 import { mountSharedRenderQueue, queueBatchIds } from "./shared_render_queue.js";
@@ -848,6 +849,7 @@ export class EditorWidget {
             ownerId: this._keyboardConsumerId("gallery"),
             getProjectDir: () => this.projectDir,
             initialData: { assets: [], folders: [] },
+            getCurrentSceneAssetIds: () => this._currentSceneAssetIdsForGallery(),
             onImportFiles: async (files, folder) => {
                 await this._importFilesWithProgress(Array.from(files || []), folder);
             },
@@ -1113,6 +1115,7 @@ export class EditorWidget {
         this._resizeViewportCanvas();
         this._renderViewportFrame();
         this._updateToolbar();
+        this._assetGallery?.refreshCurrentScene?.();
     }
 
     _refreshDurationInput() {
@@ -1367,6 +1370,14 @@ export class EditorWidget {
     }
 
     // ── Asset Management ───────────────────────────────────────────────
+    _allProjectAssetsForGallery() {
+        return Object.values(this.assets || {}).flatMap((entries) => Array.isArray(entries) ? entries : []);
+    }
+
+    _currentSceneAssetIdsForGallery() {
+        return deriveCurrentSceneAssetIds(this.activeScene, this._allProjectAssetsForGallery());
+    }
+
     async _fetchAssets({ ignoreMutationGate = false, reason = "assets" } = {}) {
         if (!this.projectDir) return;
         if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
@@ -1390,6 +1401,7 @@ export class EditorWidget {
                 this._assetGallery?.setData({
                     assets: data.assets || [],
                     folders: data.folders || [],
+                    currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
                 });
             }
         } catch (e) {
@@ -9441,6 +9453,7 @@ export class EditorWidget {
                 ["Arrow keys", "Move asset focus / selection"],
                 ["Space", "Open inspect overlay for focused asset"],
                 ["Ctrl+A", "Select all visible assets"],
+                ["S", "Favorite / unfavorite selected asset"],
                 ["Delete", "Trash or permanently delete selection (when gallery focused)"],
                 ["Esc", "Clear or reduce gallery selection"],
             ]) +
