@@ -16,6 +16,7 @@ import cv2
 from .media_helpers import (
     CUSTOM_OUTPUT_KIND_VIDEO,
     CUSTOM_SAVE_VIDEO_PRESET,
+    MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS,
     MediaOperationCancelled,
     audio_only_export_spec,
     encode_audio,
@@ -28,8 +29,6 @@ from .media_helpers import (
     resolve_custom_export_options,
     run_ffmpeg_command,
     save_video_encode_timeout_seconds,
-    tensor_mode_for_preset,
-    tensor_to_uint8_frames,
 )
 from .atomic_io import atomic_replace
 from .project_commit import created_ids_since, save_generated_project, snapshot_item_ids
@@ -37,8 +36,8 @@ from .project_manager import load_project
 from .thumbnail_service import ensure_thumbnail
 from .timeline_renderer import (
     TimelineRenderCancelled,
+    iter_scene_frames,
     mix_scene_audio_to_wav,
-    render_scene_frames,
 )
 from .timeline_state import Asset, AudioTrack, ClipReference, LaneConfig, Scene, TimelineProject
 
@@ -304,6 +303,14 @@ def _technical_video_metadata(path: str, fallback: dict) -> dict:
         if cap is not None:
             cap.release()
     return dict(fallback)
+
+
+def _timeline_export_stream_timeout(encode_timeout: int, frame_count: int) -> int:
+    compositor_allowance = max(300, int((max(0, int(frame_count or 0)) + 1) // 2))
+    return min(
+        MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS,
+        max(1, int(encode_timeout or 1)) + compositor_allowance,
+    )
 
 
 def _place_video_take(
@@ -628,15 +635,9 @@ class TimelineExportManager:
             rgb_frames = None
             if include_video:
                 self._set_phase(job, "compositing", "Compositing frames...")
-                tensor = render_scene_frames(project, scene, start, end, cancel_event=job.cancel_event)
-                tensor_mode = "round"
-                if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
-                    tensor_mode = resolve_custom_export_options(custom_options)["tensor_mode"]
-                else:
-                    tensor_mode = tensor_mode_for_preset(preset_id)
-                rgb_frames = tensor_to_uint8_frames(tensor, mode=tensor_mode)
-                frame_count = int(rgb_frames.shape[0])
-                height, width = rgb_frames.shape[1], rgb_frames.shape[2]
+                job.frames_total = int(frame_count)
+                job.frames_done = 0
+                rgb_frames = iter_scene_frames(project, scene, start, end, cancel_event=job.cancel_event)
 
             mixed_audio_path = None
             mixed_audio_contributors = []
@@ -676,10 +677,12 @@ class TimelineExportManager:
                     height,
                     custom_options,
                 )
+                export_timeout = _timeline_export_stream_timeout(encode_timeout, frame_count)
                 # Determinate frame counter for the export status poll (the
                 # frontend maps frames_done/frames_total → "Exporting: 312/720f").
                 job.frames_total = int(frame_count)
                 job.frames_done = 0
+                self._set_phase(job, "encoding", f"Encoding frame 0 / {frame_count}...")
                 encode_metadata = encode_video(
                     rgb_frames,
                     preset_id=preset_id,
@@ -687,9 +690,12 @@ class TimelineExportManager:
                     fps=fps,
                     audio_path=mixed_audio_path if mixed_audio_path and os.path.isfile(mixed_audio_path) else None,
                     custom_options=custom_options,
-                    timeout=encode_timeout,
+                    timeout=export_timeout,
                     cancel_event=job.cancel_event,
-                    progress_callback=lambda done: setattr(job, "frames_done", min(int(done), int(frame_count))),
+                    progress_callback=lambda done: (
+                        setattr(job, "frames_done", min(int(done), int(frame_count))),
+                        setattr(job, "message", f"Encoding frame {min(int(done), int(frame_count))} / {frame_count}..."),
+                    ),
                 )
             else:
                 if not mixed_audio_path or not os.path.isfile(mixed_audio_path):

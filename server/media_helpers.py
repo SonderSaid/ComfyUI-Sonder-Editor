@@ -737,13 +737,77 @@ def write_png(path: str, frame_rgb: np.ndarray, *, compression: int = 0, metadat
     )
 
 
+_FRAME_SHAPE_ERROR = "frames_iter must provide one or more RGB frames shaped (H, W, 3)"
+
+
+def _close_iterable(value) -> None:
+    close = getattr(value, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _normalize_rgb_frame(frame, *, expected_shape: tuple[int, int, int] | None = None) -> np.ndarray:
+    arr = np.asarray(frame)
+    if arr.ndim != 3 or arr.shape[-1] != 3 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+        raise ValueError(_FRAME_SHAPE_ERROR)
+    if expected_shape is not None and tuple(arr.shape) != tuple(expected_shape):
+        raise ValueError("frames_iter must provide same-sized RGB frames")
+    if arr.dtype != np.uint8:
+        arr = np.asarray(arr).clip(0, 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+def _non_array_frame_stream(frames_iter: Iterable[np.ndarray]) -> tuple[Iterator[np.ndarray], int, int]:
+    source = frames_iter
+    iterator = iter(frames_iter)
+
+    def close_source() -> None:
+        _close_iterable(iterator)
+        if iterator is not source:
+            _close_iterable(source)
+
+    try:
+        first = _normalize_rgb_frame(next(iterator))
+    except StopIteration:
+        close_source()
+        raise ValueError(_FRAME_SHAPE_ERROR) from None
+    except Exception:
+        close_source()
+        raise
+
+    expected_shape = tuple(first.shape)
+
+    def stream() -> Iterator[np.ndarray]:
+        try:
+            yield first
+            for frame in iterator:
+                yield _normalize_rgb_frame(frame, expected_shape=expected_shape)
+        finally:
+            close_source()
+
+    return stream(), int(first.shape[0]), int(first.shape[1])
+
+
+def _prepare_frame_stream(frames_iter: Iterable[np.ndarray]) -> tuple[Iterable[np.ndarray], int | None, int, int]:
+    if isinstance(frames_iter, np.ndarray):
+        frames = _coerce_frames_array(frames_iter)
+        frame_count, h, w = frames.shape[:3]
+        return frames, int(frame_count), int(h), int(w)
+    frames, h, w = _non_array_frame_stream(frames_iter)
+    return frames, None, h, w
+
+
 def _coerce_frames_array(frames_iter: Iterable[np.ndarray]) -> np.ndarray:
     if isinstance(frames_iter, np.ndarray):
         frames = frames_iter
     else:
-        frames = np.stack([np.asarray(frame) for frame in frames_iter], axis=0)
-    if frames.ndim != 4 or frames.shape[-1] != 3 or frames.shape[0] <= 0:
-        raise ValueError("frames_iter must provide one or more RGB frames shaped (H, W, 3)")
+        stream, _, _ = _non_array_frame_stream(frames_iter)
+        frames = np.stack(list(stream), axis=0)
+    if frames.ndim != 4 or frames.shape[-1] != 3 or frames.shape[0] <= 0 or frames.shape[1] <= 0 or frames.shape[2] <= 0:
+        raise ValueError(_FRAME_SHAPE_ERROR)
     if frames.dtype != np.uint8:
         frames = np.asarray(frames).clip(0, 255).astype(np.uint8)
     return np.ascontiguousarray(frames)
@@ -858,11 +922,12 @@ def run_ffmpeg_command(
 
 def _run_ffmpeg_streaming_frames(
     cmd: list,
-    frames: np.ndarray,
+    frames: Iterable[np.ndarray],
     *,
     timeout: int | float | None,
     cancel_event=None,
     progress_callback=None,
+    frame_count: int | None = None,
 ) -> None:
     deadline = time.perf_counter() + float(timeout) if timeout is not None else None
     with tempfile.TemporaryFile() as stderr_file:
@@ -892,23 +957,36 @@ def _run_ffmpeg_streaming_frames(
                 raise RuntimeError("ffmpeg failed: stdin pipe was not available")
 
             written = 0
-            for frame in frames:
-                if _cancel_requested(cancel_event):
-                    _terminate_process(proc)
-                    raise MediaOperationCancelled("media operation cancelled")
-                if timed_out.is_set():
-                    _raise_stream_timeout(proc, cmd, timeout, stderr_file)
-                try:
-                    proc.stdin.write(memoryview(frame).cast("B"))
-                except (BrokenPipeError, OSError):
-                    broken_pipe = True
-                    break
-                written += 1
-                if progress_callback is not None:
+            terminated = False
+            try:
+                for frame in frames:
+                    if _cancel_requested(cancel_event):
+                        _terminate_process(proc)
+                        terminated = True
+                        raise MediaOperationCancelled("media operation cancelled")
+                    if timed_out.is_set():
+                        _raise_stream_timeout(proc, cmd, timeout, stderr_file)
                     try:
-                        progress_callback(written)
-                    except Exception:
-                        pass
+                        proc.stdin.write(memoryview(frame).cast("B"))
+                    except (BrokenPipeError, OSError):
+                        broken_pipe = True
+                        break
+                    written += 1
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(written)
+                        except Exception:
+                            pass
+            except BaseException:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                if not terminated and not timed_out.is_set():
+                    _terminate_process(proc)
+                raise
+            finally:
+                _close_iterable(frames)
 
             try:
                 proc.stdin.close()
@@ -967,9 +1045,9 @@ def _run_ffmpeg_streaming_frames(
                 # "ffmpeg failed: <encoder summary stats>" message. Trust the exit
                 # code; only log the early close for observability.
                 logger.warning(
-                    "ffmpeg closed input early (wrote %d/%d frames) but exited 0; treating encode as success",
+                    "ffmpeg closed input early (wrote %d/%s frames) but exited 0; treating encode as success",
                     written,
-                    len(frames),
+                    frame_count if frame_count is not None else "unknown",
                 )
         finally:
             if timer is not None:
@@ -1168,8 +1246,7 @@ def encode_video(
         if custom_spec["output_kind"] != CUSTOM_OUTPUT_KIND_VIDEO:
             raise ValueError("Custom PNG Sequence must be saved through the PNG sequence path")
     audio_args = _preset_audio_args(preset_id, custom_options)
-    frames = _coerce_frames_array(frames_iter)
-    frame_count, h, w = frames.shape[:3]
+    frames, frame_count, h, w = _prepare_frame_stream(frames_iter)
     fps_value = max(0.001, float(fps or 24.0))
     cmd = [
         get_ffmpeg_path(),
@@ -1211,7 +1288,13 @@ def encode_video(
 
     started_at = time.perf_counter()
     try:
-        _run_ffmpeg_streaming_frames(cmd, frames, timeout=timeout, cancel_event=cancel_event, progress_callback=progress_callback)
+        _run_ffmpeg_streaming_frames(
+            cmd,
+            frames,
+            timeout=timeout,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
     except subprocess.TimeoutExpired:
         logger.warning("ffmpeg timeout: encode_video output=%s", output_path)
         raise
@@ -1228,7 +1311,8 @@ def encode_video(
                 os.remove(ffmetadata_path)
             except OSError:
                 pass
-    logger.debug("ffmpeg encode complete output=%s frames=%d duration=%.2fs", output_path, frame_count, time.perf_counter() - started_at)
+    frame_count_label = frame_count if frame_count is not None else "streamed"
+    logger.debug("ffmpeg encode complete output=%s frames=%s duration=%.2fs", output_path, frame_count_label, time.perf_counter() - started_at)
     return _preset_metadata(preset_id, custom_options)
 
 

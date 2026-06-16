@@ -40,50 +40,13 @@ def _scene_resolution(project: TimelineProject, scene: Scene) -> tuple[int, int]
     return max(1, int(proj_w or 1)), max(1, int(proj_h or 1))
 
 
-def render_scene_frames(
-    project: TimelineProject,
-    scene: Scene,
-    start_frame: int,
-    end_frame: int,
-    *,
-    cancel_event=None,
-    video_capture_factory=None,
-) -> torch.Tensor:
-    """Composite visible render clips into an RGB float tensor for [start_frame, end_frame)."""
-    _check_cancel(cancel_event)
-    video_capture_factory = video_capture_factory or cv2.VideoCapture
-    proj_w, proj_h = _scene_resolution(project, scene)
-    render_start = max(0, int(start_frame or 0))
-    render_end = max(render_start, int(end_frame or render_start))
-    num_frames = render_end - render_start
-
-    if num_frames <= 0:
-        return torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
-
-    cache_dir = os.path.join(project.project_dir, "cache", "renders")
-    content_hash = scene.content_hash(render_start, render_end, project.resolution)
-    cache_path = os.path.join(cache_dir, f"{scene.scene_id}_{content_hash}.pt")
-
-    if os.path.isfile(cache_path):
-        _check_cancel(cancel_event)
-        try:
-            cached = torch.load(cache_path, weights_only=True)
-            logger.info("Render cache hit for scene %s (%d frames)", scene.scene_id, num_frames)
-            return cached
-        except Exception as exc:
-            logger.warning("Failed to load render cache: %s", exc)
-            try:
-                os.remove(cache_path)
-                logger.warning("Deleted corrupt render cache: %s", cache_path)
-            except OSError as remove_error:
-                logger.warning("Failed to delete corrupt render cache %s: %s", cache_path, remove_error)
-
+def _visible_render_clips(scene: Scene) -> list:
     hidden_lanes = {
         idx
         for idx, cfg in enumerate(getattr(scene, "video_lane_configs", []) or [])
         if getattr(cfg, "hidden", False)
     }
-    visible_clips = [
+    return [
         clip
         for clip in getattr(scene, "clips", []) or []
         if getattr(clip, "track_index", 0) not in hidden_lanes
@@ -91,9 +54,24 @@ def render_scene_frames(
         and not getattr(clip, "muted", False)
     ]
 
-    if not visible_clips:
-        return torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
 
+def iter_scene_frames(
+    project: TimelineProject,
+    scene: Scene,
+    start_frame: int,
+    end_frame: int,
+    *,
+    cancel_event=None,
+    video_capture_factory=None,
+):
+    """Yield uncached uint8 RGB scene frames for [start_frame, end_frame)."""
+    _check_cancel(cancel_event)
+    video_capture_factory = video_capture_factory or cv2.VideoCapture
+    proj_w, proj_h = _scene_resolution(project, scene)
+    render_start = max(0, int(start_frame or 0))
+    render_end = max(render_start, int(end_frame or render_start))
+
+    visible_clips = _visible_render_clips(scene)
     captures = {}
 
     def get_cap(source_path: str):
@@ -108,7 +86,6 @@ def render_scene_frames(
         return captures[abs_path]
 
     try:
-        frames: list[np.ndarray] = []
         for frame_index in range(render_start, render_end):
             _check_cancel(cancel_event)
             canvas = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
@@ -149,38 +126,88 @@ def render_scene_frames(
                         opacity,
                         0,
                     )
-            frames.append(canvas)
-
-        arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
-        tensor = torch.from_numpy(arr)
-
-        os.makedirs(cache_dir, exist_ok=True)
-        tmp_path = os.path.join(cache_dir, f".{scene.scene_id}_{content_hash}_{uuid.uuid4().hex[:8]}.tmp")
-        try:
-            _check_cancel(cancel_event)
-            torch.save(tensor, tmp_path)
-            _check_cancel(cancel_event)
-            atomic_replace(tmp_path, cache_path)
-            logger.info("Cached render for scene %s (%d frames)", scene.scene_id, num_frames)
-        except TimelineRenderCancelled:
-            try:
-                if os.path.isfile(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
-        except Exception as exc:
-            try:
-                if os.path.isfile(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
-            logger.warning("Failed to save render cache: %s", exc)
-
-        return tensor
+            yield np.ascontiguousarray(canvas)
     finally:
         for cap in captures.values():
             cap.release()
+
+
+def render_scene_frames(
+    project: TimelineProject,
+    scene: Scene,
+    start_frame: int,
+    end_frame: int,
+    *,
+    cancel_event=None,
+    video_capture_factory=None,
+) -> torch.Tensor:
+    """Composite visible render clips into an RGB float tensor for [start_frame, end_frame)."""
+    _check_cancel(cancel_event)
+    video_capture_factory = video_capture_factory or cv2.VideoCapture
+    proj_w, proj_h = _scene_resolution(project, scene)
+    render_start = max(0, int(start_frame or 0))
+    render_end = max(render_start, int(end_frame or render_start))
+    num_frames = render_end - render_start
+
+    if num_frames <= 0:
+        return torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+
+    cache_dir = os.path.join(project.project_dir, "cache", "renders")
+    content_hash = scene.content_hash(render_start, render_end, project.resolution)
+    cache_path = os.path.join(cache_dir, f"{scene.scene_id}_{content_hash}.pt")
+
+    if os.path.isfile(cache_path):
+        _check_cancel(cancel_event)
+        try:
+            cached = torch.load(cache_path, weights_only=True)
+            logger.info("Render cache hit for scene %s (%d frames)", scene.scene_id, num_frames)
+            return cached
+        except Exception as exc:
+            logger.warning("Failed to load render cache: %s", exc)
+            try:
+                os.remove(cache_path)
+                logger.warning("Deleted corrupt render cache: %s", cache_path)
+            except OSError as remove_error:
+                logger.warning("Failed to delete corrupt render cache %s: %s", cache_path, remove_error)
+
+    if not _visible_render_clips(scene):
+        return torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
+
+    frames = list(iter_scene_frames(
+        project,
+        scene,
+        render_start,
+        render_end,
+        cancel_event=cancel_event,
+        video_capture_factory=video_capture_factory,
+    ))
+    arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
+    tensor = torch.from_numpy(arr)
+
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp_path = os.path.join(cache_dir, f".{scene.scene_id}_{content_hash}_{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        _check_cancel(cancel_event)
+        torch.save(tensor, tmp_path)
+        _check_cancel(cancel_event)
+        atomic_replace(tmp_path, cache_path)
+        logger.info("Cached render for scene %s (%d frames)", scene.scene_id, num_frames)
+    except TimelineRenderCancelled:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    except Exception as exc:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        logger.warning("Failed to save render cache: %s", exc)
+
+    return tensor
 
 
 def _effective_scene_fps(project: TimelineProject, scene: Scene) -> float:
@@ -265,7 +292,23 @@ def mix_scene_audio_to_wav(
 
     cmd = [get_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y"]
     for entry in contributors:
-        cmd += ["-i", str(entry["path"])]
+        cmd += [
+            "-ss",
+            f"{entry['source_start_sec']:.6f}",
+            "-t",
+            f"{entry['duration_sec']:.6f}",
+            "-i",
+            str(entry["path"]),
+        ]
+    silence_index = len(contributors)
+    cmd += [
+        "-f",
+        "lavfi",
+        "-t",
+        f"{duration_sec:.6f}",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=44100",
+    ]
 
     filters = []
     labels = []
@@ -275,26 +318,20 @@ def mix_scene_audio_to_wav(
         delay = int(entry["delay_ms"])
         filters.append(
             f"[{idx}:a]"
-            f"atrim=start={entry['source_start_sec']:.6f}:duration={entry['duration_sec']:.6f},"
             "asetpts=PTS-STARTPTS,"
             f"volume={entry['volume']:.6f},"
             f"adelay={delay}|{delay}"
             f"[{label}]"
         )
-    if len(labels) == 1:
-        filters.append(
-            f"{labels[0]}"
-            + f"atrim=duration={duration_sec:.6f},"
-            + "aformat=sample_fmts=s16:channel_layouts=stereo[mix]"
-        )
-    else:
-        filters.append(
-            "".join(labels)
-            + f"amix=inputs={len(labels)}:duration=longest,"
-            + f"volume={len(labels):.6f},"
-            + f"atrim=duration={duration_sec:.6f},"
-            + "aformat=sample_fmts=s16:channel_layouts=stereo[mix]"
-        )
+    silence_label = "silence"
+    filters.append(f"[{silence_index}:a]anull[{silence_label}]")
+    mix_inputs = labels + [f"[{silence_label}]"]
+    filters.append(
+        "".join(mix_inputs)
+        + f"amix=inputs={len(mix_inputs)}:duration=longest,"
+        + f"volume={len(mix_inputs):.6f},"
+        + "aformat=sample_fmts=s16:channel_layouts=stereo[mix]"
+    )
     cmd += [
         "-filter_complex",
         ";".join(filters),

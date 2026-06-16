@@ -16,7 +16,7 @@ import server
 import server.routes as routes
 from server.project_manager import load_project, save_project
 from server.timeline_export import TimelineExportManager, _resolve_committed_asset_id
-from server.timeline_renderer import TimelineRenderCancelled, render_scene_frames
+from server.timeline_renderer import TimelineRenderCancelled, iter_scene_frames, render_scene_frames
 from server.timeline_state import Asset, AudioTrack, ClipReference, GuideFrame, LaneConfig, Scene, TimelineProject, classify_asset_path
 
 
@@ -105,7 +105,52 @@ def test_render_scene_frames_cancel_avoids_cache_commit(tmp_path):
     assert not cache_dir.exists() or list(cache_dir.iterdir()) == []
 
 
-def test_audio_mix_single_track_avoids_unsupported_amix_normalize(tmp_path, monkeypatch):
+def test_iter_scene_frames_close_releases_capture(tmp_path):
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "clip.mp4").write_bytes(b"video")
+    project = TimelineProject(project_dir=str(project_dir), resolution=(2, 2))
+    scene = Scene(scene_id="scene-1", duration_frames=2, video_lane_configs=[LaneConfig()])
+    scene.clips = [
+        ClipReference(
+            source_path=os.path.join("media", "clip.mp4"),
+            timeline_start_frame=0,
+            timeline_end_frame=2,
+        )
+    ]
+    captures = []
+
+    class ReleasingCapture:
+        def __init__(self, _path):
+            self.released = False
+            captures.append(self)
+
+        def isOpened(self):
+            return True
+
+        def set(self, _prop, _value):
+            pass
+
+        def read(self):
+            return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+        def release(self):
+            self.released = True
+
+    frames = iter_scene_frames(
+        project,
+        scene,
+        0,
+        2,
+        video_capture_factory=ReleasingCapture,
+    )
+
+    assert next(frames).shape == (2, 2, 3)
+    frames.close()
+    assert captures and captures[0].released is True
+
+
+def test_audio_mix_single_track_uses_silence_pad_without_atrim(tmp_path, monkeypatch):
     import server.timeline_renderer as timeline_renderer
 
     project_dir = tmp_path / "project"
@@ -140,7 +185,118 @@ def test_audio_mix_single_track_avoids_unsupported_amix_normalize(tmp_path, monk
     filter_complex = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
     assert len(contributors) == 1
     assert "normalize=" not in filter_complex
-    assert "amix=" not in filter_complex
+    assert "atrim" not in filter_complex
+    assert "apad" not in filter_complex
+    assert "amix=inputs=2:duration=longest" in filter_complex
+    assert "anullsrc=channel_layout=stereo:sample_rate=44100" in captured["cmd"]
+    assert "-ss" in captured["cmd"]
+
+
+def test_audio_mix_multiple_tracks_pads_to_full_export_duration(tmp_path, monkeypatch):
+    import server.timeline_renderer as timeline_renderer
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "audio-a.wav").write_bytes(b"audio-a")
+    (project_dir / "media" / "audio-b.wav").write_bytes(b"audio-b")
+    project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project")
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=48)
+    scene.audio_tracks = [
+        AudioTrack(
+            source_path=os.path.join("media", "audio-a.wav"),
+            timeline_start_frame=0,
+            timeline_end_frame=12,
+        ),
+        AudioTrack(
+            source_path=os.path.join("media", "audio-b.wav"),
+            timeline_start_frame=12,
+            timeline_end_frame=24,
+        ),
+    ]
+
+    captured = {}
+
+    def fake_run_ffmpeg(cmd, **_kwargs):
+        captured["cmd"] = cmd
+
+    monkeypatch.setattr(timeline_renderer, "run_ffmpeg_command", fake_run_ffmpeg)
+
+    contributors = timeline_renderer.mix_scene_audio_to_wav(
+        project,
+        scene,
+        0,
+        48,
+        str(project_dir / "media" / "mixed.wav"),
+    )
+
+    filter_complex = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+    assert len(contributors) == 2
+    assert "amix=inputs=3:duration=longest" in filter_complex
+    assert "atrim" not in filter_complex
+    assert "apad" not in filter_complex
+    assert "anullsrc=channel_layout=stereo:sample_rate=44100" in captured["cmd"]
+
+
+def test_audio_mix_real_ffmpeg_short_source_pads_to_export_duration(tmp_path):
+    import shutil
+    import wave
+
+    import server.timeline_renderer as timeline_renderer
+    from server.media_helpers import get_ffmpeg_path, run_ffmpeg_command
+
+    ffmpeg = get_ffmpeg_path()
+    if ffmpeg == "ffmpeg" and shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg unavailable")
+
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    source = media_dir / "short.wav"
+    output = media_dir / "mixed.wav"
+    run_ffmpeg_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.5",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-c:a",
+            "pcm_s16le",
+            str(source),
+        ],
+        timeout=30,
+    )
+
+    project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project", fps=24)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=48)
+    scene.audio_tracks = [
+        AudioTrack(
+            source_path=os.path.join("media", "short.wav"),
+            timeline_start_frame=0,
+            timeline_end_frame=48,
+        )
+    ]
+
+    contributors = timeline_renderer.mix_scene_audio_to_wav(
+        project,
+        scene,
+        0,
+        48,
+        str(output),
+    )
+
+    with wave.open(str(output), "rb") as handle:
+        duration = handle.getnframes() / float(handle.getframerate())
+    assert len(contributors) == 1
+    assert duration == pytest.approx(2.0, abs=1 / 44100)
 
 
 def test_render_timeline_routes_return_job_payload(monkeypatch, tmp_path):
@@ -194,8 +350,119 @@ def test_render_timeline_routes_return_job_payload(monkeypatch, tmp_path):
     assert _response_json(cancel_resp)["phase"] == "cancelling"
 
 
+def test_timeline_export_streams_without_render_scene_frames_or_cache(tmp_path, monkeypatch):
+    import server.timeline_export as timeline_export
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=4, video_lane_configs=[LaneConfig()])
+    project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project", scenes=[scene], resolution=(2, 2))
+    save_project(project)
+
+    consumed = []
+
+    def fail_render(*_args, **_kwargs):
+        raise AssertionError("timeline export must not call render_scene_frames")
+
+    def fake_iter(_project, _scene, start, end, **_kwargs):
+        assert (start, end) == (0, 4)
+        for idx in range(start, end):
+            yield np.full((2, 2, 3), idx, dtype=np.uint8)
+
+    def fake_encode(frames_iter, *, output_path, timeout, progress_callback=None, **_kwargs):
+        assert timeout == 390
+        for frame in frames_iter:
+            consumed.append(int(frame[0, 0, 0]))
+            if progress_callback:
+                progress_callback(len(consumed))
+        with open(output_path, "wb") as handle:
+            handle.write(b"video")
+        return {
+            "save_preset": "Compatible MP4",
+            "codec": "libx264",
+            "pix_fmt": "yuv420p",
+            "container": "mp4",
+            "tensor_mode": "round",
+            "browser_preview_compatible": True,
+        }
+
+    monkeypatch.setattr(timeline_export, "render_scene_frames", fail_render, raising=False)
+    monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
+    monkeypatch.setattr(timeline_export, "encode_video", fake_encode)
+    monkeypatch.setattr(timeline_export, "ensure_thumbnail", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(timeline_export, "_technical_video_metadata", lambda _path, fallback: dict(fallback))
+
+    manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
+    job = manager.start(load_project(str(project_dir)), {
+        "scene_id": "scene-1",
+        "range": {"start": 0, "end": 4},
+        "include_video": True,
+        "include_audio": False,
+        "save_preset": "Compatible MP4",
+        "place_as_take": False,
+    })
+
+    job.future.result(timeout=5)
+    cache_dir = project_dir / "cache" / "renders"
+    assert job.status == "completed"
+    assert job.frames_done == 4
+    assert consumed == [0, 1, 2, 3]
+    assert not cache_dir.exists() or list(cache_dir.glob("*.pt")) == []
+
+
+def test_timeline_export_audio_only_skips_video_stream(tmp_path, monkeypatch):
+    import server.timeline_export as timeline_export
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "audio.wav").write_bytes(b"audio")
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    scene.audio_tracks = [
+        AudioTrack(
+            source_path=os.path.join("media", "audio.wav"),
+            timeline_start_frame=0,
+            timeline_end_frame=24,
+        )
+    ]
+    project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project", scenes=[scene], resolution=(2, 2))
+    save_project(project)
+
+    def fail_iter(*_args, **_kwargs):
+        raise AssertionError("audio-only export must not create video frames")
+
+    def fake_mix(_project, _scene, _start, _end, output_wav, **_kwargs):
+        with open(output_wav, "wb") as handle:
+            handle.write(b"mixed")
+        return []
+
+    def fake_encode_audio(_input_wav, output_path, **_kwargs):
+        with open(output_path, "wb") as handle:
+            handle.write(b"audio")
+
+    monkeypatch.setattr(timeline_export, "iter_scene_frames", fail_iter)
+    monkeypatch.setattr(timeline_export, "mix_scene_audio_to_wav", fake_mix)
+    monkeypatch.setattr(timeline_export, "encode_audio", fake_encode_audio)
+    monkeypatch.setattr(timeline_export, "ensure_thumbnail", lambda *_args, **_kwargs: True)
+
+    manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
+    job = manager.start(load_project(str(project_dir)), {
+        "scene_id": "scene-1",
+        "range": {"start": 0, "end": 24},
+        "include_video": False,
+        "include_audio": True,
+        "save_preset": "Compatible MP4",
+    })
+
+    job.future.result(timeout=5)
+    saved = load_project(str(project_dir))
+    asset = saved.get_asset(job.result_asset_id)
+    assert job.status == "completed"
+    assert asset.asset_type == "audio"
+    assert asset.folder == "Exports"
+    assert asset.path.replace("\\", "/").startswith("media/Exports/")
+
+
 def test_timeline_export_registration_reloads_current_project(tmp_path, monkeypatch):
-    import torch
     import server.timeline_export as timeline_export
 
     project_dir = tmp_path / "project"
@@ -207,11 +474,12 @@ def test_timeline_export_registration_reloads_current_project(tmp_path, monkeypa
     encode_started = threading.Event()
     continue_encode = threading.Event()
 
-    def fake_render(*_args, **_kwargs):
-        return torch.zeros(4, 2, 2, 3, dtype=torch.float32)
+    def fake_iter(*_args, **_kwargs):
+        return iter(np.zeros((4, 2, 2, 3), dtype=np.uint8))
 
     def fake_encode(frames_iter, *, output_path, **_kwargs):
         encode_started.set()
+        assert not isinstance(frames_iter, np.ndarray)
         assert continue_encode.wait(timeout=5)
         with open(output_path, "wb") as handle:
             handle.write(b"video")
@@ -224,7 +492,7 @@ def test_timeline_export_registration_reloads_current_project(tmp_path, monkeypa
             "browser_preview_compatible": True,
         }
 
-    monkeypatch.setattr(timeline_export, "render_scene_frames", fake_render)
+    monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
     monkeypatch.setattr(timeline_export, "encode_video", fake_encode)
     monkeypatch.setattr(timeline_export, "ensure_thumbnail", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(timeline_export, "_technical_video_metadata", lambda _path, fallback: dict(fallback))
@@ -258,7 +526,6 @@ def test_timeline_export_registration_reloads_current_project(tmp_path, monkeypa
 
 
 def test_timeline_export_non_take_writes_under_media_exports(tmp_path, monkeypatch):
-    import torch
     import server.timeline_export as timeline_export
 
     project_dir = tmp_path / "project"
@@ -267,8 +534,8 @@ def test_timeline_export_non_take_writes_under_media_exports(tmp_path, monkeypat
     project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project", scenes=[scene], resolution=(2, 2))
     save_project(project)
 
-    def fake_render(*_args, **_kwargs):
-        return torch.zeros(4, 2, 2, 3, dtype=torch.float32)
+    def fake_iter(*_args, **_kwargs):
+        return iter(np.zeros((4, 2, 2, 3), dtype=np.uint8))
 
     def fake_encode(frames_iter, *, output_path, **_kwargs):
         with open(output_path, "wb") as handle:
@@ -282,7 +549,7 @@ def test_timeline_export_non_take_writes_under_media_exports(tmp_path, monkeypat
             "browser_preview_compatible": True,
         }
 
-    monkeypatch.setattr(timeline_export, "render_scene_frames", fake_render)
+    monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
     monkeypatch.setattr(timeline_export, "encode_video", fake_encode)
     monkeypatch.setattr(timeline_export, "ensure_thumbnail", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(timeline_export, "_technical_video_metadata", lambda _path, fallback: dict(fallback))
@@ -341,7 +608,6 @@ def test_timeline_export_registration_reuses_same_path_asset(tmp_path, monkeypat
 
 
 def test_timeline_export_cleans_temp_audio_after_success(tmp_path, monkeypatch):
-    import torch
     import server.timeline_export as timeline_export
 
     project_dir = tmp_path / "project"
@@ -358,8 +624,8 @@ def test_timeline_export_cleans_temp_audio_after_success(tmp_path, monkeypatch):
     project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project", scenes=[scene], resolution=(2, 2))
     save_project(project)
 
-    def fake_render(*_args, **_kwargs):
-        return torch.zeros(4, 2, 2, 3, dtype=torch.float32)
+    def fake_iter(*_args, **_kwargs):
+        return iter(np.zeros((4, 2, 2, 3), dtype=np.uint8))
 
     def fake_mix(_project, _scene, _start, _end, output_wav, **_kwargs):
         with open(output_wav, "wb") as handle:
@@ -379,7 +645,7 @@ def test_timeline_export_cleans_temp_audio_after_success(tmp_path, monkeypatch):
             "browser_preview_compatible": True,
         }
 
-    monkeypatch.setattr(timeline_export, "render_scene_frames", fake_render)
+    monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
     monkeypatch.setattr(timeline_export, "mix_scene_audio_to_wav", fake_mix)
     monkeypatch.setattr(timeline_export, "encode_video", fake_encode)
     monkeypatch.setattr(timeline_export, "ensure_thumbnail", lambda *_args, **_kwargs: True)
@@ -402,7 +668,6 @@ def test_timeline_export_cleans_temp_audio_after_success(tmp_path, monkeypatch):
 
 
 def test_timeline_export_take_with_audio_adds_paired_audio_track(tmp_path, monkeypatch):
-    import torch
     import server.timeline_export as timeline_export
 
     project_dir = tmp_path / "project"
@@ -419,8 +684,8 @@ def test_timeline_export_take_with_audio_adds_paired_audio_track(tmp_path, monke
     project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project", scenes=[scene], resolution=(2, 2))
     save_project(project)
 
-    def fake_render(*_args, **_kwargs):
-        return torch.zeros(4, 2, 2, 3, dtype=torch.float32)
+    def fake_iter(*_args, **_kwargs):
+        return iter(np.zeros((4, 2, 2, 3), dtype=np.uint8))
 
     def fake_mix(_project, _scene, _start, _end, output_wav, **_kwargs):
         with open(output_wav, "wb") as handle:
@@ -444,7 +709,7 @@ def test_timeline_export_take_with_audio_adds_paired_audio_track(tmp_path, monke
         with open(cmd[-1], "wb") as handle:
             handle.write(b"audio" * 512)
 
-    monkeypatch.setattr(timeline_export, "render_scene_frames", fake_render)
+    monkeypatch.setattr(timeline_export, "iter_scene_frames", fake_iter)
     monkeypatch.setattr(timeline_export, "mix_scene_audio_to_wav", fake_mix)
     monkeypatch.setattr(timeline_export, "encode_video", fake_encode)
     monkeypatch.setattr(timeline_export, "run_ffmpeg_command", fake_run_ffmpeg)

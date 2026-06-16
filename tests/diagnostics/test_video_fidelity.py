@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -55,6 +56,7 @@ class _FakeStreamingProcess:
         self.write_error = write_error
         self.wait_error = wait_error
         self.killed = False
+        self.terminated = False
         self.stdin = _FakeStreamingStdin(self)
         captured["cmds"].append([str(part) for part in cmd])
         captured["kwargs"].append(kwargs)
@@ -72,6 +74,10 @@ class _FakeStreamingProcess:
     def kill(self):
         self.killed = True
         self.returncode = -9
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
 
 
 def _install_fake_streaming_popen(media_helpers, monkeypatch, **process_kwargs):
@@ -794,6 +800,201 @@ def test_encode_video_streams_frames_incrementally(tmp_path, monkeypatch):
     assert kwargs["stdout"] == subprocess.DEVNULL
     assert kwargs["stderr"] not in {subprocess.PIPE, subprocess.DEVNULL}
     assert captured["writes"] == [frames[0].tobytes(), frames[1].tobytes()]
+
+
+def test_encode_video_streams_generator_after_first_frame_inference(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    frames = np.arange(2 * 2 * 2 * 3, dtype=np.uint8).reshape((2, 2, 2, 3))
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    def frame_generator():
+        yield frames[0]
+        assert captured["cmds"], "ffmpeg should start after first-frame inference"
+        yield frames[1]
+
+    media_helpers.encode_video(
+        frame_generator(),
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "streamed_generator.mp4"),
+        fps=24,
+    )
+
+    assert captured["writes"] == [frames[0].tobytes(), frames[1].tobytes()]
+
+
+def test_encode_video_rejects_empty_and_ragged_iterables(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    with pytest.raises(ValueError, match="one or more RGB frames"):
+        media_helpers.encode_video(
+            iter(()),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "empty.mp4"),
+            fps=24,
+        )
+
+    with pytest.raises(ValueError, match="one or more RGB frames"):
+        media_helpers.encode_video(
+            iter([np.zeros((2, 2, 4), dtype=np.uint8)]),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "rgba.mp4"),
+            fps=24,
+        )
+
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    def ragged_generator():
+        yield np.zeros((2, 2, 3), dtype=np.uint8)
+        yield np.zeros((3, 2, 3), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="same-sized RGB frames"):
+        media_helpers.encode_video(
+            ragged_generator(),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "ragged.mp4"),
+            fps=24,
+        )
+
+    assert captured["processes"][0].terminated is True
+    assert captured["processes"][0].stdin.closed is True
+
+
+def test_encode_video_normalizes_generator_frame_dtype_per_frame(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    frames = [
+        np.full((2, 2, 3), 300.0, dtype=np.float32),
+        np.full((2, 2, 3), 1.5, dtype=np.float32),
+    ]
+
+    media_helpers.encode_video(
+        iter(frames),
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "dtype.mp4"),
+        fps=24,
+    )
+
+    assert captured["writes"][0] == bytes([255]) * 12
+    assert captured["writes"][1] == bytes([1]) * 12
+
+
+def test_encode_video_generator_cancel_terminates_process_and_closes_producer(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    cancel_event = threading.Event()
+    closed = False
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    def frame_generator():
+        nonlocal closed
+        try:
+            yield np.zeros((2, 2, 3), dtype=np.uint8)
+            cancel_event.set()
+            yield np.ones((2, 2, 3), dtype=np.uint8)
+        finally:
+            closed = True
+
+    with pytest.raises(media_helpers.MediaOperationCancelled):
+        media_helpers.encode_video(
+            frame_generator(),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "cancel.mp4"),
+            fps=24,
+            cancel_event=cancel_event,
+        )
+
+    assert captured["processes"][0].terminated is True
+    assert captured["processes"][0].stdin.closed is True
+    assert closed is True
+
+
+def test_encode_video_write_failure_closes_generator_producer(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    closed = False
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    _install_fake_streaming_popen(
+        media_helpers,
+        monkeypatch,
+        returncode=1,
+        stderr=b"pipe closed",
+        write_error=BrokenPipeError(),
+    )
+
+    def frame_generator():
+        nonlocal closed
+        try:
+            yield np.zeros((2, 2, 3), dtype=np.uint8)
+            yield np.ones((2, 2, 3), dtype=np.uint8)
+        finally:
+            closed = True
+
+    with pytest.raises(RuntimeError, match="pipe closed"):
+        media_helpers.encode_video(
+            frame_generator(),
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "write_failure.mp4"),
+            fps=24,
+        )
+
+    assert closed is True
+
+
+def test_encode_video_failure_closes_closeable_source_iterable(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    class CloseableFrames:
+        def __init__(self):
+            self.closed = False
+            self.frames = [
+                np.zeros((2, 2, 3), dtype=np.uint8),
+                np.ones((2, 2, 3), dtype=np.uint8),
+            ]
+
+        def __iter__(self):
+            return iter(self.frames)
+
+        def close(self):
+            self.closed = True
+
+    producer = CloseableFrames()
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    _install_fake_streaming_popen(
+        media_helpers,
+        monkeypatch,
+        returncode=1,
+        stderr=b"pipe closed",
+        write_error=BrokenPipeError(),
+    )
+
+    with pytest.raises(RuntimeError, match="pipe closed"):
+        media_helpers.encode_video(
+            producer,
+            preset_id="Compatible MP4",
+            output_path=str(tmp_path / "source_close.mp4"),
+            fps=24,
+        )
+
+    assert producer.closed is True
 
 
 def test_encode_video_streaming_nonzero_exit_includes_stderr(tmp_path, monkeypatch):
