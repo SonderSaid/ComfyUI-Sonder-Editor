@@ -132,6 +132,8 @@ class GuideFrame:
     source: str = ""                        # "asset" | "scene_boundary" (auto from adjacent scene)
     strength: float = 1.0                   # conditioning strength 0.0-1.0
     muted: bool = False                     # hidden from editor/conditioning without deleting
+    fit_mode: str = "pad_edge"              # fit | pad_edge | cover | stretch (default IS the fixed code constant)
+    crop_position: str = "center"          # center | top | bottom | left | right (only meaningful for cover)
 
     def to_dict(self) -> dict:
         return {
@@ -141,6 +143,8 @@ class GuideFrame:
             "source": self.source,
             "strength": self.strength,
             "muted": self.muted,
+            "fit_mode": self.fit_mode,
+            "crop_position": self.crop_position,
         }
 
     @classmethod
@@ -152,6 +156,8 @@ class GuideFrame:
             source=data.get("source", ""),
             strength=data.get("strength", 1.0),
             muted=bool(data.get("muted", False)),
+            fit_mode=data.get("fit_mode", "pad_edge"),
+            crop_position=data.get("crop_position", "center"),
         )
 
 
@@ -415,10 +421,12 @@ class Scene:
             "clips": [(c.source_path, c.timeline_start_frame, c.timeline_end_frame,
                         c.source_in_frame, c.opacity, c.track_index,
                         getattr(c, "role", "render"), getattr(c, "strength", 1.0),
-                        getattr(c, "muted", False))
+                        getattr(c, "muted", False),
+                        getattr(c, "fit_mode", "pad_edge"), getattr(c, "crop_position", "center"))
                        for c in self.clips],
             "guides": [(g.frame_index, g.asset_id, g.source,
-                        getattr(g, "strength", 1.0), getattr(g, "muted", False))
+                        getattr(g, "strength", 1.0), getattr(g, "muted", False),
+                        getattr(g, "fit_mode", "pad_edge"), getattr(g, "crop_position", "center"))
                        for g in self.guide_frames],
             "audio": [(a.source_path, a.timeline_start_frame, a.timeline_end_frame,
                         a.source_in_frame, a.volume, a.muted, a.lane_index)
@@ -644,6 +652,8 @@ class ClipReference:
     role: str = "render"                    # render | motion_driver
     strength: float = 1.0                   # motion-driver conditioning strength
     muted: bool = False                     # hidden from viewport/render/motion output
+    fit_mode: str = "pad_edge"              # fit | pad_edge | cover | stretch (default IS the fixed code constant)
+    crop_position: str = "center"          # center | top | bottom | left | right (only meaningful for cover)
     prompt: str = ""
     is_generated: bool = False
     generation_params: dict = field(default_factory=dict)
@@ -674,6 +684,8 @@ class ClipReference:
             "role": self.role,
             "strength": self.strength,
             "muted": self.muted,
+            "fit_mode": self.fit_mode,
+            "crop_position": self.crop_position,
             "prompt": self.prompt,
             "is_generated": self.is_generated,
             "generation_params": self.generation_params,
@@ -702,6 +714,8 @@ class ClipReference:
             role=role,
             strength=data.get("strength", 1.0),
             muted=bool(data.get("muted", False)),
+            fit_mode=data.get("fit_mode", "pad_edge"),
+            crop_position=data.get("crop_position", "center"),
             prompt=data.get("prompt", ""),
             is_generated=data.get("is_generated", False),
             generation_params=data.get("generation_params", {}),

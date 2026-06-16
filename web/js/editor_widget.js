@@ -172,9 +172,13 @@ import {
 } from "./keyboard_ownership.js";
 import {
     ASPECT_RATIO_PRESETS,
+    CROP_POSITION_OPTIONS,
     CUSTOM_OUTPUT_KIND_VIDEO,
     DEFAULT_EDITOR_SETTINGS,
+    FIT_MODE_OPTIONS,
     RESOLUTION_TIERS,
+    VALID_CROP_POSITIONS,
+    VALID_FIT_MODES,
     computeResolutionFromTier,
     frameConstraintsEqual,
     getEditorSettings,
@@ -2131,6 +2135,8 @@ export class EditorWidget {
             source: fields.source || "asset",
             strength: fields.strength ?? this._defaultGuideStrength(),
             muted: !!fields.muted,
+            fit_mode: VALID_FIT_MODES.has(fields.fit_mode) ? fields.fit_mode : this._defaultFitMode(),
+            crop_position: VALID_CROP_POSITIONS.has(fields.crop_position) ? fields.crop_position : this._defaultCropPosition(),
         };
         this.activeScene.guide_frames = (this.activeScene.guide_frames || [])
             .filter((current) => current.frame_index !== frameIndex);
@@ -3522,6 +3528,28 @@ export class EditorWidget {
             ?? 1.0;
     }
 
+    _defaultFitMode() {
+        const value = this._settings?.projectDefaults?.defaultFitMode
+            ?? DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultFitMode;
+        return VALID_FIT_MODES.has(value) ? value : "pad_edge";
+    }
+
+    _defaultCropPosition() {
+        const value = this._settings?.projectDefaults?.defaultCropPosition
+            ?? DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultCropPosition;
+        return VALID_CROP_POSITIONS.has(value) ? value : "center";
+    }
+
+    // Stamp browser-local fit defaults onto a create-fields/POST body before it is
+    // both optimistically applied and persisted, so the local mirror and saved record
+    // agree. This is the ONLY place the browser default is consulted — never a
+    // render-time fallback (that's the fixed code constant in the backend from_dict).
+    _seedFitDefaults(fields = {}) {
+        if (fields.fit_mode == null) fields.fit_mode = this._defaultFitMode();
+        if (fields.crop_position == null) fields.crop_position = this._defaultCropPosition();
+        return fields;
+    }
+
     async _toggleAnimatic() {
         if (!this.activeScene || !this.projectDir) return;
 
@@ -3962,6 +3990,8 @@ export class EditorWidget {
         const nextStreamingMode = nextSettings?.playback?.streamingMode ?? "auto";
         const prevLaneTintSignature = JSON.stringify(this._settings?.appearance?.laneTintOverrides || {});
         const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
+        const prevSceneOutline = this._settings?.appearance?.sceneOutline !== false;
+        const nextSceneOutline = nextSettings?.appearance?.sceneOutline !== false;
         this._settings = nextSettings;
         this._syncTakePlacementModeWidget(nextSettings);
         const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
@@ -4002,6 +4032,9 @@ export class EditorWidget {
         }
         if (prevLaneTintSignature !== nextLaneTintSignature && this.timelineCanvas) {
             this._renderTimeline();
+        }
+        if (prevSceneOutline !== nextSceneOutline && !this.isPlaying) {
+            this._renderViewportFrame();
         }
         if (this._queueContainer && prevQueueExpanded !== this._queueExpanded) {
             this._applyQueueExpandedState();
@@ -5494,6 +5527,23 @@ export class EditorWidget {
                 }
                 const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
                 this._createPromptSection(frame);
+                return;
+            }
+            // Double-click a clip/audio/guide isolates just that item (ignoring its
+            // linked group) so the inline property editor opens. Single-click keeps
+            // selecting the whole linked group for group operations. Locked items
+            // stay unselectable (no-op), matching the locked-selection rule.
+            const itemHit = this._hitTestItem(x, rawY);
+            if (
+                itemHit
+                && (itemHit.type === "clip" || itemHit.type === "audio" || itemHit.type === "guide")
+                && !this._isItemLocked(itemHit)
+            ) {
+                this._selectItem(itemHit);
+                this.selectedItem = this._findSceneItemBySelection(itemHit.type, itemHit.id) || itemHit;
+                this._selectedPromptIdx = null;
+                this._showItemEditor();
+                this._renderTimeline();
             }
         });
 
@@ -5909,6 +5959,8 @@ export class EditorWidget {
                 role: "motion_driver",
                 strength: this._defaultMotionDriverStrength(),
                 muted: false,
+                fit_mode: this._defaultFitMode(),
+                crop_position: this._defaultCropPosition(),
             });
             this._renderSceneAfterLocalMutation();
             try {
@@ -5922,6 +5974,8 @@ export class EditorWidget {
                         role: "motion_driver",
                         strength: this._defaultMotionDriverStrength(),
                         dual_drop: false,
+                        fit_mode: this._defaultFitMode(),
+                        crop_position: this._defaultCropPosition(),
                     }),
                 });
                 if (!resp.ok) {
@@ -6077,13 +6131,13 @@ export class EditorWidget {
         try {
             if (asset.asset_type === "image") {
                 // Images always create guide frames (regardless of which track they're dropped on)
-                const guideFields = {
+                const guideFields = this._seedFitDefaults({
                     guide_id: this._newLocalItemId("guide"),
                     frame_index: frame,
                     asset_id: asset.asset_id,
                     source: "asset",
                     strength: this._defaultGuideStrength(),
-                };
+                });
                 this._applyLocalCreateGuide(guideFields);
                 this._renderSceneAfterLocalMutation();
                 resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/guides`), {
@@ -6122,6 +6176,8 @@ export class EditorWidget {
                     role: "render",
                     opacity: 1.0,
                     muted: false,
+                    fit_mode: this._defaultFitMode(),
+                    crop_position: this._defaultCropPosition(),
                 };
                 this.activeScene.clips = this.activeScene.clips || [];
                 this.activeScene.clips.push(optimisticClip);
@@ -6149,6 +6205,8 @@ export class EditorWidget {
                     audio_lane_index: dualDrop ? targetAudioLane : 0,
                     dual_drop: dualDrop,
                     link_video_audio: this._settings?.timelineBehavior?.linkedVideoAudioDrop !== false,
+                    fit_mode: this._defaultFitMode(),
+                    crop_position: this._defaultCropPosition(),
                 };
                 resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
                     method: "POST",
@@ -7516,6 +7574,7 @@ export class EditorWidget {
                     this._renderViewportFrame();
                 });
                 editor.appendChild(clipMuteBtn);
+                this._appendFitModeControls(editor, type, id, data);
             } else {
                 // Volume slider for audio
                 const volLabel = this._makeEditorLabel("Vol:");
@@ -7615,6 +7674,7 @@ export class EditorWidget {
                 this._renderViewportFrame();
             });
             editor.appendChild(guideMuteBtn);
+            this._appendFitModeControls(editor, type, id, data);
 
             const applyGuideEdit = () => {
                 const newIdx = this._parsePositionInput(frameInput.value);
@@ -7695,6 +7755,55 @@ export class EditorWidget {
         input.max = max;
         input.style.cssText = chromeInputCss({ width: "60px", fontSize: "11px", padding: "2px 4px", textAlign: "right" });
         return input;
+    }
+
+    // Per-item fit-mode + crop-position controls for the selected clip/guide editor.
+    // Crop anchor only shows for `cover`. Persists via the standard update_clip /
+    // update_guide property path; the local `data` mirror is updated optimistically.
+    _appendFitModeControls(editor, type, id, data) {
+        const selectCss = `${chromeInputCss({ fontSize: "10px", padding: "2px 4px", textAlign: "left" })} min-width:96px; cursor:pointer;`;
+        const fitLabel = this._makeEditorLabel("Fit:");
+        const fitSelect = document.createElement("select");
+        fitSelect.style.cssText = selectCss;
+        for (const opt of FIT_MODE_OPTIONS) {
+            const el = document.createElement("option");
+            el.value = opt.value;
+            el.textContent = opt.label;
+            fitSelect.appendChild(el);
+        }
+        fitSelect.value = VALID_FIT_MODES.has(data.fit_mode) ? data.fit_mode : "pad_edge";
+
+        const cropLabel = this._makeEditorLabel("Crop:");
+        const cropSelect = document.createElement("select");
+        cropSelect.style.cssText = selectCss;
+        for (const opt of CROP_POSITION_OPTIONS) {
+            const el = document.createElement("option");
+            el.value = opt.value;
+            el.textContent = opt.label;
+            cropSelect.appendChild(el);
+        }
+        cropSelect.value = VALID_CROP_POSITIONS.has(data.crop_position) ? data.crop_position : "center";
+
+        const syncCropVisibility = () => {
+            const showCrop = fitSelect.value === "cover";
+            cropLabel.style.display = showCrop ? "" : "none";
+            cropSelect.style.display = showCrop ? "" : "none";
+        };
+        syncCropVisibility();
+
+        fitSelect.addEventListener("change", () => {
+            const value = VALID_FIT_MODES.has(fitSelect.value) ? fitSelect.value : "pad_edge";
+            data.fit_mode = value;
+            syncCropVisibility();
+            this._updateItemProperty(type, id, { fit_mode: value });
+        });
+        cropSelect.addEventListener("change", () => {
+            const value = VALID_CROP_POSITIONS.has(cropSelect.value) ? cropSelect.value : "center";
+            data.crop_position = value;
+            this._updateItemProperty(type, id, { crop_position: value });
+        });
+
+        editor.append(fitLabel, fitSelect, cropLabel, cropSelect);
     }
 
     async _moveItemToFrame(type, id, data, newStart) {
@@ -7948,6 +8057,11 @@ export class EditorWidget {
             strength,
             muted: !!guideData.muted,
         };
+        // Preserve fit fields across the delete+recreate move (guides are keyed by
+        // frame_index). Only sent when present so the backend falls back to the
+        // existing guide's values rather than rejecting an empty string.
+        if (guideData.fit_mode != null) fields.fit_mode = guideData.fit_mode;
+        if (guideData.crop_position != null) fields.crop_position = guideData.crop_position;
         this._applyLocalMoveGuide(oldIdx, newIdx, guideData, fields);
         this._clearSelection();
         this._hideItemEditor();
@@ -8300,13 +8414,13 @@ export class EditorWidget {
                 notifyInfo("Captured via backend (viewport snapshot unavailable)");
             }
 
-            const fields = {
+            const fields = this._seedFitDefaults({
                 guide_id: this._newLocalItemId("guide"),
                 frame_index: this.playhead,
                 asset_id: asset.asset_id,
                 source: "asset",
                 strength: 1.0,
-            };
+            });
             this._pushUndo("add guide");
             this._applyLocalCreateGuide(fields);
             this._renderSceneAfterLocalMutation();
@@ -11497,6 +11611,7 @@ export class EditorWidget {
             isPrebufferEnabled: () => !!this._settings?.playback?.prebufferEnabled,
             getPrebufferLookaheadMs: () => this._settings?.playback?.prebufferLookaheadMs ?? 1000,
             getStreamingMode: () => this._settings?.playback?.streamingMode ?? "auto",
+            isSceneOutlineEnabled: () => this._settings?.appearance?.sceneOutline !== false,
             onFrameChange: (frame, meta = {}) => {
                 this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
                 if (meta.reason === "playback" || meta.reason === "playback-loop" || meta.reason === "playback-stop-return") {

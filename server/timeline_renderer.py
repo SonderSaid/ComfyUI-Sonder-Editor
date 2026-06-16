@@ -131,7 +131,11 @@ def render_scene_frames(
                     continue
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                placed, (dx, dy, dw, dh) = fit_frame_to_canvas(frame_rgb, proj_w, proj_h)
+                placed, (dx, dy, dw, dh) = fit_frame_to_canvas(
+                    frame_rgb, proj_w, proj_h,
+                    mode=getattr(clip, "fit_mode", "pad_edge"),
+                    crop_position=getattr(clip, "crop_position", "center"),
+                )
                 if getattr(clip, "opacity", 1.0) >= 1.0:
                     canvas[dy:dy + dh, dx:dx + dw] = placed[dy:dy + dh, dx:dx + dw]
                 else:

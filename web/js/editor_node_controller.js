@@ -384,7 +384,21 @@ function loadDormantPreviewImage(cache, src, onReady) {
     return null;
 }
 
-function drawDormantCanvasMedia(canvas, media, { opacity = 1 } = {}) {
+// Per-item fit modes mirror server/media_helpers.py and the fullscreen viewport.
+// Dormant is a separate renderer by design (dormant/fullscreen separation), so the
+// per-mode branch is duplicated here rather than shared. Dormant draws no scene
+// outline (intentionally out of scope).
+const DORMANT_FIT_MODES = new Set(["fit", "pad_edge", "cover", "stretch"]);
+
+function dormantFitOptions(item) {
+    const mode = item?.fit_mode;
+    return {
+        fitMode: DORMANT_FIT_MODES.has(mode) ? mode : "pad_edge",
+        cropPosition: item?.crop_position || "center",
+    };
+}
+
+function drawDormantCanvasMedia(canvas, media, { opacity = 1, fitMode = "pad_edge", cropPosition = "center" } = {}) {
     const ctx = canvas?.getContext?.("2d");
     if (!ctx || !canvas || !media) return false;
     const mediaWidth = Math.max(
@@ -403,15 +417,43 @@ function drawDormantCanvasMedia(canvas, media, { opacity = 1 } = {}) {
     );
     const canvasWidth = Math.max(1, canvas.width || 1);
     const canvasHeight = Math.max(1, canvas.height || 1);
-    const scale = Math.min(canvasWidth / mediaWidth, canvasHeight / mediaHeight);
-    const drawWidth = Math.max(1, Math.round(mediaWidth * scale));
-    const drawHeight = Math.max(1, Math.round(mediaHeight * scale));
-    const drawX = Math.floor((canvasWidth - drawWidth) / 2);
-    const drawY = Math.floor((canvasHeight - drawHeight) / 2);
+    const mode = DORMANT_FIT_MODES.has(fitMode) ? fitMode : "pad_edge";
     const prevAlpha = ctx.globalAlpha;
     if (opacity < 1) ctx.globalAlpha = Math.max(0, opacity);
     try {
-        ctx.drawImage(media, drawX, drawY, drawWidth, drawHeight);
+        if (mode === "stretch") {
+            ctx.drawImage(media, 0, 0, canvasWidth, canvasHeight);
+        } else if (mode === "cover") {
+            const coverScale = Math.max(canvasWidth / mediaWidth, canvasHeight / mediaHeight);
+            const srcW = Math.min(mediaWidth, canvasWidth / coverScale);
+            const srcH = Math.min(mediaHeight, canvasHeight / coverScale);
+            const xExtra = mediaWidth - srcW;
+            const yExtra = mediaHeight - srcH;
+            let sx = xExtra / 2;
+            if (cropPosition === "left") sx = 0;
+            else if (cropPosition === "right") sx = xExtra;
+            let sy = yExtra / 2;
+            if (cropPosition === "top") sy = 0;
+            else if (cropPosition === "bottom") sy = yExtra;
+            ctx.drawImage(media, sx, sy, srcW, srcH, 0, 0, canvasWidth, canvasHeight);
+        } else {
+            const scale = Math.min(canvasWidth / mediaWidth, canvasHeight / mediaHeight);
+            const drawWidth = Math.max(1, Math.round(mediaWidth * scale));
+            const drawHeight = Math.max(1, Math.round(mediaHeight * scale));
+            const drawX = Math.floor((canvasWidth - drawWidth) / 2);
+            const drawY = Math.floor((canvasHeight - drawHeight) / 2);
+            ctx.drawImage(media, drawX, drawY, drawWidth, drawHeight);
+            if (mode === "pad_edge") {
+                const left = drawX;
+                const top = drawY;
+                const right = canvasWidth - (drawX + drawWidth);
+                const bottom = canvasHeight - (drawY + drawHeight);
+                if (left > 0.5) ctx.drawImage(media, 0, 0, 1, mediaHeight, 0, drawY, left, drawHeight);
+                if (right > 0.5) ctx.drawImage(media, mediaWidth - 1, 0, 1, mediaHeight, drawX + drawWidth, drawY, right, drawHeight);
+                if (top > 0.5) ctx.drawImage(media, 0, 0, mediaWidth, 1, drawX, 0, drawWidth, top);
+                if (bottom > 0.5) ctx.drawImage(media, 0, mediaHeight - 1, mediaWidth, 1, drawX, drawY + drawHeight, drawWidth, bottom);
+            }
+        }
     } catch (error) {
         ctx.globalAlpha = prevAlpha;
         return false;
@@ -552,6 +594,8 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
     const guidePreview = guideAsset && !isMissingAsset(guideAsset)
         ? {
             posterUrl: buildProjectAssetViewURL(projectDir, guideAsset.path),
+            fit_mode: guide?.fit_mode,
+            crop_position: guide?.crop_position,
         }
         : null;
 
@@ -629,6 +673,8 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
                 label: `Guide ${guideFrame}`,
                 subtitle: guideAsset.name || guideAsset.path.split(/[/\\]/).pop() || "Guide",
                 posterUrl: buildProjectAssetViewURL(projectDir, guideAsset.path),
+                fit_mode: guide?.fit_mode,
+                crop_position: guide?.crop_position,
             };
         }
     }
@@ -3815,7 +3861,7 @@ export class EditorNodeController {
         function drawGuideBackground(target) {
             if (!target?.guide?.posterUrl) return false;
             const guideImage = loadDormantPreviewImage(previewImageCache, target.guide.posterUrl, () => scheduleRender());
-            return !!guideImage && drawDormantCanvasMedia(canvas, guideImage);
+            return !!guideImage && drawDormantCanvasMedia(canvas, guideImage, dormantFitOptions(target.guide));
         }
 
         function updateTransport() {
@@ -3890,7 +3936,7 @@ export class EditorNodeController {
             }
             if (target.kind === "image") {
                 const image = loadDormantPreviewImage(previewImageCache, target.posterUrl, () => scheduleRender());
-                if (image && drawDormantCanvasMedia(canvas, image)) {
+                if (image && drawDormantCanvasMedia(canvas, image, dormantFitOptions(target))) {
                     return;
                 }
                 drawDormantCanvasMessage(canvas, "Loading guide...", target.subtitle || "");
@@ -3985,7 +4031,7 @@ export class EditorNodeController {
                         prepareDormantVideo(entry, layer, frame, "scrub", { force: forceSeek });
                     }
                     if (isDormantVideoDrawable(entry, layer, frame, { playing: false })) {
-                        drewAny = drawDormantCanvasMedia(canvas, entry.el, { opacity: layer.opacity ?? 1 }) || drewAny;
+                        drewAny = drawDormantCanvasMedia(canvas, entry.el, { opacity: layer.opacity ?? 1, ...dormantFitOptions(layer.clip) }) || drewAny;
                         entry.lastCommittedFrame = frame;
                         entry.lastDrawnMediaTime = entry.el.currentTime || 0;
                     }
@@ -4014,7 +4060,7 @@ export class EditorNodeController {
                 clearDormantCanvas(canvas);
                 let drewAny = drawGuideBackground(target);
                 for (const { entry, layer } of drawableLayers) {
-                    drewAny = drawDormantCanvasMedia(canvas, entry.el, { opacity: layer.opacity ?? 1 }) || drewAny;
+                    drewAny = drawDormantCanvasMedia(canvas, entry.el, { opacity: layer.opacity ?? 1, ...dormantFitOptions(layer.clip) }) || drewAny;
                     entry.lastCommittedFrame = frame;
                     entry.lastDrawnMediaTime = entry.el.currentTime || 0;
                 }

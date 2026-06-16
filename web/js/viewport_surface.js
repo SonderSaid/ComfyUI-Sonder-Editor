@@ -42,6 +42,42 @@ function fitRect(sourceWidth, sourceHeight, targetWidth, targetHeight) {
     return { x: (safeTargetWidth - width) / 2, y: 0, width, height };
 }
 
+// Per-item fit modes mirror server/media_helpers.py. Preview must show the chosen
+// framing or it lies about what will render. Canvas smoothing isn't AREA/Lanczos,
+// so this is framing-accurate, not pixel-accurate.
+const VIEWPORT_FIT_MODES = new Set(["fit", "pad_edge", "cover", "stretch"]);
+
+function fitOptionsFor(item) {
+    const mode = item?.fit_mode;
+    return {
+        fitMode: VIEWPORT_FIT_MODES.has(mode) ? mode : "pad_edge",
+        cropPosition: item?.crop_position || "center",
+    };
+}
+
+// pad_edge: stretch the 1px source edge across each letterbox/pillarbox bar so the
+// framing matches `fit` but without a hard black edge (mirrors cv2 BORDER_REPLICATE).
+function drawEdgePadBars(ctx, element, rect, canvasW, canvasH, srcW, srcH) {
+    const left = rect.x;
+    const top = rect.y;
+    const right = canvasW - (rect.x + rect.width);
+    const bottom = canvasH - (rect.y + rect.height);
+    try {
+        if (left > 0.5) {
+            ctx.drawImage(element, 0, 0, 1, srcH, 0, rect.y, left, rect.height);
+        }
+        if (right > 0.5) {
+            ctx.drawImage(element, srcW - 1, 0, 1, srcH, rect.x + rect.width, rect.y, right, rect.height);
+        }
+        if (top > 0.5) {
+            ctx.drawImage(element, 0, 0, srcW, 1, rect.x, 0, rect.width, top);
+        }
+        if (bottom > 0.5) {
+            ctx.drawImage(element, 0, srcH - 1, srcW, 1, rect.x, rect.y + rect.height, rect.width, bottom);
+        }
+    } catch (error) {}
+}
+
 function removeMediaSource(mediaEl) {
     if (!mediaEl) return;
     try {
@@ -309,6 +345,7 @@ export function createViewportSurface(options = {}) {
     const isPrebufferEnabled = options.isPrebufferEnabled || (() => true);
     const getPrebufferLookaheadMs = options.getPrebufferLookaheadMs || (() => 1000);
     const getStreamingMode = options.getStreamingMode || (() => "auto");
+    const isSceneOutlineEnabled = options.isSceneOutlineEnabled || (() => false);
 
     function currentFrame() {
         return clamp(Math.round(Number(getFrame()) || 0), 0, totalFrames());
@@ -547,22 +584,70 @@ export function createViewportSurface(options = {}) {
         }
     }
 
-    function drawImageLike(element, { opacity = 1 } = {}) {
+    function drawImageLike(element, { opacity = 1, fitMode = "pad_edge", cropPosition = "center" } = {}) {
         const ctx = getCanvasContext();
         if (!ctx || !state.canvas || !element) return false;
-        const width = element.videoWidth || element.naturalWidth || element.width || state.canvas.width;
-        const height = element.videoHeight || element.naturalHeight || element.height || state.canvas.height;
-        const rect = fitRect(width, height, state.canvas.width, state.canvas.height);
+        const canvasW = state.canvas.width;
+        const canvasH = state.canvas.height;
+        const width = element.videoWidth || element.naturalWidth || element.width || canvasW;
+        const height = element.videoHeight || element.naturalHeight || element.height || canvasH;
+        const mode = VIEWPORT_FIT_MODES.has(fitMode) ? fitMode : "pad_edge";
         const previousAlpha = ctx.globalAlpha;
         ctx.globalAlpha = clamp(Number(opacity) || 0, 0, 1);
         try {
-            ctx.drawImage(element, rect.x, rect.y, rect.width, rect.height);
+            if (mode === "stretch") {
+                ctx.drawImage(element, 0, 0, canvasW, canvasH);
+            } else if (mode === "cover") {
+                // Source sub-rect that fills the canvas, anchored by cropPosition.
+                // Math mirrors the backend cover crop so preview and render agree.
+                const scale = Math.max(canvasW / width, canvasH / height);
+                const srcW = Math.min(width, canvasW / scale);
+                const srcH = Math.min(height, canvasH / scale);
+                const xExtra = width - srcW;
+                const yExtra = height - srcH;
+                let sx = xExtra / 2;
+                if (cropPosition === "left") sx = 0;
+                else if (cropPosition === "right") sx = xExtra;
+                let sy = yExtra / 2;
+                if (cropPosition === "top") sy = 0;
+                else if (cropPosition === "bottom") sy = yExtra;
+                ctx.drawImage(element, sx, sy, srcW, srcH, 0, 0, canvasW, canvasH);
+            } else {
+                // fit / pad_edge: contain, centered.
+                const rect = fitRect(width, height, canvasW, canvasH);
+                ctx.drawImage(element, rect.x, rect.y, rect.width, rect.height);
+                if (mode === "pad_edge") {
+                    drawEdgePadBars(ctx, element, rect, canvasW, canvasH, width, height);
+                }
+            }
             return true;
         } catch (error) {
             return false;
         } finally {
             ctx.globalAlpha = previousAlpha;
         }
+    }
+
+    // Scene workspace outline. The canvas buffer is sized to the scene aspect
+    // exactly, so the scene frame == the canvas edge; inset ~1px so the half-pixel
+    // stroke isn't clipped. Drawn at the tail of ALL composite paths (playback,
+    // live, static) so it stays visible while paused/scrubbing — exactly when
+    // reading pad_edge / cover boundaries matters most.
+    function drawSceneOutline() {
+        if (!isSceneOutlineEnabled()) return;
+        const ctx = getCanvasContext();
+        if (!ctx || !state.canvas) return;
+        const w = state.canvas.width;
+        const h = state.canvas.height;
+        if (w < 3 || h < 3) return;
+        const previousAlpha = ctx.globalAlpha;
+        ctx.save();
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = THEME.fg3;
+        ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+        ctx.restore();
+        ctx.globalAlpha = previousAlpha;
     }
 
     function imageLikeDrawRect(element) {
@@ -1132,7 +1217,7 @@ export function createViewportSurface(options = {}) {
         const guideImage = await loadGuideLayer(snapshot);
         if (state.destroyed || state.isPlaying || renderToken !== state.renderToken) return;
         if (guideImage) {
-            sources.push({ element: guideImage, opacity: 1 });
+            sources.push({ element: guideImage, opacity: 1, ...fitOptionsFor(snapshot.guide) });
         }
         for (const layer of snapshot.playableClipLayers) {
             const src = resolvePreviewImageUrl(layer);
@@ -1141,19 +1226,20 @@ export function createViewportSurface(options = {}) {
             const img = await loadImage(cacheKey, src);
             if (state.destroyed || state.isPlaying || renderToken !== state.renderToken) return;
             if (img) {
-                sources.push({ element: img, opacity: layer.opacity });
+                sources.push({ element: img, opacity: layer.opacity, ...fitOptionsFor(layer.clip) });
             }
         }
         drawBlack();
         let drewAny = false;
         for (const source of sources) {
-            if (drawImageLike(source.element, { opacity: source.opacity })) {
+            if (drawImageLike(source.element, { opacity: source.opacity, fitMode: source.fitMode, cropPosition: source.cropPosition })) {
                 drewAny = true;
             }
         }
         if (!drewAny) {
             drawViewportText("Preview unavailable", "Click Load Preview for live media.");
         }
+        drawSceneOutline();
     }
 
     function clipSourceTime(layer, frame) {
@@ -1572,7 +1658,7 @@ export function createViewportSurface(options = {}) {
                 };
             }
             if (guide.element) {
-                renderables.push({ type: "guide", element: guide.element, opacity: 1 });
+                renderables.push({ type: "guide", element: guide.element, opacity: 1, guide: snapshot.guide });
             }
         } else if (snapshot?.guide && snapshot.guideAsset && !snapshot.guideAsset.missing) {
             skippedLayers.push({
@@ -1670,7 +1756,7 @@ export function createViewportSurface(options = {}) {
             const src = buildViewUrl(layer.asset.path || layer.clip?.source_path || "");
             if (!src) return null;
             const img = await loadImage(`live-image:${layer.asset.asset_id || layer.key}`, src);
-            return img ? { type: "image", element: img, opacity: layer.opacity } : null;
+            return img ? { type: "image", element: img, opacity: layer.opacity, clip: layer.clip } : null;
         }
         const video = getOrCreateVideo(layer);
         if (!video) return null;
@@ -1681,7 +1767,7 @@ export function createViewportSurface(options = {}) {
             requireTarget: true,
             waitForFrame: true,
         });
-        return sought ? { type: "video", element: sought, opacity: layer.opacity } : null;
+        return sought ? { type: "video", element: sought, opacity: layer.opacity, clip: layer.clip } : null;
     }
 
     async function renderLiveComposite(snapshot, renderToken) {
@@ -1694,17 +1780,18 @@ export function createViewportSurface(options = {}) {
         drawBlack();
         let drewAny = false;
         if (guideImage) {
-            drewAny = drawImageLike(guideImage, { opacity: 1 }) || drewAny;
+            drewAny = drawImageLike(guideImage, { opacity: 1, ...fitOptionsFor(snapshot.guide) }) || drewAny;
         }
         for (const layer of renderableLayers) {
             if (!layer?.element) continue;
-            if (drawImageLike(layer.element, { opacity: layer.opacity })) {
+            if (drawImageLike(layer.element, { opacity: layer.opacity, ...fitOptionsFor(layer.clip) })) {
                 drewAny = true;
             }
         }
         if (!drewAny) {
             drawViewportText("Loading preview...", "");
         }
+        drawSceneOutline();
     }
 
     function syncPlaybackMedia(snapshot) {
@@ -1805,7 +1892,8 @@ export function createViewportSurface(options = {}) {
         drawBlack();
         let drewAny = false;
         for (const renderable of preflight.renderables || []) {
-            const didDraw = drawImageLike(renderable.element, { opacity: renderable.opacity });
+            const fitItem = renderable.type === "guide" ? renderable.guide : renderable.layer?.clip;
+            const didDraw = drawImageLike(renderable.element, { opacity: renderable.opacity, ...fitOptionsFor(fitItem) });
             if (renderable.type === "video" && renderable.active) {
                 pauseTailPlaybackVideo(renderable.active, renderable.layer, snapshot.frame);
             }
@@ -1817,6 +1905,7 @@ export function createViewportSurface(options = {}) {
                 }
             }
         }
+        drawSceneOutline();
         state.playbackCompositeCommitted = true;
         state.playbackBlockedSinceMs = null;
         state.playbackBlockedSignature = "";

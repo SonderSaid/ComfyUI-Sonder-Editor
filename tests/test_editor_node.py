@@ -837,7 +837,7 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_guide_image",
-        lambda self, path, asset_type, target_w, target_h: torch.ones(target_h, target_w, 3, dtype=torch.float32),
+        lambda self, path, asset_type, target_w, target_h, **_kwargs: torch.ones(target_h, target_w, 3, dtype=torch.float32),
     )
 
     result = editor_node.SonderEditor().execute(
@@ -907,6 +907,7 @@ def test_guide_image_output_letterboxes_to_project_canvas(tmp_path, monkeypatch)
         "image",
         4,
         4,
+        fit_mode="fit",
     )
 
     assert tuple(tensor.shape) == (4, 4, 3)
@@ -1402,7 +1403,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_guide_image",
-        lambda self, path, asset_type, target_w, target_h: torch.ones(target_h, target_w, 3, dtype=torch.float32),
+        lambda self, path, asset_type, target_w, target_h, **_kwargs: torch.ones(target_h, target_w, 3, dtype=torch.float32),
     )
 
     node = editor_node.SonderEditor()

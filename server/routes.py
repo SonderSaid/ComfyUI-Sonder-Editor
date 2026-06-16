@@ -10,6 +10,10 @@ from datetime import datetime, timedelta
 from aiohttp import web
 
 from .media_helpers import (
+    CROP_POSITIONS,
+    DEFAULT_CROP_POSITION,
+    DEFAULT_FIT_MODE,
+    FIT_MODES,
     decode_video_frame,
     get_ffmpeg_path,
     get_ffprobe_path,
@@ -1078,6 +1082,8 @@ def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int) -> C
         role=getattr(clip, "role", "render"),
         strength=getattr(clip, "strength", 1.0),
         muted=getattr(clip, "muted", False),
+        fit_mode=getattr(clip, "fit_mode", "pad_edge"),
+        crop_position=getattr(clip, "crop_position", "center"),
         prompt=getattr(clip, "prompt", ""),
         is_generated=getattr(clip, "is_generated", False),
         generation_params=dict(getattr(clip, "generation_params", {}) or {}),
@@ -1336,6 +1342,20 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
         _trim_lane_configs(scene.audio_lane_configs, lane_index, scene.audio_lane_count)
 
 
+def _validated_fit_mode(value) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in FIT_MODES:
+        _mutation_error(f"Invalid fit_mode: {value}", 400, "invalid_fit_mode")
+    return mode
+
+
+def _validated_crop_position(value) -> str:
+    pos = str(value or "").strip().lower()
+    if pos not in CROP_POSITIONS:
+        _mutation_error(f"Invalid crop_position: {value}", 400, "invalid_crop_position")
+    return pos
+
+
 def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fields: dict) -> ClipReference:
     if not isinstance(fields, dict):
         _mutation_error("update_clip requires fields", 400)
@@ -1375,6 +1395,10 @@ def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fie
         clip.strength = float(fields["strength"])
     if "muted" in fields:
         clip.muted = bool(fields["muted"])
+    if "fit_mode" in fields:
+        clip.fit_mode = _validated_fit_mode(fields["fit_mode"])
+    if "crop_position" in fields:
+        clip.crop_position = _validated_crop_position(fields["crop_position"])
     return clip
 
 
@@ -1559,6 +1583,8 @@ def _apply_move_guide(scene: Scene, op: dict) -> GuideFrame:
         source=str(op.get("source", getattr(guide, "source", "") or "asset") or "asset"),
         strength=_mutation_float(op.get("strength", getattr(guide, "strength", 1.0)), "strength", 1.0),
         muted=bool(op.get("muted", getattr(guide, "muted", False))),
+        fit_mode=_validated_fit_mode(op["fit_mode"]) if "fit_mode" in op else getattr(guide, "fit_mode", "pad_edge"),
+        crop_position=_validated_crop_position(op["crop_position"]) if "crop_position" in op else getattr(guide, "crop_position", "center"),
     )
     replaced_ids = [
         getattr(current, "guide_id", "")
@@ -1588,6 +1614,10 @@ def _apply_update_guide(scene: Scene, frame_index: int, fields: dict, expected: 
         guide.asset_id = str(fields["asset_id"] or "")
     if "source" in fields:
         guide.source = str(fields["source"] or "asset")
+    if "fit_mode" in fields:
+        guide.fit_mode = _validated_fit_mode(fields["fit_mode"])
+    if "crop_position" in fields:
+        guide.crop_position = _validated_crop_position(fields["crop_position"])
     return guide
 
 
@@ -1608,6 +1638,8 @@ def _apply_create_guide(scene: Scene, fields: dict) -> GuideFrame:
         source=str(fields.get("source", "asset") or "asset"),
         strength=_mutation_float(fields.get("strength", 1.0), "strength", 1.0),
         muted=bool(fields.get("muted", False)),
+        fit_mode=_validated_fit_mode(fields["fit_mode"]) if "fit_mode" in fields else DEFAULT_FIT_MODE,
+        crop_position=_validated_crop_position(fields["crop_position"]) if "crop_position" in fields else DEFAULT_CROP_POSITION,
     )
     replaced_ids = [
         getattr(current, "guide_id", "")
@@ -5790,6 +5822,12 @@ if routes is not None:
             return _json_error("Motion-driver clips require video assets", 400)
         track_index = int(body.get("track_index", 0))
         audio_lane_idx = int(body.get("audio_lane_index", 0))
+        clip_fit_mode = str(body.get("fit_mode", DEFAULT_FIT_MODE) or DEFAULT_FIT_MODE).strip().lower()
+        if clip_fit_mode not in FIT_MODES:
+            return _json_error(f"Invalid fit_mode: {clip_fit_mode}", 400)
+        clip_crop_position = str(body.get("crop_position", DEFAULT_CROP_POSITION) or DEFAULT_CROP_POSITION).strip().lower()
+        if clip_crop_position not in CROP_POSITIONS:
+            return _json_error(f"Invalid crop_position: {clip_crop_position}", 400)
         try:
             _require_lane_unlocked(scene, "motion_driver" if role == "motion_driver" else "video", track_index)
             if role != "motion_driver" and body.get("dual_drop") and asset.asset_type == "video" and asset.has_audio:
@@ -5808,6 +5846,8 @@ if routes is not None:
             role=role,
             strength=float(body.get("strength", 1.0)),
             muted=bool(body.get("muted", False)),
+            fit_mode=clip_fit_mode,
+            crop_position=clip_crop_position,
         )
         scene.clips.append(clip)
 
@@ -5939,6 +5979,16 @@ if routes is not None:
             clip.strength = float(body["strength"])
         if "muted" in body:
             clip.muted = bool(body["muted"])
+        if "fit_mode" in body:
+            mode = str(body["fit_mode"] or "").strip().lower()
+            if mode not in FIT_MODES:
+                return _json_error(f"Invalid fit_mode: {body['fit_mode']}", 400)
+            clip.fit_mode = mode
+        if "crop_position" in body:
+            pos = str(body["crop_position"] or "").strip().lower()
+            if pos not in CROP_POSITIONS:
+                return _json_error(f"Invalid crop_position: {body['crop_position']}", 400)
+            clip.crop_position = pos
 
         save_project(project)
         return web.json_response(clip.to_dict())

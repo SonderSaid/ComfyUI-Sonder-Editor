@@ -109,6 +109,8 @@ def test_guide_frame_roundtrip():
         source="asset",
         strength=0.8,
         muted=True,
+        fit_mode="cover",
+        crop_position="top",
     )
     data = gf.to_dict()
     restored = GuideFrame.from_dict(data)
@@ -120,6 +122,17 @@ def test_guide_frame_roundtrip():
     assert restored.source == "asset"
     assert restored.strength == 0.8
     assert restored.muted is True
+    assert restored.fit_mode == "cover"
+    assert restored.crop_position == "top"
+
+
+def test_fit_mode_defaults_to_constant_for_legacy_records():
+    # Legacy project.json has no fit keys → deserialize to the fixed constants,
+    # NOT a browser default, so renders are deterministic across browsers.
+    clip = ClipReference.from_dict({"clip_id": "c1"})
+    guide = GuideFrame.from_dict({"frame_index": 0})
+    assert (clip.fit_mode, clip.crop_position) == ("pad_edge", "center")
+    assert (guide.fit_mode, guide.crop_position) == ("pad_edge", "center")
 
 
 def test_guide_frame_last_frame():
@@ -369,6 +382,45 @@ def test_scene_content_hash_changes_with_clip_and_guide_mute_state():
     assert base_scene.content_hash() != hidden_guides_scene.content_hash()
 
 
+def test_scene_content_hash_changes_with_fit_mode_and_crop_position():
+    clip = ClipReference(source_path="media/clip.mp4", timeline_start_frame=0, timeline_end_frame=10)
+    base_scene = Scene(name="Render")
+    base_scene.clips = [clip]
+    base_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
+
+    clip_fit_scene = Scene(name="Render")
+    clip_fit_scene.clips = [ClipReference.from_dict({**clip.to_dict(), "fit_mode": "cover"})]
+    clip_fit_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
+
+    clip_crop_scene = Scene(name="Render")
+    clip_crop_scene.clips = [ClipReference.from_dict({**clip.to_dict(), "fit_mode": "cover", "crop_position": "top"})]
+    clip_crop_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
+
+    guide_fit_scene = Scene(name="Render")
+    guide_fit_scene.clips = [ClipReference.from_dict(clip.to_dict())]
+    guide_fit_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a", fit_mode="stretch")]
+
+    assert base_scene.content_hash() != clip_fit_scene.content_hash()
+    assert clip_fit_scene.content_hash() != clip_crop_scene.content_hash()
+    assert base_scene.content_hash() != guide_fit_scene.content_hash()
+
+
+def test_scene_content_hash_stable_for_legacy_fit_default():
+    # A scene whose stored clip/guide dicts predate the fit fields must hash the
+    # same as one explicitly carrying the default constants (no spurious cache bust
+    # between a freshly-saved default item and a legacy one).
+    clip_legacy = ClipReference.from_dict({"source_path": "media/clip.mp4",
+                                           "timeline_start_frame": 0, "timeline_end_frame": 10})
+    clip_explicit = ClipReference.from_dict({"source_path": "media/clip.mp4",
+                                             "timeline_start_frame": 0, "timeline_end_frame": 10,
+                                             "fit_mode": "pad_edge", "crop_position": "center"})
+    legacy_scene = Scene(name="Render")
+    legacy_scene.clips = [clip_legacy]
+    explicit_scene = Scene(name="Render")
+    explicit_scene.clips = [clip_explicit]
+    assert legacy_scene.content_hash() == explicit_scene.content_hash()
+
+
 # --- ClipReference ---
 
 def test_clip_reference_roundtrip():
@@ -383,6 +435,8 @@ def test_clip_reference_roundtrip():
         role="motion_driver",
         strength=0.42,
         muted=True,
+        fit_mode="stretch",
+        crop_position="right",
         prompt="a cat walking",
         is_generated=True,
         generation_params={"seed": 42, "cfg": 7.5},
@@ -402,6 +456,8 @@ def test_clip_reference_roundtrip():
     assert restored.role == "motion_driver"
     assert restored.strength == 0.42
     assert restored.muted is True
+    assert restored.fit_mode == "stretch"
+    assert restored.crop_position == "right"
     assert restored.prompt == clip.prompt
     assert restored.is_generated == clip.is_generated
     assert restored.generation_params == clip.generation_params

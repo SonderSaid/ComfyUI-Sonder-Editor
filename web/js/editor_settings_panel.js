@@ -9,8 +9,10 @@ import {
 } from "./keyboard_ownership.js";
 import {
     CLIP_LABEL_MODE_OPTIONS,
+    CROP_POSITION_OPTIONS,
     DEFAULT_EDITOR_SETTINGS,
     DEFAULT_SAVE_PRESET,
+    FIT_MODE_OPTIONS,
     GALLERY_SORT_OPTIONS,
     GALLERY_THUMBNAIL_SIZE_OPTIONS,
     MODEL_TEMPLATE_PARAM_KEYS,
@@ -186,6 +188,7 @@ function syncSettingsPanelControls() {
     if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
     if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
     if (controls.clipLabelMode) controls.clipLabelMode.value = this._settings.appearance.clipLabelMode;
+    if (controls.sceneOutline) controls.sceneOutline.checked = this._settings.appearance.sceneOutline !== false;
     for (const tintKey of ["video", "audio", "motion_driver"]) {
         const tintInput = controls[`laneTintOverride_${tintKey}`];
         if (tintInput) {
@@ -215,6 +218,8 @@ function syncSettingsPanelControls() {
     if (controls.defaultSceneDuration) controls.defaultSceneDuration.value = String(this._settings.projectDefaults.newSceneDuration);
     if (controls.defaultGuideStrength) controls.defaultGuideStrength.value = String(this._settings.projectDefaults.defaultGuideStrength);
     if (controls.defaultMotionDriverStrength) controls.defaultMotionDriverStrength.value = String(this._settings.projectDefaults.defaultMotionDriverStrength);
+    if (controls.defaultFitMode) controls.defaultFitMode.value = this._settings.projectDefaults.defaultFitMode || "pad_edge";
+    if (controls.defaultCropPosition) controls.defaultCropPosition.value = this._settings.projectDefaults.defaultCropPosition || "center";
     if (controls.defaultTemplateId) controls.defaultTemplateId.value = this._settings.projectDefaults.defaultTemplateId || "free";
     if (controls.gallerySortMode) controls.gallerySortMode.value = this._settings.gallery.sortMode;
     if (controls.galleryInspectorCollapsed) controls.galleryInspectorCollapsed.checked = !!this._settings.gallery.inspectorCollapsed;
@@ -1226,6 +1231,15 @@ function showSettingsPanel() {
         (value) => updateCategory("appearance", "clipLabelMode", value)
     );
 
+    createCheckbox(
+        appearanceSection,
+        "sceneOutline",
+        "Scene Bounds Outline",
+        "Stroke a thin border at the scene frame edge in the fullscreen viewport — helps read edge-pad / fill framing.",
+        () => this._settings.appearance.sceneOutline,
+        (checked) => updateCategory("appearance", "sceneOutline", checked)
+    );
+
     const laneTintSpecs = [
         { key: "video", label: "Video Lane Tint", description: "Optional subtle color overlay on all video lane backgrounds." },
         { key: "audio", label: "Audio Lane Tint", description: "Optional subtle color overlay on all audio lane backgrounds." },
@@ -1344,6 +1358,24 @@ function showSettingsPanel() {
             getter: () => this._settings.projectDefaults.defaultMotionDriverStrength,
             onChange: (value) => updateCategory("projectDefaults", "defaultMotionDriverStrength", value),
         }
+    );
+    createSelect(
+        projectDefaultsSection,
+        "defaultFitMode",
+        "Default Fit Mode",
+        "How new clips and guides fill the scene frame when their aspect differs. Override per item in the timeline.",
+        FIT_MODE_OPTIONS,
+        () => this._settings.projectDefaults.defaultFitMode,
+        (value) => updateCategory("projectDefaults", "defaultFitMode", value)
+    );
+    createSelect(
+        projectDefaultsSection,
+        "defaultCropPosition",
+        "Default Crop Anchor",
+        "Anchor used when a new item's fit mode is Fill (crop).",
+        CROP_POSITION_OPTIONS,
+        () => this._settings.projectDefaults.defaultCropPosition,
+        (value) => updateCategory("projectDefaults", "defaultCropPosition", value)
     );
     createSelect(
         projectDefaultsSection,

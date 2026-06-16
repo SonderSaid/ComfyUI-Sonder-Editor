@@ -795,7 +795,9 @@ class SonderEditor:
                         asset_path = os.path.join(proj.project_dir, asset.path)
                         if os.path.isfile(asset_path):
                             img = self._load_guide_image(
-                                asset_path, asset.asset_type, proj_w, proj_h
+                                asset_path, asset.asset_type, proj_w, proj_h,
+                                fit_mode=getattr(guide, "fit_mode", "pad_edge"),
+                                crop_position=getattr(guide, "crop_position", "center"),
                             )
                             if img is not None:
                                 guide_images.append(img)
@@ -990,7 +992,11 @@ class SonderEditor:
                         warned_read_failure = True
                     frames.append(black_rgb.copy())
                     continue
-                placed, _bounds = fit_frame_to_canvas(frame_rgb, proj_w, proj_h)
+                placed, _bounds = fit_frame_to_canvas(
+                    frame_rgb, proj_w, proj_h,
+                    mode=getattr(clip, "fit_mode", "pad_edge"),
+                    crop_position=getattr(clip, "crop_position", "center"),
+                )
                 frames.append(placed)
             tensor = torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
         except Exception as ffmpeg_error:
@@ -1021,7 +1027,11 @@ class SonderEditor:
                         frames.append(black_rgb.copy())
                         continue
 
-                    placed, _bounds = self._fit_frame_to_canvas(frame_bgr, proj_w, proj_h)
+                    placed, _bounds = self._fit_frame_to_canvas(
+                        frame_bgr, proj_w, proj_h,
+                        mode=getattr(clip, "fit_mode", "pad_edge"),
+                        crop_position=getattr(clip, "crop_position", "center"),
+                    )
                     frames.append(cv2.cvtColor(placed, cv2.COLOR_BGR2RGB))
 
                 tensor = torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
@@ -1050,18 +1060,21 @@ class SonderEditor:
         )
 
     @staticmethod
-    def _fit_frame_to_canvas(frame_bgr: np.ndarray, canvas_w: int, canvas_h: int):
-        """Resize frame to fit canvas preserving aspect ratio (letterbox/pillarbox).
+    def _fit_frame_to_canvas(frame_bgr: np.ndarray, canvas_w: int, canvas_h: int,
+                             mode: str = "pad_edge", crop_position: str = "center"):
+        """Resize frame to fit canvas per fit mode (letterbox/edge-pad/cover/stretch).
 
         Returns:
             tuple: (canvas, (x_off, y_off, new_w, new_h)) — placed frame and content bounds.
         """
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        placed_rgb, bounds = fit_frame_to_canvas(frame_rgb, canvas_w, canvas_h)
+        placed_rgb, bounds = fit_frame_to_canvas(frame_rgb, canvas_w, canvas_h,
+                                                 mode=mode, crop_position=crop_position)
         return cv2.cvtColor(placed_rgb, cv2.COLOR_RGB2BGR), bounds
 
     def _load_guide_image(self, path: str, asset_type: str,
-                          target_w: int, target_h: int) -> torch.Tensor | None:
+                          target_w: int, target_h: int,
+                          fit_mode: str = "pad_edge", crop_position: str = "center") -> torch.Tensor | None:
         """Load an image file and return as (H, W, 3) float32 RGB tensor."""
         try:
             if asset_type == "video":
@@ -1084,7 +1097,8 @@ class SonderEditor:
                     return None
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-            rgb, _bounds = fit_frame_to_canvas(frame_rgb, target_w, target_h)
+            rgb, _bounds = fit_frame_to_canvas(frame_rgb, target_w, target_h,
+                                               mode=fit_mode, crop_position=crop_position)
 
             # Convert to float32 tensor
             tensor = torch.from_numpy(rgb.astype(np.float32) / 255.0)

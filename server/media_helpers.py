@@ -507,19 +507,90 @@ def tensor_to_uint8_frames(tensor, *, mode: str = "truncate") -> np.ndarray:
     return scaled.clip(0, 255).astype(np.uint8)
 
 
-def fit_frame_to_canvas(frame_rgb: np.ndarray, canvas_w: int, canvas_h: int) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+# Per-item fit-mode vocabulary (shared with timeline_state defaults / routes validation).
+# The default values below ARE the fixed code constants legacy projects deserialize to.
+FIT_MODES = ("fit", "pad_edge", "cover", "stretch")
+CROP_POSITIONS = ("center", "top", "bottom", "left", "right")
+DEFAULT_FIT_MODE = "pad_edge"
+DEFAULT_CROP_POSITION = "center"
+
+
+def _resize_interpolation(src_w: int, src_h: int, dst_w: int, dst_h: int) -> int:
+    """Auto interpolation: downscale → INTER_AREA (anti-aliased), upscale → INTER_LANCZOS4 (sharp)."""
+    return cv2.INTER_AREA if (dst_w * dst_h) < (src_w * src_h) else cv2.INTER_LANCZOS4
+
+
+def fit_frame_to_canvas(
+    frame_rgb: np.ndarray,
+    canvas_w: int,
+    canvas_h: int,
+    mode: str = DEFAULT_FIT_MODE,
+    crop_position: str = DEFAULT_CROP_POSITION,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Fit a source frame onto a scene-sized canvas.
+
+    Returns (canvas, (x_off, y_off, w, h)) where the bounds are the region to composite:
+    `fit` returns the inner content rect so black bars stay transparent to lower layers;
+    `pad_edge`/`cover`/`stretch` return the full canvas (the whole frame is content).
+    """
     fh, fw = frame_rgb.shape[:2]
     canvas_w = max(1, int(canvas_w))
     canvas_h = max(1, int(canvas_h))
     if fw <= 0 or fh <= 0:
         return np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8), (0, 0, 0, 0)
+
+    mode = mode if mode in FIT_MODES else DEFAULT_FIT_MODE
+    crop_position = crop_position if crop_position in CROP_POSITIONS else DEFAULT_CROP_POSITION
+
+    if mode == "stretch":
+        interp = _resize_interpolation(fw, fh, canvas_w, canvas_h)
+        canvas = cv2.resize(frame_rgb, (canvas_w, canvas_h), interpolation=interp)
+        return canvas, (0, 0, canvas_w, canvas_h)
+
+    if mode == "cover":
+        scale = max(canvas_w / fw, canvas_h / fh)
+        new_w = max(canvas_w, int(round(fw * scale)))
+        new_h = max(canvas_h, int(round(fh * scale)))
+        interp = _resize_interpolation(fw, fh, new_w, new_h)
+        resized = cv2.resize(frame_rgb, (new_w, new_h), interpolation=interp)
+        x_extra = new_w - canvas_w
+        y_extra = new_h - canvas_h
+        if crop_position == "left":
+            x_crop = 0
+        elif crop_position == "right":
+            x_crop = x_extra
+        else:
+            x_crop = x_extra // 2
+        if crop_position == "top":
+            y_crop = 0
+        elif crop_position == "bottom":
+            y_crop = y_extra
+        else:
+            y_crop = y_extra // 2
+        x_crop = max(0, min(x_crop, x_extra))
+        y_crop = max(0, min(y_crop, y_extra))
+        canvas = np.ascontiguousarray(resized[y_crop:y_crop + canvas_h, x_crop:x_crop + canvas_w])
+        return canvas, (0, 0, canvas_w, canvas_h)
+
+    # fit / pad_edge: contain, centered
     scale = min(canvas_w / fw, canvas_h / fh)
     new_w = max(1, int(fw * scale))
     new_h = max(1, int(fh * scale))
-    resized = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    interp = _resize_interpolation(fw, fh, new_w, new_h)
+    resized = cv2.resize(frame_rgb, (new_w, new_h), interpolation=interp)
     x_off = (canvas_w - new_w) // 2
     y_off = (canvas_h - new_h) // 2
+
+    if mode == "pad_edge":
+        top = y_off
+        bottom = canvas_h - new_h - top
+        left = x_off
+        right = canvas_w - new_w - left
+        canvas = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_REPLICATE)
+        return canvas, (0, 0, canvas_w, canvas_h)
+
+    # mode == "fit": black bars; return inner content rect so bars are NOT composited
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
     return canvas, (x_off, y_off, new_w, new_h)
 

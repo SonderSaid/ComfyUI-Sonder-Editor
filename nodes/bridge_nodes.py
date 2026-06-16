@@ -56,7 +56,8 @@ _ANY = _AnyType("*")
 
 
 # ── Guide image loading (mirrors editor_node.py:793) ──────────────────
-def _load_guide_image_bridge(path: str, asset_type: str, target_w: int, target_h: int):
+def _load_guide_image_bridge(path: str, asset_type: str, target_w: int, target_h: int,
+                             fit_mode: str = "pad_edge", crop_position: str = "center"):
     try:
         if asset_type == "video":
             frame_rgb = decode_video_frame(path, 0)
@@ -76,7 +77,8 @@ def _load_guide_image_bridge(path: str, asset_type: str, target_w: int, target_h
             if frame_bgr is None:
                 return None
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        rgb, _bounds = fit_frame_to_canvas(frame_rgb, target_w, target_h)
+        rgb, _bounds = fit_frame_to_canvas(frame_rgb, target_w, target_h,
+                                           mode=fit_mode, crop_position=crop_position)
         return torch.from_numpy(rgb.astype(np.float32) / 255.0)
     except Exception as e:
         logger.warning("Sonder bridge: failed to load guide %s: %s", path, e)
@@ -223,6 +225,8 @@ def _filtered_guides(project):
             "asset_type": asset.asset_type,
             "strength": float(getattr(guide, "strength", 1.0)),
             "editor_muted": live_guide_track_hidden or bool(getattr(guide, "muted", False)),
+            "fit_mode": getattr(guide, "fit_mode", "pad_edge"),
+            "crop_position": getattr(guide, "crop_position", "center"),
         })
     return out
 
@@ -315,7 +319,9 @@ class SonderGuidesBridgeStart:
 
         guide = guides[iteration_index]
         img = _load_guide_image_bridge(
-            guide["asset_path"], guide["asset_type"], proj_w, proj_h
+            guide["asset_path"], guide["asset_type"], proj_w, proj_h,
+            fit_mode=guide.get("fit_mode", "pad_edge"),
+            crop_position=guide.get("crop_position", "center"),
         )
         if img is None:
             return (

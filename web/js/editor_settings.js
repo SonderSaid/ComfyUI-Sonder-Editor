@@ -195,6 +195,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         waveformAccent: "#dcffdc",
         timelineBrightness: 100,
         clipLabelMode: "name_duration",
+        sceneOutline: true,
         laneTintOverrides: {
             video: "",
             audio: "",
@@ -247,6 +248,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
         defaultGuideStrength: 1.0,
         defaultMotionDriverStrength: 1.0,
         defaultTemplateId: "free",
+        defaultFitMode: "pad_edge",
+        defaultCropPosition: "center",
     },
     gallery: {
         sortMode: "newest",
@@ -294,6 +297,27 @@ const VALID_AUDIO_COMPARE_WAVEFORM_LAYOUTS = new Set(["stacked", "overlay"]);
 const VALID_AUDIO_COMPARE_MONITORS = new Set(["a", "b", "both", "mute"]);
 const VALID_COMPARE_CYCLE_SIDES = new Set(["A", "B"]);
 export const VALID_TAKE_PLACEMENT_MODES = new Set(TAKE_PLACEMENT_MODE_OPTIONS.map((entry) => entry.value));
+
+// Per-item fit modes (mirror server/media_helpers.py FIT_MODES / CROP_POSITIONS).
+// The defaults below ARE the fixed code constants — they only seed NEW items,
+// never act as a render-time fallback (that lives in the backend from_dict).
+export const FIT_MODE_OPTIONS = [
+    { value: "fit", label: "Fit (black bars)" },
+    { value: "pad_edge", label: "Fit (edge pad)" },
+    { value: "cover", label: "Fill (crop)" },
+    { value: "stretch", label: "Stretch" },
+];
+export const CROP_POSITION_OPTIONS = [
+    { value: "center", label: "Center" },
+    { value: "top", label: "Top" },
+    { value: "bottom", label: "Bottom" },
+    { value: "left", label: "Left" },
+    { value: "right", label: "Right" },
+];
+export const VALID_FIT_MODES = new Set(FIT_MODE_OPTIONS.map((entry) => entry.value));
+export const VALID_CROP_POSITIONS = new Set(CROP_POSITION_OPTIONS.map((entry) => entry.value));
+export const DEFAULT_FIT_MODE = "pad_edge";
+export const DEFAULT_CROP_POSITION = "center";
 const VALID_CUSTOM_CONTAINERS = new Set(CUSTOM_CONTAINER_OPTIONS);
 const VALID_CUSTOM_VIDEO_CODECS = new Set(CUSTOM_VIDEO_CODEC_OPTIONS);
 const VALID_CUSTOM_PIX_FMTS = new Set(CUSTOM_PIX_FMT_OPTIONS);
@@ -824,6 +848,9 @@ function normalizeEditorSettings(source = null) {
             clipLabelMode: VALID_CLIP_LABEL_MODES.has(stored?.appearance?.clipLabelMode)
                 ? stored.appearance.clipLabelMode
                 : defaults.appearance.clipLabelMode,
+            sceneOutline: stored?.appearance?.sceneOutline == null
+                ? defaults.appearance.sceneOutline
+                : !!stored.appearance.sceneOutline,
             laneTintOverrides: normalizeLaneTintOverrides(stored?.appearance?.laneTintOverrides),
         },
         batchRender: {
@@ -924,6 +951,12 @@ function normalizeEditorSettings(source = null) {
             defaultTemplateId: validTemplateIds.has(normalizeModelTemplateId(stored?.projectDefaults?.defaultTemplateId))
                 ? normalizeModelTemplateId(stored.projectDefaults.defaultTemplateId)
                 : defaults.projectDefaults.defaultTemplateId,
+            defaultFitMode: VALID_FIT_MODES.has(stored?.projectDefaults?.defaultFitMode)
+                ? stored.projectDefaults.defaultFitMode
+                : defaults.projectDefaults.defaultFitMode,
+            defaultCropPosition: VALID_CROP_POSITIONS.has(stored?.projectDefaults?.defaultCropPosition)
+                ? stored.projectDefaults.defaultCropPosition
+                : defaults.projectDefaults.defaultCropPosition,
         },
         gallery: {
             sortMode: VALID_SORT_MODES.has(stored?.gallery?.sortMode)
