@@ -2101,6 +2101,86 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
     project.metadata["prompt_history"] = history
 
 
+def _queue_payload(project: TimelineProject) -> list[dict]:
+    return [job.to_dict() for job in project.generation_queue]
+
+
+def _load_project_after_queue_conflict(
+    exc: ProjectVersionConflict,
+    fallback_project: TimelineProject | None = None,
+) -> TimelineProject:
+    project_dir = str(getattr(exc, "project_dir", "") or "")
+    if not project_dir and fallback_project is not None:
+        project_dir = str(getattr(fallback_project, "project_dir", "") or "")
+    if not project_dir:
+        raise exc
+    return load_project(project_dir)
+
+
+def _apply_queue_versioned_sync(request: web.Request, apply_fn, max_attempts: int = 3):
+    project: TimelineProject | None = None
+    for attempt in range(max_attempts):
+        if project is None:
+            try:
+                project = _load_project_from_request(request)
+            except ProjectVersionConflict as exc:
+                project = _load_project_after_queue_conflict(exc)
+        base_modified_at = str(getattr(project, "modified_at", "") or "")
+        changed, payload = apply_fn(project)
+        if not changed:
+            return project, payload
+        try:
+            save_project(project, expected_modified_at=base_modified_at)
+            return project, payload
+        except ProjectVersionConflict as exc:
+            if attempt >= max_attempts - 1:
+                raise
+            project = _load_project_after_queue_conflict(exc, project)
+    raise RuntimeError("Queue mutation retry loop exhausted")
+
+
+def _apply_queue_mutation_operations(project: TimelineProject, operations: list) -> tuple[bool, dict]:
+    changed = False
+    results = []
+    for operation in operations:
+        if not isinstance(operation, dict):
+            _mutation_error("Queue operation must be an object", 400, "invalid_queue_mutation")
+        op_type = str(operation.get("type", "") or "")
+        if op_type == "delete_job":
+            job_id = str(operation.get("job_id", "") or "")
+            if not job_id:
+                _mutation_error("delete_job requires job_id", 400, "invalid_queue_mutation")
+            before = len(project.generation_queue)
+            project.generation_queue = [job for job in project.generation_queue if job.job_id != job_id]
+            removed = before - len(project.generation_queue)
+            changed = changed or removed > 0
+            results.append({"type": op_type, "job_id": job_id, "removed": removed})
+        elif op_type == "clear_completed":
+            before = len(project.generation_queue)
+            project.generation_queue = [
+                job for job in project.generation_queue
+                if str(getattr(job, "status", "") or "").lower() != "completed"
+            ]
+            removed = before - len(project.generation_queue)
+            changed = changed or removed > 0
+            results.append({"type": op_type, "removed": removed})
+        elif op_type == "clear_all":
+            removed = len(project.generation_queue)
+            if removed:
+                project.generation_queue.clear()
+                changed = True
+            results.append({"type": op_type, "removed": removed})
+        else:
+            _mutation_error(f"Unsupported queue operation: {op_type}", 400, "unsupported_queue_mutation")
+
+    return changed, {
+        "status": "ok",
+        "operation_count": len(operations),
+        "results": results,
+        "queue": _queue_payload(project),
+    }
+
+
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
     return os.path.join(project.project_dir, asset.path) if getattr(asset, "path", "") else ""
 
@@ -6465,18 +6545,18 @@ if routes is not None:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("Queue job body must be an object", 400)
 
-        def add_one() -> tuple[TimelineProject, dict]:
-            project = _load_project_from_request(request)
+        def add_one(project: TimelineProject) -> tuple[bool, dict]:
             job = _queue_job_from_body(body)
             _compose_frozen_job_prompt(project, job)
             project.generation_queue.append(job)
             _record_prompt_history(project, [job])
-            save_project(project)
-            return project, job.to_dict()
+            return True, job.to_dict()
 
         try:
-            project, payload = await asyncio.to_thread(add_one)
+            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, add_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -6489,6 +6569,8 @@ if routes is not None:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("Queue batch body must be an object", 400)
 
         raw_jobs = body.get("jobs", [])
         if not isinstance(raw_jobs, list):
@@ -6498,27 +6580,52 @@ if routes is not None:
         if not all(isinstance(item, dict) for item in raw_jobs):
             return _json_error("Each batch job must be an object", 400)
 
-        def add_batch() -> tuple[TimelineProject, dict]:
-            project = _load_project_from_request(request)
+        def add_batch(project: TimelineProject) -> tuple[bool, dict]:
             jobs = [_queue_job_from_body(item) for item in raw_jobs]
             for job in jobs:
                 _compose_frozen_job_prompt(project, job)
             project.generation_queue.extend(jobs)
             _record_prompt_history(project, jobs)
-            save_project(project)
-            return project, {
+            return True, {
                 "status": "ok",
                 "count": len(jobs),
                 "jobs": [job.to_dict() for job in jobs],
             }
 
         try:
-            project, payload = await asyncio.to_thread(add_batch)
+            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, add_batch)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
         _remember_request_project(request, project)
         return web.json_response(payload, status=201)
+
+    @routes.post("/sonder-editor/project/{project_id}/queue/mutations")
+    async def api_apply_queue_mutations(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("Queue mutation body must be an object", 400)
+
+        operations = body.get("operations", [])
+        if not isinstance(operations, list):
+            return _json_error("operations must be a list", 400)
+
+        try:
+            project, payload = await asyncio.to_thread(
+                _apply_queue_versioned_sync,
+                request,
+                lambda queue_project: _apply_queue_mutation_operations(queue_project, operations),
+            )
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+
+        _remember_request_project(request, project)
+        return web.json_response(payload)
 
     @routes.put("/sonder-editor/project/{project_id}/queue/{job_id}")
     async def api_update_queue_job(request: web.Request) -> web.Response:
@@ -6528,27 +6635,33 @@ if routes is not None:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("Queue update body must be an object", 400)
 
-        def update_one() -> tuple[TimelineProject, dict | None]:
-            project = _load_project_from_request(request)
+        def update_one(project: TimelineProject) -> tuple[bool, dict | None]:
             job = next((j for j in project.generation_queue if j.job_id == job_id), None)
             if not job:
-                return project, None
+                return False, None
+            changed = False
             if "status" in body:
                 job.status = body["status"]
+                changed = True
             if "progress" in body:
                 job.progress = float(body["progress"])
+                changed = True
             if "error" in body:
                 job.error = body["error"]
+                changed = True
             if "result_asset_id" in body:
                 job.result_asset_id = body["result_asset_id"]
+                changed = True
             if "completed_at" in body:
                 job.completed_at = body["completed_at"]
-            save_project(project)
-            return project, job.to_dict()
+                changed = True
+            return changed, job.to_dict()
 
         try:
-            project, payload = await asyncio.to_thread(update_one)
+            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, update_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
         if payload is None:
@@ -6560,49 +6673,39 @@ if routes is not None:
     async def api_delete_queue_job(request: web.Request) -> web.Response:
         job_id = request.match_info["job_id"]
 
-        def delete_one() -> tuple[TimelineProject, bool]:
-            project = _load_project_from_request(request)
-            before = len(project.generation_queue)
-            project.generation_queue = [j for j in project.generation_queue if j.job_id != job_id]
-            if len(project.generation_queue) == before:
-                return project, False
-            save_project(project)
-            return project, True
+        def delete_one(project: TimelineProject) -> tuple[bool, dict]:
+            changed, payload = _apply_queue_mutation_operations(project, [{"type": "delete_job", "job_id": job_id}])
+            removed = int(payload["results"][0].get("removed", 0)) if payload.get("results") else 0
+            return changed, {"status": "deleted", "removed": removed, "queue": payload["queue"]}
 
         try:
-            project, deleted = await asyncio.to_thread(delete_one)
+            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, delete_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
-        if not deleted:
-            return _json_error(f"Job not found: {job_id}", 404)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
         _remember_request_project(request, project)
-        return web.json_response({"status": "deleted"})
+        return web.json_response(payload)
 
     @routes.delete("/sonder-editor/project/{project_id}/queue")
     async def api_clear_queue(request: web.Request) -> web.Response:
         """Clear completed jobs, or all if ?all=1."""
         clear_all = request.query.get("all") == "1"
 
-        def clear_queue() -> tuple[TimelineProject, int]:
-            project = _load_project_from_request(request)
-            before = len(project.generation_queue)
-            if clear_all:
-                project.generation_queue.clear()
-            else:
-                project.generation_queue = [
-                    j for j in project.generation_queue
-                    if str(getattr(j, "status", "") or "").lower() != "completed"
-                ]
-            removed = before - len(project.generation_queue)
-            save_project(project)
-            return project, removed
+        def clear_queue(project: TimelineProject) -> tuple[bool, dict]:
+            op_type = "clear_all" if clear_all else "clear_completed"
+            changed, payload = _apply_queue_mutation_operations(project, [{"type": op_type}])
+            removed = int(payload["results"][0].get("removed", 0)) if payload.get("results") else 0
+            return changed, {"status": "cleared", "removed": removed, "queue": payload["queue"]}
 
         try:
-            project, removed = await asyncio.to_thread(clear_queue)
+            project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, clear_queue)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
         _remember_request_project(request, project)
-        return web.json_response({"status": "cleared", "removed": removed})
+        return web.json_response(payload)
 
     # -----------------------------------------------------------------------
     # WebSocket stub

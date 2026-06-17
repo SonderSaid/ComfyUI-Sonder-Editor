@@ -471,6 +471,7 @@ export class EditorWidget {
         this._pendingProjectRefreshDrain = false;
         this._timelineMutationDepth = 0;
         this._sceneFetchSeq = 0;
+        this._queueFetchSeq = 0;
         this._projectMutationQueue = new ProjectMutationQueue({
             onIdle: () => this._replayDeferredProjectBackedRefresh(),
         });
@@ -1789,6 +1790,7 @@ export class EditorWidget {
         }
         const wantsAssets = keys.has("assets");
         const wantsScenes = keys.has("scenes");
+        const wantsQueue = keys.has("queue");
         if (wantsAssets && wantsScenes) {
             this._fetchAssets({ ignoreMutationGate: true }).then(() => {
                 if (!this._destroyed) {
@@ -1802,6 +1804,9 @@ export class EditorWidget {
             if (wantsScenes) {
                 this._fetchScenes({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay" });
             }
+        }
+        if (wantsQueue) {
+            this._fetchRenderQueue({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay" });
         }
     }
 
@@ -1850,6 +1855,9 @@ export class EditorWidget {
         run,
         refreshScenes = true,
         reconcileFromResult = null,
+        refreshKeysOnError = null,
+        failureMessage = null,
+        invalidateQueueFetch = false,
     }) {
         // Flicker-audit fix #1 (2026-06-11): invalidate any in-flight scenes GET
         // the moment a mutation is enqueued — its payload predates this local
@@ -1857,6 +1865,9 @@ export class EditorWidget {
         // apply time; the discard path defers a replay so state still converges).
         // The reconcile path's bump only covers refreshScenes:true mutations.
         this._sceneFetchSeq += 1;
+        if (invalidateQueueFetch) {
+            this._queueFetchSeq += 1;
+        }
         const promise = this._projectMutationQueue.enqueue({
             key,
             label,
@@ -1881,8 +1892,12 @@ export class EditorWidget {
                 // omission of onRetry — failure paths auto-resync to authoritative
                 // state, so a retry would re-issue stale intent; source-coalesced
                 // so a burst of failures yields one counted toast.
-                notifyError(`${label || "Project change"} failed — timeline restored.`, { source: "project-mutation-failed" });
-                if (refreshScenes) this._deferProjectBackedRefresh(["scenes"], `${label || key}_error`);
+                notifyError(failureMessage || `${label || "Project change"} failed — timeline restored.`, { source: "project-mutation-failed" });
+                if (Array.isArray(refreshKeysOnError) && refreshKeysOnError.length) {
+                    this._deferProjectBackedRefresh(refreshKeysOnError, `${label || key}_error`);
+                } else if (refreshScenes) {
+                    this._deferProjectBackedRefresh(["scenes"], `${label || key}_error`);
+                }
             }
         );
         return promise;
@@ -1920,6 +1935,74 @@ export class EditorWidget {
                     },
                     { projectId: queuedIntent.projectId }
                 );
+            },
+        });
+    }
+
+    _mergeQueueMutationIntents(oldIntent, nextIntent) {
+        const operations = [...(oldIntent?.operations || []), ...(nextIntent?.operations || [])];
+        if (operations.some((op) => op?.type === "clear_all")) {
+            return { ...nextIntent, operations: [{ type: "clear_all" }] };
+        }
+        const merged = [];
+        const seenDeletes = new Set();
+        let sawClearCompleted = false;
+        for (const op of operations) {
+            if (!op || typeof op !== "object") continue;
+            if (op.type === "delete_job") {
+                const jobId = String(op.job_id || "");
+                if (!jobId || seenDeletes.has(jobId)) continue;
+                seenDeletes.add(jobId);
+                merged.push({ type: "delete_job", job_id: jobId });
+            } else if (op.type === "clear_completed") {
+                sawClearCompleted = true;
+            } else {
+                merged.push({ ...op });
+            }
+        }
+        if (sawClearCompleted) {
+            merged.push({ type: "clear_completed" });
+        }
+        return { ...nextIntent, operations: merged };
+    }
+
+    _runQueueMutation(operations, {
+        key = "project:queue",
+        label = "render queue",
+        coalesce = true,
+        merge = (oldIntent, nextIntent) => this._mergeQueueMutationIntents(oldIntent, nextIntent),
+    } = {}) {
+        const projectId = this._projectDirName();
+        if (!projectId) return Promise.resolve(null);
+        const intent = {
+            projectId,
+            operations: JSON.parse(JSON.stringify(operations || [])),
+        };
+        return this._queueProjectMutation({
+            key,
+            label,
+            coalesce,
+            merge,
+            intent,
+            refreshScenes: false,
+            refreshKeysOnError: ["queue"],
+            failureMessage: "Render queue change failed — queue restored.",
+            invalidateQueueFetch: true,
+            run: async (queuedIntent) => {
+                const result = await this._runVersionedProjectMutation(
+                    `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue/mutations`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ operations: queuedIntent.operations }),
+                    },
+                    { projectId: queuedIntent.projectId }
+                );
+                const queue = Array.isArray(result?.payload?.queue) ? result.payload.queue : [];
+                this._renderQueue = queue;
+                this._applyStoredQueueBatchCollapseState();
+                this._renderQueuePanel();
+                return result;
             },
         });
     }
@@ -10968,27 +11051,6 @@ export class EditorWidget {
         this._batchQueueBtn.title = `Add current ${scopeLabel} to render queue as ${chunkCount} chunk${chunkCount === 1 ? "" : "s"} — ${modeLabel}`;
     }
 
-    async _readQueueError(resp, fallback) {
-        try {
-            const payload = await resp.json();
-            if (payload?.error) {
-                return payload.error;
-            }
-        } catch {
-            // Fall through to raw text.
-        }
-
-        try {
-            const text = await resp.text();
-            if (text) {
-                return text;
-            }
-        } catch {
-            // Ignore text-read failures.
-        }
-        return fallback;
-    }
-
     _flashQueueButton(button) {
         if (!button) return;
         setButtonVariant(button, "active");
@@ -11021,14 +11083,33 @@ export class EditorWidget {
         this._renderQueuePanel();
 
         try {
-            const dirName = encodeURIComponent(this._projectDirName());
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(snapshot),
+            const projectId = this._projectDirName();
+            const result = await this._queueProjectMutation({
+                key: `project:queue:add:${tempId}`,
+                label: "add render queue job",
+                coalesce: false,
+                intent: {
+                    projectId,
+                    snapshot: JSON.parse(JSON.stringify(snapshot)),
+                },
+                refreshScenes: false,
+                refreshKeysOnError: ["queue"],
+                failureMessage: "Add to render queue failed — queue restored.",
+                invalidateQueueFetch: true,
+                run: async (queuedIntent) => {
+                    return await this._runVersionedProjectMutation(
+                        `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue`,
+                        {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(queuedIntent.snapshot),
+                        },
+                        { projectId: queuedIntent.projectId }
+                    );
+                },
             });
-            if (resp.ok) {
-                const createdJob = await resp.json();
+            const createdJob = result?.payload;
+            if (createdJob?.job_id) {
                 this._renderQueue = (this._renderQueue || []).map((job) => job.job_id === tempId ? createdJob : job);
                 this._flashQueueButton(this._queueBtn);
                 this._applyStoredQueueBatchCollapseState();
@@ -11036,12 +11117,11 @@ export class EditorWidget {
             } else {
                 this._renderQueue = (this._renderQueue || []).filter((job) => job.job_id !== tempId);
                 this._renderQueuePanel();
-                await this._fetchRenderQueue();
+                this._deferProjectBackedRefresh(["queue"], "queue_add_missing_payload");
             }
         } catch (e) {
             this._renderQueue = (this._renderQueue || []).filter((job) => job.job_id !== tempId);
             this._renderQueuePanel();
-            await this._fetchRenderQueue();
             console.error("Add to queue failed:", e);
         }
     }
@@ -11063,7 +11143,6 @@ export class EditorWidget {
             return;
         }
 
-        const dirName = encodeURIComponent(this._projectDirName());
         const batchId = globalThis.crypto?.randomUUID?.()
             || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
 
@@ -11099,20 +11178,31 @@ export class EditorWidget {
             this._applyStoredQueueBatchCollapseState();
             this._renderQueuePanel();
 
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue/batch`), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ jobs: snapshots }),
+            const result = await this._queueProjectMutation({
+                key: `project:queue:batch:${batchId}`,
+                label: "add render queue batch",
+                coalesce: false,
+                intent: {
+                    projectId: this._projectDirName(),
+                    snapshots: JSON.parse(JSON.stringify(snapshots)),
+                },
+                refreshScenes: false,
+                refreshKeysOnError: ["queue"],
+                failureMessage: "Add render batch failed — queue restored.",
+                invalidateQueueFetch: true,
+                run: async (queuedIntent) => {
+                    return await this._runVersionedProjectMutation(
+                        `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue/batch`,
+                        {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ jobs: queuedIntent.snapshots }),
+                        },
+                        { projectId: queuedIntent.projectId }
+                    );
+                },
             });
-            if (!resp.ok) {
-                const message = await this._readQueueError(resp, `Add batch failed: ${resp.status}`);
-                this._renderQueue = (this._renderQueue || []).filter((job) => !tempIds.has(job.job_id));
-                this._renderQueuePanel();
-                await this._fetchRenderQueue();
-                notifyError(message);
-                return;
-            }
-            const payload = await resp.json();
+            const payload = result?.payload || {};
             const createdJobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
             this._renderQueue = (this._renderQueue || []).map((job) => {
                 if (!tempIds.has(job.job_id)) return job;
@@ -11126,20 +11216,55 @@ export class EditorWidget {
             console.error("Add batch to queue failed:", e);
             this._renderQueue = (this._renderQueue || []).filter((job) => !tempIds.has(job.job_id));
             this._renderQueuePanel();
-            await this._fetchRenderQueue();
-            notifyError(e?.message || "Add batch to queue failed.", {
-                onRetry: () => { this._addBatchToRenderQueue().catch(() => {}); },
-            });
+            if (!tempIds.size) {
+                notifyError(e?.message || "Add batch to queue failed.", {
+                    onRetry: () => { this._addBatchToRenderQueue().catch(() => {}); },
+                });
+            }
         }
     }
 
-    async _fetchRenderQueue() {
-        if (!this._projectDirName()) return;
+    async _fetchRenderQueue({ ignoreMutationGate = false, reason = "queue_refresh" } = {}) {
+        const projectId = this._projectDirName();
+        if (!projectId) return;
+        if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
+            this._deferProjectBackedRefresh(["queue"], reason);
+            return;
+        }
+        const fetchSeq = ++this._queueFetchSeq;
         try {
-            const dirName = encodeURIComponent(this._projectDirName());
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`));
+            const knownVersion = getProjectVersion(projectId);
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}/queue`));
             if (resp.ok) {
-                this._renderQueue = await resp.json();
+                const data = await resp.json();
+                if (fetchSeq !== this._queueFetchSeq) {
+                    sessionDiagRecord("queue_refresh_stale", {
+                        reason,
+                        fetch_seq: fetchSeq,
+                        current_seq: this._queueFetchSeq,
+                    });
+                    this._deferProjectBackedRefresh(["queue"], "queue_refresh_stale_replay");
+                    return;
+                }
+                const headerProjectId = resp.headers.get("X-Sonder-Project-Id") || "";
+                const headerVersion = resp.headers.get("X-Sonder-Project-Modified-At") || "";
+                const compareVersion = headerProjectId && headerProjectId !== projectId
+                    ? (getProjectVersion(headerProjectId) || knownVersion)
+                    : knownVersion;
+                if (headerVersion && compareVersion && headerVersion < compareVersion) {
+                    sessionDiagRecord("queue_refresh_stale_version", {
+                        reason,
+                        header_version: headerVersion,
+                        known_version: compareVersion,
+                    });
+                    this._deferProjectBackedRefresh(["queue"], "queue_refresh_stale_version_replay");
+                    return;
+                }
+                if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
+                    this._deferProjectBackedRefresh(["queue"], `${reason}_apply_deferred`);
+                    return;
+                }
+                this._renderQueue = Array.isArray(data) ? data : [];
                 this._applyStoredQueueBatchCollapseState();
                 this._renderQueuePanel();
             }
@@ -11148,24 +11273,12 @@ export class EditorWidget {
 
     async _clearCompletedRenderQueue() {
         if (!this._projectDirName()) return;
-        const previousQueue = [...(this._renderQueue || [])];
-        this._renderQueue = previousQueue.filter((job) => String(job.status || "").toLowerCase() !== "completed");
+        this._renderQueue = (this._renderQueue || []).filter((job) => String(job.status || "").toLowerCase() !== "completed");
         this._renderQueuePanel();
         try {
-            const dirName = encodeURIComponent(this._projectDirName());
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue`), { method: "DELETE" });
-            if (!resp.ok) {
-                const message = await this._readQueueError(resp, `Clear completed renders failed: ${resp.status}`);
-                throw new Error(message);
-            }
+            await this._runQueueMutation([{ type: "clear_completed" }]);
         } catch (e) {
-            this._renderQueue = previousQueue;
-            this._renderQueuePanel();
-            await this._fetchRenderQueue();
             console.error("Clear completed renders failed:", e);
-            notifyError(e?.message || "Clear completed renders failed.", {
-                onRetry: () => { this._clearCompletedRenderQueue().catch(() => {}); },
-            });
             throw e;
         }
     }
@@ -11196,7 +11309,7 @@ export class EditorWidget {
             });
         }
         if ((changed || fetch) && nextExpanded) {
-            this._fetchRenderQueue();
+            this._fetchRenderQueue({ reason: "queue_expand" });
         }
     }
 
@@ -11216,24 +11329,12 @@ export class EditorWidget {
 
     async _deleteRenderQueueJob(job) {
         if (!this._projectDirName() || !job?.job_id) return;
-        const previousQueue = [...(this._renderQueue || [])];
-        this._renderQueue = previousQueue.filter((candidate) => candidate.job_id !== job.job_id);
+        this._renderQueue = (this._renderQueue || []).filter((candidate) => candidate.job_id !== job.job_id);
         this._renderQueuePanel();
         try {
-            const dirName = encodeURIComponent(this._projectDirName());
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/queue/${job.job_id}`), { method: "DELETE" });
-            if (!resp.ok) {
-                const message = await this._readQueueError(resp, `Delete queue job failed: ${resp.status}`);
-                throw new Error(message);
-            }
+            await this._runQueueMutation([{ type: "delete_job", job_id: job.job_id }]);
         } catch (e) {
-            this._renderQueue = previousQueue;
-            this._renderQueuePanel();
-            await this._fetchRenderQueue();
             console.error("Delete queue job failed:", e);
-            notifyError(e?.message || "Delete queue job failed.", {
-                onRetry: () => { this._deleteRenderQueueJob(job).catch(() => {}); },
-            });
             throw e;
         }
     }
@@ -11545,7 +11646,7 @@ export class EditorWidget {
         // Fetch assets first (triggers audio duration repair), then scenes
         this._fetchAssets().then(() => this._fetchScenes());
         if (this._queueExpanded) {
-            this._fetchRenderQueue();
+            this._fetchRenderQueue({ reason: "load_project" });
         }
         this._renderTimeline();
     }
@@ -11555,11 +11656,13 @@ export class EditorWidget {
         const wantsAssets = !wanted.size || wanted.has("assets");
         const wantsScenes = !wanted.size || wanted.has("scenes");
         const wantsProject = !wanted.size || wanted.has("project");
-        if (this._hasPendingProjectMutations() && (wantsProject || wantsAssets || wantsScenes)) {
+        const wantsQueue = !wanted.size || wanted.has("queue");
+        if (this._hasPendingProjectMutations() && (wantsProject || wantsAssets || wantsScenes || wantsQueue)) {
             const deferred = [];
             if (wantsProject) deferred.push("project");
             if (wantsAssets) deferred.push("assets");
             if (wantsScenes) deferred.push("scenes");
+            if (wantsQueue) deferred.push("queue");
             this._deferProjectBackedRefresh(deferred, "external_refresh");
         } else {
             if (wantsProject) {
@@ -11575,9 +11678,9 @@ export class EditorWidget {
                     this._fetchScenes();
                 }
             }
-        }
-        if (!wanted.size || wanted.has("queue")) {
-            this._fetchRenderQueue();
+            if (wantsQueue) {
+                this._fetchRenderQueue({ reason: "external_refresh" });
+            }
         }
     }
 

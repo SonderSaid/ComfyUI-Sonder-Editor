@@ -11,14 +11,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
-from server.timeline_state import AudioTrack, ClipReference, GuideFrame, LaneConfig, PromptSection, Scene, TimelineProject
+from server.timeline_state import AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, Scene, TimelineProject
 
 
 class DummyRequest(dict):
-    def __init__(self, *, match_info=None, query=None, body=None, method="POST", path="/sonder-editor/project/proj"):
+    def __init__(self, *, match_info=None, query=None, body=None, method="POST", path="/sonder-editor/project/proj", headers=None):
         super().__init__()
         self.match_info = match_info or {}
         self.query = query or {}
+        self.headers = headers or {}
         self._body = body
         self.method = method
         self.path = path
@@ -476,7 +477,7 @@ def test_queue_route_constructor_carries_scene_prompt(monkeypatch, tmp_path):
     project = TimelineProject(project_dir=str(tmp_path), name="Project")
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -521,7 +522,7 @@ def test_queue_route_composes_frozen_prompt_server_side(monkeypatch, tmp_path):
     project.metadata["prompt_section_delimiter"] = ","
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -571,7 +572,7 @@ def test_queue_batch_chunks_get_differing_composed_prompts(monkeypatch, tmp_path
     project = TimelineProject(project_dir=str(tmp_path), name="Project")
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -614,7 +615,7 @@ def test_queue_prompt_history_dedup_and_cap(monkeypatch, tmp_path):
     project = TimelineProject(project_dir=str(tmp_path), name="Project")
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -660,7 +661,7 @@ def test_queue_batch_route_appends_all_jobs_with_single_save(monkeypatch, tmp_pa
     project = TimelineProject(project_dir=str(tmp_path), name="Project")
     saves = []
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
 
     handler = _route_handler(
         route_module,
@@ -703,6 +704,161 @@ def test_queue_batch_route_appends_all_jobs_with_single_save(monkeypatch, tmp_pa
     assert len(saves) == 1
     assert [job.batch_index for job in project.generation_queue] == [0, 1]
     assert all(job.frame_constraint == {"step": 8, "offset": 1} for job in project.generation_queue)
+
+
+def _queue_mutations_handler(route_module):
+    return _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/queue/mutations",
+    )
+
+
+def _queue_ids(project):
+    return [job.job_id for job in project.generation_queue]
+
+
+def test_queue_mutation_delete_absent_job_is_noop(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project.generation_queue = [GenerationJob(job_id="job-a"), GenerationJob(job_id="job-b")]
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
+
+    response = asyncio.run(_queue_mutations_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={"operations": [{"type": "delete_job", "job_id": "missing"}]},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert _queue_ids(project) == ["job-a", "job-b"]
+    assert [job["job_id"] for job in payload["queue"]] == ["job-a", "job-b"]
+    assert payload["results"][0]["removed"] == 0
+    assert saves == []
+
+
+def test_legacy_queue_delete_absent_job_is_idempotent(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project.generation_queue = [GenerationJob(job_id="job-a")]
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
+
+    handler = _route_handler(route_module, "DELETE", "/sonder-editor/project/{project_id}/queue/{job_id}")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "job_id": "missing"},
+        method="DELETE",
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["removed"] == 0
+    assert _queue_ids(project) == ["job-a"]
+    assert saves == []
+
+
+def test_queue_mutations_clear_completed_and_clear_all(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project.generation_queue = [
+        GenerationJob(job_id="pending", status="pending"),
+        GenerationJob(job_id="done", status="completed"),
+        GenerationJob(job_id="running", status="running"),
+    ]
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project, **kwargs: saves.append(saved_project))
+    handler = _queue_mutations_handler(route_module)
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={"operations": [{"type": "clear_completed"}]},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["results"][0]["removed"] == 1
+    assert _queue_ids(project) == ["pending", "running"]
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        body={"operations": [{"type": "clear_all"}]},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["results"][0]["removed"] == 2
+    assert project.generation_queue == []
+    assert len(saves) == 2
+
+
+def test_queue_mutations_retry_stale_deletes_without_resurrection(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project.generation_queue = [
+        GenerationJob(job_id="job-a"),
+        GenerationJob(job_id="job-b"),
+        GenerationJob(job_id="job-c"),
+    ]
+    route_module.save_project(project)
+    base_version = project.modified_at
+    handler = _queue_mutations_handler(route_module)
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        query={"path": str(tmp_path)},
+        headers={"If-Match": base_version},
+        method="POST",
+        body={"operations": [{"type": "delete_job", "job_id": "job-a"}]},
+    )))
+    assert response.status == 200
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj"},
+        query={"path": str(tmp_path)},
+        headers={"If-Match": base_version},
+        method="POST",
+        body={"operations": [{"type": "delete_job", "job_id": "job-b"}]},
+    )))
+    payload = _response_json(response)
+    restored = route_module.load_project(str(tmp_path))
+
+    assert response.status == 200
+    assert [job["job_id"] for job in payload["queue"]] == ["job-c"]
+    assert _queue_ids(restored) == ["job-c"]
+
+
+def test_queue_update_retries_stale_version_and_preserves_newer_jobs(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project.generation_queue = [GenerationJob(job_id="job-a", status="pending")]
+    route_module.save_project(project)
+    base_version = project.modified_at
+
+    current = route_module.load_project(str(tmp_path))
+    current.generation_queue.append(GenerationJob(job_id="job-b", status="pending"))
+    route_module.save_project(current)
+
+    handler = _route_handler(route_module, "PUT", "/sonder-editor/project/{project_id}/queue/{job_id}")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "job_id": "job-a"},
+        query={"path": str(tmp_path)},
+        headers={"If-Match": base_version},
+        method="PUT",
+        body={"status": "completed", "progress": 1.0},
+    )))
+    payload = _response_json(response)
+    restored = route_module.load_project(str(tmp_path))
+
+    assert response.status == 200
+    assert payload["status"] == "completed"
+    assert {job.job_id: job.status for job in restored.generation_queue} == {
+        "job-a": "completed",
+        "job-b": "pending",
+    }
 
 
 def _mutations_handler(route_module):

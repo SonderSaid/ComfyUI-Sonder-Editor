@@ -150,7 +150,7 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
     ]
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
 
     add_clip = _route_handler(
         route_module,
@@ -926,7 +926,7 @@ def test_clear_queue_route_removes_only_completed_jobs(tmp_path, monkeypatch):
     ]
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    monkeypatch.setattr(route_module, "save_project", lambda project, **kwargs: None)
 
     clear_queue = _route_handler(
         route_module,
@@ -936,7 +936,14 @@ def test_clear_queue_route_removes_only_completed_jobs(tmp_path, monkeypatch):
     response = asyncio.run(clear_queue(DummyRequest(match_info={"project_id": "project"})))
     payload = _response_json(response)
 
-    assert payload == {"status": "cleared", "removed": 1}
+    assert payload["status"] == "cleared"
+    assert payload["removed"] == 1
+    assert [job["job_id"] for job in payload["queue"]] == [
+        "pending-1",
+        "running-1",
+        "failed-1",
+        "skipped-1",
+    ]
     assert [job.job_id for job in project.generation_queue] == [
         "pending-1",
         "running-1",

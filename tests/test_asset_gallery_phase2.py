@@ -602,7 +602,7 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     project = _make_project(tmp_path)
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(module, "save_project", lambda project: None)
+    monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
 
     request = DummyRequest(match_info={"project_id": "phase-4"}, body={
         "scene_id": "scene-1",
