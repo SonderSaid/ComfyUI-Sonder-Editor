@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +20,10 @@ logger = logging.getLogger("sonder_editor")
 
 class MediaOperationCancelled(RuntimeError):
     """Raised when a cooperative media operation is cancelled."""
+
+
+class MediaProbeError(RuntimeError):
+    """Raised when media metadata cannot be probed well enough to register safely."""
 
 
 DEFAULT_SAVE_VIDEO_PRESET = "Compatible MP4"
@@ -251,6 +256,376 @@ def get_ffprobe_path() -> str:
     if _FFPROBE_PATH is None:
         _FFPROBE_PATH = _find_ffprobe()
     return _FFPROBE_PATH
+
+
+_TIMECODE_RE = re.compile(r"(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}(?:\.\d+)?)")
+_DURATION_RE = re.compile(r"Duration:\s*(?P<value>N/A|\d+:\d{2}:\d{2}(?:\.\d+)?)")
+_PROGRESS_TIME_RE = re.compile(r"time=(?P<value>\d+:\d{2}:\d{2}(?:\.\d+)?)")
+_FRAME_RE = re.compile(r"frame=\s*(?P<value>\d+)")
+_VIDEO_SIZE_RE = re.compile(r"(?P<w>\d{2,6})x(?P<h>\d{2,6})(?:\s|,|\[)")
+_FPS_RE = re.compile(r"(?P<fps>\d+(?:\.\d+)?)\s*fps\b")
+
+
+def _finite_positive(value) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number > 0
+
+
+def _finite_positive_int(value) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _finite_positive_float(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return number if math.isfinite(number) and number > 0 else 0.0
+
+
+def _parse_fraction(value) -> float:
+    text = str(value or "").strip()
+    if not text or text == "0/0":
+        return 0.0
+    if "/" in text:
+        try:
+            left, right = text.split("/", 1)
+            numerator = float(left)
+            denominator = float(right)
+            return numerator / denominator if denominator else 0.0
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+    return _finite_positive_float(text)
+
+
+def _timecode_seconds(value: str) -> float:
+    match = _TIMECODE_RE.search(str(value or ""))
+    if not match:
+        return 0.0
+    hours = int(match.group("h"))
+    minutes = int(match.group("m"))
+    seconds = float(match.group("s"))
+    return hours * 3600.0 + minutes * 60.0 + seconds
+
+
+def _duration_from_ffmpeg_text(text: str) -> float:
+    match = _DURATION_RE.search(str(text or ""))
+    if match and match.group("value") != "N/A":
+        duration = _timecode_seconds(match.group("value"))
+        if duration > 0:
+            return duration
+    progress = _PROGRESS_TIME_RE.findall(str(text or ""))
+    if progress:
+        duration = _timecode_seconds(progress[-1])
+        if duration > 0:
+            return duration
+    return 0.0
+
+
+def _run_text_command(cmd: list[str], *, timeout: int | float = 30) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.debug("media probe command unavailable (%s): %s", cmd[0] if cmd else "", exc)
+        return None
+
+
+def _ffprobe_json(path: str, entries: str, *, select_streams: str = "") -> dict:
+    cmd = [get_ffprobe_path(), "-v", "error"]
+    if select_streams:
+        cmd += ["-select_streams", select_streams]
+    cmd += ["-show_entries", entries, "-of", "json", str(path)]
+    result = _run_text_command(cmd, timeout=30)
+    if not result or result.returncode != 0 or not (result.stdout or "").strip():
+        return {}
+    try:
+        return json.loads(result.stdout or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _ffmpeg_input_text(path: str) -> str:
+    result = _run_text_command([get_ffmpeg_path(), "-hide_banner", "-i", str(path)], timeout=30)
+    if not result:
+        return ""
+    return f"{result.stdout or ''}\n{result.stderr or ''}"
+
+
+def _ffmpeg_decode_null_text(path: str, *, stream: str = "", timeout: int | float = 120) -> tuple[int, str]:
+    cmd = [get_ffmpeg_path(), "-hide_banner", "-i", str(path)]
+    if stream:
+        cmd += ["-map", stream]
+    cmd += ["-f", "null", "-"]
+    result = _run_text_command(cmd, timeout=timeout)
+    if not result:
+        return 1, ""
+    return int(result.returncode or 0), f"{result.stdout or ''}\n{result.stderr or ''}"
+
+
+def _mutagen_audio_metadata(path: str) -> tuple[float, int]:
+    try:
+        from mutagen import File as MutagenFile
+
+        mf = MutagenFile(path)
+        info = getattr(mf, "info", None) if mf is not None else None
+        duration = _finite_positive_float(getattr(info, "length", 0.0))
+        sample_rate = _finite_positive_int(getattr(info, "sample_rate", 0))
+        if duration > 0:
+            return duration, sample_rate
+    except Exception as exc:
+        logger.debug("mutagen audio probe failed for %s: %s", path, exc)
+    return 0.0, 0
+
+
+def probe_audio_metadata(path: str) -> dict:
+    duration, sample_rate = _mutagen_audio_metadata(path)
+    if duration > 0:
+        return {"duration_sec": duration, "sample_rate": sample_rate}
+
+    data = _ffprobe_json(
+        path,
+        "stream=sample_rate,duration:format=duration",
+        select_streams="a:0",
+    )
+    stream = next(iter(data.get("streams", []) or []), {})
+    fmt = data.get("format", {}) or {}
+    duration = _finite_positive_float(stream.get("duration")) or _finite_positive_float(fmt.get("duration"))
+    sample_rate = _finite_positive_int(stream.get("sample_rate"))
+    if duration > 0:
+        return {"duration_sec": duration, "sample_rate": sample_rate}
+
+    text = _ffmpeg_input_text(path)
+    duration = _duration_from_ffmpeg_text(text)
+    if duration <= 0:
+        _returncode, text = _ffmpeg_decode_null_text(path, stream="0:a:0", timeout=120)
+        duration = _duration_from_ffmpeg_text(text)
+    if duration <= 0:
+        raise MediaProbeError(f"Could not probe usable audio duration for {os.path.basename(path)}")
+    return {"duration_sec": duration, "sample_rate": sample_rate}
+
+
+def probe_audio_duration(path: str) -> float:
+    return float(probe_audio_metadata(path).get("duration_sec", 0.0) or 0.0)
+
+
+def _opencv_video_metadata(path: str) -> dict:
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return {}
+        width = _finite_positive_int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = _finite_positive_int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_count = _finite_positive_int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = _finite_positive_float(cap.get(cv2.CAP_PROP_FPS))
+        duration = (frame_count / fps) if frame_count > 0 and fps > 0 else 0.0
+        if width > 0 and height > 0 and frame_count > 0 and fps > 0 and duration > 0:
+            return {
+                "width": width,
+                "height": height,
+                "frame_count": frame_count,
+                "fps": fps,
+                "duration_sec": duration,
+            }
+    finally:
+        cap.release()
+    return {}
+
+
+def _ffprobe_video_metadata(path: str) -> dict:
+    data = _ffprobe_json(
+        path,
+        "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+        select_streams="v:0",
+    )
+    stream = next(iter(data.get("streams", []) or []), {})
+    fmt = data.get("format", {}) or {}
+    width = _finite_positive_int(stream.get("width"))
+    height = _finite_positive_int(stream.get("height"))
+    fps = _parse_fraction(stream.get("avg_frame_rate")) or _parse_fraction(stream.get("r_frame_rate"))
+    duration = _finite_positive_float(stream.get("duration")) or _finite_positive_float(fmt.get("duration"))
+    frame_count = _finite_positive_int(stream.get("nb_frames"))
+    if frame_count <= 0 and duration > 0 and fps > 0:
+        frame_count = max(1, int(round(duration * fps)))
+    if duration <= 0 and frame_count > 0 and fps > 0:
+        duration = frame_count / fps
+    if width > 0 and height > 0 and frame_count > 0 and fps > 0 and duration > 0:
+        return {
+            "width": width,
+            "height": height,
+            "frame_count": frame_count,
+            "fps": fps,
+            "duration_sec": duration,
+        }
+    return {}
+
+
+def _ffmpeg_video_metadata(path: str) -> dict:
+    returncode, text = _ffmpeg_decode_null_text(path, stream="0:v:0", timeout=180)
+    if returncode != 0 and not text:
+        return {}
+
+    video_line = next((line for line in text.splitlines() if " Video:" in line or line.strip().startswith("Stream") and "Video:" in line), "")
+    size_match = _VIDEO_SIZE_RE.search(video_line)
+    fps_match = _FPS_RE.search(video_line)
+    width = _finite_positive_int(size_match.group("w")) if size_match else 0
+    height = _finite_positive_int(size_match.group("h")) if size_match else 0
+    fps = _finite_positive_float(fps_match.group("fps")) if fps_match else 0.0
+    frame_matches = _FRAME_RE.findall(text)
+    frame_count = _finite_positive_int(frame_matches[-1]) if frame_matches else 0
+    duration = _duration_from_ffmpeg_text(text)
+    if frame_count <= 0 and duration > 0 and fps > 0:
+        frame_count = max(1, int(round(duration * fps)))
+    if duration <= 0 and frame_count > 0 and fps > 0:
+        duration = frame_count / fps
+    if fps <= 0 and frame_count > 0 and duration > 0:
+        fps = frame_count / duration
+    if width > 0 and height > 0 and frame_count > 0 and fps > 0 and duration > 0:
+        return {
+            "width": width,
+            "height": height,
+            "frame_count": frame_count,
+            "fps": fps,
+            "duration_sec": duration,
+        }
+    return {}
+
+
+def probe_media_has_audio(path: str) -> bool:
+    data = _ffprobe_json(path, "stream=codec_type", select_streams="a")
+    if any((stream.get("codec_type") == "audio") for stream in data.get("streams", []) or []):
+        return True
+
+    result = _run_text_command(
+        [get_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", "0:a:0", "-t", "0.1", "-f", "null", "-"],
+        timeout=30,
+    )
+    return bool(result and result.returncode == 0)
+
+
+def probe_video_metadata(path: str) -> dict:
+    metadata = _ffprobe_video_metadata(path) or _opencv_video_metadata(path) or _ffmpeg_video_metadata(path)
+    if not metadata:
+        raise MediaProbeError(f"Could not probe usable video metadata for {os.path.basename(path)}")
+    metadata["has_audio"] = probe_media_has_audio(path)
+    return metadata
+
+
+def probe_image_metadata(path: str) -> dict:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            width, height = img.size
+        width = _finite_positive_int(width)
+        height = _finite_positive_int(height)
+        if width > 0 and height > 0:
+            return {"width": width, "height": height}
+    except Exception as exc:
+        logger.debug("image metadata probe failed for %s: %s", path, exc)
+    raise MediaProbeError(f"Could not probe usable image metadata for {os.path.basename(path)}")
+
+
+def empty_media_metadata() -> dict:
+    return {
+        "width": 0,
+        "height": 0,
+        "frame_count": 0,
+        "fps": 0.0,
+        "duration_sec": 0.0,
+        "sample_rate": 0,
+        "has_audio": False,
+    }
+
+
+def is_valid_media_metadata(metadata: dict, asset_type: str) -> bool:
+    if asset_type == "video":
+        return (
+            _finite_positive(metadata.get("width"))
+            and _finite_positive(metadata.get("height"))
+            and _finite_positive(metadata.get("frame_count"))
+            and _finite_positive(metadata.get("fps"))
+            and _finite_positive(metadata.get("duration_sec"))
+        )
+    if asset_type == "image":
+        return _finite_positive(metadata.get("width")) and _finite_positive(metadata.get("height"))
+    if asset_type == "audio":
+        return _finite_positive(metadata.get("duration_sec"))
+    return True
+
+
+def validate_media_metadata(metadata: dict, asset_type: str, path: str = "") -> None:
+    if not is_valid_media_metadata(metadata, asset_type):
+        label = os.path.basename(path) if path else "media"
+        raise MediaProbeError(f"Could not probe usable {asset_type} metadata for {label}")
+
+
+def probe_media_metadata(path: str, asset_type: str, *, strict: bool = False) -> dict:
+    metadata = empty_media_metadata()
+    try:
+        if asset_type == "video":
+            metadata.update(probe_video_metadata(path))
+        elif asset_type == "image":
+            metadata.update(probe_image_metadata(path))
+        elif asset_type == "audio":
+            metadata.update(probe_audio_metadata(path))
+    except MediaProbeError:
+        if strict:
+            raise
+    if strict:
+        validate_media_metadata(metadata, asset_type, path)
+    return metadata
+
+
+def decode_audio_samples(
+    path: str,
+    *,
+    sample_rate: int = 44100,
+    channels: int = 1,
+    timeout: int | float = 60,
+) -> tuple[np.ndarray, int]:
+    sample_rate = max(1, int(sample_rate or 44100))
+    channels = max(1, int(channels or 1))
+    try:
+        result = subprocess.run(
+            [
+                get_ffmpeg_path(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-f",
+                "s16le",
+                "-ac",
+                str(channels),
+                "-ar",
+                str(sample_rate),
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise MediaProbeError(f"Could not decode audio samples for {os.path.basename(path)}: {exc}") from exc
+    if result.returncode != 0 or not result.stdout:
+        stderr = (result.stderr or b"").decode(errors="replace").strip()
+        raise MediaProbeError(f"Could not decode audio samples for {os.path.basename(path)}: {stderr[:240]}")
+    samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return samples, sample_rate
 
 
 def _parse_metadata_json(value):

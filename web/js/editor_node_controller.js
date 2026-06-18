@@ -2662,10 +2662,16 @@ export class EditorNodeController {
         let done = 0;
         let imported = 0;
         try {
+            const failures = [];
             for (const file of list) {
-                if (await importFileIntoProject(this.state.projectDir, file, folder)) {
-                    importedAny = true;
-                    imported += 1;
+                try {
+                    if (await importFileIntoProject(this.state.projectDir, file, folder)) {
+                        importedAny = true;
+                        imported += 1;
+                    }
+                } catch (error) {
+                    failures.push({ file, error });
+                    console.warn("[Sonder] Import failed:", file?.name, error);
                 }
                 done += 1;
                 handle.update({
@@ -2679,12 +2685,14 @@ export class EditorNodeController {
                 this._reloadExpandedModuleIfNeeded(["assets", "scene"]);
                 await this.refreshSummary({ syncAssets: true });
             }
-            if (imported === total) {
+            if (!failures.length && imported === total) {
                 handle.resolve({ message: `Imported ${imported} file${imported === 1 ? "" : "s"}` });
             } else if (imported > 0) {
-                handle.resolve({ message: `Imported ${imported} of ${total} files` });
+                const first = failures[0]?.error?.message || "one file failed";
+                handle.resolve({ tier: "warning", message: `Imported ${imported} of ${total} files. ${first}` });
             } else {
-                handle.resolve({ tier: "warning", message: "No files imported." });
+                const first = failures[0]?.error?.message || "No files imported.";
+                handle.resolve({ tier: "error", message: first });
             }
         } catch (e) {
             console.error("[Sonder] Import failed:", e);

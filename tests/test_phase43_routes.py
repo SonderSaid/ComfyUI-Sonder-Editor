@@ -448,6 +448,122 @@ def test_dual_drop_skips_audio_when_video_asset_has_no_audio(tmp_path, monkeypat
     assert [asset.asset_id for asset in project.assets] == ["asset-1"]
 
 
+def test_clip_post_rejects_video_asset_with_invalid_duration_metadata(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene")
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [
+        Asset(
+            asset_id="asset-1",
+            name="bad.webm",
+            asset_type="video",
+            path=os.path.join("media", "bad.webm"),
+            frame_count=-221360928884514624,
+            duration_sec=-9223372036854776.0,
+        ),
+    ]
+    save_calls = []
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: save_calls.append(saved_project))
+
+    add_clip = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/clips",
+    )
+    response = asyncio.run(add_clip(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"asset_id": "asset-1", "timeline_start_frame": 3},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 400
+    assert "invalid duration metadata" in payload["error"]
+    assert scene.clips == []
+    assert save_calls == []
+
+
+def test_audio_track_post_rejects_audio_asset_with_invalid_duration(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene")
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [
+        Asset(
+            asset_id="asset-1",
+            name="bad.mp3",
+            asset_type="audio",
+            path=os.path.join("media", "bad.mp3"),
+            duration_sec=0.0,
+            duration_checked=True,
+        ),
+    ]
+    save_calls = []
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: save_calls.append(saved_project))
+
+    add_audio = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/audio_tracks",
+    )
+    response = asyncio.run(add_audio(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"asset_id": "asset-1", "timeline_start_frame": 3},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 400
+    assert "invalid duration metadata" in payload["error"]
+    assert scene.audio_tracks == []
+    assert save_calls == []
+
+
+def test_prepare_video_audio_asset_dedupes_existing_asset_with_mixed_slashes(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    audio_path = media_dir / "asset-1_audio.wav"
+    audio_path.write_bytes(b"a" * 2048)
+    video_asset = Asset(
+        asset_id="asset-1",
+        name="with-audio.mp4",
+        asset_type="video",
+        path=os.path.join("media", "with-audio.mp4"),
+        has_audio=True,
+    )
+    audio_asset = Asset(
+        asset_id="audio-1",
+        name="with-audio.mp4 (audio)",
+        asset_type="audio",
+        path="media\\asset-1_audio.wav",
+        duration_sec=0.0,
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project")
+    project.assets = [video_asset, audio_asset]
+
+    monkeypatch.setattr(
+        route_module,
+        "_extract_audio_from_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("existing audio should be reused")),
+    )
+    monkeypatch.setattr(route_module, "_get_audio_duration", lambda *_args, **_kwargs: 1.5)
+    monkeypatch.setattr(route_module, "ensure_thumbnail", lambda *args, **kwargs: None)
+
+    result = route_module._prepare_video_audio_asset(project, video_asset)
+
+    assert result is audio_asset
+    assert result.duration_sec == 1.5
+    assert result.duration_checked is True
+    assert len([asset for asset in project.assets if asset.asset_type == "audio"]) == 1
+
+
 def test_dual_drop_uses_target_audio_lane_lock_only(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"

@@ -217,6 +217,23 @@ function coerceBoolean(value, defaultValue = false) {
     return defaultValue;
 }
 
+async function readResponseError(resp, fallback = "Request failed.") {
+    try {
+        const payload = await resp.clone().json();
+        if (payload?.error) return String(payload.error);
+        if (payload?.message) return String(payload.message);
+    } catch {
+        // Fall through to text response.
+    }
+    try {
+        const text = await resp.text();
+        if (text) return text;
+    } catch {
+        // Ignore parse failures and use fallback.
+    }
+    return fallback;
+}
+
 export async function uploadFileToComfyInput(file) {
     if (!file) return "";
 
@@ -250,13 +267,7 @@ export function buildProjectAssetViewURL(projectDir, sourcePath) {
 export async function importFileIntoProject(projectDir, file, folder = "") {
     if (!projectDir || !file) return false;
 
-    let uploadedName = "";
-    try {
-        uploadedName = await uploadFileToComfyInput(file);
-    } catch (error) {
-        console.warn("[Sonder] Upload failed:", error);
-        return false;
-    }
+    const uploadedName = await uploadFileToComfyInput(file);
 
     const dirName = projectDir.split(/[/\\]/).pop();
     const importResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/import`), {
@@ -269,8 +280,8 @@ export async function importFileIntoProject(projectDir, file, folder = "") {
     });
 
     if (!importResp.ok) {
-        console.warn("[Sonder] Import failed:", await importResp.text());
-        return false;
+        const message = await readResponseError(importResp, `Import failed: ${importResp.status}`);
+        throw new Error(message);
     }
 
     return true;
@@ -6087,7 +6098,9 @@ export class EditorWidget {
                     }),
                 });
                 if (!resp.ok) {
-                    console.warn("[Sonder] Motion-driver clip creation failed:", resp.status, await resp.text());
+                    const message = await readResponseError(resp, `Motion-driver clip creation failed: ${resp.status}`);
+                    console.warn("[Sonder] Motion-driver clip creation failed:", resp.status, message);
+                    notifyError(message, { source: "timeline-drop" });
                     this._discardLastUndo("add motion driver");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
                     return;
@@ -6254,7 +6267,9 @@ export class EditorWidget {
                     body: JSON.stringify(guideFields),
                 });
                 if (!resp.ok) {
-                    console.warn("[Sonder] Guide creation failed:", resp.status, await resp.text());
+                    const message = await readResponseError(resp, `Guide creation failed: ${resp.status}`);
+                    console.warn("[Sonder] Guide creation failed:", resp.status, message);
+                    notifyError(message, { source: "timeline-drop" });
                     this._discardLastUndo("add asset");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_guide_error" });
                     return;
@@ -6322,7 +6337,9 @@ export class EditorWidget {
                     body: JSON.stringify(clipBody),
                 });
                 if (!resp.ok) {
-                    console.warn("[Sonder] Clip creation failed:", resp.status, await resp.text());
+                    const message = await readResponseError(resp, `Clip creation failed: ${resp.status}`);
+                    console.warn("[Sonder] Clip creation failed:", resp.status, message);
+                    notifyError(message, { source: "timeline-drop" });
                     this._discardLastUndo("add asset");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_clip_error" });
                     return;
@@ -6391,7 +6408,9 @@ export class EditorWidget {
                     }),
                 });
                 if (!resp.ok) {
-                    console.warn("[Sonder] Audio track creation failed:", resp.status, await resp.text());
+                    const message = await readResponseError(resp, `Audio track creation failed: ${resp.status}`);
+                    console.warn("[Sonder] Audio track creation failed:", resp.status, message);
+                    notifyError(message, { source: "timeline-drop" });
                     this._discardLastUndo("add asset");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_audio_error" });
                     return;
@@ -12746,8 +12765,14 @@ export class EditorWidget {
         let done = 0;
         let imported = 0;
         try {
+            const failures = [];
             for (const file of list) {
-                if (await importFileIntoProject(this.projectDir, file, folder)) imported += 1;
+                try {
+                    if (await importFileIntoProject(this.projectDir, file, folder)) imported += 1;
+                } catch (error) {
+                    failures.push({ file, error });
+                    console.warn("[Sonder] Import failed:", file?.name, error);
+                }
                 done += 1;
                 handle.update({
                     message: total > 1 ? `${done}/${total} files` : (file?.name || ""),
@@ -12755,12 +12780,14 @@ export class EditorWidget {
                 });
             }
             if (imported) await this._fetchAssets();
-            if (imported === total) {
+            if (!failures.length && imported === total) {
                 handle.resolve({ message: `Imported ${imported} file${imported === 1 ? "" : "s"}` });
             } else if (imported > 0) {
-                handle.resolve({ message: `Imported ${imported} of ${total} files` });
+                const first = failures[0]?.error?.message || "one file failed";
+                handle.resolve({ tier: "warning", message: `Imported ${imported} of ${total} files. ${first}` });
             } else {
-                handle.resolve({ tier: "warning", message: "No files imported." });
+                const first = failures[0]?.error?.message || "No files imported.";
+                handle.resolve({ tier: "error", message: first });
             }
         } catch (e) {
             console.error("[Sonder] Import failed:", e);
@@ -12777,6 +12804,7 @@ export class EditorWidget {
             }
         } catch (e) {
             console.warn("[Sonder] File import error:", e);
+            notifyError(e?.message || "Import failed.", { source: "import" });
         }
     }
 

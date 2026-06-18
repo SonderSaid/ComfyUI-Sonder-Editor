@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .media_helpers import MediaProbeError, decode_audio_samples
+
 logger = logging.getLogger("sonder_editor")
 
 THUMB_SIZE = (192, 128)  # width, height
@@ -53,12 +55,7 @@ def generate_audio_waveform(audio_path: str, output_path: str,
                             size: tuple[int, int] = (192, 64)) -> bool:
     """Generate a simple waveform visualization as a PNG thumbnail."""
     try:
-        import torchaudio
-        waveform, sample_rate = torchaudio.load(audio_path)
-        # Mix to mono
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        samples = waveform.squeeze().numpy()
+        samples, _sample_rate = decode_audio_samples(audio_path, sample_rate=44100, channels=1)
 
         w, h = size
         img = np.zeros((h, w, 3), dtype=np.uint8)
@@ -169,19 +166,7 @@ def generate_waveform_data(audio_path: str, output_path: str,
     except Exception:
         pass
 
-    # Method 2: torchaudio
-    if samples is None:
-        try:
-            import torchaudio
-            waveform, sr = torchaudio.load(audio_path)
-            sample_rate = sr
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            samples = waveform.squeeze().numpy()
-        except Exception:
-            pass
-
-    # Method 3: soundfile (handles FLAC, OGG, WAV natively)
+    # Method 2: soundfile (handles FLAC, OGG, WAV natively)
     if samples is None:
         try:
             import soundfile as sf
@@ -193,17 +178,22 @@ def generate_waveform_data(audio_path: str, output_path: str,
         except Exception:
             pass
 
-    # Method 4: ffmpeg decode to raw PCM (universal fallback)
+    # Method 3: ffmpeg decode to raw PCM (universal fallback, no TorchCodec dependency)
     if samples is None:
         try:
-            import subprocess
-            result = subprocess.run(
-                ["ffmpeg", "-i", audio_path, "-f", "s16le", "-ac", "1",
-                 "-ar", "44100", "-"],
-                capture_output=True, timeout=30,
-            )
-            if result.returncode == 0 and result.stdout:
-                samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+            samples, sample_rate = decode_audio_samples(audio_path, sample_rate=44100, channels=1, timeout=30)
+        except MediaProbeError:
+            pass
+
+    # Method 4: torchaudio last, only for environments where it is known-good.
+    if samples is None:
+        try:
+            import torchaudio
+            waveform, sr = torchaudio.load(audio_path)
+            sample_rate = sr
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            samples = waveform.squeeze().numpy()
         except Exception:
             pass
 

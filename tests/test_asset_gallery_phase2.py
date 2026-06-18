@@ -9,12 +9,15 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from aiohttp import web
+import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
+import server.media_helpers as media_helpers
+import server.thumbnail_service as thumbnail_service
 from server.project_manager import create_project, load_project, save_project
 from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, Scene, TimelineProject
 
@@ -65,6 +68,13 @@ def _load_route_module(monkeypatch):
     fake_prompt_server = SimpleNamespace(instance=SimpleNamespace(routes=web.RouteTableDef()))
     monkeypatch.setattr(server, "PromptServer", fake_prompt_server, raising=False)
     return importlib.reload(routes)
+
+
+def _route_handler(route_module, method, path):
+    for route in route_module.routes:
+        if route.method == method and route.path == path:
+            return route.handler
+    raise AssertionError(f"Route not found: {method} {path}")
 
 
 def test_asset_payload_marks_missing_from_disk(tmp_path):
@@ -146,7 +156,7 @@ def test_fast_cached_asset_response_rejects_traversal(tmp_path, monkeypatch):
         routes._fast_cached_asset_response(request, "thumbnails", "../asset123.png")
 
 
-def test_video_has_audio_uses_extraction_fallback(tmp_path, monkeypatch):
+def test_video_has_audio_returns_false_when_probe_fails(tmp_path, monkeypatch):
     video_path = tmp_path / "clip.mp4"
     video_path.write_bytes(b"video")
 
@@ -160,14 +170,7 @@ def test_video_has_audio_uses_extraction_fallback(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "mutagen", SimpleNamespace(File=lambda filepath: None))
     monkeypatch.setitem(sys.modules, "torchaudio", SimpleNamespace(info=lambda filepath: (_ for _ in ()).throw(RuntimeError("probe failed"))))
 
-    def fake_extract(video_path_arg, output_path):
-        with open(output_path, "wb") as handle:
-            handle.write(b"wav")
-        return True
-
-    monkeypatch.setattr(routes, "_extract_audio_from_video", fake_extract)
-
-    assert routes._video_has_audio(str(video_path)) is True
+    assert routes._video_has_audio(str(video_path)) is False
 
 
 def test_ffmpeg_stderr_summary_omits_banner():
@@ -189,7 +192,15 @@ def test_sync_media_folder_repairs_false_video_has_audio_flags(tmp_path, monkeyp
         Asset(asset_id="vid-1", asset_type="video", path="media/clip.mp4", has_audio=False),
     ]
 
-    monkeypatch.setattr(routes, "_video_has_audio", lambda filepath: True)
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", lambda *args, **kwargs: {
+        "width": 640,
+        "height": 360,
+        "frame_count": 48,
+        "fps": 24.0,
+        "duration_sec": 2.0,
+        "sample_rate": 0,
+        "has_audio": True,
+    })
 
     assert routes._sync_media_folder(project) is True
     assert project.assets[0].has_audio is True
@@ -206,11 +217,19 @@ def test_sync_media_folder_caches_no_audio_video_probe(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_video_has_audio(filepath):
+    def fake_probe(filepath, *_args, **_kwargs):
         calls.append(filepath)
-        return False
+        return {
+            "width": 640,
+            "height": 360,
+            "frame_count": 48,
+            "fps": 24.0,
+            "duration_sec": 2.0,
+            "sample_rate": 0,
+            "has_audio": False,
+        }
 
-    monkeypatch.setattr(routes, "_video_has_audio", fake_video_has_audio)
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", fake_probe)
 
     assert routes._sync_media_folder(project) is True
     assert project.assets[0].has_audio is False
@@ -220,11 +239,60 @@ def test_sync_media_folder_caches_no_audio_video_probe(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
-def test_sync_media_folder_caches_failed_audio_duration_probe(tmp_path, monkeypatch):
+def test_audio_duration_falls_back_to_ffmpeg_duration_when_ffprobe_missing(monkeypatch):
+    calls = []
+
+    class Result:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0] == "missing-ffprobe":
+            raise FileNotFoundError("ffprobe")
+        return Result(
+            returncode=1,
+            stderr="Input #0, mp3\n  Duration: 00:00:16.69, start: 0.025057, bitrate: 192 kb/s\n",
+        )
+
+    monkeypatch.setattr(media_helpers, "_mutagen_audio_metadata", lambda _path: (0.0, 0))
+    monkeypatch.setattr(media_helpers, "get_ffprobe_path", lambda: "missing-ffprobe")
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "bundled-ffmpeg")
+    monkeypatch.setattr(media_helpers.subprocess, "run", fake_run)
+
+    assert media_helpers.probe_audio_duration("sound.mp3") == pytest.approx(16.69)
+    assert calls[0][0] == "missing-ffprobe"
+    assert calls[1][0] == "bundled-ffmpeg"
+
+
+def test_waveform_generation_uses_ffmpeg_when_torchaudio_unavailable(tmp_path, monkeypatch):
+    audio_path = tmp_path / "sound.mp3"
+    audio_path.write_bytes(b"fake")
+    output_path = tmp_path / "waveform.png"
+
+    def fake_decode(path, *, sample_rate=44100, channels=1, timeout=60):
+        assert str(path) == str(audio_path)
+        return np.linspace(-1.0, 1.0, sample_rate // 10, dtype=np.float32), sample_rate
+
+    monkeypatch.setattr(thumbnail_service, "decode_audio_samples", fake_decode)
+
+    assert thumbnail_service.generate_audio_waveform(str(audio_path), str(output_path)) is True
+    assert output_path.is_file()
+
+
+def test_sync_media_folder_reprobes_failed_audio_duration_probe(tmp_path, monkeypatch):
     project = _make_project(tmp_path)
     _write_project_file(project, "media/no-duration.wav", b"audio")
     project.assets = [
-        Asset(asset_id="aud-1", asset_type="audio", path="media/no-duration.wav", duration_sec=0),
+        Asset(
+            asset_id="aud-1",
+            asset_type="audio",
+            path="media/no-duration.wav",
+            duration_sec=0,
+            duration_checked=True,
+        ),
     ]
 
     calls = []
@@ -237,10 +305,109 @@ def test_sync_media_folder_caches_failed_audio_duration_probe(tmp_path, monkeypa
 
     assert routes._sync_media_folder(project) is True
     assert project.assets[0].duration_sec == 0
-    assert project.assets[0].duration_checked is True
+    assert project.assets[0].duration_checked is False
     assert project.assets[0].media_probe_signature
     assert routes._sync_media_folder(project) is False
-    assert len(calls) == 1
+    assert len(calls) == 2
+
+
+def test_sync_media_folder_repairs_zero_duration_audio_and_one_frame_track(tmp_path, monkeypatch):
+    project = _make_project(tmp_path)
+    _write_project_file(project, "media/sound.mp3", b"audio")
+    project.assets = [
+        Asset(
+            asset_id="aud-1",
+            asset_type="audio",
+            path="media\\sound.mp3",
+            duration_sec=0,
+            duration_checked=True,
+        ),
+    ]
+    scene = Scene(scene_id="scene-1")
+    scene.audio_tracks = [
+        AudioTrack(source_path="media/sound.mp3", timeline_start_frame=10, timeline_end_frame=11, total_source_frames=1),
+    ]
+    project.scenes = [scene]
+
+    monkeypatch.setattr(routes, "_get_audio_duration", lambda _filepath: 2.0)
+
+    assert routes._sync_media_folder(project) is True
+    assert project.assets[0].duration_sec == 2.0
+    assert project.assets[0].duration_checked is True
+    assert scene.audio_tracks[0].timeline_end_frame == 58
+    assert scene.audio_tracks[0].total_source_frames == 48
+
+
+def test_sync_media_folder_repairs_corrupt_video_metadata(tmp_path, monkeypatch):
+    project = _make_project(tmp_path)
+    _write_project_file(project, "media/bad.webm", b"video")
+    project.assets = [
+        Asset(
+            asset_id="vid-1",
+            asset_type="video",
+            path="media/bad.webm",
+            width=864,
+            height=480,
+            frame_count=-221360928884514624,
+            fps=24.0,
+            duration_sec=-9223372036854776.0,
+            has_audio=True,
+            has_audio_checked=True,
+        ),
+    ]
+
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", lambda *args, **kwargs: {
+        "width": 864,
+        "height": 480,
+        "frame_count": 313,
+        "fps": 24.0,
+        "duration_sec": 313 / 24.0,
+        "sample_rate": 0,
+        "has_audio": True,
+    })
+
+    assert routes._sync_media_folder(project) is True
+    assert project.assets[0].frame_count == 313
+    assert project.assets[0].duration_sec == pytest.approx(313 / 24.0)
+
+
+def test_sync_media_folder_skips_new_unprobeable_media(tmp_path, monkeypatch):
+    project = _make_project(tmp_path)
+    _write_project_file(project, "media/broken.mp3", b"not-media")
+
+    def fail_probe(*_args, **_kwargs):
+        raise media_helpers.MediaProbeError("bad media")
+
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", fail_probe)
+
+    assert routes._sync_media_folder(project) is False
+    assert project.assets == []
+
+
+def test_import_rejects_unprobeable_media_and_removes_copy(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    source_path = tmp_path / "source.mp3"
+    source_path.write_bytes(b"not-media")
+    save_calls = []
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: save_calls.append(saved_project))
+
+    def fail_probe(*_args, **_kwargs):
+        raise route_module.MediaProbeError("Could not probe audio metadata")
+
+    monkeypatch.setattr(route_module, "_extract_asset_media_metadata", fail_probe)
+
+    handler = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/assets/import")
+    response = asyncio.run(handler(DummyRequest(body={"source_path": str(source_path)})))
+    payload = _response_json(response)
+
+    assert response.status == 400
+    assert payload["error"] == "Could not probe audio metadata"
+    assert project.assets == []
+    assert save_calls == []
+    assert list((tmp_path / "project" / "media").iterdir()) == []
 
 
 def test_sync_media_folder_reprobes_when_media_signature_changes(tmp_path, monkeypatch):
@@ -252,11 +419,19 @@ def test_sync_media_folder_reprobes_when_media_signature_changes(tmp_path, monke
 
     calls = []
 
-    def fake_video_has_audio(filepath):
+    def fake_probe(filepath, *_args, **_kwargs):
         calls.append(routes._media_probe_signature(filepath))
-        return len(calls) == 2
+        return {
+            "width": 640,
+            "height": 360,
+            "frame_count": 48,
+            "fps": 24.0,
+            "duration_sec": 2.0,
+            "sample_rate": 0,
+            "has_audio": len(calls) == 2,
+        }
 
-    monkeypatch.setattr(routes, "_video_has_audio", fake_video_has_audio)
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", fake_probe)
 
     assert routes._sync_media_folder(project) is True
     first_signature = project.assets[0].media_probe_signature
@@ -333,16 +508,28 @@ def test_versioned_media_sync_saves_fresh_repairs_after_conflict(tmp_path, monke
     _write_project_file(project, "media/clip.mp4", b"video")
 
     monkeypatch.setattr(routes, "ensure_thumbnail", lambda *args, **kwargs: None)
-    monkeypatch.setattr(routes, "_extract_asset_media_metadata", lambda *args, **kwargs: {
-        "width": 64,
-        "height": 64,
-        "frame_count": 0,
-        "fps": 0.0,
-        "duration_sec": 0.0,
-        "sample_rate": 0,
-        "has_audio": False,
-    })
-    monkeypatch.setattr(routes, "_video_has_audio", lambda _filepath: True)
+    def fake_metadata(_path, asset_type, **_kwargs):
+        if asset_type == "video":
+            return {
+                "width": 640,
+                "height": 360,
+                "frame_count": 48,
+                "fps": 24.0,
+                "duration_sec": 2.0,
+                "sample_rate": 0,
+                "has_audio": True,
+            }
+        return {
+            "width": 64,
+            "height": 64,
+            "frame_count": 0,
+            "fps": 0.0,
+            "duration_sec": 0.0,
+            "sample_rate": 0,
+            "has_audio": False,
+        }
+
+    monkeypatch.setattr(routes, "_extract_asset_media_metadata", fake_metadata)
 
     stale = load_project(project.project_dir)
     base_version = stale.modified_at
@@ -527,7 +714,7 @@ def test_replace_project_asset_updates_references_when_path_changes(tmp_path, mo
 
     monkeypatch.setattr(
         "server.routes._extract_asset_media_metadata",
-        lambda path, asset_type: {
+            lambda path, asset_type, **_kwargs: {
             "width": 1280,
             "height": 720,
             "frame_count": 48,

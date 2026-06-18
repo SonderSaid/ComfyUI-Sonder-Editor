@@ -39,6 +39,7 @@ from ..server.media_helpers import (
     CUSTOM_SAVE_VIDEO_PRESET,
     CUSTOM_VIDEO_CODEC_OPTIONS,
     DEFAULT_SAVE_VIDEO_PRESET,
+    MediaProbeError,
     SAVE_VIDEO_PRESET_ORDER,
     SAVE_VIDEO_PRESETS,
     encode_video,
@@ -48,6 +49,7 @@ from ..server.media_helpers import (
     normalize_save_preset,
     output_extension_for_custom_options,
     output_extension_for_preset,
+    probe_media_metadata,
     resolve_custom_export_options,
     save_video_encode_timeout_seconds,
     tensor_mode_for_preset,
@@ -547,51 +549,11 @@ def _save_custom_png_sequence(
 
 
 def _extract_bridge_asset_metadata(source_path: str, asset_type: str) -> dict:
-    width, height, frame_count, fps, duration_sec, sample_rate = 0, 0, 0, 0.0, 0.0, 0
-    has_audio = False
-
-    if asset_type == "video":
-        cap = None
-        try:
-            cap = cv2.VideoCapture(source_path)
-            if cap.isOpened():
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-                duration_sec = frame_count / fps if fps > 0 else 0.0
-        except Exception as exc:
-            logger.warning("Bridge video metadata failed for %s: %s", source_path, exc)
-        finally:
-            if cap is not None:
-                cap.release()
-        try:
-            from ..server.routes import _video_has_audio as route_video_has_audio
-            has_audio = bool(route_video_has_audio(source_path))
-        except Exception:
-            has_audio = False
-    elif asset_type == "image":
-        try:
-            with Image.open(source_path) as img:
-                width, height = img.size
-        except Exception as exc:
-            logger.warning("Bridge image metadata failed for %s: %s", source_path, exc)
-    elif asset_type == "audio":
-        try:
-            from ..server.routes import _get_audio_duration as route_get_audio_duration
-            duration_sec = float(route_get_audio_duration(source_path) or 0.0)
-        except Exception:
-            duration_sec = 0.0
-
-    return {
-        "width": width,
-        "height": height,
-        "frame_count": frame_count,
-        "fps": fps,
-        "duration_sec": duration_sec,
-        "sample_rate": sample_rate,
-        "has_audio": has_audio,
-    }
+    return probe_media_metadata(
+        source_path,
+        asset_type,
+        strict=asset_type in {"video", "image", "audio"},
+    )
 
 
 def _load_prompt_server_instance():
@@ -890,7 +852,11 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         final_path = os.path.join(media_dir, final_name)
 
         asset_type, artifact_kind = classify_asset_path(final_path)
-        metadata = _extract_bridge_asset_metadata(source_path, asset_type)
+        try:
+            metadata = _extract_bridge_asset_metadata(source_path, asset_type)
+        except MediaProbeError as exc:
+            logger.warning("Skipping unprobeable bridge media output %s: %s", source_basename, exc)
+            continue
         generation_params = _generation_params_with_detected_workflow(
             dict(entry.get("generation_params") or {}),
             source_path,

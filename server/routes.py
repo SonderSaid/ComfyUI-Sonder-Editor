@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import time
@@ -14,9 +15,14 @@ from .media_helpers import (
     DEFAULT_CROP_POSITION,
     DEFAULT_FIT_MODE,
     FIT_MODES,
+    MediaProbeError,
     decode_video_frame,
     get_ffmpeg_path,
     get_ffprobe_path,
+    is_valid_media_metadata,
+    probe_audio_duration,
+    probe_media_has_audio,
+    probe_media_metadata,
     resize_frame_to_long_edge,
     write_png,
 )
@@ -371,42 +377,43 @@ def _classify_asset_for_registration(source_path: str) -> tuple[str, str]:
     return classify_asset_path(source_path)
 
 
-def _extract_asset_media_metadata(source_path: str, asset_type: str) -> dict:
-    width, height, frame_count, fps, duration_sec, sample_rate = 0, 0, 0, 0.0, 0.0, 0
+def _extract_asset_media_metadata(source_path: str, asset_type: str, *, strict: bool = False) -> dict:
+    return probe_media_metadata(source_path, asset_type, strict=strict)
 
-    if asset_type == "video":
-        try:
-            import cv2
-            cap = cv2.VideoCapture(source_path)
-            if cap.isOpened():
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-                duration_sec = frame_count / fps if fps > 0 else 0.0
-                cap.release()
-        except Exception as e:
-            logger.warning("Failed to extract video metadata: %s", e)
-    elif asset_type == "image":
-        try:
-            from PIL import Image
-            img = Image.open(source_path)
-            width, height = img.size
-        except Exception as e:
-            logger.warning("Failed to extract image metadata: %s", e)
-    elif asset_type == "audio":
-        duration_sec = _get_audio_duration(source_path)
 
-    has_audio = _video_has_audio(source_path) if asset_type == "video" else False
-    return {
-        "width": width,
-        "height": height,
-        "frame_count": frame_count,
-        "fps": fps,
-        "duration_sec": duration_sec,
-        "sample_rate": sample_rate,
-        "has_audio": has_audio,
-    }
+def _media_asset_requires_probe(asset_type: str) -> bool:
+    return asset_type in {"video", "image", "audio"}
+
+
+def _metadata_checked_for_asset(asset_type: str, metadata: dict) -> bool:
+    return _media_asset_requires_probe(asset_type) and is_valid_media_metadata(metadata, asset_type)
+
+
+def _finite_positive_number(value) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(number) and number > 0
+
+
+def _valid_source_frame_count(asset: Asset) -> int:
+    try:
+        frame_count = int(float(getattr(asset, "frame_count", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return frame_count if frame_count > 0 else 0
+
+
+def _valid_audio_duration_frames(asset: Asset, fps: float) -> int:
+    duration_sec = getattr(asset, "duration_sec", 0.0)
+    if not _finite_positive_number(duration_sec):
+        return 0
+    try:
+        frames = int(round(float(duration_sec) * float(fps or 24.0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return frames if frames > 0 else 0
 
 
 def _asset_file_size(source_path: str) -> int:
@@ -2468,211 +2475,25 @@ def _extract_embedded_workflow(project: TimelineProject, asset: Asset):
 
 
 def _get_audio_duration(filepath: str) -> float:
-    """Get audio duration in seconds using multiple fallback methods."""
-    # Method 1: mutagen auto-detect
+    """Get audio duration in seconds using the centralized media probe."""
     try:
-        from mutagen import File as MutagenFile
-        mf = MutagenFile(filepath)
-        if mf is not None and mf.info and mf.info.length and mf.info.length > 0:
-            logger.info("Audio duration via mutagen: %.2fs (%s)", mf.info.length, os.path.basename(filepath))
-            return float(mf.info.length)
+        duration = float(probe_audio_duration(filepath) or 0.0)
+        if duration > 0:
+            logger.info("Audio duration: %.2fs (%s)", duration, os.path.basename(filepath))
+            return duration
     except Exception as e:
-        logger.debug("mutagen auto-detect failed for %s: %s", filepath, e)
-
-    # Method 2: mutagen with explicit format (handles MP3 without ID3 tags)
-    ext = os.path.splitext(filepath)[1].lower()
-    try:
-        if ext == ".mp3":
-            from mutagen.mp3 import MP3
-            m = MP3(filepath)
-            if m.info and m.info.length > 0:
-                logger.info("Audio duration via mutagen.mp3: %.2fs (%s)", m.info.length, os.path.basename(filepath))
-                return float(m.info.length)
-        elif ext == ".flac":
-            from mutagen.flac import FLAC
-            m = FLAC(filepath)
-            if m.info and m.info.length > 0:
-                logger.info("Audio duration via mutagen.flac: %.2fs (%s)", m.info.length, os.path.basename(filepath))
-                return float(m.info.length)
-        elif ext == ".ogg":
-            from mutagen.oggvorbis import OggVorbis
-            m = OggVorbis(filepath)
-            if m.info and m.info.length > 0:
-                return float(m.info.length)
-        elif ext in (".m4a", ".aac"):
-            from mutagen.mp4 import MP4
-            m = MP4(filepath)
-            if m.info and m.info.length > 0:
-                return float(m.info.length)
-    except Exception as e:
-        logger.debug("mutagen explicit format failed for %s: %s", filepath, e)
-
-    # Method 3: torchaudio
-    try:
-        import torchaudio
-        waveform, sr = torchaudio.load(filepath)
-        dur = waveform.shape[-1] / sr
-        logger.info("Audio duration via torchaudio: %.2fs (%s)", dur, os.path.basename(filepath))
-        return dur
-    except Exception as e:
-        logger.debug("torchaudio failed for %s: %s", filepath, e)
-
-    # Method 4: ffprobe
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            dur = float(result.stdout.strip())
-            logger.info("Audio duration via ffprobe: %.2fs (%s)", dur, os.path.basename(filepath))
-            return dur
-    except Exception as e:
-        logger.debug("ffprobe failed for %s: %s", filepath, e)
-
+        logger.debug("audio duration probe failed for %s: %s", filepath, e)
     logger.warning("All audio duration methods failed for %s", filepath)
     return 0.0
 
 
 def _video_has_audio(filepath: str) -> bool:
-    """Check if a video file contains an audio stream."""
-    # Method 1: ffprobe
+    """Check if a video file contains an audio stream using the centralized media probe."""
     try:
-        import subprocess
-        ffprobe = _find_ffprobe()
-        result = subprocess.run(
-            [ffprobe, "-v", "quiet", "-select_streams", "a",
-             "-show_entries", "stream=codec_type", "-of", "csv=p=0", filepath],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0 and "audio" in result.stdout:
-            return True
+        return bool(probe_media_has_audio(filepath))
     except Exception as e:
-        logger.debug("ffprobe audio check failed for %s: %s", filepath, e)
-
-    # Method 2: mutagen (reads container metadata for audio streams)
-    try:
-        from mutagen import File as MutagenFile
-        mf = MutagenFile(filepath)
-        if mf is not None and mf.info:
-            # MP4/M4V containers: check for audio bitrate
-            if hasattr(mf.info, 'bitrate') and hasattr(mf.info, 'codec'):
-                return True
-            # Most video containers with audio will have sample_rate
-            if hasattr(mf.info, 'sample_rate') and mf.info.sample_rate > 0:
-                return True
-    except Exception as e:
-        logger.debug("mutagen audio check failed for %s: %s", filepath, e)
-
-    # Method 3: cv2 — check if video has more frames than expected for pure video
-    # This is a heuristic; cv2 can't directly detect audio streams
-    # but we can try loading audio with torchaudio as a last resort
-    try:
-        import torchaudio
-        info = torchaudio.info(filepath)
-        if info.num_frames > 0:
-            return True
-    except Exception:
-        pass
-
-    # Method 4: extraction fallback. This is slower, so only use it after the
-    # metadata probes fail; it keeps legacy/stale assets repairable without
-    # relying on frontend heuristics.
-    temp_audio_path = ""
-    try:
-        import tempfile
-        fd, temp_audio_path = tempfile.mkstemp(prefix="sonder_audio_probe_", suffix=".wav")
-        os.close(fd)
-        if _extract_audio_from_video(filepath, temp_audio_path):
-            return os.path.isfile(temp_audio_path) and os.path.getsize(temp_audio_path) > 0
-    except Exception as e:
-        logger.debug("ffmpeg extraction audio check failed for %s: %s", filepath, e)
-    finally:
-        if temp_audio_path:
-            try:
-                os.remove(temp_audio_path)
-            except OSError:
-                pass
-
-    return False
-
-
-def _find_ffmpeg() -> str:
-    """Find ffmpeg executable, checking PATH, Python packages, and common locations."""
-    import shutil
-    path = shutil.which("ffmpeg")
-    if path:
-        logger.info("Found ffmpeg on PATH: %s", path)
-        return path
-
-    # Method 1: imageio-ffmpeg (bundled ffmpeg in Python package)
-    try:
-        import imageio_ffmpeg
-        path = imageio_ffmpeg.get_ffmpeg_exe()
-        if path and os.path.isfile(path):
-            logger.info("Found ffmpeg via imageio-ffmpeg: %s", path)
-            return path
-    except ImportError:
-        # Try to install imageio-ffmpeg (it bundles a static ffmpeg binary)
-        logger.info("imageio-ffmpeg not found, attempting to install...")
-        try:
-            import subprocess, sys
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=120,
-            )
-            import imageio_ffmpeg
-            path = imageio_ffmpeg.get_ffmpeg_exe()
-            if path and os.path.isfile(path):
-                logger.info("Installed imageio-ffmpeg, ffmpeg at: %s", path)
-                return path
-        except Exception as e:
-            logger.warning("Failed to install imageio-ffmpeg: %s", e)
-    except Exception:
-        pass
-
-    # Method 2: Search common locations
-    import sys
-    candidates = []
-    python_dir = os.path.dirname(sys.executable)
-    candidates.append(os.path.join(python_dir, "ffmpeg.exe"))
-    candidates.append(os.path.join(python_dir, "Scripts", "ffmpeg.exe"))
-    candidates.append(os.path.join(python_dir, "..", "ffmpeg.exe"))
-    # Stability Matrix common paths
-    try:
-        import folder_paths
-        comfy_base = folder_paths.base_path
-        candidates.append(os.path.join(comfy_base, "ffmpeg.exe"))
-        candidates.append(os.path.join(comfy_base, "ffmpeg", "ffmpeg.exe"))
-        # Go up from ComfyUI to Stability Data
-        sm_data = os.path.dirname(os.path.dirname(comfy_base))
-        candidates.append(os.path.join(sm_data, "Assets", "ffmpeg", "ffmpeg.exe"))
-        candidates.append(os.path.join(sm_data, "Assets", "ffmpeg", "bin", "ffmpeg.exe"))
-    except Exception:
-        pass
-    # Search imageio_ffmpeg package directory directly
-    site_packages = os.path.join(python_dir, "Lib", "site-packages", "imageio_ffmpeg", "binaries")
-    if os.path.isdir(site_packages):
-        for f in os.listdir(site_packages):
-            if "ffmpeg" in f.lower() and not "probe" in f.lower():
-                candidates.append(os.path.join(site_packages, f))
-    # Common system locations
-    candidates.append(r"C:\ffmpeg\bin\ffmpeg.exe")
-    candidates.append(os.path.expanduser(r"~\ffmpeg\bin\ffmpeg.exe"))
-
-    for c in candidates:
-        if os.path.isfile(c):
-            logger.info("Found ffmpeg at: %s", c)
-            return c
-
-    logger.warning("ffmpeg not found anywhere. Audio extraction from video will not work.")
-    return "ffmpeg"  # fallback to PATH (will fail)
-
-
-_ffmpeg_path = None
+        logger.debug("audio stream probe failed for %s: %s", filepath, e)
+        return False
 
 def _get_ffmpeg() -> str:
     return get_ffmpeg_path()
@@ -2706,21 +2527,6 @@ def _extract_video_frame_ffmpeg(video_path: str, frame_index: int, output_path: 
     except Exception as e:
         logger.warning("ffmpeg frame extraction failed for %s: %s", video_path, e)
         return None
-
-
-def _find_ffprobe() -> str:
-    """Find ffprobe executable."""
-    import shutil
-    path = shutil.which("ffprobe")
-    if path:
-        return path
-    # Try same directory as ffmpeg
-    ffmpeg = _get_ffmpeg()
-    if ffmpeg and ffmpeg != "ffmpeg":
-        probe = os.path.join(os.path.dirname(ffmpeg), "ffprobe" + (".exe" if os.name == "nt" else ""))
-        if os.path.isfile(probe):
-            return probe
-    return "ffprobe"
 
 
 def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
@@ -2758,17 +2564,6 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
             e,
         )
 
-    # Method 2: torchaudio (can read audio from video containers)
-    try:
-        import torchaudio
-        waveform, sr = torchaudio.load(video_path)
-        torchaudio.save(output_path, waveform, sr, format="wav")
-        if os.path.isfile(output_path):
-            logger.info("Extracted audio from video via torchaudio: %s", os.path.basename(video_path))
-            return True
-    except Exception as e:
-        logger.debug("torchaudio audio extraction failed for %s: %s", video_path, e)
-
     return False
 
 
@@ -2785,8 +2580,13 @@ def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset 
     audio_filename = f"{asset.asset_id}_audio.wav"
     audio_rel_path = os.path.join("media", audio_filename)
     audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
+    audio_rel_norm = _normalize_project_relpath(audio_rel_path)
     existing_audio_asset = next(
-        (a for a in project.assets if a.path == audio_rel_path), None
+        (
+            a for a in project.assets
+            if _normalize_project_relpath(getattr(a, "path", "") or "") == audio_rel_norm
+        ),
+        None,
     )
 
     extracted = True
@@ -2803,12 +2603,19 @@ def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset 
 
     if audio_dur > 0:
         audio_asset = existing_audio_asset
-        if not audio_asset:
+        if audio_asset:
+            if audio_asset.duration_sec != audio_dur:
+                audio_asset.duration_sec = audio_dur
+            audio_asset.duration_checked = True
+            audio_asset.media_probe_signature = _media_probe_signature(audio_abs_path)
+        else:
             audio_asset = Asset(
                 name=f"{asset.name} (audio)",
                 asset_type="audio",
                 path=audio_rel_path,
                 duration_sec=audio_dur,
+                duration_checked=True,
+                media_probe_signature=_media_probe_signature(audio_abs_path),
             )
             project.add_asset(audio_asset)
             thumb_path = os.path.join(
@@ -2885,8 +2692,15 @@ def _sync_media_folder(
 
         asset_type, artifact_kind = _classify_asset_for_registration(filename)
 
-        # Extract metadata
-        metadata = _extract_asset_media_metadata(filepath, asset_type)
+        try:
+            metadata = _extract_asset_media_metadata(
+                filepath,
+                asset_type,
+                strict=_media_asset_requires_probe(asset_type),
+            )
+        except MediaProbeError as exc:
+            logger.warning("Skipped auto-registering unprobeable media %s: %s", filename, exc)
+            continue
 
         asset = Asset(
             name=filename,
@@ -2900,8 +2714,8 @@ def _sync_media_folder(
             duration_sec=metadata["duration_sec"],
             sample_rate=metadata["sample_rate"],
             has_audio=metadata["has_audio"],
-            has_audio_checked=asset_type == "video",
-            duration_checked=asset_type == "audio",
+            has_audio_checked=asset_type == "video" and _metadata_checked_for_asset(asset_type, metadata),
+            duration_checked=asset_type == "audio" and _metadata_checked_for_asset(asset_type, metadata),
             media_probe_signature=file_info.get("signature") or _media_probe_signature(filepath),
         )
         project.add_asset(asset)
@@ -2916,7 +2730,8 @@ def _sync_media_folder(
         changed = True
         logger.info("Auto-registered asset: %s (%s)", filename, asset_type)
 
-    # Repair video assets missing has_audio detection
+    # Repair video assets missing audio detection or carrying corrupt metadata
+    repaired_video_assets = {}
     for asset in project.assets:
         if asset.asset_type != "video":
             continue
@@ -2929,19 +2744,33 @@ def _sync_media_folder(
         checked = bool(getattr(asset, "has_audio_checked", False))
         stored_signature = getattr(asset, "media_probe_signature", "") or ""
         signature_changed = bool(stored_signature and signature and stored_signature != signature)
-        if asset.has_audio and not checked and not stored_signature:
+        current_metadata = {
+            "width": getattr(asset, "width", 0),
+            "height": getattr(asset, "height", 0),
+            "frame_count": getattr(asset, "frame_count", 0),
+            "fps": getattr(asset, "fps", 0.0),
+            "duration_sec": getattr(asset, "duration_sec", 0.0),
+        }
+        metadata_valid = is_valid_media_metadata(current_metadata, "video")
+        if metadata_valid and asset.has_audio and not checked and not stored_signature:
             changed = _mark_probe_state(asset, signature, has_audio=True) or changed
             continue
-        if checked and not signature_changed:
+        if checked and metadata_valid and not signature_changed:
             if signature and not stored_signature:
                 changed = _mark_probe_state(asset, signature) or changed
             continue
-        has_audio = _video_has_audio(filepath)
-        if asset.has_audio != has_audio:
-            asset.has_audio = has_audio
-            changed = True
-            if has_audio:
-                logger.info("Detected audio in video: %s", asset.name)
+        try:
+            metadata = _extract_asset_media_metadata(filepath, "video", strict=True)
+        except MediaProbeError as exc:
+            logger.warning("Video metadata repair failed for %s: %s", asset.name, exc)
+            continue
+        for field in ("width", "height", "frame_count", "fps", "duration_sec", "sample_rate", "has_audio"):
+            if getattr(asset, field, None) != metadata[field]:
+                setattr(asset, field, metadata[field])
+                changed = True
+        if metadata.get("has_audio"):
+            logger.info("Detected audio in video: %s", asset.name)
+        repaired_video_assets[rel_path] = int(metadata["frame_count"])
         changed = _mark_probe_state(asset, signature, has_audio=True) or changed
 
     # Repair existing audio assets with missing duration
@@ -2958,20 +2787,27 @@ def _sync_media_folder(
         checked = bool(getattr(asset, "duration_checked", False))
         stored_signature = getattr(asset, "media_probe_signature", "") or ""
         signature_changed = bool(stored_signature and signature and stored_signature != signature)
-        if asset.duration_sec > 0 and not checked and not stored_signature:
+        duration_valid = _finite_positive_number(getattr(asset, "duration_sec", 0.0))
+        if duration_valid and not checked and not stored_signature:
             changed = _mark_probe_state(asset, signature, duration=True) or changed
             continue
-        if checked and not signature_changed:
+        if checked and duration_valid and not signature_changed:
             if signature and not stored_signature:
                 changed = _mark_probe_state(asset, signature) or changed
             continue
         dur = _get_audio_duration(filepath)
         if dur and dur > 0:
             asset.duration_sec = dur
-            repaired_assets[asset.path] = dur
+            repaired_assets[_normalize_project_relpath(asset.path)] = dur
             changed = True
             logger.info("Repaired audio duration: %.2fs (%s)", dur, asset.name)
-        changed = _mark_probe_state(asset, signature, duration=True) or changed
+            changed = _mark_probe_state(asset, signature, duration=True) or changed
+        else:
+            if checked:
+                asset.duration_checked = False
+                changed = True
+            if signature and not stored_signature:
+                changed = _mark_probe_state(asset, signature) or changed
 
     # Repair audio tracks with 1-frame duration (caused by previous 0-duration bug)
     if repaired_assets:
@@ -2979,11 +2815,31 @@ def _sync_media_folder(
         for scene in project.scenes:
             for track in scene.audio_tracks:
                 duration_frames = track.timeline_end_frame - track.timeline_start_frame
-                if duration_frames <= 1 and track.source_path in repaired_assets:
-                    new_duration = int(repaired_assets[track.source_path] * fps)
+                track_source = _normalize_project_relpath(getattr(track, "source_path", "") or "")
+                if duration_frames <= 1 and track_source in repaired_assets:
+                    new_duration = int(round(repaired_assets[track_source] * fps))
                     if new_duration > 1:
                         track.timeline_end_frame = track.timeline_start_frame + new_duration
+                        track.total_source_frames = max(track.total_source_frames or 0, new_duration)
+                        changed = True
                         logger.info("Repaired audio track duration: %d frames (%s)", new_duration, track.source_path)
+
+    if repaired_video_assets:
+        for scene in project.scenes:
+            for clip in scene.clips:
+                clip_source = _normalize_project_relpath(getattr(clip, "source_path", "") or "")
+                source_frames = repaired_video_assets.get(clip_source)
+                if not source_frames:
+                    continue
+                duration_frames = int(getattr(clip, "timeline_end_frame", 0) or 0) - int(getattr(clip, "timeline_start_frame", 0) or 0)
+                if duration_frames > 0 and int(getattr(clip, "source_out_frame", 0) or 0) > 0 and int(getattr(clip, "total_source_frames", 0) or 0) > 0:
+                    continue
+                clip.source_in_frame = max(0, int(getattr(clip, "source_in_frame", 0) or 0))
+                clip.source_out_frame = max(clip.source_in_frame + 1, source_frames)
+                clip.total_source_frames = max(1, source_frames)
+                clip.timeline_end_frame = int(getattr(clip, "timeline_start_frame", 0) or 0) + max(1, source_frames - clip.source_in_frame)
+                changed = True
+                logger.info("Repaired video clip duration: %d frames (%s)", source_frames, clip.source_path)
 
     return changed
 
@@ -3942,6 +3798,11 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     replacement_type, replacement_artifact_kind = _classify_asset_for_registration(resolved_source)
     if replacement_type != asset.asset_type:
         raise ValueError(f"Replacement type mismatch: expected {asset.asset_type}, got {replacement_type}")
+    metadata = _extract_asset_media_metadata(
+        resolved_source,
+        asset.asset_type,
+        strict=_media_asset_requires_probe(asset.asset_type),
+    )
 
     media_dir = os.path.join(project.project_dir, "media")
     os.makedirs(media_dir, exist_ok=True)
@@ -3974,7 +3835,6 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
                 except OSError:
                     logger.warning("Failed to remove replaced asset file: %s", old_abs_path)
 
-    metadata = _extract_asset_media_metadata(next_abs_path, asset.asset_type)
     asset.width = metadata["width"]
     asset.height = metadata["height"]
     asset.frame_count = metadata["frame_count"]
@@ -3982,8 +3842,8 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     asset.duration_sec = metadata["duration_sec"]
     asset.sample_rate = metadata["sample_rate"]
     asset.has_audio = metadata["has_audio"]
-    asset.has_audio_checked = asset.asset_type == "video"
-    asset.duration_checked = asset.asset_type == "audio"
+    asset.has_audio_checked = asset.asset_type == "video" and _metadata_checked_for_asset(asset.asset_type, metadata)
+    asset.duration_checked = asset.asset_type == "audio" and _metadata_checked_for_asset(asset.asset_type, metadata)
     asset.media_probe_signature = _media_probe_signature(next_abs_path)
     asset.artifact_kind = replacement_artifact_kind if asset.asset_type == "artifact" else ""
 
@@ -4503,7 +4363,18 @@ if routes is not None:
         dest_path = os.path.join(media_dir, dest_filename)
         shutil.copy2(source_path, dest_path)
 
-        metadata = _extract_asset_media_metadata(dest_path, asset_type)
+        try:
+            metadata = _extract_asset_media_metadata(
+                dest_path,
+                asset_type,
+                strict=_media_asset_requires_probe(asset_type),
+            )
+        except MediaProbeError as exc:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+            return _json_error(str(exc), 400)
 
         # Create asset entry
         asset = Asset(
@@ -4518,8 +4389,8 @@ if routes is not None:
             duration_sec=metadata["duration_sec"],
             sample_rate=metadata["sample_rate"],
             has_audio=metadata["has_audio"],
-            has_audio_checked=asset_type == "video",
-            duration_checked=asset_type == "audio",
+            has_audio_checked=asset_type == "video" and _metadata_checked_for_asset(asset_type, metadata),
+            duration_checked=asset_type == "audio" and _metadata_checked_for_asset(asset_type, metadata),
             media_probe_signature=_media_probe_signature(dest_path),
             prompt=body.get("prompt", ""),
             generation_params=body.get("generation_params", {}),
@@ -5127,7 +4998,7 @@ if routes is not None:
             _replace_project_asset(project, asset, source_path)
         except FileNotFoundError as e:
             return _json_error(str(e), 400)
-        except ValueError as e:
+        except (ValueError, MediaProbeError) as e:
             return _json_error(str(e), 400)
 
         _delete_asset_cache_files(project, asset)
@@ -5894,14 +5765,17 @@ if routes is not None:
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
-        start_frame = int(body.get("timeline_start_frame", 0))
-        frame_count = asset.frame_count or 1
-        end_frame = start_frame + frame_count
         role = body.get("role", "render")
         if role not in {"render", "motion_driver"}:
             return _json_error(f"Invalid clip role: {role}", 400)
         if role == "motion_driver" and asset.asset_type != "video":
             return _json_error("Motion-driver clips require video assets", 400)
+        start_frame = int(body.get("timeline_start_frame", 0))
+        frame_count = _valid_source_frame_count(asset)
+        if asset.asset_type == "video" and frame_count <= 0:
+            return _json_error("Video asset has invalid duration metadata. Refresh assets or re-import the file.", 400)
+        frame_count = frame_count or 1
+        end_frame = start_frame + frame_count
         track_index = int(body.get("track_index", 0))
         audio_lane_idx = int(body.get("audio_lane_index", 0))
         clip_fit_mode = str(body.get("fit_mode", DEFAULT_FIT_MODE) or DEFAULT_FIT_MODE).strip().lower()
@@ -5941,7 +5815,9 @@ if routes is not None:
                 audio_asset = await asyncio.to_thread(_prepare_video_audio_asset, project, asset)
                 if audio_asset:
                     fps = project.fps or 24.0
-                    audio_frames = int(audio_asset.duration_sec * fps) if audio_asset.duration_sec > 0 else frame_count
+                    audio_frames = _valid_audio_duration_frames(audio_asset, fps)
+                    if audio_frames <= 0:
+                        raise ValueError("Extracted audio has invalid duration metadata")
                     audio_track = AudioTrack(
                         source_path=audio_asset.path,
                         timeline_start_frame=start_frame,
@@ -6165,7 +6041,9 @@ if routes is not None:
         start_frame = int(body.get("timeline_start_frame", 0))
         # Calculate duration in frames from asset duration
         fps = project.fps or 24.0
-        duration_frames = int(asset.duration_sec * fps) if asset.duration_sec > 0 else 1
+        duration_frames = _valid_audio_duration_frames(asset, fps)
+        if asset.asset_type != "audio" or duration_frames <= 0:
+            return _json_error("Audio asset has invalid duration metadata. Refresh assets or re-import the file.", 400)
         end_frame = start_frame + duration_frames
 
         track = AudioTrack(
