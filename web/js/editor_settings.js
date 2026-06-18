@@ -197,6 +197,9 @@ export const DEFAULT_EDITOR_SETTINGS = {
         prebufferEnabled: true,
         prebufferLookaheadMs: 5000,
         streamingMode: "auto",
+        adaptiveRebuffer: true,
+        rebufferEnterMs: 250,
+        rebufferMaxMs: 4000,
     },
     notifications: {
         toastDurationMs: 4000,
@@ -833,6 +836,23 @@ function normalizeEditorSettings(source = null) {
                 true,
             ),
             streamingMode,
+            adaptiveRebuffer: stored?.playback?.adaptiveRebuffer == null
+                ? defaults.playback.adaptiveRebuffer
+                : !!stored.playback.adaptiveRebuffer,
+            rebufferEnterMs: clampNumber(
+                stored?.playback?.rebufferEnterMs,
+                0,
+                5000,
+                defaults.playback.rebufferEnterMs,
+                true,
+            ),
+            rebufferMaxMs: clampNumber(
+                stored?.playback?.rebufferMaxMs,
+                500,
+                30000,
+                defaults.playback.rebufferMaxMs,
+                true,
+            ),
         },
         notifications: {
             toastDurationMs: clampNumber(

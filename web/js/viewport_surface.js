@@ -14,6 +14,9 @@ const PLAYBACK_FIRST_COMMIT_HOLD_MS = 2500;
 const PLAYBACK_PREBUFFER_BOUNDARY_DEPTH = 2;
 // Hard cap on simultaneously warmed prebuffer video elements (RAM/VRAM budget).
 const PLAYBACK_PREBUFFER_MAX_ENTRIES = 8;
+// Adaptive rebuffer hysteresis: minimum gap after a rebuffer exit before another
+// may start, so a marginally-slow scene cannot oscillate buffer/play every frame.
+const PLAYBACK_REBUFFER_REENTRY_MS = 500;
 
 // Session-diagnostic helper: writes to `window.__SONDER_CANVAS_DIAG` populated
 // by editor_widget.js when `window.SONDER_DEBUG_SESSION === true`. Zero-cost
@@ -320,6 +323,26 @@ export function createViewportSurface(options = {}) {
         videoCache: options.videoCache || {},
         audioCache: options.audioCache || {},
         imageCache: options.imageCache || {},
+        // Phase 2 adaptive rebuffer: when a transient in-flight prepare keeps the
+        // composite blocked, freeze the clock + audio at the buffering frame so they
+        // stop running away from frozen video, then resume in sync on the next commit.
+        playbackRebuffering: false,
+        playbackRebufferFrame: 0,
+        playbackRebufferSinceMs: null,
+        playbackRebufferCapped: false,
+        playbackRebufferLastExitMs: 0,
+        playbackRebufferToastHandle: null,
+        playbackRebufferCapHandle: null,
+        // Phase 1 playback telemetry accumulators (dev-only; only touched when
+        // SONDER_DEBUG_SESSION or SONDER_DEBUG_PLAYBACK_BOUNDARY is on).
+        playbackTelemetry: {
+            lastFramesBehindMs: 0,
+            maxFramesBehind: 0,
+            lastQualitySampleMs: 0,
+            qualityByKey: new Map(),
+            blockReasons: new Map(),
+            lastBlockFlushMs: 0,
+        },
     };
 
     const noop = () => {};
@@ -346,6 +369,13 @@ export function createViewportSurface(options = {}) {
     const getPrebufferLookaheadMs = options.getPrebufferLookaheadMs || (() => 1000);
     const getStreamingMode = options.getStreamingMode || (() => "auto");
     const isSceneOutlineEnabled = options.isSceneOutlineEnabled || (() => false);
+    const isAdaptiveRebufferEnabled = options.isAdaptiveRebufferEnabled || (() => true);
+    const getRebufferEnterMs = options.getRebufferEnterMs || (() => 250);
+    const getRebufferMaxMs = options.getRebufferMaxMs || (() => 4000);
+    // Injected notification emitter (Core `notifyInfo`-shaped: returns a handle with
+    // update/resolve/dismiss, or null). No-op fallback keeps the surface decoupled.
+    const notifyInfo = options.notifyInfo || (() => null);
+    const notifyWarning = options.notifyWarning || (() => null);
 
     function currentFrame() {
         return clamp(Math.round(Number(getFrame()) || 0), 0, totalFrames());
@@ -391,6 +421,106 @@ export function createViewportSurface(options = {}) {
         if (state.playbackDecisionLogKeys.has(logKey)) return;
         state.playbackDecisionLogKeys.add(logKey);
         playbackDebugEvent(eventName, details);
+    }
+
+    // --- Phase 1 playback telemetry (dev-only) -------------------------------
+    // All sampling is gated behind this check so it is zero-cost in normal use.
+    // Records land in the SONDER_DEBUG_SESSION ring (__SONDER_CANVAS_DIAG via
+    // viewportDiagRecord) and, when SONDER_DEBUG_PLAYBACK_BOUNDARY is on, also
+    // print to the console. Surfaced through the existing Ctrl+Alt+Shift+D bundle.
+    function playbackTelemetryActive() {
+        return typeof window !== "undefined"
+            && (window.SONDER_DEBUG_SESSION === true || !!window.SONDER_DEBUG_PLAYBACK_BOUNDARY);
+    }
+
+    function recordPlaybackTelemetry(kind, payload) {
+        viewportDiagRecord(kind, payload);
+        debugPlaybackBoundary(`telemetry:${kind}`, payload);
+    }
+
+    function resetPlaybackTelemetry() {
+        const t = state.playbackTelemetry;
+        t.lastFramesBehindMs = 0;
+        t.maxFramesBehind = 0;
+        t.lastQualitySampleMs = 0;
+        t.qualityByKey.clear();
+        t.blockReasons.clear();
+        t.lastBlockFlushMs = 0;
+    }
+
+    // (1) Frames-behind-wall-clock: how far the free-running clock has advanced
+    // past the last committed composite frame — i.e. the A/V desync, quantified.
+    function recordFramesBehindTelemetry(timestamp, nextFrame, endFrame) {
+        if (!playbackTelemetryActive()) return;
+        const committed = state.playbackLastCommittedFrame;
+        if (committed === null || !Number.isFinite(committed)) return;
+        const behind = nextFrame - committed;
+        if (behind < 2) return;
+        const t = state.playbackTelemetry;
+        if (behind > t.maxFramesBehind) t.maxFramesBehind = behind;
+        if (timestamp - t.lastFramesBehindMs < 250) return;
+        t.lastFramesBehindMs = timestamp;
+        recordPlaybackTelemetry("playback_frames_behind", {
+            behind,
+            maxBehind: t.maxFramesBehind,
+            committedFrame: committed,
+            wallClockFrame: nextFrame,
+            endFrame,
+            fps: fps(),
+            playbackSessionId: state.playbackSessionId,
+        });
+    }
+
+    // (2) Decoder health: dropped vs total decoded frames per active video.
+    // Separates "decoder fell behind" from "we never delivered the frame".
+    function samplePlaybackQualityTelemetry() {
+        if (!playbackTelemetryActive()) return;
+        const now = performance.now();
+        const t = state.playbackTelemetry;
+        if (now - t.lastQualitySampleMs < 500) return;
+        t.lastQualitySampleMs = now;
+        for (const [key, active] of state.activePlaybackVideos.entries()) {
+            const video = active?.video;
+            if (typeof video?.getVideoPlaybackQuality !== "function") continue;
+            const q = video.getVideoPlaybackQuality();
+            const prev = t.qualityByKey.get(key) || { dropped: 0, total: 0 };
+            const dropped = Number(q.droppedVideoFrames) || 0;
+            const total = Number(q.totalVideoFrames) || 0;
+            const deltaDropped = Math.max(0, dropped - prev.dropped);
+            const deltaTotal = Math.max(0, total - prev.total);
+            t.qualityByKey.set(key, { dropped, total });
+            if (deltaTotal <= 0 && deltaDropped <= 0) continue;
+            recordPlaybackTelemetry("playback_video_quality", {
+                layerKey: key,
+                sourcePath: active?.sourcePath || "",
+                droppedTotal: dropped,
+                totalTotal: total,
+                droppedDelta: deltaDropped,
+                totalDelta: deltaTotal,
+                playbackSessionId: state.playbackSessionId,
+            });
+        }
+    }
+
+    // (4) Block-reason histogram: why drawPlaybackComposite couldn't commit, split
+    // by whether a prepare was in flight (transient) vs not (likely permanent).
+    function noteBlockReasonTelemetry(reason, inflight, timestamp) {
+        if (!playbackTelemetryActive()) return;
+        const t = state.playbackTelemetry;
+        const bucket = `${reason || "unknown"}|${inflight ? "inflight" : "stalled"}`;
+        t.blockReasons.set(bucket, (t.blockReasons.get(bucket) || 0) + 1);
+        if (timestamp - t.lastBlockFlushMs >= 1000) flushBlockReasonTelemetry(timestamp);
+    }
+
+    function flushBlockReasonTelemetry(timestamp) {
+        const t = state.playbackTelemetry;
+        if (!t.blockReasons.size) return;
+        t.lastBlockFlushMs = Number.isFinite(timestamp) ? timestamp : performance.now();
+        recordPlaybackTelemetry("playback_block_reasons", {
+            buckets: Object.fromEntries(t.blockReasons),
+            playbackSessionId: state.playbackSessionId,
+        });
+        t.blockReasons.clear();
     }
 
     function invalidateAsyncPreviewRenders() {
@@ -847,6 +977,9 @@ export function createViewportSurface(options = {}) {
     }
 
     function audioPlaybackAllowed(snapshot) {
+        // While rebuffering, audio is frozen with the clock — never let the
+        // syncPlaybackMedia resume-play branch un-pause it mid-hold.
+        if (state.playbackRebuffering) return false;
         const allowed = state.audioReleasedThisSession || !snapshotHasPlayableVideo(snapshot);
         if (!allowed && !state.audioFreezeLogged) {
             playbackDebugEvent("audio-frozen", {
@@ -1419,6 +1552,11 @@ export function createViewportSurface(options = {}) {
             return active.pendingPrepare;
         }
         const token = ++state.playbackPrepareToken;
+        // Cold-start timing: end-to-end prepare (source-resolve + seek + decode)
+        // until first drawable frame. The blob-fetch portion is attributable
+        // separately via the resolve_media_source diag record.
+        const prepareStartedAt = performance.now();
+        const prepareWasWarm = !!active.firstDrawComplete;
         active.layer = layer;
         active.layerKey = layer.key;
         active.sourcePath = sourcePath;
@@ -1471,6 +1609,15 @@ export function createViewportSurface(options = {}) {
                         readyState: active.video?.readyState || 0,
                         playbackSessionId: sessionId,
                     }, [layer.key, sourcePath]);
+                    if (playbackTelemetryActive()) {
+                        recordPlaybackTelemetry("playback_clip_coldstart", {
+                            layerKey: layer.key,
+                            sourcePath,
+                            prepareMs: Math.round(performance.now() - prepareStartedAt),
+                            warm: prepareWasWarm,
+                            playbackSessionId: sessionId,
+                        });
+                    }
                     syncPreparedVideoPlayback(active, layer, frame);
                     renderFrame();
                     return active.video;
@@ -1693,6 +1840,9 @@ export function createViewportSurface(options = {}) {
 
     function commitPlaybackBlocked(snapshot, details, options = {}) {
         const now = performance.now();
+        if (playbackTelemetryActive()) {
+            noteBlockReasonTelemetry(details?.reason, hasCurrentLayerPrepareInFlight(snapshot), now);
+        }
         const signature = playbackLayerSignature(snapshot);
         const canHoldCanvas = playbackCanvasStillValid();
         if (state.playbackBlockedSignature !== signature) {
@@ -1727,6 +1877,23 @@ export function createViewportSurface(options = {}) {
             }
         }
 
+        // Adaptive rebuffer: a transient in-flight prepare has kept us blocked past
+        // the enter threshold while a committed frame is on screen → arm the clock
+        // freeze (the actual freeze happens at the top of playbackTick). The canvas
+        // stays held by the hold-inflight-prepare path just below.
+        if (
+            isAdaptiveRebufferEnabled()
+            && !state.playbackRebuffering
+            && canHoldCanvas
+            && state.playbackCompositeCommitted
+            && state.playbackBlockedSinceMs !== null
+            && (now - state.playbackBlockedSinceMs) >= getRebufferEnterMs()
+            && (now - state.playbackRebufferLastExitMs) >= PLAYBACK_REBUFFER_REENTRY_MS
+            && hasCurrentLayerPrepareInFlight(snapshot)
+        ) {
+            enterRebuffer(now);
+        }
+
         if (canHoldCanvas && hasCurrentLayerPrepareInFlight(snapshot)) {
             playbackDecisionDebugEvent("hold-inflight-prepare", { ...details }, [
                 signature,
@@ -1738,6 +1905,12 @@ export function createViewportSurface(options = {}) {
             return false;
         }
 
+        // No prepare in flight and still blocked → this is a permanent failure
+        // (missing/offline media), not a transient buffer. Stop freezing and let the
+        // timeline play through (audio resumes) rather than holding indefinitely.
+        if (state.playbackRebuffering) {
+            finishRebuffer({ resume: true, reason: "permanent-failure" });
+        }
         drawViewportText("Loading preview...", "");
         resetPlaybackCompositeState();
         playbackDecisionDebugEvent("commit-loading-fallback", details, [
@@ -1880,6 +2053,7 @@ export function createViewportSurface(options = {}) {
             active.audio.pause();
             state.activePlaybackAudios.delete(key);
         }
+        samplePlaybackQualityTelemetry();
     }
 
     function drawPlaybackComposite(snapshot) {
@@ -1917,6 +2091,11 @@ export function createViewportSurface(options = {}) {
         clearPlaybackDecisionLogs();
         releaseAudioForSession("first-composite-commit", { frame: snapshot.frame });
         clearFirstCommitHold();
+        // A frame committed again — if we were rebuffering, recover and resume audio
+        // in sync. maybeHoldForRebuffer re-pins the clock to the committed frame.
+        if (state.playbackRebuffering) {
+            finishRebuffer({ resume: true, reason: "recovered" });
+        }
         // The new frame is committed; outgoing elements parked at claim time are
         // no longer on screen and can be torn down.
         drainPendingReleases();
@@ -2037,6 +2216,135 @@ export function createViewportSurface(options = {}) {
         return true;
     }
 
+    // --- Phase 2 adaptive rebuffer ------------------------------------------------
+    // Full reset for session start / stop / dormant teardown.
+    function resetRebufferState() {
+        state.playbackRebuffering = false;
+        state.playbackRebufferFrame = 0;
+        state.playbackRebufferSinceMs = null;
+        state.playbackRebufferCapped = false;
+        state.playbackRebufferLastExitMs = 0;
+        if (state.playbackRebufferToastHandle) {
+            try { state.playbackRebufferToastHandle.dismiss(); } catch (e) { /* ignore */ }
+            state.playbackRebufferToastHandle = null;
+        }
+        if (state.playbackRebufferCapHandle) {
+            try { state.playbackRebufferCapHandle.dismiss(); } catch (e) { /* ignore */ }
+            state.playbackRebufferCapHandle = null;
+        }
+    }
+
+    function enterRebuffer(now) {
+        state.playbackRebuffering = true;
+        // Hold at the current (runaway) frame: audio has already played to ~here, so
+        // catching the frozen video up to this frame keeps audio continuous (no
+        // rewind) and resyncs A/V where the listener already is.
+        state.playbackRebufferFrame = currentFrame();
+        state.playbackRebufferSinceMs = now;
+        state.playbackRebufferCapped = false;
+        for (const active of state.activePlaybackAudios.values()) {
+            active.audio.pause();
+        }
+        if (!state.playbackRebufferToastHandle) {
+            state.playbackRebufferToastHandle = notifyInfo(
+                "Heavy scene — buffering for smooth playback",
+                { source: "playback-rebuffer" }
+            );
+        }
+        recordPlaybackTelemetry("playback_rebuffer_enter", {
+            frame: state.playbackRebufferFrame,
+            committedFrame: state.playbackLastCommittedFrame,
+            playbackSessionId: state.playbackSessionId,
+        });
+    }
+
+    // Exit a live rebuffer (a frame committed again, or a permanent failure made
+    // holding pointless). resume:true re-pins the clock and re-seeks audio to the
+    // buffering frame so A/V resume in sync.
+    function finishRebuffer({ resume, reason } = {}) {
+        if (!state.playbackRebuffering && !state.playbackRebufferToastHandle) return;
+        const wasBuffering = state.playbackRebuffering;
+        // Resume from the buffering frame (where audio already is) — NOT
+        // lastCommittedFrame, which a permanent-failure exit resets to null.
+        const resumeFrame = clamp(Math.round(Number(state.playbackRebufferFrame) || 0), 0, totalFrames());
+        state.playbackRebuffering = false;
+        state.playbackRebufferSinceMs = null;
+        state.playbackRebufferCapped = false;
+        state.playbackRebufferLastExitMs = performance.now();
+        if (state.playbackRebufferToastHandle) {
+            try { state.playbackRebufferToastHandle.resolve(); } catch (e) { /* ignore */ }
+            state.playbackRebufferToastHandle = null;
+        }
+        if (resume) {
+            // Re-pin the clock and re-seek audio to the buffering frame so A/V resume
+            // locked together (covers both the held-tick and async prepare-ready paths).
+            state.playbackStartTime = performance.now();
+            state.playbackStartFrame = resumeFrame;
+            for (const active of state.activePlaybackAudios.values()) {
+                try { active.audio.currentTime = audioSourceTime(active.layer, resumeFrame); } catch (e) { /* ignore */ }
+            }
+        }
+        if (wasBuffering) {
+            recordPlaybackTelemetry("playback_rebuffer_exit", {
+                reason: reason || "",
+                frame: resumeFrame,
+                playbackSessionId: state.playbackSessionId,
+            });
+        }
+    }
+
+    function escalateRebufferToast() {
+        // The transient buffering info toast may have already auto-dismissed during a
+        // long hold, so update()-ing it would be a no-op. Emit a SEPARATE sticky
+        // warning instead. It persists (warning tier) until playback stops, since the
+        // "too heavy" verdict stays valid across brief recovery windows; coalesces by
+        // source so repeated caps don't stack.
+        if (state.playbackRebufferToastHandle) {
+            try { state.playbackRebufferToastHandle.dismiss(); } catch (e) { /* ignore */ }
+            state.playbackRebufferToastHandle = null;
+        }
+        if (!state.playbackRebufferCapHandle) {
+            state.playbackRebufferCapHandle = notifyWarning(
+                "Scene too heavy for smooth live playback",
+                { source: "playback-rebuffer-cap" }
+            );
+        }
+    }
+
+    // Freeze the wall clock at the buffering frame so the prepare target stops
+    // moving and the in-flight seek can land. Returns true while held (consumes the
+    // tick). At the cap, prefer an honest stall (last frame held, audio paused) over
+    // resuming the runaway.
+    function maybeHoldForRebuffer(timestamp) {
+        if (!state.playbackRebuffering) return false;
+        const holdFrame = clamp(Math.round(Number(state.playbackRebufferFrame) || 0), 0, totalFrames());
+        state.playbackStartTime = timestamp;
+        state.playbackStartFrame = holdFrame;
+        if (currentFrame() !== holdFrame) {
+            applyFrame(holdFrame, { reason: "playback-rebuffer-hold" });
+        }
+        const snapshot = buildFrameSnapshot(holdFrame);
+        invalidateAsyncPreviewRenders();
+        renderPlaybackFrame(snapshot); // a successful commit clears the flag via finishRebuffer
+        if (!state.playbackRebuffering) {
+            // Recovered this tick — finishRebuffer already re-pinned the clock to the
+            // buffering frame; the next tick advances cleanly from there.
+        } else {
+            const heldMs = state.playbackRebufferSinceMs !== null ? timestamp - state.playbackRebufferSinceMs : 0;
+            if (heldMs >= getRebufferMaxMs() && !state.playbackRebufferCapped) {
+                state.playbackRebufferCapped = true;
+                escalateRebufferToast();
+                recordPlaybackTelemetry("playback_rebuffer_cap", {
+                    frame: holdFrame,
+                    heldMs,
+                    playbackSessionId: state.playbackSessionId,
+                });
+            }
+        }
+        state.playbackRAF = requestAnimationFrame(playbackTick);
+        return true;
+    }
+
     function restartPlaybackLoop(timestamp) {
         if (!state.playbackLoopRange) return;
         const hadCommittedFrame = state.playbackCompositeCommitted;
@@ -2058,6 +2366,11 @@ export function createViewportSurface(options = {}) {
 
     function playbackTick(timestamp) {
         if (state.destroyed || !state.isPlaying) return;
+        // Freeze the clock before any advance while rebuffering (mirrors the
+        // first-commit hold) so the playhead never overshoots the buffering frame.
+        if (maybeHoldForRebuffer(timestamp)) {
+            return;
+        }
         const elapsedSeconds = (timestamp - state.playbackStartTime) / 1000;
         const nextFrame = state.playbackStartFrame + Math.floor(elapsedSeconds * fps());
         const loopRange = state.playbackLoopRange;
@@ -2075,6 +2388,7 @@ export function createViewportSurface(options = {}) {
             return;
         }
         applyFrame(nextFrame, { reason: "playback" });
+        recordFramesBehindTelemetry(timestamp, nextFrame, endFrame);
         const snapshot = buildFrameSnapshot(nextFrame);
         invalidateAsyncPreviewRenders();
         renderPlaybackFrame(snapshot);
@@ -2105,6 +2419,8 @@ export function createViewportSurface(options = {}) {
             return;
         }
         updatePlaybackState(false);
+        flushBlockReasonTelemetry();
+        resetRebufferState();
         clearActivePlaybackMedia();
         clearPrebufferCache();
         resetPlaybackCompositeState();
@@ -2135,6 +2451,8 @@ export function createViewportSurface(options = {}) {
         clearPlaybackDecisionLogs();
         resetPlaybackCompositeState();
         resetAudioReleaseLatch();
+        resetPlaybackTelemetry();
+        resetRebufferState();
         beginFirstCommitHold(state.playbackStartTime, startFrame);
         updatePlaybackState(true);
         const snapshot = buildFrameSnapshot(startFrame);
@@ -2155,6 +2473,7 @@ export function createViewportSurface(options = {}) {
         clearPrebufferCache();
         resetPlaybackCompositeState();
         clearFirstCommitHold();
+        resetRebufferState();
         for (const mediaEl of Object.values(state.videoCache)) {
             removeMediaSource(mediaEl);
         }

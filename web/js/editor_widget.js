@@ -11763,6 +11763,11 @@ export class EditorWidget {
             getPrebufferLookaheadMs: () => this._settings?.playback?.prebufferLookaheadMs ?? 1000,
             getStreamingMode: () => this._settings?.playback?.streamingMode ?? "auto",
             isSceneOutlineEnabled: () => this._settings?.appearance?.sceneOutline !== false,
+            isAdaptiveRebufferEnabled: () => this._settings?.playback?.adaptiveRebuffer !== false,
+            getRebufferEnterMs: () => this._settings?.playback?.rebufferEnterMs ?? 250,
+            getRebufferMaxMs: () => this._settings?.playback?.rebufferMaxMs ?? 4000,
+            notifyInfo: (message, opts) => notifyInfo(message, opts),
+            notifyWarning: (message, opts) => notifyWarning(message, opts),
             onFrameChange: (frame, meta = {}) => {
                 this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
                 if (meta.reason === "playback" || meta.reason === "playback-loop" || meta.reason === "playback-stop-return") {
