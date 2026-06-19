@@ -184,6 +184,9 @@ function syncSettingsPanelControls() {
     if (controls.playbackResolution) controls.playbackResolution.value = this._settings.playback.resolution;
     if (controls.prebufferEnabled) controls.prebufferEnabled.checked = !!this._settings.playback.prebufferEnabled;
     if (controls.prebufferLookaheadMs) controls.prebufferLookaheadMs.value = String(this._settings.playback.prebufferLookaheadMs);
+    if (controls.prebufferBoundaryDepth) controls.prebufferBoundaryDepth.value = String(this._settings.playback.prebufferBoundaryDepth);
+    if (controls.prebufferMaxEntries) controls.prebufferMaxEntries.value = String(this._settings.playback.prebufferMaxEntries);
+    if (controls.videoCacheMaxEntries) controls.videoCacheMaxEntries.value = String(this._settings.playback.videoCacheMaxEntries);
     if (controls.waveformAccent) controls.waveformAccent.value = this._settings.appearance.waveformAccent;
     if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
     if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
@@ -955,6 +958,45 @@ function showSettingsPanel() {
             step: 100,
             getter: () => this._settings.playback.prebufferLookaheadMs,
             onChange: (value) => updateCategory("playback", "prebufferLookaheadMs", Math.round(value)),
+        }
+    );
+    createNumberInput(
+        playbackSection,
+        "prebufferBoundaryDepth",
+        "Prebuffer Boundary Depth (advanced)",
+        "How many upcoming clip boundaries to warm ahead. Raise on heavy multi-layer scenes so the playhead reaches each boundary already warm. Default 2.",
+        {
+            min: 1,
+            max: 12,
+            step: 1,
+            getter: () => this._settings.playback.prebufferBoundaryDepth,
+            onChange: (value) => updateCategory("playback", "prebufferBoundaryDepth", Math.round(value)),
+        }
+    );
+    createNumberInput(
+        playbackSection,
+        "prebufferMaxEntries",
+        "Prebuffer Max Warmed Clips (advanced)",
+        "Hard cap on simultaneously warmed prebuffer video decoders (RAM/VRAM budget). Raising past your GPU's concurrent-4K-decode limit can hurt — watch playback. Default 8.",
+        {
+            min: 1,
+            max: 64,
+            step: 1,
+            getter: () => this._settings.playback.prebufferMaxEntries,
+            onChange: (value) => updateCategory("playback", "prebufferMaxEntries", Math.round(value)),
+        }
+    );
+    createNumberInput(
+        playbackSection,
+        "videoCacheMaxEntries",
+        "Playback Decoder Cache Cap (advanced)",
+        "Bound the per-clip video decoder pool for the active scene; least-recently-played decoders are evicted past this cap. 0 = unlimited (legacy). Try 16–32 on very long heavy scenes to curb decoder accumulation.",
+        {
+            min: 0,
+            max: 512,
+            step: 1,
+            getter: () => this._settings.playback.videoCacheMaxEntries,
+            onChange: (value) => updateCategory("playback", "videoCacheMaxEntries", Math.round(value)),
         }
     );
 

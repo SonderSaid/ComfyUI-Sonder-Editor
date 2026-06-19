@@ -1,4 +1,4 @@
-import { EDITOR_COLORS as COLORS } from "./editor_theme.js";
+import { EDITOR_COLORS as COLORS, THEME } from "./editor_theme.js";
 import {
     LABEL_WIDTH,
     LABEL_WIDTH_FS,
@@ -105,7 +105,7 @@ export function _renderTimeline(host) {
         ctx.fillRect(0, 0, width, canvasH);
 
         host._drawRuler(ctx, width);
-        host._drawPlayheadTriangle(ctx, width);
+        drawPlaybackWarmStrip(host, ctx, width, rulerH);
 
         // Drag-drop new-lane cue: the ruler strip is the explicit
         // lane-creation drop zone (zone-model targeting).
@@ -122,6 +122,7 @@ export function _renderTimeline(host) {
             ctx.fillText("Drop here: new lane", width / 2, rulerH / 2 + 4);
             ctx.restore();
         }
+        host._drawPlayheadTriangle(ctx, width);
 
         ctx.save();
         ctx.beginPath();
@@ -209,6 +210,62 @@ export function _drawRuler(host, ctx, width) {
                 ctx.lineTo(x, rulerH);
                 ctx.stroke();
             }
+        }
+    }
+
+function drawPlaybackWarmStrip(host, ctx, width, rulerH) {
+        const snapshot = host._playbackWarmState;
+        if (!host.isFullscreen || !snapshot?.entries?.length) return;
+        const labelW = host._labelW;
+        const visibleW = Math.max(0, width - labelW);
+        if (visibleW <= 0 || host.pixelsPerFrame <= 0) return;
+
+        const ts = host._scaleTimeline || 1;
+        const stripH = Math.max(2, Math.round(3 * ts));
+        const stripY = Math.max(0, rulerH - stripH);
+        const startFrame = Math.max(0, Math.floor(host.scrollX));
+        const endFrame = Math.min(host.totalFrames, Math.ceil(host.scrollX + visibleW / host.pixelsPerFrame));
+        if (endFrame <= startFrame) return;
+
+        const colorForState = {
+            cold: THEME.statusIdle,
+            warming: THEME.statusPending,
+            warm: THEME.statusRunning,
+            blocked: THEME.statusFailed,
+        };
+        const alphaForState = {
+            cold: 0.18,
+            warming: 0.58,
+            warm: 0.62,
+            blocked: 0.72,
+        };
+        const priority = { warming: 1, warm: 2, blocked: 3 };
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(labelW, stripY, visibleW, stripH);
+        ctx.clip();
+
+        ctx.globalAlpha *= alphaForState.cold;
+        ctx.fillStyle = colorForState.cold;
+        ctx.fillRect(labelW, stripY, visibleW, stripH);
+        ctx.restore();
+
+        const entries = [...snapshot.entries]
+            .filter((entry) => entry && entry.endFrame > startFrame && entry.startFrame < endFrame)
+            .sort((a, b) => (priority[a.state] || 0) - (priority[b.state] || 0));
+
+        for (const entry of entries) {
+            const color = colorForState[entry.state];
+            if (!color) continue;
+            const x1 = Math.max(labelW, host._frameToX(Math.max(startFrame, entry.startFrame)));
+            const x2 = Math.min(width, host._frameToX(Math.min(endFrame, entry.endFrame)));
+            const rectW = Math.max(1, Math.ceil(x2 - x1));
+            ctx.save();
+            ctx.globalAlpha *= alphaForState[entry.state] ?? 0.5;
+            ctx.fillStyle = color;
+            ctx.fillRect(Math.floor(x1), stripY, rectW, stripH);
+            ctx.restore();
         }
     }
 

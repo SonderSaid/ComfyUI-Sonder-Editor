@@ -564,6 +564,9 @@ export class EditorWidget {
         this._vpCanvas = null;
         this._vpCtx = null;
         this._vpSeekDebounce = null;
+        this._playbackWarmState = null;
+        this._playbackWarmRenderRAF = null;
+        this._playbackWarmSceneSignature = "";
         this._activePlaybackVideo = null;
         this._activePlaybackAudios = [];
 
@@ -1063,6 +1066,7 @@ export class EditorWidget {
         const hasActiveScene = !!this.activeScene;
         const preservePendingFrameSelection = !hasActiveScene && this.activeSceneId === scene.scene_id;
         const isSameScene = hasActiveScene && this.activeSceneId === scene.scene_id;
+        const previousWarmSignature = this._playbackWarmSceneSignature;
         if (!isSameScene && hasActiveScene) {
             this._persistActiveTimelineSelection();
         }
@@ -1100,6 +1104,12 @@ export class EditorWidget {
             this._reconcileSelection();
         }
         this._buildTrackLayout();
+        const nextWarmSignature = this._buildPlaybackWarmSceneSignature();
+        if (!isSameScene || (previousWarmSignature && previousWarmSignature !== nextWarmSignature)) {
+            this._clearPlaybackWarmOverlay(isSameScene ? "scene-content-refresh" : "scene-switch", { render: false });
+        } else {
+            this._playbackWarmSceneSignature = nextWarmSignature;
+        }
         this.totalFrames = scene.duration_frames || 200;
         this._refreshDurationInput();
         this.sceneLabel.textContent = scene.name || "Untitled Scene";
@@ -1415,6 +1425,7 @@ export class EditorWidget {
                     folders: data.folders || [],
                     currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
                 });
+                this._clearPlaybackWarmOverlay("assets-refresh");
             }
         } catch (e) {
             console.warn("[Sonder] Failed to fetch assets:", e);
@@ -2114,10 +2125,96 @@ export class EditorWidget {
     }
 
     _renderSceneAfterLocalMutation({ viewport = true } = {}) {
+        this._clearPlaybackWarmOverlay("local-scene-mutation", { render: false });
         this._reconcileSelection();
         this._buildTrackLayout();
         this._renderTimeline();
         if (viewport) this._renderViewportFrame();
+    }
+
+    _buildPlaybackWarmSceneSignature() {
+        const scene = this.activeScene;
+        if (!scene) return "";
+        const clipParts = (scene.clips || []).map((clip) => [
+            clip.clip_id || "",
+            clip.source_path || "",
+            clip.timeline_start_frame || 0,
+            clip.timeline_end_frame || 0,
+            clip.source_in_frame || 0,
+            clip.source_out_frame || 0,
+            clip.track_index || 0,
+            clip.role || "render",
+            clip.opacity ?? 1,
+            clip.muted ? 1 : 0,
+        ]);
+        const laneParts = {
+            video: (scene.video_lane_configs || []).map((entry) => entry?.hidden ? 1 : 0),
+            motion: (scene.motion_driver_lane_configs || []).map((entry) => entry?.hidden ? 1 : 0),
+            guide: scene.guide_track_config?.hidden ? 1 : 0,
+            animatic: this._animaticMode ? 1 : 0,
+        };
+        const sourcePaths = Array.from(new Set((scene.clips || []).map((clip) => clip.source_path).filter(Boolean))).sort();
+        const assetParts = sourcePaths.map((sourcePath) => {
+            const asset = this._getAssetForSourcePath(sourcePath);
+            return [
+                sourcePath,
+                asset?.asset_id || "",
+                asset?.path || "",
+                asset?.asset_type || "",
+                asset?.missing ? 1 : 0,
+            ];
+        });
+        return JSON.stringify({
+            sceneId: scene.scene_id || "",
+            duration: scene.duration_frames || 0,
+            fps: this._effectiveFps,
+            clips: clipParts,
+            lanes: laneParts,
+            assets: assetParts,
+        });
+    }
+
+    _requestPlaybackWarmTimelineRender() {
+        if (this._destroyed || !this.timelineCanvas || this._playbackWarmRenderRAF !== null) return;
+        this._playbackWarmRenderRAF = requestAnimationFrame(() => {
+            this._playbackWarmRenderRAF = null;
+            if (this._destroyed) return;
+            this._renderTimeline();
+        });
+    }
+
+    _clearPlaybackWarmOverlay(reason = "clear", { notifySurface = true, render = true } = {}) {
+        if (this._playbackWarmRenderRAF !== null) {
+            cancelAnimationFrame(this._playbackWarmRenderRAF);
+            this._playbackWarmRenderRAF = null;
+        }
+        const hadState = !!this._playbackWarmState;
+        this._playbackWarmState = null;
+        this._playbackWarmSceneSignature = this._buildPlaybackWarmSceneSignature();
+        if (notifySurface && this._viewportSurface?.clearPlaybackWarmState) {
+            this._viewportSurface.clearPlaybackWarmState(reason);
+        }
+        if (render && hadState && this.timelineCanvas) {
+            this._renderTimeline();
+        }
+    }
+
+    _handlePlaybackWarmStateChange(payload = {}) {
+        if (this._destroyed) return;
+        const entries = Array.isArray(payload.entries) ? payload.entries : [];
+        const sceneSignature = this._buildPlaybackWarmSceneSignature();
+        this._playbackWarmSceneSignature = sceneSignature;
+        this._playbackWarmState = entries.length
+            ? {
+                generation: payload.generation || 0,
+                entries,
+                reason: payload.reason || "",
+                sceneSignature,
+            }
+            : null;
+        if (!this.isPlaying) {
+            this._requestPlaybackWarmTimelineRender();
+        }
     }
 
     _applyLocalSetLaneCount(laneType, count) {
@@ -3673,6 +3770,7 @@ export class EditorWidget {
         }
 
         await this._saveLaneConfig(this._trackLayout.filter((e) => e.type === TRACK_TYPE.VIDEO));
+        this._clearPlaybackWarmOverlay("animatic-toggle", { render: false });
         this._renderTimeline();
         this._renderViewportFrame();
         this._updateToolbar();
@@ -6643,6 +6741,7 @@ export class EditorWidget {
                 target.hidden = false;
             }
         }
+        this._clearPlaybackWarmOverlay("lane-visibility-change", { render: false });
         await this._saveLaneConfig(targets);
         if (unmuteTargets.length) {
             for (const target of unmuteTargets) {
@@ -11785,6 +11884,9 @@ export class EditorWidget {
             isAdaptiveRebufferEnabled: () => this._settings?.playback?.adaptiveRebuffer !== false,
             getRebufferEnterMs: () => this._settings?.playback?.rebufferEnterMs ?? 250,
             getRebufferMaxMs: () => this._settings?.playback?.rebufferMaxMs ?? 4000,
+            getPrebufferBoundaryDepth: () => this._settings?.playback?.prebufferBoundaryDepth ?? 2,
+            getPrebufferMaxEntries: () => this._settings?.playback?.prebufferMaxEntries ?? 8,
+            getVideoCacheMaxEntries: () => this._settings?.playback?.videoCacheMaxEntries ?? 0,
             notifyInfo: (message, opts) => notifyInfo(message, opts),
             notifyWarning: (message, opts) => notifyWarning(message, opts),
             onFrameChange: (frame, meta = {}) => {
@@ -11805,6 +11907,7 @@ export class EditorWidget {
                 this._renderTimeline();
                 this._updateToolbar();
             },
+            onPlaybackWarmStateChange: (payload) => this._handlePlaybackWarmStateChange(payload),
             getAssetForSourcePath: (sourcePath) => this._getAssetForSourcePath(sourcePath),
             getGuideAsset: (guide) => this._getGuideAsset(guide),
             includeMotionDrivers: () => !!this._animaticMode,
@@ -11823,8 +11926,10 @@ export class EditorWidget {
     _clearVideoCache() {
         if (this._viewportSurface) {
             this._viewportSurface.clearMediaCache();
+            this._clearPlaybackWarmOverlay("media-cache-clear", { notifySurface: false, render: false });
             return;
         }
+        this._clearPlaybackWarmOverlay("media-cache-clear", { notifySurface: false, render: false });
         for (const key of Object.keys(this._videoCache)) {
             const v = this._videoCache[key];
             if (v.pause) v.pause();
@@ -12918,10 +13023,18 @@ export class EditorWidget {
             this._assetGallery.destroy();
             this._assetGallery = null;
         }
+        if (this._playbackWarmRenderRAF !== null) {
+            cancelAnimationFrame(this._playbackWarmRenderRAF);
+            this._playbackWarmRenderRAF = null;
+        }
 
         if (this._viewportSurface) {
             this._viewportSurface.destroy();
             this._viewportSurface = null;
+        }
+        if (this._playbackWarmRenderRAF !== null) {
+            cancelAnimationFrame(this._playbackWarmRenderRAF);
+            this._playbackWarmRenderRAF = null;
         }
         this._clearVideoCache();
 

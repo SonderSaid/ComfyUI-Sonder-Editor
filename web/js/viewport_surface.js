@@ -14,6 +14,8 @@ const PLAYBACK_FIRST_COMMIT_HOLD_MS = 2500;
 const PLAYBACK_PREBUFFER_BOUNDARY_DEPTH = 2;
 // Hard cap on simultaneously warmed prebuffer video elements (RAM/VRAM budget).
 const PLAYBACK_PREBUFFER_MAX_ENTRIES = 8;
+// Bound the ephemeral warm-status map so long sessions cannot grow without limit.
+const PLAYBACK_WARM_MAX_ENTRIES = 6000;
 // Adaptive rebuffer hysteresis: minimum gap after a rebuffer exit before another
 // may start, so a marginally-slow scene cannot oscillate buffer/play every frame.
 const PLAYBACK_REBUFFER_REENTRY_MS = 500;
@@ -317,10 +319,24 @@ export function createViewportSurface(options = {}) {
         activePlaybackVideos: new Map(),
         activePlaybackAudios: new Map(),
         prebufferCache: new Map(),
+        playbackWarmEntries: new Map(),
+        playbackWarmGeneration: 0,
+        playbackWarmNotifyRAF: null,
+        playbackWarmEntrySeq: 0,
+        playbackWarmContentToken: 0,
         // Outgoing media elements awaiting release after the next successful
         // commit (so we never tear down an element still feeding the canvas).
         pendingRelease: new Set(),
         videoCache: options.videoCache || {},
+        // A1+A1b: LRU bookkeeping for the videoCache decoder pool. `videoCacheLastUsed`
+        // (layer.key -> monotonic seq) orders eviction so recently-played decoders
+        // survive (trailing-warm retention) and the oldest unpinned ones are evicted
+        // once the live count exceeds the cap. `playbackLastCommittedLayerKeys` pins the
+        // on-screen composite's layers from eviction.
+        videoCacheLastUsed: new Map(),
+        videoCacheUseSeq: 0,
+        playbackLastCommittedLayerKeys: new Set(),
+        lastBoundaryCoverageSig: "",
         audioCache: options.audioCache || {},
         imageCache: options.imageCache || {},
         // Phase 2 adaptive rebuffer: when a transient in-flight prepare keeps the
@@ -356,6 +372,7 @@ export function createViewportSurface(options = {}) {
     const onFrameChange = options.onFrameChange || noop;
     const onTransportUpdate = options.onTransportUpdate || noop;
     const onPlaybackStateChange = options.onPlaybackStateChange || noop;
+    const onPlaybackWarmStateChange = options.onPlaybackWarmStateChange || noop;
     const getAssetForSourcePath = options.getAssetForSourcePath || (() => null);
     const getGuideAsset = options.getGuideAsset || (() => null);
     const includeMotionDrivers = options.includeMotionDrivers || (() => false);
@@ -372,6 +389,12 @@ export function createViewportSurface(options = {}) {
     const isAdaptiveRebufferEnabled = options.isAdaptiveRebufferEnabled || (() => true);
     const getRebufferEnterMs = options.getRebufferEnterMs || (() => 250);
     const getRebufferMaxMs = options.getRebufferMaxMs || (() => 4000);
+    // Warm-ahead tuning knobs (browser-local playback settings; host-injected getters).
+    // Fallbacks preserve current behavior for callers that do not wire them.
+    const getPrebufferBoundaryDepth = options.getPrebufferBoundaryDepth || (() => PLAYBACK_PREBUFFER_BOUNDARY_DEPTH);
+    const getPrebufferMaxEntries = options.getPrebufferMaxEntries || (() => PLAYBACK_PREBUFFER_MAX_ENTRIES);
+    // 0 = unlimited (LRU disabled = legacy behavior); host default enables it.
+    const getVideoCacheMaxEntries = options.getVideoCacheMaxEntries || (() => 0);
     // Injected notification emitter (Core `notifyInfo`-shaped: returns a handle with
     // update/resolve/dismiss, or null). No-op fallback keeps the surface decoupled.
     const notifyInfo = options.notifyInfo || (() => null);
@@ -483,9 +506,13 @@ export function createViewportSurface(options = {}) {
             const video = active?.video;
             if (typeof video?.getVideoPlaybackQuality !== "function") continue;
             const q = video.getVideoPlaybackQuality();
-            const prev = t.qualityByKey.get(key) || { dropped: 0, total: 0 };
             const dropped = Number(q.droppedVideoFrames) || 0;
             const total = Number(q.totalVideoFrames) || 0;
+            const prev = t.qualityByKey.get(key);
+            if (!prev) {
+                t.qualityByKey.set(key, { dropped, total });
+                continue;
+            }
             const deltaDropped = Math.max(0, dropped - prev.dropped);
             const deltaTotal = Math.max(0, total - prev.total);
             t.qualityByKey.set(key, { dropped, total });
@@ -523,6 +550,196 @@ export function createViewportSurface(options = {}) {
         t.blockReasons.clear();
     }
 
+    function schedulePlaybackWarmStateNotify(reason = "update") {
+        if (state.playbackWarmNotifyRAF !== null) return;
+        state.playbackWarmNotifyRAF = requestAnimationFrame(() => {
+            state.playbackWarmNotifyRAF = null;
+            const entries = Array.from(state.playbackWarmEntries.values());
+            const stateCounts = entries.reduce((acc, entry) => {
+                const key = entry?.state || "unknown";
+                acc[key] = (acc[key] || 0) + 1;
+                return acc;
+            }, {});
+            const payload = {
+                generation: state.playbackWarmGeneration,
+                entries,
+                reason,
+                playbackSessionId: state.playbackSessionId,
+            };
+            recordPlaybackTelemetry("playback_warm_state_update", {
+                generation: payload.generation,
+                entryCount: entries.length,
+                stateCounts,
+                reason,
+                playbackSessionId: state.playbackSessionId,
+            });
+            try {
+                onPlaybackWarmStateChange(payload);
+            } catch (e) {
+                // The viewport owns playback; a host render bug must not break transport.
+            }
+        });
+    }
+
+    function cancelPlaybackWarmStateNotify() {
+        if (state.playbackWarmNotifyRAF === null) return;
+        cancelAnimationFrame(state.playbackWarmNotifyRAF);
+        state.playbackWarmNotifyRAF = null;
+    }
+
+    function clearPlaybackWarmState(reason = "clear") {
+        const hadEntries = state.playbackWarmEntries.size > 0;
+        state.playbackWarmContentToken += 1;
+        state.playbackWarmEntries.clear();
+        state.playbackWarmGeneration += 1;
+        cancelPlaybackWarmStateNotify();
+        recordPlaybackTelemetry("playback_warm_cache_clear", {
+            generation: state.playbackWarmGeneration,
+            reason,
+            hadEntries,
+            playbackSessionId: state.playbackSessionId,
+        });
+        try {
+            onPlaybackWarmStateChange({
+                generation: state.playbackWarmGeneration,
+                entries: [],
+                reason,
+                playbackSessionId: state.playbackSessionId,
+            });
+        } catch (e) {
+            // Keep cache teardown independent from host UI.
+        }
+    }
+
+    function playbackWarmFrameRange(frame) {
+        const startFrame = clamp(Math.round(Number(frame) || 0), 0, totalFrames());
+        const endFrame = Math.min(totalFrames(), startFrame + 1);
+        return endFrame > startFrame ? { startFrame, endFrame } : null;
+    }
+
+    function trimPlaybackWarmEntries() {
+        while (state.playbackWarmEntries.size > PLAYBACK_WARM_MAX_ENTRIES) {
+            const firstKey = state.playbackWarmEntries.keys().next().value;
+            if (firstKey === undefined) break;
+            state.playbackWarmEntries.delete(firstKey);
+        }
+    }
+
+    function playbackWarmIdentityForLayer(layer, warmState, options = {}) {
+        const owner = options.owner || "active";
+        const ownerKey = options.ownerKey || layer?.key || "";
+        return {
+            layerKey: layer?.key || "",
+            sourcePath: layer?.clip?.source_path || "",
+            laneIndex: Math.max(0, Math.round(Number(layer?.clip?.track_index) || 0)),
+            trackType: layer?.clip?.role === "motion_driver" ? "motion_driver" : "video",
+            state: warmState,
+            owner,
+            ownerKey,
+        };
+    }
+
+    function playbackWarmEntriesOverlap(entry, range) {
+        return !!entry && !!range && entry.startFrame < range.endFrame && entry.endFrame > range.startFrame;
+    }
+
+    function playbackWarmEntriesTouch(entry, range) {
+        return !!entry && !!range && entry.startFrame <= range.endFrame && entry.endFrame >= range.startFrame;
+    }
+
+    function playbackWarmCanMerge(entry, identity) {
+        return !!entry
+            && entry.layerKey === identity.layerKey
+            && entry.sourcePath === identity.sourcePath
+            && entry.laneIndex === identity.laneIndex
+            && entry.trackType === identity.trackType
+            && entry.state === identity.state
+            && entry.owner === identity.owner
+            && entry.ownerKey === identity.ownerKey;
+    }
+
+    function removePlaybackWarmEntriesByOwner(owner, ownerKey, reason = "owner-clear") {
+        if (!owner || !ownerKey) return;
+        let removed = false;
+        for (const [key, entry] of Array.from(state.playbackWarmEntries.entries())) {
+            if (entry.owner !== owner || entry.ownerKey !== ownerKey) continue;
+            state.playbackWarmEntries.delete(key);
+            removed = true;
+        }
+        if (!removed) return;
+        state.playbackWarmGeneration += 1;
+        schedulePlaybackWarmStateNotify(reason);
+    }
+
+    function pruneTransientPlaybackWarmEntries(reason = "transient-clear") {
+        let removed = false;
+        for (const [key, entry] of Array.from(state.playbackWarmEntries.entries())) {
+            if (entry?.state === "warm") continue;
+            state.playbackWarmEntries.delete(key);
+            removed = true;
+        }
+        if (!removed) return;
+        state.playbackWarmGeneration += 1;
+        schedulePlaybackWarmStateNotify(reason);
+    }
+
+    function notePlaybackWarmLayer(layer, frame, warmState, reason, options = {}) {
+        const token = options.token ?? state.playbackWarmContentToken;
+        if (token !== state.playbackWarmContentToken) return;
+        const range = playbackWarmFrameRange(frame);
+        if (!range || !layer?.clip || !layer?.key) return;
+        const identity = playbackWarmIdentityForLayer(layer, warmState, options);
+        const sameSourceEntries = Array.from(state.playbackWarmEntries.entries())
+            .filter(([, entry]) => entry.layerKey === identity.layerKey && entry.sourcePath === identity.sourcePath);
+        const overlapping = sameSourceEntries.filter(([, entry]) => playbackWarmEntriesOverlap(entry, range));
+        const exactCover = overlapping.find(([, entry]) => (
+            playbackWarmCanMerge(entry, identity)
+            && entry.startFrame <= range.startFrame
+            && entry.endFrame >= range.endFrame
+        ));
+        if (exactCover) return;
+
+        const mayReplaceWarm = warmState === "warm" || options.replaceWarm || reason === "missing-layer";
+        if (!mayReplaceWarm && overlapping.some(([, entry]) => entry.state === "warm")) return;
+        for (const [key] of overlapping) {
+            state.playbackWarmEntries.delete(key);
+        }
+
+        const entry = {
+            key: "",
+            ...identity,
+            startFrame: range.startFrame,
+            endFrame: range.endFrame,
+            reason,
+            updatedAtMs: Math.round(performance.now()),
+        };
+
+        let merged = true;
+        while (merged) {
+            merged = false;
+            for (const [key, candidate] of Array.from(state.playbackWarmEntries.entries())) {
+                if (!playbackWarmCanMerge(candidate, identity)) continue;
+                if (!playbackWarmEntriesTouch(candidate, entry)) continue;
+                entry.startFrame = Math.min(entry.startFrame, candidate.startFrame);
+                entry.endFrame = Math.max(entry.endFrame, candidate.endFrame);
+                state.playbackWarmEntries.delete(key);
+                merged = true;
+            }
+        }
+
+        entry.key = `warm:${++state.playbackWarmEntrySeq}`;
+        state.playbackWarmEntries.set(entry.key, entry);
+        state.playbackWarmGeneration += 1;
+        trimPlaybackWarmEntries();
+        schedulePlaybackWarmStateNotify(reason);
+    }
+
+    function notePlaybackWarmMissingLayers(snapshot, reason = "missing") {
+        for (const layer of snapshot?.missingClipLayers || []) {
+            notePlaybackWarmLayer(layer, snapshot.frame, "blocked", reason);
+        }
+    }
+
     function invalidateAsyncPreviewRenders() {
         state.renderToken += 1;
     }
@@ -536,6 +753,8 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedFrame = null;
         state.playbackLastCommittedSignature = "";
         state.playbackLastCommittedSessionId = 0;
+        state.playbackLastCommittedLayerKeys = new Set();
+        state.lastBoundaryCoverageSig = "";
     }
 
     function beginFirstCommitHold(timestamp, frame) {
@@ -941,6 +1160,7 @@ export function createViewportSurface(options = {}) {
             video.playsInline = true;
             state.videoCache[layer.key] = video;
         }
+        touchVideoCacheUse(layer.key);
         return state.videoCache[layer.key];
     }
 
@@ -1001,6 +1221,72 @@ export function createViewportSurface(options = {}) {
         return clamp(Number.isFinite(numeric) ? Math.round(numeric) : 1000, 100, 5000);
     }
 
+    function normalizedPrebufferBoundaryDepth() {
+        const numeric = Number(getPrebufferBoundaryDepth());
+        return clamp(Number.isFinite(numeric) ? Math.round(numeric) : PLAYBACK_PREBUFFER_BOUNDARY_DEPTH, 1, 12);
+    }
+
+    function normalizedPrebufferMaxEntries() {
+        const numeric = Number(getPrebufferMaxEntries());
+        return clamp(Number.isFinite(numeric) ? Math.round(numeric) : PLAYBACK_PREBUFFER_MAX_ENTRIES, 1, 64);
+    }
+
+    function normalizedVideoCacheMaxEntries() {
+        const numeric = Number(getVideoCacheMaxEntries());
+        // 0 / non-positive = unlimited (LRU disabled, legacy behavior).
+        if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+        return clamp(Math.round(numeric), 4, 512);
+    }
+
+    function touchVideoCacheUse(key) {
+        if (!key) return;
+        state.videoCacheUseSeq += 1;
+        state.videoCacheLastUsed.set(key, state.videoCacheUseSeq);
+    }
+
+    function currentSceneClipKeySet() {
+        const scene = getScene();
+        const keys = new Set();
+        for (const clip of scene?.clips || []) {
+            if (clip?.clip_id) keys.add(clip.clip_id);
+        }
+        return keys;
+    }
+
+    // A1+A1b: bound the otherwise-immortal videoCache by evicting the least-recently
+    // used current-scene decoders beyond the cap. Pinned keys (current playable,
+    // prebuffer targets, active videos, last committed composite) are never evicted;
+    // snapshot:/guide-capture and other-scene decoders are out of scope (cleared by
+    // clearMediaCache). Evicted elements are parked in pendingRelease and torn down by
+    // the existing post-commit drainPendingReleases (never inline) so an element still
+    // feeding the on-screen canvas survives until the next commit replaces it; the
+    // drawImage pixel-copy at the last commit is the backstop.
+    function enforceVideoCacheBudget(pinnedKeys) {
+        const cap = normalizedVideoCacheMaxEntries();
+        if (cap <= 0) return;
+        const sceneClipKeys = currentSceneClipKeySet();
+        const live = [];
+        for (const key of Object.keys(state.videoCache)) {
+            if (sceneClipKeys.has(key)) live.push(key);
+        }
+        if (live.length <= cap) return;
+        const evictable = live.filter((key) => (
+            !pinnedKeys.has(key) && !state.activePlaybackVideos.has(key)
+        ));
+        evictable.sort((a, b) => (
+            (state.videoCacheLastUsed.get(a) || 0) - (state.videoCacheLastUsed.get(b) || 0)
+        ));
+        let toEvict = live.length - cap;
+        for (const key of evictable) {
+            if (toEvict <= 0) break;
+            const el = state.videoCache[key];
+            delete state.videoCache[key];
+            state.videoCacheLastUsed.delete(key);
+            if (el) state.pendingRelease.add(el);
+            toEvict -= 1;
+        }
+    }
+
     function playbackFrameDistance(fromFrame, targetFrame, endFrame) {
         const from = Math.max(0, Math.round(Number(fromFrame) || 0));
         const target = Math.max(0, Math.round(Number(targetFrame) || 0));
@@ -1015,6 +1301,7 @@ export function createViewportSurface(options = {}) {
     function discardPrebufferEntry(entry) {
         if (!entry) return;
         if (entry.claimedByActive) return;
+        removePlaybackWarmEntriesByOwner("prebuffer", entry.key, "prebuffer-discarded");
         entry.cancelled = true;
         removeMediaSource(entry.video);
     }
@@ -1111,16 +1398,27 @@ export function createViewportSurface(options = {}) {
 
     async function loadPrebufferEntry(entry) {
         if (!entry?.video || !entry.sourcePath) return null;
-        const resolvedUrl = await resolveMediaSourceUrl(entry.sourcePath);
-        if (!resolvedUrl || state.destroyed || entry.cancelled) return null;
+        const sourcePath = entry.sourcePath;
+        const layer = entry.layer;
+        const targetFrame = entry.targetFrame;
+        const warmToken = entry.warmToken;
+        const stillCurrent = () => (
+            !state.destroyed
+            && !entry.cancelled
+            && entry.sourcePath === sourcePath
+            && entry.targetFrame === targetFrame
+            && entry.warmToken === warmToken
+        );
+        const resolvedUrl = await resolveMediaSourceUrl(sourcePath);
+        if (!resolvedUrl || !stillCurrent()) return null;
         const video = entry.video;
         if (video._sonderSourceUrl !== resolvedUrl) {
             video._sonderSourceUrl = resolvedUrl;
             video.src = resolvedUrl;
         }
         await waitForMediaReady(video, 2, 1500);
-        if (state.destroyed || entry.cancelled) return null;
-        const targetTime = clipSourceTime(entry.layer, entry.targetFrame);
+        if (!stillCurrent()) return null;
+        const targetTime = clipSourceTime(layer, targetFrame);
         entry.targetTime = targetTime;
         const sought = await seekMedia(video, targetTime, {
             tolerance: 0.03,
@@ -1128,10 +1426,17 @@ export function createViewportSurface(options = {}) {
             requireTarget: true,
             waitForFrame: true,
         });
-        if (!sought || state.destroyed || entry.cancelled) return null;
+        if (!sought || !stillCurrent()) return null;
         await waitForMediaReady(video, 2, 500);
-        if (state.destroyed || entry.cancelled) return null;
+        if (!stillCurrent()) return null;
         entry.ready = (video.readyState || 0) >= 2 && isMediaAtTarget(video, targetTime, 0.04);
+        if (entry.ready) {
+            notePlaybackWarmLayer(layer, targetFrame, "warm", "prebuffer-ready", {
+                owner: "prebuffer",
+                ownerKey: entry.key,
+                token: warmToken,
+            });
+        }
         if (entry.consumed && state.isPlaying) {
             renderFrame();
         }
@@ -1143,10 +1448,14 @@ export function createViewportSurface(options = {}) {
         if (!key || state.activePlaybackVideos.has(layer.key)) return;
         const existing = state.prebufferCache.get(key);
         if (existing) {
-            existing.layer = layer;
-            existing.targetFrame = targetFrame;
-            return;
+            if (existing.targetFrame === targetFrame) {
+                existing.layer = layer;
+                return;
+            }
+            state.prebufferCache.delete(key);
+            discardPrebufferEntry(existing);
         }
+        const warmToken = state.playbackWarmContentToken;
         const entry = {
             key,
             layer,
@@ -1159,6 +1468,7 @@ export function createViewportSurface(options = {}) {
             cancelled: false,
             consumed: false,
             claimedByActive: false,
+            warmToken,
             promise: null,
         };
         playbackDebugEvent("prebuffer-warm-scheduled", {
@@ -1167,11 +1477,17 @@ export function createViewportSurface(options = {}) {
             sourcePath: layer.clip.source_path,
             targetFrame,
         });
+        notePlaybackWarmLayer(layer, targetFrame, "warming", "prebuffer-scheduled", {
+            owner: "prebuffer",
+            ownerKey: key,
+            token: warmToken,
+        });
         entry.promise = loadPrebufferEntry(entry)
             .catch(() => null)
             .then((element) => {
                 if (!element && !entry.cancelled && state.prebufferCache.get(key) === entry) {
                     state.prebufferCache.delete(key);
+                    discardPrebufferEntry(entry);
                 }
                 return element;
             });
@@ -1209,12 +1525,18 @@ export function createViewportSurface(options = {}) {
             state.pendingRelease.add(existing);
         }
         state.videoCache[layer.key] = entry.video;
+        touchVideoCacheUse(layer.key);
         playbackDebugEvent("claim-hit", {
             key,
             layerKey: layer.key,
             sourcePath: layer.clip.source_path,
             frame,
             targetFrame: entry.targetFrame,
+        });
+        removePlaybackWarmEntriesByOwner("prebuffer", key, "prebuffer-claimed");
+        notePlaybackWarmLayer(layer, frame, "warm", "prebuffer-claimed", {
+            owner: "active",
+            ownerKey: layer.key,
         });
         return { entry, video: entry.video, key };
     }
@@ -1270,8 +1592,9 @@ export function createViewportSurface(options = {}) {
         );
     }
 
-    // Returns up to PLAYBACK_PREBUFFER_BOUNDARY_DEPTH distinct boundaries' worth
-    // of novel video layers to warm, each tagged with its own target frame.
+    // Returns up to the configured boundary depth's worth of novel video layers to
+    // warm, each tagged with its own target frame. The budget is enforced per WHOLE
+    // boundary (a partially-warmed boundary still cold-starts), capped by maxEntries.
     function findUpcomingPrebufferTargets(snapshot, endFrame) {
         const currentFrame = Math.max(0, Math.round(Number(snapshot?.frame) || 0));
         const currentKeys = new Set(
@@ -1279,25 +1602,39 @@ export function createViewportSurface(options = {}) {
                 .filter(isRenderableVideoLayer)
                 .map(prebufferKeyForLayer)
         );
+        const maxBoundaries = normalizedPrebufferBoundaryDepth();
+        const maxEntries = normalizedPrebufferMaxEntries();
         const horizonFrames = Math.max(1, Math.round((normalizedPrebufferLookaheadMs() / 1000) * fps()));
         const candidateFrames = collectPrebufferCandidateFrames(currentFrame, endFrame, horizonFrames);
         const targets = [];
         const seenKeys = new Set();
         let boundariesCovered = 0;
         for (const frame of candidateFrames) {
-            if (boundariesCovered >= PLAYBACK_PREBUFFER_BOUNDARY_DEPTH) break;
+            if (boundariesCovered >= maxBoundaries) break;
             const futureSnapshot = buildFrameSnapshot(frame);
-            let novelOnThisBoundary = false;
+            // Collect this boundary's novel layers as a whole group first.
+            const boundaryTargets = [];
+            const boundaryKeys = new Set();
             for (const layer of futureSnapshot.playableClipLayers) {
                 if (!isRenderableVideoLayer(layer)) continue;
                 const key = prebufferKeyForLayer(layer);
-                if (!key || currentKeys.has(key) || seenKeys.has(key)) continue;
+                if (!key || currentKeys.has(key) || seenKeys.has(key) || boundaryKeys.has(key)) continue;
                 if (state.activePlaybackVideos.has(layer.key)) continue;
-                seenKeys.add(key);
-                targets.push({ layer, targetFrame: frame });
-                novelOnThisBoundary = true;
+                boundaryKeys.add(key);
+                boundaryTargets.push({ layer, targetFrame: frame });
             }
-            if (novelOnThisBoundary) boundariesCovered += 1;
+            if (!boundaryTargets.length) continue;
+            // Budget is whole-boundary: a partially-warmed boundary still cold-starts,
+            // so stop before a boundary that would overflow the cap rather than
+            // half-warming it. Always admit the first boundary so a single oversized
+            // boundary still warms as far as the schedule's hard cap allows.
+            if (targets.length > 0 && targets.length + boundaryTargets.length > maxEntries) break;
+            for (const t of boundaryTargets) {
+                seenKeys.add(prebufferKeyForLayer(t.layer));
+                targets.push(t);
+            }
+            boundariesCovered += 1;
+            if (targets.length >= maxEntries) break;
         }
         return targets;
     }
@@ -1315,10 +1652,14 @@ export function createViewportSurface(options = {}) {
             return;
         }
         let targets = findUpcomingPrebufferTargets(snapshot, playbackEndFrame);
-        // Memory budget: keep only the nearest warmed elements. Claimed entries
-        // are no longer in prebufferCache, so this bounds RAM/VRAM by count.
-        if (targets.length > PLAYBACK_PREBUFFER_MAX_ENTRIES) {
-            targets = targets.slice(0, PLAYBACK_PREBUFFER_MAX_ENTRIES);
+        // Hard RAM/VRAM safety cap. findUpcomingPrebufferTargets already enforces a
+        // whole-boundary budget, so this only bites when a single boundary needs more
+        // elements than the entire cap (degenerate stacked scene) — warming as many as
+        // fit still beats warming none. Claimed entries are no longer in prebufferCache,
+        // so this bounds the warmed element count.
+        const maxEntries = normalizedPrebufferMaxEntries();
+        if (targets.length > maxEntries) {
+            targets = targets.slice(0, maxEntries);
         }
         const desiredKeys = new Set([
             ...(snapshot?.playableClipLayers || []).map(prebufferKeyForLayer).filter(Boolean),
@@ -1336,6 +1677,17 @@ export function createViewportSurface(options = {}) {
         for (const { layer, targetFrame } of targets) {
             ensurePrebufferedLayer(layer, targetFrame);
         }
+        // A1+A1b: bound the videoCache decoder pool by LRU. Pin the in-use /
+        // about-to-use set (current playable + prebuffer targets + active videos +
+        // last committed composite, all in layer.key space); recently-played decoders
+        // survive by use-recency. No-op while videoCacheMaxEntries is 0 (default).
+        const videoCachePinKeys = new Set([
+            ...(snapshot?.playableClipLayers || []).map((layer) => layer?.key).filter(Boolean),
+            ...targets.map(({ layer }) => layer?.key).filter(Boolean),
+            ...state.activePlaybackVideos.keys(),
+            ...state.playbackLastCommittedLayerKeys,
+        ]);
+        enforceVideoCacheBudget(videoCachePinKeys);
     }
 
     async function loadGuideLayer(snapshot) {
@@ -1531,6 +1883,7 @@ export function createViewportSurface(options = {}) {
         const expectedTime = clipSourceTime(layer, frame);
         const targetTolerance = firstDrawTolerance();
         const sessionId = state.playbackSessionId;
+        const warmToken = state.playbackWarmContentToken;
         const existingAtTarget = playbackVideoAtFrame(active, layer, frame, targetTolerance);
         if (!force && existingAtTarget) {
             active.layer = layer;
@@ -1539,7 +1892,18 @@ export function createViewportSurface(options = {}) {
             active.requestedFrame = frame;
             active.readyForDraw = true;
             active.playbackSessionId = sessionId;
-            syncPreparedVideoPlayback(active, layer, frame);
+            notePlaybackWarmLayer(layer, frame, "warm", "prepare-reused", {
+                owner: "active",
+                ownerKey: layer.key,
+                token: warmToken,
+            });
+            recordPlaybackTelemetry("playback_prepare_reused", {
+                layerKey: layer.key,
+                sourcePath,
+                frame,
+                expectedTime,
+                playbackSessionId: sessionId,
+            });
             return Promise.resolve(active.video);
         }
         if (
@@ -1564,6 +1928,11 @@ export function createViewportSurface(options = {}) {
         active.requestedFrame = frame;
         active.readyForDraw = false;
         active.playbackSessionId = sessionId;
+        notePlaybackWarmLayer(layer, frame, "warming", "prepare-start", {
+            owner: "active",
+            ownerKey: layer.key,
+            token: warmToken,
+        });
 
         playbackDecisionDebugEvent("prepare-start", {
             layerKey: layer.key,
@@ -1618,7 +1987,11 @@ export function createViewportSurface(options = {}) {
                             playbackSessionId: sessionId,
                         });
                     }
-                    syncPreparedVideoPlayback(active, layer, frame);
+                    notePlaybackWarmLayer(layer, frame, "warm", "prepare-ready", {
+                        owner: "active",
+                        ownerKey: layer.key,
+                        token: warmToken,
+                    });
                     renderFrame();
                     return active.video;
                 }
@@ -1632,12 +2005,31 @@ export function createViewportSurface(options = {}) {
                     seeking: !!active.video?.seeking,
                     playbackSessionId: sessionId,
                 }, [layer.key, sourcePath, active.firstDrawComplete ? "warm" : "first"]);
+                notePlaybackWarmLayer(layer, frame, "blocked", "prepare-timeout", {
+                    owner: "active",
+                    ownerKey: layer.key,
+                    token: warmToken,
+                });
                 return null;
             })
             .catch(() => {
-                if (state.activePlaybackVideos.get(layer.key) === active && active.prepareToken === token) {
+                const stillCurrent = (
+                    state.isPlaying
+                    && !state.destroyed
+                    && state.playbackSessionId === sessionId
+                    && state.activePlaybackVideos.get(layer.key) === active
+                    && active.prepareToken === token
+                    && active.layerKey === layer.key
+                    && active.sourcePath === sourcePath
+                );
+                if (stillCurrent) {
                     active.pendingPrepare = null;
                     active.readyForDraw = false;
+                    notePlaybackWarmLayer(layer, frame, "blocked", "prepare-error", {
+                        owner: "active",
+                        ownerKey: layer.key,
+                        token: warmToken,
+                    });
                 }
                 return null;
             });
@@ -1843,6 +2235,28 @@ export function createViewportSurface(options = {}) {
         if (playbackTelemetryActive()) {
             noteBlockReasonTelemetry(details?.reason, hasCurrentLayerPrepareInFlight(snapshot), now);
         }
+        notePlaybackWarmMissingLayers(snapshot, "missing-layer");
+        const blockedLayer = [...(snapshot?.clipLayers || [])].find((layer) => layer.key === details?.layerKey);
+        if (blockedLayer) {
+            // D6: a layer blocked only because its own prepare/seek is still in flight
+            // is recovering, not stalled — tag it `warming` (amber) so the strip does
+            // not flicker red on every cold-start. The diag confirms the observed red is
+            // `video-not-drawable|inflight`, i.e. this commit site while a prepare runs
+            // (preflightPlaybackComposite kicks that prepare just before this commits).
+            // Reserve `blocked` (red) for a genuine stall (no prepare in flight); missing
+            // media is already tagged blocked above. The hold/rebuffer control flow below
+            // is unchanged — this only affects the warm-strip color.
+            const blockedActive = state.activePlaybackVideos.get(blockedLayer.key);
+            const blockedPrebuffer = state.prebufferCache.get(prebufferKeyForLayer(blockedLayer));
+            const blockedPrepareInFlight = !!blockedActive?.pendingPrepare
+                || (!!blockedPrebuffer && !blockedPrebuffer.ready && !blockedPrebuffer.cancelled);
+            notePlaybackWarmLayer(
+                blockedLayer,
+                snapshot.frame,
+                blockedPrepareInFlight ? "warming" : "blocked",
+                details?.reason || "blocked",
+            );
+        }
         const signature = playbackLayerSignature(snapshot);
         const canHoldCanvas = playbackCanvasStillValid();
         if (state.playbackBlockedSignature !== signature) {
@@ -1991,7 +2405,7 @@ export function createViewportSurface(options = {}) {
                 active.firstDrawComplete = false;
                 prepareActivePlaybackVideo(active, layer, snapshot.frame, { force: true });
             } else if (isActiveVideoDrawable(active, layer, snapshot.frame)) {
-                syncPreparedVideoPlayback(active, layer, snapshot.frame);
+                active.readyForDraw = true;
             } else if (shouldDeferPlaybackTailPrepare(active, layer, snapshot)) {
                 active.requestedFrame = snapshot.frame;
                 active.readyForDraw = false;
@@ -2056,6 +2470,35 @@ export function createViewportSurface(options = {}) {
         samplePlaybackQualityTelemetry();
     }
 
+    // E8: per-boundary coverage telemetry. Fires once per distinct committed video
+    // layer set (a clip boundary), recording the live decoder count alongside the
+    // active tuning caps so a re-captured diag can correlate decoder accumulation with
+    // the prebuffer/cache settings and detect the concurrent-decoder cliff (a rising
+    // videoCacheLiveCount as the cap rises). Pairs with playback_clip_coldstart /
+    // playback_prepare_reused for the warm-vs-cold breakdown. Dev-gated.
+    function recordBoundaryCoverageTelemetry(snapshot, committedVideoKeys) {
+        if (!playbackTelemetryActive()) return;
+        const sig = [...committedVideoKeys].sort().join("|");
+        if (sig === state.lastBoundaryCoverageSig) return;
+        state.lastBoundaryCoverageSig = sig;
+        const sceneClipKeys = currentSceneClipKeySet();
+        let videoCacheLiveCount = 0;
+        for (const key of Object.keys(state.videoCache)) {
+            if (sceneClipKeys.has(key)) videoCacheLiveCount += 1;
+        }
+        recordPlaybackTelemetry("playback_boundary_coverage", {
+            frame: snapshot.frame,
+            videoLayerCount: committedVideoKeys.length,
+            videoCacheLiveCount,
+            activeCount: state.activePlaybackVideos.size,
+            prebufferCount: state.prebufferCache.size,
+            prebufferBoundaryDepth: normalizedPrebufferBoundaryDepth(),
+            prebufferMaxEntries: normalizedPrebufferMaxEntries(),
+            videoCacheMaxEntries: normalizedVideoCacheMaxEntries(),
+            playbackSessionId: state.playbackSessionId,
+        });
+    }
+
     function drawPlaybackComposite(snapshot) {
         const preflight = preflightPlaybackComposite(snapshot);
         if (preflight.blocked) {
@@ -2065,6 +2508,7 @@ export function createViewportSurface(options = {}) {
 
         drawBlack();
         let drewAny = false;
+        const committedVideoKeys = [];
         for (const renderable of preflight.renderables || []) {
             const fitItem = renderable.type === "guide" ? renderable.guide : renderable.layer?.clip;
             const didDraw = drawImageLike(renderable.element, { opacity: renderable.opacity, ...fitOptionsFor(fitItem) });
@@ -2076,10 +2520,22 @@ export function createViewportSurface(options = {}) {
                 if (renderable.type === "video" && renderable.active) {
                     renderable.active.firstDrawComplete = true;
                     renderable.active.readyForDraw = true;
+                    syncPreparedVideoPlayback(renderable.active, renderable.layer, snapshot.frame);
+                    notePlaybackWarmLayer(renderable.layer, snapshot.frame, "warm", "composite-commit");
+                    if (renderable.layer?.key) {
+                        committedVideoKeys.push(renderable.layer.key);
+                        touchVideoCacheUse(renderable.layer.key);
+                    }
+                } else if (renderable.type === "image" && renderable.layer) {
+                    notePlaybackWarmLayer(renderable.layer, snapshot.frame, "warm", "composite-commit");
                 }
             }
         }
         drawSceneOutline();
+        // A1b pin source: the layers feeding the on-screen composite must never be
+        // evicted by the videoCache LRU before the next commit replaces them.
+        state.playbackLastCommittedLayerKeys = new Set(committedVideoKeys);
+        recordBoundaryCoverageTelemetry(snapshot, committedVideoKeys);
         state.playbackCompositeCommitted = true;
         state.playbackBlockedSinceMs = null;
         state.playbackBlockedSignature = "";
@@ -2116,6 +2572,7 @@ export function createViewportSurface(options = {}) {
 
     function renderPlaybackFrame(snapshot) {
         if (shouldReuseCommittedPlaybackFrame(snapshot)) return true;
+        notePlaybackWarmMissingLayers(snapshot, "missing-layer");
         syncPlaybackMedia(snapshot);
         schedulePlaybackPrebuffer(snapshot);
         return drawPlaybackComposite(snapshot);
@@ -2242,6 +2699,9 @@ export function createViewportSurface(options = {}) {
         state.playbackRebufferFrame = currentFrame();
         state.playbackRebufferSinceMs = now;
         state.playbackRebufferCapped = false;
+        for (const active of state.activePlaybackVideos.values()) {
+            active.video.pause();
+        }
         for (const active of state.activePlaybackAudios.values()) {
             active.audio.pause();
         }
@@ -2423,6 +2883,7 @@ export function createViewportSurface(options = {}) {
         resetRebufferState();
         clearActivePlaybackMedia();
         clearPrebufferCache();
+        pruneTransientPlaybackWarmEntries("playback-stop");
         resetPlaybackCompositeState();
         clearFirstCommitHold();
         if (!preservePlayhead && shouldReturnToPlaybackStart()) {
@@ -2474,6 +2935,7 @@ export function createViewportSurface(options = {}) {
         resetPlaybackCompositeState();
         clearFirstCommitHold();
         resetRebufferState();
+        clearPlaybackWarmState("media-cache-clear");
         for (const mediaEl of Object.values(state.videoCache)) {
             removeMediaSource(mediaEl);
         }
@@ -2489,6 +2951,12 @@ export function createViewportSurface(options = {}) {
         clearCacheObject(state.videoCache);
         clearCacheObject(state.audioCache);
         clearCacheObject(state.imageCache);
+        // A1+A1b: clearMediaCache stays the dormant teardown for the videoCache LRU
+        // bookkeeping (the LRU is only a steady-state bound; full release happens here).
+        state.videoCacheLastUsed.clear();
+        state.videoCacheUseSeq = 0;
+        state.playbackLastCommittedLayerKeys = new Set();
+        state.lastBoundaryCoverageSig = "";
     }
 
     function invalidatePlaybackComposite() {
@@ -2529,6 +2997,7 @@ export function createViewportSurface(options = {}) {
         stopPlayback,
         captureSourceFrame,
         clearMediaCache,
+        clearPlaybackWarmState,
         invalidatePlaybackComposite,
         destroy,
         setLiveMediaEnabled,
