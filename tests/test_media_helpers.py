@@ -1,7 +1,9 @@
-"""Tests for fit modes + auto interpolation in fit_frame_to_canvas."""
+"""Tests for shared media helpers."""
 
 import os
 import sys
+import types
+import wave
 
 import numpy as np
 import cv2
@@ -12,8 +14,11 @@ from server.media_helpers import (  # noqa: E402
     DEFAULT_CROP_POSITION,
     DEFAULT_FIT_MODE,
     _resize_interpolation,
+    decode_audio_samples,
     fit_frame_to_canvas,
+    write_audio_wav,
 )
+import server.media_helpers as media_helpers  # noqa: E402
 
 
 def _portrait(w=2, h=4, value=255):
@@ -89,3 +94,57 @@ def test_resize_interpolation_picks_area_on_downscale_and_lanczos_on_upscale():
     assert _resize_interpolation(500, 500, 1000, 1000) == cv2.INTER_LANCZOS4
     # Equal size is not a downscale → sharp path.
     assert _resize_interpolation(640, 480, 640, 480) == cv2.INTER_LANCZOS4
+
+
+def test_decode_audio_samples_can_return_channel_first_stereo(monkeypatch):
+    pcm = np.array(
+        [1000, -1000, 2000, -2000, 3000, -3000, 4000, -4000],
+        dtype=np.int16,
+    ).tobytes()
+
+    def fake_run(cmd, capture_output, timeout):
+        assert "-ac" in cmd
+        assert cmd[cmd.index("-ac") + 1] == "2"
+        assert "-ar" in cmd
+        assert cmd[cmd.index("-ar") + 1] == "48000"
+        return types.SimpleNamespace(returncode=0, stdout=pcm, stderr=b"")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    monkeypatch.setattr(media_helpers.subprocess, "run", fake_run)
+
+    samples, sample_rate = decode_audio_samples(
+        "audio.wav",
+        sample_rate=48000,
+        channels=2,
+        mix_to_mono=False,
+    )
+
+    expected = np.array(
+        [[1000, 2000, 3000, 4000], [-1000, -2000, -3000, -4000]],
+        dtype=np.float32,
+    ) / 32768.0
+    assert sample_rate == 48000
+    assert samples.shape == (2, 4)
+    assert np.allclose(samples, expected)
+
+
+def test_write_audio_wav_writes_channel_first_float_pcm(tmp_path):
+    output_path = tmp_path / "audio.wav"
+    samples = np.array(
+        [[0.0, 0.5, -1.0], [1.0, -0.5, 0.25]],
+        dtype=np.float32,
+    )
+
+    write_audio_wav(str(output_path), samples, 8000)
+
+    with wave.open(str(output_path), "rb") as wav_file:
+        assert wav_file.getnchannels() == 2
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == 8000
+        pcm = np.frombuffer(wav_file.readframes(3), dtype="<i2").reshape(-1, 2)
+
+    expected = np.array(
+        [[0, 32767], [16383, -16383], [-32767, 8191]],
+        dtype=np.int16,
+    )
+    assert np.array_equal(pcm, expected)

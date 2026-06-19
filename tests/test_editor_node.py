@@ -2757,14 +2757,14 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
 
     saved_audio_paths = []
 
-    def fake_torchaudio_save(path, waveform, sample_rate, *args, **kwargs):
+    def fake_write_audio_wav(path, samples, sample_rate):
         Path(path).write_bytes(b"audio")
         saved_audio_paths.append(path)
 
     monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
     monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
-    monkeypatch.setitem(sys.modules, "torchaudio", types.SimpleNamespace(save=fake_torchaudio_save))
+    monkeypatch.setattr(io_nodes, "write_audio_wav", fake_write_audio_wav)
 
     node = io_nodes.SonderSaveVideo()
     frames = torch.zeros(5, 2, 2, 3, dtype=torch.float32)
@@ -2816,13 +2816,11 @@ def test_save_video_passes_audio_and_computed_timeout_to_encoder(tmp_path, monke
 
     captured = []
 
-    fake_torchaudio = types.SimpleNamespace(save=lambda *args, **kwargs: None)
-
-    monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
     monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes, captured))
     monkeypatch.setattr(io_nodes, "save_video_encode_timeout_seconds", lambda *args, **kwargs: 1234)
     monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "write_audio_wav", lambda *args, **kwargs: None)
 
     node = io_nodes.SonderSaveVideo()
     frames = torch.zeros(2, 2, 2, 3, dtype=torch.float32)
@@ -2905,11 +2903,14 @@ def test_load_scene_audio_caps_track_to_timeline_trim(tmp_path, monkeypatch):
     sample_rate = 44100
     fps = 44100.0
     waveform = (torch.arange(200, dtype=torch.float32) / 1000.0).unsqueeze(0)
+    stereo_samples = editor_node.np.vstack([waveform.numpy(), waveform.numpy()])
 
-    fake_torchaudio = types.SimpleNamespace(
-        load=lambda *_args, **_kwargs: (waveform.clone(), sample_rate)
-    )
-    monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
+    def fake_decode_audio_samples(path, *, sample_rate, channels, mix_to_mono=True, **kwargs):
+        assert channels == 2
+        assert mix_to_mono is False
+        return stereo_samples.copy(), sample_rate
+
+    monkeypatch.setattr(editor_node, "decode_audio_samples", fake_decode_audio_samples)
 
     track = types.SimpleNamespace(
         muted=False,
@@ -2943,8 +2944,10 @@ def test_load_scene_audio_caps_track_to_timeline_trim(tmp_path, monkeypatch):
 def test_load_scene_audio_logs_missing_source_and_silent_fallback(tmp_path, monkeypatch, caplog):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
 
-    fake_torchaudio = types.SimpleNamespace(load=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected load")))
-    monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
+    def fail_decode_audio_samples(*args, **kwargs):
+        raise AssertionError("unexpected decode")
+
+    monkeypatch.setattr(editor_node, "decode_audio_samples", fail_decode_audio_samples)
 
     track = types.SimpleNamespace(
         muted=False,
@@ -2973,3 +2976,67 @@ def test_load_scene_audio_logs_missing_source_and_silent_fallback(tmp_path, monk
     assert audio["sample_rate"] == 44100
     assert "file not found" in caplog.text
     assert "fell back to silence" in caplog.text
+
+
+def test_load_scene_audio_skips_failed_track_and_keeps_good_mix(tmp_path, monkeypatch, caplog):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    bad_path = media_dir / "bad.wav"
+    good_path = media_dir / "good.wav"
+    bad_path.write_bytes(b"bad")
+    good_path.write_bytes(b"good")
+
+    sample_rate = 44100
+    fps = 44100.0
+    good_samples = editor_node.np.ones((2, 10), dtype=editor_node.np.float32) * 0.25
+
+    def fake_decode_audio_samples(path, *, sample_rate, channels, mix_to_mono=True, **kwargs):
+        assert channels == 2
+        assert mix_to_mono is False
+        if str(path).endswith("bad.wav"):
+            raise RuntimeError("decode failed")
+        return good_samples.copy(), sample_rate
+
+    monkeypatch.setattr(editor_node, "decode_audio_samples", fake_decode_audio_samples)
+
+    bad_track = types.SimpleNamespace(
+        muted=False,
+        lane_index=0,
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        source_path=os.path.join("media", "bad.wav"),
+        source_in_frame=0,
+        volume=1.0,
+    )
+    good_track = types.SimpleNamespace(
+        muted=False,
+        lane_index=0,
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        source_path=os.path.join("media", "good.wav"),
+        source_in_frame=0,
+        volume=1.0,
+    )
+    scene = types.SimpleNamespace(
+        fps=fps,
+        audio_tracks=[bad_track, good_track],
+        audio_lane_configs=[],
+    )
+    project = types.SimpleNamespace(
+        fps=fps,
+        project_dir=str(tmp_path),
+    )
+
+    caplog.set_level("WARNING", logger="sonder_editor")
+
+    node = editor_node.SonderEditor()
+    audio = node._load_scene_audio(project, scene, 0, 10)
+
+    mixed = audio["waveform"][0]
+    assert audio["sample_rate"] == sample_rate
+    assert torch.allclose(mixed, torch.from_numpy(good_samples))
+    assert "Failed to decode/mix scene audio track" in caplog.text
+    assert "bad.wav" in caplog.text

@@ -54,6 +54,7 @@ from ..server.media_helpers import (
     save_video_encode_timeout_seconds,
     tensor_mode_for_preset,
     tensor_to_uint8_frames,
+    write_audio_wav,
     write_png,
 )
 
@@ -1044,13 +1045,11 @@ def _tensor_to_frames(tensor: torch.Tensor) -> list[np.ndarray]:
 
 def _save_audio_waveform(audio: dict, output_path: str) -> tuple[int, torch.Tensor]:
     """Persist a ComfyUI AUDIO dict as a waveform file and return sample rate plus waveform."""
-    import torchaudio
-
     waveform = audio["waveform"]
     if waveform.dim() == 3:
         waveform = waveform.squeeze(0)
     sample_rate = int(audio["sample_rate"])
-    torchaudio.save(output_path, waveform, sample_rate)
+    write_audio_wav(output_path, waveform.detach().cpu().numpy(), sample_rate)
     return sample_rate, waveform
 
 

@@ -17,7 +17,7 @@ import folder_paths
 
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
-from ..server.media_helpers import decode_video_frame, decode_video_range, fit_frame_to_canvas
+from ..server.media_helpers import decode_audio_samples, decode_video_frame, decode_video_range, fit_frame_to_canvas
 from ..server.timeline_renderer import render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
@@ -1122,67 +1122,64 @@ class SonderEditor:
         if not scene.audio_tracks:
             return _make_silent_audio(duration_sec, sample_rate)
 
-        try:
-            import torchaudio
+        total_samples = int(duration_sec * sample_rate)
+        mixed = torch.zeros(2, total_samples, dtype=torch.float32)
 
-            total_samples = int(duration_sec * sample_rate)
-            mixed = torch.zeros(2, total_samples, dtype=torch.float32)
+        # Build set of hidden audio lanes
+        hidden_audio_lanes = set()
+        for i, cfg in enumerate(scene.audio_lane_configs):
+            if cfg.hidden:
+                hidden_audio_lanes.add(i)
 
-            # Build set of hidden audio lanes
-            hidden_audio_lanes = set()
-            for i, cfg in enumerate(scene.audio_lane_configs):
-                if cfg.hidden:
-                    hidden_audio_lanes.add(i)
+        any_loaded = False
+        considered_tracks = len(scene.audio_tracks)
+        loaded_tracks = 0
+        failed_tracks = 0
+        for track in scene.audio_tracks:
+            if track.muted:
+                logger.debug("Skipping scene audio track %s: muted", track.source_path)
+                continue
+            if track.lane_index in hidden_audio_lanes:
+                logger.debug(
+                    "Skipping scene audio track %s: hidden lane %s",
+                    track.source_path,
+                    track.lane_index,
+                )
+                continue
+            overlap_start = max(sel_start, int(track.timeline_start_frame or 0))
+            overlap_end = min(sel_end, int(track.timeline_end_frame or 0))
+            if overlap_end <= overlap_start:
+                logger.debug(
+                    "Skipping scene audio track %s: no overlap with range %d-%d",
+                    track.source_path,
+                    sel_start,
+                    sel_end,
+                )
+                continue
 
-            any_loaded = False
-            considered_tracks = len(scene.audio_tracks)
-            loaded_tracks = 0
-            for track in scene.audio_tracks:
-                if track.muted:
-                    logger.debug("Skipping scene audio track %s: muted", track.source_path)
-                    continue
-                if track.lane_index in hidden_audio_lanes:
-                    logger.debug(
-                        "Skipping scene audio track %s: hidden lane %s",
-                        track.source_path,
-                        track.lane_index,
-                    )
-                    continue
-                overlap_start = max(sel_start, int(track.timeline_start_frame or 0))
-                overlap_end = min(sel_end, int(track.timeline_end_frame or 0))
-                if overlap_end <= overlap_start:
-                    logger.debug(
-                        "Skipping scene audio track %s: no overlap with range %d-%d",
-                        track.source_path,
-                        sel_start,
-                        sel_end,
-                    )
-                    continue
+            raw_path = track.source_path
+            fallback_path = os.path.join(proj.project_dir, track.source_path)
+            src_path = raw_path
+            if not os.path.isfile(src_path):
+                # Try relative to project dir
+                src_path = fallback_path
+            if not os.path.isfile(src_path):
+                logger.info(
+                    "Skipping scene audio track %s: file not found (attempted: %s, %s)",
+                    track.source_path,
+                    raw_path,
+                    fallback_path,
+                )
+                continue
 
-                raw_path = track.source_path
-                fallback_path = os.path.join(proj.project_dir, track.source_path)
-                src_path = raw_path
-                if not os.path.isfile(src_path):
-                    # Try relative to project dir
-                    src_path = fallback_path
-                if not os.path.isfile(src_path):
-                    logger.info(
-                        "Skipping scene audio track %s: file not found (attempted: %s, %s)",
-                        track.source_path,
-                        raw_path,
-                        fallback_path,
-                    )
-                    continue
-
-                waveform, sr = torchaudio.load(src_path)
-                if sr != sample_rate:
-                    waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
-
-                # Ensure stereo
-                if waveform.shape[0] == 1:
-                    waveform = waveform.repeat(2, 1)
-                elif waveform.shape[0] > 2:
-                    waveform = waveform[:2]
+            try:
+                samples, _sr = decode_audio_samples(
+                    src_path,
+                    sample_rate=sample_rate,
+                    channels=2,
+                    mix_to_mono=False,
+                )
+                waveform = torch.from_numpy(np.ascontiguousarray(samples, dtype=np.float32))
 
                 # Calculate the overlapping source slice and destination offset.
                 track_offset_frames = overlap_start - sel_start
@@ -1215,24 +1212,22 @@ class SonderEditor:
                 mixed[:, track_offset_samples:end_sample] += src_audio * track.volume
                 any_loaded = True
                 loaded_tracks += 1
+            except Exception as e:
+                failed_tracks += 1
+                logger.warning("Failed to decode/mix scene audio track %s: %s", track.source_path, e)
+                continue
 
-            if not any_loaded:
-                logger.info(
-                    "Scene audio fell back to silence: considered=%d loaded=%d range=%d-%d",
-                    considered_tracks,
-                    loaded_tracks,
-                    sel_start,
-                    sel_end,
-                )
-                return _make_silent_audio(duration_sec, sample_rate)
-
-            # Clamp to prevent clipping
-            mixed = mixed.clamp(-1.0, 1.0)
-            return {"waveform": mixed.unsqueeze(0), "sample_rate": sample_rate}
-
-        except ImportError:
-            logger.warning("torchaudio not available — returning silent audio")
+        if not any_loaded:
+            logger.info(
+                "Scene audio fell back to silence: considered=%d loaded=%d failed=%d range=%d-%d",
+                considered_tracks,
+                loaded_tracks,
+                failed_tracks,
+                sel_start,
+                sel_end,
+            )
             return _make_silent_audio(duration_sec, sample_rate)
-        except Exception as e:
-            logger.warning("Failed to load scene audio: %s", e)
-            return _make_silent_audio(duration_sec, sample_rate)
+
+        # Clamp to prevent clipping
+        mixed = mixed.clamp(-1.0, 1.0)
+        return {"waveform": mixed.unsqueeze(0), "sample_rate": sample_rate}

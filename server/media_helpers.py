@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import wave
 from typing import Iterable, Iterator
 
 import cv2
@@ -593,6 +594,7 @@ def decode_audio_samples(
     *,
     sample_rate: int = 44100,
     channels: int = 1,
+    mix_to_mono: bool = True,
     timeout: int | float = 60,
 ) -> tuple[np.ndarray, int]:
     sample_rate = max(1, int(sample_rate or 44100))
@@ -624,8 +626,40 @@ def decode_audio_samples(
         raise MediaProbeError(f"Could not decode audio samples for {os.path.basename(path)}: {stderr[:240]}")
     samples = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
     if channels > 1:
-        samples = samples.reshape(-1, channels).mean(axis=1)
+        samples = samples.reshape(-1, channels)
+        if mix_to_mono:
+            samples = samples.mean(axis=1)
+        else:
+            samples = samples.T.copy()
     return samples, sample_rate
+
+
+def write_audio_wav(path: str, samples: np.ndarray, sample_rate: int) -> None:
+    """Write float audio samples to a 16-bit PCM WAV file.
+
+    Accepts mono samples shaped (N,) or channel-first samples shaped (channels, N).
+    """
+    sample_rate = max(1, int(sample_rate or 44100))
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if arr.ndim == 1:
+        channels = 1
+        interleaved = arr
+    elif arr.ndim == 2:
+        channels = int(arr.shape[0])
+        if channels < 1:
+            raise ValueError("Audio waveform must have at least one channel")
+        interleaved = arr.T.reshape(-1)
+    else:
+        raise ValueError(f"Unsupported audio waveform shape for WAV export: {arr.shape}")
+
+    pcm = (np.clip(interleaved, -1.0, 1.0) * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
 
 
 def _parse_metadata_json(value):
