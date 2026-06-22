@@ -11361,7 +11361,12 @@ export class EditorWidget {
                         fetch_seq: fetchSeq,
                         current_seq: this._queueFetchSeq,
                     });
-                    this._deferProjectBackedRefresh(["queue"], "queue_refresh_stale_replay");
+                    // A newer queue fetch superseded this one — bail (latest-wins).
+                    // Do NOT re-defer: the seq gate tracks dispatch order, not server
+                    // commit order (durable_rules #101), so the winning in-flight fetch
+                    // is authoritative and the version/pending re-defers below remain the
+                    // correctness net. Re-deferring here self-sustained an idle replay
+                    // churn loop (queue_refresh_stale / project_mutation_deferred_replay).
                     return;
                 }
                 const headerProjectId = resp.headers.get("X-Sonder-Project-Id") || "";
