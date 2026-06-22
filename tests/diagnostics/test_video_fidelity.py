@@ -553,23 +553,15 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
     frames_rgb = _make_diagnostic_rgb_frames(frame_count=4)
     frames = _rgb_to_tensor(frames_rgb)
     captured_popen: list[list[str]] = []
-    captured_run: list[list[str]] = []
-    real_run = subprocess.run
     real_popen = subprocess.Popen
 
     def capture_popen(cmd, *args, **kwargs):
         captured_popen.append([str(part) for part in cmd])
         return real_popen(cmd, *args, **kwargs)
 
-    def capture_run(cmd, *args, **kwargs):
-        captured_run.append([str(part) for part in cmd])
-        return real_run(cmd, *args, **kwargs)
-
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
-    monkeypatch.setattr(io_nodes, "_get_ffmpeg", lambda: ffmpeg)
     monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
     monkeypatch.setattr(media_helpers.subprocess, "Popen", capture_popen)
-    monkeypatch.setattr(media_helpers.subprocess, "run", capture_run)
 
     save_result = io_nodes.SonderSaveVideo().save_video(
         project,
@@ -582,21 +574,25 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
     )
     preview_result = io_nodes.SonderPreviewVideo().preview(frames, fps=24.0)
     monkeypatch.setattr(media_helpers.subprocess, "Popen", real_popen)
-    monkeypatch.setattr(media_helpers.subprocess, "run", real_run)
 
     save_path = Path(save_result["result"][0])
-    preview_video = preview_result["ui"]["videos"][0]["filename"]
+    preview_video = preview_result["ui"]["sonder_video"][0]["filename"]
     preview_path = tmp_path / "temp" / preview_video
     assert save_path.is_file()
     assert preview_path.is_file()
     assert len(project.assets) == 1
 
-    save_cmd = next(cmd for cmd in captured_popen if "-preset" in cmd and "slow" in cmd)
-    preview_cmd = captured_run[0]
+    # Preview now shares SonderSaveVideo's streaming encoder (Compatible MP4) instead of a
+    # bespoke `libx264 -crf 23` subprocess.run command, so both encodes appear in Popen.
+    def _cmd_for(filename):
+        return next(cmd for cmd in captured_popen if cmd[-2].endswith(filename))
+
+    save_cmd = _cmd_for(save_path.name)
+    preview_cmd = _cmd_for(preview_video)
     save_tail = save_cmd[save_cmd.index("-c:v") :]
-    preview_tail = preview_cmd[preview_cmd.index("-c:v") :]
     assert save_tail[:10] == ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-    assert preview_tail[:6] == ["-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p"]
+    assert preview_cmd[preview_cmd.index("-c:v") + 1] == "libx264"
+    assert preview_cmd[preview_cmd.index("-pix_fmt", preview_cmd.index("-c:v")) + 1] == "yuv420p"
     assert project.assets[0].generation_params["save_preset"] == "Compatible MP4"
     assert project.assets[0].generation_params["tensor_mode"] == "round"
 

@@ -2836,24 +2836,45 @@ def test_save_video_passes_audio_and_computed_timeout_to_encoder(tmp_path, monke
     assert captured[-1]["preset_id"] == "Compatible MP4"
 
 
-def test_preview_uses_shorter_timeout(tmp_path, monkeypatch):
+def test_preview_routes_through_shared_encoder(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
 
-    captured = {}
-
-    def fake_ffmpeg(cmd, input=None, capture_output=None, timeout=None):
-        captured["timeout"] = timeout
-        Path(cmd[-2]).write_bytes(b"video")
-        return types.SimpleNamespace(returncode=0, stderr=b"")
-
-    monkeypatch.setattr(io_nodes.subprocess, "run", fake_ffmpeg)
+    captured = []
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes, captured))
+    monkeypatch.setattr(io_nodes, "save_video_encode_timeout_seconds", lambda *args, **kwargs: 1234)
 
     node = io_nodes.SonderPreviewVideo()
     frames = torch.zeros(2, 2, 2, 3, dtype=torch.float32)
-    node.preview(frames, fps=24.0)
+    result = node.preview(frames, fps=24.0)
 
-    assert captured["timeout"] == 90
+    # Preview now shares SonderSaveVideo's streaming encoder + computed timeout instead of
+    # building a whole raw-video payload with a fixed 90s timeout.
+    assert captured[-1]["timeout"] == 1234
+    assert captured[-1]["preset_id"] == "Compatible MP4"
+    assert not captured[-1]["audio_path"]
+
+    descriptor = result["ui"]["sonder_video"][0]
+    assert descriptor["type"] == "temp"
+    assert descriptor["has_audio"] is False
+    assert descriptor["filename"].endswith(".mp4")
+
+
+def test_preview_muxes_audio_into_player(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    captured = []
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes, captured))
+    monkeypatch.setattr(io_nodes, "write_audio_wav", lambda *args, **kwargs: None)
+
+    node = io_nodes.SonderPreviewVideo()
+    frames = torch.zeros(2, 2, 2, 3, dtype=torch.float32)
+    audio = {"waveform": torch.zeros(1, 2, 64, dtype=torch.float32), "sample_rate": 44100}
+    result = node.preview(frames, fps=24.0, audio=audio)
+
+    assert captured[-1]["audio_path"]
+    assert result["ui"]["sonder_video"][0]["has_audio"] is True
 
 
 def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):

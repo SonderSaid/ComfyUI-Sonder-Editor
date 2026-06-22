@@ -23,6 +23,7 @@ import {
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
 import { notifyProgress, configureNotifications } from "./editor_notifications.js";
+import { mountNodeVideoPreview } from "./node_video_preview.js";
 
 injectSonderFontFaces();
 
@@ -1258,10 +1259,34 @@ app.registerExtension({
             };
 
             const origOnExecuted = nodeType.prototype.onExecuted;
-            nodeType.prototype.onExecuted = function () {
+            nodeType.prototype.onExecuted = function (message) {
                 origOnExecuted?.apply(this, arguments);
+                const descriptor = message?.sonder_video?.[0];
+                if (descriptor) {
+                    try {
+                        mountNodeVideoPreview(this, descriptor);
+                    } catch (error) {
+                        console.warn("[Sonder] Failed to mount save-video player:", error);
+                    }
+                }
                 const editorNodes = getSaveVideoEditorNodes(this);
                 refreshEditorNodes(editorNodes);
+            };
+        }
+
+        // ── Sonder Preview Video — inline player on the node card ─────────
+        if (nodeData.name === "SonderPreviewVideo") {
+            const origOnExecuted = nodeType.prototype.onExecuted;
+            nodeType.prototype.onExecuted = function (message) {
+                origOnExecuted?.apply(this, arguments);
+                const descriptor = message?.sonder_video?.[0];
+                if (descriptor) {
+                    try {
+                        mountNodeVideoPreview(this, descriptor);
+                    } catch (error) {
+                        console.warn("[Sonder] Failed to mount preview player:", error);
+                    }
+                }
             };
         }
 

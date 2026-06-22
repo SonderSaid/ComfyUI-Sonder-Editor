@@ -1476,12 +1476,25 @@ class SonderSaveVideo:
 
         _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
 
-        # Generate preview thumbnail for ComfyUI node display
-        preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savevid")
+        # Inline node player descriptor — the saved project media file is served via
+        # ComfyUI /view from <output>/sonder-projects/<dir>/media. Poster is the first
+        # frame shown before playback starts. PNG-sequence saves keep the thumbnail-only
+        # path above; this is the playable-video case.
+        poster = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savevid")
+        project_subfolder = f"sonder-projects/{os.path.basename(os.path.normpath(project.project_dir))}/media"
 
         logger.info("Saved video to %s (%d frames, %.1f fps, preset=%s)", output_path, len(rgb_frames), fps, preset_id)
         return {
-            "ui": {"images": preview_images},
+            "ui": {
+                "sonder_video": [{
+                    "filename": output_filename,
+                    "subfolder": project_subfolder,
+                    "type": "output",
+                    "fps": fps,
+                    "has_audio": has_audio,
+                    "poster": poster[0] if poster else None,
+                }],
+            },
             "result": (output_path,),
         }
 
@@ -1560,39 +1573,54 @@ class SonderPreviewVideo:
                 "frames": ("IMAGE", {"tooltip": "Batch of frames to preview."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001, "tooltip": "Playback frame rate for the preview."}),
             },
+            "optional": {
+                "audio": ("AUDIO", {"tooltip": "Optional audio to mux into the preview so playback has sound."}),
+            },
         }
 
-    def preview(self, frames, fps=24.0):
+    def preview(self, frames, fps=24.0, audio=None):
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
 
-        preview_filename = f"sonder_preview_{uuid.uuid4().hex[:8]}.mp4"
+        # Encode through the shared media_helpers path (streaming frames, browser-playable
+        # Compatible MP4, audio mux, size-aware timeout) — the same encoder SonderSaveVideo
+        # uses — so the preview is consistent and never builds a whole raw-video payload.
+        preset_id = DEFAULT_SAVE_VIDEO_PRESET
+        extension = output_extension_for_preset(preset_id)
+        preview_filename = f"sonder_preview_{uuid.uuid4().hex[:8]}{extension}"
         preview_path = os.path.join(temp_dir, preview_filename)
 
-        bgr_frames = _tensor_to_frames(frames)
-        h, w = bgr_frames[0].shape[:2]
+        rgb_frames = tensor_to_uint8_frames(frames, mode=tensor_mode_for_preset(preset_id))
+        h, w = rgb_frames[0].shape[:2]
 
-        ffmpeg = _get_ffmpeg()
+        audio_tmp = None
+        if audio is not None:
+            audio_tmp = os.path.join(temp_dir, f"_tmp_preview_audio_{uuid.uuid4().hex[:6]}.wav")
+            try:
+                _save_audio_waveform(audio, audio_tmp)
+            except Exception as e:
+                logger.warning("Failed to save temp preview audio: %s", e)
+                audio_tmp = None
+        has_audio = bool(audio_tmp)
 
-        cmd = [
-            ffmpeg,
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{w}x{h}", "-r", str(fps),
-            "-i", "pipe:0",
-            "-c:v", "libx264", "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            preview_path, "-y",
-        ]
-
-        raw_bytes = b"".join(f.tobytes() for f in bgr_frames)
+        encode_timeout = save_video_encode_timeout_seconds(preset_id, len(rgb_frames), w, h)
         ffmpeg_started_at = time.perf_counter()
         logger.info(
-            "ffmpeg start: preview output=%s frames=%d",
+            "ffmpeg start: preview output=%s frames=%d audio=%s timeout=%ss",
             preview_path,
-            len(bgr_frames),
+            len(rgb_frames),
+            has_audio,
+            encode_timeout,
         )
         try:
-            proc = subprocess.run(cmd, input=raw_bytes, capture_output=True, timeout=90)
+            encode_video(
+                rgb_frames,
+                preset_id=preset_id,
+                output_path=preview_path,
+                fps=fps,
+                audio_path=audio_tmp,
+                timeout=encode_timeout,
+            )
         except subprocess.TimeoutExpired:
             logger.warning(
                 "ffmpeg timeout: preview output=%s duration=%.2fs",
@@ -1600,20 +1628,25 @@ class SonderPreviewVideo:
                 time.perf_counter() - ffmpeg_started_at,
             )
             raise
+        finally:
+            if audio_tmp and os.path.isfile(audio_tmp):
+                os.remove(audio_tmp)
         logger.info(
-            "ffmpeg end: preview output=%s returncode=%s duration=%.2fs",
+            "ffmpeg end: preview output=%s duration=%.2fs",
             preview_path,
-            proc.returncode,
             time.perf_counter() - ffmpeg_started_at,
         )
 
-        if proc.returncode != 0:
-            logger.warning("Preview encode failed: %s", proc.stderr.decode(errors="replace")[:300])
-
-        # Also show thumbnail on the node
-        preview_images = _save_preview_thumbnail(bgr_frames[0], "sonder_preview")
+        # First-frame poster for the inline player (shown before playback starts).
+        poster = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_preview")
 
         return {"ui": {
-            "videos": [{"filename": preview_filename, "subfolder": "", "type": "temp"}],
-            "images": preview_images,
+            "sonder_video": [{
+                "filename": preview_filename,
+                "subfolder": "",
+                "type": "temp",
+                "fps": fps,
+                "has_audio": has_audio,
+                "poster": poster[0] if poster else None,
+            }],
         }}

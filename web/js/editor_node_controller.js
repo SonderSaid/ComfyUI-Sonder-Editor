@@ -217,7 +217,7 @@ function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
 
-function renderDormantMediaScrubBar(mediaEl) {
+export function renderDormantMediaScrubBar(mediaEl) {
     const wrap = style(document.createElement("div"), `
         display: flex;
         align-items: center;
