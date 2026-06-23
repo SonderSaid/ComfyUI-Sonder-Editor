@@ -196,13 +196,12 @@ export const DEFAULT_EDITOR_SETTINGS = {
         resolution: "full",
         prebufferEnabled: true,
         prebufferLookaheadMs: 5000,
-        // Warm-ahead tuning (advanced). Defaults reproduce legacy playback behavior;
-        // raise on heavy 4K multi-layer scenes (see warm-ahead tuning plan). depth/cap
-        // warm more clip boundaries ahead; videoCacheMaxEntries=0 disables the decoder
-        // LRU (legacy unbounded behavior).
+        // Warm-ahead tuning. Defaults reproduce legacy playback behavior; depth/cap
+        // warm more clip boundaries ahead, while decodeConcurrency bounds simultaneous
+        // video seek+decode work on heavy stacked scenes.
         prebufferBoundaryDepth: 2,
         prebufferMaxEntries: 8,
-        videoCacheMaxEntries: 0,
+        decodeConcurrency: 2,
         streamingMode: "auto",
         adaptiveRebuffer: true,
         rebufferEnterMs: 250,
@@ -856,11 +855,11 @@ function normalizeEditorSettings(source = null) {
                 defaults.playback.prebufferMaxEntries,
                 true,
             ),
-            videoCacheMaxEntries: clampNumber(
-                stored?.playback?.videoCacheMaxEntries,
-                0,
-                512,
-                defaults.playback.videoCacheMaxEntries,
+            decodeConcurrency: clampNumber(
+                stored?.playback?.decodeConcurrency,
+                1,
+                8,
+                defaults.playback.decodeConcurrency,
                 true,
             ),
             streamingMode,
