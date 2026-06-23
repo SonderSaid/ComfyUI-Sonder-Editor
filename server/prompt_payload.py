@@ -102,10 +102,11 @@ def _section_entries(sections):
     return entries
 
 
-def resolve_segments(sections, window_start, window_end, labels_on=True):
+def resolve_segments(sections, window_start, window_end, labels_on=True,
+                     boundary_threshold_pct=0.0):
     """Resolve the segment lane into contiguous window-local segments.
 
-    Three passes:
+    Four passes:
     1. First-wins normalization of (legacy) overlaps: sections sorted by
        start; a later section's start is pushed past the previous section's
        end; fully shadowed sections drop. The EARLIER section keeps the
@@ -117,9 +118,20 @@ def resolve_segments(sections, window_start, window_end, labels_on=True):
        normalization honest — gaps would silently distort segment timing.
     3. Clip coverage to [window_start, window_end), drop empty spans, rebase
        to window-local 0-based frames.
+    4. Boundary-spill threshold (only when boundary_threshold_pct > 0): only
+       the FIRST and LAST segments can be clipped by the window edge. Drop a
+       window-clipped end segment whose in-window coverage is below
+       boundary_threshold_pct% of its source section's AUTHORED length, and
+       let the neighbor absorb the freed span (hold-until-next). Never reduce
+       below one surviving segment, so a window sitting inside a single long
+       section is never emptied. Stops frame-constraint snapping from
+       bleeding a few frames of an adjacent section into the generation.
 
-    Sections whose channels compose to "" are dropped before coverage so an
-    empty section never claims a span. Zero sections → [].
+    Each returned segment additionally carries `section_start` (the source
+    section's authored start_frame) so callers can map a window-local segment
+    back to its originating section. Sections whose channels compose to "" are
+    dropped before coverage so an empty section never claims a span. Zero
+    sections → [].
     """
     if window_end <= window_start:
         return []
@@ -133,7 +145,9 @@ def resolve_segments(sections, window_start, window_end, labels_on=True):
         composed.append({**entry, "text": text})
     composed.sort(key=lambda e: e["start"])
 
-    # Pass 1 — first-wins overlap normalization.
+    # Pass 1 — first-wins overlap normalization. Carry the authored start/end
+    # (pre-overlap-push) so Pass 4 can measure window clipping against each
+    # section's own authored length and map segments back to source sections.
     survivors = []
     cursor = None
     for entry in composed:
@@ -141,7 +155,9 @@ def resolve_segments(sections, window_start, window_end, labels_on=True):
         if eff_start >= entry["end"]:
             continue  # fully shadowed by an earlier section
         survivors.append({"start": eff_start, "text": entry["text"],
-                          "channels": entry["channels"]})
+                          "channels": entry["channels"],
+                          "authored_start": entry["start"],
+                          "authored_end": entry["end"]})
         cursor = entry["end"]
 
     if not survivors:
@@ -159,9 +175,39 @@ def resolve_segments(sections, window_start, window_end, labels_on=True):
         segments.append({
             "text": entry["text"],
             "channels": entry["channels"],
+            "section_start": entry["authored_start"],
+            "authored_start": entry["authored_start"],
+            "authored_end": entry["authored_end"],
             "start": cov_start - window_start,
             "end": cov_end - window_start,
         })
+
+    # Pass 4 — boundary-spill threshold. Only the first and last segments can
+    # be window-clipped (middle segments are bounded by neighbors). Drop a
+    # clipped end whose in-window coverage is a small fraction of its source
+    # section's authored length; the neighbor absorbs the freed span. The
+    # len>=2 guards keep at least one surviving segment so the window is never
+    # emptied (e.g. a selection entirely inside one long section).
+    if boundary_threshold_pct > 0 and len(segments) >= 2:
+        frac = boundary_threshold_pct / 100.0
+        last = segments[-1]
+        last_authored_len = max(1, last["authored_end"] - last["authored_start"])
+        if (last["authored_end"] > window_end
+                and (last["end"] - last["start"]) < frac * last_authored_len):
+            freed_end = last["end"]
+            segments.pop()
+            segments[-1]["end"] = freed_end
+        if len(segments) >= 2:
+            first = segments[0]
+            first_authored_len = max(1, first["authored_end"] - first["authored_start"])
+            if (first["authored_start"] < window_start
+                    and (first["end"] - first["start"]) < frac * first_authored_len):
+                segments.pop(0)
+                segments[0]["start"] = 0
+
+    for seg in segments:
+        seg.pop("authored_start", None)
+        seg.pop("authored_end", None)
     return segments
 
 
@@ -180,7 +226,8 @@ def join_segment_texts(texts, delimiter=DEFAULT_SECTION_DELIMITER) -> str:
 
 
 def compose_range_prompt(global_text, sections, window_start, window_end,
-                         labels_on=True, delimiter=DEFAULT_SECTION_DELIMITER) -> str:
+                         labels_on=True, delimiter=DEFAULT_SECTION_DELIMITER,
+                         boundary_threshold_pct=0.0) -> str:
     """THE single-string composer: global + ALL window segments, joined by the
     section-seam delimiter. Used by the Scene selectors, the queue handlers'
     frozen-prompt compose, and the dormant summary.
@@ -189,10 +236,12 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
     segment's text for that channel joined in temporal order
     (`[VISUAL]: a dog. it barks [SPEECH]: …`), never repeated per segment.
     Labels OFF keeps plain temporal concatenation of per-segment text.
-    Relay payloads are NOT affected — each relay segment must stay
+    `boundary_threshold_pct` forwards to resolve_segments (boundary-spill
+    drop). Relay payloads are NOT affected — each relay segment must stay
     self-contained, so the bridge keeps per-segment labels.
     """
-    segments = resolve_segments(sections, window_start, window_end, labels_on)
+    segments = resolve_segments(sections, window_start, window_end, labels_on,
+                                boundary_threshold_pct)
     if labels_on:
         parts = []
         for key in CHANNEL_ORDER:

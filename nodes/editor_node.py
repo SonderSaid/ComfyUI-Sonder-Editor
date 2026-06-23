@@ -819,20 +819,27 @@ class SonderEditor:
             # knobs; queued jobs use their frozen composed prompt instead.
             prompt_labels_on = True
             prompt_delimiter = "."
+            prompt_threshold = 0.0
             proj_metadata = getattr(proj, "metadata", None)
             if isinstance(proj_metadata, dict):
                 prompt_labels_on = proj_metadata.get("prompt_channel_labels", True) is not False
                 prompt_delimiter = str(proj_metadata.get("prompt_section_delimiter", ".") or "")
+                try:
+                    prompt_threshold = float(proj_metadata.get("prompt_frame_threshold", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    prompt_threshold = 0.0
             if queue_job:
                 prompt_text = getattr(queue_job, "prompt", "")
                 if snapshot_version <= 0 and not prompt_text:
                     prompt_text = scene.get_prompt_for_range(
                         render_start, render_end,
-                        labels_on=prompt_labels_on, delimiter=prompt_delimiter)
+                        labels_on=prompt_labels_on, delimiter=prompt_delimiter,
+                        boundary_threshold_pct=prompt_threshold)
             else:
                 prompt_text = scene.get_prompt_for_range(
                     render_start, render_end,
-                    labels_on=prompt_labels_on, delimiter=prompt_delimiter)
+                    labels_on=prompt_labels_on, delimiter=prompt_delimiter,
+                    boundary_threshold_pct=prompt_threshold)
 
             # --- Load audio from scene's audio tracks for the render range ---
             audio = self._load_scene_audio(proj, scene, render_start, render_end)

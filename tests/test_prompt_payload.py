@@ -153,6 +153,100 @@ def test_resolve_invalid_window():
     assert pp.resolve_segments(_sections((0, 10, "A")), 60, 50) == []
 
 
+def test_resolve_carries_section_start_identity():
+    # Each segment carries its source section's authored start_frame so the
+    # editor can map a window-local segment back to a timeline section.
+    segments = pp.resolve_segments(_sections((10, 20, "A"), (40, 50, "B")), 0, 100,
+                                   labels_on=False)
+    assert [s["section_start"] for s in segments] == [10, 40]
+
+
+# --- resolve_segments boundary threshold ---------------------------------------
+
+def test_threshold_zero_disables_filtering():
+    # 0% (default) leaves the trailing sliver in place byte-for-byte.
+    sections = _sections((0, 120, "A"), (120, 240, "B"))
+    segments = pp.resolve_segments(sections, 0, 125, labels_on=False,
+                                   boundary_threshold_pct=0.0)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [
+        ("A", 0, 120),
+        ("B", 120, 125),
+    ]
+
+
+def test_threshold_drops_trailing_spill_neighbor_absorbs():
+    # Window [0,125): B is clipped to 5f of its authored 120f (~4%) < 10% →
+    # dropped; A (the neighbor) absorbs the freed trailing span to 125.
+    sections = _sections((0, 120, "A"), (120, 240, "B"))
+    segments = pp.resolve_segments(sections, 0, 125, labels_on=False,
+                                   boundary_threshold_pct=10.0)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [("A", 0, 125)]
+
+
+def test_threshold_drops_leading_spill_neighbor_absorbs():
+    # Window [115,240): A is clipped to 5f of its authored 120f (~4%) < 10% →
+    # dropped; B absorbs the freed leading span back to window-local 0.
+    sections = _sections((0, 120, "A"), (120, 240, "B"))
+    segments = pp.resolve_segments(sections, 115, 240, labels_on=False,
+                                   boundary_threshold_pct=10.0)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [("B", 0, 125)]
+
+
+def test_threshold_keeps_substantial_boundary_overlap():
+    # Window [0,180): B covers 60f of its authored 120f (50%) ≥ 10% → kept.
+    sections = _sections((0, 120, "A"), (120, 240, "B"))
+    segments = pp.resolve_segments(sections, 0, 180, labels_on=False,
+                                   boundary_threshold_pct=10.0)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [
+        ("A", 0, 120),
+        ("B", 120, 180),
+    ]
+
+
+def test_threshold_never_empties_single_section_window():
+    # A selection sitting entirely inside one long section keeps that section
+    # even though its in-window coverage is a tiny fraction — never empty.
+    segments = pp.resolve_segments(_sections((0, 200, "A")), 125, 130, labels_on=False,
+                                   boundary_threshold_pct=50.0)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [("A", 0, 5)]
+
+
+def test_threshold_leaves_short_interior_section():
+    # A deliberately short MIDDLE section is never window-clipped, so even a
+    # high threshold must not drop it (only first/last segments are eligible).
+    sections = _sections((0, 40, "A"), (40, 50, "B"), (50, 200, "C"))
+    segments = pp.resolve_segments(sections, 0, 200, labels_on=False,
+                                   boundary_threshold_pct=90.0)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [
+        ("A", 0, 40),
+        ("B", 40, 50),
+        ("C", 50, 200),
+    ]
+
+
+def test_threshold_relay_lengths_realign_after_drop():
+    # Dropping a trailing sliver and letting the neighbor absorb it must keep
+    # PromptRelay segment_lengths aligned with the surviving locals.
+    sections = _sections((0, 100, "A"), (100, 200, "B"), (200, 300, "C"))
+    segments = pp.resolve_segments(sections, 0, 205, labels_on=False,
+                                   boundary_threshold_pct=10.0)
+    assert [(s["text"], s["start"], s["end"]) for s in segments] == [
+        ("A", 0, 100),
+        ("B", 100, 205),
+    ]
+    relay = pp.build_relay_payload("", segments)
+    assert relay["segment_lengths"] == "100,105"
+    assert relay["local_prompts"] == "A | B"
+
+
+def test_threshold_compose_range_prompt_drops_sliver_text():
+    sections = _sections((0, 120, "A"), (120, 240, "B"))
+    assert pp.compose_range_prompt("", sections, 0, 125, labels_on=False,
+                                   delimiter=".") == "A. B"
+    assert pp.compose_range_prompt("", sections, 0, 125, labels_on=False,
+                                   delimiter=".", boundary_threshold_pct=10.0) == "A"
+
+
 # --- join + compose_range_prompt -------------------------------------------------
 
 def test_join_segment_texts():

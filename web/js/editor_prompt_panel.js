@@ -379,17 +379,28 @@ export function mountPromptManagementPanel(host) {
 
         const chipLengths = () => writingState.allocations.reduce((sum, a) => sum + (a?.length || 0), 0);
 
+        // The actual laid-out duration uses max(minLen, allocation) per block,
+        // so it can exceed the raw chip sum when an allocation is below the
+        // template minimum — this is the value the scene must fit/grow to.
+        const laidOutTotal = (blocks) =>
+            blocks.reduce((sum, _t, i) =>
+                sum + Math.max(minLen, writingState.allocations[i]?.length ?? minLen), 0);
+
         const updateReadout = (blocks) => {
             const total = chipLengths();
-            const overMin = blocks.length * minLen > totalFrames;
-            const overBudget = total > totalFrames;
+            const requiredTotal = laidOutTotal(blocks);
+            const willExtend = blocks.length > 0 && requiredTotal > totalFrames;
             readout.textContent = blocks.length
                 ? `Sections: ${blocks.length} — total ${total}f of ${totalFrames}f (${Math.max(0, totalFrames - total)}f remaining; min ${minLen}f per section)`
                 : "No sections yet — the whole draft is one block until you add --- lines.";
-            readout.style.color = (overMin || overBudget) ? COLORS.dangerText : COLORS.textDim;
-            if (overMin) readout.textContent += " — too many sections for this scene at the template minimum.";
-            else if (overBudget) readout.textContent += " — total exceeds the scene; reduce lengths to Apply.";
-            applyBtn.disabled = applyBlocked || !blocks.length || overMin || overBudget;
+            if (willExtend) readout.textContent += ` — Apply will extend the scene to ${requiredTotal}f.`;
+            readout.style.color = COLORS.textDim;
+            // Over-budget no longer blocks — Apply extends the scene instead
+            // (which also satisfies the per-section minimum). Only a locked
+            // lane or an empty draft can block.
+            if (applyBlocked) applyBtn.textContent = "Apply (locked)";
+            else applyBtn.textContent = willExtend ? `Apply & Extend Scene to ${requiredTotal}f` : "Apply";
+            applyBtn.disabled = applyBlocked || !blocks.length;
         };
 
         const updateStrip = () => {
@@ -455,9 +466,19 @@ export function mountPromptManagementPanel(host) {
                 cursor += length;
                 return section;
             });
-            await host._applyPromptSetup({ global: host.activeScene?.prompt || "", sections });
+            const sceneDur = host.activeScene?.duration_frames || host.totalFrames || 0;
+            const extendDurationTo = cursor > sceneDur ? cursor : 0;
+            await host._applyPromptSetup({
+                global: host.activeScene?.prompt || "",
+                sections,
+                extendDurationTo,
+            });
             clearWritingState();
-            notifySuccess(`Applied ${sections.length} section(s) from the draft.`, { source: "prompt-writing-apply" });
+            notifySuccess(
+                extendDurationTo
+                    ? `Applied ${sections.length} section(s) and extended the scene to ${extendDurationTo}f.`
+                    : `Applied ${sections.length} section(s) from the draft.`,
+                { source: "prompt-writing-apply" });
             render();
         });
 

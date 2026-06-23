@@ -1070,6 +1070,19 @@ export function _drawClips(host, ctx, width) {
                 if (sectionHidden) {
                     host._drawMutedOverlay(ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, sectionMuted ? "Muted" : "Hidden");
                 }
+                // Selection prompt-usage highlight (keyed on authored start_frame):
+                // a strong top accent for sections the current selection window
+                // will output, a dim "Ignored" hatch for sections it clips but
+                // the boundary threshold drops.
+                if (host._promptUsedSections?.has(section.start_frame)) {
+                    ctx.fillStyle = COLORS.accent;
+                    ctx.fillRect(x1 + 1, promptY + 2, x2 - x1 - 2, Math.max(2, Math.round(3 * host._scaleTimeline)));
+                } else if (host._promptDroppedSections?.has(section.start_frame)) {
+                    ctx.save();
+                    ctx.globalAlpha = 0.5;
+                    host._drawMutedOverlay(ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, "Ignored");
+                    ctx.restore();
+                }
                 {
                     const linkGroup = host._linkGroupForItem?.({ type: "prompt", id: si, data: section });
                     if (linkGroup) drawLinkBadge(host, ctx, x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4, linkGroup);

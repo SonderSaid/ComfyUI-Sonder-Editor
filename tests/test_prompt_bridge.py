@@ -74,6 +74,25 @@ def test_bridge_window_fallback_without_editor_ctx():
     assert payload["segment_lengths"] == "100"
 
 
+def test_bridge_respects_boundary_threshold():
+    prompt_bridge = _import_prompt_bridge()
+    project, scene = _project_with_scene(
+        prompt="",
+        prompt_sections=[
+            PromptSection(0, 40, prompt="a"),
+            PromptSection(40, 80, prompt="b"),
+        ],
+    )
+    project.metadata["prompt_frame_threshold"] = 10
+    # Editor executed a window [0,42) that clips B to 2f of its authored 40f
+    # (5% < 10%) — the boundary threshold must drop B from the relay payload.
+    project._execution_context = {"scene_id": "scene-1", "context_start": 0, "context_end": 42}
+
+    payload = prompt_bridge.build_window_relay_payload(project)
+    assert payload["local_prompts"] == "[VISUAL]: a"
+    assert payload["segment_lengths"] == "42"
+
+
 def test_bridge_snapshot_via_queue_job_ref_id_on_peek():
     """Peek runs (no consume) MUST resolve the frozen snapshot — the bridge
     keys off `queue_job_ref_id`, never the consume-only `queue_job_id`."""

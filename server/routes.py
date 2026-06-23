@@ -2036,6 +2036,12 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
     delimiter = str(metadata.get("prompt_section_delimiter",
                                  prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
     params["prompt_section_delimiter"] = delimiter  # frozen for reproducibility
+    try:
+        threshold = float(params.get("prompt_frame_threshold",
+                                     metadata.get("prompt_frame_threshold", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    params["prompt_frame_threshold"] = threshold  # frozen for reproducibility
     job.params = params
     window_start = max(0, int(getattr(job, "selection_start", 0) or 0)
                        - int(getattr(job, "pre_context_frames", 0) or 0))
@@ -2046,6 +2052,7 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         getattr(job, "prompt_sections", []) or [],
         window_start, window_end,
         labels_on=labels_on, delimiter=delimiter,
+        boundary_threshold_pct=threshold,
     )
 
 
@@ -3199,11 +3206,16 @@ def _build_dormant_summary(
         labels_on = metadata.get("prompt_channel_labels", True) is not False
         delimiter = str(metadata.get("prompt_section_delimiter",
                                      prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
+        try:
+            threshold = float(metadata.get("prompt_frame_threshold", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            threshold = 0.0
         preview_prompt = active_scene.get_prompt_for_range(
             selection["context_start_frame"],
             selection["context_end_frame"],
             labels_on=labels_on,
             delimiter=delimiter,
+            boundary_threshold_pct=threshold,
         )
         active_scene_payload = {
             "scene_id": active_scene.scene_id,
@@ -5602,10 +5614,19 @@ if routes is not None:
                 active_job = job
                 break
 
+        def _coerce_threshold(source) -> float:
+            if not isinstance(source, dict):
+                return 0.0
+            try:
+                return float(source.get("prompt_frame_threshold", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
         if active_job is not None:
             params = getattr(active_job, "params", {}) or {}
             labels_on = params.get("prompt_channel_labels", True) is not False \
                 if isinstance(params, dict) else True
+            threshold = _coerce_threshold(params)
             global_text = str(getattr(active_job, "scene_prompt", "") or "")
             sections = list(getattr(active_job, "prompt_sections", []) or [])
             source_label = "snapshot"
@@ -5613,22 +5634,53 @@ if routes is not None:
             metadata = getattr(project, "metadata", None)
             labels_on = metadata.get("prompt_channel_labels", True) is not False \
                 if isinstance(metadata, dict) else True
+            threshold = _coerce_threshold(metadata)
             global_hidden = bool(getattr(scene.global_prompt_track_config, "hidden", False))
             sections_hidden = bool(getattr(scene.prompt_track_config, "hidden", False))
             global_text = "" if global_hidden else (scene.prompt or "")
             sections = [] if sections_hidden else list(scene.prompt_sections or [])
             source_label = "live"
 
-        segments = prompt_payload.resolve_segments(sections, 0, duration, labels_on)
+        # Optional selection-scoped window for the timeline highlight; default
+        # is the full scene so the structural panel preview is unchanged.
+        def _q_int(name, default):
+            raw = request.query.get(name)
+            if raw is None or raw == "":
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return default
+        window_start = max(0, _q_int("window_start", 0))
+        window_end = min(duration, _q_int("window_end", duration))
+        if window_end <= window_start:
+            window_start, window_end = 0, duration
+
+        segments = prompt_payload.resolve_segments(
+            sections, window_start, window_end, labels_on, threshold)
         relay = prompt_payload.build_relay_payload(global_text, segments)
+
+        # Which authored sections survive (used) vs were dropped by the
+        # boundary threshold for this window — drives the highlight. Diffing a
+        # threshold=0 resolve isolates exactly the spill drops.
+        used_sections = sorted({int(s["section_start"]) for s in segments
+                                if "section_start" in s})
+        candidates = prompt_payload.resolve_segments(
+            sections, window_start, window_end, labels_on, 0.0)
+        candidate_keys = {int(s["section_start"]) for s in candidates
+                          if "section_start" in s}
+        dropped_sections = sorted(candidate_keys.difference(used_sections))
+
         return web.json_response({
-            "window_start": 0,
-            "window_end": duration,
+            "window_start": window_start,
+            "window_end": window_end,
             "scene_name": getattr(scene, "name", "") or scene_id,
             "source": source_label,
             "labels_on": labels_on,
             "global_prompt": relay["global_prompt"],
             "segments": relay["segments"],
+            "used_sections": used_sections,
+            "dropped_sections": dropped_sections,
             "relay": {
                 "global_prompt": relay["global_prompt"],
                 "smart_prompt": relay["smart_prompt"],

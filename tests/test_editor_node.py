@@ -97,7 +97,7 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"prompt:{start_frame}-{end_frame}"
 
     class DummyProject:
@@ -169,7 +169,7 @@ class _FrameConstraintScene:
     guide_frames = []
 
     @staticmethod
-    def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+    def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
         return f"prompt:{start_frame}-{end_frame}"
 
 
@@ -1226,7 +1226,7 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1334,7 +1334,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1461,7 +1461,7 @@ def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1555,7 +1555,7 @@ def test_unmarked_save_with_active_queue_peeks_without_completion(tmp_path, monk
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1649,7 +1649,7 @@ def test_render_queue_inactive_ignores_terminal_save_queue(tmp_path, monkeypatch
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -1820,7 +1820,7 @@ def test_no_active_queue_runs_full_scene(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     class DummyProject:
@@ -1892,7 +1892,7 @@ def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(
@@ -2335,7 +2335,7 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
         guide_frames = []
 
         @staticmethod
-        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter="."):
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0):
             return f"live:{start_frame}-{end_frame}"
 
     queue_job = types.SimpleNamespace(

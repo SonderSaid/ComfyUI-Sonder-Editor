@@ -470,6 +470,10 @@ export class EditorWidget {
         this.totalFrames = this._settings.projectDefaults.newSceneDuration;
         this.selectionStart = 0;
         this.selectionEnd = 0;
+        // Prompt-usage highlight: authored start_frames the live selection
+        // window will output (used) vs dropped by the boundary threshold.
+        this._promptUsedSections = new Set();
+        this._promptDroppedSections = new Set();
         this.playhead = 0;
         this.scrollX = 0;
         this.scrollY = 0;
@@ -1084,6 +1088,10 @@ export class EditorWidget {
             // Clear undo/redo on scene switch (snapshots are scene-specific)
             this._undoStack = [];
             this._redoStack = [];
+            // Drop stale prompt-usage highlight (sets are keyed by start_frame
+            // and would otherwise falsely match the new scene's sections).
+            this._promptUsedSections = new Set();
+            this._promptDroppedSections = new Set();
             this.scrollY = 0;
             this._selectedPromptIdx = null;
             this._hidePromptEditor();
@@ -3253,6 +3261,8 @@ export class EditorWidget {
         this._setWidgetValue("mask_pre_offset", maskPre);
         this._setWidgetValue("mask_post_offset", maskPost);
         this._updateToolbar();
+        // Context frames widen the highlight window (selection + context).
+        this._refreshPromptUsageHighlight();
     }
 
     _refreshSelectionInputs() {
@@ -3319,6 +3329,7 @@ export class EditorWidget {
         this._setWidgetValue("selection_end", this.selectionEnd);
         if (persist) this._persistActiveTimelineSelection();
         this._refreshSelectionInputs();
+        this._refreshPromptUsageHighlight();
         if (render) {
             this._renderTimeline();
             this._updateToolbar();
@@ -4326,8 +4337,10 @@ export class EditorWidget {
             // project PUTs (not settings writes); getters back their sync
             get _promptChannelLabels() { return editor._promptChannelLabels; },
             get _promptSectionDelimiter() { return editor._promptSectionDelimiter; },
+            get _promptFrameThreshold() { return editor._promptFrameThreshold; },
             _togglePromptChannelLabels: (on) => editor._togglePromptChannelLabels(on),
             _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
+            _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
             _keyboardConsumerId: (suffix) => editor._keyboardConsumerId(suffix),
             _hideSettingsPanel: () => editor._hideSettingsPanel(),
         };
@@ -7111,6 +7124,11 @@ export class EditorWidget {
      *  Shift+Enter inserts a newline, Esc cancels. */
     _makePromptTextarea({ value = "", placeholder = "", title = "", flex = 1 }, onEnter, onEscape) {
         const area = document.createElement("textarea");
+        // Marks every prompt-editing field so the global key consumer leaves
+        // Ctrl+Z to native text undo instead of routing it to timeline undo
+        // (keyboard_ownership dispatches at window-capture, before this
+        // element's stopPropagation runs). Mirrors the panel boxes.
+        area.dataset.sonderPromptBox = "1";
         area.rows = 2;
         area.placeholder = placeholder;
         area.title = title ? `${title} — Enter commits, Shift+Enter inserts a newline` : "Enter commits, Shift+Enter inserts a newline";
@@ -7427,6 +7445,36 @@ export class EditorWidget {
         }
     }
 
+    /** Project-durable boundary-spill threshold (%). Drops a prompt section
+     *  from a render window when the selection only clips a small sliver of it
+     *  at the window edge (under N% of that section's own length); 0 = off.
+     *  Same project-metadata mutation exemption as the delimiter/labels. */
+    async _setPromptFrameThreshold(value) {
+        const dirName = this._projectDirName();
+        if (!dirName) return;
+        let pct = parseFloat(value);
+        if (!Number.isFinite(pct)) pct = 0;
+        pct = Math.max(0, Math.min(100, pct));
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ metadata: { prompt_frame_threshold: pct } }),
+                },
+                { projectId: dirName }
+            );
+            this._promptFrameThreshold = pct;
+            // The threshold changes which sections survive the live selection
+            // window — refresh the timeline "used/ignored" highlight.
+            this._refreshPromptUsageHighlight();
+        } catch (e) {
+            notifyWarning(e?.message || "Failed to update prompt threshold.", { source: "prompt-threshold-refused" });
+            throw e;
+        }
+    }
+
     /** Resolved relay payload preview for the panel (full-scene window). */
     async _fetchPromptPayload() {
         const dirName = this._projectDirName();
@@ -7440,6 +7488,57 @@ export class EditorWidget {
             return await resp.json();
         } catch (e) {
             console.warn("[Sonder] Failed to fetch prompt payload:", e);
+            return null;
+        }
+    }
+
+    /** Refresh the timeline "used / ignored-at-boundary" prompt highlight for
+     *  the live selection window. Resolves over the same raw selection+context
+     *  window the dormant preview uses (the render's grid-snap drift is an
+     *  accepted approximation, durable_rules.md). Debounced and stale-guarded:
+     *  the route is a filesystem load, so out-of-order responses are dropped. */
+    _refreshPromptUsageHighlight() {
+        const sameSet = (a, b) => a.size === b.size && [...a].every((v) => b.has(v));
+        const setSets = (used, dropped) => {
+            const changed = !sameSet(this._promptUsedSections, used)
+                || !sameSet(this._promptDroppedSections, dropped);
+            this._promptUsedSections = used;
+            this._promptDroppedSections = dropped;
+            if (changed) this._renderTimeline();
+        };
+        const ctx = this._selectionContextRange();
+        if (!ctx) { setSets(new Set(), new Set()); return; }
+        const windowStart = Math.max(0, Math.round(ctx.contextStart));
+        const windowEnd = Math.round(ctx.contextEnd);
+        if (this._promptHighlightTimer) clearTimeout(this._promptHighlightTimer);
+        const token = (this._promptHighlightToken || 0) + 1;
+        this._promptHighlightToken = token;
+        this._promptHighlightTimer = setTimeout(async () => {
+            const payload = await this._fetchPromptUsage(windowStart, windowEnd);
+            if (token !== this._promptHighlightToken) return; // a newer request won
+            if (!payload) return;
+            setSets(
+                new Set((payload.used_sections || []).map(Number)),
+                new Set((payload.dropped_sections || []).map(Number)),
+            );
+        }, 120);
+    }
+
+    /** Windowed prompt-payload fetch returning the used/dropped section sets
+     *  the timeline highlight draws. */
+    async _fetchPromptUsage(windowStart, windowEnd) {
+        const dirName = this._projectDirName();
+        const sceneId = this.activeSceneId;
+        if (!dirName || !sceneId) return null;
+        try {
+            const resp = await fetch(api.apiURL(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-payload`
+                + `?window_start=${windowStart}&window_end=${windowEnd}`
+            ));
+            if (!resp.ok) return null;
+            return await resp.json();
+        } catch (e) {
+            console.warn("[Sonder] Failed to fetch prompt usage:", e);
             return null;
         }
     }
@@ -7532,7 +7631,7 @@ export class EditorWidget {
     /** Replace the scene's prompt state with a history entry / template:
      *  ONE mutation request (deletes high-index-first, then creates, then the
      *  global text) so the apply is a single save and a single undo step. */
-    async _applyPromptSetup({ global: globalText, sections } = {}) {
+    async _applyPromptSetup({ global: globalText, sections, extendDurationTo = 0 } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
             notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
@@ -7569,11 +7668,30 @@ export class EditorWidget {
                 fields: { prompt_id: s.prompt_id, start_frame: s.start_frame, end_frame: s.end_frame, channels: s.channels, muted: !!s.muted },
             });
         }
-        operations.push({ type: "update_scene_fields", fields: { prompt: String(globalText ?? "") } });
+        // Optionally grow the scene to fit the new sections (writing-mode
+        // "Apply & Extend"). Merge into the SAME scene-fields op so it stays
+        // one mutation + one undo — the undo snapshot is a full scene clone,
+        // so a single Ctrl+Z reverts both the sections and the duration.
+        const curDuration = sceneRef.duration_frames || this.totalFrames || 0;
+        const nextDuration = Math.max(0, Math.round(extendDurationTo || 0));
+        const willExtend = nextDuration > curDuration;
+        const sceneFields = { prompt: String(globalText ?? "") };
+        if (willExtend) sceneFields.duration_frames = nextDuration;
+        operations.push({ type: "update_scene_fields", fields: sceneFields });
 
         sceneRef.prompt = String(globalText ?? "");
         sceneRef.prompt_sections = [...nextSections].sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
+        if (willExtend) {
+            sceneRef.duration_frames = nextDuration;
+            this.totalFrames = nextDuration;
+            this._clampTimelineStateToDuration();
+            this._refreshDurationInput();
+        }
         this._renderSceneAfterLocalMutation({ viewport: false });
+        if (willExtend) {
+            this._updateToolbar();
+            this._updateTransportUI();
+        }
         try {
             await this._runSceneMutation(operations, {
                 key: `prompt:${this.activeSceneId}:apply:${Date.now()}`,
@@ -10187,12 +10305,15 @@ export class EditorWidget {
             const tag = document.activeElement?.tagName;
             const isUndo = ctrl && (normalizedKey === "z" || normalizedKey === "y");
             const isInspectOverlayInput = !!document.activeElement?.closest?.("[data-sonder-inspect-overlay='1']");
+            // Prompt-editing fields (panel boxes + inline section/global/draft
+            // bars) own their own native Ctrl+Z; never route it to timeline undo.
+            const isPromptPanelInput = !!document.activeElement?.closest?.("[data-sonder-prompt-box='1']");
             const debugUndoRouting = (message, extra = {}) => {
                 if (!ctrl || (normalizedKey !== "z" && normalizedKey !== "y")) return;
                 this._keyboardDebug(message, this._keyboardDebugSnapshot(e, extra));
             };
             if (isInspectOverlayInput) return false;
-            if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && !isUndo) return false;
+            if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && (!isUndo || isPromptPanelInput)) return false;
 
             // Guard: only handle keys when our editor is focused
             // (fullscreen always focused, node mode only when user clicked inside)
@@ -11828,6 +11949,8 @@ export class EditorWidget {
                 this._promptChannelLabels = data.metadata?.prompt_channel_labels !== false;
                 // Project-durable section-seam delimiter (render-affecting; default ".")
                 this._promptSectionDelimiter = String(data.metadata?.prompt_section_delimiter ?? ".");
+                // Project-durable boundary-spill threshold % (render-affecting; default 0 = off)
+                this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold) || 0;
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 this._syncSceneResolutionControls();
                 this._updateViewportHeader();
@@ -11891,7 +12014,7 @@ export class EditorWidget {
             getRebufferMaxMs: () => this._settings?.playback?.rebufferMaxMs ?? 4000,
             getPrebufferBoundaryDepth: () => this._settings?.playback?.prebufferBoundaryDepth ?? 2,
             getPrebufferMaxEntries: () => this._settings?.playback?.prebufferMaxEntries ?? 8,
-            getVideoCacheMaxEntries: () => this._settings?.playback?.videoCacheMaxEntries ?? 0,
+            getDecodeConcurrency: () => this._settings?.playback?.decodeConcurrency ?? 2,
             notifyInfo: (message, opts) => notifyInfo(message, opts),
             notifyWarning: (message, opts) => notifyWarning(message, opts),
             onFrameChange: (frame, meta = {}) => {

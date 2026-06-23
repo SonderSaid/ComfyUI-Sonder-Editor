@@ -76,12 +76,21 @@ def _project_labels_on(project) -> bool:
     return True
 
 
+def _threshold_from(source) -> float:
+    if not isinstance(source, dict):
+        return 0.0
+    try:
+        return float(source.get("prompt_frame_threshold", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def resolve_window_prompt_state(project):
-    """Resolve (global_text, sections, labels_on, window, source) for the run.
+    """Resolve (global_text, sections, labels_on, window, source, threshold).
 
     Frozen job snapshot when this execution rendered a snapshot_version>0
-    job (its hidden flags were baked at enqueue); live scene + project
-    metadata + per-lane hidden flags otherwise.
+    job (its hidden flags + threshold were baked at enqueue); live scene +
+    project metadata + per-lane hidden flags otherwise.
     """
     scene = _resolve_active_scene(project)
     window_start, window_end = _resolve_prompt_window(project, scene)
@@ -98,24 +107,27 @@ def resolve_window_prompt_state(project):
             window_start,
             window_end,
             "snapshot",
+            _threshold_from(params),
         )
 
     labels_on = _project_labels_on(project)
+    threshold = _threshold_from(getattr(project, "metadata", None))
     if scene is None:
-        return "", [], labels_on, window_start, window_end, "live"
+        return "", [], labels_on, window_start, window_end, "live", threshold
     global_hidden = bool(getattr(getattr(scene, "global_prompt_track_config", None), "hidden", False))
     sections_hidden = bool(getattr(getattr(scene, "prompt_track_config", None), "hidden", False))
     global_text = "" if global_hidden else str(getattr(scene, "prompt", "") or "")
     sections = [] if sections_hidden else list(getattr(scene, "prompt_sections", []) or [])
-    return global_text, sections, labels_on, window_start, window_end, "live"
+    return global_text, sections, labels_on, window_start, window_end, "live", threshold
 
 
 def build_window_relay_payload(project) -> dict:
     """Window-resolved PromptRelay payload (the bridge's testable core)."""
-    global_text, sections, labels_on, window_start, window_end, source = (
+    global_text, sections, labels_on, window_start, window_end, source, threshold = (
         resolve_window_prompt_state(project)
     )
-    segments = prompt_payload.resolve_segments(sections, window_start, window_end, labels_on)
+    segments = prompt_payload.resolve_segments(
+        sections, window_start, window_end, labels_on, threshold)
     payload = prompt_payload.build_relay_payload(global_text, segments)
     payload["labels_on"] = labels_on
     payload["window_start"] = window_start

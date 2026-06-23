@@ -446,13 +446,16 @@ class Scene:
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
 
     def get_prompt_at_frame(self, frame: int, labels_on: bool = True,
-                            delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER) -> str:
+                            delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER,
+                            boundary_threshold_pct: float = 0.0) -> str:
         """Composed prompt (global + covering section) for a single frame."""
         return self.get_prompt_for_range(frame, frame + 1, labels_on=labels_on,
-                                         delimiter=delimiter)
+                                         delimiter=delimiter,
+                                         boundary_threshold_pct=boundary_threshold_pct)
 
     def get_prompt_for_range(self, start: int, end: int, labels_on: bool = True,
-                             delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER) -> str:
+                             delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER,
+                             boundary_threshold_pct: float = 0.0) -> str:
         """Composed single-string prompt for a frame range.
 
         Global lane text + ALL segments overlapping the window in temporal
@@ -460,6 +463,8 @@ class Scene:
         next section starts; the first also covers anything before it).
         Per-lane hidden semantics: global hidden zeroes the global part,
         segment lane hidden zeroes the section part, both hidden yields "".
+        `boundary_threshold_pct` forwards the boundary-spill drop to the
+        resolver (0 = off).
         """
         global_hidden = getattr(self.global_prompt_track_config, "hidden", False)
         sections_hidden = getattr(self.prompt_track_config, "hidden", False)
@@ -468,6 +473,7 @@ class Scene:
         return prompt_payload.compose_range_prompt(
             global_text, sections, start, end,
             labels_on=labels_on, delimiter=delimiter,
+            boundary_threshold_pct=boundary_threshold_pct,
         )
 
     def to_dict(self) -> dict:

@@ -186,7 +186,7 @@ function syncSettingsPanelControls() {
     if (controls.prebufferLookaheadMs) controls.prebufferLookaheadMs.value = String(this._settings.playback.prebufferLookaheadMs);
     if (controls.prebufferBoundaryDepth) controls.prebufferBoundaryDepth.value = String(this._settings.playback.prebufferBoundaryDepth);
     if (controls.prebufferMaxEntries) controls.prebufferMaxEntries.value = String(this._settings.playback.prebufferMaxEntries);
-    if (controls.videoCacheMaxEntries) controls.videoCacheMaxEntries.value = String(this._settings.playback.videoCacheMaxEntries);
+    if (controls.decodeConcurrency) controls.decodeConcurrency.value = String(this._settings.playback.decodeConcurrency);
     if (controls.waveformAccent) controls.waveformAccent.value = this._settings.appearance.waveformAccent;
     if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
     if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
@@ -963,8 +963,8 @@ function showSettingsPanel() {
     createNumberInput(
         playbackSection,
         "prebufferBoundaryDepth",
-        "Prebuffer Boundary Depth (advanced)",
-        "How many upcoming clip boundaries to warm ahead. Raise on heavy multi-layer scenes so the playhead reaches each boundary already warm. Default 2.",
+        "Prebuffer Boundary Depth",
+        "How many upcoming clip boundaries to warm ahead.",
         {
             min: 1,
             max: 12,
@@ -976,8 +976,8 @@ function showSettingsPanel() {
     createNumberInput(
         playbackSection,
         "prebufferMaxEntries",
-        "Prebuffer Max Warmed Clips (advanced)",
-        "Hard cap on simultaneously warmed prebuffer video decoders (RAM/VRAM budget). Raising past your GPU's concurrent-4K-decode limit can hurt — watch playback. Default 8.",
+        "Prebuffer Max Warmed Clips",
+        "Cap on clips warmed ahead at once.",
         {
             min: 1,
             max: 64,
@@ -988,15 +988,15 @@ function showSettingsPanel() {
     );
     createNumberInput(
         playbackSection,
-        "videoCacheMaxEntries",
-        "Playback Decoder Cache Cap (advanced)",
-        "Bound the per-clip video decoder pool for the active scene; least-recently-played decoders are evicted past this cap. 0 = unlimited (legacy). Try 16–32 on very long heavy scenes to curb decoder accumulation.",
+        "decodeConcurrency",
+        "Playback Decode Concurrency",
+        "Max video clips decoded at once during playback. Lower avoids contention on heavy stacked scenes.",
         {
-            min: 0,
-            max: 512,
+            min: 1,
+            max: 8,
             step: 1,
-            getter: () => this._settings.playback.videoCacheMaxEntries,
-            onChange: (value) => updateCategory("playback", "videoCacheMaxEntries", Math.round(value)),
+            getter: () => this._settings.playback.decodeConcurrency,
+            onChange: (value) => updateCategory("playback", "decodeConcurrency", Math.round(value)),
         }
     );
 
@@ -1213,6 +1213,31 @@ function showSettingsPanel() {
             e.stopPropagation();
         });
         delimiterControls.appendChild(delimiterInput);
+    }
+    {
+        const thresholdControls = createRow(
+            promptsSection,
+            "Boundary Prompt Threshold % (project-wide)",
+            "Ignore a prompt section in a render window when the selection only clips a small sliver of it at the window edge (under N% of that section's length). 0 = off. Saved into the project."
+        );
+        const thresholdInput = document.createElement("input");
+        thresholdInput.type = "number";
+        thresholdInput.min = "0";
+        thresholdInput.max = "100";
+        thresholdInput.step = "1";
+        thresholdInput.value = String(this._promptFrameThreshold ?? 0);
+        thresholdInput.style.cssText = chromeInputCss({ width: "72px", textAlign: "center" });
+        const commitThreshold = () => {
+            Promise.resolve(this._setPromptFrameThreshold(thresholdInput.value))
+                .then(() => { thresholdInput.value = String(this._promptFrameThreshold ?? 0); })
+                .catch(() => { thresholdInput.value = String(this._promptFrameThreshold ?? 0); });
+        };
+        thresholdInput.addEventListener("change", commitThreshold);
+        thresholdInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") commitThreshold();
+            e.stopPropagation();
+        });
+        thresholdControls.appendChild(thresholdInput);
     }
     // — Browser-local preferences
     createCheckbox(
