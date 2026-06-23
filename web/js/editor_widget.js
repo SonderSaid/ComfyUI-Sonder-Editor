@@ -43,6 +43,55 @@ function isSessionDiagEnabled() {
     return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
 }
 
+// Console command (`window.SonderClearDiag()`): wipe every in-memory diagnostic
+// ring / telemetry set on this page WITHOUT a reload, so the next
+// Ctrl+Alt+Shift+D bundle — and the dedup-gated playback decision logs — start
+// clean between test runs. Subsystems that own their own rings (viewport
+// surfaces, dormant controllers) self-register a reset fn in the shared
+// `window.__SONDER_DIAG_CLEARERS` set, mirroring how they share the
+// `__SONDER_CANVAS_DIAG` surface. Always exposed (harmless when diag is off).
+function getDiagClearerRegistry() {
+    if (typeof window === "undefined") return null;
+    if (!(window.__SONDER_DIAG_CLEARERS instanceof Set)) {
+        window.__SONDER_DIAG_CLEARERS = new Set();
+    }
+    return window.__SONDER_DIAG_CLEARERS;
+}
+
+function clearSessionDiagnostics() {
+    let sources = 0;
+    const surface = typeof window !== "undefined" ? window.__SONDER_CANVAS_DIAG : null;
+    if (surface && Array.isArray(surface.events)) {
+        const boot = {
+            kind: "boot",
+            t_wall: Date.now(),
+            t_mono: performance.now(),
+            build_marker: "canvas_page",
+            href: typeof location !== "undefined" ? String(location.href || "") : "",
+            cleared: true,
+        };
+        // Mutate in place so the surface.record closure keeps the same array.
+        surface.events.length = 0;
+        surface.events.push(boot);
+        surface.boot = boot;
+        sources += 1;
+    }
+    _sessionDiagInFlightMarkerId = "";
+    _sessionDiagInFlightKind = "";
+    const registry = getDiagClearerRegistry();
+    if (registry) {
+        for (const clear of registry) {
+            try { clear(); sources += 1; } catch (_) {}
+        }
+    }
+    console.info(`[Sonder Session Diag] Cleared ${sources} diagnostic source(s) without reload.`);
+    return sources;
+}
+
+if (typeof window !== "undefined") {
+    window.SonderClearDiag = clearSessionDiagnostics;
+}
+
 function _sessionDiagInit() {
     if (_sessionDiagInitialized) return window.__SONDER_CANVAS_DIAG;
     _sessionDiagInitialized = true;

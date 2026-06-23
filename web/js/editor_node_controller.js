@@ -1257,8 +1257,26 @@ export class EditorNodeController {
         this._diagEvents = [];
         this._diagBoot = null;
         this._diagHotkeyUnregister = null;
+        this._diagClearHook = () => this._clearDiagEvents();
         // Register hotkey unconditionally; handler checks flag at press time.
         this._registerDiagHotkey();
+        this._registerDiagClearHook();
+        this._diagBootIfNeeded();
+    }
+
+    _registerDiagClearHook() {
+        // Self-register into the shared window.SonderClearDiag() registry so the
+        // console command can reset this controller's diag ring without a reload.
+        if (typeof window === "undefined") return;
+        if (!(window.__SONDER_DIAG_CLEARERS instanceof Set)) {
+            window.__SONDER_DIAG_CLEARERS = new Set();
+        }
+        window.__SONDER_DIAG_CLEARERS.add(this._diagClearHook);
+    }
+
+    _clearDiagEvents() {
+        this._diagEvents.length = 0;
+        this._diagBoot = null;
         this._diagBootIfNeeded();
     }
 
@@ -1380,6 +1398,9 @@ export class EditorNodeController {
         if (this._diagHotkeyUnregister) {
             try { this._diagHotkeyUnregister(); } catch (_) {}
             this._diagHotkeyUnregister = null;
+        }
+        if (typeof window !== "undefined" && window.__SONDER_DIAG_CLEARERS instanceof Set && this._diagClearHook) {
+            window.__SONDER_DIAG_CLEARERS.delete(this._diagClearHook);
         }
         this._diagEvents.length = 0;
 
