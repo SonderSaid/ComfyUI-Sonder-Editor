@@ -1104,6 +1104,7 @@ class SonderSaveVideo:
                 "custom_audio_codec": (CUSTOM_AUDIO_CODEC_OPTIONS, {"default": "aac", "tooltip": "Custom video only. Choose none to omit connected audio."}),
                 "custom_audio_bitrate_kbps": ("INT", {"default": 192, "min": 1, "max": 10000, "tooltip": "Custom AAC audio only. Audio bitrate in kbps."}),
                 "custom_png_compression": ("INT", {"default": 0, "min": 0, "max": 9, "tooltip": "Custom PNG Sequence only. 0 is fastest/largest; 9 is smallest/slowest."}),
+                "autoplay_preview": ("BOOLEAN", {"default": False, "tooltip": "Autoplay the inline video player on this node card after a run. When off, it opens paused on the first frame. Display-only — does not affect the saved file."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -1125,6 +1126,7 @@ class SonderSaveVideo:
                     custom_audio_bitrate_kbps=192,
                     custom_png_compression=0,
                     embed_metadata=True,
+                    autoplay_preview=False,  # frontend display-only; accepted and ignored here
                     prompt=None,
                     extra_pnginfo=None,
                     unique_id=None):
@@ -1575,10 +1577,11 @@ class SonderPreviewVideo:
             },
             "optional": {
                 "audio": ("AUDIO", {"tooltip": "Optional audio to mux into the preview so playback has sound."}),
+                "autoplay_preview": ("BOOLEAN", {"default": False, "tooltip": "Autoplay the inline video player on this node card after a run. When off, it opens paused on the first frame."}),
             },
         }
 
-    def preview(self, frames, fps=24.0, audio=None):
+    def preview(self, frames, fps=24.0, audio=None, autoplay_preview=False):
         temp_dir = folder_paths.get_temp_directory()
         os.makedirs(temp_dir, exist_ok=True)
 

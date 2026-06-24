@@ -131,7 +131,7 @@ const BUTTON_STYLES = {
     },
 };
 
-function buttonStyle(variant = "muted", { padding = "6px 10px", radius = "6px", fontSize = "11px", fontWeight = "600" } = {}) {
+export function buttonStyle(variant = "muted", { padding = "6px 10px", radius = "6px", fontSize = "11px", fontWeight = "600" } = {}) {
     const palette = BUTTON_STYLES[variant] || BUTTON_STYLES.muted;
     return `
         background: ${palette.background};
@@ -269,6 +269,10 @@ export function renderDormantMediaScrubBar(mediaEl) {
     wrap.append(track, label);
 
     let dragging = false;
+    // When the user grabs the scrubber while the media is playing, pause for the
+    // duration of the drag and resume on release — otherwise active playback keeps
+    // overwriting the seeked currentTime and the scrub reads as unresponsive.
+    let resumeAfterDrag = false;
 
     const duration = () => {
         const value = Number(mediaEl?.duration);
@@ -303,11 +307,22 @@ export function renderDormantMediaScrubBar(mediaEl) {
         seekFromClientX(event.clientX);
         window.removeEventListener("mousemove", handlePointerMove);
         window.removeEventListener("mouseup", handlePointerUp);
+        if (resumeAfterDrag) {
+            resumeAfterDrag = false;
+            try {
+                const resume = mediaEl?.play?.();
+                if (resume?.catch) resume.catch(() => {});
+            } catch (_) { /* resume is best-effort */ }
+        }
     };
 
     track.addEventListener("mousedown", (event) => {
         event.preventDefault();
         dragging = true;
+        resumeAfterDrag = !!mediaEl && !mediaEl.paused;
+        if (resumeAfterDrag) {
+            try { mediaEl.pause(); } catch (_) { /* pause is best-effort */ }
+        }
         seekFromClientX(event.clientX);
         window.addEventListener("mousemove", handlePointerMove);
         window.addEventListener("mouseup", handlePointerUp);
@@ -323,6 +338,7 @@ export function renderDormantMediaScrubBar(mediaEl) {
         el: wrap,
         cleanup: () => {
             dragging = false;
+            resumeAfterDrag = false;
             window.removeEventListener("mousemove", handlePointerMove);
             window.removeEventListener("mouseup", handlePointerUp);
             for (const eventName of mediaEvents) {

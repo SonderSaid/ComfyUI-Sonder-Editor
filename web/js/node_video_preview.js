@@ -2,23 +2,42 @@
 //
 // Both nodes emit a uniform `ui.sonder_video = [{ filename, subfolder, type, fps,
 // has_audio, poster? }]` descriptor on execute. This module turns that into a single
-// `<video>` DOM widget on the node, served via ComfyUI's /view route.
+// `<video>` DOM widget on the node. The media is fetched WHOLE as a blob (via the shared
+// `loadMediaAsBlob`) rather than pointing `<video src>` at the raw /view URL — a directly
+// streamed source reports a limited seekable range in this DOM-widget context, which clamps
+// every scrub seek back to frame 0. Blob loading makes the file fully seekable, matching the
+// editor's other playback surfaces (see durable_rules > Technical Traps).
 //
 // Native `<video controls>` does not work reliably inside a ComfyUI DOM widget — the
 // browser's shadow-DOM scrubber never receives a usable drag — so we build our own
-// control bar (play/pause + scrub + mute) and REUSE the proven custom scrubber from the
-// dormant preview (`renderDormantMediaScrubBar`, which drives seeking via mousedown +
-// window mousemove/up). Defaults: autoplay muted + loop (muted is required for browser
-// autoplay; the user unmutes via the bar).
+// transport (Play/Pause + scrub + Audio toggle) that REUSES the custom scrubber
+// `renderDormantMediaScrubBar` (seeks via mousedown + window mousemove/up, and pauses
+// playback during a drag so the seek sticks). The control bar mirrors the dormant
+// preview transport's text-button style via the shared `buttonStyle`.
+//
+// Playback: the video opens PAUSED on its first frame. Clicking the video toggles
+// play/pause. Autoplay is controlled by the node's own `autoplay_preview` BOOLEAN input
+// (default off, declared in INPUT_TYPES like `embed_metadata`) — a first-class node widget
+// that is present before any run and persists per-node via the workflow's `widgets_values`.
+// The player reads that widget at mount time. Audio is muted by default (required for
+// autoplay); the user unmutes via the Audio button.
 
 import { THEME, RADIUS } from "./editor_theme.js";
-import { renderDormantMediaScrubBar } from "./editor_node_controller.js";
+import { renderDormantMediaScrubBar, buttonStyle } from "./editor_node_controller.js";
+import { loadMediaAsBlob } from "./shared_asset_gallery.js";
 
-const MIN_HEIGHT = 110;
+const MIN_HEIGHT = 128;
 const MAX_HEIGHT = 760;
 const DEFAULT_ASPECT = 16 / 9;
-// Widget height beyond the video itself: control bar (~34) + container margin/border (~12).
-const CONTROL_CHROME_PX = 46;
+// Widget height beyond the video itself: controls row + scrub row + container margin/border.
+const CONTROL_CHROME_PX = 76;
+
+// Autoplay is the node's `autoplay_preview` BOOLEAN input widget (persisted in the workflow
+// via widgets_values, per-node). Read it from the live widget; default off when absent.
+function getNodeAutoplay(node) {
+    const widget = node?.widgets?.find?.((w) => w.name === "autoplay_preview");
+    return widget ? widget.value === true : false;
+}
 
 function comfyApi() {
     return window.comfyAPI?.api?.api || null;
@@ -67,26 +86,20 @@ function sizeNodeToVideo(node) {
     }
 }
 
-function controlButton(label) {
+// Text buttons matching the dormant preview transport. Re-callable so the Autoplay
+// button can swap its variant (active/muted) when toggled.
+function styleBarButton(btn, variant = "muted", minWidth = "") {
+    btn.style.cssText = buttonStyle(variant, { padding: "5px 10px", fontSize: "10px" });
+    btn.style.flex = "0 0 auto";
+    if (minWidth) btn.style.minWidth = minWidth;
+    return btn;
+}
+
+function barButton(label, variant = "muted", minWidth = "") {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.textContent = label;
-    btn.style.cssText = `
-        flex: 0 0 auto;
-        width: 28px;
-        height: 24px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        cursor: pointer;
-        padding: 0;
-        font-size: 12px;
-        line-height: 1;
-        color: ${THEME.fg0};
-        background: ${THEME.bg2};
-        border: 1px solid ${THEME.line2};
-        border-radius: ${RADIUS.r1}px;
-    `;
+    styleBarButton(btn, variant, minWidth);
     return btn;
 }
 
@@ -108,10 +121,12 @@ function createWidget(node) {
     const video = document.createElement("video");
     video.loop = true;
     video.muted = true;
-    video.autoplay = true;
+    video.autoplay = false;
     video.playsInline = true;
-    video.preload = "metadata";
-    // No native controls — we drive playback through the custom bar below.
+    // `auto` buffers a frame so the first frame paints while paused (no autoplay).
+    video.preload = "auto";
+    // No native controls — we drive playback through the custom bar below. Clicking the
+    // video toggles play/pause.
     video.style.cssText = `
         flex: 1 1 auto;
         min-height: 0;
@@ -119,45 +134,87 @@ function createWidget(node) {
         display: block;
         background: ${THEME.bg0};
         object-fit: contain;
+        cursor: pointer;
     `;
 
-    // Custom control bar: play/pause + reused scrubber + mute toggle.
-    const bar = document.createElement("div");
-    bar.style.cssText = `
+    // Control bar mirrors the dormant preview transport: a controls row (Play/Pause,
+    // Audio, Autoplay) over a scrub row.
+    const controlsRow = document.createElement("div");
+    controlsRow.style.cssText = `
         flex: 0 0 auto;
         display: flex;
         align-items: center;
         gap: 6px;
+        padding: 4px 6px 0;
+        flex-wrap: wrap;
+    `;
+    const scrubRow = document.createElement("div");
+    scrubRow.style.cssText = `
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
         padding: 4px 6px;
     `;
-    const playBtn = controlButton("▶"); // ▶
-    const muteBtn = controlButton("🔇"); // 🔇
+    const playBtn = barButton("Play", "subtle", "48px");
+    const audioBtn = barButton("Audio On", "muted", "64px");
     const scrub = renderDormantMediaScrubBar(video);
     scrub.el.style.flex = "1 1 auto";
     scrub.el.style.minWidth = "0";
 
-    playBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
+    // Whether the current source carries an audio track — set from the descriptor on mount.
+    let hasAudio = false;
+
+    const togglePlay = () => {
         if (video.paused) {
-            video.play?.().catch(() => {});
+            video.play?.().catch(() => { /* play can be deferred/blocked by the browser */ });
         } else {
             video.pause?.();
         }
-    });
-    muteBtn.addEventListener("click", (e) => {
+    };
+    const syncPlay = () => { playBtn.textContent = video.paused ? "Play" : "Pause"; };
+    const syncMute = () => {
+        if (!hasAudio) {
+            audioBtn.textContent = "No audio";
+            audioBtn.disabled = true;
+            audioBtn.style.opacity = "0.55";
+            audioBtn.style.cursor = "default";
+            return;
+        }
+        audioBtn.disabled = false;
+        audioBtn.style.opacity = "1";
+        audioBtn.style.cursor = "pointer";
+        audioBtn.textContent = video.muted ? "Muted" : "Audio On";
+    };
+
+    playBtn.addEventListener("click", (e) => { e.stopPropagation(); togglePlay(); });
+    video.addEventListener("click", (e) => { e.stopPropagation(); togglePlay(); });
+    audioBtn.addEventListener("click", (e) => {
         e.stopPropagation();
+        if (!hasAudio) return;
         video.muted = !video.muted;
     });
-    const syncPlay = () => { playBtn.textContent = video.paused ? "▶" : "⏸"; }; // ▶ / ⏸
-    const syncMute = () => { muteBtn.textContent = video.muted ? "🔇" : "🔊"; }; // 🔇 / 🔊
+    // Apply the per-node autoplay choice once the media is actually decodable. Blob loading
+    // is async, so we can't decide this synchronously at mount time — `loadeddata` (first
+    // frame available) is the reliable moment.
+    const applyAutoplay = () => {
+        if (getNodeAutoplay(node)) {
+            const p = video.play?.();
+            if (p?.catch) p.catch(() => { /* play can be deferred/blocked by the browser */ });
+        } else {
+            try { video.pause?.(); } catch (_) { /* ignore */ }
+        }
+    };
+
     video.addEventListener("play", syncPlay);
     video.addEventListener("pause", syncPlay);
     video.addEventListener("volumechange", syncMute);
+    video.addEventListener("loadeddata", applyAutoplay);
     syncPlay();
     syncMute();
 
-    bar.append(playBtn, scrub.el, muteBtn);
-    container.append(video, bar);
+    controlsRow.append(playBtn, audioBtn);
+    scrubRow.append(scrub.el);
+    container.append(video, controlsRow, scrubRow);
 
     // Keep clicks/drags on the player from being stolen by LiteGraph's canvas pointer
     // handling (which otherwise moves the node and breaks the controls).
@@ -175,6 +232,8 @@ function createWidget(node) {
     widget.computeSize = (width) => [width, widgetHeightForWidth(node, width)];
     widget._sonderVideoEl = video;
     widget._sonderScrubCleanup = scrub.cleanup;
+    widget._sonderSetHasAudio = (value) => { hasAudio = !!value; syncMute(); };
+    widget._sonderApplyAutoplay = applyAutoplay;
     node._sonderVideoWidget = widget;
 
     // Lock the aspect once the real dimensions are known, then grow the node to fit.
@@ -208,21 +267,33 @@ export function mountNodeVideoPreview(node, descriptor) {
     const video = widget._sonderVideoEl;
     if (!video) return;
 
+    // Reflect this run's audio availability on the bar.
+    widget._sonderSetHasAudio?.(descriptor.has_audio === true);
+
     if (descriptor.poster?.filename) {
         video.poster = viewUrl(descriptor.poster);
     } else {
         video.removeAttribute("poster");
     }
 
-    // Autoplay requires muted; keep loop on. The user toggles audio via the mute button.
+    // Muted is required for autoplay and is the default regardless; keep loop on. The user
+    // toggles audio via the Audio button.
     video.muted = true;
     video.loop = true;
-    if (video.src !== src) {
-        video.src = src;
+
+    // Load the WHOLE file as a blob (like every other editor playback surface) so the media
+    // is fully seekable — a directly-streamed /view src reports a limited/empty seekable
+    // range in this DOM-widget context, which clamps every scrub seek back to frame 0.
+    // `_sonderLoadedUrl` tracks the source /view URL (not the resulting blob: URL, which
+    // never equals `src`) so re-runs with the same file don't refetch.
+    if (widget._sonderLoadedUrl !== src) {
+        try { widget._sonderMediaCleanup?.(); } catch (_) { /* prior load cleanup is best-effort */ }
+        const handle = loadMediaAsBlob(src, video, { mode: "blob" });
+        widget._sonderMediaCleanup = handle?.cleanup || null;
+        widget._sonderLoadedUrl = src;
+        // Autoplay is applied on `loadeddata` once the blob is decodable (see createWidget).
     } else {
         try { video.currentTime = 0; } catch (_) { /* ignore */ }
+        widget._sonderApplyAutoplay?.();
     }
-
-    const playPromise = video.play?.();
-    if (playPromise?.catch) playPromise.catch(() => { /* autoplay can be deferred by the browser */ });
 }
