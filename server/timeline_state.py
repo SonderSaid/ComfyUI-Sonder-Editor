@@ -385,7 +385,7 @@ class Scene:
     asset_ids: list = field(default_factory=list)        # references to project-level Assets used
     is_bridge: bool = False                 # True if this is an auto-generated bridge between scenes
     video_lane_count: int = 1               # number of video lanes (multi-layer)
-    motion_driver_lane_count: int = 1       # single motion-driver lane in Phase 4.3
+    motion_driver_lane_count: int = 1       # number of driver lanes
     audio_lane_count: int = 1               # number of audio lanes (multi-layer)
     video_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     motion_driver_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
@@ -420,13 +420,13 @@ class Scene:
         """Deterministic hash of all state that affects rendered output."""
         import hashlib
         import json
+        render_clips = [c for c in self.clips if getattr(c, "role", "render") in ("", "render")]
         data = {
             "clips": [(c.source_path, c.timeline_start_frame, c.timeline_end_frame,
                         c.source_in_frame, c.opacity, c.track_index,
-                        getattr(c, "role", "render"), getattr(c, "strength", 1.0),
-                        getattr(c, "muted", False),
+                        getattr(c, "role", "render"), getattr(c, "muted", False),
                         getattr(c, "fit_mode", "pad_edge"), getattr(c, "crop_position", "center"))
-                       for c in self.clips],
+                       for c in render_clips],
             "guides": [(g.frame_index, g.asset_id, g.source,
                         getattr(g, "strength", 1.0), getattr(g, "muted", False),
                         getattr(g, "fit_mode", "pad_edge"), getattr(g, "crop_position", "center"))
@@ -435,7 +435,6 @@ class Scene:
                         a.source_in_frame, a.volume, a.muted, a.lane_index)
                        for a in self.audio_tracks],
             "hidden_video": [i for i, c in enumerate(self.video_lane_configs) if c.hidden],
-            "hidden_motion_driver": [i for i, c in enumerate(self.motion_driver_lane_configs) if c.hidden],
             "hidden_audio": [i for i, c in enumerate(self.audio_lane_configs) if c.hidden],
             "hidden_guides": bool(getattr(self.guide_track_config, "hidden", False)),
             "sel": (selection_start, selection_end),
@@ -659,7 +658,7 @@ class ClipReference:
     opacity: float = 1.0
     track_index: int = 0
     role: str = "render"                    # render | motion_driver
-    strength: float = 1.0                   # motion-driver conditioning strength
+    strength: float = 1.0                   # driver conditioning strength
     muted: bool = False                     # hidden from viewport/render/motion output
     fit_mode: str = "pad_edge"              # fit | pad_edge | cover | stretch (default IS the fixed code constant)
     crop_position: str = "center"          # center | top | bottom | left | right (only meaningful for cover)
@@ -809,6 +808,9 @@ class GenerationJob:
     mask_pre_offset: int = 0
     mask_post_offset: int = 0
     guide_frame_snapshots: list = field(default_factory=list)
+    driver_clip_snapshots: list = field(default_factory=list)
+    driver_lane_count: int = 1
+    driver_lane_configs: list = field(default_factory=list)
     prompt_sections: list = field(default_factory=list)
     scene_width: int = 0
     scene_height: int = 0
@@ -846,6 +848,9 @@ class GenerationJob:
             "mask_pre_offset": self.mask_pre_offset,
             "mask_post_offset": self.mask_post_offset,
             "guide_frame_snapshots": list(self.guide_frame_snapshots),
+            "driver_clip_snapshots": list(self.driver_clip_snapshots),
+            "driver_lane_count": self.driver_lane_count,
+            "driver_lane_configs": list(self.driver_lane_configs),
             "prompt_sections": list(self.prompt_sections),
             "scene_width": self.scene_width,
             "scene_height": self.scene_height,
@@ -890,6 +895,9 @@ class GenerationJob:
             mask_pre_offset=data.get("mask_pre_offset", 0),
             mask_post_offset=data.get("mask_post_offset", 0),
             guide_frame_snapshots=list(data.get("guide_frame_snapshots", []) or []),
+            driver_clip_snapshots=list(data.get("driver_clip_snapshots", []) or []),
+            driver_lane_count=max(1, int(data.get("driver_lane_count", 1) or 1)),
+            driver_lane_configs=list(data.get("driver_lane_configs", []) or []),
             prompt_sections=list(data.get("prompt_sections", []) or []),
             scene_width=data.get("scene_width", 0),
             scene_height=data.get("scene_height", 0),

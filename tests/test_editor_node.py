@@ -146,11 +146,9 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         take_placement_muted=True,
     )
 
-    assert result[6] == 0
-    assert result[7] == 1.0
-    assert result[9] == 14
-    assert result[14] == pytest.approx(1 / 24.0)
-    assert result[15] == pytest.approx(11 / 24.0)
+    assert result[6] == 14
+    assert result[11] == pytest.approx(1 / 24.0)
+    assert result[12] == pytest.approx(11 / 24.0)
     assert project._execution_context["pre_context_frames"] == 3
     assert project._execution_context["post_context_frames"] == 4
     assert project._execution_context["mask_pre_offset"] == 2
@@ -232,15 +230,15 @@ def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, mo
     )
     result = _execute_constraint_test(editor_node, project, monkeypatch)
 
-    audio = result[13]
-    assert result[9] == 169
+    audio = result[10]
+    assert result[6] == 169
     assert tuple(result[1].shape) == (169, 4, 4, 3)
     # Context-first alignment: requested pre=48 sits between LTX boundaries 41 and 49;
     # actual_pre expands by 1 to 49 so the in-point (mask_start) lands on grid without
     # the snap helper extending the mask into already-rendered pre-context.
     # mask_end = 49 + 119 + 0 + padding(1) = 169 is already on the 8n+1 grid.
-    assert result[14] == pytest.approx(49 / 24.0)
-    assert result[15] == pytest.approx(169 / 24.0)
+    assert result[11] == pytest.approx(49 / 24.0)
+    assert result[12] == pytest.approx(169 / 24.0)
     assert audio["waveform"].shape[-1] >= int((169 / 24.0) * audio["sample_rate"])
     assert project._execution_context["source_frame_count"] == 168
     assert project._execution_context["frame_count"] == 169
@@ -316,7 +314,7 @@ def test_queue_job_frame_constraint_overrides_project(tmp_path, monkeypatch):
     )
 
     # 167 source frames -> next 4n is 168 (job constraint wins over project's 8n+1=169)
-    assert result[9] == 168
+    assert result[6] == 168
     assert tuple(result[1].shape) == (168, 4, 4, 3)
     assert project._execution_context["source_frame_count"] == 167
     assert project._execution_context["frame_count"] == 168
@@ -330,7 +328,7 @@ def test_missing_frame_constraint_no_padding(tmp_path, monkeypatch):
     project = _FrameConstraintProject(tmp_path, template_id="free", frame_constraint=None)
     result = _execute_constraint_test(editor_node, project, monkeypatch)
 
-    assert result[9] == 167
+    assert result[6] == 167
     assert tuple(result[1].shape) == (167, 4, 4, 3)
     assert project._execution_context["source_frame_count"] == 167
     assert project._execution_context["frame_count"] == 167
@@ -350,7 +348,7 @@ def test_custom_template_constraint_pads_correctly(tmp_path, monkeypatch):
     # Context-first alignment with step=10/offset=3: desired mask_start = 48,
     # next grid value is 53, so actual_pre expands by 5 to 53.
     # source = 53+119+0 = 172 -> next 10n+3 is 173 -> padding = 1 (was 6 pre-expansion).
-    assert result[9] == 173
+    assert result[6] == 173
     assert tuple(result[1].shape) == (173, 4, 4, 3)
     assert project._execution_context["actual_pre_context_frames"] == 53
     assert project._execution_context["frame_count"] == 173
@@ -423,8 +421,8 @@ def test_execute_expands_pre_context_to_align_mask_with_ltx_boundary(tmp_path, m
     # actual_pre=49 (= {0, 8, 16, 24, 32, 40, 48, 49}), next >= 10 is 16.
     # mask_start = 49 - 16 = 33; source = 49+119+0 = 168; target = 169; padding = 1;
     # mask_end = 49+119+0+1 = 169 (on grid). No snap-helper fallback fires.
-    assert result[14] == pytest.approx(33 / 24.0)
-    assert result[15] == pytest.approx(169 / 24.0)
+    assert result[11] == pytest.approx(33 / 24.0)
+    assert result[12] == pytest.approx(169 / 24.0)
     assert project._execution_context["actual_pre_context_frames"] == 49
     assert project._execution_context["mask_pre_offset"] == 16
     assert project._execution_context["frame_count_padding"] == 1
@@ -461,8 +459,8 @@ def test_execute_expands_both_sides_for_ltx_alignment(tmp_path, monkeypatch):
         mask_post_offset=0,
     )
 
-    assert result[14] == pytest.approx(9 / 24.0)
-    assert result[15] == pytest.approx(113 / 24.0)
+    assert result[11] == pytest.approx(9 / 24.0)
+    assert result[12] == pytest.approx(113 / 24.0)
     assert project._execution_context["actual_pre_context_frames"] == 9
     assert project._execution_context["actual_post_context_frames"] == 8
     assert project._execution_context["frame_count"] == 121
@@ -503,7 +501,7 @@ def test_execute_falls_back_to_floor_snap_at_scene_start(tmp_path, monkeypatch):
 
     # actual_pre clamped to 3 (scene start); no expansion possible; snap floor 3 -> 1.
     assert project._execution_context["actual_pre_context_frames"] == 3
-    assert result[14] == pytest.approx(1 / 24.0)
+    assert result[11] == pytest.approx(1 / 24.0)
     assert project._execution_context["mask_start_frame"] == 1
 
 
@@ -538,7 +536,7 @@ def test_execute_snaps_mask_offsets_independently_of_context_frames(tmp_path, mo
         mask_post_offset=12,
     )
 
-    assert result[9] == 169
+    assert result[6] == 169
     assert project._execution_context["actual_pre_context_frames"] == 25
     assert project._execution_context["actual_post_context_frames"] == 24
     assert project._execution_context["mask_pre_offset"] == 16
@@ -659,7 +657,7 @@ def test_execute_first_batch_chunk_with_offset_grown_gen_renders_clean(tmp_path,
     # actual_pre clamps to 0 (no frames before scene start); gen=73 is already in G,
     # so total=73 with NO padding (contrast: un-grown gen=72 would round up to 73 with
     # padding=1, a repeated tail frame).
-    assert result[9] == 73
+    assert result[6] == 73
     assert project._execution_context["actual_pre_context_frames"] == 0
     assert project._execution_context["frame_count"] == 73
     assert project._execution_context["frame_count_padding"] == 0
@@ -694,7 +692,7 @@ def test_execute_first_batch_chunk_without_offset_grown_gen_needs_padding(tmp_pa
         mask_post_offset=0,
     )
 
-    assert result[9] == 73
+    assert result[6] == 73
     assert project._execution_context["frame_count_padding"] == 1
 
 
@@ -704,8 +702,8 @@ def test_execute_mask_times_unsnapped_without_frame_constraint(tmp_path, monkeyp
     result = _execute_constraint_test(editor_node, project, monkeypatch)
     # No constraint -> snap is a no-op; raw values pass through.
     # source = 167 (no padding); mask_start_pixel = 48, mask_end_pixel = 167.
-    assert result[14] == pytest.approx(48 / 24.0)
-    assert result[15] == pytest.approx(167 / 24.0)
+    assert result[11] == pytest.approx(48 / 24.0)
+    assert result[12] == pytest.approx(167 / 24.0)
     assert project._execution_context["mask_start_frame"] == 48
     assert project._execution_context["mask_end_frame"] == 167
 
@@ -773,34 +771,30 @@ def test_empty_execute_result_matches_output_contract(tmp_path, monkeypatch):
 
     expected_names = (
         "project", "rendered_frames", "guide_images", "guide_idx", "guide_strengths",
-        "motion_driver_images", "motion_driver_idx", "motion_driver_strength",
         "prompt", "frame_count", "fps", "width", "height", "audio",
         "mask_start_time", "mask_end_time",
     )
     assert editor_node.SonderEditor.RETURN_NAMES == expected_names
-    assert len(editor_node.SonderEditor.RETURN_TYPES) == 16
-    assert len(editor_node.SonderEditor.OUTPUT_TOOLTIPS) == 16
+    assert len(editor_node.SonderEditor.RETURN_TYPES) == 13
+    assert len(editor_node.SonderEditor.OUTPUT_TOOLTIPS) == 13
 
     project = timeline_state.TimelineProject(project_dir=str(tmp_path), resolution=(8, 6))
     result = editor_node.SonderEditor._empty_execute_result(project, 24.0, 8, 6)
 
-    assert len(result) == 16
+    assert len(result) == 13
     assert result[0] is project
     assert tuple(result[1].shape) == (1, 6, 8, 3)
     assert tuple(result[2].shape) == (1, 6, 8, 3)
     assert result[3] == ""
     assert result[4] == ""
-    assert tuple(result[5].shape) == (1, 6, 8, 3)
+    assert result[5] == ""
     assert result[6] == 0
-    assert result[7] == 1.0
-    assert result[8] == ""
-    assert result[9] == 0
-    assert result[10] == 24.0
-    assert result[11] == 8
-    assert result[12] == 6
-    assert "waveform" in result[13]
-    assert result[14] == 0.0
-    assert result[15] == 0.0
+    assert result[7] == 24.0
+    assert result[8] == 8
+    assert result[9] == 6
+    assert "waveform" in result[10]
+    assert result[11] == 0.0
+    assert result[12] == 0.0
 
 
 def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
@@ -853,9 +847,7 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
 
     assert result[3] == "1"
     assert result[4] == "0.2500"
-    assert tuple(result[5].shape) == (1, 512, 768, 3)
-    assert result[6] == 0
-    assert result[7] == pytest.approx(1.0)
+    assert tuple(result[2].shape) == (1, 512, 768, 3)
 
     scene.guide_track_config = timeline_state.LaneConfig(hidden=True)
     hidden_track_result = editor_node.SonderEditor().execute(
@@ -871,7 +863,7 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
 
     assert hidden_track_result[3] == ""
     assert hidden_track_result[4] == ""
-    assert tuple(hidden_track_result[5].shape) == (1, 512, 768, 3)
+    assert tuple(hidden_track_result[2].shape) == (1, 512, 768, 3)
 
     scene.guide_track_config = timeline_state.LaneConfig()
     scene.guide_frames = []
@@ -888,9 +880,7 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
 
     assert empty_result[3] == ""
     assert empty_result[4] == ""
-    assert tuple(empty_result[5].shape) == (1, 512, 768, 3)
-    assert empty_result[6] == 0
-    assert empty_result[7] == pytest.approx(1.0)
+    assert tuple(empty_result[2].shape) == (1, 512, 768, 3)
 
 
 def test_guide_image_output_letterboxes_to_project_canvas(tmp_path, monkeypatch):
@@ -915,183 +905,6 @@ def test_guide_image_output_letterboxes_to_project_canvas(tmp_path, monkeypatch)
     assert np.allclose(np_tensor[:, 0, :], 0.0)
     assert np.allclose(np_tensor[:, 3, :], 0.0)
     assert np.allclose(np_tensor[:, 1:3, :], 1.0)
-
-
-def test_motion_driver_outputs_and_hidden_lane_fallback(tmp_path, monkeypatch):
-    editor_node = _import_editor_node(tmp_path, monkeypatch)
-    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
-    cv2 = importlib.import_module("cv2")
-
-    project_dir = tmp_path / "project"
-    (project_dir / "media").mkdir(parents=True)
-    (project_dir / "media" / "driver.mp4").write_bytes(b"driver")
-    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Motion")
-    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=12)
-    scene.motion_driver_lane_configs = [timeline_state.LaneConfig()]
-    scene.clips = [
-        timeline_state.ClipReference(
-            clip_id="driver-1",
-            source_path=os.path.join("media", "driver.mp4"),
-            timeline_start_frame=3,
-            timeline_end_frame=8,
-            source_in_frame=10,
-            track_index=0,
-            role="motion_driver",
-            strength=0.42,
-        ),
-    ]
-
-    class FakeCapture:
-        def __init__(self, path):
-            self.pos = 0
-            self.opened = True
-            self.released = False
-
-        def isOpened(self):
-            return self.opened
-
-        def set(self, prop, value):
-            if prop == cv2.CAP_PROP_POS_FRAMES:
-                self.pos = int(value)
-
-        def read(self):
-            import numpy as np
-            frame = np.full((2, 2, 3), self.pos, dtype=np.uint8)
-            return True, frame
-
-        def release(self):
-            self.released = True
-
-    monkeypatch.setattr(editor_node.cv2, "VideoCapture", FakeCapture)
-
-    tensor, frame_idx, strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
-        project, scene, render_start=5, render_end=9, proj_w=6, proj_h=4
-    )
-
-    assert tuple(tensor.shape) == (3, 4, 6, 3)
-    assert frame_idx == 0
-    assert strength == pytest.approx(0.42)
-    assert float(tensor[0].max()) > 0
-
-    scene.motion_driver_lane_configs[0].hidden = True
-    hidden_tensor, hidden_idx, hidden_strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
-        project, scene, render_start=5, render_end=9, proj_w=6, proj_h=4
-    )
-
-    assert tuple(hidden_tensor.shape) == (1, 4, 6, 3)
-    assert hidden_idx == 0
-    assert hidden_strength == pytest.approx(1.0)
-    assert float(hidden_tensor.max()) == 0.0
-
-
-def test_motion_driver_precedence_and_unopenable_fallback(tmp_path, monkeypatch, caplog):
-    editor_node = _import_editor_node(tmp_path, monkeypatch)
-    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
-
-    project_dir = tmp_path / "project"
-    (project_dir / "media").mkdir(parents=True)
-    (project_dir / "media" / "driver-a.mp4").write_bytes(b"a")
-    (project_dir / "media" / "driver-b.mp4").write_bytes(b"b")
-    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Motion")
-    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=12)
-    scene.clips = [
-        timeline_state.ClipReference(
-            clip_id="driver-b",
-            source_path=os.path.join("media", "driver-b.mp4"),
-            timeline_start_frame=2,
-            timeline_end_frame=7,
-            track_index=1,
-            role="motion_driver",
-            strength=0.9,
-        ),
-        timeline_state.ClipReference(
-            clip_id="driver-a",
-            source_path=os.path.join("media", "driver-a.mp4"),
-            timeline_start_frame=4,
-            timeline_end_frame=8,
-            track_index=0,
-            role="motion_driver",
-            strength=0.2,
-        ),
-    ]
-
-    class UnopenableCapture:
-        def __init__(self, path):
-            self.path = path
-
-        def isOpened(self):
-            return False
-
-        def release(self):
-            pass
-
-    monkeypatch.setattr(editor_node.cv2, "VideoCapture", UnopenableCapture)
-
-    tensor, frame_idx, strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
-        project, scene, render_start=4, render_end=8, proj_w=6, proj_h=4
-    )
-
-    assert tuple(tensor.shape) == (1, 4, 6, 3)
-    assert frame_idx == 0
-    assert strength == pytest.approx(1.0)
-    assert "Multiple motion-driver clips overlap" in caplog.text
-    assert "Cannot open motion-driver video" in caplog.text
-
-
-def test_motion_driver_read_gaps_are_black_padded(tmp_path, monkeypatch, caplog):
-    editor_node = _import_editor_node(tmp_path, monkeypatch)
-    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
-    np = importlib.import_module("numpy")
-
-    project_dir = tmp_path / "project"
-    (project_dir / "media").mkdir(parents=True)
-    (project_dir / "media" / "driver.mp4").write_bytes(b"driver")
-    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Motion")
-    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=12)
-    scene.clips = [
-        timeline_state.ClipReference(
-            clip_id="driver-1",
-            source_path=os.path.join("media", "driver.mp4"),
-            timeline_start_frame=5,
-            timeline_end_frame=8,
-            source_in_frame=5,
-            track_index=0,
-            role="motion_driver",
-            strength=0.5,
-        ),
-    ]
-
-    class GappedCapture:
-        def __init__(self, path):
-            self.pos = 0
-
-        def isOpened(self):
-            return True
-
-        def set(self, prop, value):
-            self.pos = int(value)
-
-        def read(self):
-            if self.pos == 6:
-                return False, None
-            return True, np.full((2, 2, 3), self.pos, dtype=np.uint8)
-
-        def release(self):
-            pass
-
-    monkeypatch.setattr(editor_node.cv2, "VideoCapture", GappedCapture)
-
-    tensor, frame_idx, strength = editor_node.SonderEditor()._gather_motion_driver_outputs(
-        project, scene, render_start=5, render_end=8, proj_w=6, proj_h=4
-    )
-
-    assert tuple(tensor.shape) == (3, 4, 6, 3)
-    assert frame_idx == 0
-    assert strength == pytest.approx(0.5)
-    assert float(tensor[0].max()) > 0.0
-    assert float(tensor[1].max()) == 0.0
-    assert float(tensor[2].max()) > 0.0
-    assert "padding unreadable frames with black" in caplog.text
 
 
 def test_render_scene_frames_excludes_motion_driver_clips(tmp_path, monkeypatch):
@@ -1306,10 +1119,10 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
     assert queue_job.status == "pending"
     # Queued snapshot 10-30 with pre=4/post=6 → gen window [6, 36) = 30 frames,
     # overriding the live 2-8 selection passed to execute(); mask spans 4/24 → 24/24.
-    assert result[8] == "queued prompt"
-    assert result[9] == 30
-    assert result[14] == pytest.approx(4 / 24.0)
-    assert result[15] == pytest.approx(24 / 24.0)
+    assert result[5] == "queued prompt"
+    assert result[6] == 30
+    assert result[11] == pytest.approx(4 / 24.0)
+    assert result[12] == pytest.approx(24 / 24.0)
     assert project._execution_context["queue_job_id"] == ""
     # Snapshot reference for read-only consumers (prompt relay bridge) IS set on peek
     assert project._execution_context["queue_job_ref_id"] == "job-1"
@@ -1429,13 +1242,13 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     assert project.generation_queue[0].status == "running"
     assert result[3] == "14"
     assert result[4] == "1.0000"
-    assert result[8] == "queued prompt"
-    assert result[9] == 30
-    assert result[10] == 30.0
-    assert result[11] == 8
-    assert result[12] == 6
-    assert result[14] == pytest.approx(4 / 30.0)
-    assert result[15] == pytest.approx(24 / 30.0)
+    assert result[5] == "queued prompt"
+    assert result[6] == 30
+    assert result[7] == 30.0
+    assert result[8] == 8
+    assert result[9] == 6
+    assert result[11] == pytest.approx(4 / 30.0)
+    assert result[12] == pytest.approx(24 / 30.0)
     assert project._execution_context["queue_job_id"] == "job-1"
     # Consume also carries the read-only snapshot reference
     assert project._execution_context["queue_job_ref_id"] == "job-1"
@@ -1535,8 +1348,8 @@ def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
     )
 
     assert render_ranges == [(24, 48)]
-    assert result[8] == "queued prompt"
-    assert result[9] == 24
+    assert result[5] == "queued prompt"
+    assert result[6] == 24
     assert project._execution_context["queue_job_id"] == "job-1"
 
 
@@ -1628,8 +1441,8 @@ def test_unmarked_save_with_active_queue_peeks_without_completion(tmp_path, monk
     assert queue_job.status == queue_status
     assert save_calls == []
     assert render_ranges == [(10, 30)]
-    assert result[8] == "queued prompt"
-    assert result[9] == 20
+    assert result[5] == "queued prompt"
+    assert result[6] == 20
     assert project._execution_context["selection_start"] == 10
     assert project._execution_context["selection_end"] == 30
     assert project._execution_context["queue_job_id"] == ""
@@ -1727,8 +1540,8 @@ def test_render_queue_inactive_ignores_terminal_save_queue(tmp_path, monkeypatch
     assert queue_job.status == "pending"
     assert save_calls == []
     assert render_ranges == [(2, 8)]
-    assert result[8] == "live:2-8"
-    assert result[9] == 6
+    assert result[5] == "live:2-8"
+    assert result[6] == 6
     assert project._execution_context["queue_job_id"] == ""
 
 
@@ -1874,8 +1687,8 @@ def test_no_active_queue_runs_full_scene(tmp_path, monkeypatch):
     )
 
     assert render_ranges == [(0, 18)]
-    assert result[8] == "live:0-18"
-    assert result[9] == 18
+    assert result[5] == "live:0-18"
+    assert result[6] == 18
 
 
 def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
@@ -1962,7 +1775,7 @@ def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
 
     assert save_calls == ["running"]
     assert queue_job.status == "running"
-    assert result[8] == "queued prompt"
+    assert result[5] == "queued prompt"
     assert project._execution_context["queue_job_id"] == "job-1"
 
 
@@ -2428,8 +2241,8 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
     )
     second_job_id = project._execution_context["queue_job_id"]
 
-    assert first_result[8] == "queued prompt"
-    assert second_result[8] == "queued prompt"
+    assert first_result[5] == "queued prompt"
+    assert second_result[5] == "queued prompt"
     assert first_job_id == "job-1"
     assert second_job_id == "job-1"
     assert queue_job.status == "running"

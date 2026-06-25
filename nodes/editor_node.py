@@ -17,7 +17,7 @@ import folder_paths
 
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
-from ..server.media_helpers import decode_audio_samples, decode_video_frame, decode_video_range, fit_frame_to_canvas
+from ..server.media_helpers import decode_audio_samples, decode_video_frame, fit_frame_to_canvas
 from ..server.timeline_renderer import render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
@@ -70,11 +70,10 @@ class SonderEditor:
     """
 
     CATEGORY = "Sonder"
-    RETURN_TYPES = ("SONDER_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING", "IMAGE", "INT", "FLOAT",
+    RETURN_TYPES = ("SONDER_PROJECT", "IMAGE", "IMAGE", "STRING", "STRING",
                     "STRING", "INT", "FLOAT", "INT", "INT", "AUDIO", "FLOAT", "FLOAT")
     RETURN_NAMES = (
         "project", "rendered_frames", "guide_images", "guide_idx", "guide_strengths",
-        "motion_driver_images", "motion_driver_idx", "motion_driver_strength",
         "prompt", "frame_count", "fps", "width", "height", "audio",
         "mask_start_time", "mask_end_time",
     )
@@ -84,9 +83,6 @@ class SonderEditor:
         "Guide frame images as an IMAGE batch tensor. Connect to LTX guiders.",
         "Comma-separated frame indices for each guide image (e.g., '0,96').",
         "Comma-separated guide strengths aligned with guide_idx.",
-        "Motion-driver video frames as an IMAGE batch tensor.",
-        "Local output frame where the motion driver begins.",
-        "Motion-driver conditioning strength.",
         "The prompt text for the selected timeline section.",
         "Number of frames in the selected section.",
         "Project FPS.",
@@ -192,9 +188,6 @@ class SonderEditor:
             empty_image,
             "",
             "",
-            empty_image,
-            0,
-            1.0,
             "",
             0,
             proj_fps,
@@ -764,10 +757,6 @@ class SonderEditor:
                 time.perf_counter() - render_started_at,
             )
 
-            motion_driver_images, motion_driver_frame_index, motion_driver_strength = self._gather_motion_driver_outputs(
-                proj, scene, render_start, render_end, proj_w, proj_h
-            )
-
             # --- Gather guide frames within render range ---
             guide_images = []
             guide_indices = []
@@ -871,6 +860,7 @@ class SonderEditor:
                 "mask_start_frame": mask_start_pixel,
                 "mask_end_frame": mask_end_pixel,
                 "template_id": template_id,
+                "frame_constraint": frame_constraint,
                 "source_frame_count": source_frame_count,
                 "frame_count": frame_count,
                 "frame_count_padding": frame_count_padding,
@@ -900,9 +890,6 @@ class SonderEditor:
                 guide_tensor,
                 indices_str,
                 strengths_str,
-                motion_driver_images,
-                motion_driver_frame_index,
-                motion_driver_strength,
                 prompt_text,
                 frame_count,
                 proj_fps,
@@ -922,134 +909,6 @@ class SonderEditor:
             if proj is not None and queue_job is not None and queue_job_consumed:
                 self._mark_queue_job_failed(proj, queue_job, str(e))
             raise
-
-    @staticmethod
-    def _empty_motion_driver_outputs(proj_w: int, proj_h: int):
-        return (
-            torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32),
-            0,
-            1.0,
-        )
-
-    def _gather_motion_driver_outputs(
-        self,
-        proj: TimelineProject,
-        scene: Scene,
-        render_start: int,
-        render_end: int,
-        proj_w: int,
-        proj_h: int,
-    ):
-        hidden_driver_lanes = {
-            i for i, cfg in enumerate(getattr(scene, "motion_driver_lane_configs", []))
-            if getattr(cfg, "hidden", False)
-        }
-        driver_clips = [
-            c for c in getattr(scene, "clips", [])
-            if getattr(c, "role", "render") == "motion_driver"
-            and not getattr(c, "muted", False)
-            and getattr(c, "track_index", 0) not in hidden_driver_lanes
-            and c.timeline_start_frame < render_end
-            and c.timeline_end_frame > render_start
-        ]
-        if not driver_clips:
-            return self._empty_motion_driver_outputs(proj_w, proj_h)
-
-        driver_clips.sort(key=lambda c: (getattr(c, "track_index", 0), c.timeline_start_frame))
-        clip = driver_clips[0]
-        if len(driver_clips) > 1:
-            ignored = [
-                getattr(c, "clip_id", "") or f"{c.source_path}:{c.timeline_start_frame}"
-                for c in driver_clips[1:]
-            ]
-            logger.warning(
-                "Multiple motion-driver clips overlap %d-%d; using %s and ignoring %s",
-                render_start,
-                render_end,
-                getattr(clip, "clip_id", "") or clip.source_path,
-                ", ".join(ignored),
-            )
-
-        overlap_start = max(clip.timeline_start_frame, render_start)
-        overlap_end = min(clip.timeline_end_frame, render_end)
-        overlap_len = max(0, overlap_end - overlap_start)
-        if overlap_len <= 0:
-            return self._empty_motion_driver_outputs(proj_w, proj_h)
-
-        source_start = (getattr(clip, "source_in_frame", 0) or 0) + (overlap_start - clip.timeline_start_frame)
-        source_path = clip.source_path
-        abs_path = source_path
-        if not os.path.isfile(abs_path):
-            abs_path = os.path.join(proj.project_dir, source_path)
-
-        black_rgb = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
-        try:
-            decoded = decode_video_range(abs_path, source_start, source_start + overlap_len)
-            frames = []
-            warned_read_failure = False
-            for _offset in range(overlap_len):
-                try:
-                    frame_rgb = next(decoded)
-                except StopIteration:
-                    if not warned_read_failure:
-                        logger.warning(
-                            "Failed to read all motion-driver frames from %s; padding unreadable frames with black",
-                            abs_path,
-                        )
-                        warned_read_failure = True
-                    frames.append(black_rgb.copy())
-                    continue
-                placed, _bounds = fit_frame_to_canvas(
-                    frame_rgb, proj_w, proj_h,
-                    mode=getattr(clip, "fit_mode", "pad_edge"),
-                    crop_position=getattr(clip, "crop_position", "center"),
-                )
-                frames.append(placed)
-            tensor = torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
-        except Exception as ffmpeg_error:
-            logger.warning(
-                "ffmpeg motion-driver decode failed for %s; falling back to OpenCV: %s",
-                abs_path,
-                ffmpeg_error,
-            )
-            cap = cv2.VideoCapture(abs_path)
-            try:
-                if not cap.isOpened():
-                    logger.warning("Cannot open motion-driver video: %s", abs_path)
-                    return self._empty_motion_driver_outputs(proj_w, proj_h)
-
-                frames = []
-                warned_read_failure = False
-                for offset in range(overlap_len):
-                    source_frame = source_start + offset
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
-                    ret, frame_bgr = cap.read()
-                    if not ret:
-                        if not warned_read_failure:
-                            logger.warning(
-                                "Failed to read motion-driver frames from %s; padding unreadable frames with black",
-                                abs_path,
-                            )
-                            warned_read_failure = True
-                        frames.append(black_rgb.copy())
-                        continue
-
-                    placed, _bounds = self._fit_frame_to_canvas(
-                        frame_bgr, proj_w, proj_h,
-                        mode=getattr(clip, "fit_mode", "pad_edge"),
-                        crop_position=getattr(clip, "crop_position", "center"),
-                    )
-                    frames.append(cv2.cvtColor(placed, cv2.COLOR_BGR2RGB))
-
-                tensor = torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
-            finally:
-                cap.release()
-
-        try:
-            strength = float(getattr(clip, "strength", 1.0))
-        except (TypeError, ValueError):
-            strength = 1.0
-        return tensor, max(0, clip.timeline_start_frame - render_start), strength
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
                               render_start: int, render_end: int) -> torch.Tensor:

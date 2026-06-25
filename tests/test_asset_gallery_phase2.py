@@ -808,6 +808,22 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
         "guide_frame_snapshots": [
             {"frame_index": 20, "asset_id": "guide-1", "source": "asset", "strength": 0.7, "muted": True},
         ],
+        "driver_clip_snapshots": [
+            {
+                "clip_id": "driver-1",
+                "source_path": "media/driver.mp4",
+                "timeline_start_frame": 18,
+                "timeline_end_frame": 64,
+                "track_index": 1,
+                "role": "motion_driver",
+                "strength": 0.55,
+            },
+        ],
+        "driver_lane_count": 2,
+        "driver_lane_configs": [
+            {"name": "Canny", "hidden": True},
+            {"name": "Depth", "hidden": False},
+        ],
         "prompt_sections": [
             {"start_frame": 0, "end_frame": 96, "prompt": "section prompt"},
         ],
@@ -834,6 +850,11 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     assert payload["mask_post_offset"] == 3
     assert payload["guide_frame_snapshots"][0]["asset_id"] == "guide-1"
     assert payload["guide_frame_snapshots"][0]["muted"] is True
+    assert payload["driver_clip_snapshots"][0]["clip_id"] == "driver-1"
+    assert payload["driver_clip_snapshots"][0]["strength"] == 0.55
+    assert payload["driver_lane_count"] == 2
+    assert payload["driver_lane_configs"][0]["name"] == "Canny"
+    assert payload["driver_lane_configs"][0]["hidden"] is True
     assert payload["prompt_sections"][0]["prompt"] == "section prompt"
     assert payload["scene_width"] == 1024
     assert payload["scene_height"] == 576
@@ -852,6 +873,9 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     assert project.generation_queue[0].take_placement_muted is False
     assert project.generation_queue[0].mask_pre_offset == 2
     assert project.generation_queue[0].mask_post_offset == 3
+    assert project.generation_queue[0].driver_clip_snapshots[0]["clip_id"] == "driver-1"
+    assert project.generation_queue[0].driver_lane_count == 2
+    assert project.generation_queue[0].driver_lane_configs[1]["name"] == "Depth"
     assert payload["params"]["snapshot_version"] == 1
 
 

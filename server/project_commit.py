@@ -243,7 +243,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
             continue
 
         # Collect generated items to add (dedup by stable id). Generated clips
-        # are split by role because render and motion-driver lanes are separate
+        # are split by role because render and driver lanes are separate
         # index spaces.
         current_clip_ids = {clip.clip_id for clip in current_scene.clips}
         new_render = []

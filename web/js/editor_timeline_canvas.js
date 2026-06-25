@@ -648,7 +648,7 @@ export function _drawClips(host, ctx, width) {
             ctx.globalAlpha = 1.0;
         };
 
-        // Video and motion-driver clips.
+        // Video and driver clips.
         const allClips = host.activeScene.clips || [];
         for (let _vli = 0; _vli < host._trackLayout.length; _vli++) {
             const _vlEntry = host._trackLayout[_vli];

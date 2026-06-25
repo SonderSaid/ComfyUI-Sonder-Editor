@@ -342,7 +342,7 @@ def test_scene_fixed_track_config_roundtrip_and_defaults():
     assert legacy.prompt_track_config.hidden is False
 
 
-def test_scene_content_hash_changes_with_clip_role_and_strength():
+def test_scene_content_hash_changes_when_clip_role_changes_render_visibility():
     base_clip = ClipReference(
         source_path="media/clip.mp4",
         timeline_start_frame=0,
@@ -357,11 +357,34 @@ def test_scene_content_hash_changes_with_clip_role_and_strength():
     driver_scene = Scene(name="Render")
     driver_scene.clips = [ClipReference.from_dict({**base_clip.to_dict(), "role": "motion_driver"})]
 
-    strength_scene = Scene(name="Render")
-    strength_scene.clips = [ClipReference.from_dict({**base_clip.to_dict(), "strength": 0.42})]
-
     assert render_scene.content_hash() != driver_scene.content_hash()
-    assert render_scene.content_hash() != strength_scene.content_hash()
+
+
+def test_scene_content_hash_ignores_driver_only_state():
+    driver_clip = ClipReference(
+        source_path="media/driver.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=10,
+        role="motion_driver",
+        strength=0.25,
+        muted=False,
+    )
+    base_scene = Scene(name="Render", motion_driver_lane_count=1)
+    base_scene.clips = [driver_clip]
+    base_scene.motion_driver_lane_configs = [LaneConfig(hidden=False, name="Driver 1")]
+    base_hash = base_scene.content_hash()
+
+    changed_scene = Scene(name="Render", motion_driver_lane_count=1)
+    changed_scene.clips = [
+        ClipReference.from_dict({
+            **driver_clip.to_dict(),
+            "strength": 0.9,
+            "muted": True,
+        }),
+    ]
+    changed_scene.motion_driver_lane_configs = [LaneConfig(hidden=True, name="Renamed Driver")]
+
+    assert changed_scene.content_hash() == base_hash
 
 
 def test_scene_content_hash_changes_with_clip_and_guide_mute_state():
@@ -536,6 +559,17 @@ def test_generation_job_roundtrip():
         mask_pre_offset=2,
         mask_post_offset=3,
         guide_frame_snapshots=[{"frame_index": 12, "asset_id": "guide001", "source": "asset", "strength": 0.8}],
+        driver_clip_snapshots=[{
+            "clip_id": "driver-1",
+            "source_path": "media/driver.mp4",
+            "timeline_start_frame": 8,
+            "timeline_end_frame": 20,
+            "track_index": 1,
+            "role": "motion_driver",
+            "strength": 0.65,
+        }],
+        driver_lane_count=2,
+        driver_lane_configs=[{"name": "Canny", "hidden": True}, {"name": "Depth", "hidden": False}],
         prompt_sections=[{"start_frame": 0, "end_frame": 96, "prompt": "section prompt"}],
         scene_width=1024,
         scene_height=576,
@@ -567,6 +601,11 @@ def test_generation_job_roundtrip():
     assert restored.mask_pre_offset == 2
     assert restored.mask_post_offset == 3
     assert restored.guide_frame_snapshots[0]["asset_id"] == "guide001"
+    assert restored.driver_clip_snapshots[0]["clip_id"] == "driver-1"
+    assert restored.driver_clip_snapshots[0]["strength"] == 0.65
+    assert restored.driver_lane_count == 2
+    assert restored.driver_lane_configs[0]["name"] == "Canny"
+    assert restored.driver_lane_configs[0]["hidden"] is True
     assert restored.prompt_sections[0]["prompt"] == "section prompt"
     assert restored.scene_width == 1024
     assert restored.scene_height == 576

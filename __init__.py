@@ -6,6 +6,7 @@ try:
     from .nodes.editor_node import SonderEditor
     from .nodes.io_nodes import SonderSaveBridge, SonderSaveVideo, SonderPreviewVideo
     from .nodes.bridge_nodes import SonderGuidesBridgeStart, SonderGuidesBridgeEnd
+    from .nodes.driver_bridge import SonderDriverBridge
     from .nodes.masks_bridge import SonderMasksBridge
     from .nodes.metadata_collector import SonderMetadataCollector
     from .nodes.prompt_bridge import SonderPromptRelayBridge
@@ -18,6 +19,7 @@ try:
         "SonderPreviewVideo": SonderPreviewVideo,
         "SonderGuidesBridgeStart": SonderGuidesBridgeStart,
         "SonderGuidesBridgeEnd": SonderGuidesBridgeEnd,
+        "SonderDriverBridge": SonderDriverBridge,
         "SonderMasksBridge": SonderMasksBridge,
         "SonderPromptRelayBridge": SonderPromptRelayBridge,
     }
@@ -30,6 +32,7 @@ try:
         "SonderPreviewVideo": "Sonder Preview Video",
         "SonderGuidesBridgeStart": "Sonder Guides Bridge Start",
         "SonderGuidesBridgeEnd": "Sonder Guides Bridge End",
+        "SonderDriverBridge": "Sonder Driver Bridge",
         "SonderMasksBridge": "Sonder Masks Bridge",
         "SonderPromptRelayBridge": "Sonder Prompt Relay Bridge",
     }

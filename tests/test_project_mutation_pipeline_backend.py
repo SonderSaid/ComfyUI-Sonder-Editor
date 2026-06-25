@@ -278,6 +278,99 @@ def test_scene_mutation_linked_move_rejects_locked_member(monkeypatch, tmp_path)
     assert scene.audio_tracks[0].timeline_start_frame == 0
 
 
+def test_scene_mutation_update_clip_rejects_driver_lane_collision_atomically(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", motion_driver_lane_count=1)
+    driver = ClipReference(
+        clip_id="driver-1",
+        source_path="media/driver-a.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        track_index=0,
+        role="motion_driver",
+    )
+    render = ClipReference(
+        clip_id="render-1",
+        source_path="media/driver-b.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        track_index=0,
+        role="render",
+    )
+    scene.clips = [driver, render]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "update_clip",
+            "clip_id": "render-1",
+            "fields": {"role": "motion_driver", "track_index": 0},
+        }]},
+    )))
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "driver_lane_occupied"
+    assert saves == []
+    assert render.role == "render"
+    assert len([clip for clip in scene.clips if clip.role == "motion_driver"]) == 1
+
+
+def test_scene_mutation_linked_split_rejects_driver_clip_atomically(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=40)
+    driver = ClipReference(
+        clip_id="driver-1",
+        source_path="media/driver.mp4",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=0,
+        source_out_frame=20,
+        total_source_frames=20,
+        track_index=0,
+        role="motion_driver",
+    )
+    audio = AudioTrack(
+        track_id="audio-1",
+        source_path="media/audio.wav",
+        timeline_start_frame=0,
+        timeline_end_frame=20,
+        source_in_frame=0,
+        total_source_frames=20,
+    )
+    scene.clips = [driver]
+    scene.audio_tracks = [audio]
+    scene.linked_item_groups = [{
+        "group_id": "group-1",
+        "items": [{"type": "clip", "id": "driver-1"}, {"type": "audio", "id": "audio-1"}],
+    }]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "split_clip",
+            "clip_id": "driver-1",
+            "frame": 10,
+            "apply_linked": True,
+        }]},
+    )))
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "driver_clip_split_refused"
+    assert saves == []
+    assert len(scene.clips) == 1
+    assert len(scene.audio_tracks) == 1
+    assert driver.timeline_end_frame == 20
+    assert audio.timeline_end_frame == 20
+
+
 def test_scene_mutation_create_prompt_section_returns_reconciled_scene(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
     scene = Scene(scene_id="scene-1", name="Scene")

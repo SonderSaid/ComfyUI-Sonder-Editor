@@ -142,7 +142,7 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
     project_dir.mkdir()
-    scene = Scene(scene_id="scene-1", name="Scene")
+    scene = Scene(scene_id="scene-1", name="Scene", motion_driver_lane_count=2)
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     project.assets = [
         Asset(asset_id="asset-1", asset_type="video", path="media/clip.mp4", frame_count=12),
@@ -178,7 +178,7 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr(
         route_module,
         "_extract_audio_from_video",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("motion drivers must not dual-drop audio")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("drivers must not dual-drop audio")),
     )
     motion_driver = asyncio.run(add_clip(DummyRequest(
         match_info={"scene_id": "scene-1"},
@@ -212,11 +212,34 @@ def test_clip_post_put_role_validation_and_defaults(tmp_path, monkeypatch):
 
     updated = asyncio.run(update_clip(DummyRequest(
         match_info={"scene_id": "scene-1", "clip_id": clip_id},
-        body={"role": "motion_driver", "strength": 0.42},
+        body={"role": "motion_driver", "track_index": 1, "strength": 0.42},
     )))
     updated_json = _response_json(updated)
+    assert updated.status == 200
     assert updated_json["role"] == "motion_driver"
     assert updated_json["strength"] == 0.42
+
+    duplicate_driver = asyncio.run(add_clip(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"asset_id": "asset-1", "role": "motion_driver", "track_index": 1},
+    )))
+    assert duplicate_driver.status == 409
+    assert _response_json(duplicate_driver)["code"] == "driver_lane_occupied"
+
+    render_for_collision = asyncio.run(add_clip(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"asset_id": "asset-1", "timeline_start_frame": 6},
+    )))
+    render_for_collision_json = _response_json(render_for_collision)
+    collision_id = render_for_collision_json["clip_id"]
+    collision_update = asyncio.run(update_clip(DummyRequest(
+        match_info={"scene_id": "scene-1", "clip_id": collision_id},
+        body={"role": "motion_driver", "track_index": 1},
+    )))
+    assert collision_update.status == 409
+    assert _response_json(collision_update)["code"] == "driver_lane_occupied"
+    collision_clip = next(clip for clip in scene.clips if clip.clip_id == collision_id)
+    assert collision_clip.role == "render"
 
     image_clip = ClipReference(clip_id="image-clip", source_path="media/ref.png")
     scene.clips.append(image_clip)
@@ -786,6 +809,37 @@ def test_scene_put_accepts_motion_driver_lane_config(tmp_path, monkeypatch):
     }
 
 
+def test_scene_put_rejects_duplicate_driver_lane_state(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene", motion_driver_lane_count=1)
+    scene.clips = [
+        ClipReference(clip_id="driver-a", source_path="media/a.mp4", timeline_end_frame=10, role="motion_driver"),
+        ClipReference(clip_id="driver-b", source_path="media/b.mp4", timeline_end_frame=10, role="motion_driver"),
+    ]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    save_calls = []
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
+
+    update_scene = _route_handler(
+        route_module,
+        "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}",
+    )
+    response = asyncio.run(update_scene(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"name": "Still invalid"},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["code"] == "driver_lane_occupied"
+    assert save_calls == []
+
+
 def test_scene_restore_accepts_guide_and_prompt_track_config(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
@@ -817,6 +871,39 @@ def test_scene_restore_accepts_guide_and_prompt_track_config(tmp_path, monkeypat
     assert payload["guide_track_config"]["hidden"] is False
     assert payload["prompt_track_config"]["locked"] is False
     assert payload["prompt_track_config"]["hidden"] is True
+
+
+def test_scene_restore_rejects_duplicate_driver_clip_snapshot(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene", motion_driver_lane_count=1)
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    save_calls = []
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
+
+    restore_scene = _route_handler(
+        route_module,
+        "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore",
+    )
+    response = asyncio.run(restore_scene(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={
+            "clips": [
+                {"clip_id": "driver-a", "source_path": "media/a.mp4", "timeline_end_frame": 10, "role": "motion_driver"},
+                {"clip_id": "driver-b", "source_path": "media/b.mp4", "timeline_end_frame": 10, "role": "motion_driver"},
+            ],
+            "motion_driver_lane_count": 1,
+        },
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["code"] == "driver_lane_occupied"
+    assert save_calls == []
 
 
 def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_path, monkeypatch):
@@ -988,7 +1075,7 @@ def test_guide_swap_route_swaps_frames_and_respects_lock(tmp_path, monkeypatch):
     assert locked.status == 409
 
 
-def test_clip_split_preserves_motion_driver_role_and_strength(tmp_path, monkeypatch):
+def test_clip_split_rejects_motion_driver_atomically(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
     project_dir.mkdir()
@@ -1009,7 +1096,8 @@ def test_clip_split_preserves_motion_driver_role_and_strength(tmp_path, monkeypa
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
-    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    save_calls = []
+    monkeypatch.setattr(route_module, "save_project", lambda project: save_calls.append(project))
 
     split_clip = _route_handler(
         route_module,
@@ -1022,10 +1110,13 @@ def test_clip_split_preserves_motion_driver_role_and_strength(tmp_path, monkeypa
     )))
     payload = _response_json(response)
 
-    assert payload["left"]["role"] == "motion_driver"
-    assert payload["right"]["role"] == "motion_driver"
-    assert payload["left"]["strength"] == 0.42
-    assert payload["right"]["strength"] == 0.42
+    assert response.status == 409
+    assert payload["code"] == "driver_clip_split_refused"
+    assert len(scene.clips) == 1
+    assert scene.clips[0] is clip
+    assert clip.timeline_start_frame == 0
+    assert clip.timeline_end_frame == 10
+    assert save_calls == []
 
 
 def test_clear_queue_route_removes_only_completed_jobs(tmp_path, monkeypatch):
@@ -1203,6 +1294,113 @@ def test_delete_last_audio_track_compacts_empty_audio_lane(tmp_path, monkeypatch
     assert scene.audio_lane_count == 2
     assert higher.lane_index == 1
     assert [config.name for config in scene.audio_lane_configs] == ["Audio 2", "Audio 3"]
+
+
+def test_bridge_drivers_route_returns_live_driver_lanes(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=120, motion_driver_lane_count=2)
+    scene.motion_driver_lane_configs = [
+        LaneConfig(name="Canny", hidden=False),
+        LaneConfig(name="Depth", hidden=True),
+    ]
+    scene.clips = [
+        ClipReference(
+            clip_id="driver-1",
+            source_path="media/driver.mp4",
+            timeline_start_frame=10,
+            timeline_end_frame=40,
+            track_index=1,
+            role="motion_driver",
+            strength=0.45,
+            muted=False,
+        ),
+    ]
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.assets = [Asset(asset_id="asset-1", asset_type="video", path="media/driver.mp4", name="Depth.mov")]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    handler = _route_handler(
+        route_module,
+        "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-drivers",
+    )
+
+    response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["source"] == "live"
+    assert payload["driver_lane_count"] == 2
+    assert payload["all_driver_keys"] == ["lane:0", "lane:1"]
+    assert payload["drivers"][0]["has_clip"] is False
+    assert payload["drivers"][0]["lane_name"] == "Canny"
+    assert payload["drivers"][1]["has_clip"] is True
+    assert payload["drivers"][1]["lane_name"] == "Depth"
+    assert payload["drivers"][1]["asset_name"] == "Depth.mov"
+    assert payload["drivers"][1]["editor_muted"] is True
+    assert payload["drivers"][1]["strength"] == 0.45
+
+
+def test_bridge_drivers_route_uses_running_job_snapshot(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=120, motion_driver_lane_count=1)
+    scene.clips = [
+        ClipReference(
+            clip_id="live-driver",
+            source_path="media/live.mp4",
+            timeline_start_frame=5,
+            timeline_end_frame=15,
+            track_index=0,
+            role="motion_driver",
+        ),
+    ]
+    snapshot_clip = ClipReference(
+        clip_id="snap-driver",
+        source_path="media/snapshot.mp4",
+        timeline_start_frame=20,
+        timeline_end_frame=50,
+        track_index=0,
+        role="motion_driver",
+        strength=0.8,
+        muted=True,
+    )
+    running_job = GenerationJob(
+        job_id="job-running",
+        scene_id="scene-1",
+        status="running",
+        params={"snapshot_version": 1},
+        driver_clip_snapshots=[snapshot_clip.to_dict()],
+        driver_lane_count=1,
+        driver_lane_configs=[{"name": "Frozen", "hidden": False}],
+    )
+    project = TimelineProject(
+        project_dir=str(project_dir),
+        name="Project",
+        scenes=[scene],
+        generation_queue=[running_job],
+    )
+    project.assets = [Asset(asset_id="asset-1", asset_type="video", path="media/snapshot.mp4", name="Snapshot.mov")]
+
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    handler = _route_handler(
+        route_module,
+        "GET",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-drivers",
+    )
+
+    response = asyncio.run(handler(DummyRequest(match_info={"scene_id": "scene-1"})))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["source"] == "snapshot"
+    assert payload["drivers"][0]["clip_id"] == "snap-driver"
+    assert payload["drivers"][0]["asset_name"] == "Snapshot.mov"
+    assert payload["drivers"][0]["editor_muted"] is True
+    assert payload["drivers"][0]["source"] == "snapshot"
 
 
 def test_bridge_guides_route_returns_all_scene_guides(tmp_path, monkeypatch):

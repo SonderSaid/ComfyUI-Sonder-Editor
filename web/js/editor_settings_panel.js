@@ -1313,7 +1313,7 @@ function showSettingsPanel() {
     const laneTintSpecs = [
         { key: "video", label: "Video Lane Tint", description: "Optional subtle color overlay on all video lane backgrounds." },
         { key: "audio", label: "Audio Lane Tint", description: "Optional subtle color overlay on all audio lane backgrounds." },
-        { key: "motion_driver", label: "Driver Lane Tint", description: "Optional subtle color overlay on all motion-driver lane backgrounds." },
+        { key: "motion_driver", label: "Driver Lane Tint", description: "Optional subtle color overlay on all driver lane backgrounds." },
     ];
     for (const spec of laneTintSpecs) {
         const row = createRow(appearanceSection, spec.label, spec.description);
@@ -1459,8 +1459,8 @@ function showSettingsPanel() {
     createNumberInput(
         projectDefaultsSection,
         "defaultMotionDriverStrength",
-        "Default Motion-Driver Strength",
-        "Applied when creating motion-driver clips.",
+        "Default Driver Strength",
+        "Applied when creating driver clips.",
         {
             min: 0,
             max: 1,

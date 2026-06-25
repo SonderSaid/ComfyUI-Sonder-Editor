@@ -2290,27 +2290,32 @@ export class EditorWidget {
     }
 
     _applyLocalRemoveLane(laneType, laneIndex, itemPolicy = "require_empty", targetLane = null) {
-        if (!this.activeScene || !["video", "audio"].includes(laneType)) return false;
+        if (!this.activeScene || !["video", "motion_driver", "audio"].includes(laneType)) return false;
         laneIndex = parseInt(laneIndex, 10);
         if (!Number.isFinite(laneIndex)) return false;
         const isVideo = laneType === "video";
+        const isDriver = laneType === "motion_driver";
         const currentCount = isVideo
             ? Math.max(1, parseInt(this.activeScene.video_lane_count, 10) || 1)
+            : isDriver
+                ? Math.max(1, parseInt(this.activeScene.motion_driver_lane_count, 10) || 1)
             : Math.max(1, parseInt(this.activeScene.audio_lane_count, 10) || 1);
         if (currentCount <= 1 || laneIndex < 0 || laneIndex >= currentCount) return false;
         const laneItems = isVideo
             ? (this.activeScene.clips || []).filter((clip) => this._isRenderClip(clip) && (clip.track_index || 0) === laneIndex)
+            : isDriver
+                ? (this.activeScene.clips || []).filter((clip) => this._isMotionDriverClip(clip) && (clip.track_index || 0) === laneIndex)
             : (this.activeScene.audio_tracks || []).filter((track) => (track.lane_index || 0) === laneIndex);
         if (laneItems.length && itemPolicy === "require_empty") return false;
         if (laneItems.length && itemPolicy === "move_items") {
             const nextTarget = targetLane == null ? (laneIndex > 0 ? laneIndex - 1 : 1) : parseInt(targetLane, 10);
             if (!Number.isFinite(nextTarget) || nextTarget < 0 || nextTarget >= currentCount || nextTarget === laneIndex) return false;
             for (const item of laneItems) {
-                if (isVideo) item.track_index = nextTarget;
+                if (isVideo || isDriver) item.track_index = nextTarget;
                 else item.lane_index = nextTarget;
             }
         } else if (laneItems.length && itemPolicy === "delete_items") {
-            if (isVideo) {
+            if (isVideo || isDriver) {
                 const deleting = new Set(laneItems.map((item) => item.clip_id));
                 this.activeScene.clips = (this.activeScene.clips || []).filter((clip) => !deleting.has(clip.clip_id));
             } else {
@@ -2332,6 +2337,18 @@ export class EditorWidget {
                 this.activeScene.video_lane_configs || [],
                 laneIndex,
                 this.activeScene.video_lane_count,
+            );
+        } else if (isDriver) {
+            for (const clip of (this.activeScene.clips || [])) {
+                if (this._isMotionDriverClip(clip) && (clip.track_index || 0) > laneIndex) {
+                    clip.track_index = Math.max(0, (clip.track_index || 0) - 1);
+                }
+            }
+            this.activeScene.motion_driver_lane_count = currentCount - 1;
+            this.activeScene.motion_driver_lane_configs = this._trimLocalLaneConfigs(
+                this.activeScene.motion_driver_lane_configs || [],
+                laneIndex,
+                this.activeScene.motion_driver_lane_count,
             );
         } else {
             for (const track of (this.activeScene.audio_tracks || [])) {
@@ -3882,13 +3899,13 @@ export class EditorWidget {
             });
         }
 
-        // Motion-driver lanes: single lane in Phase 4.3, below audio.
+        // Driver lanes: below audio, ordered by lane index.
         for (let i = 0; i < motionDriverLanes; i++) {
             const key = TRACK_TYPE.MOTION_DRIVER + ":" + i;
             const cfg = mdConfigs[i] || {};
             layout.push({
                 type: TRACK_TYPE.MOTION_DRIVER,
-                label: cfg.name || (motionDriverLanes > 1 ? `MD${i + 1}` : "Driver"),
+                label: cfg.name || (motionDriverLanes > 1 ? `Driver ${i + 1}` : "Driver"),
                 customName: cfg.name || "",
                 laneIndex: i,
                 collapsed: isStored ? storedCollapsed.has(key) : false,
@@ -3951,7 +3968,7 @@ export class EditorWidget {
         );
     }
 
-    /** Find layout index for a motion-driver lane */
+    /** Find layout index for a driver lane */
     _motionDriverLaneLayoutIdx(laneIndex) {
         return this._trackLayout.findIndex(
             e => e.type === TRACK_TYPE.MOTION_DRIVER && e.laneIndex === laneIndex
@@ -5885,15 +5902,15 @@ export class EditorWidget {
                         : isMotionDriver
                             ? (this.activeScene?.motion_driver_lane_count || 1)
                             : (this.activeScene?.audio_lane_count || 1);
-                    const label = isVideo ? "Video" : (isMotionDriver ? "Motion Driver" : "Audio");
+                    const label = isVideo ? "Video" : (isMotionDriver ? "Driver" : "Audio");
 
                     menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(headerHit.layoutIdx) });
-                    if (!isMotionDriver) {
-                        menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
-                    }
-                    if (!isMotionDriver && laneCount > 1) {
+                    menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
+                    if (laneCount > 1) {
                         const hasItems = isVideo
                             ? (this.activeScene?.clips || []).some(c => this._isRenderClip(c) && (c.track_index || 0) === entry.laneIndex)
+                            : isMotionDriver
+                                ? (this.activeScene?.clips || []).some(c => this._isMotionDriverClip(c) && (c.track_index || 0) === entry.laneIndex)
                             : (this.activeScene?.audio_tracks || []).some(a => (a.lane_index || 0) === entry.laneIndex);
                         if (hasItems) {
                             menuItems.push({ label: `Delete ${label} Lane and Move Items`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
@@ -5971,12 +5988,12 @@ export class EditorWidget {
                     const isMotionDriverClip = this._isMotionDriverClip(hit.data);
                     const canConvertRole = isMotionDriverClip || clipAsset?.asset_type === "video";
                     menuItems.push({
-                        label: itemLocked || isMotionDriverClip ? "Move to New Lane" + (itemLocked ? " (locked)" : " (unavailable)") : "Move to New Lane",
-                        action: itemLocked || isMotionDriverClip ? () => {} : () => this._moveItemToNewLane(hit),
-                        disabled: itemLocked || isMotionDriverClip,
+                        label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane",
+                        action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit),
+                        disabled: itemLocked,
                     });
                     menuItems.push({
-                        label: !canConvertRole && !itemLocked ? "Convert to Motion Driver (video only)" : (isMotionDriverClip ? "Convert to Render Clip" : "Convert to Motion Driver"),
+                        label: !canConvertRole && !itemLocked ? "Convert to Driver (video only)" : (isMotionDriverClip ? "Convert to Render Clip" : "Convert to Driver"),
                         action: itemLocked || !canConvertRole
                             ? () => {}
                             : () => this._convertClipRole(hit.data.clip_id, isMotionDriverClip ? "render" : "motion_driver"),
@@ -6192,7 +6209,7 @@ export class EditorWidget {
                     const entry = this._trackLayout[layoutIdx];
                     // #33: reject drops onto any collapsed non-image destination lane.
                     // Image drops were checked against Guides above; for video/audio/
-                    // motion-driver we use the lane the cursor is over.
+                    // driver we use the lane the cursor is over.
                     if (asset.asset_type !== "image" && entry.collapsed) {
                         return;
                     }
@@ -6205,25 +6222,21 @@ export class EditorWidget {
 
         if (targetMotionDriverLane >= 0) {
             if (asset.asset_type !== "video") {
-                this._showToast("Motion drivers accept video assets only");
+                this._showToast("Driver lanes accept video assets only.");
                 return;
             }
             if (this._isLaneLocked(TRACK_TYPE.MOTION_DRIVER, targetMotionDriverLane)) {
                 this._showToast("Target lane is locked.");
                 return;
             }
-            this._pushUndo("add motion driver");
+            if (this._driverClipInLane(targetMotionDriverLane)) {
+                this._showToast("Only one driver clip is allowed per driver lane.");
+                return;
+            }
+            this._pushUndo("add driver");
             const assetObj = this._findAssetById(asset.asset_id);
             const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
             const dropEnd = frame + dropDuration;
-            const hasOverlap = (this.activeScene.clips || []).some(c =>
-                this._isMotionDriverClip(c) &&
-                (c.track_index || 0) === targetMotionDriverLane &&
-                c.timeline_start_frame < dropEnd && c.timeline_end_frame > frame
-            );
-            if (hasOverlap) {
-                this._showToast("Only the earliest overlapping motion driver will be used.");
-            }
             const tempClipId = `temp-driver-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
             this.activeScene.clips = this.activeScene.clips || [];
             this.activeScene.clips.push({
@@ -6258,10 +6271,10 @@ export class EditorWidget {
                     }),
                 });
                 if (!resp.ok) {
-                    const message = await readResponseError(resp, `Motion-driver clip creation failed: ${resp.status}`);
-                    console.warn("[Sonder] Motion-driver clip creation failed:", resp.status, message);
+                    const message = await readResponseError(resp, `Driver clip creation failed: ${resp.status}`);
+                    console.warn("[Sonder] Driver clip creation failed:", resp.status, message);
                     notifyError(message, { source: "timeline-drop" });
-                    this._discardLastUndo("add motion driver");
+                    this._discardLastUndo("add driver");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
                     return;
                 }
@@ -6271,9 +6284,9 @@ export class EditorWidget {
                 this._renderSceneAfterLocalMutation();
                 this._deferProjectBackedRefresh(["scenes"], "motion_driver_drop_reconcile");
             } catch (e) {
-                this._discardLastUndo("add motion driver");
+                this._discardLastUndo("add driver");
                 await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_motion_driver_error" });
-                console.warn("[Sonder] Failed to drop motion driver:", e);
+                console.warn("[Sonder] Failed to drop driver:", e);
             }
             return;
         }
@@ -6608,27 +6621,54 @@ export class EditorWidget {
         return visibleLane;
     }
 
+    _driverClipInLane(laneIndex, excludeClipId = "") {
+        return (this.activeScene?.clips || []).some((clip) =>
+            this._isMotionDriverClip(clip)
+            && (clip.track_index || 0) === laneIndex
+            && (!excludeClipId || clip.clip_id !== excludeClipId)
+        );
+    }
+
+    _hasDriverLaneCollision() {
+        const occupied = new Map();
+        for (const clip of (this.activeScene?.clips || [])) {
+            if (!this._isMotionDriverClip(clip)) continue;
+            const laneIndex = clip.track_index || 0;
+            if (occupied.has(laneIndex)) return true;
+            occupied.set(laneIndex, clip.clip_id || "");
+        }
+        return false;
+    }
+
+    _firstEmptyUnlockedDriverLane() {
+        const count = Math.max(1, parseInt(this.activeScene?.motion_driver_lane_count, 10) || 1);
+        for (let i = 0; i < count; i++) {
+            if (this._isLaneHidden(TRACK_TYPE.MOTION_DRIVER, i)) continue;
+            if (this._isLaneLocked(TRACK_TYPE.MOTION_DRIVER, i)) continue;
+            if (!this._driverClipInLane(i)) return i;
+        }
+        return count;
+    }
+
     async _convertClipRole(clipId, targetRole) {
         if (!this.activeScene || !this.projectDir || !clipId) return;
         const clip = (this.activeScene.clips || []).find(c => c.clip_id === clipId);
         if (!clip) return;
-        const targetType = targetRole === "motion_driver" ? TRACK_TYPE.MOTION_DRIVER : TRACK_TYPE.VIDEO;
         if (targetRole === "motion_driver") {
             const sourceAsset = this._getAssetForSourcePath(clip.source_path);
             if (sourceAsset?.asset_type !== "video") {
-                this._showToast("Motion drivers accept video assets only");
+                this._showToast("Driver lanes accept video assets only.");
                 return;
             }
         }
-        const targetLane = this._firstAvailableLane(targetType);
-        if (targetLane < 0 || this._isLaneHidden(targetType, targetLane)) {
-            this._showToast(targetRole === "motion_driver" ? "No visible motion-driver lane available." : "No visible video lane available.");
-            return;
-        }
-        if (this._isLaneLocked(targetType, targetLane)) {
-            this._showToast("Target lane is locked.");
-            return;
-        }
+        const currentDriverLaneCount = Math.max(1, parseInt(this.activeScene.motion_driver_lane_count, 10) || 1);
+        const targetLane = targetRole === "motion_driver"
+            ? this._firstEmptyUnlockedDriverLane()
+            : (this.activeScene.video_lane_count || 1);
+        const nextCount = targetRole === "motion_driver"
+            ? Math.max(currentDriverLaneCount, targetLane + 1)
+            : targetLane + 1;
+        const laneType = targetRole === "motion_driver" ? "motion_driver" : "video";
 
         const oldState = {
             role: clip.role || "render",
@@ -6641,10 +6681,14 @@ export class EditorWidget {
         }
 
         this._pushUndo("convert clip role");
+        this._applyLocalSetLaneCount(laneType, nextCount);
         Object.assign(clip, body);
         try {
             await this._runSceneMutation(
-                [{ type: "update_clip", clip_id: clipId, fields: body }],
+                [
+                    { type: "set_lane_count", lane_type: laneType, count: nextCount },
+                    { type: "update_clip", clip_id: clipId, fields: body },
+                ],
                 {
                     key: `clip:${clipId}:role`,
                     label: "convert clip role",
@@ -6657,8 +6701,9 @@ export class EditorWidget {
             this._renderViewportFrame();
         } catch (e) {
             Object.assign(clip, oldState);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "convert_clip_role_error" });
             console.warn("[Sonder] Failed to convert clip role:", e);
-            notifyError("Failed to convert clip role.");
+            notifyError(e?.message || "Failed to convert clip role.");
             this._renderTimeline();
         }
     }
@@ -6671,14 +6716,14 @@ export class EditorWidget {
         try {
             const operations = [];
             if (hit.type === "clip") {
-                if (this._isMotionDriverClip(hit.data)) {
-                    this._showToast("Motion-driver lanes are single-lane in this phase.");
-                    return;
-                }
-                // Add a new video lane and move clip there
-                const newCount = (this.activeScene.video_lane_count || 1) + 1;
+                const isDriver = this._isMotionDriverClip(hit.data);
+                const laneType = isDriver ? "motion_driver" : "video";
+                const currentCount = isDriver
+                    ? (this.activeScene.motion_driver_lane_count || 1)
+                    : (this.activeScene.video_lane_count || 1);
+                const newCount = currentCount + 1;
                 const newLane = newCount - 1;
-                operations.push({ type: "set_lane_count", lane_type: "video", count: newCount });
+                operations.push({ type: "set_lane_count", lane_type: laneType, count: newCount });
                 operations.push({ type: "update_clip", clip_id: hit.id, fields: { track_index: newLane } });
             } else if (hit.type === "audio") {
                 const newCount = (this.activeScene.audio_lane_count || 1) + 1;
@@ -6854,7 +6899,7 @@ export class EditorWidget {
                 entry.label = newName || (entry.type === TRACK_TYPE.VIDEO
                     ? ((this.activeScene?.video_lane_count || 1) > 1 ? `V${entry.laneIndex + 1}` : "Video")
                     : entry.type === TRACK_TYPE.MOTION_DRIVER
-                        ? ((this.activeScene?.motion_driver_lane_count || 1) > 1 ? `MD${entry.laneIndex + 1}` : "Driver")
+                        ? ((this.activeScene?.motion_driver_lane_count || 1) > 1 ? `Driver ${entry.laneIndex + 1}` : "Driver")
                         : ((this.activeScene?.audio_lane_count || 1) > 1 ? `A${entry.laneIndex + 1}` : "Audio"));
                 this._saveLaneConfig([entry]);
                 this._renderTimeline();
@@ -6955,23 +7000,23 @@ export class EditorWidget {
 
     async _addLane(trackType) {
         if (!this.activeScene || !this.projectDir) return;
-        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
-            this._showToast("Motion-driver lanes are single-lane in this phase.");
-            return;
-        }
         const isVideo = trackType === TRACK_TYPE.VIDEO;
+        const isDriver = trackType === TRACK_TYPE.MOTION_DRIVER;
+        const laneType = isVideo ? "video" : (isDriver ? "motion_driver" : "audio");
         const nextCount = isVideo
             ? (this.activeScene.video_lane_count || 1) + 1
+            : isDriver
+                ? (this.activeScene.motion_driver_lane_count || 1) + 1
             : (this.activeScene.audio_lane_count || 1) + 1;
         const undoLabel = "add lane";
         this._pushUndo(undoLabel);
-        this._applyLocalSetLaneCount(isVideo ? "video" : "audio", nextCount);
+        this._applyLocalSetLaneCount(laneType, nextCount);
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
             await this._runSceneMutation(
-                [{ type: "set_lane_count", lane_type: isVideo ? "video" : "audio", count: nextCount }],
+                [{ type: "set_lane_count", lane_type: laneType, count: nextCount }],
                 {
-                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-lane-count`,
+                    key: `scene:${this.activeSceneId}:${laneType}-lane-count`,
                     label: "add lane",
                     coalesce: false,
                 }
@@ -6986,22 +7031,24 @@ export class EditorWidget {
     }
 
     async _removeLaneWithItems(trackType, laneIndex) {
-        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
-            this._showToast("Motion-driver lanes are single-lane in this phase.");
-            return;
-        }
         const isVideo = trackType === TRACK_TYPE.VIDEO;
-        const label = isVideo ? "video" : "audio";
+        const isDriver = trackType === TRACK_TYPE.MOTION_DRIVER;
+        const laneType = isVideo ? "video" : (isDriver ? "motion_driver" : "audio");
+        const label = isVideo ? "video" : (isDriver ? "driver" : "audio");
         const items = isVideo
             ? (this.activeScene?.clips || []).filter(c => this._isRenderClip(c) && (c.track_index || 0) === laneIndex)
+            : isDriver
+                ? (this.activeScene?.clips || []).filter(c => this._isMotionDriverClip(c) && (c.track_index || 0) === laneIndex)
             : (this.activeScene?.audio_tracks || []).filter(a => (a.lane_index || 0) === laneIndex);
         const targetLane = laneIndex > 0 ? laneIndex - 1 : 1;
         const currentCount = isVideo
             ? (this.activeScene?.video_lane_count || 1)
+            : isDriver
+                ? (this.activeScene?.motion_driver_lane_count || 1)
             : (this.activeScene?.audio_lane_count || 1);
 
         // If target lane would be the same (only 1 lane) or no valid target, delete items instead
-        const willMove = currentCount > 1 && targetLane !== laneIndex;
+        const willMove = currentCount > 1 && targetLane !== laneIndex && !(isDriver && this._driverClipInLane(targetLane));
         const msg = willMove
             ? `This ${label} lane has ${items.length} item(s). Move them to lane ${targetLane} and remove this lane?`
             : `This ${label} lane has ${items.length} item(s). Delete them and remove this lane?`;
@@ -7010,7 +7057,7 @@ export class EditorWidget {
         const undoLabel = "remove lane";
         const operation = {
             type: "remove_lane",
-            lane_type: isVideo ? "video" : "audio",
+            lane_type: laneType,
             lane_index: laneIndex,
             item_policy: willMove ? "move_items" : "delete_items",
             target_lane: targetLane,
@@ -7025,7 +7072,7 @@ export class EditorWidget {
             await this._runSceneMutation(
                 [operation],
                 {
-                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-remove-lane:${laneIndex}`,
+                    key: `scene:${this.activeSceneId}:${laneType}-remove-lane:${laneIndex}`,
                     label: "remove lane",
                     coalesce: false,
                 }
@@ -7039,14 +7086,13 @@ export class EditorWidget {
 
     async _deleteItemsInLane(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
-        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
-            this._showToast("Motion-driver lanes are single-lane in this phase.");
-            return;
-        }
         const isVideo = trackType === TRACK_TYPE.VIDEO;
-        const label = isVideo ? "video" : "audio";
+        const isDriver = trackType === TRACK_TYPE.MOTION_DRIVER;
+        const label = isVideo ? "video" : (isDriver ? "driver" : "audio");
         const items = isVideo
             ? (this.activeScene?.clips || []).filter(c => this._isRenderClip(c) && (c.track_index || 0) === laneIndex)
+            : isDriver
+                ? (this.activeScene?.clips || []).filter(c => this._isMotionDriverClip(c) && (c.track_index || 0) === laneIndex)
             : (this.activeScene?.audio_tracks || []).filter(a => (a.lane_index || 0) === laneIndex);
         if (!items.length) {
             this._showToast("Lane is already empty.");
@@ -7059,8 +7105,8 @@ export class EditorWidget {
             type: "bulk_delete_items",
             preserve_lanes: true,
             items: items.map((item) => ({
-                type: isVideo ? "clip" : "audio",
-                id: isVideo ? item.clip_id : item.track_id,
+                type: (isVideo || isDriver) ? "clip" : "audio",
+                id: (isVideo || isDriver) ? item.clip_id : item.track_id,
                 preserve_lane: true,
             })),
         };
@@ -7074,7 +7120,7 @@ export class EditorWidget {
             await this._runSceneMutation(
                 [operation],
                 {
-                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-delete-lane-items:${laneIndex}`,
+                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : (isDriver ? "motion_driver" : "audio")}-delete-lane-items:${laneIndex}`,
                     label: "delete lane items",
                     coalesce: false,
                 }
@@ -7088,19 +7134,19 @@ export class EditorWidget {
 
     async _removeLane(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
-        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
-            this._showToast("Motion-driver lanes are single-lane in this phase.");
-            return;
-        }
         const isVideo = trackType === TRACK_TYPE.VIDEO;
+        const isDriver = trackType === TRACK_TYPE.MOTION_DRIVER;
+        const laneType = isVideo ? "video" : (isDriver ? "motion_driver" : "audio");
         const currentCount = isVideo
             ? (this.activeScene.video_lane_count || 1)
+            : isDriver
+                ? (this.activeScene.motion_driver_lane_count || 1)
             : (this.activeScene.audio_lane_count || 1);
         if (currentCount <= 1) return;
         const undoLabel = "remove lane";
         const operation = {
             type: "remove_lane",
-            lane_type: isVideo ? "video" : "audio",
+            lane_type: laneType,
             lane_index: laneIndex,
             item_policy: "require_empty",
         };
@@ -7114,7 +7160,7 @@ export class EditorWidget {
             await this._runSceneMutation(
                 [operation],
                 {
-                    key: `scene:${this.activeSceneId}:${isVideo ? "video" : "audio"}-remove-lane:${laneIndex}`,
+                    key: `scene:${this.activeSceneId}:${laneType}-remove-lane:${laneIndex}`,
                     label: "remove lane",
                     coalesce: false,
                 }
@@ -7898,7 +7944,7 @@ export class EditorWidget {
 
         const typeLabel = document.createElement("span");
         typeLabel.style.cssText = `font-size: 10px; color: ${editorAccent}; white-space: nowrap; font-weight: bold;`;
-        typeLabel.textContent = type === "clip" ? (isMotionDriverClip ? "Motion Driver" : "Video Clip") : type === "audio" ? "Audio Track" : "Guide Frame";
+        typeLabel.textContent = type === "clip" ? (isMotionDriverClip ? "Driver" : "Video Clip") : type === "audio" ? "Audio Track" : "Guide Frame";
         editor.appendChild(typeLabel);
 
         if (type === "clip" || type === "audio") {
@@ -8965,6 +9011,9 @@ export class EditorWidget {
 
         return this._withTimelineMutationCommit("moveItem", async () => {
             try {
+                if (this._hasDriverLaneCollision()) {
+                    throw new Error("Only one driver clip is allowed per driver lane.");
+                }
                 const operations = [];
                 const dragItemsOrig = this._dragItemsOrig || [];
                 const draggedClipIds = new Set(dragItemsOrig.filter(o => o.type === "clip").map(o => o.id));
@@ -9210,6 +9259,11 @@ export class EditorWidget {
         const applyLinked = this._isLinkedItem(hit);
         if (applyLinked && this._expandItemsWithLinked([hit]).some((item) => this._isItemLocked(item))) {
             notifyWarning("Split refused because one or more linked items are locked.", { source: "timeline-split-refused" });
+            return;
+        }
+        const splitTargets = applyLinked ? this._expandItemsWithLinked([hit]) : [hit];
+        if (splitTargets.some((item) => item?.type === "clip" && this._isMotionDriverClip(item.data))) {
+            notifyWarning("Driver clips cannot be split.", { source: "timeline-split-refused" });
             return;
         }
 
@@ -11259,6 +11313,47 @@ export class EditorWidget {
             }
         }
 
+        const driverLaneCount = Math.max(1, parseInt(this.activeScene.motion_driver_lane_count, 10) || 1);
+        const driverLaneConfigs = [];
+        for (let i = 0; i < driverLaneCount; i++) {
+            const cfg = (this.activeScene.motion_driver_lane_configs || [])[i] || {};
+            driverLaneConfigs.push({
+                name: cfg.name || "",
+                color: cfg.color || "",
+                locked: !!cfg.locked,
+                hidden: !!cfg.hidden,
+            });
+        }
+        const driverClipSnapshots = [];
+        for (const clip of (this.activeScene.clips || [])) {
+            if (!this._isMotionDriverClip(clip)) continue;
+            if ((clip.timeline_start_frame || 0) < snapshotEnd && (clip.timeline_end_frame || 0) > snapshotStart) {
+                driverClipSnapshots.push({
+                    clip_id: clip.clip_id || "",
+                    source_path: clip.source_path || "",
+                    timeline_start_frame: clip.timeline_start_frame || 0,
+                    timeline_end_frame: clip.timeline_end_frame || 0,
+                    source_in_frame: clip.source_in_frame || 0,
+                    source_out_frame: clip.source_out_frame || 0,
+                    total_source_frames: clip.total_source_frames || 0,
+                    source_origin_frame: clip.source_origin_frame || 0,
+                    opacity: clip.opacity ?? 1.0,
+                    track_index: clip.track_index || 0,
+                    role: "motion_driver",
+                    strength: clip.strength ?? 1.0,
+                    muted: !!clip.muted,
+                    fit_mode: clip.fit_mode || this._defaultFitMode(),
+                    crop_position: clip.crop_position || this._defaultCropPosition(),
+                    prompt: clip.prompt || "",
+                    is_generated: !!clip.is_generated,
+                    generation_params: clip.generation_params || {},
+                    takes: Array.isArray(clip.takes) ? clip.takes : [],
+                    active_take: clip.active_take || 0,
+                    take_metadata: clip.take_metadata || {},
+                });
+            }
+        }
+
         return {
             scene_id: range.sceneId,
             scene_name: range.sceneName,
@@ -11272,6 +11367,9 @@ export class EditorWidget {
             mask_pre_offset: maskPreOffset,
             mask_post_offset: maskPostOffset,
             guide_frame_snapshots: guideFrameSnapshots,
+            driver_clip_snapshots: driverClipSnapshots,
+            driver_lane_count: driverLaneCount,
+            driver_lane_configs: driverLaneConfigs,
             prompt_sections: promptSections,
             scene_width: Math.max(0, parseInt(this.activeScene.width, 10) || 0),
             scene_height: Math.max(0, parseInt(this.activeScene.height, 10) || 0),

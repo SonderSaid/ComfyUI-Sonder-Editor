@@ -608,6 +608,53 @@ def _ensure_scene_lane_config_lengths(scene: Scene) -> None:
     _set_scene_lane_count(scene, "audio", _scene_lane_count(scene, "audio"))
 
 
+def _validate_single_driver_per_lane(scene: Scene) -> None:
+    lane_count = _scene_lane_count(scene, "motion_driver")
+    occupied: dict[int, str] = {}
+    for clip in getattr(scene, "clips", []) or []:
+        if getattr(clip, "role", "render") != "motion_driver":
+            continue
+        lane_index = int(getattr(clip, "track_index", 0) or 0)
+        if lane_index < 0 or lane_index >= lane_count:
+            _mutation_error(
+                f"Driver clip is on missing driver lane {lane_index}",
+                409,
+                "driver_lane_missing",
+            )
+        prior_clip_id = occupied.get(lane_index)
+        if prior_clip_id is not None:
+            _mutation_error(
+                "Only one driver clip is allowed per driver lane",
+                409,
+                "driver_lane_occupied",
+            )
+        occupied[lane_index] = getattr(clip, "clip_id", "") or ""
+
+
+def _preflight_driver_lane_target(scene: Scene, clip: ClipReference, target_role: str, target_lane: int) -> None:
+    if target_role != "motion_driver":
+        return
+    lane_count = _scene_lane_count(scene, "motion_driver")
+    if target_lane < 0 or target_lane >= lane_count:
+        _mutation_error(
+            f"Driver clip is on missing driver lane {target_lane}",
+            409,
+            "driver_lane_missing",
+        )
+    clip_id = getattr(clip, "clip_id", "") or ""
+    for other in getattr(scene, "clips", []) or []:
+        if other is clip or (clip_id and getattr(other, "clip_id", "") == clip_id):
+            continue
+        if getattr(other, "role", "render") != "motion_driver":
+            continue
+        if int(getattr(other, "track_index", 0) or 0) == target_lane:
+            _mutation_error(
+                "Only one driver clip is allowed per driver lane",
+                409,
+                "driver_lane_occupied",
+            )
+
+
 def _find_clip(scene: Scene, clip_id: str) -> ClipReference:
     clip = next((c for c in scene.clips if c.clip_id == clip_id), None)
     if not clip:
@@ -1070,6 +1117,8 @@ def _apply_linked_bounds_update(project: TimelineProject, scene: Scene, anchor_r
 
 
 def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int) -> ClipReference:
+    if getattr(clip, "role", "render") == "motion_driver":
+        _mutation_error("Driver clips cannot be split", 409, "driver_clip_split_refused")
     if split_frame <= clip.timeline_start_frame or split_frame >= clip.timeline_end_frame:
         _mutation_error("Split frame must be within clip range", 400, "invalid_range")
     source_offset = split_frame - clip.timeline_start_frame
@@ -1151,6 +1200,14 @@ def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int, apply_
     refs = _expand_linked_refs(scene, [anchor_ref], apply_linked)
     _require_link_refs_unlocked(scene, refs)
     split_frame = _mutation_int(split_frame, "frame")
+    for ref in refs:
+        item_type, item_id = _link_ref_key(ref)
+        if item_type != "clip":
+            continue
+        clip = _find_clip(scene, item_id)
+        start, end = _item_bounds(scene, ref)
+        if start < split_frame < end and getattr(clip, "role", "render") == "motion_driver":
+            _mutation_error("Driver clips cannot be split", 409, "driver_clip_split_refused")
     left_refs = []
     right_refs = []
     split_results = {}
@@ -1294,7 +1351,7 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
 
 
 def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_policy: str, target_lane: int | None = None) -> None:
-    if lane_type not in {"video", "audio"}:
+    if lane_type not in {"video", "motion_driver", "audio"}:
         _mutation_error(f"Cannot remove lane type: {lane_type}", 400)
     lane_index = _mutation_int(lane_index, "lane_index")
     current_count = _scene_lane_count(scene, lane_type)
@@ -1306,6 +1363,12 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
 
     if lane_type == "video":
         lane_items = [clip for clip in scene.clips if _is_render_clip(clip) and int(clip.track_index or 0) == lane_index]
+    elif lane_type == "motion_driver":
+        lane_items = [
+            clip for clip in scene.clips
+            if getattr(clip, "role", "render") == "motion_driver"
+            and int(clip.track_index or 0) == lane_index
+        ]
     else:
         lane_items = [track for track in scene.audio_tracks if int(track.lane_index or 0) == lane_index]
 
@@ -1321,12 +1384,12 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
             _mutation_error("Invalid target lane", 400)
         _require_lane_unlocked(scene, lane_type, target_lane)
         for item in lane_items:
-            if lane_type == "video":
+            if lane_type in {"video", "motion_driver"}:
                 item.track_index = target_lane
             else:
                 item.lane_index = target_lane
     elif lane_items and item_policy == "delete_items":
-        if lane_type == "video":
+        if lane_type in {"video", "motion_driver"}:
             deleting = {item.clip_id for item in lane_items}
             scene.clips = [clip for clip in scene.clips if clip.clip_id not in deleting]
         else:
@@ -1341,6 +1404,13 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
                 clip.track_index = max(0, int(clip.track_index or 0) - 1)
         scene.video_lane_count = current_count - 1
         _trim_lane_configs(scene.video_lane_configs, lane_index, scene.video_lane_count)
+    elif lane_type == "motion_driver":
+        for clip in scene.clips:
+            if getattr(clip, "role", "render") == "motion_driver" and int(clip.track_index or 0) > lane_index:
+                clip.track_index = max(0, int(clip.track_index or 0) - 1)
+        scene.motion_driver_lane_count = current_count - 1
+        _trim_lane_configs(scene.motion_driver_lane_configs, lane_index, scene.motion_driver_lane_count)
+        _validate_single_driver_per_lane(scene)
     else:
         for track in scene.audio_tracks:
             if int(track.lane_index or 0) > lane_index:
@@ -1373,10 +1443,12 @@ def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fie
         if target_role not in {"render", "motion_driver"}:
             _mutation_error(f"Invalid clip role: {target_role}", 400)
         if target_role == "motion_driver" and _clip_source_asset_type(project, clip) != "video":
-            _mutation_error("Motion-driver clips require video assets", 400)
+            _mutation_error("Driver clips require video assets", 400)
+    target_lane = int(fields.get("track_index", getattr(clip, "track_index", 0)) or 0)
+    _preflight_driver_lane_target(scene, clip, target_role, target_lane)
     if "track_index" in fields:
         target_lane_type = "video" if target_role in {"", "render"} else "motion_driver"
-        _require_lane_unlocked(scene, target_lane_type, int(fields["track_index"]))
+        _require_lane_unlocked(scene, target_lane_type, target_lane)
 
     if "timeline_start_frame" in fields:
         new_start = max(0, int(fields["timeline_start_frame"]))
@@ -1406,6 +1478,7 @@ def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fie
         clip.fit_mode = _validated_fit_mode(fields["fit_mode"])
     if "crop_position" in fields:
         clip.crop_position = _validated_crop_position(fields["crop_position"])
+    _validate_single_driver_per_lane(scene)
     return clip
 
 
@@ -1938,6 +2011,7 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
         _apply_scene_mutation_operation(project, scene, operation)
         for operation in operations
     ]
+    _validate_single_driver_per_lane(scene)
 
     save_project(project)
     return project, {
@@ -1956,6 +2030,9 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         "pre_context_frames",
         "post_context_frames",
         "guide_frame_snapshots",
+        "driver_clip_snapshots",
+        "driver_lane_count",
+        "driver_lane_configs",
         "prompt_sections",
         "scene_prompt",
         "scene_width",
@@ -1992,6 +2069,9 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         mask_pre_offset=int(body.get("mask_pre_offset", 0)),
         mask_post_offset=int(body.get("mask_post_offset", 0)),
         guide_frame_snapshots=list(body.get("guide_frame_snapshots", []) or []),
+        driver_clip_snapshots=list(body.get("driver_clip_snapshots", []) or []),
+        driver_lane_count=max(1, int(body.get("driver_lane_count", 1) or 1)),
+        driver_lane_configs=list(body.get("driver_lane_configs", []) or []),
         prompt_sections=list(body.get("prompt_sections", []) or []),
         scene_width=int(body.get("scene_width", 0)),
         scene_height=int(body.get("scene_height", 0)),
@@ -5330,6 +5410,11 @@ if routes is not None:
         while len(scene.audio_lane_configs) < scene.audio_lane_count:
             scene.audio_lane_configs.append(LaneConfig())
 
+        try:
+            _validate_single_driver_per_lane(scene)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
+
         save_project(project)
         return web.json_response(scene.to_dict())
 
@@ -5444,6 +5529,11 @@ if routes is not None:
             scene.motion_driver_lane_configs.append(LaneConfig())
         while len(scene.audio_lane_configs) < scene.audio_lane_count:
             scene.audio_lane_configs.append(LaneConfig())
+
+        try:
+            _validate_single_driver_per_lane(scene)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         save_project(project)
         return web.json_response(scene.to_dict())
@@ -5573,6 +5663,109 @@ if routes is not None:
             "source": source_label,
             "guides": rows,
             "all_guide_keys": all_guide_keys,
+        })
+
+    @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-drivers")
+    async def api_bridge_drivers(request: web.Request) -> web.Response:
+        """Return Driver lane state for the Sonder Driver Bridge panel.
+
+        This panel is informational. Execution remains authoritative through
+        the project._execution_context queue_job_ref_id consumed by the node.
+        """
+        try:
+            project = await asyncio.to_thread(_load_project_from_request, request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        scene_id = request.match_info["scene_id"]
+        scene = project.get_scene(scene_id)
+        if not scene:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+
+        active_job = None
+        for job in getattr(project, "generation_queue", []) or []:
+            if getattr(job, "scene_id", "") != scene_id:
+                continue
+            if str(getattr(job, "status", "") or "").lower() != "running":
+                continue
+            params = getattr(job, "params", {}) or {}
+            try:
+                snap_ver = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
+            except (TypeError, ValueError):
+                snap_ver = 0
+            if snap_ver > 0:
+                active_job = job
+                break
+
+        if active_job is not None:
+            lane_count = max(1, int(getattr(active_job, "driver_lane_count", 1) or 1))
+            lane_configs = [
+                LaneConfig.from_dict(item) if isinstance(item, dict) else item
+                for item in (getattr(active_job, "driver_lane_configs", []) or [])
+            ]
+            clips = [
+                ClipReference.from_dict(item)
+                for item in (getattr(active_job, "driver_clip_snapshots", []) or [])
+                if isinstance(item, dict)
+            ]
+            source_label = "snapshot"
+        else:
+            lane_count = max(1, int(getattr(scene, "motion_driver_lane_count", 1) or 1))
+            lane_configs = list(getattr(scene, "motion_driver_lane_configs", []) or [])
+            clips = list(getattr(scene, "clips", []) or [])
+            source_label = "live"
+
+        while len(lane_configs) < lane_count:
+            lane_configs.append(LaneConfig())
+
+        def _asset_name_for_source(source_path: str) -> str:
+            norm = str(source_path or "").replace("\\", "/")
+            for asset in getattr(project, "assets", []) or []:
+                if str(getattr(asset, "path", "") or "").replace("\\", "/") == norm:
+                    return getattr(asset, "name", "") or os.path.basename(norm)
+            return os.path.basename(norm) if norm else ""
+
+        rows = []
+        all_driver_keys = []
+        for lane_index in range(lane_count):
+            cfg = lane_configs[lane_index]
+            lane_name = getattr(cfg, "name", "") or f"Driver {lane_index + 1}"
+            hidden = bool(getattr(cfg, "hidden", False))
+            lane_key = f"lane:{lane_index}"
+            all_driver_keys.append(lane_key)
+            lane_clips = [
+                clip for clip in clips
+                if getattr(clip, "role", "render") == "motion_driver"
+                and int(getattr(clip, "track_index", 0) or 0) == lane_index
+            ]
+            lane_clips.sort(key=lambda clip: int(getattr(clip, "timeline_start_frame", 0) or 0))
+            clip = lane_clips[0] if lane_clips else None
+            source_path = str(getattr(clip, "source_path", "") or "") if clip else ""
+            rows.append({
+                "lane_key": lane_key,
+                "lane_index": lane_index,
+                "lane_name": lane_name,
+                "hidden": hidden,
+                "has_clip": clip is not None,
+                "clip_id": getattr(clip, "clip_id", "") if clip else "",
+                "asset_name": _asset_name_for_source(source_path) or "Driver",
+                "source_path": source_path,
+                "start_frame": int(getattr(clip, "timeline_start_frame", 0) or 0) if clip else 0,
+                "end_frame": int(getattr(clip, "timeline_end_frame", 0) or 0) if clip else 0,
+                "strength": float(getattr(clip, "strength", 0.0) or 0.0) if clip else 0.0,
+                "editor_muted": hidden or (bool(getattr(clip, "muted", False)) if clip else False),
+                "duplicate_count": max(0, len(lane_clips) - 1),
+                "source": source_label,
+            })
+
+        return web.json_response({
+            "window_start": 0,
+            "window_end": max(0, int(getattr(scene, "duration_frames", 0) or 0)),
+            "scene_name": getattr(scene, "name", "") or scene_id,
+            "source": source_label,
+            "driver_lane_count": lane_count,
+            "drivers": rows,
+            "all_driver_keys": all_driver_keys,
         })
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-payload")
@@ -5821,7 +6014,7 @@ if routes is not None:
         if role not in {"render", "motion_driver"}:
             return _json_error(f"Invalid clip role: {role}", 400)
         if role == "motion_driver" and asset.asset_type != "video":
-            return _json_error("Motion-driver clips require video assets", 400)
+            return _json_error("Driver clips require video assets", 400)
         start_frame = int(body.get("timeline_start_frame", 0))
         frame_count = _valid_source_frame_count(asset)
         if asset.asset_type == "video" and frame_count <= 0:
@@ -5858,6 +6051,11 @@ if routes is not None:
             crop_position=clip_crop_position,
         )
         scene.clips.append(clip)
+        try:
+            _validate_single_driver_per_lane(scene)
+        except ProjectMutationRequestError as e:
+            scene.clips = [existing for existing in scene.clips if existing is not clip]
+            return _mutation_json_error(e)
 
         # Dual drop: also create audio track if video has audio
         # Wrapped in try/except so audio extraction failure doesn't prevent clip creation
@@ -5951,54 +6149,9 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
         try:
-            _require_clip_unlocked(scene, clip)
-            if "track_index" in body:
-                target_role = body.get("role", getattr(clip, "role", "render"))
-                _require_lane_unlocked(scene, "motion_driver" if target_role == "motion_driver" else "video", int(body["track_index"]))
+            clip = _apply_update_clip(project, scene, clip_id, body)
         except ProjectMutationRequestError as e:
             return _mutation_json_error(e)
-
-        if "timeline_start_frame" in body:
-            new_start = int(body["timeline_start_frame"])
-            if "timeline_end_frame" not in body:
-                # Move: preserve duration
-                duration = clip.timeline_end_frame - clip.timeline_start_frame
-                clip.timeline_start_frame = max(0, new_start)
-                clip.timeline_end_frame = clip.timeline_start_frame + duration
-            else:
-                clip.timeline_start_frame = max(0, new_start)
-
-        if "timeline_end_frame" in body:
-            clip.timeline_end_frame = int(body["timeline_end_frame"])
-        if "source_in_frame" in body:
-            clip.source_in_frame = int(body["source_in_frame"])
-        if "source_out_frame" in body:
-            clip.source_out_frame = int(body["source_out_frame"])
-        if "opacity" in body:
-            clip.opacity = float(body["opacity"])
-        if "track_index" in body:
-            clip.track_index = int(body["track_index"])
-        if "role" in body:
-            role = body["role"]
-            if role not in {"render", "motion_driver"}:
-                return _json_error(f"Invalid clip role: {role}", 400)
-            if role == "motion_driver" and _clip_source_asset_type(project, clip) != "video":
-                return _json_error("Motion-driver clips require video assets", 400)
-            clip.role = role
-        if "strength" in body:
-            clip.strength = float(body["strength"])
-        if "muted" in body:
-            clip.muted = bool(body["muted"])
-        if "fit_mode" in body:
-            mode = str(body["fit_mode"] or "").strip().lower()
-            if mode not in FIT_MODES:
-                return _json_error(f"Invalid fit_mode: {body['fit_mode']}", 400)
-            clip.fit_mode = mode
-        if "crop_position" in body:
-            pos = str(body["crop_position"] or "").strip().lower()
-            if pos not in CROP_POSITIONS:
-                return _json_error(f"Invalid crop_position: {body['crop_position']}", 400)
-            clip.crop_position = pos
 
         save_project(project)
         return web.json_response(clip.to_dict())

@@ -1111,14 +1111,15 @@ export function getEditorSettings() {
 }
 
 // Maps browser-local notification settings to the editor_notifications Core
-// config shape (ms; 0 = sticky). `toastDurationMs` drives info+success;
-// `errorToastDurationMs` drives error (0 = stay until dismissed). Warnings stay
-// sticky by design. Callers push this into `configureNotifications()`.
+// config shape (ms; 0 = sticky). `toastDurationMs` drives info/success/warning;
+// `errorToastDurationMs` drives error (0 = stay until dismissed). Callers push
+// this into `configureNotifications()`.
 export function notificationCoreConfig(settings = currentSettings) {
     const n = settings?.notifications || DEFAULT_EDITOR_SETTINGS.notifications;
     return {
         info: n.toastDurationMs,
         success: n.toastDurationMs,
+        warning: n.toastDurationMs,
         error: n.errorToastDurationMs,
     };
 }

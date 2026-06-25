@@ -15,14 +15,19 @@ const { api } = window.comfyAPI.api;
 const EXT_NAME = "sonder.bridge";
 const TARGET_START = "SonderGuidesBridgeStart";
 const TARGET_END = "SonderGuidesBridgeEnd";
+const TARGET_DRIVER = "SonderDriverBridge";
 const MAX_PASSTHROUGH = 8; // mirror SONDER_BRIDGE_MAX_PASSTHROUGH default
 const VALUE_RE = /^value_(\d+)$/;
 const NODE_STATE = Symbol("sonderBridgeState");
 const OVERRIDES_WIDGET = "bridge_overrides_json";
+const DRIVER_LANE_WIDGET = "driver_lane_index";
+const DRIVER_OVERRIDES_WIDGET = "driver_bridge_overrides_json";
 
 const isStart = (node) => node?.comfyClass === TARGET_START;
 const isEnd = (node) => node?.comfyClass === TARGET_END;
+const isDriverBridge = (node) => node?.comfyClass === TARGET_DRIVER;
 const isBridge = (node) => isStart(node) || isEnd(node);
+const isAnySonderBridge = (node) => isBridge(node) || isDriverBridge(node);
 
 const TYPE_ALIASES = new Map([
     ["AUDIO", "AUDIO"],
@@ -272,6 +277,11 @@ const ensureNodeState = (node) => {
         guideList: null,
         guideStatus: null,
         guideRefreshToken: 0,
+        driverPanel: null,
+        driverSelect: null,
+        driverList: null,
+        driverStatus: null,
+        driverRefreshToken: 0,
     };
     node[NODE_STATE] = state;
     return state;
@@ -649,9 +659,296 @@ function installGuidePanel(node) {
     refreshBridgeGuidePanel(node);
 }
 
+const readDriverOverrides = (node) => {
+    const widget = findWidget(node, DRIVER_OVERRIDES_WIDGET);
+    const raw = widget?.value || "{}";
+    try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw || "{}") : raw;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+        const drivers = parsed.drivers;
+        return drivers && typeof drivers === "object" && !Array.isArray(drivers) ? drivers : parsed;
+    } catch (_) {
+        return {};
+    }
+};
+
+const writeDriverOverrides = (node, overrides) => {
+    const widget = findWidget(node, DRIVER_OVERRIDES_WIDGET);
+    if (!widget) return;
+    const compact = {};
+    for (const [key, value] of Object.entries(overrides || {})) {
+        if (!key || !value || typeof value !== "object" || typeof value.muted !== "boolean") continue;
+        compact[key] = { muted: value.muted };
+    }
+    const serialized = JSON.stringify({ drivers: compact });
+    widget.value = serialized;
+    widget.callback?.call(widget, serialized);
+    app.graph.setDirtyCanvas?.(true, true);
+};
+
+const driverLaneWidgetValue = (node) => {
+    const widget = findWidget(node, DRIVER_LANE_WIDGET);
+    const value = parseInt(widget?.value, 10);
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+};
+
+const setDriverLaneWidgetValue = (node, value) => {
+    const widget = findWidget(node, DRIVER_LANE_WIDGET);
+    if (!widget) return;
+    const next = Math.max(0, parseInt(value, 10) || 0);
+    widget.value = next;
+    widget.callback?.call(widget, next);
+    app.graph.setDirtyCanvas?.(true, true);
+};
+
+async function loadLinkedEditorDrivers(node) {
+    const editorNode = linkedNodeFromInput(node, "project");
+    const controllerState = editorNode?._sonderController?.state || null;
+    const projectDir = controllerState?.projectDir || "";
+    const projectId = projectIdFromDir(projectDir);
+    if (!projectId) {
+        return { status: "Connect a Sonder Editor project.", drivers: [], linked: false };
+    }
+
+    const sceneId = controllerState?.sceneId || controllerState?.dormantSummary?.active_scene?.scene_id || "";
+    if (!sceneId) {
+        return { status: "No active scene.", drivers: [], linked: false };
+    }
+
+    const url = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-drivers`;
+    const resp = await fetch(api.apiURL(url));
+    if (!resp.ok) {
+        throw new Error(`Bridge driver fetch failed: ${resp.status}`);
+    }
+    const payload = await resp.json();
+    const rows = Array.isArray(payload?.drivers) ? payload.drivers : [];
+    const sourceLabel = payload?.source === "snapshot" ? "Snapshot drivers for running job" : "Live editor drivers";
+    const sceneName = payload?.scene_name || "Scene";
+    const ws = payload?.window_start ?? 0;
+    const we = payload?.window_end ?? 0;
+    return {
+        status: `${sourceLabel} - ${sceneName} f${ws}-${we}`,
+        drivers: rows,
+        all_driver_keys: Array.isArray(payload?.all_driver_keys) ? payload.all_driver_keys : null,
+        linked: true,
+    };
+}
+
+function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
+    const state = ensureNodeState(node);
+    if (!state.driverList || !state.driverStatus || !state.driverSelect) return;
+    state.driverStatus.textContent = payload.status || "";
+    state.driverList.innerHTML = "";
+
+    const drivers = payload.drivers || [];
+    const selectedLane = driverLaneWidgetValue(node);
+    state.driverSelect.innerHTML = "";
+    for (const driver of drivers) {
+        const option = document.createElement("option");
+        option.value = String(driver.lane_index);
+        option.textContent = driver.lane_name || `Driver ${driver.lane_index + 1}`;
+        state.driverSelect.appendChild(option);
+    }
+    if (!drivers.some((driver) => driver.lane_index === selectedLane)) {
+        const option = document.createElement("option");
+        option.value = String(selectedLane);
+        option.textContent = `Missing lane ${selectedLane + 1}`;
+        state.driverSelect.appendChild(option);
+    }
+    state.driverSelect.value = String(selectedLane);
+
+    const allKeys = Array.isArray(payload.all_driver_keys) ? payload.all_driver_keys : null;
+    const overrides = readDriverOverrides(node);
+    if (allKeys) {
+        const sceneKeys = new Set(allKeys.filter(Boolean));
+        const stale = Object.keys(overrides).filter((k) => !sceneKeys.has(k));
+        if (stale.length) {
+            const cleaned = { ...overrides };
+            for (const k of stale) delete cleaned[k];
+            writeDriverOverrides(node, cleaned);
+            for (const k of stale) delete overrides[k];
+        }
+    }
+
+    if (!drivers.length) {
+        if (payload.linked) {
+            const empty = style(document.createElement("div"), "color:#8b96a3;font-size:10px;padding:3px 0;");
+            empty.textContent = "No driver lanes in scene.";
+            state.driverList.appendChild(empty);
+        }
+        return;
+    }
+
+    const selectedDriver = drivers.find((driver) => driver.lane_index === selectedLane) || null;
+    if (!selectedDriver) {
+        const missing = style(document.createElement("div"), "color:#8b96a3;font-size:10px;padding:3px 0;");
+        missing.textContent = `Selected Driver ${selectedLane + 1} is not available in this scene.`;
+        state.driverList.appendChild(missing);
+        return;
+    }
+
+    for (const driver of [selectedDriver]) {
+        const row = style(document.createElement("div"), `
+            display:grid;
+            grid-template-columns:72px 1fr 88px;
+            gap:6px;
+            align-items:center;
+            padding:3px 0;
+            border-top:1px solid rgba(255,255,255,0.06);
+            cursor:pointer;
+        `);
+        const lane = style(document.createElement("span"), "color:#9db5cf;font-size:10px;font-family:monospace;");
+        lane.textContent = `D${driver.lane_index + 1}`;
+        const name = style(document.createElement("span"), "color:#dbe4ed;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;");
+        const clipLabel = driver.has_clip
+            ? `${driver.asset_name || "Driver"} f${driver.start_frame}-${driver.end_frame}`
+            : "No clip";
+        name.textContent = `${driver.lane_name || `Driver ${driver.lane_index + 1}`} - ${clipLabel}`;
+        name.title = name.textContent;
+        const key = driver.lane_key || `lane:${driver.lane_index}`;
+        const override = overrides[key];
+        const mode = override && typeof override.muted === "boolean"
+            ? (override.muted ? "off" : "on")
+            : "auto";
+        const inheritedMuted = !!driver.editor_muted || !driver.has_clip;
+        const bg = mode === "off"
+            ? "rgba(135,52,60,0.85)"
+            : mode === "on"
+                ? "rgba(38,99,66,0.85)"
+                : (inheritedMuted ? "rgba(70,55,60,0.7)" : "rgba(45,70,58,0.7)");
+        const btn = style(document.createElement("button"), `
+            border:1px solid rgba(126,168,201,0.35);
+            border-radius:5px;
+            background:${bg};
+            color:#f2f7fb;
+            font-size:10px;
+            padding:2px 5px;
+            cursor:pointer;
+        `);
+        const labels = {
+            auto: inheritedMuted ? "Inherit (off)" : "Inherit (on)",
+            off: "Bridge mute",
+            on: "Bridge on",
+        };
+        btn.textContent = labels[mode];
+        btn.title = "Click to cycle Inherit / Bridge mute / Bridge on for this bridge only";
+        btn.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const nextOverrides = readDriverOverrides(node);
+            if (mode === "auto") {
+                nextOverrides[key] = { muted: true };
+            } else if (mode === "off") {
+                nextOverrides[key] = { muted: false };
+            } else {
+                delete nextOverrides[key];
+            }
+            writeDriverOverrides(node, nextOverrides);
+            renderDriverPanel(node, payload);
+        });
+        row.append(lane, name, btn);
+        state.driverList.appendChild(row);
+    }
+}
+
+function refreshBridgeDriverPanel(node) {
+    if (!isDriverBridge(node)) return;
+    const state = ensureNodeState(node);
+    if (!state.driverPanel) return;
+
+    const editorNode = linkedNodeFromInput(node, "project");
+    const controller = editorNode?._sonderController || null;
+    if (controller && !controller.state?.projectDir && typeof controller.whenProjectReady === "function") {
+        controller.whenProjectReady(() => refreshBridgeDriverPanel(node));
+    }
+
+    const token = ++state.driverRefreshToken;
+    state.driverStatus.textContent = "Loading drivers...";
+    loadLinkedEditorDrivers(node)
+        .then((payload) => {
+            if (token !== state.driverRefreshToken) return;
+            renderDriverPanel(node, payload);
+        })
+        .catch((error) => {
+            if (token !== state.driverRefreshToken) return;
+            renderDriverPanel(node, {
+                status: error?.message || "Driver panel failed.",
+                drivers: [],
+                linked: false,
+            });
+        });
+}
+
+function installDriverPanel(node) {
+    if (!isDriverBridge(node) || typeof node.addDOMWidget !== "function") return;
+    const state = ensureNodeState(node);
+    if (state.driverPanel) return;
+    const wrapper = style(document.createElement("div"), `
+        display:flex;
+        flex-direction:column;
+        gap:5px;
+        width:100%;
+        box-sizing:border-box;
+        padding-top:2px;
+    `);
+    const header = style(document.createElement("div"), `
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        gap:6px;
+        color:#cfd7df;
+        font-size:10px;
+        font-weight:700;
+    `);
+    const title = document.createElement("span");
+    title.textContent = "Driver Bridge";
+    const refreshBtn = style(document.createElement("button"), `
+        border:1px solid rgba(126,168,201,0.35);
+        border-radius:5px;
+        background:rgba(14,19,25,0.92);
+        color:#dbe4ed;
+        font-size:10px;
+        padding:2px 6px;
+        cursor:pointer;
+    `);
+    refreshBtn.textContent = "Refresh";
+    refreshBtn.addEventListener("click", () => refreshBridgeDriverPanel(node));
+    header.append(title, refreshBtn);
+
+    const select = style(document.createElement("select"), `
+        width:100%;
+        box-sizing:border-box;
+        background:#17202a;
+        color:#e6edf3;
+        border:1px solid rgba(126,168,201,0.35);
+        border-radius:5px;
+        padding:3px 5px;
+        font-size:10px;
+    `);
+    select.addEventListener("change", () => {
+        setDriverLaneWidgetValue(node, select.value);
+        refreshBridgeDriverPanel(node);
+    });
+    const status = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;");
+    const list = style(document.createElement("div"), "display:flex;flex-direction:column;max-height:138px;overflow:auto;");
+    wrapper.append(header, select, status, list);
+    const domWidget = node.addDOMWidget("sonder_driver_bridge_panel", "SonderDriverBridgePanel", wrapper, {
+        serialize: false,
+        hideOnZoom: false,
+        getMinHeight: () => 92,
+        getMaxHeight: () => 196,
+        getHeight: () => 172,
+    });
+    domWidget.computeSize = (width) => [width, 172];
+    state.driverPanel = wrapper;
+    state.driverSelect = select;
+    state.driverStatus = status;
+    state.driverList = list;
+    refreshBridgeDriverPanel(node);
+}
+
 // ── Per-node install ─────────────────────────────────────────────────
 const installNode = (node) => {
-    if (!isBridge(node)) return;
+    if (!isAnySonderBridge(node)) return;
     const state = ensureNodeState(node);
     if (state.initialized) return;
     state.initialized = true;
@@ -664,15 +961,24 @@ const installNode = (node) => {
         installGuidePanel(node);
     }
 
+    if (isDriverBridge(node)) {
+        const laneWidget = (node.widgets || []).find((w) => w?.name === DRIVER_LANE_WIDGET);
+        if (laneWidget) hideWidget(laneWidget);
+        const overridesWidget = (node.widgets || []).find((w) => w?.name === DRIVER_OVERRIDES_WIDGET);
+        if (overridesWidget) hideWidget(overridesWidget);
+        installDriverPanel(node);
+    }
+
     const original = node.onConnectionsChange;
     node.onConnectionsChange = function (...args) {
         const result = original?.apply(this, args);
         try {
-            refreshNodeShape(this);
+            if (isBridge(this)) refreshNodeShape(this);
             if (isStart(this)) {
                 mirrorProjectWire(this);
                 refreshBridgeGuidePanel(this);
             }
+            if (isDriverBridge(this)) refreshBridgeDriverPanel(this);
         } catch (e) {
             console.warn("[Sonder Bridge] connection-change handler error:", e);
         }
@@ -681,13 +987,14 @@ const installNode = (node) => {
 
     // Defer initial shape so post-load connection state is settled before measuring.
     window.setTimeout(() => {
-        if (!isBridge(node)) return;
+        if (!isAnySonderBridge(node)) return;
         try {
-            refreshNodeShape(node);
+            if (isBridge(node)) refreshNodeShape(node);
             if (isStart(node)) {
                 mirrorProjectWire(node);
                 refreshBridgeGuidePanel(node);
             }
+            if (isDriverBridge(node)) refreshBridgeDriverPanel(node);
         } catch (e) {
             console.warn("[Sonder Bridge] initial-shape error:", e);
         }
@@ -697,7 +1004,7 @@ const installNode = (node) => {
 app.registerExtension({
     name: EXT_NAME,
     async nodeCreated(node) {
-        if (!isBridge(node)) return;
+        if (!isAnySonderBridge(node)) return;
         installNode(node);
     },
 });
