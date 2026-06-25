@@ -244,6 +244,8 @@ def test_scene_roundtrip():
         "end": 96,
         "pre_context_frames": 8,
         "post_context_frames": 12,
+        "mask_pre_offset": 4,
+        "mask_post_offset": 6,
     }]
 
     data = scene.to_dict()
@@ -261,10 +263,12 @@ def test_scene_roundtrip():
     assert restored.asset_ids == ["img001", "img002", "vid001"]
     assert restored.saved_selections[0]["pre_context_frames"] == 8
     assert restored.saved_selections[0]["post_context_frames"] == 12
+    assert restored.saved_selections[0]["mask_pre_offset"] == 4
+    assert restored.saved_selections[0]["mask_post_offset"] == 6
     assert restored.is_bridge is False
 
 
-def test_scene_saved_selection_defaults_context_fields():
+def test_scene_saved_selection_defaults_context_and_mask_fields():
     scene = Scene.from_dict({
         "name": "Legacy Scene",
         "saved_selections": [{"name": "Old", "start": "4", "end": "20"}],
@@ -276,6 +280,8 @@ def test_scene_saved_selection_defaults_context_fields():
         "end": 20,
         "pre_context_frames": 0,
         "post_context_frames": 0,
+        "mask_pre_offset": 0,
+        "mask_post_offset": 0,
     }]
 
 

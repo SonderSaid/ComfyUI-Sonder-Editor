@@ -79,6 +79,56 @@ def test_workflow_endpoint_extracts_from_png_when_cache_empty(tmp_path, monkeypa
     assert payload == {"workflow": workflow, "source": "embedded"}
 
 
+def test_saved_selection_routes_preserve_mask_offsets(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene 1", duration_frames=120)
+    project = TimelineProject(project_dir=str(tmp_path / "project"), name="Project", scenes=[scene])
+    saved_projects = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saved_projects.append(saved_project))
+
+    post_handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections",
+    )
+    post_response = asyncio.run(post_handler(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={
+            "name": "Masked",
+            "start": 10,
+            "end": 42,
+            "pre_context_frames": 8,
+            "post_context_frames": 16,
+            "mask_pre_offset": 4,
+            "mask_post_offset": 12,
+        },
+    )))
+    post_payload = _response_json(post_response)
+
+    assert post_response.status == 200
+    assert post_payload["entry"]["mask_pre_offset"] == 4
+    assert post_payload["entry"]["mask_post_offset"] == 12
+    assert scene.saved_selections[0]["mask_pre_offset"] == 4
+    assert scene.saved_selections[0]["mask_post_offset"] == 12
+
+    put_handler = _route_handler(
+        route_module,
+        "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/saved_selections/{index}",
+    )
+    put_response = asyncio.run(put_handler(DummyRequest(
+        match_info={"scene_id": "scene-1", "index": "0"},
+        body={"mask_pre_offset": 6, "mask_post_offset": 18},
+    )))
+    put_payload = _response_json(put_response)
+
+    assert put_response.status == 200
+    assert put_payload["mask_pre_offset"] == 6
+    assert put_payload["mask_post_offset"] == 18
+    assert len(saved_projects) == 2
+
+
 def test_workflow_endpoint_returns_404_when_unavailable(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"

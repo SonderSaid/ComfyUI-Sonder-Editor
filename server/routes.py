@@ -6551,6 +6551,8 @@ if routes is not None:
             "end": _coerce_nonnegative_int(body.get("end", 0)),
             "pre_context_frames": _coerce_nonnegative_int(body.get("pre_context_frames", 0)),
             "post_context_frames": _coerce_nonnegative_int(body.get("post_context_frames", 0)),
+            "mask_pre_offset": _coerce_nonnegative_int(body.get("mask_pre_offset", 0)),
+            "mask_post_offset": _coerce_nonnegative_int(body.get("mask_post_offset", 0)),
         }
         scene.saved_selections.append(entry)
         save_project(project)
@@ -6586,6 +6588,10 @@ if routes is not None:
             scene.saved_selections[idx]["pre_context_frames"] = _coerce_nonnegative_int(body["pre_context_frames"])
         if "post_context_frames" in body:
             scene.saved_selections[idx]["post_context_frames"] = _coerce_nonnegative_int(body["post_context_frames"])
+        if "mask_pre_offset" in body:
+            scene.saved_selections[idx]["mask_pre_offset"] = _coerce_nonnegative_int(body["mask_pre_offset"])
+        if "mask_post_offset" in body:
+            scene.saved_selections[idx]["mask_post_offset"] = _coerce_nonnegative_int(body["mask_post_offset"])
 
         save_project(project)
         return web.json_response(scene.saved_selections[idx])

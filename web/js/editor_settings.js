@@ -126,11 +126,12 @@ export const BUILTIN_MODEL_TEMPLATES = [
         builtIn: true,
         hintTier: 720,
         constraints: {
-            width: { step: 32, offset: 0, min: 64, max: 2048 },
-            height: { step: 32, offset: 0, min: 64, max: 2048 },
-            frames: { step: 8, offset: 1, min: 1, max: 257 },
-            fps: { min: 1, max: 120 },
-            batchMaxFrames: 97,
+            width: { step: 32, offset: 0, min: 64, max: 4096 },
+            height: { step: 32, offset: 0, min: 64, max: 4096 },
+            frames: { step: 8, offset: 1, min: 1, max: 481 },
+            fps: { min: 24, max: 50 },
+            batchMaxFrames: 121,
+            evenLatentDimensions: true,
         },
     },
 ];
@@ -453,6 +454,7 @@ function normalizeCustomTemplate(template, index = 0) {
     if (batchMaxFrames !== undefined) {
         constraints.batchMaxFrames = batchMaxFrames;
     }
+    constraints.evenLatentDimensions = template.constraints?.evenLatentDimensions !== false;
     const hintTier = coerceFiniteNumber(template.hintTier, { integer: true, min: 1 });
     return {
         id,
@@ -1198,19 +1200,42 @@ export function snapToConstraint(value, constraint) {
     return snapped;
 }
 
+function templateUsesEvenLatentDimensions(template) {
+    return !!template && template.id !== "free" && template.constraints?.evenLatentDimensions !== false;
+}
+
+function snapDimensionToTemplate(value, constraint, template) {
+    const snapped = Math.round(snapToConstraint(value, constraint));
+    if (!templateUsesEvenLatentDimensions(template)) return snapped;
+    const step = Number(constraint?.step);
+    if (!Number.isFinite(step) || step <= 0) return snapped;
+    const latentSize = snapped / step;
+    const roundedLatentSize = Math.round(latentSize);
+    if (Math.abs(latentSize - roundedLatentSize) > 1e-6 || roundedLatentSize % 2 === 0) {
+        return snapped;
+    }
+    const max = constraint?.max != null ? Number(constraint.max) : Infinity;
+    const min = constraint?.min != null ? Number(constraint.min) : -Infinity;
+    const up = snapped + step;
+    if (up <= max) return Math.round(up);
+    const down = snapped - step;
+    if (down >= min) return Math.round(down);
+    return snapped;
+}
+
 export function computeResolutionFromTier(c, a, b, template) {
     if (a <= 0 || b <= 0) return null;
     const rawW = Number(c) * Math.sqrt(a / b);
     const rawH = Number(c) * Math.sqrt(b / a);
-    const width = Math.round(snapToConstraint(rawW, template?.constraints?.width));
-    const height = Math.round(snapToConstraint(rawH, template?.constraints?.height));
+    const width = snapDimensionToTemplate(rawW, template?.constraints?.width, template);
+    const height = snapDimensionToTemplate(rawH, template?.constraints?.height, template);
     return { width, height };
 }
 
 export function snapResolution(width, height, template) {
     return {
-        width: Math.round(snapToConstraint(width, template?.constraints?.width)),
-        height: Math.round(snapToConstraint(height, template?.constraints?.height)),
+        width: snapDimensionToTemplate(width, template?.constraints?.width, template),
+        height: snapDimensionToTemplate(height, template?.constraints?.height, template),
     };
 }
 

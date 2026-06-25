@@ -654,6 +654,9 @@ function showSettingsPanel() {
             if ((template.constraints?.batchMaxFrames || 0) > 0) {
                 summaryParts.push(`batch: ${template.constraints.batchMaxFrames}`);
             }
+            if (template.id !== "free" && template.constraints?.evenLatentDimensions !== false) {
+                summaryParts.push("even latent dimensions");
+            }
             summary.textContent = summaryParts.join(" | ");
 
             card.append(head, summary);
@@ -778,6 +781,19 @@ function showSettingsPanel() {
         batchHelp.textContent = "Default batch chunk ceiling for this template. The active frame constraint still snaps/clamps the final chunk size.";
         form.appendChild(batchHelp);
 
+        const evenLatentRow = document.createElement("label");
+        evenLatentRow.style.cssText = "display:flex;align-items:center;gap:8px;margin-left:90px;font-size:10px;color:#d9e1e8;";
+        const evenLatentInput = document.createElement("input");
+        evenLatentInput.type = "checkbox";
+        evenLatentInput.checked = editingTemplate?.constraints?.evenLatentDimensions !== false;
+        evenLatentRow.append(evenLatentInput, document.createTextNode("Even latent dimensions"));
+        form.appendChild(evenLatentRow);
+
+        const evenLatentHelp = document.createElement("div");
+        evenLatentHelp.style.cssText = "margin-left:90px;font-size:10px;color:#8f9cab;line-height:1.4;";
+        evenLatentHelp.textContent = "After width/height snapping, round latent width and height to even values when the dimension step represents the latent scale.";
+        form.appendChild(evenLatentHelp);
+
         const actionRow = document.createElement("div");
         actionRow.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:4px;";
         const saveBtn = document.createElement("button");
@@ -804,6 +820,7 @@ function showSettingsPanel() {
             if (Number.isFinite(batchMaxFrames) && batchMaxFrames > 0) {
                 nextTemplate.constraints.batchMaxFrames = Math.round(batchMaxFrames);
             }
+            nextTemplate.constraints.evenLatentDimensions = !!evenLatentInput.checked;
             const nextCustomTemplates = editingTemplate
                 ? customTemplates.map((template) => template.id === editingTemplate.id ? nextTemplate : template)
                 : [...customTemplates, nextTemplate];

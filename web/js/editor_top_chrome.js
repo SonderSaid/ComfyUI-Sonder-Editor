@@ -362,6 +362,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
         widget._aspectRatioSelect.appendChild(option);
     }
     widget._aspectRatioSelect.addEventListener("change", () => {
+        widget._markResolutionSelectionPinned?.();
         widget._resetFreeAspectTierDraft();
         widget._updateResolutionInputMode();
         widget._recalculateResolution();
@@ -370,6 +371,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget._resTierSelect = document.createElement("select");
     widget._resTierSelect.style.cssText = topSelectCss({ width: "92px", fontSize: "9px", padding: "1px 4px" });
     widget._resTierSelect.addEventListener("change", () => {
+        widget._markResolutionSelectionPinned?.();
         widget._resetFreeAspectTierDraft();
         widget._recalculateResolution();
     });

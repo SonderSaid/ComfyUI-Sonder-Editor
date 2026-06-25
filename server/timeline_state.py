@@ -396,7 +396,7 @@ class Scene:
     width: int = 0                              # 0 = inherit from project
     height: int = 0                             # 0 = inherit from project
     fps: float = 0.0                            # 0 = inherit from project
-    saved_selections: list = field(default_factory=list)  # list[dict] {name, start, end, pre_context_frames, post_context_frames}
+    saved_selections: list = field(default_factory=list)  # list[dict] {name, start, end, pre/post context, mask pre/post offsets}
 
     @property
     def duration_seconds(self) -> float:
@@ -476,6 +476,26 @@ class Scene:
         )
 
     def to_dict(self) -> dict:
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        saved_selections = [
+            {
+                "name": entry.get("name", f"Selection {idx + 1}"),
+                "start": _safe_int(entry.get("start", 0)),
+                "end": _safe_int(entry.get("end", 0)),
+                "pre_context_frames": _safe_int(entry.get("pre_context_frames", 0)),
+                "post_context_frames": _safe_int(entry.get("post_context_frames", 0)),
+                "mask_pre_offset": _safe_int(entry.get("mask_pre_offset", 0)),
+                "mask_post_offset": _safe_int(entry.get("mask_post_offset", 0)),
+            }
+            for idx, entry in enumerate(self.saved_selections)
+            if isinstance(entry, dict)
+        ]
+
         return {
             "scene_id": self.scene_id,
             "name": self.name,
@@ -503,7 +523,7 @@ class Scene:
             "width": self.width,
             "height": self.height,
             "fps": self.fps,
-            "saved_selections": list(self.saved_selections),
+            "saved_selections": saved_selections,
         }
 
     @classmethod
@@ -539,6 +559,8 @@ class Scene:
                 "end": _safe_int(entry.get("end", 0)),
                 "pre_context_frames": _safe_int(entry.get("pre_context_frames", 0)),
                 "post_context_frames": _safe_int(entry.get("post_context_frames", 0)),
+                "mask_pre_offset": _safe_int(entry.get("mask_pre_offset", 0)),
+                "mask_post_offset": _safe_int(entry.get("mask_post_offset", 0)),
             }
             for idx, entry in enumerate(data.get("saved_selections", []))
             if isinstance(entry, dict)

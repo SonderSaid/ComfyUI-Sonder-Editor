@@ -602,6 +602,7 @@ export class EditorWidget {
         this._templateFormState = { expanded: false, editId: "" };
         this._resolutionEditAxis = "w";
         this._freeAspectTierDraft = { width: false, height: false };
+        this._resolutionSelectionPinned = false;
 
         // Viewport / playback state
         this.isPlaying = false;
@@ -1172,7 +1173,10 @@ export class EditorWidget {
         this.sceneLabel.textContent = scene.name || "Untitled Scene";
 
         // Load scene resolution/fps into inputs
-        this._syncSceneResolutionControls();
+        if (!isSameScene) {
+            this._resolutionSelectionPinned = false;
+        }
+        this._syncSceneResolutionControls({ detectSelections: !isSameScene });
         this._syncSceneFpsControl();
         this._updateViewportHeader();
 
@@ -1224,6 +1228,7 @@ export class EditorWidget {
 
     _onResolutionChange(axis = "w") {
         this._resolutionEditAxis = axis === "h" ? "h" : "w";
+        this._markResolutionSelectionPinned();
         const mode = this._resolutionControlMode();
         if (mode === "locked") {
             this._syncSceneResolutionControls({ detectSelections: false });
@@ -3023,6 +3028,10 @@ export class EditorWidget {
         this._freeAspectTierDraft = { width: false, height: false };
     }
 
+    _markResolutionSelectionPinned() {
+        this._resolutionSelectionPinned = true;
+    }
+
     _markFreeAspectTierDraft(axis) {
         if (axis === "w") this._freeAspectTierDraft.width = true;
         if (axis === "h") this._freeAspectTierDraft.height = true;
@@ -3060,7 +3069,7 @@ export class EditorWidget {
         } else {
             return null;
         }
-        return { width, height };
+        return template.id === "free" ? { width, height } : snapResolution(width, height, template);
     }
 
     _resolveFreeAspectTierResolution({ requireDraftComplete = false } = {}) {
@@ -3251,6 +3260,7 @@ export class EditorWidget {
         } else {
             this._ensureCustomAspectRatioOption(a, b, `Custom ${a}:${b}`);
         }
+        this._markResolutionSelectionPinned();
         this._resetFreeAspectTierDraft();
         this._updateResolutionInputMode();
         this._recalculateResolution();
@@ -3271,7 +3281,7 @@ export class EditorWidget {
         this._rebuildTemplateOptions();
         this._rebuildResolutionTierOptions();
         this._applyTemplateConstraintMetadata();
-        if (detectSelections) {
+        if (detectSelections && !this._resolutionSelectionPinned) {
             this._selectAspectRatioForDimensions(width, height, { preferExistingCustom: true });
             const tier = this._findNearestResolutionTier(width, height);
             if (this._resTierSelect) {
@@ -10821,8 +10831,14 @@ export class EditorWidget {
                 const label = document.createElement("span");
                 const preCtx = Math.max(0, parseInt(sel.pre_context_frames, 10) || 0);
                 const postCtx = Math.max(0, parseInt(sel.post_context_frames, 10) || 0);
+                const maskPre = Math.max(0, parseInt(sel.mask_pre_offset, 10) || 0);
+                const maskPost = Math.max(0, parseInt(sel.mask_post_offset, 10) || 0);
                 const ctxSuffix = (preCtx > 0 || postCtx > 0) ? ` | Ctx -${preCtx}/+${postCtx}` : "";
+                const maskSuffix = (maskPre > 0 || maskPost > 0) ? ` | Mask -${maskPre}/+${maskPost}` : "";
                 label.textContent = `${sel.name} (${this._frameToTimecode(sel.start)}–${this._frameToTimecode(sel.end)}${ctxSuffix})`;
+                if (maskSuffix) {
+                    label.textContent = label.textContent.replace(/\)$/, `${maskSuffix})`);
+                }
                 item.appendChild(label);
 
                 const delBtn = document.createElement("span");
@@ -10890,6 +10906,8 @@ export class EditorWidget {
                     end: this.selectionEnd,
                     pre_context_frames: this._contextFrameValue("pre_context_frames"),
                     post_context_frames: this._contextFrameValue("post_context_frames"),
+                    mask_pre_offset: this._contextFrameValue("mask_pre_offset"),
+                    mask_post_offset: this._contextFrameValue("mask_post_offset"),
                 }),
             });
             if (resp.ok) {
@@ -10908,6 +10926,8 @@ export class EditorWidget {
         this._setTimelineSelection(sel.start, sel.end, { render: false });
         this._setWidgetValue("pre_context_frames", Math.max(0, parseInt(sel.pre_context_frames, 10) || 0));
         this._setWidgetValue("post_context_frames", Math.max(0, parseInt(sel.post_context_frames, 10) || 0));
+        this._setWidgetValue("mask_pre_offset", Math.max(0, parseInt(sel.mask_pre_offset, 10) || 0));
+        this._setWidgetValue("mask_post_offset", Math.max(0, parseInt(sel.mask_post_offset, 10) || 0));
         this._refreshContextInputs();
         this._renderTimeline();
         this._updateToolbar();
@@ -12099,7 +12119,7 @@ export class EditorWidget {
                 // Project-durable boundary-spill threshold % (render-affecting; default 0 = off)
                 this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold) || 0;
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
-                this._syncSceneResolutionControls();
+                this._syncSceneResolutionControls({ detectSelections: false });
                 this._updateViewportHeader();
                 this._resizeViewportCanvas();
             }
