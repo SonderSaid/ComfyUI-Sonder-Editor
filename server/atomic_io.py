@@ -9,10 +9,15 @@ viewer. No inter-process lock fixes this; the pragmatic remedy is a short
 bounded retry, since the colliding handle is almost always transient (a real
 ``os.replace`` completes in microseconds).
 
-Deliberately retry-only, no threading lock: project saves run synchronously on
-the aiohttp event loop for most routes, so a lock held across a backoff window
-would block the loop. The bounded backoff here is ~375 ms worst case — far under
-the 30 s session TTL — and zero on the uncontended common path.
+Our own concurrent writers (the ComfyUI render worker, the bridge daemon thread,
+``asyncio.to_thread`` workers, and the event-loop routes) are now serialized by a
+per-project lock in ``project_manager.save_project``, so this ``atomic_replace``
+succeeds on the first attempt in the common case; the backoff below is exercised
+only by *external* handle holders (antivirus, the Search Indexer, an external
+viewer) that no in-process lock can coordinate with. Because our writers no longer
+collide, that per-project lock is held for ~one uncontended save (low-ms) and does
+not stall the event loop. The bounded backoff here is ~375 ms worst case — far
+under the 30 s session TTL — and zero on the uncontended common path.
 """
 
 import logging

@@ -1212,7 +1212,14 @@ class SonderSaveVideo:
 
         audio_tmp = None
         if audio is not None:
-            audio_tmp = os.path.join(media_dir, f"_tmp_audio_{uuid.uuid4().hex[:6]}.wav")
+            # Write the transient mux WAV to ComfyUI's temp dir, NOT media/, so the
+            # editor's media-folder scan never ffprobes it mid-life — otherwise the
+            # os.remove below races that probe handle and raises WinError 32 (sharing
+            # violation), failing the save. Mirrors the Preview node, which already
+            # writes its temp audio to get_temp_directory().
+            tmp_root = folder_paths.get_temp_directory()
+            os.makedirs(tmp_root, exist_ok=True)
+            audio_tmp = os.path.join(tmp_root, f"_tmp_audio_{uuid.uuid4().hex[:6]}.wav")
             try:
                 _save_audio_waveform(audio, audio_tmp)
             except Exception as e:

@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import threading
 import uuid
 from datetime import datetime
 from typing import Callable
@@ -20,6 +21,39 @@ PROJECT_SUBDIRS = [
 ]
 
 _PROJECT_SAVED_HOOKS: list[Callable[[TimelineProject], None]] = []
+
+# Per-project write serialization. `save_project` runs from genuinely different OS
+# threads — the ComfyUI prompt worker, the `sonder-bridge-*` daemon, `asyncio.to_thread`
+# workers, and ~45 routes directly on the aiohttp event loop. File syscalls release the
+# GIL, so concurrent read/replace on the single `project.json` collide on Windows
+# (WinError 5 on os.replace, Errno 13 on the version-check open). This lock makes the
+# read-version-check → tmp-write → atomic_replace a true compare-and-swap. It is a
+# deliberate, scoped override of the former "no inter-thread lock" stance (see
+# `atomic_io.py` and durable_rules): the bounded retry alone failed under
+# editor-concurrent-with-render load. Held only around one uncontended save (low-ms,
+# since serializing our own writers means os.replace succeeds first try) — never across
+# the notify hooks — so the event loop is not stalled (route-blocking threshold is 0.5s).
+# Keyed by the canonicalized path so the output→Images symlink's two spellings (and any
+# `.`/case variance) map to ONE lock; otherwise the gate would not actually serialize.
+_PROJECT_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_PROJECT_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _project_write_lock(project_dir: str) -> threading.Lock:
+    try:
+        key = os.path.normcase(os.path.realpath(project_dir))
+    except OSError:
+        key = os.path.normcase(os.path.abspath(project_dir))
+        logger.warning(
+            "save_project: realpath failed for %s; using abspath key — the write lock "
+            "may not serialize across path spellings for this project.", project_dir,
+        )
+    with _PROJECT_WRITE_LOCKS_GUARD:
+        lock = _PROJECT_WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PROJECT_WRITE_LOCKS[key] = lock
+        return lock
 
 
 class ProjectVersionConflict(RuntimeError):
@@ -92,31 +126,36 @@ def save_project(
     project_file = os.path.join(project.project_dir, "project.json")
     if expected_modified_at is None:
         expected_modified_at = getattr(project, "_expected_modified_at", None) or None
-    current_data = None
-    if expected_modified_at:
-        if os.path.isfile(project_file):
-            with open(project_file, "r", encoding="utf-8") as f:
-                current_data = json.load(f)
-            actual_modified_at = str(current_data.get("modified_at", "") or "")
-        else:
-            actual_modified_at = ""
-        if actual_modified_at != expected_modified_at:
-            raise ProjectVersionConflict(
-                project_dir=project.project_dir,
-                expected_modified_at=expected_modified_at,
-                actual_modified_at=actual_modified_at,
-                current_data=current_data,
-            )
+    # Serialize the read-version-check → tmp-write → atomic_replace as one critical
+    # section per project (see _project_write_lock). Raising ProjectVersionConflict
+    # releases the lock via the context manager. Diag + notify hooks run OUTSIDE the
+    # lock (below) — they broadcast / schedule cross-thread work and must not be held.
+    with _project_write_lock(project.project_dir):
+        current_data = None
+        if expected_modified_at:
+            if os.path.isfile(project_file):
+                with open(project_file, "r", encoding="utf-8") as f:
+                    current_data = json.load(f)
+                actual_modified_at = str(current_data.get("modified_at", "") or "")
+            else:
+                actual_modified_at = ""
+            if actual_modified_at != expected_modified_at:
+                raise ProjectVersionConflict(
+                    project_dir=project.project_dir,
+                    expected_modified_at=expected_modified_at,
+                    actual_modified_at=actual_modified_at,
+                    current_data=current_data,
+                )
 
-    if bump_modified_at:
-        project.modified_at = datetime.now().isoformat()
-    data = project.to_dict()
-    tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    atomic_replace(tmp_file, project_file)
-    if hasattr(project, "_expected_modified_at"):
-        setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
+        if bump_modified_at:
+            project.modified_at = datetime.now().isoformat()
+        data = project.to_dict()
+        tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        atomic_replace(tmp_file, project_file)
+        if hasattr(project, "_expected_modified_at"):
+            setattr(project, "_expected_modified_at", getattr(project, "modified_at", ""))
     # #36 diagnostic: every save with the caller's immediate stack frame so the diag ring
     # shows WHO bumped modified_at. Pairs with `project_version_conflict_409` events to
     # trace concurrent writers. Lazy import avoids circular dependency at module load.

@@ -41,6 +41,21 @@ from .timeline_renderer import (
 )
 from .timeline_state import Asset, AudioTrack, ClipReference, LaneConfig, Scene, TimelineProject
 
+
+def _transient_temp_dir() -> str:
+    """Temp dir for transient export work files (the mux WAV). Never the project
+    ``media/`` tree — files there get ffprobed by the editor's asset scan mid-life,
+    racing their cleanup ``os.remove`` (WinError 32). Uses ComfyUI's temp dir, with
+    a system-temp fallback when ``folder_paths`` is unavailable (e.g. unit tests)."""
+    try:
+        import folder_paths
+        temp_dir = folder_paths.get_temp_directory()
+    except Exception:
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+    os.makedirs(temp_dir, exist_ok=True)
+    return temp_dir
+
 logger = logging.getLogger("sonder_editor")
 
 
@@ -643,7 +658,7 @@ class TimelineExportManager:
             mixed_audio_contributors = []
             if include_audio and getattr(scene, "audio_tracks", []):
                 self._set_phase(job, "mixing_audio", "Mixing audio...")
-                mixed_audio_path = os.path.join(project.project_dir, "media", f"_tmp_export_audio_{job.job_id}.wav")
+                mixed_audio_path = os.path.join(_transient_temp_dir(), f"_tmp_export_audio_{job.job_id}.wav")
                 cleanup_paths.append(mixed_audio_path)
                 mixed_audio_contributors = mix_scene_audio_to_wav(
                     project,

@@ -2774,6 +2774,13 @@ def _sync_media_folder(
 
         filepath = file_info.get("path") or os.path.join(project.project_dir, rel_path)
         filename = os.path.basename(rel_path)
+        # Skip transient work files that node/export code may write into media/ and
+        # delete moments later (save_video / export audio mux, export *.tmp output).
+        # ffprobing one mid-life races its os.remove → WinError 32 (sharing violation),
+        # failing the save node. Deny-list the known temp conventions only — real
+        # assets never use these names. Defense-in-depth behind the temp-dir relocation.
+        if filename.startswith("_tmp_") or ".tmp." in filename or filename.endswith(".tmp"):
+            continue
         if rel_path in known_paths:
             continue
 
@@ -2938,14 +2945,19 @@ def _save_versioned_sync_phase(project: TimelineProject, sync_fn, reload_project
         if not changed:
             return project
         try:
-            save_project(project, expected_modified_at=base_modified_at)
+            # Discovery-sync is opportunistic GET-side repair, not a user edit:
+            # save WITHOUT a version bump or a project_updated broadcast (durable_rules
+            # #279). A bump here re-arms the WS→/assets refresh loop (~10/sec churn) AND
+            # spuriously 409s in-flight save-node commits (their expected_modified_at goes
+            # stale mid-render). Discovered assets re-surface on the next load.
+            save_project(project, expected_modified_at=base_modified_at, bump_modified_at=False, notify=False)
             return project
         except ProjectVersionConflict:
             project = reload_project()
     base_modified_at = str(getattr(project, "modified_at", "") or "")
     changed = sync_fn(project)
     if changed:
-        save_project(project, expected_modified_at=base_modified_at)
+        save_project(project, expected_modified_at=base_modified_at, bump_modified_at=False, notify=False)
     return project
 
 

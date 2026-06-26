@@ -333,6 +333,13 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
     return changed
 
 
+# Bounded retries for committing generated outputs when a concurrent writer keeps
+# bumping the project version (e.g. a busy editor). Each retry re-merges onto a fresh
+# load. The no-bump discovery-sync removes the common trigger; this is defense-in-depth
+# so a render's output is never lost to a transient 409.
+_GENERATED_SAVE_MERGE_RETRIES = 8
+
+
 def save_generated_project(project: TimelineProject, base_modified_at: str = "", created_ids=None) -> TimelineProject:
     """Save generated outputs without overwriting unrelated live editor changes.
 
@@ -353,14 +360,27 @@ def save_generated_project(project: TimelineProject, base_modified_at: str = "",
         save_project(project, expected_modified_at=base_modified_at)
         setattr(project, "_asset_id_remap", {})
         return project
-    except ProjectVersionConflict:
+    except ProjectVersionConflict as initial_exc:
+        last_exc = initial_exc
+
+    # Conflict path: a concurrent writer bumped the version between this run's load and
+    # now. Re-merge our generated outputs onto the freshest version and retry a bounded
+    # number of times — a single lost race must never discard an expensive render's
+    # output. `created_ids` keeps the merge to items created this run, so an item the
+    # user deleted mid-run is not resurrected.
+    for _attempt in range(_GENERATED_SAVE_MERGE_RETRIES):
         current = load_project(project.project_dir)
         asset_id_remap = {}
         changed = _merge_generated_outputs(current, project, created_ids, asset_id_remap=asset_id_remap)
         if not changed and not asset_id_remap:
-            raise
+            raise last_exc
         if changed:
-            save_project(current, expected_modified_at=current.modified_at)
+            try:
+                save_project(current, expected_modified_at=current.modified_at)
+            except ProjectVersionConflict as exc:
+                last_exc = exc
+                continue
         setattr(current, "_asset_id_remap", asset_id_remap)
         logger.info("Merged generated outputs into newer project version at %s", project.project_dir)
         return current
+    raise last_exc
