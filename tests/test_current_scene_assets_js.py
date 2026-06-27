@@ -127,3 +127,108 @@ console.log(JSON.stringify({
     assert result["customDefault480p43"] == {"width": 768, "height": 576}
     assert result["customOffEven"] is False
     assert result["customOff480p43"] == {"width": 736, "height": 544}
+
+
+def test_editor_settings_detects_snapped_resolution_presets_and_session_memory():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+
+    module_path = Path(__file__).resolve().parents[1] / "web" / "js" / "editor_settings.js"
+    module_url = module_path.as_uri()
+    script = """
+globalThis.window = {
+    localStorage: {
+        getItem() { return null; },
+        setItem() {},
+    },
+    addEventListener() {},
+};
+const mod = await import(__MODULE_URL__);
+const ltx = mod.getTemplateById("ltx-2.3");
+const free = mod.getTemplateById("free");
+const cases = [
+    ["16:9", 16, 9],
+    ["21:9", 21, 9],
+    ["9:16", 9, 16],
+    ["4:3", 4, 3],
+    ["3:4", 3, 4],
+    ["1:1", 1, 1],
+];
+const detected = {};
+for (const [label, a, b] of cases) {
+    const resolved = mod.computeResolutionFromTier(720, a, b, ltx);
+    const selection = mod.detectResolutionPresetSelections(resolved.width, resolved.height, ltx);
+    detected[label] = {
+        resolution: resolved,
+        aspectValue: selection?.aspectValue || "",
+        tierValue: selection?.tierValue || "",
+        source: selection?.source || "",
+    };
+}
+const freeResolution = mod.computeResolutionFromTier(720, 16, 9, free);
+const freeSelection = mod.detectResolutionPresetSelections(freeResolution.width, freeResolution.height, free);
+const memory = mod.createResolutionToolbarSelectionMemory();
+const missing = memory.read("project-a", "scene-a");
+const wrote = memory.write("project-a", "scene-a", {
+    aspectValue: "0,0",
+    tierValue: "custom",
+    customAspectValue: "",
+    customAspectLabel: "",
+});
+const remembered = memory.read("project-a", "scene-a");
+const isolated = memory.read("project-a", "scene-b");
+console.log(JSON.stringify({
+    detected,
+    free: {
+        resolution: freeResolution,
+        aspectValue: freeSelection?.aspectValue || "",
+        tierValue: freeSelection?.tierValue || "",
+    },
+    memory: { missing, wrote, remembered, isolated },
+}));
+""".replace("__MODULE_URL__", json.dumps(module_url))
+
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result["detected"]["16:9"] == {
+        "resolution": {"width": 960, "height": 576},
+        "aspectValue": "16,9",
+        "tierValue": "720",
+        "source": "snapped",
+    }
+    assert result["detected"]["21:9"] == {
+        "resolution": {"width": 1088, "height": 512},
+        "aspectValue": "21,9",
+        "tierValue": "720",
+        "source": "snapped",
+    }
+    assert result["detected"]["9:16"] == {
+        "resolution": {"width": 576, "height": 960},
+        "aspectValue": "9,16",
+        "tierValue": "720",
+        "source": "snapped",
+    }
+    assert result["detected"]["4:3"]["aspectValue"] == "4,3"
+    assert result["detected"]["3:4"]["aspectValue"] == "3,4"
+    assert result["detected"]["1:1"]["aspectValue"] == "1,1"
+    assert result["free"] == {
+        "resolution": {"width": 960, "height": 540},
+        "aspectValue": "16,9",
+        "tierValue": "720",
+    }
+    assert result["memory"]["missing"] is None
+    assert result["memory"]["wrote"] is True
+    assert result["memory"]["remembered"] == {
+        "aspectValue": "0,0",
+        "tierValue": "custom",
+        "customAspectValue": "",
+        "customAspectLabel": "",
+    }
+    assert result["memory"]["isolated"] is None

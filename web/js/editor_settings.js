@@ -1239,6 +1239,120 @@ export function snapResolution(width, height, template) {
     };
 }
 
+function resolutionAspectValue(a, b) {
+    return `${a},${b}`;
+}
+
+function findNearestResolutionTierForDimensions(width, height, tolerance = 0.10) {
+    if (!(width > 0 && height > 0)) return null;
+    const c = Math.sqrt(width * height);
+    let bestTier = null;
+    let bestDiff = Infinity;
+    for (const tier of RESOLUTION_TIERS) {
+        const diff = Math.abs(tier.c - c) / tier.c;
+        if (diff < bestDiff) {
+            bestTier = tier;
+            bestDiff = diff;
+        }
+    }
+    return bestDiff <= tolerance ? bestTier : null;
+}
+
+function findMatchingAspectPresetForDimensions(width, height, tolerance = 0.03) {
+    if (!(width > 0 && height > 0)) return null;
+    const actualRatio = width / height;
+    return ASPECT_RATIO_PRESETS.find((preset) => {
+        if (!(preset.a > 0 && preset.b > 0)) return false;
+        const targetRatio = preset.a / preset.b;
+        return Math.abs(actualRatio - targetRatio) / targetRatio <= tolerance;
+    }) || null;
+}
+
+export function detectResolutionPresetSelections(width, height, template, {
+    aspectTolerance = 0.03,
+    tierTolerance = 0.10,
+    pixelTolerance = 0,
+} = {}) {
+    const w = Math.max(0, Math.round(Number(width) || 0));
+    const h = Math.max(0, Math.round(Number(height) || 0));
+    if (!(w > 0 && h > 0)) return null;
+
+    const maxPixelDelta = Math.max(0, Math.round(Number(pixelTolerance) || 0));
+    for (const aspect of ASPECT_RATIO_PRESETS) {
+        if (!(aspect.a > 0 && aspect.b > 0)) continue;
+        for (const tier of RESOLUTION_TIERS) {
+            const resolved = computeResolutionFromTier(tier.c, aspect.a, aspect.b, template);
+            if (!resolved) continue;
+            const pixelDelta = Math.max(
+                Math.abs(Math.round(resolved.width) - w),
+                Math.abs(Math.round(resolved.height) - h)
+            );
+            if (pixelDelta <= maxPixelDelta) {
+                return {
+                    aspectPreset: aspect,
+                    tier,
+                    aspectValue: resolutionAspectValue(aspect.a, aspect.b),
+                    tierValue: String(tier.c),
+                    source: "snapped",
+                };
+            }
+        }
+    }
+
+    const aspectPreset = findMatchingAspectPresetForDimensions(w, h, aspectTolerance);
+    const tier = findNearestResolutionTierForDimensions(w, h, tierTolerance);
+    return {
+        aspectPreset,
+        tier,
+        aspectValue: aspectPreset ? resolutionAspectValue(aspectPreset.a, aspectPreset.b) : resolutionAspectValue(0, 0),
+        tierValue: tier ? String(tier.c) : "custom",
+        source: "tolerance",
+    };
+}
+
+function normalizeResolutionToolbarState(state) {
+    if (!state || typeof state !== "object") return null;
+    const aspectValue = String(state.aspectValue || "");
+    const tierValue = String(state.tierValue || "");
+    if (!aspectValue && !tierValue) return null;
+    return {
+        aspectValue,
+        tierValue,
+        customAspectValue: String(state.customAspectValue || ""),
+        customAspectLabel: String(state.customAspectLabel || ""),
+    };
+}
+
+function resolutionToolbarMemoryKey(projectDir, sceneId) {
+    const projectKey = String(projectDir || "");
+    const sceneKey = String(sceneId || "");
+    return projectKey && sceneKey ? JSON.stringify([projectKey, sceneKey]) : "";
+}
+
+export function createResolutionToolbarSelectionMemory() {
+    const entries = new Map();
+    return {
+        read(projectDir, sceneId) {
+            const key = resolutionToolbarMemoryKey(projectDir, sceneId);
+            if (!key || !entries.has(key)) return null;
+            return { ...entries.get(key) };
+        },
+        write(projectDir, sceneId, state) {
+            const key = resolutionToolbarMemoryKey(projectDir, sceneId);
+            const normalized = normalizeResolutionToolbarState(state);
+            if (!key || !normalized) return false;
+            entries.set(key, normalized);
+            return true;
+        },
+        clear(projectDir, sceneId) {
+            const key = resolutionToolbarMemoryKey(projectDir, sceneId);
+            if (key) entries.delete(key);
+        },
+    };
+}
+
+export const resolutionToolbarSelectionMemory = createResolutionToolbarSelectionMemory();
+
 export function resolveBatchChunkSize({ settings, template, preContext = 0, postContext = 0 } = {}) {
     // `batchMaxFrames` is a TOTAL rendered-tensor budget per chunk (LTX 2.3 default
     // of 97 = the model's frame ceiling). Selection chunk size = total budget minus

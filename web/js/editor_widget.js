@@ -230,12 +230,14 @@ import {
     VALID_CROP_POSITIONS,
     VALID_FIT_MODES,
     computeResolutionFromTier,
+    detectResolutionPresetSelections,
     frameConstraintsEqual,
     getEditorSettings,
     getAllModelTemplates,
     getTemplateById,
     resolveBatchChunkSizes,
     resolveFrameConstraintForTemplate,
+    resolutionToolbarSelectionMemory,
     snapResolution,
     snapToConstraint,
     subscribeEditorSettings,
@@ -1266,6 +1268,7 @@ export class EditorWidget {
         if (this._resTierSelect) {
             this._resTierSelect.value = "custom";
         }
+        this._rememberResolutionSelection();
         this._updateSceneResolution(width, height, { detectSelections: false });
     }
 
@@ -2941,13 +2944,21 @@ export class EditorWidget {
         return Math.abs(actualRatio - targetRatio) / targetRatio <= tolerance;
     }
 
+    _detectResolutionPresetSelections(width, height, options = {}) {
+        return detectResolutionPresetSelections(width, height, this._getActiveTemplate(), options);
+    }
+
     _findMatchingAspectPreset(width, height, tolerance = 0.03) {
-        return ASPECT_RATIO_PRESETS.find(
-            (preset) => preset.a > 0 && preset.b > 0 && this._matchesAspectRatio(width, height, preset.a, preset.b, tolerance)
-        ) || null;
+        return this._detectResolutionPresetSelections(width, height, { aspectTolerance: tolerance })?.aspectPreset
+            || ASPECT_RATIO_PRESETS.find(
+                (preset) => preset.a > 0 && preset.b > 0 && this._matchesAspectRatio(width, height, preset.a, preset.b, tolerance)
+            )
+            || null;
     }
 
     _findNearestResolutionTier(width, height, tolerance = 0.10) {
+        const snappedDetection = this._detectResolutionPresetSelections(width, height, { tierTolerance: tolerance });
+        if (snappedDetection?.tier) return snappedDetection.tier;
         if (!(width > 0 && height > 0)) return null;
         const c = Math.sqrt(width * height);
         let bestTier = null;
@@ -3028,8 +3039,65 @@ export class EditorWidget {
         this._freeAspectTierDraft = { width: false, height: false };
     }
 
+    _captureResolutionSelectionState() {
+        const selectedAspectOption = this._aspectRatioSelect?.selectedOptions?.[0] || null;
+        const selectedIsCustomAspect = selectedAspectOption?.dataset?.sonderCustomAspect === "true";
+        return {
+            aspectValue: this._aspectRatioSelect?.value || "",
+            tierValue: this._resTierSelect?.value || "",
+            customAspectValue: selectedIsCustomAspect ? (selectedAspectOption.value || "") : "",
+            customAspectLabel: selectedIsCustomAspect ? (selectedAspectOption.textContent || "") : "",
+        };
+    }
+
+    _rememberResolutionSelection() {
+        if (!this.projectDir || !this.activeSceneId) return;
+        resolutionToolbarSelectionMemory.write(
+            this.projectDir,
+            this.activeSceneId,
+            this._captureResolutionSelectionState()
+        );
+    }
+
+    _restoreRememberedResolutionSelection() {
+        if (!this._aspectRatioSelect || !this._resTierSelect || !this.projectDir || !this.activeSceneId) {
+            return false;
+        }
+        const state = resolutionToolbarSelectionMemory.read(this.projectDir, this.activeSceneId);
+        if (!state) return false;
+
+        const aspectValue = String(state.aspectValue || "");
+        const customAspectValue = String(state.customAspectValue || "");
+        if (customAspectValue) {
+            const { a, b } = this._parseAspectRatioValue(customAspectValue);
+            if (a > 0 && b > 0) {
+                this._ensureCustomAspectRatioOption(a, b, state.customAspectLabel || `Custom ${a}:${b}`);
+            }
+        } else {
+            this._clearCustomAspectRatioOption();
+        }
+
+        if (aspectValue && !Array.from(this._aspectRatioSelect.options).some((option) => option.value === aspectValue)) {
+            const { a, b } = this._parseAspectRatioValue(aspectValue);
+            if (a > 0 && b > 0) {
+                this._ensureCustomAspectRatioOption(a, b, state.customAspectLabel || `Custom ${a}:${b}`);
+            }
+        }
+        if (aspectValue && Array.from(this._aspectRatioSelect.options).some((option) => option.value === aspectValue)) {
+            this._aspectRatioSelect.value = aspectValue;
+        }
+
+        const tierValue = String(state.tierValue || "custom");
+        this._resTierSelect.value = Array.from(this._resTierSelect.options).some((option) => option.value === tierValue)
+            ? tierValue
+            : "custom";
+        this._resolutionSelectionPinned = true;
+        return true;
+    }
+
     _markResolutionSelectionPinned() {
         this._resolutionSelectionPinned = true;
+        this._rememberResolutionSelection();
     }
 
     _markFreeAspectTierDraft(axis) {
@@ -3282,10 +3350,12 @@ export class EditorWidget {
         this._rebuildResolutionTierOptions();
         this._applyTemplateConstraintMetadata();
         if (detectSelections && !this._resolutionSelectionPinned) {
-            this._selectAspectRatioForDimensions(width, height, { preferExistingCustom: true });
-            const tier = this._findNearestResolutionTier(width, height);
-            if (this._resTierSelect) {
-                this._resTierSelect.value = tier ? String(tier.c) : "custom";
+            if (!this._restoreRememberedResolutionSelection()) {
+                const detectedSelections = this._detectResolutionPresetSelections(width, height);
+                this._selectAspectRatioForDimensions(width, height, { preferExistingCustom: true });
+                if (this._resTierSelect) {
+                    this._resTierSelect.value = detectedSelections?.tierValue || "custom";
+                }
             }
         }
         this._updateResolutionInputMode();
