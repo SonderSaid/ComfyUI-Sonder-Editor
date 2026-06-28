@@ -84,6 +84,13 @@ function makeDivider(height = 16) {
     return divider;
 }
 
+function makeInlineGroup(...children) {
+    const group = document.createElement("span");
+    group.style.cssText = "display:inline-flex;align-items:center;gap:4px;white-space:nowrap;flex:0 0 auto;";
+    group.append(...children);
+    return group;
+}
+
 function makeTextInput(title, cssText, apply, onEscape) {
     const input = document.createElement("input");
     input.type = "text";
@@ -195,56 +202,13 @@ function wireForegroundPill(widget) {
 }
 
 export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
-    const bar = document.createElement("div");
-    bar.style.cssText = `
-        display: flex;
-        align-items: center;
-        gap: 5px;
-        padding: 5px 7px;
-        background: ${THEME.bg1};
-        border-bottom: 1px solid ${THEME.line2};
-        min-height: ${sceneBarHeight}px;
-        box-sizing: border-box;
-    `;
-
-    const prevBtn = makeButton("\u25c0", "Previous scene", BUTTON_OPTIONS.tertiary);
-    prevBtn.addEventListener("click", () => widget._cycleScene(-1));
-
-    widget.sceneLabel = document.createElement("span");
-    widget.sceneLabel.style.cssText = `
-        flex: 1;
-        min-width: 0;
-        text-align: center;
-        font-size: ${TYPE.t12}px;
-        font-weight: ${TYPE.fwBold};
-        color: ${THEME.fg0};
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        cursor: pointer;
-    `;
-    widget.sceneLabel.textContent = "No Scene";
-    widget.sceneLabel.title = "Double-click to rename - Right-click for options";
-    widget.sceneLabel.addEventListener("dblclick", () => widget._renameScene());
-    widget.sceneLabel.addEventListener("contextmenu", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (!widget.activeScene) return;
-        widget._showContextMenu(event.clientX, event.clientY, [
-            { label: "Rename Scene", action: () => widget._renameScene() },
-            { label: "Duplicate Scene", action: () => widget._duplicateScene() },
-            { label: "Delete Scene", action: () => widget._deleteScene(), danger: true },
-        ]);
-    });
-
-    const nextBtn = makeButton("\u25b6", "Next scene", BUTTON_OPTIONS.tertiary);
-    nextBtn.addEventListener("click", () => widget._cycleScene(1));
-
-    const addBtn = makeButton("+", "Create new scene", BUTTON_OPTIONS.primary);
-    addBtn.addEventListener("click", () => widget._createScene());
+    // Scene geometry + generation context/mask inputs. No longer a standalone bar \u2014
+    // buildEditorToolbar assembles these groups into the single toolbar row (geometry
+    // on the right under the viewport; ctx/mask inside the generation-window block).
+    // Scene switching lives in the fullscreen breadcrumb identity zone.
 
     widget._durLabel = document.createElement("span");
-    widget._durLabel.style.cssText = labelCss({ marginLeft: "8px" });
+    widget._durLabel.style.cssText = labelCss({});
     widget._durLabel.textContent = "Frames:";
 
     widget.durationInput = document.createElement("input");
@@ -301,7 +265,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
     const maskLabel = document.createElement("span");
     maskLabel.style.cssText = labelCss({ marginLeft: "4px" });
-    maskLabel.textContent = "Mask Offset:";
+    maskLabel.textContent = "Mask:";
     const maskPreLabel = document.createElement("span");
     maskPreLabel.style.cssText = labelCss({ fontSize: "9px" });
     maskPreLabel.textContent = "-";
@@ -404,18 +368,27 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
         }
     });
 
-    bar.append(
-        prevBtn, widget.sceneLabel, nextBtn, addBtn,
-        widget._durLabel, widget.durationInput,
-        ctxLabel, preCtxLabel, widget._preContextInput, postCtxLabel, widget._postContextInput,
-        maskLabel, maskPreLabel, widget._maskPreOffsetInput, maskPostLabel, widget._maskPostOffsetInput,
-        resLabel, widget._resWInput, xLabel, widget._resHInput, widget._aspectRatioSelect, widget._resTierSelect, widget._templateSelect,
-        fpsLabel, widget._fpsInput
+    // Context + Mask sub-group — placed inside the generation-window block by the toolbar.
+    widget._ctxMaskGroup = document.createElement("div");
+    widget._ctxMaskGroup.style.cssText = "display:flex; align-items:center; gap:4px; row-gap:3px; flex-wrap:wrap; min-width:0; max-width:100%; flex:1 1 280px;";
+    widget._ctxMaskGroup.append(
+        ctxLabel,
+        makeInlineGroup(preCtxLabel, widget._preContextInput),
+        makeInlineGroup(postCtxLabel, widget._postContextInput),
+        maskLabel,
+        makeInlineGroup(maskPreLabel, widget._maskPreOffsetInput),
+        makeInlineGroup(maskPostLabel, widget._maskPostOffsetInput)
     );
 
-    widget._sceneBar = bar;
-    widget.container.appendChild(bar);
-    return bar;
+    // Scene geometry group — placed on the right of the toolbar row (under the viewport).
+    widget._sceneGeometryGroup = document.createElement("div");
+    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; justify-content:flex-end; gap:6px; row-gap:4px; flex-wrap:wrap; min-width:0; max-width:100%; flex:1 1 520px;";
+    widget._sceneGeometryGroup.append(
+        makeInlineGroup(widget._durLabel, widget.durationInput),
+        makeInlineGroup(resLabel, widget._resWInput, xLabel, widget._resHInput),
+        widget._aspectRatioSelect, widget._resTierSelect, widget._templateSelect,
+        makeInlineGroup(fpsLabel, widget._fpsInput)
+    );
 }
 
 export function buildEditorToolbar(widget) {
@@ -424,6 +397,9 @@ export function buildEditorToolbar(widget) {
         display: flex;
         align-items: center;
         gap: 3px;
+        flex-wrap: wrap;
+        row-gap: 4px;
+        min-width: 0;
         padding: 4px 7px;
         background: ${THEME.bg1};
         border-bottom: 1px solid ${THEME.line2};
@@ -538,9 +514,6 @@ export function buildEditorToolbar(widget) {
     redoBtn.style.fontSize = `${TYPE.t14}px`;
     redoBtn.addEventListener("click", () => widget._redo());
 
-    const spacer = document.createElement("span");
-    spacer.style.flex = "1";
-
     const helpBtn = makeButton("?", "Keyboard Shortcuts", { ...BUTTON_OPTIONS.tertiary, radius: "999px" });
     helpBtn.addEventListener("click", () => widget._showShortcutOverlay());
 
@@ -584,20 +557,46 @@ export function buildEditorToolbar(widget) {
     zoomIn.style.fontSize = `${TYPE.t14}px`;
     zoomIn.addEventListener("click", () => widget._zoom(1));
 
-    widget._fullscreenBtn = makeButton("\u26f6", "Toggle fullscreen", BUTTON_OPTIONS.icon);
-    widget._fullscreenBtn.style.fontSize = `${TYPE.t14}px`;
-    widget._fullscreenBtn.addEventListener("click", () => widget._toggleFullscreen());
+    // \u2500\u2500 Generation-window block: the one contained/tinted group \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    const navSelDivider = document.createElement("span");
+    navSelDivider.style.cssText = `width:1px; align-self:stretch; background:${THEME.line2}; margin:0 2px;`;
+    const genLabel = document.createElement("span");
+    genLabel.style.cssText = `font-size:9px; font-weight:${TYPE.fwBold}; letter-spacing:0.09em; text-transform:uppercase; color:${THEME.accentHi}; margin-right:3px; white-space:nowrap;`;
+    genLabel.textContent = "Generation Window";
+    widget._genReadout = document.createElement("span");
+    widget._genReadout.style.cssText = `font-size:9px; color:${THEME.accentHi}; white-space:nowrap; border-left:1px solid ${THEME.accentLo}; padding-left:7px; margin-left:3px;`;
+    widget._genWindowGroup = document.createElement("div");
+    widget._genWindowGroup.style.cssText = `display:flex; align-items:center; gap:4px 5px; flex-wrap:wrap; min-width:0; max-width:100%; flex:1 1 620px; box-sizing:border-box; background:${THEME.accentBg}; border:1px solid ${THEME.accentLo}; border-radius:7px; padding:3px 9px;`;
+    widget._genWindowGroup.append(
+        genLabel,
+        makeInlineGroup(frameLabel, widget._playheadFrameInput),
+        navSelDivider,
+        makeInlineGroup(inLabel, widget._selectionStartInput),
+        makeInlineGroup(outLabel, widget._selectionEndInput),
+        clearSelBtn, widget._bookmarkBtn,
+        widget._ctxMaskGroup, widget._genReadout
+    );
+
+    widget._sceneGeometryGroup.style.marginLeft = "0";
 
     toolbar.append(
-        undoBtn, redoBtn, makeDivider(), widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn, makeDivider(),
-        frameLabel, widget._playheadFrameInput, inLabel, widget._selectionStartInput, outLabel, widget._selectionEndInput,
-        clearSelBtn, widget._bookmarkBtn, makeDivider(), fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic,
-        widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn, spacer,
-        zoomOut, zoomIn, widget._fullscreenBtn, helpBtn, settingsBtn
+        undoBtn, redoBtn, makeDivider(),
+        widget._genWindowGroup, makeDivider(),
+        widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn, makeDivider(),
+        fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic, makeDivider(),
+        widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn,
+        widget._sceneGeometryGroup, makeDivider(),
+        zoomOut, zoomIn, helpBtn, settingsBtn
     );
 
     widget._toolbar = toolbar;
-    widget.container.appendChild(toolbar);
+    // Wrapper so UI scaling (transform:scale) can reserve real layout height via the
+    // wrapper's explicit height — pushing the timeline down instead of overlapping it
+    // (transform/zoom are visual-only and reserve no flow space on their own).
+    widget._toolbarWrap = document.createElement("div");
+    widget._toolbarWrap.style.cssText = "width:100%; overflow-x:auto; overflow-y:hidden; box-sizing:border-box; flex-shrink:0;";
+    widget._toolbarWrap.appendChild(toolbar);
+    widget.container.appendChild(widget._toolbarWrap);
     wireForegroundPill(widget);
     updateEditorToolbar(widget);
     return toolbar;

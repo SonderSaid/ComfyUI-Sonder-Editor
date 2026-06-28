@@ -847,7 +847,7 @@ function showSettingsPanel() {
         "Layout & UI Scale",
         "Adjust the editor chrome and restore saved fullscreen sizing."
     );
-    createScaleRow(layoutSection, "Toolbar", "Toolbar & Bars", "Scene strip, toolbar, and transport controls.", () => this._settings.layout.scaleToolbar);
+    createScaleRow(layoutSection, "Toolbar", "Toolbar", "Toolbar and transport controls.", () => this._settings.layout.scaleToolbar);
     createScaleRow(layoutSection, "TrackHeaders", "Track Headers", "Lane labels, icons, and left-side track controls.", () => this._settings.layout.scaleTrackHeaders);
     createScaleRow(layoutSection, "Timeline", "Timeline", "Ruler, track heights, clip blocks, and inline editors.", () => this._settings.layout.scaleTimeline);
     createScaleRow(layoutSection, "Gallery", "Asset Gallery", "Gallery lists, tabs, metadata text, and inspector chrome.", () => this._settings.layout.scaleGallery);

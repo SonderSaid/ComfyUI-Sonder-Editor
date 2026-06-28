@@ -3059,6 +3059,34 @@ def _direct_project_dir_from_request(request: web.Request) -> str | None:
     return project_dir
 
 
+def _reveal_in_file_manager(path: str) -> tuple[bool, str]:
+    """Open the OS file manager with `path` selected/revealed. Local server only.
+
+    Fire-and-forget via Popen with list args (never shell=True). NOTE: Windows
+    explorer.exe returns a NON-ZERO exit code even on success, so we do not wait
+    on or gate the result by the process return code.
+    """
+    import sys
+    import subprocess
+
+    norm = os.path.normpath(path)
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", f"/select,{norm}"])
+            return True, ""
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", norm])
+            return True, ""
+        parent = os.path.dirname(norm) or norm
+        subprocess.Popen(["xdg-open", parent])
+        return True, ""
+    except FileNotFoundError:
+        return False, "File manager not available on this server"
+    except Exception as exc:
+        logger.warning("reveal_in_file_manager failed for %s: %s", norm, exc)
+        return False, "Could not open folder"
+
+
 def _cached_asset_file_response(
     path: str,
     *,
@@ -4263,6 +4291,25 @@ if routes is not None:
 
         save_project(project)
         return web.json_response(project.to_dict())
+
+    @routes.post("/sonder-editor/project/{project_id}/reveal")
+    async def api_reveal_project(request: web.Request) -> web.Response:
+        # Local-only convenience: open the project folder selected in the OS file
+        # manager so the user can rename/delete it on disk. Path is containment-
+        # validated by _direct_project_dir_from_request / project.project_dir.
+        project_dir = _direct_project_dir_from_request(request)
+        if not project_dir:
+            try:
+                project = _load_project_from_request(request)
+                project_dir = getattr(project, "project_dir", "") or ""
+            except FileNotFoundError as e:
+                return _json_error(str(e), 404)
+        if not project_dir or not os.path.isdir(project_dir):
+            return _json_error("Project folder not found", 404)
+        ok, err = _reveal_in_file_manager(project_dir)
+        if not ok:
+            return _json_error(err or "Could not open folder", 400)
+        return web.json_response({"ok": True})
 
     # -----------------------------------------------------------------------
     # Timeline export jobs

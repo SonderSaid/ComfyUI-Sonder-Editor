@@ -60,8 +60,6 @@ const sourceNodeId = params.get("source_node_id") || "";
 const sessionWindowName = params.get("session_name") || "";
 const statusEl = document.getElementById("status");
 const sessionId = `tab-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
-const STATUS_PILL_TOOLBAR_GAP = 12;
-const STATUS_PILL_FALLBACK_RIGHT = 140;
 
 const DEFAULT_WIDGET_VALUES = {
     scene_id: "",
@@ -84,13 +82,11 @@ function setStatus(message) {
 function makeStatusPill() {
     const pill = document.createElement("div");
     pill.style.cssText = `
-        position: fixed;
-        right: 12px;
-        top: 10px;
-        z-index: 10020;
         ${statusPillCss({ state: "idle", padding: "4px 8px" })}
         font-size: 11px;
         pointer-events: none;
+        flex: 0 0 auto;
+        margin-right: 8px;
     `;
     const dot = document.createElement("span");
     dot.style.cssText = `
@@ -104,7 +100,19 @@ function makeStatusPill() {
     label.textContent = "Connecting";
     pill._sonderLabel = label;
     pill.append(dot, label);
-    document.body.appendChild(pill);
+    // Mount inside the fullscreen toolbar's button cluster, left of Mount/Exit,
+    // so status + session controls read as one group. The mounted tab enters
+    // fullscreen before this runs, so the cluster already exists.
+    const toolbarButtons = document.querySelector("[data-fs-toolbar-buttons]");
+    if (toolbarButtons) {
+        toolbarButtons.prepend(pill);
+    } else {
+        pill.style.position = "fixed";
+        pill.style.top = "10px";
+        pill.style.right = "12px";
+        pill.style.zIndex = "10020";
+        document.body.appendChild(pill);
+    }
     return pill;
 }
 
@@ -121,54 +129,6 @@ function setStatusPillState(pill, label, state = "idle") {
         pill.textContent = label;
     }
     pill?.style?.setProperty?.("--sonder-status-color", color);
-}
-
-function attachStatusPillOffset(pill) {
-    let raf = 0;
-    let observer = null;
-    let observed = null;
-
-    const applyFallback = () => {
-        pill.style.right = `${STATUS_PILL_FALLBACK_RIGHT}px`;
-    };
-
-    const measure = () => {
-        const toolbarButtons = document.querySelector("[data-fs-toolbar-buttons]");
-        if (!toolbarButtons) {
-            applyFallback();
-            return false;
-        }
-        if (toolbarButtons !== observed && typeof ResizeObserver !== "undefined") {
-            observer?.disconnect();
-            observer = new ResizeObserver(() => schedule(false));
-            observer.observe(toolbarButtons);
-            observed = toolbarButtons;
-        }
-        const width = Math.ceil(toolbarButtons.getBoundingClientRect().width || toolbarButtons.offsetWidth || 0);
-        if (width <= 0) {
-            applyFallback();
-            return false;
-        }
-        pill.style.right = `${width + STATUS_PILL_TOOLBAR_GAP}px`;
-        return true;
-    };
-
-    const schedule = (retry = false) => {
-        if (raf) cancelAnimationFrame(raf);
-        raf = requestAnimationFrame(() => {
-            raf = 0;
-            if (!measure() && retry) requestAnimationFrame(measure);
-        });
-    };
-
-    schedule(true);
-    return {
-        refresh: () => schedule(false),
-        cleanup: () => {
-            if (raf) cancelAnimationFrame(raf);
-            observer?.disconnect();
-        },
-    };
 }
 
 function projectWidgetNode() {
@@ -361,7 +321,6 @@ async function main() {
     }
 
     const statusPill = makeStatusPill();
-    const statusPillOffset = attachStatusPillOffset(statusPill);
     const blocker = document.createElement("div");
     blocker.style.cssText = `
         position: fixed;
@@ -481,7 +440,6 @@ async function main() {
         if (!changed) return;
         host.lastPillSignature = signature;
         setStatusPillState(statusPill, label, pillState);
-        statusPillOffset.refresh();
         updateBlocker();
     };
     setCanvasConnected(host.canvasHostConnected);
@@ -733,7 +691,6 @@ async function main() {
         }
         clearInterval(heartbeat);
         clearInterval(hostPresencePoll);
-        statusPillOffset.cleanup();
         try {
             editor?._drainProjectMutations?.("tab_pagehide").catch(() => {});
         } catch (_err) {}

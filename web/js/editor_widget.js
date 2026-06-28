@@ -193,7 +193,7 @@ import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset 
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
-import { mountSharedRenderQueue, queueBatchIds } from "./shared_render_queue.js";
+import { mountSharedRenderQueue, queueBatchIds, formatQueueTime } from "./shared_render_queue.js";
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
 import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
 import { mountPromptManagementPanel } from "./editor_prompt_panel.js";
@@ -898,7 +898,31 @@ export class EditorWidget {
     }
 
     _updateToolbar() {
-        return updateEditorToolbar(this);
+        const result = updateEditorToolbar(this);
+        this._scheduleFullscreenToolbarLayoutRefresh();
+        return result;
+    }
+
+    _scheduleFullscreenToolbarLayoutRefresh() {
+        if (!this.isFullscreen || !this._fsBottomRow || this._destroyed) return;
+        if (this._toolbarLayoutRefreshRaf) return;
+        this._toolbarLayoutRefreshRaf = requestAnimationFrame(() => {
+            this._toolbarLayoutRefreshRaf = null;
+            if (this._destroyed || !this.isFullscreen || !this._fsBottomRow) return;
+            const prevPanelH = parseInt(getComputedStyle(this._fsBottomRow).height, 10)
+                || this._defaultFullscreenTimelineHeight();
+            const prevTimelineH = this._timelineHeight;
+            const clamped = this._applyFullscreenTimelineHeight(prevPanelH);
+            const nextTimelineH = Math.max(
+                clamped.metrics.visibleCanvasMin,
+                clamped.height - clamped.metrics.paddingY - clamped.metrics.chromeH
+            );
+            if (Math.ceil(clamped.height) !== prevPanelH || Math.ceil(nextTimelineH) !== Math.ceil(prevTimelineH)) {
+                this._timelineHeight = nextTimelineH;
+                this._clampScrollY();
+                this._renderTimeline();
+            }
+        });
     }
     // Info bar removed — zoom/fullscreen controls moved to toolbar.
     // _updateInfoLabel calls replaced with _updateToolbar.
@@ -1039,6 +1063,7 @@ export class EditorWidget {
             const knownVersion = getProjectVersion(dirName);
             const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes`));
             if (resp.ok) {
+                this._clearProjectNotFound();
                 const data = await resp.json();
                 if (fetchSeq !== this._sceneFetchSeq) {
                     sessionDiagRecord("scene_refresh_stale", {
@@ -1089,6 +1114,8 @@ export class EditorWidget {
                         this._setActiveScene(this.scenes[0]);
                     }
                 }
+            } else if (resp.status === 404) {
+                this._showProjectNotFound();
             }
         } catch (e) {
             console.warn("[Sonder] Failed to fetch scenes:", e);
@@ -1172,7 +1199,7 @@ export class EditorWidget {
         }
         this.totalFrames = scene.duration_frames || 200;
         this._refreshDurationInput();
-        this.sceneLabel.textContent = scene.name || "Untitled Scene";
+        this._updateSceneIdentity(scene.name || "Untitled Scene");
 
         // Load scene resolution/fps into inputs
         if (!isSameScene) {
@@ -1184,11 +1211,6 @@ export class EditorWidget {
 
         // Update hidden widgets
         this._setWidgetValue("scene_id", scene.scene_id);
-
-        // Update fullscreen title if in fullscreen
-        if (this.isFullscreen && this._fsTitle) {
-            this._fsTitle.textContent = `Editor — ${scene.name || "No Scene"}`;
-        }
 
         if (!isSameScene) {
             // Defer auto-fit to next frame so browser reflows after editor hide
@@ -1371,7 +1393,7 @@ export class EditorWidget {
                 }
             );
             this.activeScene.name = name;
-            this.sceneLabel.textContent = name;
+            this._updateSceneIdentity(name);
         } catch (e) {
             console.warn("[Sonder] Failed to rename scene:", e);
         }
@@ -3409,6 +3431,7 @@ export class EditorWidget {
         this._updateToolbar();
         // Context frames widen the highlight window (selection + context).
         this._refreshPromptUsageHighlight();
+        this._updateGenReadout();
     }
 
     _refreshSelectionInputs() {
@@ -3422,6 +3445,7 @@ export class EditorWidget {
             this._selectionEndInput.title = `Selection out-point: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(duration)})`;
         }
         this._refreshPlayheadInput();
+        this._updateGenReadout();
     }
 
     _refreshPlayheadInput() {
@@ -3429,6 +3453,28 @@ export class EditorWidget {
         if (document.activeElement === this._playheadFrameInput) return;
         this._playheadFrameInput.value = this._formatPositionInput(this.playhead);
         this._playheadFrameInput.title = `Playhead frame: ${this._frameToTimecode(this.playhead)}`;
+    }
+
+    // Derived generation-window readout: selected frames + source-frame total
+    // (selection + context, clamped per-edge like the backend source_frame_count).
+    _updateGenReadout() {
+        if (!this._genReadout) return;
+        const start = Math.max(0, Math.round(Number(this.selectionStart) || 0));
+        const end = Math.max(start, Math.round(Number(this.selectionEnd) || 0));
+        const selected = end - start;
+        if (selected <= 0) {
+            this._genReadout.textContent = "";
+            return;
+        }
+        const pre = Math.max(0, parseInt(this._preContextInput?.value, 10) || 0);
+        const post = Math.max(0, parseInt(this._postContextInput?.value, 10) || 0);
+        const sceneDur = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
+        const renderStart = Math.max(0, start - pre);
+        const renderEnd = sceneDur ? Math.min(sceneDur, end + post) : (end + post);
+        const source = Math.max(selected, renderEnd - renderStart);
+        const mode = this._timecodeMode === "timecode" ? "timecode" : "frames";
+        const unit = mode === "timecode" ? "" : "f";
+        this._genReadout.textContent = `${formatQueueTime(selected, this.fps, mode)}${unit} · ${formatQueueTime(source, this.fps, mode)} src`;
     }
 
     _readStoredTimelineSelection(scene = this.activeScene, settings = this._settings) {
@@ -4382,7 +4428,7 @@ export class EditorWidget {
         this._rebuildTemplateOptions();
         this._rebuildResolutionTierOptions();
         this._applyTemplateConstraintMetadata();
-        if (this.activeScene || this._sceneBar) {
+        if (this.activeScene || this._toolbar) {
             this._syncSceneResolutionControls({ detectSelections: false });
         }
         if (templateChanged && this.projectDir && resolvedTemplateId === "free") {
@@ -4420,7 +4466,7 @@ export class EditorWidget {
             this._showItemEditor();
         }
         this._syncSettingsPanelControls();
-        if (this._sceneBar) {
+        if (this._toolbar) {
             this._applyScales();
         }
         if (marginsChanged) {
@@ -4431,9 +4477,11 @@ export class EditorWidget {
                 const sidebarMax = this._computeFullscreenSidebarMaxWidth();
                 this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, nextSettings.layout.fullscreenSidebarWidth))}px`;
             }
-            if (this._fsBottomRow && nextSettings.layout.fullscreenTimelineHeight > 0) {
-                const timelineMax = this._computeFullscreenTimelineMaxHeight();
-                this._fsBottomRow.style.height = `${Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.min(timelineMax, nextSettings.layout.fullscreenTimelineHeight))}px`;
+            if (this._fsBottomRow) {
+                const requestedTimelineH = nextSettings.layout.fullscreenTimelineHeight > 0
+                    ? nextSettings.layout.fullscreenTimelineHeight
+                    : (parseInt(getComputedStyle(this._fsBottomRow).height, 10) || this._defaultFullscreenTimelineHeight());
+                this._applyFullscreenTimelineHeight(requestedTimelineH);
             }
             this._recalcFullscreenHeights();
             if (marginsChanged) {
@@ -4613,6 +4661,55 @@ export class EditorWidget {
         return Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.floor(avail * 0.8));
     }
 
+    _visibleTimelineCanvasMinHeight() {
+        const rulerH = this._timelineRulerHeight?.() ?? RULER_HEIGHT;
+        return Math.max(100, rulerH + 1);
+    }
+
+    _measureFullscreenTimelineChrome() {
+        this._reserveToolbarHeight();
+        const cs = this.container ? getComputedStyle(this.container) : null;
+        const paddingY = cs
+            ? (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0)
+            : 0;
+        let chromeH = 0;
+        if (this.container) {
+            for (const child of this.container.children) {
+                if (child === this.timelineCanvas) continue;
+                chromeH += child.offsetHeight || 0;
+            }
+        }
+        const visibleCanvasMin = this._visibleTimelineCanvasMinHeight();
+        return {
+            chromeH,
+            paddingY,
+            visibleCanvasMin,
+            minBottomH: chromeH + paddingY + visibleCanvasMin,
+        };
+    }
+
+    _clampFullscreenTimelineHeight(requestedHeight, metrics = null) {
+        const resolvedMetrics = metrics || this._measureFullscreenTimelineChrome();
+        const minHeight = resolvedMetrics.minBottomH;
+        const maxHeight = Math.max(this._computeFullscreenTimelineMaxHeight(), minHeight);
+        const numeric = Number(requestedHeight);
+        const fallback = this._defaultFullscreenTimelineHeight();
+        const requested = Number.isFinite(numeric) ? numeric : fallback;
+        return {
+            height: Math.max(minHeight, Math.min(maxHeight, requested)),
+            maxHeight,
+            metrics: resolvedMetrics,
+        };
+    }
+
+    _applyFullscreenTimelineHeight(requestedHeight, metrics = null) {
+        if (!this._fsBottomRow) return this._clampFullscreenTimelineHeight(requestedHeight, metrics);
+        const result = this._clampFullscreenTimelineHeight(requestedHeight, metrics);
+        this._fsBottomRow.style.maxHeight = `${Math.ceil(result.maxHeight)}px`;
+        this._fsBottomRow.style.height = `${Math.ceil(result.height)}px`;
+        return result;
+    }
+
     _defaultFullscreenTimelineHeight() {
         return Math.max(200, Math.min(FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT, Math.round(window.innerHeight * 0.4)));
     }
@@ -4637,7 +4734,7 @@ export class EditorWidget {
             this._fsSidebar.style.width = `${FULLSCREEN_SIDEBAR_DEFAULT_WIDTH}px`;
         }
         if (this._fsBottomRow) {
-            this._fsBottomRow.style.height = `${this._defaultFullscreenTimelineHeight()}px`;
+            this._applyFullscreenTimelineHeight(this._defaultFullscreenTimelineHeight());
         }
         if (this.isFullscreen) {
             this._recalcFullscreenHeights();
@@ -10004,6 +10101,238 @@ export class EditorWidget {
         }
     }
 
+    // ── Identity zone (brand › project › scene breadcrumb) ───────────
+    // Replaces the old static "Editor — <scene>" title. Lives only in the
+    // fullscreen/mounted top toolbar; the EditorWidget is always fullscreen
+    // (the dormant card is a separate controller with no scene bar), so the
+    // in-bar scene-selector group is hidden in _enterFullscreen.
+    _buildFullscreenIdentityZone() {
+        const zone = document.createElement("div");
+        zone.style.cssText = `display: flex; align-items: center; min-width: 0; flex-shrink: 1; overflow: hidden;`;
+
+        const brand = document.createElement("div");
+        brand.style.cssText = `display: flex; flex-direction: column; line-height: 1; margin-right: 14px; flex-shrink: 0; user-select: none;`;
+        const brandTop = document.createElement("span");
+        brandTop.textContent = "SONDER";
+        brandTop.style.cssText = `font-size: 17px; font-weight: 600; letter-spacing: 0.12em; color: ${COLORS.text};`;
+        const brandSub = document.createElement("span");
+        brandSub.textContent = "EDITOR";
+        brandSub.style.cssText = `font-size: 10px; letter-spacing: 0.46em; color: ${COLORS.accent}; margin-top: 3px;`;
+        brand.append(brandTop, brandSub);
+
+        const divider = document.createElement("span");
+        divider.style.cssText = `width: 1px; height: 20px; background: ${COLORS.border}; margin-right: 12px; flex-shrink: 0;`;
+
+        this._fsProjectPill = document.createElement("span");
+        this._fsProjectPill.style.cssText = `
+            display: inline-flex; align-items: center; gap: 6px; flex-shrink: 1; min-width: 0;
+            background: ${COLORS.panelRaised}; border: 1px solid ${COLORS.border}; border-radius: 7px;
+            padding: 4px 9px; font-size: 12px; font-weight: 500; color: ${COLORS.text}; cursor: pointer;
+        `;
+        this._fsProjectPill.title = "Project options";
+        this._fsProjectLabel = document.createElement("span");
+        this._fsProjectLabel.style.cssText = `overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;`;
+        this._fsProjectLabel.textContent = this._projectDirName() || "No Project";
+        const projectCaret = document.createElement("span");
+        projectCaret.textContent = "▾";
+        projectCaret.style.cssText = `font-size: 10px; color: ${COLORS.textDim}; flex-shrink: 0;`;
+        this._fsProjectPill.append(this._fsProjectLabel, projectCaret);
+        const openProjectMenu = (ev) => { ev.preventDefault(); ev.stopPropagation(); this._showProjectMenu(this._fsProjectPill); };
+        this._fsProjectPill.addEventListener("click", openProjectMenu);
+        this._fsProjectPill.addEventListener("contextmenu", openProjectMenu);
+
+        const chevron = document.createElement("span");
+        chevron.textContent = "›";
+        chevron.style.cssText = `font-size: 14px; color: ${COLORS.textMuted}; margin: 0 8px; flex-shrink: 0;`;
+
+        const sceneWrap = document.createElement("div");
+        sceneWrap.style.cssText = `display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0;`;
+        const prev = this._makeBtn("‹", "Previous scene");
+        prev.style.cssText += `font-size: 15px; padding: 1px 6px; color: ${COLORS.textDim};`;
+        prev.addEventListener("click", () => this._cycleScene(-1));
+        const scenePill = document.createElement("span");
+        scenePill.style.cssText = `
+            display: inline-flex; align-items: center; gap: 6px;
+            background: ${COLORS.accentSoft}; border: 1px solid ${COLORS.accentLo}; border-radius: 7px;
+            padding: 4px 9px; font-size: 12px; font-weight: 500; color: ${COLORS.text}; cursor: pointer;
+            max-width: 240px; overflow: hidden; white-space: nowrap;
+        `;
+        scenePill.title = "Click to switch scene · Right-click to rename / duplicate / delete";
+        this._fsSceneLabel = document.createElement("span");
+        this._fsSceneLabel.style.cssText = `overflow: hidden; text-overflow: ellipsis; white-space: nowrap;`;
+        this._fsSceneLabel.textContent = this.activeScene?.name || "No Scene";
+        const sceneCaret = document.createElement("span");
+        sceneCaret.textContent = "▾";
+        sceneCaret.style.cssText = `font-size: 10px; color: ${COLORS.accentHi}; flex-shrink: 0;`;
+        scenePill.append(this._fsSceneLabel, sceneCaret);
+        scenePill.addEventListener("click", () => this._showSceneDropdown(scenePill));
+        scenePill.addEventListener("contextmenu", (e) => {
+            e.preventDefault(); e.stopPropagation();
+            if (!this.activeScene) return;
+            this._showContextMenu(e.clientX, e.clientY, [
+                { label: "Rename Scene", action: () => this._renameScene() },
+                { label: "Duplicate Scene", action: () => this._duplicateScene() },
+                { label: "Delete Scene", action: () => this._deleteScene(), danger: true },
+            ]);
+        });
+        const next = this._makeBtn("›", "Next scene");
+        next.style.cssText += `font-size: 15px; padding: 1px 6px; color: ${COLORS.textDim};`;
+        next.addEventListener("click", () => this._cycleScene(1));
+        sceneWrap.append(prev, scenePill, next);
+
+        const addScene = this._makeBtn("+ Scene", "Create new scene");
+        addScene.style.cssText += `font-size: 12px; padding: 3px 8px; margin-left: 8px; color: ${COLORS.textDim}; flex-shrink: 0;`;
+        addScene.addEventListener("click", () => this._createScene());
+
+        zone.append(brand, divider, this._fsProjectPill, chevron, sceneWrap, addScene);
+        return zone;
+    }
+
+    _updateSceneIdentity(name) {
+        const text = name || "No Scene";
+        if (this.sceneLabel) this.sceneLabel.textContent = text;
+        if (this._fsSceneLabel) this._fsSceneLabel.textContent = text;
+    }
+
+    _updateProjectIdentity() {
+        if (this._fsProjectLabel) this._fsProjectLabel.textContent = this._projectDirName() || "No Project";
+    }
+
+    _showSceneDropdown(anchorEl) {
+        if (!this.scenes?.length) return;
+        const rect = anchorEl.getBoundingClientRect();
+        const items = this.scenes.map((scene) => {
+            const isActive = scene.scene_id === this.activeSceneId;
+            return {
+                label: `${isActive ? "✓ " : " "}${scene.name || "Untitled Scene"}`,
+                action: () => { if (scene.scene_id !== this.activeSceneId) this._setActiveScene(scene); },
+            };
+        });
+        items.push({ type: "separator" });
+        items.push({ label: "+ New scene", action: () => this._createScene() });
+        this._showContextMenu(rect.left, rect.bottom + 4, items);
+    }
+
+    _showProjectMenu(anchorEl) {
+        const rect = anchorEl.getBoundingClientRect();
+        this._showContextMenu(rect.left, rect.bottom + 4, [
+            { label: "Reveal projects folder", action: () => this._revealProjectFolder() },
+            { label: "Copy folder path", action: () => this._copyProjectPath() },
+        ]);
+    }
+
+    async _copyProjectPath() {
+        const path = this.projectDir || "";
+        if (!path) { notifyWarning("No project folder to copy"); return; }
+        try {
+            await navigator.clipboard.writeText(path);
+            notifyInfo("Folder path copied");
+        } catch (e) {
+            notifyWarning("Could not copy folder path");
+        }
+    }
+
+    async _revealProjectFolder() {
+        const dirName = this._projectDirName();
+        if (!dirName) { notifyWarning("No project folder to open"); return; }
+        try {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/reveal`), { method: "POST" });
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                notifyWarning(data?.error || "Could not open folder — use Copy folder path");
+            }
+        } catch (e) {
+            notifyWarning("Could not open folder — use Copy folder path");
+        }
+    }
+
+    // ── Project-not-found recovery (ephemeral session UI) ────────────
+    _showProjectNotFound() {
+        if (this._projectMissingEl) return;
+        this._projectMissing = true;
+        const host = this._fsContent || this._fullscreenOverlay || this.container;
+        if (!host) return;
+        if (!host.style.position || host.style.position === "static") host.style.position = "relative";
+        const panel = document.createElement("div");
+        panel.style.cssText = `
+            position: absolute; inset: 0; z-index: 50;
+            display: flex; align-items: center; justify-content: center;
+            background: ${COLORS.bg};
+        `;
+        const card = document.createElement("div");
+        card.style.cssText = `
+            max-width: 440px; padding: 24px; text-align: center;
+            background: ${COLORS.panel}; border: 1px solid ${COLORS.border}; border-radius: 10px;
+            color: ${COLORS.text}; font-size: 13px;
+        `;
+        const title = document.createElement("div");
+        title.style.cssText = `font-size: 15px; font-weight: 600; margin-bottom: 8px;`;
+        title.textContent = "Project not found";
+        const msg = document.createElement("div");
+        msg.style.cssText = `color: ${COLORS.textDim}; margin-bottom: 16px; line-height: 1.5;`;
+        const boundName = this._projectDirName() || "(unknown)";
+        msg.textContent = `The project folder “${boundName}” could not be opened — it may have been renamed or moved. Pick a project to continue:`;
+        const pickBtn = this._makeBtn("Choose a project…", "Select an available project");
+        pickBtn.style.cssText += `font-size: 13px; padding: 6px 16px;`;
+        pickBtn.addEventListener("click", (e) => this._showProjectRecoveryPicker(e.currentTarget));
+        card.append(title, msg, pickBtn);
+        panel.appendChild(card);
+        host.appendChild(panel);
+        this._projectMissingEl = panel;
+    }
+
+    _clearProjectNotFound() {
+        this._projectMissing = false;
+        if (this._projectMissingEl) {
+            this._projectMissingEl.remove();
+            this._projectMissingEl = null;
+        }
+    }
+
+    async _showProjectRecoveryPicker(anchorEl) {
+        let projects = [];
+        try {
+            const resp = await fetch(api.apiURL("/sonder-editor/projects"));
+            if (resp.ok) {
+                const data = await resp.json();
+                projects = data.projects || [];
+            }
+        } catch (e) { /* ignore */ }
+        const rect = (anchorEl || this._projectMissingEl)?.getBoundingClientRect?.() || { left: 200, bottom: 200 };
+        if (!projects.length) {
+            this._showContextMenu(rect.left, rect.bottom + 4, [{ label: "No projects found", disabled: true }]);
+            return;
+        }
+        const items = projects.map((p) => ({
+            label: String(p.path || "").split(/[/\\]/).pop() || p.name || "(unnamed)",
+            action: () => this._recoverToProject(p),
+        }));
+        this._showContextMenu(rect.left, rect.bottom + 4, items);
+    }
+
+    _recoverToProject(project) {
+        const folder = String(project?.path || "").split(/[/\\]/).pop();
+        if (!folder) return;
+        // Canvas node: re-point the `project` widget through its existing combo
+        // callback (the same switch path the user uses manually). Fire-and-forget
+        // — controller.updateProject calls session.destroy() and rebuilds under
+        // the new project, so do NOT touch this.* afterward.
+        const widgets = this.node?.widgets;
+        if (Array.isArray(widgets)) {
+            const projectWidget = widgets.find((w) => w.name === "project");
+            if (projectWidget && typeof projectWidget.callback === "function") {
+                projectWidget.value = folder;
+                projectWidget.callback(folder);
+                return;
+            }
+        }
+        // Mounted tab (widget-less stub node): editor-local rebind for recovery.
+        if (project?.path) {
+            this._clearProjectNotFound();
+            this.updateProject(project.path);
+        }
+    }
+
     // ── Fullscreen Mode ──────────────────────────────────────────────
     _createFullscreenOverlay() {
         if (this._fullscreenOverlay) return;
@@ -10023,9 +10352,7 @@ export class EditorWidget {
             flex-shrink: 0;
         `;
 
-        this._fsTitle = document.createElement("span");
-        this._fsTitle.style.cssText = `font-size: 13px; color: ${COLORS.text}; font-weight: 600;`;
-        this._fsTitle.textContent = "Sonder Editor";
+        this._fsTitle = this._buildFullscreenIdentityZone();
 
         const spacer = document.createElement("span");
         spacer.style.flex = "1";
@@ -10193,7 +10520,16 @@ export class EditorWidget {
             position: absolute; top: -3px; left: 0; right: 0; height: 6px;
             cursor: ns-resize; z-index: 2;
         `;
-        this._setupResizeHandle(timelineHandle, this._fsBottomRow, "height", FULLSCREEN_TIMELINE_MIN_HEIGHT, () => this._computeFullscreenTimelineMaxHeight(), true, "timeline-height");
+        this._setupResizeHandle(
+            timelineHandle, this._fsBottomRow, "height",
+            // Toolbar-aware minimum: the panel cannot be dragged below measured chrome
+            // plus the renderer's visible canvas floor.
+            () => this._measureFullscreenTimelineChrome().minBottomH,
+            () => {
+                const metrics = this._measureFullscreenTimelineChrome();
+                return Math.max(this._computeFullscreenTimelineMaxHeight(), metrics.minBottomH);
+            },
+            true, "timeline-height");
         this._fsBottomRow.appendChild(timelineHandle);
 
         this._fsContent.append(this._fsTopRow, this._fsBottomRow);
@@ -10221,13 +10557,18 @@ export class EditorWidget {
 
         const onMouseMove = (e) => {
             const maxValue = typeof max === "function" ? max() : max;
+            const minValue = typeof min === "function" ? min() : min;
             const delta = prop === "width"
                 ? e.clientX - startPos
                 : e.clientY - startPos;
             const newSize = invert
-                ? Math.max(min, Math.min(maxValue, startSize - delta))
-                : Math.max(min, Math.min(maxValue, startSize + delta));
-            target.style[prop] = newSize + "px";
+                ? Math.max(minValue, Math.min(maxValue, startSize - delta))
+                : Math.max(minValue, Math.min(maxValue, startSize + delta));
+            if (persistKey === "timeline-height" && target === this._fsBottomRow && prop === "height") {
+                this._applyFullscreenTimelineHeight(newSize);
+            } else {
+                target.style[prop] = newSize + "px";
+            }
 
             // Recalc timeline height to fill remaining space
             if (this.isFullscreen) {
@@ -10265,28 +10606,20 @@ export class EditorWidget {
             this._fsSidebar.style.maxWidth = `${sidebarMax}px`;
             this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, sidebarWidth))}px`;
         }
-        if (this._fsBottomRow) {
-            const timelineMax = this._computeFullscreenTimelineMaxHeight();
-            const timelineHeight = parseInt(getComputedStyle(this._fsBottomRow).height, 10) || this._defaultFullscreenTimelineHeight();
-            this._fsBottomRow.style.maxHeight = `${timelineMax}px`;
-            this._fsBottomRow.style.height = `${Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.min(timelineMax, timelineHeight))}px`;
-        }
-
-        // In three-panel layout, timeline height is based on the bottom row height
-        const bottomH = this._fsBottomRow ? parseInt(getComputedStyle(this._fsBottomRow).height) || 280 : 280;
-        // Derive the timeline canvas height from the container's content box: measure
-        // every non-canvas child (scene bar, toolbar, inline editor bars) and subtract
-        // the container's real vertical padding. Trusting hardcoded scene-bar/toolbar/
-        // editor heights left the container's vertical padding unaccounted, so the
-        // bottom-most child (an inline editor bar) was shaved by overflow:hidden.
-        const cs = getComputedStyle(this.container);
-        const vpad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
-        let nonCanvasH = 0;
-        for (const child of this.container.children) {
-            if (child === this.timelineCanvas) continue;
-            nonCanvasH += child.offsetHeight || 0;
-        }
-        this._timelineHeight = Math.max(100, bottomH - vpad - nonCanvasH);
+        // Keep the toolbar wrapper's reserved height current. CSS transform does not
+        // reserve flow space, so the panel clamp must account for measured toolbar chrome.
+        const metrics = this._measureFullscreenTimelineChrome();
+        const currentH = this._fsBottomRow
+            ? (parseInt(getComputedStyle(this._fsBottomRow).height, 10) || this._defaultFullscreenTimelineHeight())
+            : this._defaultFullscreenTimelineHeight();
+        const clamped = this._applyFullscreenTimelineHeight(currentH, metrics);
+        // Clamp the panel to its valid range; this is idempotent during a drag.
+        const bottomH = clamped?.height || currentH;
+        // Timeline canvas fills the bottom row minus the chrome.
+        this._timelineHeight = Math.max(
+            metrics.visibleCanvasMin,
+            bottomH - metrics.paddingY - metrics.chromeH
+        );
         this._clampScrollY();
         // Gallery is in the sidebar now, doesn't need height calc
         this._galleryHeight = GALLERY_HEIGHT; // Not used in fullscreen layout
@@ -10298,14 +10631,9 @@ export class EditorWidget {
 
         this._createFullscreenOverlay();
         const savedSidebarWidth = this._readFullscreenPersistValue("sidebar-width");
-        const savedTimelineHeight = this._readFullscreenPersistValue("timeline-height");
         if (savedSidebarWidth && this._fsSidebar) {
             const sidebarMax = this._computeFullscreenSidebarMaxWidth();
             this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, savedSidebarWidth))}px`;
-        }
-        if (savedTimelineHeight && this._fsBottomRow) {
-            const timelineMax = this._computeFullscreenTimelineMaxHeight();
-            this._fsBottomRow.style.height = `${Math.max(FULLSCREEN_TIMELINE_MIN_HEIGHT, Math.min(timelineMax, savedTimelineHeight))}px`;
         }
 
         // Save position and node size for re-insertion
@@ -10317,9 +10645,8 @@ export class EditorWidget {
         // Save gallery's position in container for restoration
         this._galleryNextSibling = this.galleryEl.nextSibling;
 
-        // Update sidebar header
-        const dirName = this.projectDir ? this.projectDir.split(/[/\\]/).pop() : "Assets";
-        if (this._fsSidebarHeader) this._fsSidebarHeader.textContent = dirName;
+        // Sidebar keeps a stable panel title; project identity lives in the breadcrumb pill.
+        if (this._fsSidebarHeader) this._fsSidebarHeader.textContent = "Assets";
 
         // Move gallery to sidebar (keep gallery zoom for scale)
         this._fsSidebar.appendChild(this.galleryEl);
@@ -10344,8 +10671,11 @@ export class EditorWidget {
         // Show overlay
         this._fullscreenOverlay.style.display = "flex";
 
-        // Update toolbar title
-        this._fsTitle.textContent = `Editor — ${this.activeScene?.name || "No Scene"}`;
+        // Identity zone owns scene + project; hide the redundant in-bar scene
+        // selector (the EditorWidget is always fullscreen — no dormant scene bar).
+        if (this._sceneSelectGroup) this._sceneSelectGroup.style.display = "none";
+        this._updateProjectIdentity();
+        this._updateSceneIdentity(this.activeScene?.name || "No Scene");
 
         // Insert placeholder into node
         this._fullscreenPlaceholder = document.createElement("div");
@@ -10366,12 +10696,11 @@ export class EditorWidget {
         // Set fullscreen state + recalc
         this.isFullscreen = true;
         EditorWidget._activeFullscreen = this;
-        this._fullscreenBtn.textContent = "⛶";
-        this._fullscreenBtn.title = "Exit fullscreen";
         this._sweepRenderCache();
 
-        this._recalcFullscreenHeights();
-        this._renderTimeline();
+        // ENTER must run _applyScales so saved/default panel height is clamped only after
+        // the editor is mounted in the visible fullscreen bottom row.
+        this._applyScales();
 
         // Render viewport after layout settles
         requestAnimationFrame(() => {
@@ -10445,8 +10774,6 @@ export class EditorWidget {
         EditorWidget._activeFullscreen = null;
         this._timelineHeight = TIMELINE_HEIGHT;
         this._galleryHeight = GALLERY_HEIGHT;
-        this._fullscreenBtn.textContent = "⛶";
-        this._fullscreenBtn.title = "Toggle fullscreen";
 
         // Reapply per-section scales (gallery transform, etc.)
         this._applyScales();
@@ -10764,22 +11091,47 @@ export class EditorWidget {
         });
     }
 
-    _applyScales() {
-        // A. Toolbar & Bars — CSS transform
+    // Reserve the toolbar's scaled height on its wrapper. `transform:scale` is
+    // visual-only in this engine, so the normal-flow wrapper carries the rendered
+    // toolbar height that pushes the timeline down.
+    // PURE: sets transform/width on the toolbar + height on the wrapper, returns the
+    // reserved px. Must NOT call _recalcFullscreenHeights (no recursion).
+    _reserveToolbarHeight() {
+        if (!this._toolbar || !this._toolbarWrap) return 0;
         const st = this._scaleToolbar;
-        for (const el of [this._sceneBar, this._toolbar, this._infoBar]) {
-            if (!el) continue;
-            el.style.transform = st !== 1.0 ? `scale(${st})` : "";
-            el.style.transformOrigin = "top left";
-            el.style.width = st !== 1.0 ? `${100 / st}%` : "";
+        if (st === 1.0) {
+            this._toolbar.style.transform = "";
+            this._toolbar.style.width = "";
+            this._toolbarWrap.style.height = "";
+            return this._toolbar.offsetHeight;
         }
-        // D. Asset Gallery — CSS zoom (not transform, because transform doesn't affect layout/scroll)
+        this._toolbar.style.transformOrigin = "top left";
+        this._toolbar.style.transform = `scale(${st})`;
+        this._toolbar.style.width = `${100 / st}%`; // narrower box re-wraps; scale fills width
+        // getBoundingClientRect reflects the transform (already scaled) + the re-wrap.
+        const h = Math.ceil(this._toolbar.getBoundingClientRect().height);
+        this._toolbarWrap.style.height = `${h}px`;
+        return h;
+    }
+
+    _applyScales() {
+        // Toolbar: reserve its scaled height on the wrapper.
+        this._reserveToolbarHeight();
+        // Asset gallery: CSS zoom.
         if (this.galleryEl) {
             const sg = this._scaleGallery;
             this.galleryEl.style.zoom = sg !== 1.0 ? sg : "";
         }
+        // Clamp the saved/default bottom-panel height after toolbar reservation so
+        // toolbar scaling can increase the measured minimum without persisting it.
+        if (this.isFullscreen && this._fsBottomRow) {
+            const userH = this._settings?.layout?.fullscreenTimelineHeight > 0
+                ? this._settings.layout.fullscreenTimelineHeight
+                : this._defaultFullscreenTimelineHeight();
+            this._applyFullscreenTimelineHeight(userH);
+        }
+        if (this.isFullscreen) this._recalcFullscreenHeights();
         this._renderTimeline();
-        // Notify ComfyUI that our size changed
         this.widgetHost?.markDirty?.();
     }
 
@@ -12111,7 +12463,8 @@ export class EditorWidget {
         this.activeScene = null;
         this.scenes = [];
         this._queueBatchExpanded = {};
-        this.sceneLabel.textContent = "Loading...";
+        this._updateSceneIdentity("Loading…");
+        this._updateProjectIdentity();
 
         // Stop playback and clear video cache on project change
         this._stopPlayback();
@@ -13174,7 +13527,7 @@ export class EditorWidget {
         if (this.isFullscreen) return 60;
         const st = this._scaleToolbar;
         const sg = this._scaleGallery;
-        const barsH = (SCENE_BAR_HEIGHT + 24) * st; // scene bar + toolbar
+        const barsH = 44 * st; // single merged toolbar row (this non-fullscreen branch is near-dead — editor is always fullscreen)
         const timelineH = this._timelineHeight;
         const editorsH = (this._promptEditorEl ? (this._promptEditorEl.offsetHeight || 30) : 0)
             + (this._itemEditorEl ? (this._itemEditorEl.offsetHeight || 30) : 0);
@@ -13316,6 +13669,10 @@ export class EditorWidget {
         if (this._seekAbort) {
             this._seekAbort();
             this._seekAbort = null;
+        }
+        if (this._toolbarLayoutRefreshRaf) {
+            cancelAnimationFrame(this._toolbarLayoutRefreshRaf);
+            this._toolbarLayoutRefreshRaf = null;
         }
 
         if (this._containerResizeObserver) {
