@@ -572,7 +572,7 @@ export function buildEditorToolbar(widget) {
     genLabel.style.cssText = `font-size:9px; font-weight:${TYPE.fwBold}; letter-spacing:0.09em; text-transform:uppercase; color:${THEME.accentHi}; margin-right:3px; white-space:nowrap;`;
     genLabel.textContent = "Gen";
     widget._genReadout = document.createElement("span");
-    widget._genReadout.style.cssText = `font-size:9px; color:${THEME.accentHi}; white-space:nowrap; border-left:1px solid ${THEME.accentLo}; padding-left:7px; margin-left:3px;`;
+    widget._genReadout.style.cssText = `font-size:9px; color:${THEME.accentHi}; white-space:nowrap; border-left:1px solid ${THEME.accentLo}; padding-left:7px; margin-left:3px; min-width:64px; box-sizing:border-box;`;
     widget._genWindowGroup = document.createElement("div");
     widget._genWindowGroup.style.cssText = `display:flex; align-items:center; gap:4px 5px; flex-wrap:wrap; min-width:0; max-width:100%; flex:0 1 auto; box-sizing:border-box; border:1px solid ${THEME.accentLo}; border-radius:7px; padding:3px 9px;`;
     widget._genWindowGroup.append(

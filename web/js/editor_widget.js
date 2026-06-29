@@ -3503,11 +3503,11 @@ export class EditorWidget {
         const end = Math.max(start, Math.round(Number(this.selectionEnd) || 0));
         const selected = end - start;
         if (selected <= 0) {
-            this._genReadout.textContent = "";
+            this._genReadout.textContent = "Full scene";
             return;
         }
-        const pre = Math.max(0, parseInt(this._preContextInput?.value, 10) || 0);
-        const post = Math.max(0, parseInt(this._postContextInput?.value, 10) || 0);
+        const pre = this._contextFrameValue("pre_context_frames");
+        const post = this._contextFrameValue("post_context_frames");
         const sceneDur = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
         const renderStart = Math.max(0, start - pre);
         const renderEnd = sceneDur ? Math.min(sceneDur, end + post) : (end + post);
