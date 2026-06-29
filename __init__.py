@@ -6,10 +6,11 @@ try:
     from .nodes.editor_node import SonderEditor
     from .nodes.io_nodes import SonderSaveBridge, SonderSaveVideo, SonderPreviewVideo
     from .nodes.bridge_nodes import SonderGuidesBridgeStart, SonderGuidesBridgeEnd
-    from .nodes.driver_bridge import SonderDriverBridge
+    from .nodes.driver_bridge import SonderDriverBridge, SonderDriverSelector
     from .nodes.masks_bridge import SonderMasksBridge
     from .nodes.metadata_collector import SonderMetadataCollector
     from .nodes.prompt_bridge import SonderPromptRelayBridge
+    from .nodes.selector import SonderSelector
 
     NODE_CLASS_MAPPINGS = {
         "SonderEditor": SonderEditor,
@@ -19,9 +20,11 @@ try:
         "SonderPreviewVideo": SonderPreviewVideo,
         "SonderGuidesBridgeStart": SonderGuidesBridgeStart,
         "SonderGuidesBridgeEnd": SonderGuidesBridgeEnd,
+        "SonderDriverSelector": SonderDriverSelector,
         "SonderDriverBridge": SonderDriverBridge,
         "SonderMasksBridge": SonderMasksBridge,
         "SonderPromptRelayBridge": SonderPromptRelayBridge,
+        "SonderSelector": SonderSelector,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
@@ -32,10 +35,20 @@ try:
         "SonderPreviewVideo": "Sonder Preview Video",
         "SonderGuidesBridgeStart": "Sonder Guides Bridge Start",
         "SonderGuidesBridgeEnd": "Sonder Guides Bridge End",
+        "SonderDriverSelector": "Sonder Driver Selector",
         "SonderDriverBridge": "Sonder Driver Bridge",
         "SonderMasksBridge": "Sonder Masks Bridge",
         "SonderPromptRelayBridge": "Sonder Prompt Relay Bridge",
+        "SonderSelector": "Sonder Selector",
     }
+
+    try:
+        from .nodes.lazy_switches import LAZY_NODE_CLASS_MAPPINGS, LAZY_NODE_DISPLAY_NAME_MAPPINGS
+        NODE_CLASS_MAPPINGS.update(LAZY_NODE_CLASS_MAPPINGS)
+        NODE_DISPLAY_NAME_MAPPINGS.update(LAZY_NODE_DISPLAY_NAME_MAPPINGS)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Sonder lazy nodes unavailable: %s", exc)
 
     WEB_DIRECTORY = "./web"
 

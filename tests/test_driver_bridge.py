@@ -93,6 +93,21 @@ def _stub_decode(monkeypatch, bridge):
     monkeypatch.setattr(bridge, "decode_video_range", fake_decode)
 
 
+def test_driver_selector_and_bridge_contracts(tmp_path, monkeypatch):
+    bridge = _import_driver_bridge(tmp_path, monkeypatch)
+
+    assert bridge.SonderDriverSelector.RETURN_TYPES == ("SONDER_DRIVER_REF", "INT")
+    assert bridge.SonderDriverSelector.RETURN_NAMES == ("driver_ref", "has_driver")
+    assert "project" in bridge.SonderDriverSelector.INPUT_TYPES()["required"]
+    assert "driver_lane_index" in bridge.SonderDriverSelector.INPUT_TYPES()["optional"]
+    assert "driver_selector_overrides_json" in bridge.SonderDriverSelector.INPUT_TYPES()["optional"]
+
+    assert bridge.SonderDriverBridge.RETURN_TYPES == ("IMAGE", "INT", "FLOAT")
+    assert bridge.SonderDriverBridge.RETURN_NAMES == ("driver_images", "driver_idx", "driver_strength")
+    assert "driver_ref" in bridge.SonderDriverBridge.INPUT_TYPES()["required"]
+    assert "project" not in bridge.SonderDriverBridge.INPUT_TYPES()["required"]
+
+
 def test_driver_bridge_emits_selected_lane_segment(tmp_path, monkeypatch):
     bridge, _timeline_state, project, _scene = _make_project(
         tmp_path,
@@ -102,10 +117,11 @@ def test_driver_bridge_emits_selected_lane_segment(tmp_path, monkeypatch):
     )
     _stub_decode(monkeypatch, bridge)
 
-    images, frame_idx, strength, has_driver = bridge.SonderDriverBridge().execute(
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(
         project,
         driver_lane_index=1,
     )
+    images, frame_idx, strength = bridge.SonderDriverBridge().execute(driver_ref)
 
     assert tuple(images.shape) == (3, 4, 6, 3)
     assert frame_idx == 0
@@ -124,37 +140,46 @@ def test_driver_bridge_missing_hidden_muted_and_override_states(tmp_path, monkey
         muted=True,
     )
     _stub_decode(monkeypatch, bridge)
+    selector = bridge.SonderDriverSelector()
     node = bridge.SonderDriverBridge()
 
-    missing_lane = node.execute(project, driver_lane_index=2)
-    assert missing_lane[3] == 0
+    missing_ref, missing_has_driver = selector.execute(project, driver_lane_index=2)
+    missing_lane = node.execute(missing_ref)
+    assert missing_has_driver == 0
     assert missing_lane[2] == pytest.approx(0.0)
 
-    inherited_hidden_muted = node.execute(project, driver_lane_index=0)
-    assert inherited_hidden_muted[3] == 0
+    inherited_ref, inherited_has_driver = selector.execute(project, driver_lane_index=0)
+    assert inherited_has_driver == 0
+    inherited_hidden_muted = node.execute(inherited_ref)
+    assert inherited_hidden_muted[2] == pytest.approx(0.0)
 
-    forced_on = node.execute(
+    forced_ref, forced_has_driver = selector.execute(
         project,
         driver_lane_index=0,
-        driver_bridge_overrides_json='{"drivers":{"lane:0":{"muted":false}}}',
+        driver_selector_overrides_json='{"drivers":{"lane:0":{"muted":false}}}',
     )
-    assert forced_on[3] == 1
+    forced_on = node.execute(forced_ref)
+    assert forced_has_driver == 1
     assert forced_on[2] == pytest.approx(0.42)
 
-    forced_muted = node.execute(
+    forced_muted_ref, forced_muted_has_driver = selector.execute(
         project,
         driver_lane_index=0,
-        driver_bridge_overrides_json='{"drivers":{"lane:0":{"muted":true}}}',
+        driver_selector_overrides_json='{"drivers":{"lane:0":{"muted":true}}}',
     )
-    assert forced_muted[3] == 0
+    assert forced_muted_has_driver == 0
+    forced_muted = node.execute(forced_muted_ref)
+    assert forced_muted[2] == pytest.approx(0.0)
 
     scene.clips = []
-    forced_missing_clip = node.execute(
+    forced_missing_ref, forced_missing_has_driver = selector.execute(
         project,
         driver_lane_index=0,
-        driver_bridge_overrides_json='{"drivers":{"lane:0":{"muted":false}}}',
+        driver_selector_overrides_json='{"drivers":{"lane:0":{"muted":false}}}',
     )
-    assert forced_missing_clip[3] == 0
+    assert forced_missing_has_driver == 0
+    forced_missing_clip = node.execute(forced_missing_ref)
+    assert forced_missing_clip[2] == pytest.approx(0.0)
 
 
 def test_driver_bridge_negative_lane_index_is_absent(tmp_path, monkeypatch):
@@ -166,10 +191,11 @@ def test_driver_bridge_negative_lane_index_is_absent(tmp_path, monkeypatch):
     )
     _stub_decode(monkeypatch, bridge)
 
-    _images, _frame_idx, strength, has_driver = bridge.SonderDriverBridge().execute(
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(
         project,
         driver_lane_index=-1,
     )
+    _images, _frame_idx, strength = bridge.SonderDriverBridge().execute(driver_ref)
 
     assert strength == pytest.approx(0.0)
     assert has_driver == 0
@@ -188,10 +214,11 @@ def test_driver_bridge_fallback_index_respects_template_and_avoids_guides(tmp_pa
         "frame_constraint": {"step": 8, "offset": 1},
     })
 
-    _images, frame_idx, strength, has_driver = bridge.SonderDriverBridge().execute(
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(
         project,
         driver_lane_index=0,
     )
+    _images, frame_idx, strength = bridge.SonderDriverBridge().execute(driver_ref)
 
     assert frame_idx == 1
     assert strength == pytest.approx(0.0)
@@ -234,10 +261,11 @@ def test_driver_bridge_uses_queue_snapshot_by_ref_id(tmp_path, monkeypatch, queu
         "queue_job_ref_id": "job-1",
     })
 
-    images, frame_idx, strength, has_driver = bridge.SonderDriverBridge().execute(
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(
         project,
         driver_lane_index=0,
     )
+    images, frame_idx, strength = bridge.SonderDriverBridge().execute(driver_ref)
 
     assert tuple(images.shape) == (4, 4, 6, 3)
     assert frame_idx == 0
@@ -249,5 +277,8 @@ def test_driver_bridge_decode_failure_for_effective_clip_raises(tmp_path, monkey
     bridge, _timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
     scene.clips[0].source_path = os.path.join("media", "missing.mp4")
 
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(project, driver_lane_index=0)
+    assert has_driver == 1
+
     with pytest.raises(RuntimeError, match="Driver media not found"):
-        bridge.SonderDriverBridge().execute(project, driver_lane_index=0)
+        bridge.SonderDriverBridge().execute(driver_ref)

@@ -1,8 +1,8 @@
-"""Sonder Driver Bridge - single-lane driver injector.
+"""Sonder Driver selector and bridge nodes.
 
-The bridge reads the same project execution context emitted by SonderEditor and
-resolves one selected driver lane to (images, local index, strength, present).
-Queued runs use the frozen driver snapshot referenced by queue_job_ref_id.
+The selector resolves one Driver lane against the current Sonder execution
+context without decoding media. The bridge consumes that resolved reference and
+only decodes when its branch actually executes.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Any
 
 import numpy as np
 import torch
@@ -232,10 +233,16 @@ def _empty_image(width: int, height: int) -> torch.Tensor:
     return torch.zeros(1, max(1, height), max(1, width), 3, dtype=torch.float32)
 
 
-def _abs_driver_path(project, source_path: str) -> str:
+def _project_dir_value(project_or_dir) -> str:
+    if isinstance(project_or_dir, str):
+        return project_or_dir
+    return getattr(project_or_dir, "project_dir", "") or ""
+
+
+def _abs_driver_path(project_or_dir, source_path: str) -> str:
     if os.path.isfile(source_path):
         return source_path
-    return os.path.join(getattr(project, "project_dir", "") or "", source_path)
+    return os.path.join(_project_dir_value(project_or_dir), source_path)
 
 
 def _decode_driver_clip(project, clip, overlap_start: int, overlap_len: int, width: int, height: int) -> torch.Tensor:
@@ -276,7 +283,68 @@ def _decode_driver_clip(project, clip, overlap_start: int, overlap_len: int, wid
     return torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
 
 
-def resolve_driver_bridge(project, driver_lane_index=0, driver_bridge_overrides_json="{}") -> dict:
+def _clip_to_dict(clip) -> dict[str, Any]:
+    if isinstance(clip, dict):
+        return dict(clip)
+    if hasattr(clip, "to_dict") and callable(clip.to_dict):
+        return clip.to_dict()
+    return {
+        "clip_id": getattr(clip, "clip_id", ""),
+        "source_path": getattr(clip, "source_path", ""),
+        "timeline_start_frame": _coerce_int(getattr(clip, "timeline_start_frame", 0), 0),
+        "timeline_end_frame": _coerce_int(getattr(clip, "timeline_end_frame", 0), 0),
+        "source_in_frame": _coerce_int(getattr(clip, "source_in_frame", 0), 0),
+        "source_out_frame": _coerce_int(getattr(clip, "source_out_frame", 0), 0),
+        "track_index": _coerce_int(getattr(clip, "track_index", 0), 0),
+        "role": getattr(clip, "role", "render"),
+        "strength": _coerce_float(getattr(clip, "strength", 1.0), 1.0),
+        "muted": bool(getattr(clip, "muted", False)),
+        "fit_mode": getattr(clip, "fit_mode", "pad_edge"),
+        "crop_position": getattr(clip, "crop_position", "center"),
+    }
+
+
+def _base_driver_ref(
+    project,
+    *,
+    source_info: dict,
+    lane_index: int,
+    render_start: int,
+    render_end: int,
+    width: int,
+    height: int,
+    frame_count: int,
+    frame_constraint,
+    reserved_guides,
+    fallback_idx: int,
+) -> dict[str, Any]:
+    return {
+        "schema": "sonder_driver_ref_v1",
+        "source": source_info.get("source", "live"),
+        "project_dir": getattr(project, "project_dir", "") or "",
+        "lane_index": int(lane_index),
+        "lane_count": max(0, _coerce_int(source_info.get("lane_count"), 0)),
+        "render_start": int(render_start),
+        "render_end": int(render_end),
+        "width": int(width),
+        "height": int(height),
+        "frame_count": int(frame_count),
+        "frame_constraint": frame_constraint if isinstance(frame_constraint, dict) else None,
+        "reserved_guide_indices": sorted(int(idx) for idx in set(reserved_guides or [])),
+        "fallback_idx": int(fallback_idx),
+        "driver_idx": int(fallback_idx),
+        "strength": 0.0,
+        "has_driver": 0,
+        "clip": None,
+        "overlap_start": 0,
+        "overlap_len": 0,
+        "overlap_local_idx": int(fallback_idx),
+    }
+
+
+def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_json="{}") -> dict[str, Any]:
+    """Resolve Driver lane metadata without decoding media."""
+
     scene = _resolve_active_scene(project)
     render_start, render_end, width, height = _resolve_render_window(project, scene)
     frame_count = _resolve_output_frame_count(project, render_start, render_end)
@@ -284,18 +352,24 @@ def resolve_driver_bridge(project, driver_lane_index=0, driver_bridge_overrides_
     frame_constraint = _resolve_frame_constraint(project)
     reserved_guides = _reserved_guide_indices(project, scene, source_info, render_start, render_end)
     fallback_idx = fallback_driver_index(frame_count, frame_constraint, reserved_guides)
-    empty = {
-        "images": _empty_image(width, height),
-        "idx": int(fallback_idx),
-        "strength": 0.0,
-        "has_driver": 0,
-        "source": source_info.get("source", "live"),
-    }
-
     lane_index = _coerce_int(driver_lane_index, 0)
+    ref = _base_driver_ref(
+        project,
+        source_info=source_info,
+        lane_index=lane_index,
+        render_start=render_start,
+        render_end=render_end,
+        width=width,
+        height=height,
+        frame_count=frame_count,
+        frame_constraint=frame_constraint,
+        reserved_guides=reserved_guides,
+        fallback_idx=fallback_idx,
+    )
+
     lane_count = max(0, _coerce_int(source_info.get("lane_count"), 0))
     if lane_index < 0 or lane_index >= lane_count or render_end <= render_start:
-        return empty
+        return ref
 
     lane_clips = [
         clip for clip in source_info.get("clips", []) or []
@@ -303,7 +377,7 @@ def resolve_driver_bridge(project, driver_lane_index=0, driver_bridge_overrides_
         and _coerce_int(getattr(clip, "track_index", 0), 0) == lane_index
     ]
     if not lane_clips:
-        return empty
+        return ref
     if len(lane_clips) > 1:
         raise RuntimeError(
             f"Multiple driver clips exist on driver lane {lane_index}; keep one driver clip per lane."
@@ -314,46 +388,92 @@ def resolve_driver_bridge(project, driver_lane_index=0, driver_bridge_overrides_
     overlap_end = min(_coerce_int(getattr(clip, "timeline_end_frame", 0), 0), render_end)
     overlap_len = max(0, overlap_end - overlap_start)
     if overlap_len <= 0:
-        return empty
+        return ref
 
-    override_state = _driver_override_state(driver_bridge_overrides_json, lane_index)
+    override_state = _driver_override_state(driver_selector_overrides_json, lane_index)
     if override_state == "mute":
-        return empty
+        return ref
 
     editor_absent = (
         _lane_hidden(source_info.get("lane_configs", []), lane_index)
         or bool(getattr(clip, "muted", False))
     )
     if editor_absent and override_state != "on":
-        return empty
+        return ref
 
-    images = _decode_driver_clip(project, clip, overlap_start, overlap_len, width, height)
+    local_idx = int(overlap_start - render_start)
+    ref.update({
+        "has_driver": 1,
+        "clip": _clip_to_dict(clip),
+        "overlap_start": int(overlap_start),
+        "overlap_len": int(overlap_len),
+        "overlap_local_idx": local_idx,
+        "driver_idx": local_idx,
+        "strength": _coerce_float(getattr(clip, "strength", 1.0), 1.0),
+    })
+    return ref
+
+
+def decode_driver_ref(driver_ref) -> dict[str, Any]:
+    ref = driver_ref if isinstance(driver_ref, dict) else {}
+    width = max(1, _coerce_int(ref.get("width"), 1))
+    height = max(1, _coerce_int(ref.get("height"), 1))
+    if _coerce_int(ref.get("has_driver"), 0) != 1:
+        idx = _coerce_int(ref.get("fallback_idx", ref.get("driver_idx")), 0)
+        return {
+            "images": _empty_image(width, height),
+            "idx": int(idx),
+            "strength": 0.0,
+            "has_driver": 0,
+            "source": ref.get("source", "live"),
+        }
+
+    clip_data = ref.get("clip")
+    if not isinstance(clip_data, dict):
+        raise RuntimeError("Driver ref is marked present but contains no clip metadata.")
+    overlap_len = _coerce_int(ref.get("overlap_len"), 0)
+    if overlap_len <= 0:
+        raise RuntimeError("Driver ref is marked present but contains no positive overlap.")
+
+    clip = ClipReference.from_dict(clip_data)
+    images = _decode_driver_clip(
+        str(ref.get("project_dir", "") or ""),
+        clip,
+        _coerce_int(ref.get("overlap_start"), 0),
+        overlap_len,
+        width,
+        height,
+    )
     return {
         "images": images,
-        "idx": int(overlap_start - render_start),
-        "strength": _coerce_float(getattr(clip, "strength", 1.0), 1.0),
+        "idx": _coerce_int(ref.get("overlap_local_idx", ref.get("driver_idx")), 0),
+        "strength": _coerce_float(ref.get("strength"), 1.0),
         "has_driver": 1,
-        "source": source_info.get("source", "live"),
+        "source": ref.get("source", "live"),
     }
 
 
-class SonderDriverBridge:
-    """Resolve one Driver lane for the active Sonder Editor render window."""
+def resolve_driver_bridge(project, driver_lane_index=0, driver_bridge_overrides_json="{}") -> dict[str, Any]:
+    """Compatibility helper that resolves and decodes in one call."""
+
+    return decode_driver_ref(resolve_driver_ref(project, driver_lane_index, driver_bridge_overrides_json))
+
+
+class SonderDriverSelector:
+    """Resolve one Driver lane and expose presence for lazy graph routing."""
 
     CATEGORY = "Sonder"
-    RETURN_TYPES = ("IMAGE", "INT", "FLOAT", "INT")
-    RETURN_NAMES = ("driver_images", "driver_idx", "driver_strength", "has_driver")
+    RETURN_TYPES = ("SONDER_DRIVER_REF", "INT")
+    RETURN_NAMES = ("driver_ref", "has_driver")
     OUTPUT_TOOLTIPS = (
-        "Driver frames for the selected driver lane, window-rebased to the editor output.",
-        "Local output frame where the driver segment starts, or a deterministic fallback index.",
-        "Driver conditioning strength. Emits 0 when no driver is active.",
-        "0 when no driver is active, 1 when the selected driver lane contributes media.",
+        "Resolved Driver reference for the selected lane. Wire to Sonder Driver Bridge.",
+        "0 when no effective driver is present, 1 when the selected lane contributes media.",
     )
     FUNCTION = "execute"
     DESCRIPTION = (
-        "Reads a selected Driver lane from the Sonder project. Queued executions use "
-        "the frozen driver snapshot. Missing lanes/clips emit a black fallback with "
-        "has_driver=0; decode failures for active drivers raise a node error."
+        "Resolves a selected Driver lane without decoding media. Use has_driver "
+        "to drive Sonder Switch/Cluster and pass driver_ref to Sonder Driver Bridge "
+        "inside the active driver branch."
     )
 
     @classmethod
@@ -371,27 +491,68 @@ class SonderDriverBridge:
                     "max": 999,
                     "tooltip": "Zero-based Driver lane order. Missing lanes are treated as no driver.",
                 }),
-                "driver_bridge_overrides_json": ("STRING", {
+                "driver_selector_overrides_json": ("STRING", {
                     "default": "{}",
-                    "tooltip": "Workflow-local bridge override state.",
+                    "tooltip": "Workflow-local Driver selector override state.",
                 }),
             },
         }
 
-    def execute(self, project, driver_lane_index=0, driver_bridge_overrides_json="{}"):
-        result = resolve_driver_bridge(project, driver_lane_index, driver_bridge_overrides_json)
+    def execute(self, project, driver_lane_index=0, driver_selector_overrides_json="{}"):
+        ref = resolve_driver_ref(project, driver_lane_index, driver_selector_overrides_json)
         ctx = getattr(project, "_execution_context", None)
         if isinstance(ctx, dict):
-            ctx["driver_bridge"] = {
+            ctx["driver_selector"] = {
                 "lane_index": _coerce_int(driver_lane_index, 0),
-                "has_driver": int(result["has_driver"]),
-                "driver_idx": int(result["idx"]),
-                "strength": float(result["strength"]),
-                "source": result.get("source", "live"),
+                "has_driver": int(ref["has_driver"]),
+                "driver_idx": int(ref["driver_idx"]),
+                "strength": float(ref["strength"]),
+                "source": ref.get("source", "live"),
             }
         logger.info(
-            "driver bridge: lane=%s source=%s has_driver=%s idx=%s strength=%.4f",
+            "driver selector: lane=%s source=%s has_driver=%s idx=%s strength=%.4f",
             driver_lane_index,
+            ref.get("source", "live"),
+            ref["has_driver"],
+            ref["driver_idx"],
+            ref["strength"],
+        )
+        return (ref, int(ref["has_driver"]))
+
+
+class SonderDriverBridge:
+    """Decode Driver media from a resolved Driver reference."""
+
+    CATEGORY = "Sonder"
+    RETURN_TYPES = ("IMAGE", "INT", "FLOAT")
+    RETURN_NAMES = ("driver_images", "driver_idx", "driver_strength")
+    OUTPUT_TOOLTIPS = (
+        "Driver frames for the selected driver lane, window-rebased to the editor output.",
+        "Local output frame where the driver segment starts, or a deterministic fallback index.",
+        "Driver conditioning strength. Emits 0 when no driver is active.",
+    )
+    FUNCTION = "execute"
+    DESCRIPTION = (
+        "Consumes a Sonder Driver Selector reference. Missing lanes/clips emit a "
+        "black fallback; decode failures for active drivers raise a node error."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "driver_ref": ("SONDER_DRIVER_REF", {
+                    "tooltip": "Wire from Sonder Driver Selector.",
+                }),
+            },
+        }
+
+    def execute(self, driver_ref):
+        result = decode_driver_ref(driver_ref)
+        lane_index = _coerce_int(driver_ref.get("lane_index"), 0) if isinstance(driver_ref, dict) else 0
+        logger.info(
+            "driver bridge: lane=%s source=%s has_driver=%s idx=%s strength=%.4f",
+            lane_index,
             result.get("source", "live"),
             result["has_driver"],
             result["idx"],
@@ -401,5 +562,4 @@ class SonderDriverBridge:
             result["images"],
             int(result["idx"]),
             float(result["strength"]),
-            int(result["has_driver"]),
         )

@@ -15,19 +15,19 @@ const { api } = window.comfyAPI.api;
 const EXT_NAME = "sonder.bridge";
 const TARGET_START = "SonderGuidesBridgeStart";
 const TARGET_END = "SonderGuidesBridgeEnd";
-const TARGET_DRIVER = "SonderDriverBridge";
+const TARGET_DRIVER_SELECTOR = "SonderDriverSelector";
 const MAX_PASSTHROUGH = 8; // mirror SONDER_BRIDGE_MAX_PASSTHROUGH default
 const VALUE_RE = /^value_(\d+)$/;
 const NODE_STATE = Symbol("sonderBridgeState");
 const OVERRIDES_WIDGET = "bridge_overrides_json";
 const DRIVER_LANE_WIDGET = "driver_lane_index";
-const DRIVER_OVERRIDES_WIDGET = "driver_bridge_overrides_json";
+const DRIVER_OVERRIDES_WIDGET = "driver_selector_overrides_json";
 
 const isStart = (node) => node?.comfyClass === TARGET_START;
 const isEnd = (node) => node?.comfyClass === TARGET_END;
-const isDriverBridge = (node) => node?.comfyClass === TARGET_DRIVER;
+const isDriverSelector = (node) => node?.comfyClass === TARGET_DRIVER_SELECTOR;
 const isBridge = (node) => isStart(node) || isEnd(node);
-const isAnySonderBridge = (node) => isBridge(node) || isDriverBridge(node);
+const isAnySonderBridge = (node) => isBridge(node) || isDriverSelector(node);
 
 const TYPE_ALIASES = new Map([
     ["AUDIO", "AUDIO"],
@@ -851,7 +851,7 @@ function renderDriverPanel(node, payload = { status: "", drivers: [] }) {
 }
 
 function refreshBridgeDriverPanel(node) {
-    if (!isDriverBridge(node)) return;
+    if (!isDriverSelector(node)) return;
     const state = ensureNodeState(node);
     if (!state.driverPanel) return;
 
@@ -879,7 +879,7 @@ function refreshBridgeDriverPanel(node) {
 }
 
 function installDriverPanel(node) {
-    if (!isDriverBridge(node) || typeof node.addDOMWidget !== "function") return;
+    if (!isDriverSelector(node) || typeof node.addDOMWidget !== "function") return;
     const state = ensureNodeState(node);
     if (state.driverPanel) return;
     const wrapper = style(document.createElement("div"), `
@@ -900,7 +900,7 @@ function installDriverPanel(node) {
         font-weight:700;
     `);
     const title = document.createElement("span");
-    title.textContent = "Driver Bridge";
+    title.textContent = "Driver Selector";
     const refreshBtn = style(document.createElement("button"), `
         border:1px solid rgba(126,168,201,0.35);
         border-radius:5px;
@@ -931,7 +931,7 @@ function installDriverPanel(node) {
     const status = style(document.createElement("div"), "color:#7f8d9b;font-size:10px;line-height:1.25;");
     const list = style(document.createElement("div"), "display:flex;flex-direction:column;max-height:138px;overflow:auto;");
     wrapper.append(header, select, status, list);
-    const domWidget = node.addDOMWidget("sonder_driver_bridge_panel", "SonderDriverBridgePanel", wrapper, {
+    const domWidget = node.addDOMWidget("sonder_driver_selector_panel", "SonderDriverSelectorPanel", wrapper, {
         serialize: false,
         hideOnZoom: false,
         getMinHeight: () => 92,
@@ -961,7 +961,7 @@ const installNode = (node) => {
         installGuidePanel(node);
     }
 
-    if (isDriverBridge(node)) {
+    if (isDriverSelector(node)) {
         const laneWidget = (node.widgets || []).find((w) => w?.name === DRIVER_LANE_WIDGET);
         if (laneWidget) hideWidget(laneWidget);
         const overridesWidget = (node.widgets || []).find((w) => w?.name === DRIVER_OVERRIDES_WIDGET);
@@ -978,7 +978,7 @@ const installNode = (node) => {
                 mirrorProjectWire(this);
                 refreshBridgeGuidePanel(this);
             }
-            if (isDriverBridge(this)) refreshBridgeDriverPanel(this);
+            if (isDriverSelector(this)) refreshBridgeDriverPanel(this);
         } catch (e) {
             console.warn("[Sonder Bridge] connection-change handler error:", e);
         }
@@ -994,7 +994,7 @@ const installNode = (node) => {
                 mirrorProjectWire(node);
                 refreshBridgeGuidePanel(node);
             }
-            if (isDriverBridge(node)) refreshBridgeDriverPanel(node);
+            if (isDriverSelector(node)) refreshBridgeDriverPanel(node);
         } catch (e) {
             console.warn("[Sonder Bridge] initial-shape error:", e);
         }
