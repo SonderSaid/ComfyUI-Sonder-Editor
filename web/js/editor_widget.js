@@ -1208,6 +1208,9 @@ export class EditorWidget {
         }
         this._syncSceneResolutionControls({ detectSelections: !isSameScene });
         this._syncSceneFpsControl();
+        if (this._timecodeMode === "timecode") {
+            this._refreshContextInputs();
+        }
         this._updateViewportHeader();
 
         // Update hidden widgets
@@ -1354,6 +1357,7 @@ export class EditorWidget {
                 this._updateViewportHeader();
                 if (this._timecodeMode === "timecode") {
                     this._refreshDurationInput();
+                    this._refreshContextInputs();
                     if (this._itemEditorEl && this.selectedItem) {
                         this._showItemEditor();
                     }
@@ -3388,19 +3392,54 @@ export class EditorWidget {
         return Math.max(0, parseInt(this._getWidgetValue(name, 0), 10) || 0);
     }
 
+    _formatContextInputValue(frames) {
+        return this._formatPositionInput(Math.max(0, parseInt(frames, 10) || 0));
+    }
+
+    _parseContextInputValue(value) {
+        const parsed = this._parsePositionInput(value);
+        return Math.max(0, Number.isFinite(parsed) ? Math.round(parsed) : 0);
+    }
+
+    _syncContextInputElement(input, frames, title) {
+        if (!input) return;
+        if (this._timecodeMode === "timecode") {
+            input.type = "text";
+            input.inputMode = "decimal";
+            input.step = "0.01";
+            input.title = `${title} (${Math.max(0, parseInt(frames, 10) || 0)} frames)`;
+        } else {
+            input.type = "number";
+            input.inputMode = "numeric";
+            input.step = "1";
+            input.title = title;
+        }
+        input.min = 0;
+        input.max = this._timecodeMode === "timecode" ? this._framesToSeconds(256).toFixed(2) : 256;
+        input.value = this._formatContextInputValue(frames);
+    }
+
     _refreshContextInputs() {
-        if (this._preContextInput) {
-            this._preContextInput.value = this._contextFrameValue("pre_context_frames");
-        }
-        if (this._postContextInput) {
-            this._postContextInput.value = this._contextFrameValue("post_context_frames");
-        }
-        if (this._maskPreOffsetInput) {
-            this._maskPreOffsetInput.value = this._contextFrameValue("mask_pre_offset");
-        }
-        if (this._maskPostOffsetInput) {
-            this._maskPostOffsetInput.value = this._contextFrameValue("mask_post_offset");
-        }
+        this._syncContextInputElement(
+            this._preContextInput,
+            this._contextFrameValue("pre_context_frames"),
+            "Frames to include before the selected generation range"
+        );
+        this._syncContextInputElement(
+            this._postContextInput,
+            this._contextFrameValue("post_context_frames"),
+            "Frames to include after the selected generation range"
+        );
+        this._syncContextInputElement(
+            this._maskPreOffsetInput,
+            this._contextFrameValue("mask_pre_offset"),
+            "Extra pre-context frames excluded from denoise mask start"
+        );
+        this._syncContextInputElement(
+            this._maskPostOffsetInput,
+            this._contextFrameValue("mask_post_offset"),
+            "Extra post-context frames included in denoise mask end"
+        );
         // Re-snap once after external refresh so old projects whose stored values are
         // off-grid under the new policy reconcile display and persisted state on the
         // first paint. _updateContextFrameWidgets handles toolbar update too.
@@ -3408,10 +3447,10 @@ export class EditorWidget {
     }
 
     _updateContextFrameWidgets() {
-        const preRaw = Math.max(0, parseInt(this._preContextInput?.value, 10) || 0);
-        const postRaw = Math.max(0, parseInt(this._postContextInput?.value, 10) || 0);
-        const maskPreRaw = Math.max(0, parseInt(this._maskPreOffsetInput?.value, 10) || 0);
-        const maskPostRaw = Math.max(0, parseInt(this._maskPostOffsetInput?.value, 10) || 0);
+        const preRaw = this._parseContextInputValue(this._preContextInput?.value);
+        const postRaw = this._parseContextInputValue(this._postContextInput?.value);
+        const maskPreRaw = this._parseContextInputValue(this._maskPreOffsetInput?.value);
+        const maskPostRaw = this._parseContextInputValue(this._maskPostOffsetInput?.value);
         // Four independent snaps mirroring SonderEditor backend: context snaps grow
         // the rendered tensor, mask offsets only choose which frames are masked
         // within the snapped context cap. The mask-offset cap is the post-snap
@@ -3421,10 +3460,10 @@ export class EditorWidget {
         const post = this._snapPostContextFrames(postRaw);
         const maskPre = this._snapMaskOffset(maskPreRaw, pre);
         const maskPost = this._snapMaskOffset(maskPostRaw, post);
-        if (this._preContextInput) this._preContextInput.value = pre;
-        if (this._postContextInput) this._postContextInput.value = post;
-        if (this._maskPreOffsetInput) this._maskPreOffsetInput.value = maskPre;
-        if (this._maskPostOffsetInput) this._maskPostOffsetInput.value = maskPost;
+        this._syncContextInputElement(this._preContextInput, pre, "Frames to include before the selected generation range");
+        this._syncContextInputElement(this._postContextInput, post, "Frames to include after the selected generation range");
+        this._syncContextInputElement(this._maskPreOffsetInput, maskPre, "Extra pre-context frames excluded from denoise mask start");
+        this._syncContextInputElement(this._maskPostOffsetInput, maskPost, "Extra post-context frames included in denoise mask end");
         this._setWidgetValue("pre_context_frames", pre);
         this._setWidgetValue("post_context_frames", post);
         this._setWidgetValue("mask_pre_offset", maskPre);
@@ -4462,6 +4501,9 @@ export class EditorWidget {
         }
         if (prevStreamingMode !== nextStreamingMode && !this.isPlaying) {
             this._clearVideoCache();
+        }
+        if (prevTimecodeMode !== this._timecodeMode) {
+            this._refreshContextInputs();
         }
         if (prevTimecodeMode !== this._timecodeMode && this._itemEditorEl && this.selectedItem) {
             this._showItemEditor();
