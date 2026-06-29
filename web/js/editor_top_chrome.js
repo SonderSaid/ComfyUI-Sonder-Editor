@@ -233,7 +233,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     });
 
     const ctxLabel = document.createElement("span");
-    ctxLabel.style.cssText = labelCss({ marginLeft: "6px" });
+    ctxLabel.style.cssText = labelCss({ marginLeft: "0" });
     ctxLabel.textContent = "Ctx:";
 
     const ctxInputStyle = topInputCss({ width: "40px", fontSize: `${TYPE.t10}px`, padding: "2px 3px", textAlign: "left" });
@@ -570,7 +570,7 @@ export function buildEditorToolbar(widget) {
     navSelDivider.style.cssText = `width:1px; align-self:stretch; background:${THEME.line2}; margin:0 2px;`;
     const genLabel = document.createElement("span");
     genLabel.style.cssText = `font-size:9px; font-weight:${TYPE.fwBold}; letter-spacing:0.09em; text-transform:uppercase; color:${THEME.accentHi}; margin-right:3px; white-space:nowrap;`;
-    genLabel.textContent = "Generation Window";
+    genLabel.textContent = "Gen";
     widget._genReadout = document.createElement("span");
     widget._genReadout.style.cssText = `font-size:9px; color:${THEME.accentHi}; white-space:nowrap; border-left:1px solid ${THEME.accentLo}; padding-left:7px; margin-left:3px;`;
     widget._genWindowGroup = document.createElement("div");
