@@ -365,8 +365,9 @@ export async function replaceAssetInProject(projectDir, assetId, file) {
 // ── Constants ──────────────────────────────────────────────────────────
 const GALLERY_HEIGHT = 160;
 const SCENE_BAR_HEIGHT = 36;
-const FULLSCREEN_SIDEBAR_DEFAULT_WIDTH = 240;
+const FULLSCREEN_SIDEBAR_DEFAULT_WIDTH = 240; // fallback only; first-run width is computed proportionally
 const FULLSCREEN_SIDEBAR_MIN_WIDTH = 180;
+const FULLSCREEN_SIDEBAR_DEFAULT_FRACTION = 0.382; // first-run gallery sidebar ≈ golden-ratio 38.2% of the editor area
 const FULLSCREEN_TIMELINE_MIN_HEIGHT = 160;
 const FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT = 600;
 
@@ -4655,6 +4656,15 @@ export class EditorWidget {
         return Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.floor(avail * 0.5));
     }
 
+    // First-run / reset gallery-sidebar width: a proportion of the editor area (not a fixed px),
+    // clamped to [min, 50% max], so the gallery:viewport split starts ~38:62 (golden ratio) on any screen.
+    _defaultFullscreenSidebarWidth() {
+        const m = this._settings?.appearance?.editorMargins || { sides: 0 };
+        const avail = Math.max(0, window.innerWidth - (m.sides || 0) * 2);
+        const target = avail > 0 ? Math.round(avail * FULLSCREEN_SIDEBAR_DEFAULT_FRACTION) : FULLSCREEN_SIDEBAR_DEFAULT_WIDTH;
+        return Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(this._computeFullscreenSidebarMaxWidth(), target));
+    }
+
     _computeFullscreenTimelineMaxHeight() {
         const m = this._settings?.appearance?.editorMargins || { top: 0, bottom: 0 };
         const avail = Math.max(0, window.innerHeight - (m.top || 0) - (m.bottom || 0));
@@ -4711,7 +4721,9 @@ export class EditorWidget {
     }
 
     _defaultFullscreenTimelineHeight() {
-        return Math.max(200, Math.min(FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT, Math.round(window.innerHeight * 0.4)));
+        // First-run / reset timeline (bottom) height = golden-ratio 38.2% of the window, so the
+        // viewport+gallery top area starts at ~61.8%. Clamped to [200, FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT].
+        return Math.max(200, Math.min(FULLSCREEN_TIMELINE_FALLBACK_MAX_HEIGHT, Math.round(window.innerHeight * 0.382)));
     }
 
     _resetEditorLayout() {
@@ -4731,7 +4743,7 @@ export class EditorWidget {
             },
         });
         if (this._fsSidebar) {
-            this._fsSidebar.style.width = `${FULLSCREEN_SIDEBAR_DEFAULT_WIDTH}px`;
+            this._fsSidebar.style.width = `${this._defaultFullscreenSidebarWidth()}px`;
         }
         if (this._fsBottomRow) {
             this._applyFullscreenTimelineHeight(this._defaultFullscreenTimelineHeight());
@@ -10392,7 +10404,7 @@ export class EditorWidget {
         // Assets sidebar (left)
         this._fsSidebar = document.createElement("div");
         this._fsSidebar.style.cssText = `
-            width: ${FULLSCREEN_SIDEBAR_DEFAULT_WIDTH}px; min-width: ${FULLSCREEN_SIDEBAR_MIN_WIDTH}px; max-width: ${this._computeFullscreenSidebarMaxWidth()}px;
+            width: ${this._defaultFullscreenSidebarWidth()}px; min-width: ${FULLSCREEN_SIDEBAR_MIN_WIDTH}px; max-width: ${this._computeFullscreenSidebarMaxWidth()}px;
             background: ${COLORS.galleryBg}; border-right: 1px solid ${COLORS.border};
             display: flex; flex-direction: column; overflow: hidden;
             flex-shrink: 0; position: relative;
@@ -10602,7 +10614,7 @@ export class EditorWidget {
     _recalcFullscreenHeights() {
         if (this._fsSidebar) {
             const sidebarMax = this._computeFullscreenSidebarMaxWidth();
-            const sidebarWidth = parseInt(getComputedStyle(this._fsSidebar).width, 10) || FULLSCREEN_SIDEBAR_DEFAULT_WIDTH;
+            const sidebarWidth = parseInt(getComputedStyle(this._fsSidebar).width, 10) || this._defaultFullscreenSidebarWidth();
             this._fsSidebar.style.maxWidth = `${sidebarMax}px`;
             this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, sidebarWidth))}px`;
         }

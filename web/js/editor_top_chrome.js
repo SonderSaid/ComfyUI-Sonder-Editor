@@ -318,7 +318,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget._resHInput.addEventListener("change", () => widget._onResolutionChange("h"));
 
     widget._aspectRatioSelect = document.createElement("select");
-    widget._aspectRatioSelect.style.cssText = topSelectCss({ width: "72px", fontSize: "9px", padding: "1px 4px" });
+    widget._aspectRatioSelect.style.cssText = topSelectCss({ width: "48px", fontSize: "9px", padding: "1px 4px" });
     for (const preset of ASPECT_RATIO_PRESETS) {
         const option = document.createElement("option");
         option.value = widget._aspectRatioOptionValue(preset.a, preset.b);
@@ -341,7 +341,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     });
 
     widget._templateSelect = document.createElement("select");
-    widget._templateSelect.style.cssText = topSelectCss({ width: "108px", fontSize: "9px", padding: "1px 4px" });
+    widget._templateSelect.style.cssText = topSelectCss({ width: "64px", fontSize: "9px", padding: "1px 4px" });
     widget._templateSelect.addEventListener("change", () => widget._handleTemplateSelectionChange());
     widget._rebuildTemplateOptions();
     widget._rebuildResolutionTierOptions();
@@ -382,7 +382,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
     // Scene geometry group — placed on the right of the toolbar row (under the viewport).
     widget._sceneGeometryGroup = document.createElement("div");
-    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; justify-content:flex-end; gap:6px; row-gap:4px; flex-wrap:wrap; min-width:0; max-width:100%; flex:0 1 auto;";
+    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; align-content:flex-start; justify-content:center; gap:6px; row-gap:4px; flex-wrap:wrap-reverse; min-width:0; max-width:100%; flex:0 1 720px; margin-bottom:3px;";
     widget._sceneGeometryGroup.append(
         makeInlineGroup(widget._durLabel, widget.durationInput),
         makeInlineGroup(resLabel, widget._resWInput, xLabel, widget._resHInput),
@@ -393,15 +393,16 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
 export function buildEditorToolbar(widget) {
     const toolbar = document.createElement("div");
-    // flex-wrap is `wrap-reverse` (not `wrap`) on purpose: the toolbar holds a left timeline
-    // group + a right scene/utility group (see toolbar.append below). Reverse-wrap makes the
-    // right group ride the TOP row when the two can't share a line; plain `wrap` would drop it
-    // underneath. Do not change back to `wrap`.
+    // The toolbar is `flex-wrap: nowrap`: it holds four group children (history, tools, geometry,
+    // utilities) that always stay side-by-side; each wraps its OWN items internally (wrap-reverse).
+    // No align-items (default stretch) so every group fills the toolbar height: the one-row end
+    // groups (history, utilities) then center their buttons vertically (their own align-items:center),
+    // while the geometry group pins its row to the floor via align-content:flex-start (with
+    // wrap-reverse, cross-start = bottom).
     toolbar.style.cssText = `
         display: flex;
-        align-items: center;
         gap: 3px;
-        flex-wrap: wrap-reverse;
+        flex-wrap: nowrap;
         row-gap: 4px;
         min-width: 0;
         padding: 4px 7px;
@@ -584,29 +585,52 @@ export function buildEditorToolbar(widget) {
         widget._ctxMaskGroup, widget._genReadout
     );
 
-    widget._sceneGeometryGroup.style.marginLeft = "0";
+    // Four side-by-side flex groups (the toolbar container is nowrap, so they never stack):
+    // history, generation/timeline tools, scene geometry, and utilities. Each group wraps its
+    // OWN items upward (flex-wrap:wrap-reverse) — keeping undo/redo and help/settings in their
+    // own groups means the big tools group wraps above ITSELF (above the Generation Window)
+    // rather than above the undo icons. margin-left:auto on the geometry group pins it +
+    // utilities to the right edge; the spare width lands between the tools and geometry groups.
+    const makeToolbarGroup = (justify, fixed = false) => {
+        const group = document.createElement("div");
+        // `fixed` groups (history, utilities) never shrink or wrap — their two buttons stay on one
+        // line, bottom-aligned with the primary row. Tools/geometry shrink and wrap upward as needed.
+        group.style.cssText = `display:flex; align-items:center; gap:3px; row-gap:4px; flex-wrap:${fixed ? "nowrap" : "wrap-reverse"}; min-width:0; flex:${fixed ? "0 0 auto" : "0 1 auto"}; justify-content:${justify};`;
+        return group;
+    };
+    // Full-height divider that marks a TOP-LEVEL group boundary (align-self:stretch spans every
+    // wrapped row), vs the 16px makeDivider() ticks used between sub-clusters inside a group.
+    const makeGroupDivider = () => {
+        const d = document.createElement("span");
+        d.style.cssText = `width:1px; align-self:stretch; background:${THEME.line2}; margin:0 4px; flex:0 0 auto;`;
+        return d;
+    };
 
-    // Split the toolbar into two flex groups so the scene/utility cluster stays pinned to
-    // the right. `margin-left:auto` on the right group absorbs the free space, keeping it
-    // right-aligned even when it wraps to its own row (a flat row would pack it back left).
-    const toolbarLeftGroup = document.createElement("div");
-    toolbarLeftGroup.style.cssText = "display:flex; align-items:center; gap:3px; row-gap:4px; flex-wrap:wrap; min-width:0; flex:0 1 auto;";
-    toolbarLeftGroup.append(
-        undoBtn, redoBtn, makeDivider(),
+    const toolbarHistoryGroup = makeToolbarGroup("flex-start", true);
+    toolbarHistoryGroup.append(undoBtn, redoBtn);
+
+    const toolbarToolsGroup = makeToolbarGroup("flex-start");
+    toolbarToolsGroup.append(
         widget._genWindowGroup, makeDivider(),
         widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn, makeDivider(),
-        fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic, makeDivider(),
+        fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic, zoomOut, zoomIn, makeDivider(),
         widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn
     );
 
-    const toolbarRightGroup = document.createElement("div");
-    toolbarRightGroup.style.cssText = "display:flex; align-items:center; gap:3px; row-gap:4px; flex-wrap:wrap; min-width:0; flex:0 1 auto; margin-left:auto; justify-content:flex-end;";
-    toolbarRightGroup.append(
-        widget._sceneGeometryGroup, makeDivider(),
-        zoomOut, zoomIn, helpBtn, settingsBtn
-    );
+    // Scene geometry is its own group, pushed to the right edge (with utilities) via margin-left:auto.
+    widget._sceneGeometryGroup.style.marginLeft = "auto";
 
-    toolbar.append(toolbarLeftGroup, toolbarRightGroup);
+    const toolbarUtilsGroup = makeToolbarGroup("flex-end", true);
+    toolbarUtilsGroup.append(helpBtn, settingsBtn);
+
+    // Group boundaries: history │ tools  …gap…  geometry │ utilities. The tools↔geometry boundary
+    // is the margin-left:auto gap (a stronger separator than a line), so no divider is placed there.
+    toolbar.append(
+        toolbarHistoryGroup, makeGroupDivider(),
+        toolbarToolsGroup,
+        widget._sceneGeometryGroup, makeGroupDivider(),
+        toolbarUtilsGroup
+    );
 
     widget._toolbar = toolbar;
     // Wrapper so UI scaling (transform:scale) can reserve real layout height via the
