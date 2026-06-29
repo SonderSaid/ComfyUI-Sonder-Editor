@@ -103,6 +103,92 @@ function barButton(label, variant = "muted", minWidth = "") {
     return btn;
 }
 
+function refreshNodeLayout(node) {
+    try {
+        sizeNodeToVideo(node);
+    } catch (_) {
+        comfyApp()?.graph?.setDirtyCanvas?.(true, true);
+    }
+}
+
+function isSonderVideoWidget(widget) {
+    return !!widget && (widget.name === "sonder_video" || widget.type === "SonderVideoPreview");
+}
+
+function removeWidgetFromNode(node, widget) {
+    if (!Array.isArray(node?.widgets) || !widget) return false;
+    let removed = false;
+    for (let idx = node.widgets.indexOf(widget); idx >= 0; idx = node.widgets.indexOf(widget)) {
+        node.widgets.splice(idx, 1);
+        removed = true;
+    }
+    return removed;
+}
+
+function cleanupWidget(widget) {
+    if (!widget || widget._sonderVideoCleaned) return;
+    widget._sonderVideoCleaned = true;
+
+    const video = widget._sonderVideoEl;
+    try { video?.pause?.(); } catch (_) { /* pause is best-effort */ }
+    try { widget._sonderMediaCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
+    try { widget._sonderScrubCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
+    try { widget._sonderEventCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
+    try {
+        if (video) {
+            video.removeAttribute("src");
+            video.removeAttribute("poster");
+            video.load?.();
+        }
+    } catch (_) {
+        /* media teardown is best-effort */
+    }
+    try { widget._sonderContainerEl?.remove?.(); } catch (_) { /* detach is best-effort */ }
+
+    widget._sonderMediaCleanup = null;
+    widget._sonderScrubCleanup = null;
+    widget._sonderEventCleanup = null;
+    widget._sonderSetHasAudio = null;
+    widget._sonderApplyAutoplay = null;
+    widget._sonderVideoEl = null;
+    widget._sonderContainerEl = null;
+    widget._sonderLoadedUrl = "";
+}
+
+function resolveNodeVideoWidget(node) {
+    const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
+    let changed = false;
+
+    if (node?._sonderVideoWidget && !widgets.includes(node._sonderVideoWidget)) {
+        cleanupWidget(node._sonderVideoWidget);
+        node._sonderVideoWidget = null;
+        changed = true;
+    }
+
+    const candidates = widgets.filter(isSonderVideoWidget);
+    let keep = null;
+    if (node?._sonderVideoWidget && candidates.includes(node._sonderVideoWidget) && node._sonderVideoWidget._sonderVideoEl) {
+        keep = node._sonderVideoWidget;
+    }
+    if (!keep) {
+        keep = candidates.find((widget) => widget?._sonderVideoEl) || null;
+    }
+
+    for (const widget of candidates) {
+        if (widget === keep) continue;
+        if (removeWidgetFromNode(node, widget)) changed = true;
+        cleanupWidget(widget);
+    }
+
+    if (keep) {
+        node._sonderVideoWidget = keep;
+    } else if (node) {
+        node._sonderVideoWidget = null;
+    }
+
+    return { widget: keep, changed };
+}
+
 function createWidget(node) {
     const container = document.createElement("div");
     container.style.cssText = `
@@ -160,6 +246,11 @@ function createWidget(node) {
     const scrub = renderDormantMediaScrubBar(video);
     scrub.el.style.flex = "1 1 auto";
     scrub.el.style.minWidth = "0";
+    const eventCleanups = [];
+    const listen = (target, eventName, handler) => {
+        target.addEventListener(eventName, handler);
+        eventCleanups.push(() => target.removeEventListener(eventName, handler));
+    };
 
     // Whether the current source carries an audio track — set from the descriptor on mount.
     let hasAudio = false;
@@ -186,9 +277,9 @@ function createWidget(node) {
         audioBtn.textContent = video.muted ? "Muted" : "Audio On";
     };
 
-    playBtn.addEventListener("click", (e) => { e.stopPropagation(); togglePlay(); });
-    video.addEventListener("click", (e) => { e.stopPropagation(); togglePlay(); });
-    audioBtn.addEventListener("click", (e) => {
+    listen(playBtn, "click", (e) => { e.stopPropagation(); togglePlay(); });
+    listen(video, "click", (e) => { e.stopPropagation(); togglePlay(); });
+    listen(audioBtn, "click", (e) => {
         e.stopPropagation();
         if (!hasAudio) return;
         video.muted = !video.muted;
@@ -205,10 +296,10 @@ function createWidget(node) {
         }
     };
 
-    video.addEventListener("play", syncPlay);
-    video.addEventListener("pause", syncPlay);
-    video.addEventListener("volumechange", syncMute);
-    video.addEventListener("loadeddata", applyAutoplay);
+    listen(video, "play", syncPlay);
+    listen(video, "pause", syncPlay);
+    listen(video, "volumechange", syncMute);
+    listen(video, "loadeddata", applyAutoplay);
     syncPlay();
     syncMute();
 
@@ -219,7 +310,7 @@ function createWidget(node) {
     // Keep clicks/drags on the player from being stolen by LiteGraph's canvas pointer
     // handling (which otherwise moves the node and breaks the controls).
     for (const evt of ["pointerdown", "mousedown"]) {
-        container.addEventListener(evt, (e) => e.stopPropagation());
+        listen(container, evt, (e) => e.stopPropagation());
     }
 
     const widget = node.addDOMWidget("sonder_video", "SonderVideoPreview", container, {
@@ -231,13 +322,19 @@ function createWidget(node) {
     });
     widget.computeSize = (width) => [width, widgetHeightForWidth(node, width)];
     widget._sonderVideoEl = video;
+    widget._sonderContainerEl = container;
     widget._sonderScrubCleanup = scrub.cleanup;
+    widget._sonderEventCleanup = () => {
+        for (const cleanup of eventCleanups.splice(0)) {
+            try { cleanup(); } catch (_) { /* cleanup is best-effort */ }
+        }
+    };
     widget._sonderSetHasAudio = (value) => { hasAudio = !!value; syncMute(); };
     widget._sonderApplyAutoplay = applyAutoplay;
     node._sonderVideoWidget = widget;
 
     // Lock the aspect once the real dimensions are known, then grow the node to fit.
-    video.addEventListener("loadedmetadata", () => {
+    listen(video, "loadedmetadata", () => {
         const vw = video.videoWidth || 0;
         const vh = video.videoHeight || 0;
         if (vw > 0 && vh > 0) node._sonderVideoAspect = vw / vh;
@@ -259,9 +356,13 @@ export function mountNodeVideoPreview(node, descriptor) {
     const src = viewUrl(descriptor);
     if (!src) return;
 
-    let widget = node._sonderVideoWidget;
-    if (!widget || !widget._sonderVideoEl?.isConnected) {
+    let { widget, changed } = resolveNodeVideoWidget(node);
+    if (!widget) {
         widget = createWidget(node);
+        changed = true;
+    }
+    if (changed) {
+        refreshNodeLayout(node);
     }
 
     const video = widget._sonderVideoEl;
@@ -295,5 +396,26 @@ export function mountNodeVideoPreview(node, descriptor) {
     } else {
         try { video.currentTime = 0; } catch (_) { /* ignore */ }
         widget._sonderApplyAutoplay?.();
+    }
+}
+
+export function unmountNodeVideoPreview(node, { resize = true } = {}) {
+    if (!node) return;
+    const widgets = Array.isArray(node.widgets) ? [...node.widgets] : [];
+    let changed = false;
+    for (const widget of widgets) {
+        if (!isSonderVideoWidget(widget)) continue;
+        if (removeWidgetFromNode(node, widget)) changed = true;
+        cleanupWidget(widget);
+    }
+    if (node._sonderVideoWidget) {
+        cleanupWidget(node._sonderVideoWidget);
+        node._sonderVideoWidget = null;
+        changed = true;
+    }
+    if (changed && resize) {
+        refreshNodeLayout(node);
+    } else if (changed) {
+        comfyApp()?.graph?.setDirtyCanvas?.(true, true);
     }
 }

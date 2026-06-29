@@ -23,7 +23,7 @@ import {
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
 import { notifyProgress, configureNotifications } from "./editor_notifications.js";
-import { mountNodeVideoPreview } from "./node_video_preview.js";
+import { mountNodeVideoPreview, unmountNodeVideoPreview } from "./node_video_preview.js";
 
 injectSonderFontFaces();
 
@@ -1268,9 +1268,25 @@ app.registerExtension({
                     } catch (error) {
                         console.warn("[Sonder] Failed to mount save-video player:", error);
                     }
+                } else {
+                    try {
+                        unmountNodeVideoPreview(this);
+                    } catch (error) {
+                        console.warn("[Sonder] Failed to unmount save-video player:", error);
+                    }
                 }
                 const editorNodes = getSaveVideoEditorNodes(this);
                 refreshEditorNodes(editorNodes);
+            };
+
+            const origOnRemoved = nodeType.prototype.onRemoved;
+            nodeType.prototype.onRemoved = function () {
+                try {
+                    unmountNodeVideoPreview(this, { resize: false });
+                } catch (error) {
+                    console.warn("[Sonder] Failed to clean up save-video player:", error);
+                }
+                origOnRemoved?.apply(this, arguments);
             };
         }
 
@@ -1287,6 +1303,16 @@ app.registerExtension({
                         console.warn("[Sonder] Failed to mount preview player:", error);
                     }
                 }
+            };
+
+            const origOnRemoved = nodeType.prototype.onRemoved;
+            nodeType.prototype.onRemoved = function () {
+                try {
+                    unmountNodeVideoPreview(this, { resize: false });
+                } catch (error) {
+                    console.warn("[Sonder] Failed to clean up preview player:", error);
+                }
+                origOnRemoved?.apply(this, arguments);
             };
         }
 
