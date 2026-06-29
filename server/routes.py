@@ -3062,9 +3062,9 @@ def _direct_project_dir_from_request(request: web.Request) -> str | None:
 def _reveal_in_file_manager(path: str) -> tuple[bool, str]:
     """Open the OS file manager with `path` selected/revealed. Local server only.
 
-    Fire-and-forget via Popen with list args (never shell=True). NOTE: Windows
-    explorer.exe returns a NON-ZERO exit code even on success, so we do not wait
-    on or gate the result by the process return code.
+    Fire-and-forget via Popen (never shell=True). NOTE: Windows explorer.exe returns
+    a NON-ZERO exit code even on success, so we do not wait on or gate the result by
+    the process return code.
     """
     import sys
     import subprocess
@@ -3072,7 +3072,12 @@ def _reveal_in_file_manager(path: str) -> tuple[bool, str]:
     norm = os.path.normpath(path)
     try:
         if sys.platform.startswith("win"):
-            subprocess.Popen(["explorer", f"/select,{norm}"])
+            # explorer.exe does its own arg parsing; as a list arg Python quotes the whole
+            # token ("/select,C:\\path with spaces"), which explorer fails to parse and then
+            # silently opens Documents. Pass a single command-line string so it receives
+            # /select,"<path>" verbatim. This is NOT shell=True, and `norm` is containment-
+            # validated (_direct_project_dir_from_request / _path_within), so no injection.
+            subprocess.Popen(f'explorer /select,"{norm}"')
             return True, ""
         if sys.platform == "darwin":
             subprocess.Popen(["open", "-R", norm])

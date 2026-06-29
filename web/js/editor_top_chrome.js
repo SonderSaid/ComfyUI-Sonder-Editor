@@ -236,7 +236,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     ctxLabel.style.cssText = labelCss({ marginLeft: "6px" });
     ctxLabel.textContent = "Ctx:";
 
-    const ctxInputStyle = topInputCss({ width: "40px", fontSize: `${TYPE.t10}px`, padding: "2px 3px" });
+    const ctxInputStyle = topInputCss({ width: "40px", fontSize: `${TYPE.t10}px`, padding: "2px 3px", textAlign: "left" });
     const preCtxLabel = document.createElement("span");
     preCtxLabel.style.cssText = labelCss({ fontSize: "9px" });
     preCtxLabel.textContent = "Pre";
@@ -370,7 +370,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
     // Context + Mask sub-group — placed inside the generation-window block by the toolbar.
     widget._ctxMaskGroup = document.createElement("div");
-    widget._ctxMaskGroup.style.cssText = "display:flex; align-items:center; gap:4px; row-gap:3px; flex-wrap:wrap; min-width:0; max-width:100%; flex:1 1 280px;";
+    widget._ctxMaskGroup.style.cssText = "display:flex; align-items:center; gap:4px; row-gap:3px; flex-wrap:wrap; min-width:0; max-width:100%; flex:0 1 auto;";
     widget._ctxMaskGroup.append(
         ctxLabel,
         makeInlineGroup(preCtxLabel, widget._preContextInput),
@@ -382,7 +382,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
     // Scene geometry group — placed on the right of the toolbar row (under the viewport).
     widget._sceneGeometryGroup = document.createElement("div");
-    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; justify-content:flex-end; gap:6px; row-gap:4px; flex-wrap:wrap; min-width:0; max-width:100%; flex:1 1 520px;";
+    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; justify-content:flex-end; gap:6px; row-gap:4px; flex-wrap:wrap; min-width:0; max-width:100%; flex:0 1 auto;";
     widget._sceneGeometryGroup.append(
         makeInlineGroup(widget._durLabel, widget.durationInput),
         makeInlineGroup(resLabel, widget._resWInput, xLabel, widget._resHInput),
@@ -393,11 +393,15 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
 export function buildEditorToolbar(widget) {
     const toolbar = document.createElement("div");
+    // flex-wrap is `wrap-reverse` (not `wrap`) on purpose: the toolbar holds a left timeline
+    // group + a right scene/utility group (see toolbar.append below). Reverse-wrap makes the
+    // right group ride the TOP row when the two can't share a line; plain `wrap` would drop it
+    // underneath. Do not change back to `wrap`.
     toolbar.style.cssText = `
         display: flex;
         align-items: center;
         gap: 3px;
-        flex-wrap: wrap;
+        flex-wrap: wrap-reverse;
         row-gap: 4px;
         min-width: 0;
         padding: 4px 7px;
@@ -443,7 +447,7 @@ export function buildEditorToolbar(widget) {
     const frameLabel = document.createElement("span");
     frameLabel.style.cssText = labelCss({ marginLeft: "2px", fontSize: "9px" });
     frameLabel.textContent = "F";
-    const frameInputCss = `${topInputCss({ width: "58px", fontSize: `${TYPE.t10}px`, padding: "2px 4px", textAlign: "right" })}min-width:0;`;
+    const frameInputCss = `${topInputCss({ width: "44px", fontSize: `${TYPE.t10}px`, padding: "2px 4px", textAlign: "left" })}min-width:0;`;
     widget._playheadFrameInput = makeTextInput(
         "Playhead frame",
         frameInputCss,
@@ -469,7 +473,7 @@ export function buildEditorToolbar(widget) {
     const outLabel = document.createElement("span");
     outLabel.style.cssText = labelCss({ fontSize: "9px" });
     outLabel.textContent = "Out";
-    const selectionInputCss = `${topInputCss({ width: "58px", fontSize: `${TYPE.t10}px`, padding: "2px 4px", textAlign: "right" })}min-width:0;`;
+    const selectionInputCss = `${topInputCss({ width: "44px", fontSize: `${TYPE.t10}px`, padding: "2px 4px", textAlign: "left" })}min-width:0;`;
     widget._selectionStartInput = makeTextInput(
         "Selection in-point",
         selectionInputCss,
@@ -520,7 +524,10 @@ export function buildEditorToolbar(widget) {
     const settingsBtn = makeButton("\u2699", "Editor Settings", { ...BUTTON_OPTIONS.tertiary, radius: "999px", fontSize: `${TYPE.t12}px` }, "margin-left:4px;");
     settingsBtn.addEventListener("click", () => widget._showSettingsPanel());
 
-    widget._bookmarkBtn = makeButton("\ud83d\udd16", "Saved Selections", BUTTON_OPTIONS.tertiary, "position:relative;");
+    widget._bookmarkBtn = makeButton("", "Saved Selections", BUTTON_OPTIONS.tertiary, "position:relative; display:inline-flex; align-items:center; justify-content:center;");
+    // Simple outline bookmark (Feather "bookmark"); stroke:currentColor inherits the
+    // tertiary button color + hover, replacing the filled white/red \ud83d\udd16 emoji.
+    widget._bookmarkBtn.innerHTML = `<svg width="11" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" style="display:block;"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>`;
     widget._bookmarkBtn.addEventListener("click", (event) => widget._toggleSavedSelectionsDropdown(event));
 
     widget._queueBtn = makeButton("+ Queue", "Add current selection to render queue", BUTTON_OPTIONS.primary, "white-space:nowrap;");
@@ -566,7 +573,7 @@ export function buildEditorToolbar(widget) {
     widget._genReadout = document.createElement("span");
     widget._genReadout.style.cssText = `font-size:9px; color:${THEME.accentHi}; white-space:nowrap; border-left:1px solid ${THEME.accentLo}; padding-left:7px; margin-left:3px;`;
     widget._genWindowGroup = document.createElement("div");
-    widget._genWindowGroup.style.cssText = `display:flex; align-items:center; gap:4px 5px; flex-wrap:wrap; min-width:0; max-width:100%; flex:1 1 620px; box-sizing:border-box; background:${THEME.accentBg}; border:1px solid ${THEME.accentLo}; border-radius:7px; padding:3px 9px;`;
+    widget._genWindowGroup.style.cssText = `display:flex; align-items:center; gap:4px 5px; flex-wrap:wrap; min-width:0; max-width:100%; flex:0 1 auto; box-sizing:border-box; border:1px solid ${THEME.accentLo}; border-radius:7px; padding:3px 9px;`;
     widget._genWindowGroup.append(
         genLabel,
         makeInlineGroup(frameLabel, widget._playheadFrameInput),
@@ -579,22 +586,38 @@ export function buildEditorToolbar(widget) {
 
     widget._sceneGeometryGroup.style.marginLeft = "0";
 
-    toolbar.append(
+    // Split the toolbar into two flex groups so the scene/utility cluster stays pinned to
+    // the right. `margin-left:auto` on the right group absorbs the free space, keeping it
+    // right-aligned even when it wraps to its own row (a flat row would pack it back left).
+    const toolbarLeftGroup = document.createElement("div");
+    toolbarLeftGroup.style.cssText = "display:flex; align-items:center; gap:3px; row-gap:4px; flex-wrap:wrap; min-width:0; flex:0 1 auto;";
+    toolbarLeftGroup.append(
         undoBtn, redoBtn, makeDivider(),
         widget._genWindowGroup, makeDivider(),
         widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn, makeDivider(),
         fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic, makeDivider(),
-        widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn,
+        widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn
+    );
+
+    const toolbarRightGroup = document.createElement("div");
+    toolbarRightGroup.style.cssText = "display:flex; align-items:center; gap:3px; row-gap:4px; flex-wrap:wrap; min-width:0; flex:0 1 auto; margin-left:auto; justify-content:flex-end;";
+    toolbarRightGroup.append(
         widget._sceneGeometryGroup, makeDivider(),
         zoomOut, zoomIn, helpBtn, settingsBtn
     );
+
+    toolbar.append(toolbarLeftGroup, toolbarRightGroup);
 
     widget._toolbar = toolbar;
     // Wrapper so UI scaling (transform:scale) can reserve real layout height via the
     // wrapper's explicit height — pushing the timeline down instead of overlapping it
     // (transform/zoom are visual-only and reserve no flow space on their own).
     widget._toolbarWrap = document.createElement("div");
-    widget._toolbarWrap.style.cssText = "width:100%; overflow-x:auto; overflow-y:hidden; box-sizing:border-box; flex-shrink:0;";
+    // overflow MUST stay visible: at toolbar scale < 100% the scaled toolbar gets
+    // width:100/st% (wider than the wrap), which makes overflow-x:auto spawn a spurious
+    // horizontal scrollbar that clips the bottom row under overflow-y:hidden. The
+    // container clips the blast radius, and flex-wrap (not scroll) handles genuine width.
+    widget._toolbarWrap.style.cssText = "width:100%; overflow:visible; box-sizing:border-box; flex-shrink:0;";
     widget._toolbarWrap.appendChild(toolbar);
     widget.container.appendChild(widget._toolbarWrap);
     wireForegroundPill(widget);
