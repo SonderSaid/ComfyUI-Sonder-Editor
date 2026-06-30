@@ -365,7 +365,20 @@ function formatDuration(asset) {
 function formatBytes(value) {
     const size = Number(value);
     if (!Number.isFinite(size) || size < 0) return "-";
-    return `${Math.round(size)} B`;
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let amount = size;
+    let unitIndex = 0;
+    while (amount >= 1024 && unitIndex < units.length - 1) {
+        amount /= 1024;
+        unitIndex += 1;
+    }
+    if (unitIndex === 0) return `${Math.round(amount)} B`;
+    return `${amount.toFixed(amount < 10 ? 1 : 0)} ${units[unitIndex]}`;
+}
+
+function formatAssetSizeOnDisk(asset) {
+    const size = Number(asset?.size_bytes);
+    return Number.isFinite(size) && size > 0 ? formatBytes(size) : "—";
 }
 
 function formatDate(value) {
@@ -2871,8 +2884,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 makeMetaCell("Type", assetKindLabel(item.asset_type)),
                 makeMetaCell("Workflow", workflowStatusLabel(item)),
                 makeMetaCell("Duration", formatDuration(item)),
-                makeMetaCell("Size", item.asset_type === "artifact" ? formatBytes(item.size_bytes) : formatResolution(item)),
+                makeMetaCell(item.asset_type === "artifact" ? "Size" : "Resolution", item.asset_type === "artifact" ? formatBytes(item.size_bytes) : formatResolution(item)),
             );
+            if (item.asset_type !== "artifact") {
+                quick.appendChild(makeMetaCell("On Disk", formatAssetSizeOnDisk(item)));
+            }
             section.appendChild(quick);
             const tracked = renderTrackedMetadataSection(item);
             if (tracked) section.appendChild(tracked);
@@ -5237,7 +5253,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                 ["Type", assetKindLabel(asset.asset_type)],
                 ["Status", assetIsMissing(asset) ? "Missing" : "Available"],
                 ["Folder", normalizeFolderName(asset.folder) || "Root"],
-                ["Size", formatResolution(asset)],
+                ["Resolution", formatResolution(asset)],
+                ["Size on disk", formatAssetSizeOnDisk(asset)],
                 ["Duration", formatDuration(asset)],
                 ["FPS", asset.fps ? String(asset.fps) : "-"],
                 ["Sample Rate", asset.sample_rate ? `${asset.sample_rate} Hz` : "-"],

@@ -110,6 +110,27 @@ function makeTextInput(title, cssText, apply, onEscape) {
     return input;
 }
 
+function makeStepButtons(title, onStep) {
+    const wrap = document.createElement("span");
+    wrap.style.cssText = "display:inline-flex;flex-direction:column;gap:1px;flex:0 0 auto;";
+    const makeStep = (direction, label) => {
+        const button = makeButton(
+            label,
+            `${title} ${direction === "up" ? "up" : "down"}`,
+            { ...BUTTON_OPTIONS.tertiary, padding: "0", fontSize: "8px", radius: "3px" },
+            "width:13px;height:11px;min-width:13px;line-height:9px;display:inline-flex;align-items:center;justify-content:center;"
+        );
+        button.type = "button";
+        button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            onStep(direction);
+        });
+        return button;
+    };
+    wrap.append(makeStep("up", "\u25b2"), makeStep("down", "\u25bc"));
+    return wrap;
+}
+
 function buildQueueBadges(widget, queue = widget._renderQueue) {
     const counts = { running: 0, pending: 0 };
     for (const job of Array.isArray(queue) ? queue : []) {
@@ -240,28 +261,22 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     const preCtxLabel = document.createElement("span");
     preCtxLabel.style.cssText = labelCss({ fontSize: "9px" });
     preCtxLabel.textContent = "Pre";
-    widget._preContextInput = document.createElement("input");
-    widget._preContextInput.type = "number";
-    widget._preContextInput.min = 0;
-    widget._preContextInput.max = 256;
-    widget._preContextInput.step = 1;
-    widget._preContextInput.value = 0;
-    widget._preContextInput.title = "Frames to include before the selected generation range";
-    widget._preContextInput.style.cssText = ctxInputStyle;
-    widget._preContextInput.addEventListener("change", () => widget._updateContextFrameWidgets());
+    widget._preContextInput = makeTextInput(
+        "Frames to include before the selected generation range",
+        ctxInputStyle,
+        () => widget._updateContextFrameWidgets(),
+        () => widget._refreshContextInputs()
+    );
 
     const postCtxLabel = document.createElement("span");
     postCtxLabel.style.cssText = labelCss({ fontSize: "9px" });
     postCtxLabel.textContent = "Post";
-    widget._postContextInput = document.createElement("input");
-    widget._postContextInput.type = "number";
-    widget._postContextInput.min = 0;
-    widget._postContextInput.max = 256;
-    widget._postContextInput.step = 1;
-    widget._postContextInput.value = 0;
-    widget._postContextInput.title = "Frames to include after the selected generation range";
-    widget._postContextInput.style.cssText = ctxInputStyle;
-    widget._postContextInput.addEventListener("change", () => widget._updateContextFrameWidgets());
+    widget._postContextInput = makeTextInput(
+        "Frames to include after the selected generation range",
+        ctxInputStyle,
+        () => widget._updateContextFrameWidgets(),
+        () => widget._refreshContextInputs()
+    );
 
     const maskLabel = document.createElement("span");
     maskLabel.style.cssText = labelCss({ marginLeft: "4px" });
@@ -269,28 +284,22 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     const maskPreLabel = document.createElement("span");
     maskPreLabel.style.cssText = labelCss({ fontSize: "9px" });
     maskPreLabel.textContent = "-";
-    widget._maskPreOffsetInput = document.createElement("input");
-    widget._maskPreOffsetInput.type = "number";
-    widget._maskPreOffsetInput.min = 0;
-    widget._maskPreOffsetInput.max = 256;
-    widget._maskPreOffsetInput.step = 1;
-    widget._maskPreOffsetInput.value = 0;
-    widget._maskPreOffsetInput.title = "Extra pre-context frames excluded from denoise mask start";
-    widget._maskPreOffsetInput.style.cssText = ctxInputStyle;
-    widget._maskPreOffsetInput.addEventListener("change", () => widget._updateContextFrameWidgets());
+    widget._maskPreOffsetInput = makeTextInput(
+        "Extra pre-context frames excluded from denoise mask start",
+        ctxInputStyle,
+        () => widget._updateContextFrameWidgets(),
+        () => widget._refreshContextInputs()
+    );
 
     const maskPostLabel = document.createElement("span");
     maskPostLabel.style.cssText = labelCss({ fontSize: "9px" });
     maskPostLabel.textContent = "+";
-    widget._maskPostOffsetInput = document.createElement("input");
-    widget._maskPostOffsetInput.type = "number";
-    widget._maskPostOffsetInput.min = 0;
-    widget._maskPostOffsetInput.max = 256;
-    widget._maskPostOffsetInput.step = 1;
-    widget._maskPostOffsetInput.value = 0;
-    widget._maskPostOffsetInput.title = "Extra post-context frames included in denoise mask end";
-    widget._maskPostOffsetInput.style.cssText = ctxInputStyle;
-    widget._maskPostOffsetInput.addEventListener("change", () => widget._updateContextFrameWidgets());
+    widget._maskPostOffsetInput = makeTextInput(
+        "Extra post-context frames included in denoise mask end",
+        ctxInputStyle,
+        () => widget._updateContextFrameWidgets(),
+        () => widget._refreshContextInputs()
+    );
 
     const resLabel = document.createElement("span");
     resLabel.style.cssText = labelCss({ marginLeft: "6px" });
@@ -373,11 +382,11 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget._ctxMaskGroup.style.cssText = "display:flex; align-items:center; gap:4px; row-gap:3px; flex-wrap:wrap; min-width:0; max-width:100%; flex:0 1 auto;";
     widget._ctxMaskGroup.append(
         ctxLabel,
-        makeInlineGroup(preCtxLabel, widget._preContextInput),
-        makeInlineGroup(postCtxLabel, widget._postContextInput),
+        makeInlineGroup(preCtxLabel, widget._preContextInput, makeStepButtons("Pre context", (direction) => widget._stepContextFrameInput("pre", direction))),
+        makeInlineGroup(postCtxLabel, widget._postContextInput, makeStepButtons("Post context", (direction) => widget._stepContextFrameInput("post", direction))),
         maskLabel,
-        makeInlineGroup(maskPreLabel, widget._maskPreOffsetInput),
-        makeInlineGroup(maskPostLabel, widget._maskPostOffsetInput)
+        makeInlineGroup(maskPreLabel, widget._maskPreOffsetInput, makeStepButtons("Mask pre offset", (direction) => widget._stepContextFrameInput("maskPre", direction))),
+        makeInlineGroup(maskPostLabel, widget._maskPostOffsetInput, makeStepButtons("Mask post offset", (direction) => widget._stepContextFrameInput("maskPost", direction)))
     );
 
     // Scene geometry group — placed on the right of the toolbar row (under the viewport).
@@ -455,15 +464,17 @@ export function buildEditorToolbar(widget) {
         (value) => {
             const parsed = widget._parsePositionInput(value);
             if (!Number.isFinite(parsed)) {
-                widget._refreshPlayheadInput();
+                widget._refreshPlayheadInput({ force: true });
                 return;
             }
             const maxFrame = Math.max(0, widget.activeScene?.duration_frames || widget.totalFrames);
             widget.playhead = Math.max(0, Math.min(maxFrame, Math.round(parsed)));
             if (widget.isPlaying) widget._stopPlayback();
+            widget._ensureFrameVisible(widget.playhead, { center: true });
             widget._renderTimeline();
             widget._renderViewportFrame();
             widget._updateToolbar();
+            widget._refreshPlayheadInput({ force: true });
         },
         () => widget._refreshPlayheadInput()
     );
@@ -483,8 +494,9 @@ export function buildEditorToolbar(widget) {
             if (Number.isFinite(frame)) {
                 const maxFrame = Math.max(0, widget.activeScene?.duration_frames || widget.totalFrames);
                 widget._setSelectionStartFrame(widget._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
+                widget._refreshSelectionInputs({ force: true });
             } else {
-                widget._refreshSelectionInputs();
+                widget._refreshSelectionInputs({ force: true });
             }
         },
         () => widget._refreshSelectionInputs()
@@ -497,8 +509,9 @@ export function buildEditorToolbar(widget) {
             if (Number.isFinite(frame)) {
                 const maxFrame = Math.max(0, widget.activeScene?.duration_frames || widget.totalFrames);
                 widget._setSelectionEndFrame(widget._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
+                widget._refreshSelectionInputs({ force: true });
             } else {
-                widget._refreshSelectionInputs();
+                widget._refreshSelectionInputs({ force: true });
             }
         },
         () => widget._refreshSelectionInputs()
@@ -579,8 +592,8 @@ export function buildEditorToolbar(widget) {
         genLabel,
         makeInlineGroup(frameLabel, widget._playheadFrameInput),
         navSelDivider,
-        makeInlineGroup(inLabel, widget._selectionStartInput),
-        makeInlineGroup(outLabel, widget._selectionEndInput),
+        makeInlineGroup(inLabel, widget._selectionStartInput, makeStepButtons("Selection in-point", (direction) => widget._stepSelectionInput("start", direction))),
+        makeInlineGroup(outLabel, widget._selectionEndInput, makeStepButtons("Selection out-point", (direction) => widget._stepSelectionInput("end", direction))),
         clearSelBtn, widget._bookmarkBtn,
         widget._ctxMaskGroup, widget._genReadout
     );

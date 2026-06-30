@@ -197,6 +197,7 @@ import { mountSharedRenderQueue, queueBatchIds, formatQueueTime } from "./shared
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
 import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
 import { mountPromptManagementPanel } from "./editor_prompt_panel.js";
+import { evalNumericExpression } from "./editor_numeric_input.js";
 import * as TimelineCanvas from "./editor_timeline_canvas.js";
 import { RULER_HEIGHT, TIMELINE_HEIGHT, TRACK_TYPE } from "./editor_timeline_constants.js";
 import { createViewportSurface } from "./viewport_surface.js";
@@ -2793,12 +2794,12 @@ export class EditorWidget {
     _secondsToFrames(seconds) { return Math.round(seconds * this._effectiveFps); }
     _formatPositionInput(frame) { return this._timecodeMode === "timecode" ? this._framesToSeconds(frame).toFixed(2) : String(frame); }
     _parsePositionInput(value) {
+        const numeric = evalNumericExpression(value);
+        if (!Number.isFinite(numeric)) return NaN;
         if (this._timecodeMode === "timecode") {
-            const seconds = parseFloat(value);
-            return Number.isFinite(seconds) ? this._secondsToFrames(seconds) : NaN;
+            return this._secondsToFrames(numeric);
         }
-        const frames = parseInt(value, 10);
-        return Number.isFinite(frames) ? frames : NaN;
+        return numeric;
     }
 
     _updateViewportHeader() {
@@ -2858,11 +2859,11 @@ export class EditorWidget {
         return Math.max(1, Math.round(snapToConstraint(numeric, durationConstraint)));
     }
 
-    _snapPreContextFrames(value) {
+    _snapPreContextFrames(value, { direction = "up" } = {}) {
         // Pre context snaps UP to next G value (= step*k + offset, k>=0). 0 stays 0
         // because pre=0 means no pre context — the +1 then lives in the selection
         // via the existing _snapSelectionFrame path (selection endpoint snap).
-        const numeric = Math.max(0, parseInt(value, 10) || 0);
+        const numeric = Math.max(0, Math.round(Number(value) || 0));
         if (numeric <= 0) return 0;
         const constraint = this._getActiveTemplate()?.constraints?.frames;
         const step = constraint?.step;
@@ -2870,35 +2871,38 @@ export class EditorWidget {
         const offset = constraint.offset || 0;
         if (numeric <= offset) return offset;
         const k = (numeric - offset) / step;
-        return offset + Math.ceil(k) * step;
+        const rounded = direction === "down" ? Math.floor(k) : Math.ceil(k);
+        return Math.max(0, offset + rounded * step);
     }
 
-    _snapPostContextFrames(value) {
+    _snapPostContextFrames(value, { direction = "up" } = {}) {
         // Post context snaps UP to next multiple of step. Post never carries the
         // +1 offset (the leading single frame lives at the start of the tensor,
         // not the tail).
-        const numeric = Math.max(0, parseInt(value, 10) || 0);
+        const numeric = Math.max(0, Math.round(Number(value) || 0));
         if (numeric <= 0) return 0;
         const constraint = this._getActiveTemplate()?.constraints?.frames;
         const step = constraint?.step;
         if (!step || step <= 1) return numeric;
-        return Math.ceil(numeric / step) * step;
+        const rounded = direction === "down" ? Math.floor(numeric / step) : Math.ceil(numeric / step);
+        return Math.max(0, rounded * step);
     }
 
-    _snapMaskOffset(value, cap) {
+    _snapMaskOffset(value, cap, { direction = "up" } = {}) {
         // Mask offset snaps UP to the next multiple of step within [0, cap]. When
         // value >= cap, returns cap (the "full mask" option — needed on the pre
         // side because actual_pre = G value isn't itself a multiple of step; on
         // the post side cap is already a multiple of step so this collapses to
         // the same multiples-of-step rule).
-        const numeric = Math.max(0, parseInt(value, 10) || 0);
-        const capValue = Math.max(0, parseInt(cap, 10) || 0);
+        const numeric = Math.max(0, Math.round(Number(value) || 0));
+        const capValue = Math.max(0, Math.round(Number(cap) || 0));
         if (capValue <= 0 || numeric <= 0) return 0;
         if (numeric >= capValue) return capValue;
         const constraint = this._getActiveTemplate()?.constraints?.frames;
         const step = constraint?.step;
         if (!step || step <= 1) return Math.min(numeric, capValue);
-        const snapped = Math.ceil(numeric / step) * step;
+        const rounded = direction === "down" ? Math.floor(numeric / step) : Math.ceil(numeric / step);
+        const snapped = Math.max(0, rounded * step);
         return snapped <= capValue ? snapped : capValue;
     }
 
@@ -3398,19 +3402,17 @@ export class EditorWidget {
 
     _parseContextInputValue(value) {
         const parsed = this._parsePositionInput(value);
-        return Math.max(0, Number.isFinite(parsed) ? Math.round(parsed) : 0);
+        return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : NaN;
     }
 
     _syncContextInputElement(input, frames, title) {
         if (!input) return;
+        input.type = "text";
+        input.inputMode = "decimal";
         if (this._timecodeMode === "timecode") {
-            input.type = "text";
-            input.inputMode = "decimal";
             input.step = "0.01";
             input.title = `${title} (${Math.max(0, parseInt(frames, 10) || 0)} frames)`;
         } else {
-            input.type = "number";
-            input.inputMode = "numeric";
             input.step = "1";
             input.title = title;
         }
@@ -3446,20 +3448,27 @@ export class EditorWidget {
         this._updateContextFrameWidgets();
     }
 
-    _updateContextFrameWidgets() {
+    _updateContextFrameWidgets(stepDirective = null) {
         const preRaw = this._parseContextInputValue(this._preContextInput?.value);
         const postRaw = this._parseContextInputValue(this._postContextInput?.value);
         const maskPreRaw = this._parseContextInputValue(this._maskPreOffsetInput?.value);
         const maskPostRaw = this._parseContextInputValue(this._maskPostOffsetInput?.value);
+        if (![preRaw, postRaw, maskPreRaw, maskPostRaw].every(Number.isFinite)) {
+            this._refreshContextInputs();
+            return;
+        }
+        const snapOptions = (field) => (stepDirective?.field === field
+            ? { direction: stepDirective.direction }
+            : undefined);
         // Four independent snaps mirroring SonderEditor backend: context snaps grow
         // the rendered tensor, mask offsets only choose which frames are masked
         // within the snapped context cap. The mask-offset cap is the post-snap
         // context value so any context change re-snaps the same-side mask offset
         // in the same pass (forward-direction cross-field coupling).
-        const pre = this._snapPreContextFrames(preRaw);
-        const post = this._snapPostContextFrames(postRaw);
-        const maskPre = this._snapMaskOffset(maskPreRaw, pre);
-        const maskPost = this._snapMaskOffset(maskPostRaw, post);
+        const pre = this._snapPreContextFrames(preRaw, snapOptions("pre"));
+        const post = this._snapPostContextFrames(postRaw, snapOptions("post"));
+        const maskPre = this._snapMaskOffset(maskPreRaw, pre, snapOptions("maskPre"));
+        const maskPost = this._snapMaskOffset(maskPostRaw, post, snapOptions("maskPost"));
         this._syncContextInputElement(this._preContextInput, pre, "Frames to include before the selected generation range");
         this._syncContextInputElement(this._postContextInput, post, "Frames to include after the selected generation range");
         this._syncContextInputElement(this._maskPreOffsetInput, maskPre, "Extra pre-context frames excluded from denoise mask start");
@@ -3471,26 +3480,65 @@ export class EditorWidget {
         this._updateToolbar();
         // Context frames widen the highlight window (selection + context).
         this._refreshPromptUsageHighlight();
+        this._renderTimeline();
         this._updateGenReadout();
     }
 
-    _refreshSelectionInputs() {
-        if (this._selectionStartInput && document.activeElement !== this._selectionStartInput) {
+    _stepContextFrameInput(field, direction) {
+        const inputByField = {
+            pre: this._preContextInput,
+            post: this._postContextInput,
+            maskPre: this._maskPreOffsetInput,
+            maskPost: this._maskPostOffsetInput,
+        };
+        const input = inputByField[field];
+        if (!input) return;
+        const widgetByField = {
+            pre: "pre_context_frames",
+            post: "post_context_frames",
+            maskPre: "mask_pre_offset",
+            maskPost: "mask_post_offset",
+        };
+        const parsed = this._parseContextInputValue(input.value);
+        const current = Number.isFinite(parsed) ? parsed : this._contextFrameValue(widgetByField[field]);
+        const nextRaw = Math.max(0, current + (direction === "down" ? -1 : 1));
+        input.value = this._formatContextInputValue(nextRaw);
+        this._updateContextFrameWidgets({ field, direction });
+    }
+
+    _stepSelectionInput(edge, direction) {
+        const isStart = edge === "start";
+        const input = isStart ? this._selectionStartInput : this._selectionEndInput;
+        const fallback = isStart ? this.selectionStart : this.selectionEnd;
+        const parsed = this._parsePositionInput(input?.value);
+        const current = Number.isFinite(parsed) ? Math.round(parsed) : fallback;
+        const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
+        const nextRaw = current + (direction === "down" ? -1 : 1);
+        const next = this._snapSelectionFrame(nextRaw, { direction, clampMax: maxFrame });
+        if (isStart) {
+            this._setSelectionStartFrame(next);
+        } else {
+            this._setSelectionEndFrame(next);
+        }
+    }
+
+    _refreshSelectionInputs({ force = false } = {}) {
+        if (this._selectionStartInput && (force || document.activeElement !== this._selectionStartInput)) {
             this._selectionStartInput.value = this._formatPositionInput(this.selectionStart);
             this._selectionStartInput.title = `Selection in-point: ${this._frameToTimecode(this.selectionStart)}`;
         }
-        if (this._selectionEndInput && document.activeElement !== this._selectionEndInput) {
+        if (this._selectionEndInput && (force || document.activeElement !== this._selectionEndInput)) {
             this._selectionEndInput.value = this._formatPositionInput(this.selectionEnd);
             const duration = Math.max(0, this.selectionEnd - this.selectionStart);
             this._selectionEndInput.title = `Selection out-point: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(duration)})`;
         }
-        this._refreshPlayheadInput();
+        this._refreshPlayheadInput({ force });
         this._updateGenReadout();
     }
 
-    _refreshPlayheadInput() {
+    _refreshPlayheadInput({ force = false } = {}) {
         if (!this._playheadFrameInput) return;
-        if (document.activeElement === this._playheadFrameInput) return;
+        if (!force && document.activeElement === this._playheadFrameInput) return;
         this._playheadFrameInput.value = this._formatPositionInput(this.playhead);
         this._playheadFrameInput.title = `Playhead frame: ${this._frameToTimecode(this.playhead)}`;
     }
@@ -3514,7 +3562,7 @@ export class EditorWidget {
         const source = Math.max(selected, renderEnd - renderStart);
         const mode = this._timecodeMode === "timecode" ? "timecode" : "frames";
         const unit = mode === "timecode" ? "" : "f";
-        this._genReadout.textContent = `${formatQueueTime(selected, this.fps, mode)}${unit} · ${formatQueueTime(source, this.fps, mode)} src`;
+        this._genReadout.textContent = `${formatQueueTime(selected, this._effectiveFps, mode)}${unit} · ${formatQueueTime(source, this._effectiveFps, mode)} src`;
     }
 
     _readStoredTimelineSelection(scene = this.activeScene, settings = this._settings) {
@@ -3582,6 +3630,58 @@ export class EditorWidget {
 
     _setSelectionToFrameRange(start, end) {
         this._setTimelineSelection(start, end);
+    }
+
+    _resolvedGuideFrame(guide) {
+        const sceneDuration = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
+        const rawFrame = parseInt(guide?.frame_index, 10);
+        if (rawFrame === -1) return Math.max(0, sceneDuration - 1);
+        return Math.max(0, Math.round(Number.isFinite(rawFrame) ? rawFrame : 0));
+    }
+
+    _guideHoldFrameRange(guide) {
+        if (!guide || !this.activeScene) return null;
+        const start = this._resolvedGuideFrame(guide);
+        const sceneDuration = Math.max(0, parseInt(this.activeScene.duration_frames, 10) || this.totalFrames || 0);
+        const nextGuide = (this.activeScene.guide_frames || [])
+            .map((candidate) => ({ guide: candidate, frame: this._resolvedGuideFrame(candidate) }))
+            .filter((candidate) => candidate.frame > start)
+            .sort((a, b) => a.frame - b.frame)[0];
+        const end = nextGuide ? nextGuide.frame : sceneDuration;
+        return { start, end: Math.max(start, end) };
+    }
+
+    _selectionRangeForItem(item) {
+        if (!item) return null;
+        const data = item.data || {};
+        let start = 0;
+        let end = 0;
+        if (item.type === "clip" || item.type === "audio") {
+            start = data.timeline_start_frame;
+            end = data.timeline_end_frame;
+        } else if (item.type === "prompt") {
+            start = data.start_frame;
+            end = data.end_frame;
+        } else if (item.type === "guide") {
+            start = this._resolvedGuideFrame(data);
+            end = start + 1;
+        } else {
+            return null;
+        }
+        const nextStart = Math.max(0, Math.round(Number(start) || 0));
+        const nextEnd = Math.max(nextStart, Math.round(Number(end) || 0));
+        return { start: nextStart, end: nextEnd };
+    }
+
+    _setSelectionToItems(items = this.selectedItems) {
+        const ranges = (items || [])
+            .map((item) => this._selectionRangeForItem(item))
+            .filter(Boolean);
+        if (!ranges.length) return false;
+        const start = Math.min(...ranges.map((range) => range.start));
+        const end = Math.max(...ranges.map((range) => range.end));
+        this._setSelectionToFrameRange(start, end);
+        return true;
     }
 
     _restoreAnimaticState() {
@@ -5058,6 +5158,7 @@ export class EditorWidget {
         this._dragSelectRect = {
             kind: "items",
             startX: x,
+            startFrame: Math.max(0, this._xToFrame(x)),
             startRawY: rawY,
             currentX: x,
             currentRawY: rawY,
@@ -5097,8 +5198,11 @@ export class EditorWidget {
 
     _timelineItemsInRect(rect) {
         if (!this.activeScene || !rect) return [];
-        const minX = Math.min(rect.startX, rect.currentX);
-        const maxX = Math.max(rect.startX, rect.currentX);
+        const startX = rect.kind === "items" && Number.isFinite(rect.startFrame)
+            ? this._frameToX(rect.startFrame)
+            : rect.startX;
+        const minX = Math.min(startX, rect.currentX);
+        const maxX = Math.max(startX, rect.currentX);
         const minY = Math.min(rect.startRawY, rect.currentRawY);
         const maxY = Math.max(rect.startRawY, rect.currentRawY);
         if (maxX < this._labelW) return [];
@@ -5205,8 +5309,11 @@ export class EditorWidget {
     _drawDragSelectOverlay(ctx, width, height) {
         const rect = this._dragSelectRect;
         if (!rect) return;
-        const x1 = rect.kind === "lanes" ? 0 : Math.min(rect.startX, rect.currentX);
-        const x2 = rect.kind === "lanes" ? this._labelW : Math.max(rect.startX, rect.currentX);
+        const startX = rect.kind === "items" && Number.isFinite(rect.startFrame)
+            ? this._frameToX(rect.startFrame)
+            : rect.startX;
+        const x1 = rect.kind === "lanes" ? 0 : Math.max(this._labelW, Math.min(startX, rect.currentX));
+        const x2 = rect.kind === "lanes" ? this._labelW : Math.max(startX, rect.currentX);
         const y1 = Math.min(rect.startRawY, rect.currentRawY);
         const y2 = Math.max(rect.startRawY, rect.currentRawY);
         if (x2 - x1 < 1 || y2 - y1 < 1) return;
@@ -5308,6 +5415,67 @@ export class EditorWidget {
     // ── Timeline Events ────────────────────────────────────────────────
     _setupTimelineEvents() {
         const canvas = this.timelineCanvas;
+        let edgeScrollRAF = 0;
+        let edgeScrollLastEvent = null;
+        const edgeScrollDragTypes = new Set(["boxSelect", "moveItem", "playhead"]);
+        const edgeScrollDeltaFrames = () => {
+            if (!edgeScrollLastEvent || !this.isDragging || !edgeScrollDragTypes.has(this.dragType)) return 0;
+            const { x } = this._canvasMouseCoords(edgeScrollLastEvent);
+            const width = canvas.width || canvas.getBoundingClientRect().width || 0;
+            if (width <= this._labelW) return 0;
+            const threshold = 24;
+            const leftDepth = threshold - (x - this._labelW);
+            const rightDepth = threshold - (width - x);
+            let direction = 0;
+            let depth = 0;
+            if (leftDepth > 0 && x >= this._labelW - threshold) {
+                direction = -1;
+                depth = Math.min(threshold, leftDepth);
+            } else if (rightDepth > 0) {
+                direction = 1;
+                depth = Math.min(threshold, rightDepth);
+            }
+            if (!direction || depth <= 0) return 0;
+            const visibleFrames = this._visibleTimelineFrameSpan();
+            const maxStep = Math.max(0.75, visibleFrames * 0.025);
+            const ratio = depth / threshold;
+            return direction * maxStep * ratio * ratio;
+        };
+        const stopEdgeScroll = () => {
+            if (edgeScrollRAF) {
+                cancelAnimationFrame(edgeScrollRAF);
+                edgeScrollRAF = 0;
+            }
+            edgeScrollLastEvent = null;
+        };
+        this._timelineEdgeScrollCleanup = stopEdgeScroll;
+        let onMouseMove = null;
+        const edgeScrollTick = () => {
+            edgeScrollRAF = 0;
+            if (this._destroyed) {
+                stopEdgeScroll();
+                return;
+            }
+            const delta = edgeScrollDeltaFrames();
+            if (!delta) return;
+            const before = this.scrollX;
+            this.scrollX += delta;
+            this._clampScrollX();
+            if (this.scrollX === before) return;
+            if (edgeScrollLastEvent && onMouseMove) {
+                onMouseMove(edgeScrollLastEvent);
+            }
+        };
+        const updateEdgeScroll = (event) => {
+            edgeScrollLastEvent = event;
+            if (!this.isDragging || !edgeScrollDragTypes.has(this.dragType)) {
+                stopEdgeScroll();
+                return;
+            }
+            if (!edgeScrollRAF && edgeScrollDeltaFrames()) {
+                edgeScrollRAF = requestAnimationFrame(edgeScrollTick);
+            }
+        };
 
         canvas.addEventListener("mousedown", (e) => {
             // Only handle left-click (button 0) for selection/playhead
@@ -5521,8 +5689,13 @@ export class EditorWidget {
             this._renderTimeline();
         });
 
-        canvas.addEventListener("mousemove", (e) => {
+        onMouseMove = (e) => {
             const { x, y, rawY } = this._canvasMouseCoords(e);
+            if (this.isDragging) {
+                updateEdgeScroll(e);
+            } else {
+                stopEdgeScroll();
+            }
 
             if (!this.isDragging) {
                 const guideHit = this._hitTestGuide(x, rawY);
@@ -5857,10 +6030,12 @@ export class EditorWidget {
             }
 
             this._renderTimeline();
-        });
+        };
+        canvas.addEventListener("mousemove", onMouseMove);
 
         const onMouseUp = (e) => {
             if (!this.isDragging) return;
+            stopEdgeScroll();
             const wasDragType = this.dragType;
             this.isDragging = false;
             this.dragType = null;
@@ -6137,6 +6312,16 @@ export class EditorWidget {
 
                     menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(headerHit.layoutIdx) });
                     menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
+                    if (this._isLaneSelected(entry) && (this._selectedLanes || []).length > 1) {
+                        const selectedLaneDeletes = this._selectedLaneDeleteEntries();
+                        if (selectedLaneDeletes.length > 0) {
+                            menuItems.push({
+                                label: `Delete ${selectedLaneDeletes.length} Selected Lane${selectedLaneDeletes.length === 1 ? "" : "s"}`,
+                                action: () => this._deleteSelectedLanesAndItems(entry),
+                                danger: true,
+                            });
+                        }
+                    }
                     if (laneCount > 1) {
                         const hasItems = isVideo
                             ? (this.activeScene?.clips || []).some(c => this._isRenderClip(c) && (c.track_index || 0) === entry.laneIndex)
@@ -6145,6 +6330,13 @@ export class EditorWidget {
                             : (this.activeScene?.audio_tracks || []).some(a => (a.lane_index || 0) === entry.laneIndex);
                         if (hasItems) {
                             menuItems.push({ label: `Delete ${label} Lane and Move Items`, action: () => this._removeLaneWithItems(entry.type, entry.laneIndex), danger: true });
+                            const laneLocked = this._isLaneLocked(entry.type, entry.laneIndex);
+                            menuItems.push({
+                                label: laneLocked ? `Delete ${label} Lane and Items (locked)` : `Delete ${label} Lane and Items`,
+                                action: laneLocked ? () => {} : () => this._removeLaneDeletingItems(entry.type, entry.laneIndex),
+                                danger: true,
+                                disabled: laneLocked,
+                            });
                             menuItems.push({ label: `Delete Items in ${label} Lane`, action: () => this._deleteItemsInLane(entry.type, entry.laneIndex), danger: true });
                         } else {
                             menuItems.push({ label: `Remove ${label} Lane`, action: () => this._removeLane(entry.type, entry.laneIndex), danger: true });
@@ -6212,6 +6404,20 @@ export class EditorWidget {
                     });
                 }
                 if (count > 1) {
+                    const rangeItems = expandedMenuItems.filter((item) => this._selectionRangeForItem(item));
+                    if (rangeItems.length > 0) {
+                        menuItems.push({
+                            label: `Set Selection to Selected (${rangeItems.length})`,
+                            action: () => this._setSelectionToItems(expandedMenuItems),
+                        });
+                    }
+                    const promptQueueItems = this._promptItemsForQueueBatch(expandedMenuItems);
+                    if (promptQueueItems.length > 0) {
+                        menuItems.push({
+                            label: `Queue Prompt Sections (${promptQueueItems.length})`,
+                            action: () => { this._queueSelectedPromptSections(expandedMenuItems).catch(() => {}); },
+                        });
+                    }
                     const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : `Delete ${count} items`;
                     menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "clip") {
@@ -6282,6 +6488,22 @@ export class EditorWidget {
                             action: () => this._setSceneAspectRatioFromDimensions(guideAsset.width, guideAsset.height),
                         });
                     }
+                    const guideRange = this._guideHoldFrameRange(hit.data);
+                    if (guideRange) {
+                        menuItems.push({
+                            label: "Select Guide Range",
+                            action: () => this._setSelectionToFrameRange(guideRange.start, guideRange.end),
+                        });
+                    }
+                    const guideFrame = this._resolvedGuideFrame(hit.data);
+                    menuItems.push({
+                        label: "Set Selection In",
+                        action: () => this._setSelectionStartFrame(guideFrame),
+                    });
+                    menuItems.push({
+                        label: "Set Selection Out",
+                        action: () => this._setSelectionEndFrame(guideFrame),
+                    });
                     const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Guide";
                     menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 }
@@ -7261,6 +7483,169 @@ export class EditorWidget {
         }
     }
 
+    _laneTypeFromTrackType(trackType) {
+        if (trackType === TRACK_TYPE.VIDEO) return "video";
+        if (trackType === TRACK_TYPE.MOTION_DRIVER) return "motion_driver";
+        if (trackType === TRACK_TYPE.AUDIO) return "audio";
+        return "";
+    }
+
+    _laneLabelFromTrackType(trackType) {
+        if (trackType === TRACK_TYPE.VIDEO) return "video";
+        if (trackType === TRACK_TYPE.MOTION_DRIVER) return "driver";
+        if (trackType === TRACK_TYPE.AUDIO) return "audio";
+        return "lane";
+    }
+
+    _laneItemsForTrackType(trackType, laneIndex) {
+        if (!this.activeScene) return [];
+        if (trackType === TRACK_TYPE.VIDEO) {
+            return (this.activeScene.clips || []).filter((clip) => this._isRenderClip(clip) && (clip.track_index || 0) === laneIndex);
+        }
+        if (trackType === TRACK_TYPE.MOTION_DRIVER) {
+            return (this.activeScene.clips || []).filter((clip) => this._isMotionDriverClip(clip) && (clip.track_index || 0) === laneIndex);
+        }
+        if (trackType === TRACK_TYPE.AUDIO) {
+            return (this.activeScene.audio_tracks || []).filter((track) => (track.lane_index || 0) === laneIndex);
+        }
+        return [];
+    }
+
+    async _removeLaneDeletingItems(trackType, laneIndex) {
+        if (!this.activeScene || !this.projectDir) return;
+        const laneType = this._laneTypeFromTrackType(trackType);
+        if (!laneType) return;
+        const label = this._laneLabelFromTrackType(trackType);
+        const isVideo = trackType === TRACK_TYPE.VIDEO;
+        const isDriver = trackType === TRACK_TYPE.MOTION_DRIVER;
+        const currentCount = isVideo
+            ? (this.activeScene.video_lane_count || 1)
+            : isDriver
+                ? (this.activeScene.motion_driver_lane_count || 1)
+                : (this.activeScene.audio_lane_count || 1);
+        if (currentCount <= 1) {
+            this._showToast(`Cannot remove the only ${label} lane.`);
+            return;
+        }
+        if (this._isLaneLocked(trackType, laneIndex)) {
+            this._showToast("Lane is locked.");
+            return;
+        }
+        const items = this._laneItemsForTrackType(trackType, laneIndex);
+        if (!confirm(`Delete ${label} lane ${laneIndex + 1} and ${items.length} item(s) on it?`)) return;
+
+        const undoLabel = "delete lane and items";
+        const operation = {
+            type: "remove_lane",
+            lane_type: laneType,
+            lane_index: laneIndex,
+            item_policy: "delete_items",
+        };
+
+        try {
+            this._pushUndo(undoLabel);
+            if (!this._applyLocalRemoveLane(operation.lane_type, laneIndex, operation.item_policy)) {
+                throw new Error("Local lane removal refused.");
+            }
+            this._clearSelection();
+            this._hideItemEditor();
+            this._renderSceneAfterLocalMutation();
+            await this._runSceneMutation(
+                [operation],
+                {
+                    key: `scene:${this.activeSceneId}:${laneType}-delete-lane-and-items:${laneIndex}`,
+                    label: "delete lane and items",
+                    coalesce: false,
+                }
+            );
+        } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_lane_and_items_error" });
+            console.warn("[Sonder] Failed to delete lane and items:", e);
+        }
+    }
+
+    _selectedLaneDeleteEntries() {
+        const selectedEntries = (this._trackLayout || [])
+            .filter((entry) => this._isLaneSelected(entry))
+            .filter((entry) => entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.AUDIO);
+        const seen = new Set();
+        const entries = [];
+        for (const entry of selectedEntries) {
+            const key = `${entry.type}:${entry.laneIndex || 0}`;
+            if (seen.has(key)) continue;
+            entries.push(entry);
+            seen.add(key);
+        }
+        return entries;
+    }
+
+    async _deleteSelectedLanesAndItems(clickedEntry) {
+        if (!this.activeScene || !this.projectDir) return;
+        if (!clickedEntry || !this._isLaneSelected(clickedEntry) || (this._selectedLanes || []).length <= 1) return;
+        const entries = this._selectedLaneDeleteEntries();
+        if (!entries.length) {
+            this._showToast("No selected video or audio lanes can be deleted.");
+            return;
+        }
+        if (entries.some((entry) => this._isLaneLocked(entry.type, entry.laneIndex))) {
+            this._showToast("Delete refused because one or more selected lanes are locked.");
+            return;
+        }
+
+        const videoCount = Math.max(1, parseInt(this.activeScene.video_lane_count, 10) || 1);
+        const audioCount = Math.max(1, parseInt(this.activeScene.audio_lane_count, 10) || 1);
+        const selectedVideoCount = entries.filter((entry) => entry.type === TRACK_TYPE.VIDEO).length;
+        const selectedAudioCount = entries.filter((entry) => entry.type === TRACK_TYPE.AUDIO).length;
+        if (selectedVideoCount >= videoCount || selectedAudioCount >= audioCount) {
+            this._showToast("At least one video lane and one audio lane must remain.");
+            return;
+        }
+
+        const orderedEntries = [
+            ...entries
+                .filter((entry) => entry.type === TRACK_TYPE.VIDEO)
+                .sort((a, b) => (b.laneIndex || 0) - (a.laneIndex || 0)),
+            ...entries
+                .filter((entry) => entry.type === TRACK_TYPE.AUDIO)
+                .sort((a, b) => (b.laneIndex || 0) - (a.laneIndex || 0)),
+        ];
+        if (!orderedEntries.length) return;
+        if (!confirm(`Delete ${orderedEntries.length} selected lane(s) and all items on them?`)) return;
+
+        const operations = orderedEntries.map((entry) => ({
+            type: "remove_lane",
+            lane_type: this._laneTypeFromTrackType(entry.type),
+            lane_index: entry.laneIndex || 0,
+            item_policy: "delete_items",
+        }));
+        const undoLabel = "delete selected lanes";
+        try {
+            this._pushUndo(undoLabel);
+            for (const operation of operations) {
+                if (!this._applyLocalRemoveLane(operation.lane_type, operation.lane_index, operation.item_policy)) {
+                    throw new Error("Local selected-lane removal refused.");
+                }
+            }
+            this._clearSelection();
+            this._clearLaneSelection();
+            this._hideItemEditor();
+            this._renderSceneAfterLocalMutation();
+            await this._runSceneMutation(
+                operations,
+                {
+                    key: `scene:${this.activeSceneId}:delete-selected-lanes:${operations.map((op) => `${op.lane_type}:${op.lane_index}`).join(",")}`,
+                    label: "delete selected lanes",
+                    coalesce: false,
+                }
+            );
+        } catch (e) {
+            this._discardLastUndo(undoLabel);
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "delete_selected_lanes_error" });
+            console.warn("[Sonder] Failed to delete selected lanes:", e);
+        }
+    }
+
     async _removeLaneWithItems(trackType, laneIndex) {
         const isVideo = trackType === TRACK_TYPE.VIDEO;
         const isDriver = trackType === TRACK_TYPE.MOTION_DRIVER;
@@ -7891,6 +8276,133 @@ export class EditorWidget {
         }
     }
 
+    _promptItemsForQueueBatch(items = this.selectedItems) {
+        const promptItems = [];
+        const seen = new Set();
+        for (const item of this._expandItemsWithLinked(items || [])) {
+            const current = this._findSceneItemBySelection(item?.type, item?.id) || item;
+            if (current?.type !== "prompt") continue;
+            const section = current.data || {};
+            const fallbackKey = current.id != null
+                ? String(current.id)
+                : `${section.start_frame || 0}:${section.end_frame || 0}:${promptItems.length}`;
+            const key = String(section.prompt_id || fallbackKey);
+            if (seen.has(key)) continue;
+            promptItems.push({ item: current, section });
+            seen.add(key);
+        }
+        return promptItems.sort((a, b) => {
+            const aStart = Math.round(Number(a.section?.start_frame) || 0);
+            const bStart = Math.round(Number(b.section?.start_frame) || 0);
+            if (aStart !== bStart) return aStart - bStart;
+            const aEnd = Math.round(Number(a.section?.end_frame) || 0);
+            const bEnd = Math.round(Number(b.section?.end_frame) || 0);
+            return aEnd - bEnd;
+        });
+    }
+
+    async _queueSelectedPromptSections(items = this.selectedItems) {
+        if (!this.activeScene) return;
+        const promptItems = this._promptItemsForQueueBatch(items);
+        const queueItems = promptItems.filter(({ section }) => {
+            const start = Math.round(Number(section?.start_frame) || 0);
+            const end = Math.round(Number(section?.end_frame) || 0);
+            return !section?.muted && end > start;
+        });
+        if (!queueItems.length) {
+            notifyWarning("No non-muted prompt sections with frames to queue.", { source: "queue-prompt-sections" });
+            return;
+        }
+        const skipped = promptItems.length - queueItems.length;
+        if (skipped > 0) {
+            notifyWarning(`Skipped ${skipped} muted or empty prompt section${skipped === 1 ? "" : "s"}.`, { source: "queue-prompt-sections" });
+        }
+
+        const projectId = this._projectDirName();
+        if (!projectId) return;
+        const batchId = globalThis.crypto?.randomUUID?.()
+            || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+
+        let snapshots = [];
+        let tempJobs = [];
+        let tempIds = new Set();
+
+        try {
+            snapshots = queueItems.map(({ section }, index) => {
+                const start = Math.round(Number(section.start_frame) || 0);
+                const end = Math.round(Number(section.end_frame) || 0);
+                const snapshot = this._buildQueueSnapshot(start, end);
+                if (!snapshot) {
+                    throw new Error("Failed to build prompt-section queue snapshot.");
+                }
+                return {
+                    ...snapshot,
+                    batch_id: batchId,
+                    batch_total: queueItems.length,
+                    batch_index: index,
+                };
+            });
+            tempJobs = snapshots.map((snapshot, index) => ({
+                ...snapshot,
+                job_id: `temp-prompt-batch-${Date.now().toString(36)}-${index}-${Math.random().toString(16).slice(2, 8)}`,
+                status: "pending",
+                progress: 0,
+                error: "",
+                created_at: new Date().toISOString(),
+                completed_at: "",
+                result_asset_id: "",
+            }));
+            tempIds = new Set(tempJobs.map((job) => job.job_id));
+            this._renderQueue = [...(this._renderQueue || []), ...tempJobs];
+            this._applyStoredQueueBatchCollapseState();
+            this._renderQueuePanel();
+
+            const result = await this._queueProjectMutation({
+                key: `project:queue:prompt-sections:${batchId}`,
+                label: "add prompt section batch",
+                coalesce: false,
+                intent: {
+                    projectId,
+                    snapshots: JSON.parse(JSON.stringify(snapshots)),
+                },
+                refreshScenes: false,
+                refreshKeysOnError: ["queue"],
+                failureMessage: "Add prompt section batch failed - queue restored.",
+                invalidateQueueFetch: true,
+                run: async (queuedIntent) => {
+                    return await this._runVersionedProjectMutation(
+                        `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/queue/batch`,
+                        {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ jobs: queuedIntent.snapshots }),
+                        },
+                        { projectId: queuedIntent.projectId }
+                    );
+                },
+            });
+            const payload = result?.payload || {};
+            const createdJobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
+            this._renderQueue = (this._renderQueue || []).map((job) => {
+                if (!tempIds.has(job.job_id)) return job;
+                const tempIndex = tempJobs.findIndex((temp) => temp.job_id === job.job_id);
+                return createdJobs[tempIndex] || job;
+            });
+            this._flashQueueButton(this._batchQueueBtn || this._queueBtn);
+            this._applyStoredQueueBatchCollapseState();
+            this._renderQueuePanel();
+        } catch (e) {
+            console.error("Add prompt section batch failed:", e);
+            this._renderQueue = (this._renderQueue || []).filter((job) => !tempIds.has(job.job_id));
+            this._renderQueuePanel();
+            if (!tempIds.size) {
+                notifyError(e?.message || "Add prompt section batch failed.", {
+                    onRetry: () => { this._queueSelectedPromptSections(items).catch(() => {}); },
+                });
+            }
+        }
+    }
+
     /** Insert an empty section directly after the given one, filling the gap
      *  to the next section / scene end (min 1 frame; warns when no room). */
     async _addPromptSectionAfter(index) {
@@ -8186,11 +8698,9 @@ export class EditorWidget {
             // Start frame input
             const startLabel = this._makeEditorLabel(this._timecodeMode === "timecode" ? "Start (s):" : "Start:");
             const startInput = this._makeEditorInput(startFrame, 0, this.totalFrames);
-            if (this._timecodeMode === "timecode") {
-                startInput.type = "text";
-                startInput.inputMode = "decimal";
-                startInput.value = this._formatPositionInput(startFrame);
-            }
+            startInput.type = "text";
+            startInput.inputMode = "decimal";
+            startInput.value = this._formatPositionInput(startFrame);
             editor.append(startLabel, startInput);
 
             // Duration display
@@ -8311,11 +8821,9 @@ export class EditorWidget {
             // Frame index input
             const frameLabel = this._makeEditorLabel(this._timecodeMode === "timecode" ? "Frame (s):" : "Frame:");
             const frameInput = this._makeEditorInput(idx, 0, this.totalFrames - 1);
-            if (this._timecodeMode === "timecode") {
-                frameInput.type = "text";
-                frameInput.inputMode = "decimal";
-                frameInput.value = this._formatPositionInput(idx);
-            }
+            frameInput.type = "text";
+            frameInput.inputMode = "decimal";
+            frameInput.value = this._formatPositionInput(idx);
             editor.append(frameLabel, frameInput);
 
             const strengthLabel = this._makeEditorLabel("Strength:");
@@ -9580,16 +10088,20 @@ export class EditorWidget {
 
             // Frame index input
             const frameInput = document.createElement("input");
-            frameInput.type = "number";
+            frameInput.type = "text";
+            frameInput.inputMode = "decimal";
             frameInput.min = "0";
-            frameInput.max = String(Math.max(0, this.totalFrames - 1));
-            frameInput.value = String(frame);
+            frameInput.max = this._timecodeMode === "timecode"
+                ? this._framesToSeconds(Math.max(0, this.totalFrames - 1)).toFixed(2)
+                : String(Math.max(0, this.totalFrames - 1));
+            frameInput.value = this._formatPositionInput(frame);
             frameInput.title = "Guide frame index (re-keys on commit)";
             frameInput.style.cssText = `width:54px;${chromeInputCss({ fontSize: "10px", padding: "2px 4px" })}`;
             const commitFrameInput = () => {
-                const newIdx = parseInt(frameInput.value, 10);
-                if (!Number.isFinite(newIdx) || newIdx === frame) return;
-                const clamped = Math.max(0, Math.min(this.totalFrames - 1, newIdx));
+                const newIdx = this._parsePositionInput(frameInput.value);
+                const nextFrame = Math.round(newIdx);
+                if (!Number.isFinite(nextFrame) || nextFrame === frame) return;
+                const clamped = Math.max(0, Math.min(this.totalFrames - 1, nextFrame));
                 this._moveGuideToFrame(guide, clamped, guide.strength);
                 this._hideGuideManagementPopup();
             };
@@ -9806,18 +10318,22 @@ export class EditorWidget {
             }
 
             const frameInput = document.createElement("input");
-            frameInput.type = "number";
+            frameInput.type = "text";
+            frameInput.inputMode = "decimal";
             frameInput.min = "0";
-            frameInput.max = String(Math.max(0, this.totalFrames - 1));
-            frameInput.value = String(frame);
+            frameInput.max = this._timecodeMode === "timecode"
+                ? this._framesToSeconds(Math.max(0, this.totalFrames - 1)).toFixed(2)
+                : String(Math.max(0, this.totalFrames - 1));
+            frameInput.value = this._formatPositionInput(frame);
             frameInput.title = "Guide frame index";
             frameInput.disabled = locked;
             frameInput.style.cssText = `${chromeInputCss({ width: "66px", fontSize: "11px", padding: "5px 7px" })}`;
             const commitFrameInput = () => {
                 if (locked) return;
-                const newIdx = parseInt(frameInput.value, 10);
-                if (!Number.isFinite(newIdx) || newIdx === frame) return;
-                const clamped = Math.max(0, Math.min(this.totalFrames - 1, newIdx));
+                const newIdx = this._parsePositionInput(frameInput.value);
+                const nextFrame = Math.round(newIdx);
+                if (!Number.isFinite(nextFrame) || nextFrame === frame) return;
+                const clamped = Math.max(0, Math.min(this.totalFrames - 1, nextFrame));
                 this._moveGuideToFrame(guide, clamped, guide.strength);
                 this._hideGuideManagementPopup();
             };
@@ -11110,8 +11626,27 @@ export class EditorWidget {
         this._clampScrollX();
     }
 
+    _ensureFrameVisible(frame, { center = false } = {}) {
+        const target = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
+        const visibleFrames = this._visibleTimelineFrameSpan();
+        if (center) {
+            this.scrollX = target - (visibleFrames / 2);
+            this._clampScrollX();
+            return;
+        }
+        const marginFrames = Math.max(2, Math.floor(visibleFrames * 0.12));
+        const leftBound = this.scrollX + marginFrames;
+        const rightBound = this.scrollX + visibleFrames - marginFrames;
+        if (target < leftBound) {
+            this.scrollX = target - marginFrames;
+        } else if (target > rightBound) {
+            this.scrollX = target - visibleFrames + marginFrames;
+        }
+        this._clampScrollX();
+    }
+
     _onPlayheadChange() {
-        this._maybeAutoScrollToPlayhead();
+        this._ensureFrameVisible(this.playhead);
         this._renderTimeline();
         if (this.isFullscreen) this._renderViewportFrame();
         this._updateToolbar();
@@ -13727,6 +14262,10 @@ export class EditorWidget {
         if (this._toolbarLayoutRefreshRaf) {
             cancelAnimationFrame(this._toolbarLayoutRefreshRaf);
             this._toolbarLayoutRefreshRaf = null;
+        }
+        if (this._timelineEdgeScrollCleanup) {
+            this._timelineEdgeScrollCleanup();
+            this._timelineEdgeScrollCleanup = null;
         }
 
         if (this._containerResizeObserver) {

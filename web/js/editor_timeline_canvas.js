@@ -130,6 +130,13 @@ export function _renderTimeline(host) {
         ctx.clip();
         ctx.translate(0, -host.scrollY);
         host._drawTracks(ctx, width);
+        ctx.restore();
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(host._labelW, rulerH, Math.max(0, width - host._labelW), Math.max(0, canvasH - rulerH));
+        ctx.clip();
+        ctx.translate(0, -host.scrollY);
         host._drawSelection(ctx, width);
         host._drawGuideMarkers(ctx, width);
         host._drawClips(ctx, width);
@@ -159,8 +166,9 @@ export function _xToFrame(host, x) {
 export function _clampScrollX(host) {
         const rect = host.timelineCanvas?.parentElement?.getBoundingClientRect();
         const width = rect ? Math.floor(rect.width) : 400;
-        const visibleFrames = (width - host._labelW) / host.pixelsPerFrame;
-        const maxScroll = Math.max(0, host.totalFrames - visibleFrames + 5);
+        const visibleFrames = Math.max(1, (width - host._labelW) / host.pixelsPerFrame);
+        const totalFrames = host.activeScene?.duration_frames ?? host.totalFrames;
+        const maxScroll = Math.max(0, totalFrames - visibleFrames);
         host.scrollX = Math.max(0, Math.min(maxScroll, host.scrollX));
     }
 
@@ -169,6 +177,11 @@ export function _drawRuler(host, ctx, width) {
         const rulerH = Math.round(RULER_HEIGHT * ts);
         ctx.fillStyle = host._timelineColor(COLORS.ruler);
         ctx.fillRect(0, 0, width, rulerH);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(host._labelW, 0, Math.max(0, width - host._labelW), rulerH);
+        ctx.clip();
 
         ctx.strokeStyle = COLORS.rulerTick;
         ctx.fillStyle = COLORS.rulerText;
@@ -191,8 +204,9 @@ export function _drawRuler(host, ctx, width) {
             }
         }
 
+        const totalFrames = host.activeScene?.duration_frames ?? host.totalFrames;
         const startFrame = Math.max(0, Math.floor(host.scrollX));
-        const endFrame = Math.min(host.totalFrames, Math.ceil(host.scrollX + (width - host._labelW) / host.pixelsPerFrame));
+        const endFrame = Math.min(totalFrames, Math.ceil(host.scrollX + (width - host._labelW) / host.pixelsPerFrame));
 
         for (let f = startFrame; f <= endFrame; f++) {
             const x = host._frameToX(f);
@@ -203,7 +217,15 @@ export function _drawRuler(host, ctx, width) {
                 ctx.moveTo(x, rulerH - Math.round(12 * ts));
                 ctx.lineTo(x, rulerH);
                 ctx.stroke();
-                ctx.fillText(host._frameToTimecode(f), x, rulerH - Math.round(13 * ts));
+                const label = host._frameToTimecode(f);
+                const labelHalfW = ctx.measureText(label).width / 2;
+                const labelPad = Math.round(4 * ts);
+                const minLabelX = host._labelW + labelPad + labelHalfW;
+                const maxLabelX = width - labelPad - labelHalfW;
+                const labelX = maxLabelX >= minLabelX
+                    ? Math.max(minLabelX, Math.min(maxLabelX, x))
+                    : width / 2;
+                ctx.fillText(label, labelX, rulerH - Math.round(13 * ts));
             } else if (f % (majorEvery / 5) === 0 && host.pixelsPerFrame > 1.5) {
                 ctx.beginPath();
                 ctx.moveTo(x, rulerH - Math.round(6 * ts));
@@ -211,6 +233,7 @@ export function _drawRuler(host, ctx, width) {
                 ctx.stroke();
             }
         }
+        ctx.restore();
     }
 
 function drawPlaybackWarmStrip(host, ctx, width, rulerH) {
@@ -1096,9 +1119,13 @@ export function _drawClips(host, ctx, width) {
 
 export function _drawPlayheadTriangle(host, ctx, width) {
         const x = host._frameToX(host.playhead);
-        if (x < 0 || x > width) return;
+        if (x < host._labelW || x > width) return;
 
         // Triangle at top
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(host._labelW, 0, Math.max(0, width - host._labelW), host._timelineRulerHeight());
+        ctx.clip();
         ctx.fillStyle = COLORS.playhead;
         ctx.beginPath();
         ctx.moveTo(x - 6, 0);
@@ -1106,11 +1133,12 @@ export function _drawPlayheadTriangle(host, ctx, width) {
         ctx.lineTo(x, 8);
         ctx.closePath();
         ctx.fill();
+        ctx.restore();
     }
 
 export function _drawPlayheadLine(host, ctx, width) {
         const x = host._frameToX(host.playhead);
-        if (x < 0 || x > width) return;
+        if (x < host._labelW || x > width) return;
 
         const rulerH = host._timelineRulerHeight();
         const totalH = rulerH + host._totalTracksHeight();
@@ -1125,8 +1153,12 @@ export function _drawPlayheadLine(host, ctx, width) {
 export function _drawSnapIndicator(host, ctx, width, height = host.timelineCanvas?.height || 0) {
         if (host._snapIndicator === null) return;
         const x = host._frameToX(host._snapIndicator);
-        if (x < 0 || x > width) return;
+        if (x < host._labelW || x > width) return;
 
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(host._labelW, 0, Math.max(0, width - host._labelW), height);
+        ctx.clip();
         ctx.strokeStyle = COLORS.snapIndicator;
         ctx.lineWidth = 1;
         ctx.setLineDash([4, 4]);
@@ -1135,6 +1167,7 @@ export function _drawSnapIndicator(host, ctx, width, height = host.timelineCanva
         ctx.lineTo(x, height);
         ctx.stroke();
         ctx.setLineDash([]);
+        ctx.restore();
     }
 
 export function _drawVerticalScrollbar(host, ctx, width, height) {
