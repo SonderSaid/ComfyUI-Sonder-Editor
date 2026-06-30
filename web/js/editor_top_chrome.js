@@ -618,16 +618,27 @@ export function buildEditorToolbar(widget) {
         d.style.cssText = `width:1px; align-self:stretch; background:${THEME.line2}; margin:0 4px; flex:0 0 auto;`;
         return d;
     };
+    // Atomic sub-cluster of related tool buttons inside toolbarToolsGroup. flex:0 0 auto +
+    // nowrap makes the whole cluster a single flex item, so a wrap moves the related group up
+    // together instead of orphaning one button. The leading makeDivider() travels with the
+    // cluster, so the separator wraps alongside its group rather than stranding at a line edge.
+    const makeToolCluster = (...children) => {
+        const cluster = document.createElement("div");
+        cluster.style.cssText = "display:flex; align-items:center; gap:3px; flex-wrap:nowrap; flex:0 0 auto;";
+        cluster.append(makeDivider(), ...children);
+        return cluster;
+    };
 
     const toolbarHistoryGroup = makeToolbarGroup("flex-start", true);
     toolbarHistoryGroup.append(undoBtn, redoBtn);
 
     const toolbarToolsGroup = makeToolbarGroup("flex-start");
+    toolbarToolsGroup.style.flex = "0 1.25 auto";
     toolbarToolsGroup.append(
-        widget._genWindowGroup, makeDivider(),
-        widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn, makeDivider(),
-        fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic, zoomOut, zoomIn, makeDivider(),
-        widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn
+        widget._genWindowGroup,
+        makeToolCluster(widget._toolBtnSnap, widget._toolBtnRazor, cutHereBtn),
+        makeToolCluster(fitBtn, widget._toolBtnTimecode, widget._toolBtnAnimatic, zoomOut, zoomIn),
+        makeToolCluster(widget._queueBtn, widget._batchQueueBtn, widget._queueStatusWrap, widget._foregroundPill, widget._exportBtn)
     );
 
     // Scene geometry is its own group, pushed to the right edge (with utilities) via margin-left:auto.
