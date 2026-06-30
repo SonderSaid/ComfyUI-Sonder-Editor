@@ -54,10 +54,10 @@ const THUMBNAIL_SIZE_CONFIG = {
 };
 
 export const INSPECT_OVERLAY_SHORTCUTS = Object.freeze([
-    ["ArrowLeft / ArrowRight", "Cycle assets; step one frame in video compare"],
-    ["Shift + ArrowLeft / ArrowRight", "Step -/+10 frames in video compare"],
-    ["Ctrl + ArrowLeft / ArrowRight", "Step -/+1 second in video compare"],
-    ["ArrowUp / ArrowDown", "Compare mode: cycle the active side's asset (A/B)"],
+    ["ArrowLeft / ArrowRight", "Video: step 1 frame back / forward · Image/Audio: previous / next asset"],
+    ["Shift + ArrowLeft / ArrowRight", "Video: step 10 frames back / forward"],
+    ["Ctrl + ArrowLeft / ArrowRight", "Video: step 1 second back / forward"],
+    ["ArrowUp / ArrowDown", "Previous / next asset (compare: cycle the active A/B side)"],
     ["Space", "Play / Pause"],
     ["Right-drag video", "Scrub from current playhead"],
     ["1 / 2 / 3 / 0", "Monitor A / B / Both / Mute in audio compare"],
@@ -393,6 +393,18 @@ function formatClockTime(seconds) {
     const mins = Math.floor(totalSeconds / 60);
     const secs = totalSeconds % 60;
     return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+// Scrub readout: clock time plus a discrete frame counter when fps is known (video). The
+// total-frame count is derived from the same fps + media duration so the current frame can
+// never read past the total. Audio / fps-less media show clock time only.
+function formatScrubLabel(currentSeconds, totalSeconds, fps) {
+    const clock = `${formatClockTime(currentSeconds)} / ${formatClockTime(totalSeconds)}`;
+    const safeFps = Number(fps) || 0;
+    if (safeFps <= 0 || !(Number(totalSeconds) > 0)) return clock;
+    const totalFrames = Math.max(1, Math.round(Number(totalSeconds) * safeFps));
+    const currentFrame = clamp(Math.round(Number(currentSeconds) * safeFps), 0, totalFrames);
+    return `${clock} · f${currentFrame}/${totalFrames}`;
 }
 
 function clamp(value, min, max) {
@@ -767,8 +779,18 @@ export function mountSharedAssetGallery(container, options = {}) {
             showWaveform: false,
             togglePlayback: null,
             stepVideoCompare: null,
+            stepVideoSingle: null,
             videoCompareFps: 30,
             applyAudioMonitor: null,
+            // Reads the live scrub position + play state of whatever media the active
+            // renderer mounted; captured before each renderInspectOverlay() teardown so the
+            // rebuild (metadata toggle, compare layout/monitor/cycle buttons) can restore it
+            // instead of snapping playback back to frame 0. carriedMediaState carries the
+            // captured value across the teardown into the new renderer.
+            captureMediaState: null,
+            carriedMediaState: null,
+            // Identity of the media shown in the last render; the carry gate compares against it.
+            mediaSignature: "",
             sideBySideTransforms: {
                 a: { zoomLevel: 1, panX: 0, panY: 0 },
                 b: { zoomLevel: 1, panX: 0, panY: 0 },
@@ -2898,7 +2920,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         return panel;
     }
 
-    function renderMediaScrubBar(mediaEl) {
+    function renderMediaScrubBar(mediaEl, opts = {}) {
+        const fps = Number(opts.fps) || 0;
         const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.borderSoft};`);
         const track = style(document.createElement("div"), `position:relative;flex:1 1 auto;height:10px;border-radius:999px;background:#1a2631;cursor:pointer;overflow:hidden;`);
         const fill = style(document.createElement("div"), `position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#6fa7d8,#8fc0f0);`);
@@ -2920,7 +2943,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const current = clamp(Number(mediaEl?.currentTime) || 0, 0, total || Number.MAX_SAFE_INTEGER);
             const ratio = total > 0 ? current / total : 0;
             fill.style.width = `${ratio * 100}%`;
-            label.textContent = `${formatClockTime(current)} / ${formatClockTime(total)}`;
+            label.textContent = formatScrubLabel(current, total, fps);
         };
 
         const seekFromClientX = (clientX) => {
@@ -2976,6 +2999,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function renderSynchronizedScrubBar(mediaEls, opts = {}) {
         const mediaList = (mediaEls || []).filter(Boolean);
         const { transport = null } = opts;
+        const fps = Number(opts.fps) || 0;
         const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;background:rgba(255,255,255,0.03);border:1px solid #343434;`);
         const track = style(document.createElement("div"), `position:relative;flex:1 1 auto;height:10px;border-radius:999px;background:#1a2631;cursor:pointer;overflow:hidden;`);
         const fill = style(document.createElement("div"), `position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#6fa7d8,#8fc0f0);`);
@@ -3001,7 +3025,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const current = currentTime();
             const ratio = total > 0 ? current / total : 0;
             fill.style.width = `${ratio * 100}%`;
-            label.textContent = `${formatClockTime(current)} / ${formatClockTime(total)}`;
+            label.textContent = formatScrubLabel(current, total, fps);
         };
         const seekFromClientX = (clientX) => {
             const total = duration();
@@ -3091,6 +3115,52 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (Number.isFinite(fps) && fps > 0) return fps;
         }
         return 30;
+    }
+
+    // Restore scrub position + play state captured before the previous renderInspectOverlay()
+    // teardown onto a freshly-mounted single media element. The new source loads async (blob),
+    // so apply on loadedmetadata when the element isn't ready yet. Returns a cleanup that
+    // cancels a pending restore if the overlay is torn down before metadata arrives.
+    function restoreOverlayMediaPlayback(media, carried) {
+        if (!media || !carried) return () => {};
+        let cancelled = false;
+        const apply = () => {
+            if (cancelled) return;
+            const dur = Number(media.duration);
+            const target = Math.max(0, Number(carried.time) || 0);
+            try {
+                media.currentTime = (Number.isFinite(dur) && dur > 0) ? Math.min(target, dur - 0.001) : target;
+            } catch {
+                // Some browsers reject currentTime before metadata is loaded.
+            }
+            if (carried.playing) void media.play?.().catch?.(() => {});
+        };
+        if (media.readyState >= 1 && Number.isFinite(media.duration) && media.duration > 0) {
+            apply();
+            return () => { cancelled = true; };
+        }
+        const onMeta = () => { media.removeEventListener("loadedmetadata", onMeta); apply(); };
+        media.addEventListener("loadedmetadata", onMeta);
+        return () => { cancelled = true; media.removeEventListener("loadedmetadata", onMeta); };
+    }
+
+    // Compare-mode analog: restore through the linked transport (shared playhead) once the
+    // primary media is ready. Guards a play() resume from re-arming a RAF on a torn-down transport.
+    function restoreOverlayTransportPlayback(transport, primaryMedia, carried) {
+        if (!transport || !carried) return () => {};
+        let cancelled = false;
+        const apply = () => {
+            if (cancelled) return;
+            transport.seek(Math.max(0, Number(carried.time) || 0));
+            if (carried.playing) transport.play();
+        };
+        if (primaryMedia && primaryMedia.readyState >= 1) {
+            apply();
+            return () => { cancelled = true; };
+        }
+        const onMeta = () => { primaryMedia?.removeEventListener?.("loadedmetadata", onMeta); apply(); };
+        primaryMedia?.addEventListener?.("loadedmetadata", onMeta);
+        return () => { cancelled = true; primaryMedia?.removeEventListener?.("loadedmetadata", onMeta); };
     }
 
     function createLinkedMediaTransport(mediaEls, options = {}) {
@@ -3404,8 +3474,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         overlay.togglePlayback = null;
         overlay.stepVideoCompare = null;
+        overlay.stepVideoSingle = null;
         overlay.videoCompareFps = 30;
         overlay.applyAudioMonitor = null;
+        overlay.captureMediaState = null;
     }
 
     function overlayAssets() {
@@ -3456,8 +3528,12 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.audioTempFlip = false;
         state.overlayState.togglePlayback = null;
         state.overlayState.stepVideoCompare = null;
+        state.overlayState.stepVideoSingle = null;
         state.overlayState.videoCompareFps = 30;
         state.overlayState.applyAudioMonitor = null;
+        state.overlayState.captureMediaState = null;
+        state.overlayState.carriedMediaState = null;
+        state.overlayState.mediaSignature = "";
         state.overlayState.overlayEl?.remove();
         state.overlayState.overlayEl = null;
         clearOverlayMediaCache();
@@ -4109,7 +4185,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const playbackRow = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
             const playPauseBtn = makeActionButton("subtle");
             const playbackHint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
-            playbackHint.textContent = "Space = Play / Pause";
+            playbackHint.textContent = "Space = Play / Pause | Right-drag = scrub";
             const syncPlayPauseLabel = () => {
                 playPauseBtn.textContent = video.paused ? "Play" : "Pause";
             };
@@ -4119,13 +4195,35 @@ export function mountSharedAssetGallery(container, options = {}) {
             video.addEventListener("pause", syncPlayPauseLabel);
             video.addEventListener("ended", syncPlayPauseLabel);
             playbackRow.append(playPauseBtn, playbackHint);
-            const scrub = renderMediaScrubBar(video);
+            const scrub = renderMediaScrubBar(video, { fps: assetFps(asset) });
             stage.appendChild(video);
             content.append(stage, playbackRow, scrub.el);
+            state.overlayState.captureMediaState = () => ({ time: Number(video.currentTime) || 0, playing: !video.paused });
+            // Single-overlay frame stepping (Left/Right): pause and seek by the frame delta.
+            state.overlayState.stepVideoSingle = (deltaSeconds) => {
+                video.pause();
+                const dur = Number(video.duration);
+                const next = (Number(video.currentTime) || 0) + deltaSeconds;
+                video.currentTime = (Number.isFinite(dur) && dur > 0) ? clamp(next, 0, dur - 0.001) : Math.max(0, next);
+            };
+            // Right-drag scrub from the current playhead, matching compare mode. A minimal
+            // transport adapter lets the shared attachRightClickVideoScrub drive the single
+            // <video> (it mutes during the drag and shows the frame readout). attachZoomPan
+            // ignores right-button, so the two coexist on the same stage (as in compare).
+            const scrubTransport = {
+                duration: () => Number(video.duration) || 0,
+                getPlayhead: () => Number(video.currentTime) || 0,
+                seek: (nextTime) => {
+                    const dur = Number(video.duration) || 0;
+                    video.currentTime = dur > 0 ? clamp(nextTime, 0, dur - 0.001) : Math.max(0, nextTime);
+                },
+            };
             state.overlayState.cleanupFns.push(
                 attachZoomPan(stage, video),
+                attachRightClickVideoScrub(stage, scrubTransport, [video], { fps: assetFps(asset) }),
                 scrub.cleanup,
                 blobHandle.cleanup,
+                restoreOverlayMediaPlayback(video, state.overlayState.carriedMediaState),
                 () => {
                     playPauseBtn.removeEventListener("click", togglePlayback);
                     video.removeEventListener("play", syncPlayPauseLabel);
@@ -4167,9 +4265,11 @@ export function mountSharedAssetGallery(container, options = {}) {
             playBtn.addEventListener("click", toggleAudio);
             const waveform = renderInteractiveWaveform(asset, audio, ["#7fc0ff"], { compact: true });
             card.append(playBtn, waveform.el);
+            state.overlayState.captureMediaState = () => ({ time: Number(audio.currentTime) || 0, playing: !audio.paused });
             state.overlayState.cleanupFns.push(
                 waveform.cleanup,
                 blobHandle.cleanup,
+                restoreOverlayMediaPlayback(audio, state.overlayState.carriedMediaState),
                 () => {
                     playBtn.removeEventListener("click", toggleAudio);
                     audio.pause();
@@ -4405,6 +4505,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 fallbackDurations: [assetDurationSeconds(compareA), assetDurationSeconds(compareB)],
             });
             state.overlayState.togglePlayback = () => transport.toggle();
+            state.overlayState.captureMediaState = () => ({ time: transport.getPlayhead(), playing: transport.isPlaying() });
             const playBtn = makeActionButton("subtle");
             playBtn.textContent = "Play";
             playBtn.addEventListener("click", () => transport.toggle());
@@ -4460,6 +4561,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 transport.cleanup,
                 blobHandleA.cleanup,
                 blobHandleB.cleanup,
+                restoreOverlayTransportPlayback(transport, audioA, state.overlayState.carriedMediaState),
                 () => { audioA.pause(); audioB.pause(); },
             );
             center.append(controls, waveform.el);
@@ -4523,7 +4625,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 });
                 state.overlayState.togglePlayback = () => transport.toggle();
                 state.overlayState.stepVideoCompare = (deltaSeconds) => transport.step(deltaSeconds);
-                state.overlayState.cleanupFns.push(transport.cleanup);
+                state.overlayState.captureMediaState = () => ({ time: transport.getPlayhead(), playing: transport.isPlaying() });
+                state.overlayState.cleanupFns.push(
+                    transport.cleanup,
+                    restoreOverlayTransportPlayback(transport, layerA, state.overlayState.carriedMediaState),
+                );
             }
 
             if (state.overlayState.compareLayout === "sideBySide") {
@@ -4636,7 +4742,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     videoControls.appendChild(btn);
                 }
                 applyVideoAudioFocus();
-                const scrub = renderSynchronizedScrubBar([layerA, layerB], { transport });
+                const scrub = renderSynchronizedScrubBar([layerA, layerB], { transport, fps: assetFps(compareA) });
                 state.overlayState.cleanupFns.push(
                     transportOff,
                     scrub.cleanup,
@@ -4663,6 +4769,13 @@ export function mountSharedAssetGallery(container, options = {}) {
             return;
         }
 
+        // Capture the live scrub position + play state before the teardown rebuilds the media,
+        // so metadata toggles and the compare layout/monitor/cycle buttons resume where the user
+        // was instead of snapping playback back to frame 0. Whether it is actually carried is
+        // gated below by an asset signature (same media only — never across asset navigation).
+        const carriedMediaState = (typeof overlay.captureMediaState === "function")
+            ? overlay.captureMediaState()
+            : null;
         clearOverlayRuntime();
         // Drop any prior re-render hooks tied to torn-down overlay sub-trees.
         // renderCompareOverlay / metadata panel mount will reinstall them as needed.
@@ -4718,15 +4831,18 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (!overlay.open) return false;
             if (event.target?.closest?.("input, textarea, select")) return false;
             const activeAsset = currentOverlayAsset();
-            const compareVideo = overlay.compareMode && activeAsset?.asset_type === "video";
             const compareAudio = overlay.compareMode && activeAsset?.asset_type === "audio";
-            if (compareVideo && (event.key === "ArrowLeft" || event.key === "ArrowRight") && typeof overlay.stepVideoCompare === "function") {
+            // Video Left/Right = frame step (Shift = 10 frames, Ctrl/Cmd = 1 second) in BOTH
+            // single and compare. Up/Down cycles assets — handled further below.
+            const isVideoAsset = activeAsset?.asset_type === "video";
+            const stepVideo = overlay.compareMode ? overlay.stepVideoCompare : overlay.stepVideoSingle;
+            if (isVideoAsset && (event.key === "ArrowLeft" || event.key === "ArrowRight") && typeof stepVideo === "function") {
                 const direction = event.key === "ArrowLeft" ? -1 : 1;
-                const fps = Number(overlay.videoCompareFps) || assetFps(activeAsset);
+                const fps = (overlay.compareMode ? Number(overlay.videoCompareFps) : 0) || assetFps(activeAsset);
                 const seconds = event.ctrlKey || event.metaKey
                     ? 1
                     : (event.shiftKey ? 10 / fps : 1 / fps);
-                overlay.stepVideoCompare(direction * seconds);
+                stepVideo(direction * seconds);
                 return true;
             }
             if (compareAudio && event.key === "Shift") {
@@ -4765,10 +4881,17 @@ export function mountSharedAssetGallery(container, options = {}) {
                 showInspectOverlayShortcutHelp();
                 return true;
             }
-            if (overlay.compareMode && event.key === "ArrowUp") { cycleCompareSlot(-1); return true; }
-            if (overlay.compareMode && event.key === "ArrowDown") { cycleCompareSlot(1); return true; }
-            if (event.key === "ArrowLeft") { cycleOverlayAsset(-1); return true; }
-            if (event.key === "ArrowRight") { cycleOverlayAsset(1); return true; }
+            // Up/Down always cycles assets (compare: the active side; single: prev/next asset).
+            // Left/Right reaches here only for non-video (video frame-steps above) and mirrors
+            // Up/Down so image/audio arrows all cycle, keeping compare mode on.
+            if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+                if (overlay.compareMode) cycleCompareSlot(-1); else cycleOverlayAsset(-1);
+                return true;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+                if (overlay.compareMode) cycleCompareSlot(1); else cycleOverlayAsset(1);
+                return true;
+            }
             if (event.key === "f" || event.key === "F" || event.key === "0") {
                 resetOverlayTransform();
                 renderInspectOverlay();
@@ -4890,10 +5013,21 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (overlay.compareMode && compareCandidates.length >= 2) {
             ensureCompareDefaults(asset);
+            // Resolved compare slots form the signature; a metadata/layout/monitor/cycle-side
+            // toggle keeps both slots, so the captured scrub state carries — but cycling either
+            // slot or switching mode changes the signature and starts the new media fresh.
+            const signature = `c:${asset.asset_type}:${overlay.compareLeftAssetId}:${overlay.compareRightAssetId}`;
+            overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;
+            overlay.mediaSignature = signature;
             renderCompareOverlay(asset, mediaWrap);
         } else {
+            const signature = `s:${asset.asset_id}`;
+            overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;
+            overlay.mediaSignature = signature;
             renderSingleOverlay(asset, mediaWrap);
         }
+        // The active renderer has consumed the carried scrub state (or there was none).
+        overlay.carriedMediaState = null;
         // Drop any prior metadata-refresh hook before deciding whether to mount a new one,
         // so closing/reopening Metadata leaves no stale callback firing into a detached node.
         state.overlayMetadataRefresh = null;

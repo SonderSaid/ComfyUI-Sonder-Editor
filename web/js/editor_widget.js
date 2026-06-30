@@ -1390,24 +1390,29 @@ export class EditorWidget {
         this._setActiveScene(this.scenes[newIdx]);
     }
 
-    async _renameScene() {
-        if (!this.activeScene) return;
-        const name = prompt("Scene name:", this.activeScene.name);
-        if (!name || name === this.activeScene.name) return;
-        this._pushUndo("rename scene");
+    async _renameScene(targetScene = null) {
+        const scene = targetScene || this.activeScene;
+        if (!scene) return;
+        const isActive = scene.scene_id === this.activeSceneId;
+        const name = prompt("Scene name:", scene.name);
+        if (!name || name === scene.name) return;
+        // Undo only snapshots the active scene, so pushing it for a non-active rename would
+        // strand an entry that reverts unrelated active state. Gate undo on the active path.
+        if (isActive) this._pushUndo("rename scene");
 
         try {
             await this._runSceneMutation(
                 [{ type: "update_scene_fields", fields: { name } }],
                 {
-                    key: `scene:${this.activeSceneId}:name`,
+                    key: `scene:${scene.scene_id}:name`,
                     label: "rename scene",
                     coalesce: true,
                     refreshScenes: false,
+                    sceneId: scene.scene_id,
                 }
             );
-            this.activeScene.name = name;
-            this._updateSceneIdentity(name);
+            scene.name = name;
+            if (isActive) this._updateSceneIdentity(name);
         } catch (e) {
             console.warn("[Sonder] Failed to rename scene:", e);
         }
@@ -1455,38 +1460,45 @@ export class EditorWidget {
         }
     }
 
-    async _deleteScene() {
-        if (!this.activeScene || !this.projectDir) return;
+    async _deleteScene(targetScene = null) {
+        const scene = targetScene || this.activeScene;
+        if (!scene || !this.projectDir) return;
         if (this.scenes.length <= 1) {
             alert("Cannot delete the last scene.");
             return;
         }
-        if (!confirm(`Delete scene "${this.activeScene.name}"? This cannot be undone.`)) return;
+        if (!confirm(`Delete scene "${scene.name}"? This cannot be undone.`)) return;
 
         const dirName = this.projectDir.split(/[/\\]/).pop();
         try {
-            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}`), {
                 method: "DELETE",
             });
+            // _fetchScenes preserves the active scene when it still exists, so deleting a
+            // non-active scene keeps the user in place; deleting the active one falls to scene 0.
             await this._fetchScenes();
         } catch (e) {
             console.warn("[Sonder] Failed to delete scene:", e);
         }
     }
 
-    async _duplicateScene() {
-        if (!this.activeScene || !this.projectDir) return;
+    async _duplicateScene(targetScene = null) {
+        const scene = targetScene || this.activeScene;
+        if (!scene || !this.projectDir) return;
+        const isActive = scene.scene_id === this.activeSceneId;
         const dirName = this.projectDir.split(/[/\\]/).pop();
 
         try {
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/duplicate`), {
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${scene.scene_id}/duplicate`), {
                 method: "POST",
             });
 
             if (!resp.ok) return;
             const newScene = await resp.json();
             this.scenes.push(newScene);
-            this._setActiveScene(newScene);
+            // Duplicating the active scene jumps to the copy (existing flow); duplicating a
+            // non-active scene from the switcher leaves the user on their current scene.
+            if (isActive) this._setActiveScene(newScene);
         } catch (e) {
             console.warn("[Sonder] Failed to duplicate scene:", e);
         }
@@ -2033,15 +2045,21 @@ export class EditorWidget {
         merge = null,
         refreshScenes = true,
         reconcileFromResult = null,
+        sceneId = "",
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
+        // Scene-scoped mutations default to the active scene, but a caller can target another
+        // scene by id (e.g. renaming a non-active scene from the switcher list). The route is
+        // scene-scoped, so the override only changes which scene the ops apply to.
+        const targetSceneId = sceneId || context.sceneId;
         const intent = {
             ...context,
+            sceneId: targetSceneId,
             operations: JSON.parse(JSON.stringify(operations || [])),
         };
         return this._queueProjectMutation({
-            key: key || `scene:${context.sceneId}:mutation`,
+            key: key || `scene:${targetSceneId}:mutation`,
             label,
             coalesce,
             merge,
@@ -6487,6 +6505,12 @@ export class EditorWidget {
                     menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "guide") {
                     const guideAsset = this._getGuideAsset(hit.data);
+                    const guidesLocked = this._isGuideTrackLocked();
+                    menuItems.push({
+                        label: guidesLocked ? "Replace guide with… (locked)" : "Replace guide with…",
+                        action: guidesLocked ? () => {} : () => this._replaceGuideImage(hit.data, { refresh: true }),
+                        disabled: guidesLocked,
+                    });
                     if (guideAsset?.asset_id) {
                         menuItems.push({ label: "Inspect in Gallery", action: () => this._inspectAssetInGallery(guideAsset) });
                     }
@@ -10284,7 +10308,7 @@ export class EditorWidget {
             const row = document.createElement("div");
             row.style.cssText = `
                 display:grid;
-                grid-template-columns: 112px 70px 72px minmax(140px, 1fr) 82px minmax(150px, 188px) 58px;
+                grid-template-columns: 112px 70px 72px minmax(140px, 1fr) 82px 76px minmax(150px, 188px) 58px;
                 align-items:center; gap:10px;
                 padding:10px; border:1px solid ${rowHidden ? COLORS.warningBorder : COLORS.borderSoft};
                 border-radius:8px; background:${rowHidden ? "rgba(48,36,20,0.28)" : COLORS.panelMuted};
@@ -10398,6 +10422,14 @@ export class EditorWidget {
                 await refreshPanel();
             });
 
+            const replaceBtn = this._makeBtn("Replace", "Replace this guide's image with another project image");
+            replaceBtn.disabled = locked;
+            replaceBtn.addEventListener("click", (event) => {
+                event.stopPropagation();
+                if (locked) return;
+                this._replaceGuideImage(guide, { refresh: false, onDone: refreshPanel });
+            });
+
             const swapWrap = document.createElement("div");
             swapWrap.style.cssText = "display:flex;align-items:center;gap:6px;min-width:0;";
             const swapSelect = document.createElement("select");
@@ -10479,7 +10511,7 @@ export class EditorWidget {
                 }
             });
 
-            row.append(thumb, frameInput, strengthInput, label, muteBtn, swapWrap, deleteBtn);
+            row.append(thumb, frameInput, strengthInput, label, muteBtn, replaceBtn, swapWrap, deleteBtn);
             body.appendChild(row);
         }
 
@@ -10535,6 +10567,16 @@ export class EditorWidget {
                     this._hideContextMenu();
                     item.action();
                 });
+                // A row may expose its own right-click submenu (e.g. per-scene actions in the
+                // scene switcher list). Opening it replaces this menu via _showContextMenu's
+                // own _hideContextMenu(), so the native browser menu never appears.
+                if (typeof item.onContextMenu === "function") {
+                    row.addEventListener("contextmenu", (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        item.onContextMenu(event);
+                    });
+                }
             }
             menu.appendChild(row);
         }
@@ -10679,6 +10721,164 @@ export class EditorWidget {
         }
     }
 
+    // ── Image picker (project image chooser) ─────────────────────────
+    // Minimal modal listing the project's image assets (name filter + lazy thumbnails),
+    // calls onPick(asset_id) when one is chosen. Shared by "Replace guide with…" on the
+    // timeline guide right-click and the Guide Management popup. Not a gallery clone.
+    _showImagePicker({ title = "Choose an image", currentAssetId = "", onPick = () => {} } = {}) {
+        this._hideImagePicker();
+        const dirName = this._projectDirName();
+        const images = (this.assets?.image || []).filter((asset) => asset && !asset.trashed && !asset.missing);
+
+        const backdrop = document.createElement("div");
+        backdrop.style.cssText = `position:fixed;inset:0;z-index:10002;background:rgba(7,10,14,0.80);display:flex;align-items:center;justify-content:center;padding:20px;`;
+        const panel = document.createElement("div");
+        panel.style.cssText = `${chromeOverlayPanelCss({
+            width: "min(760px, calc(100vw - 48px))",
+            maxWidth: "760px",
+            maxHeight: "min(620px, calc(100vh - 48px))",
+            padding: "0",
+            fontFamily: "'Segoe UI', Arial, sans-serif",
+        })} display:flex;flex-direction:column;`;
+
+        const header = document.createElement("div");
+        header.style.cssText = `display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid ${COLORS.border};flex:0 0 auto;`;
+        const titleEl = document.createElement("div");
+        titleEl.textContent = title;
+        titleEl.style.cssText = `font-size:14px;font-weight:700;color:#fff;flex:0 0 auto;`;
+        const search = document.createElement("input");
+        search.type = "search";
+        search.placeholder = "Filter images…";
+        search.style.cssText = `${chromeInputCss({ fontSize: "12px", padding: "6px 9px", textAlign: "left" })} flex:1 1 auto;min-width:0;`;
+        const closeBtn = document.createElement("button");
+        closeBtn.textContent = "Close";
+        closeBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "6px 12px", fontSize: "11px", radius: "7px" });
+        closeBtn.addEventListener("click", () => this._hideImagePicker());
+        header.append(titleEl, search, closeBtn);
+
+        const body = document.createElement("div");
+        body.style.cssText = "padding:14px 16px;overflow:auto;flex:1 1 auto;min-height:0;";
+        const grid = document.createElement("div");
+        grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill, minmax(120px, 1fr));gap:10px;";
+        body.appendChild(grid);
+
+        const renderGrid = () => {
+            const query = (search.value || "").trim().toLowerCase();
+            grid.innerHTML = "";
+            const matches = images.filter((asset) => {
+                if (!query) return true;
+                return (asset.name || asset.path || "").toLowerCase().includes(query);
+            });
+            if (!matches.length) {
+                const empty = document.createElement("div");
+                empty.textContent = images.length ? "No images match the filter." : "No image assets in this project.";
+                empty.style.cssText = `grid-column:1/-1;color:${COLORS.textMuted};font-size:12px;padding:24px 0;text-align:center;`;
+                grid.appendChild(empty);
+                return;
+            }
+            for (const asset of matches) {
+                const isCurrent = asset.asset_id === currentAssetId;
+                const card = document.createElement("div");
+                card.style.cssText = `display:flex;flex-direction:column;gap:5px;padding:6px;border-radius:8px;border:1px solid ${isCurrent ? COLORS.accent : COLORS.borderSoft};background:${COLORS.panelMuted};cursor:pointer;`;
+                const thumb = document.createElement("div");
+                thumb.style.cssText = `aspect-ratio:16/10;border-radius:5px;background:#000;border:1px solid rgba(255,255,255,0.12);overflow:hidden;display:flex;align-items:center;justify-content:center;color:${COLORS.textMuted};font-size:10px;`;
+                const thumbUrl = (asset.has_thumbnail && dirName)
+                    ? api.apiURL(`/sonder-editor/project/${dirName}/thumbnail/${asset.asset_id}`)
+                    : (asset.path ? this._buildViewURL(asset.path) : null);
+                if (thumbUrl) {
+                    const img = document.createElement("img");
+                    img.src = thumbUrl;
+                    img.loading = "lazy";
+                    img.decoding = "async";
+                    img.draggable = false;
+                    img.alt = "";
+                    img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+                    thumb.appendChild(img);
+                } else {
+                    thumb.textContent = "No image";
+                }
+                const nameEl = document.createElement("div");
+                nameEl.textContent = asset.name || asset.path?.split(/[/\\]/).pop() || asset.asset_id || "Image";
+                nameEl.title = nameEl.textContent;
+                nameEl.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e5e9ee;font-size:11px;";
+                card.append(thumb, nameEl);
+                if (isCurrent) {
+                    const badge = document.createElement("div");
+                    badge.textContent = "Current";
+                    badge.style.cssText = `color:${COLORS.accent};font-size:9px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;`;
+                    card.appendChild(badge);
+                }
+                card.addEventListener("mouseenter", () => { card.style.borderColor = COLORS.accent; });
+                card.addEventListener("mouseleave", () => { card.style.borderColor = isCurrent ? COLORS.accent : COLORS.borderSoft; });
+                card.addEventListener("click", () => {
+                    this._hideImagePicker();
+                    onPick(asset.asset_id);
+                });
+                grid.appendChild(card);
+            }
+        };
+        search.addEventListener("input", renderGrid);
+        renderGrid();
+
+        panel.append(header, body);
+        backdrop.appendChild(panel);
+        backdrop.addEventListener("click", (event) => { if (event.target === backdrop) this._hideImagePicker(); });
+        document.body.appendChild(backdrop);
+        this._imagePickerEl = backdrop;
+        this._imagePickerKeyOff = registerKeyboardConsumer({
+            id: this._keyboardConsumerId("imgpicker"),
+            priority: KEY_PRIORITY.OVERLAY,
+            keydown: (e) => {
+                if (e.key === "Escape") { this._hideImagePicker(); return true; }
+                return false;
+            },
+        });
+        setTimeout(() => { try { search.focus(); } catch { /* ignore */ } }, 0);
+    }
+
+    _hideImagePicker() {
+        if (this._imagePickerEl) {
+            this._imagePickerEl.remove();
+            this._imagePickerEl = null;
+        }
+        if (this._imagePickerKeyOff) {
+            this._imagePickerKeyOff();
+            this._imagePickerKeyOff = null;
+        }
+    }
+
+    // Replace a guide frame's image with another project image. Shared by both surfaces.
+    // The guide updates in place (same guide_id / frame_index / fit_mode / crop_position);
+    // only asset_id + source change. Pass onDone (e.g. the Guide popup's refreshPanel) to
+    // re-render that surface; the timeline path relies on the mutation's own scene refresh.
+    _replaceGuideImage(guide, { refresh = true, onDone = null } = {}) {
+        if (!guide) return;
+        if (this._isGuideTrackLocked()) {
+            notifyWarning("Guide track is locked.", { source: "guide-replace-locked" });
+            return;
+        }
+        this._showImagePicker({
+            title: "Replace guide with…",
+            currentAssetId: guide.asset_id || "",
+            onPick: async (assetId) => {
+                if (!assetId || assetId === guide.asset_id) return;
+                this._pushUndo("replace guide");
+                try {
+                    await this._updateItemProperty(
+                        "guide",
+                        guide.frame_index,
+                        { asset_id: assetId, source: "asset" },
+                        { refresh },
+                    );
+                    if (onDone) await onDone();
+                } catch (e) {
+                    this._discardLastUndo("replace guide");
+                    console.warn("[Sonder] Failed to replace guide:", e);
+                }
+            },
+        });
+    }
+
     // ── Identity zone (brand › project › scene breadcrumb) ───────────
     // Replaces the old static "Editor — <scene>" title. Lives only in the
     // fullscreen/mounted top toolbar; the EditorWidget is always fullscreen
@@ -10746,12 +10946,7 @@ export class EditorWidget {
         scenePill.addEventListener("click", () => this._showSceneDropdown(scenePill));
         scenePill.addEventListener("contextmenu", (e) => {
             e.preventDefault(); e.stopPropagation();
-            if (!this.activeScene) return;
-            this._showContextMenu(e.clientX, e.clientY, [
-                { label: "Rename Scene", action: () => this._renameScene() },
-                { label: "Duplicate Scene", action: () => this._duplicateScene() },
-                { label: "Delete Scene", action: () => this._deleteScene(), danger: true },
-            ]);
+            this._showSceneRowMenu(e, this.activeScene);
         });
         const next = this._makeBtn("›", "Next scene");
         next.style.cssText += `font-size: 15px; padding: 1px 6px; color: ${COLORS.textDim};`;
@@ -10784,11 +10979,24 @@ export class EditorWidget {
             return {
                 label: `${isActive ? "✓ " : " "}${scene.name || "Untitled Scene"}`,
                 action: () => { if (scene.scene_id !== this.activeSceneId) this._setActiveScene(scene); },
+                onContextMenu: (event) => this._showSceneRowMenu(event, scene),
             };
         });
         items.push({ type: "separator" });
         items.push({ label: "+ New scene", action: () => this._createScene() });
         this._showContextMenu(rect.left, rect.bottom + 4, items);
+    }
+
+    // Per-scene actions, shared by the breadcrumb pill (active scene) and the switcher list
+    // rows (any scene). The scene methods accept a target so a non-active scene can be managed
+    // without switching to it first.
+    _showSceneRowMenu(event, scene) {
+        if (!scene) return;
+        this._showContextMenu(event.clientX, event.clientY, [
+            { label: "Rename Scene", action: () => this._renameScene(scene) },
+            { label: "Duplicate Scene", action: () => this._duplicateScene(scene) },
+            { label: "Delete Scene", action: () => this._deleteScene(scene), danger: true },
+        ]);
     }
 
     _showProjectMenu(anchorEl) {
@@ -14297,6 +14505,7 @@ export class EditorWidget {
         if (this._exportPanelKeyOff) { this._exportPanelKeyOff(); this._exportPanelKeyOff = null; }
         if (this._contextMenuKeyOff) { this._contextMenuKeyOff(); this._contextMenuKeyOff = null; }
         this._hideGuideManagementPopup();
+        this._hideImagePicker();
         this._hideGuideHoverPreview();
         this._hidePromptHoverPreview();
         if (this._promptPanelHandle) { this._promptPanelHandle.cleanup(); this._promptPanelHandle = null; }
