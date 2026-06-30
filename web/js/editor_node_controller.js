@@ -30,6 +30,15 @@ import {
 import { register as registerKeyboardConsumer, PRIORITY as KEYBOARD_PRIORITY } from "./keyboard_ownership.js";
 import { notifyProgress, notifyInfo } from "./editor_notifications.js";
 import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
+import {
+    DORMANT_NODE_MIN_WIDTH,
+    DORMANT_WIDGET_FLOOR,
+    computeAutoResizeNodeHeight,
+    computeNodeOverhead,
+    nodeHeightFromWidgetHeight,
+    shouldAutoResizeDormantModule,
+    widgetHeightFromNodeHeight,
+} from "./dormant_node_sizing.js";
 
 // Session-diagnostic mode is gated by `window.SONDER_DEBUG_SESSION === true`.
 // When off, the helpers below are no-ops with zero allocation. Do NOT enable
@@ -1062,10 +1071,31 @@ class DormantNodeCard {
     }
 
     shouldAutoResizeNode(moduleId) {
-        if (!moduleId) return false;
-        const moduleDef = this._getModuleDef(moduleId);
-        const nodeResize = moduleDef?.nodeResize || (this.isFillModule(moduleId) ? "manual" : "auto");
-        return nodeResize === "auto";
+        return shouldAutoResizeDormantModule(moduleId, this._getModuleDef(moduleId));
+    }
+
+    measureAutoResizeWidgetHeight() {
+        const root = this.root;
+        if (!root) return DORMANT_WIDGET_FLOOR;
+
+        let measured = Math.max(
+            root.scrollHeight || 0,
+            root.offsetHeight || 0,
+            root.clientHeight || 0,
+            DORMANT_WIDGET_FLOOR
+        );
+
+        const moduleEl = this._moduleContainerEl;
+        if (moduleEl && moduleEl.style.display !== "none") {
+            const rootStyle = window.getComputedStyle(root);
+            const paddingBottom = parseFloat(rootStyle.paddingBottom) || 0;
+            measured = Math.max(
+                measured,
+                (moduleEl.offsetTop || 0) + (moduleEl.scrollHeight || 0) + paddingBottom
+            );
+        }
+
+        return Math.ceil(measured);
     }
 
     _measureAvailableModuleHeight() {
@@ -1470,44 +1500,63 @@ export class EditorNodeController {
             this.card.syncModuleContainerHeight?.();
             return;
         }
-        // User-initiated resize: compute widget height from node height minus overhead
-        const nodeHeight = Math.max(0, this.node.size?.[1] || 0);
-        if (nodeHeight > 0) {
-            const computed = this.node.computeSize?.();
-            const totalComputed = computed?.[1] || nodeHeight;
-            // 150 matches the widget floor used by the node.computeSize override
-            const overhead = Math.max(0, totalComputed - 150);
-            this._height = Math.max(150, nodeHeight - overhead);
+        if (this.node?._sonderLoadedSize && !this.node?._sonderInitializedSize) {
+            this.card.syncModuleContainerHeight?.();
+            return;
         }
-        this.card.syncModuleContainerHeight?.();
+        this._adoptNodeHeight(this.node.size?.[1]);
     }
 
-    // Align _height with an already-restored node.size[1] (e.g. workflow load).
-    // Overhead is recomputed here because widget visibility (Create button, hidden
-    // workflow widgets) can change it between calls.
-    adoptLoadedNodeHeight() {
-        if (this._destroyed) return;
-        const nodeHeight = Math.max(0, this.node.size?.[1] || 0);
-        if (nodeHeight <= 0) return;
-        const computed = this.node.computeSize?.();
-        const totalComputed = computed?.[1] || nodeHeight;
-        const overhead = Math.max(0, totalComputed - 150);
-        this._height = Math.max(150, nodeHeight - overhead);
+    _nodeOverhead() {
+        return computeNodeOverhead(this.node.computeSize?.());
+    }
+
+    _minimumNodeHeight() {
+        return nodeHeightFromWidgetHeight(DORMANT_WIDGET_FLOOR, this._nodeOverhead());
+    }
+
+    _adoptNodeHeight(nodeHeight = this.node.size?.[1]) {
+        if (this._destroyed) return this._height;
+        const totalNodeHeight = Math.max(0, Number(nodeHeight) || 0);
+        if (totalNodeHeight <= 0) return this._height;
+        this._height = widgetHeightFromNodeHeight(totalNodeHeight, this._nodeOverhead());
         this.card.syncModuleContainerHeight?.();
+        return this._height;
+    }
+
+    getMinimumNodeHeight() {
+        return this._minimumNodeHeight();
+    }
+
+    adoptLoadedNodeHeight() {
+        this._adoptNodeHeight(this.node.size?.[1]);
     }
 
     // Wraps node.setSize in _programmaticResize so handleNodeResize treats it
     // as programmatic. Per durable_rules.md > Dormant Resize Contract.
-    setNodeSizeProgrammatic(width, height) {
-        if (this._destroyed) return;
+    setNodeSizeProgrammatic(width, height, { adoptHeight = false } = {}) {
+        if (this._destroyed) return false;
+        if (Array.isArray(width)) {
+            const size = width;
+            const options = height && typeof height === "object" ? height : {};
+            return this.setNodeSizeProgrammatic(size[0], size[1], options);
+        }
         const w = Math.max(0, Number(width) || 0);
         const h = Math.max(0, Number(height) || 0);
+        const currentW = Math.max(0, Number(this.node.size?.[0]) || 0);
+        const currentH = Math.max(0, Number(this.node.size?.[1]) || 0);
+        if (Math.abs(currentW - w) <= 0.5 && Math.abs(currentH - h) <= 0.5) {
+            if (adoptHeight) this._adoptNodeHeight(h);
+            return false;
+        }
         this._programmaticResize = true;
         try {
             this.node.setSize?.([w, h]);
         } finally {
             this._programmaticResize = false;
         }
+        if (adoptHeight) this._adoptNodeHeight(h);
+        return true;
     }
 
     queueResize() {
@@ -1526,13 +1575,17 @@ export class EditorNodeController {
                 this.card.syncModuleContainerHeight?.();
                 return;
             }
-            const currentWidth = Math.max(240, this.node.size?.[0] || 0);
+            const currentWidth = Math.max(DORMANT_NODE_MIN_WIDTH, this.node.size?.[0] || 0);
             const currentHeight = Math.max(0, this.node.size?.[1] || 0);
             this.card.syncModuleContainerHeight?.();
-            const measured = Math.ceil(this.root.scrollHeight || this.root.offsetHeight || this.root.clientHeight || 190);
-            this._height = Math.max(150, measured + 10);
-            if (Math.abs(currentHeight - this._height) > 1) {
-                this.setNodeSizeProgrammatic(currentWidth, this._height);
+            const autoSize = computeAutoResizeNodeHeight({
+                currentNodeHeight: currentHeight,
+                measuredWidgetHeight: this.card.measureAutoResizeWidgetHeight?.(),
+                overhead: this._nodeOverhead(),
+            });
+            this._height = autoSize.widgetHeight;
+            if (autoSize.shouldResize) {
+                this.setNodeSizeProgrammatic(currentWidth, autoSize.nodeHeight);
             }
         });
     }
@@ -1555,7 +1608,7 @@ export class EditorNodeController {
                 id: "preview",
                 title: "Preview",
                 hostSizing: "fill",
-                nodeResize: "auto",
+                nodeResize: "manual",
                 resourceTier: "media",
                 load: async (controller, signal) => await controller._loadPreviewModule(signal),
                 mount: (container, data, controller) => controller._mountPreviewModule(container, data),

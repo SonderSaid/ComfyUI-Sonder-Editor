@@ -1064,6 +1064,7 @@ app.registerExtension({
                             Number(info.size[1]) || 0,
                         ];
                     }
+                    window.setTimeout?.(() => node._sonderRunUpdateVisibility?.(), 0);
                     return origNodeOnConfigure?.apply(this, arguments);
                 };
 
@@ -1098,45 +1099,57 @@ app.registerExtension({
                 });
                 createButtonWidget.serialize = false;
 
+                let visibilityRunId = 0;
                 const updateVisibility = async () => {
-                    const isCreateNew = projectWidget?.value === "+ Create New";
+                    const runId = ++visibilityRunId;
+                    const projectValue = projectWidget?.value || "";
+                    const isCreateNew = projectValue === "+ Create New";
+                    const isCurrentRun = () => (
+                        runId === visibilityRunId
+                        && (projectWidget?.value || "") === projectValue
+                    );
+                    let layoutChanged = false;
                     for (const widget of node.widgets) {
                         if (creationWidgetNames.includes(widget.name)) {
-                            if (isCreateNew) {
-                                showWidget(node, widget);
-                            } else {
-                                hideWidget(node, widget);
-                            }
+                            layoutChanged = setWidgetVisible(node, widget, isCreateNew) || layoutChanged;
                         }
                         if (hiddenWidgetNames.includes(widget.name)) {
-                            hideWidget(node, widget);
+                            layoutChanged = setWidgetVisible(node, widget, false) || layoutChanged;
                         }
                     }
                     if (isCreateNew) {
                         applyProjectCreationDefaults(node);
-                        showWidget(node, createButtonWidget);
+                        layoutChanged = setWidgetVisible(node, createButtonWidget, true) || layoutChanged;
                     } else {
-                        hideWidget(node, createButtonWidget);
+                        layoutChanged = setWidgetVisible(node, createButtonWidget, false) || layoutChanged;
                     }
-                    app.graph.setDirtyCanvas?.(true, true);
 
                     if (isCreateNew) {
-                        hideWidget(node, editorDOMWidget);
-                        controller.getElement().style.display = "none";
-                        await controller.updateProject("", projectWidget?.value || "");
+                        layoutChanged = setWidgetVisible(node, editorDOMWidget, false) || layoutChanged;
+                        if (controller.getElement().style.display !== "none") {
+                            controller.getElement().style.display = "none";
+                            layoutChanged = true;
+                        }
+                        await controller.updateProject("", projectValue);
+                        if (!isCurrentRun()) return;
                     } else {
-                        showWidget(node, editorDOMWidget);
-                        controller.getElement().style.display = "";
-                        const dir = await getProjectDir(projectWidget?.value);
-                        await controller.updateProject(dir, projectWidget?.value || "");
+                        layoutChanged = setWidgetVisible(node, editorDOMWidget, true) || layoutChanged;
+                        if (controller.getElement().style.display !== "") {
+                            controller.getElement().style.display = "";
+                            layoutChanged = true;
+                        }
+                        const dir = await getProjectDir(projectValue);
+                        if (!isCurrentRun()) return;
+                        await controller.updateProject(dir, projectValue);
+                        if (!isCurrentRun()) return;
                     }
 
-                    app.graph.setDirtyCanvas?.(true, true);
-
-                    const nextSize = node.computeSize();
                     const preferredWidth = isCreateNew ? 340 : 440;
                     const modeKey = isCreateNew ? "create" : "existing";
-                    const minComputedHeight = nextSize?.[1] || 0;
+                    const minComputedHeight = controller.getMinimumNodeHeight?.()
+                        || node.computeSize?.()?.[1]
+                        || 0;
+                    let sizeChanged = false;
                     if (!node._sonderInitializedSize) {
                         node._sonderInitializedSize = true;
                         node._sonderPreferredWidthMode = modeKey;
@@ -1149,24 +1162,28 @@ app.registerExtension({
                             const safeW = Math.max(loadedW, 240);
                             const safeH = Math.max(loadedH, minComputedHeight);
                             if (safeW !== loadedW || safeH !== loadedH) {
-                                controller.setNodeSizeProgrammatic(safeW, safeH);
+                                sizeChanged = controller.setNodeSizeProgrammatic(safeW, safeH) || sizeChanged;
                                 controller.adoptLoadedNodeHeight();
                             }
                         } else {
                             // Menu-created node: apply preferred default size.
-                            controller.setNodeSizeProgrammatic(
+                            sizeChanged = controller.setNodeSizeProgrammatic(
                                 preferredWidth,
                                 Math.max(minComputedHeight, node.size?.[1] || 0),
-                            );
+                            ) || sizeChanged;
                         }
                     } else if (node._sonderPreferredWidthMode !== modeKey && (node.size?.[0] || 0) < preferredWidth) {
                         // Mode switch (create ↔ existing) grows a too-narrow node to the
                         // preferred width for the new mode. Height is preserved.
                         node._sonderPreferredWidthMode = modeKey;
-                        controller.setNodeSizeProgrammatic(
+                        sizeChanged = controller.setNodeSizeProgrammatic(
                             preferredWidth,
                             node.size?.[1] || minComputedHeight || controller.getHeight(),
-                        );
+                        ) || sizeChanged;
+                    }
+
+                    if (layoutChanged || sizeChanged) {
+                        app.graph.setDirtyCanvas?.(true, true);
                     }
 
                     if (!isCreateNew) {
@@ -1179,6 +1196,7 @@ app.registerExtension({
                         console.warn("[Sonder] Failed to update node visibility:", e);
                     });
                 };
+                node._sonderRunUpdateVisibility = runUpdateVisibility;
 
                 // Hook dropdown changes
                 if (projectWidget) {

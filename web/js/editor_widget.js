@@ -716,7 +716,15 @@ export class EditorWidget {
             },
             getNodeId: () => node?.id ?? "anon",
             getSize: () => node?.size ? [...node.size] : null,
-            setSize: (size) => node?.setSize?.(size),
+            setSize: (size) => {
+                if (!Array.isArray(size)) return;
+                const controller = node?._sonderController;
+                if (typeof controller?.setNodeSizeProgrammatic === "function") {
+                    controller.setNodeSizeProgrammatic(size[0], size[1], { adoptHeight: true });
+                    return;
+                }
+                node?.setSize?.(size);
+            },
             computeSize: () => node?.computeSize?.(),
             markDirty: () => node?.setDirtyCanvas?.(true, true),
         };
