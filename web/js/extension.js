@@ -551,6 +551,7 @@ function installSaveVideoPresetUi(node) {
         for (const name of SAVE_VIDEO_CUSTOM_WIDGET_NAMES) {
             changed = setWidgetVisible(node, findWidget(node, name), visibleNames.has(name)) || changed;
         }
+        changed = setWidgetVisible(node, findWidget(node, "place_audio_on_timeline"), isTake) || changed;
         updateSavePresetHelp(node, helpEl);
         if (changed) resizeSaveVideoNode(node);
     };

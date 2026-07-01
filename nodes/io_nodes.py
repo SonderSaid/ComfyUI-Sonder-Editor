@@ -1089,6 +1089,7 @@ class SonderSaveVideo:
                 "filename_prefix": ("STRING", {"default": "output", "tooltip": "Prefix for the output filename."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.001, "tooltip": "Output video frame rate."}),
                 "mode": (["Video", "Take"], {"default": "Video", "tooltip": "Video: normal save. Take: saves and auto-places result on timeline as a new lane."}),
+                "place_audio_on_timeline": ("BOOLEAN", {"default": True, "tooltip": "Take mode only. When on, the take's audio is also placed as a separate audio track on the timeline. Turn off for fixed/unchanging audio you've already placed once, to avoid duplicate audio lanes and assets per take. The audio is still muxed into the saved video either way."}),
                 "mark_queue_complete": ("BOOLEAN", {"default": False, "tooltip": "When enabled, this save node completes the active Sonder queue job after a successful save."}),
             },
             "optional": {
@@ -1114,7 +1115,7 @@ class SonderSaveVideo:
         }
 
     def save_video(self, project, frames, filename_prefix="output", fps=24.0,
-                   mode="Video", mark_queue_complete=False, audio=None,
+                   mode="Video", place_audio_on_timeline=True, mark_queue_complete=False, audio=None,
                    save_preset=DEFAULT_SAVE_VIDEO_PRESET,
                    custom_output_kind=CUSTOM_OUTPUT_KIND_VIDEO,
                    custom_container="mp4",
@@ -1409,7 +1410,7 @@ class SonderSaveVideo:
                 )
                 scene.clips.append(clip)
                 placed_audio_track = None
-                if has_audio and audio is not None:
+                if place_audio_on_timeline and has_audio and audio is not None:
                     audio_filename = f"{os.path.splitext(output_filename)[0]}_audio.wav"
                     audio_rel_path = os.path.join("media", audio_filename)
                     audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
