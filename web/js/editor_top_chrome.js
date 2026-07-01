@@ -350,7 +350,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     });
 
     widget._templateSelect = document.createElement("select");
-    widget._templateSelect.style.cssText = topSelectCss({ width: "64px", fontSize: "9px", padding: "1px 4px" });
+    widget._templateSelect.style.cssText = topSelectCss({ width: "112px", fontSize: "9px", padding: "1px 4px" });
     widget._templateSelect.addEventListener("change", () => widget._handleTemplateSelectionChange());
     widget._rebuildTemplateOptions();
     widget._rebuildResolutionTierOptions();
@@ -391,7 +391,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
 
     // Scene geometry group — placed on the right of the toolbar row (under the viewport).
     widget._sceneGeometryGroup = document.createElement("div");
-    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; align-content:flex-start; justify-content:center; gap:6px; row-gap:4px; flex-wrap:wrap-reverse; min-width:0; max-width:100%; flex:0 1 720px; margin-bottom:3px;";
+    widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; align-content:flex-start; justify-content:center; gap:6px; row-gap:4px; flex-wrap:wrap-reverse; min-width:0; max-width:100%; flex:0 0.5 720px; margin-bottom:3px;";
     widget._sceneGeometryGroup.append(
         makeInlineGroup(widget._durLabel, widget.durationInput),
         makeInlineGroup(resLabel, widget._resWInput, xLabel, widget._resHInput),
