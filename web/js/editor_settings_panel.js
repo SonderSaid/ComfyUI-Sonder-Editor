@@ -15,7 +15,6 @@ import {
     FIT_MODE_OPTIONS,
     GALLERY_SORT_OPTIONS,
     GALLERY_THUMBNAIL_SIZE_OPTIONS,
-    MODEL_TEMPLATE_PARAM_KEYS,
     PLAYBACK_RESOLUTION_OPTIONS,
     SAVE_PRESET_OPTIONS,
     SNAP_TARGET_OPTIONS,
@@ -23,6 +22,9 @@ import {
     TIMECODE_MODE_OPTIONS,
     describeConstraintFormula,
     getAllModelTemplates,
+    getTemplateById,
+    getTemplateFpsValues,
+    isBuiltinModelTemplate,
     previewConstraintValues,
 } from "./editor_settings.js";
 
@@ -523,39 +525,11 @@ function showSettingsPanel() {
             : (options[0]?.value ?? "");
     };
 
-    const summarizeConstraint = (constraint, key) => {
-        if (!constraint || typeof constraint !== "object") return `${key}: Any`;
-        const formula = describeConstraintFormula(constraint);
-        if (constraint.min != null || constraint.max != null) {
-            const min = constraint.min != null ? constraint.min : "-";
-            const max = constraint.max != null ? constraint.max : "-";
-            return `${key}: ${formula} [${min}..${max}]`;
-        }
-        return `${key}: ${formula}`;
-    };
-
     const parseDraftNumber = (value, integer = true) => {
         if (value === "" || value == null) return undefined;
         const numeric = Number(value);
         if (!Number.isFinite(numeric)) return undefined;
         return integer ? Math.round(numeric) : numeric;
-    };
-
-    const buildConstraintDraft = (paramKey, fields) => {
-        const integer = paramKey !== "fps";
-        const constraint = {};
-        const step = parseDraftNumber(fields.step.value, integer);
-        const offset = parseDraftNumber(fields.offset.value, integer);
-        const min = parseDraftNumber(fields.min.value, integer);
-        const max = parseDraftNumber(fields.max.value, integer);
-        if (step != null && step > 0) constraint.step = step;
-        if (offset != null) constraint.offset = offset;
-        if (min != null) constraint.min = min;
-        if (max != null) constraint.max = max;
-        if (constraint.min != null && constraint.max != null && constraint.max < constraint.min) {
-            constraint.max = constraint.min;
-        }
-        return Object.keys(constraint).length ? constraint : null;
     };
 
     const makeUniqueTemplateId = (name, existingId = "") => {
@@ -615,14 +589,17 @@ function showSettingsPanel() {
             const head = document.createElement("div");
             head.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:10px;";
             const nameWrap = document.createElement("div");
-            const badge = template.builtIn ? "Built-in" : "Custom";
+            const isOverriddenBuiltin = template.builtIn && !!this._settings.modelTemplates?.builtinOverrides?.[template.id];
+            const badge = template.builtIn ? (isOverriddenBuiltin ? "Built-in (edited)" : "Built-in") : "Custom";
             nameWrap.innerHTML = `
                 <div style="font-size:11px;font-weight:700;color:${COLORS.text};">${template.name}</div>
                 <div style="font-size:10px;color:${COLORS.textMuted};">${badge}${template.id === this._templateId ? " &bull; Active Project Template" : ""}</div>
             `;
             head.appendChild(nameWrap);
 
-            if (!template.builtIn) {
+            // `free` is the no-op template — no edit/reset. Built-ins are editable
+            // (writes a browser-local override) with Reset shown once overridden.
+            if (!template.builtIn || template.id !== "free") {
                 const actions = document.createElement("div");
                 actions.style.cssText = "display:flex;gap:6px;";
 
@@ -633,31 +610,59 @@ function showSettingsPanel() {
                     this._templateFormState = { expanded: true, editId: template.id };
                     this._renderModelTemplateSettings?.();
                 });
+                actions.appendChild(editBtn);
 
-                const deleteBtn = document.createElement("button");
-                deleteBtn.textContent = "Delete";
-                deleteBtn.style.cssText = chromeButtonCss({ variant: "danger", padding: "4px 9px", fontSize: "10px", radius: "6px" });
-                deleteBtn.addEventListener("click", async () => {
-                    this._templateFormState = { expanded: false, editId: "" };
-                    await this._deleteCustomModelTemplate(template.id);
-                    this._renderModelTemplateSettings?.();
-                });
+                if (!template.builtIn) {
+                    const deleteBtn = document.createElement("button");
+                    deleteBtn.textContent = "Delete";
+                    deleteBtn.style.cssText = chromeButtonCss({ variant: "danger", padding: "4px 9px", fontSize: "10px", radius: "6px" });
+                    deleteBtn.addEventListener("click", async () => {
+                        this._templateFormState = { expanded: false, editId: "" };
+                        await this._deleteCustomModelTemplate(template.id);
+                        this._renderModelTemplateSettings?.();
+                    });
+                    actions.appendChild(deleteBtn);
+                } else if (isOverriddenBuiltin) {
+                    const resetBtn = document.createElement("button");
+                    resetBtn.textContent = "Reset";
+                    resetBtn.title = "Reset this built-in template to its default values";
+                    resetBtn.style.cssText = chromeButtonCss({ variant: "danger", padding: "4px 9px", fontSize: "10px", radius: "6px" });
+                    resetBtn.addEventListener("click", () => {
+                        this._templateFormState = { expanded: false, editId: "" };
+                        this._updateSettings({ modelTemplates: { builtinOverrides: { [template.id]: null } } });
+                    });
+                    actions.appendChild(resetBtn);
+                }
 
-                actions.append(editBtn, deleteBtn);
                 head.appendChild(actions);
             }
 
             const summary = document.createElement("div");
             summary.style.cssText = "font-size:10px;color:#9ca9b5;line-height:1.45;";
-            const summaryParts = MODEL_TEMPLATE_PARAM_KEYS
-                .map((key) => summarizeConstraint(template.constraints?.[key], key));
-            if ((template.constraints?.batchMaxFrames || 0) > 0) {
-                summaryParts.push(`batch: ${template.constraints.batchMaxFrames}`);
+            const summaryParts = [];
+            if (template.id !== "free") {
+                const dimStep = template.hard?.dimensionStep;
+                if (dimStep > 0) {
+                    summaryParts.push(`÷${dimStep}${template.hard?.evenLatentDimensions ? " (even latent)" : ""}`);
+                }
+                const frameStep = template.hard?.frameStep;
+                if (frameStep > 1) {
+                    summaryParts.push(`frames ${describeConstraintFormula({ step: frameStep, offset: template.hard?.frameOffset || 0 })}`);
+                }
+                const fpsValues = getTemplateFpsValues(template);
+                if (fpsValues.length) summaryParts.push(`fps ${fpsValues.join("/")}`);
+                const minDim = template.soft?.minDimension;
+                if (minDim > 0) summaryParts.push(`min ${minDim}px`);
+                const recRes = template.soft?.recommendedRes;
+                if (Array.isArray(recRes) && recRes.length) {
+                    summaryParts.push(`rec ${recRes.map((pair) => `~${pair[0]}×${pair[1]}`).join(", ")}`);
+                }
+                const maxRes = template.soft?.maxRes;
+                if (Array.isArray(maxRes)) summaryParts.push(`max ~${maxRes[0]}×${maxRes[1]}`);
+                const band = template.soft?.recommendedDuration;
+                if (band) summaryParts.push(`~${band.minSec}–${band.maxSec}s`);
             }
-            if (template.id !== "free" && template.constraints?.evenLatentDimensions !== false) {
-                summaryParts.push("even latent dimensions");
-            }
-            summary.textContent = summaryParts.join(" | ");
+            summary.textContent = summaryParts.join(" | ") || "No constraints";
 
             card.append(head, summary);
             templateList.appendChild(card);
@@ -678,7 +683,10 @@ function showSettingsPanel() {
             return;
         }
 
-        const editingTemplate = customTemplates.find((template) => template.id === formState.editId) || null;
+        const editingTemplate = customTemplates.find((template) => template.id === formState.editId)
+            || (formState.editId && formState.editId !== "free" && isBuiltinModelTemplate(formState.editId)
+                ? getTemplateById(formState.editId, this._settings)
+                : null);
         const form = document.createElement("div");
         form.style.cssText = `
             border: 1px solid ${COLORS.border};
@@ -708,91 +716,129 @@ function showSettingsPanel() {
         nameRow.append(nameLabel, nameInput);
         form.appendChild(nameRow);
 
-        const constraintInputs = {};
-        const previewRows = [];
-        for (const paramKey of MODEL_TEMPLATE_PARAM_KEYS) {
-            const existingConstraint = editingTemplate?.constraints?.[paramKey] || {};
+        // ── Form field helpers ──────────────────────────────────────
+        const fieldLabelCss = "font-size:10px;color:#92a0ad;min-width:130px;";
+        const helpCss = "font-size:10px;color:#8f9cab;line-height:1.4;";
+        const numInput = (value, placeholder, step = "1") => {
+            const input = document.createElement("input");
+            input.type = "number";
+            input.step = step;
+            input.value = value ?? "";
+            input.placeholder = placeholder;
+            input.style.cssText = chromeInputCss({ width: "72px", fontSize: "10px", padding: "4px 6px", textAlign: "right" });
+            return input;
+        };
+        const textInput = (value, placeholder) => {
+            const input = document.createElement("input");
+            input.type = "text";
+            input.value = value ?? "";
+            input.placeholder = placeholder;
+            input.style.cssText = `${chromeInputCss({ fontSize: "10px", padding: "4px 6px", textAlign: "left" })} flex:1;`;
+            return input;
+        };
+        const labeledRow = (labelText, ...children) => {
             const row = document.createElement("div");
-            row.style.cssText = `
-                display:grid;
-                grid-template-columns: 84px repeat(4, minmax(0, 1fr));
-                gap: 6px;
-                align-items: center;
-            `;
-            const header = document.createElement("div");
-            header.style.cssText = "font-size:10px;color:#d9e1e8;font-weight:700;text-transform:capitalize;";
-            header.textContent = paramKey;
-            row.appendChild(header);
-            const fields = {};
-            for (const fieldKey of ["step", "offset", "min", "max"]) {
-                const input = document.createElement("input");
-                input.type = "number";
-                input.step = paramKey === "fps" ? "0.001" : "1";
-                input.value = existingConstraint[fieldKey] ?? "";
-                input.placeholder = fieldKey;
-                input.style.cssText = chromeInputCss({ fontSize: "10px", padding: "4px 6px", textAlign: "right" });
-                fields[fieldKey] = input;
-                row.appendChild(input);
-            }
-            constraintInputs[paramKey] = fields;
+            row.style.cssText = "display:flex;align-items:center;gap:8px;";
+            const label = document.createElement("div");
+            label.style.cssText = fieldLabelCss;
+            label.textContent = labelText;
+            row.append(label, ...children);
             form.appendChild(row);
-
-            const preview = document.createElement("div");
-            preview.style.cssText = "margin-left:84px;font-size:10px;color:#8f9cab;line-height:1.4;";
-            form.appendChild(preview);
-            previewRows.push({ key: paramKey, el: preview });
-        }
-
-        const refreshConstraintPreviews = () => {
-            for (const preview of previewRows) {
-                const constraint = buildConstraintDraft(preview.key, constraintInputs[preview.key]);
-                const values = previewConstraintValues(constraint, 5);
-                const formula = describeConstraintFormula(constraint);
-                preview.el.textContent = values.length
-                    ? `Formula: ${formula} | Sample: ${values.join(", ")}`
-                    : `Formula: ${formula}`;
+            return row;
+        };
+        const sectionHeader = (text, help) => {
+            const header = document.createElement("div");
+            header.style.cssText = "font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#c3d0dc;margin-top:6px;";
+            header.textContent = text;
+            form.appendChild(header);
+            if (help) {
+                const helpEl = document.createElement("div");
+                helpEl.style.cssText = helpCss;
+                helpEl.textContent = help;
+                form.appendChild(helpEl);
             }
         };
+        const fmtResList = (list) => Array.isArray(list) ? list.map((pair) => `${pair[0]}x${pair[1]}`).join(", ") : "";
+        const fmtResPair = (pair) => Array.isArray(pair) ? `${pair[0]}x${pair[1]}` : "";
+        // Lenient parsers — normalizeCustomTemplate re-validates everything on save.
+        const parseFpsList = (value) => String(value || "")
+            .split(/[,\s]+/).map((token) => Number(token)).filter((numeric) => Number.isFinite(numeric) && numeric > 0);
+        const parseResPair = (value) => {
+            const match = String(value || "").trim().match(/(\d+)\s*[x×,]\s*(\d+)/i);
+            return match ? [Number(match[1]), Number(match[2])] : null;
+        };
+        const parseResList = (value) => String(value || "")
+            .split(/[,;]+/).map((token) => parseResPair(token)).filter(Boolean);
 
-        for (const paramKey of MODEL_TEMPLATE_PARAM_KEYS) {
-            for (const field of Object.values(constraintInputs[paramKey])) {
-                field.addEventListener("input", refreshConstraintPreviews);
-            }
-        }
-        refreshConstraintPreviews();
+        const hard = editingTemplate?.hard || {};
+        const soft = editingTemplate?.soft || {};
 
-        const batchRow = document.createElement("div");
-        batchRow.style.cssText = "display:flex;align-items:center;gap:8px;";
-        const batchLabel = document.createElement("div");
-        batchLabel.style.cssText = "font-size:10px;color:#92a0ad;min-width:90px;";
-        batchLabel.textContent = "Batch Max Frames";
-        const batchInput = document.createElement("input");
-        batchInput.type = "number";
-        batchInput.min = "1";
-        batchInput.step = "1";
-        batchInput.value = editingTemplate?.constraints?.batchMaxFrames ?? "";
-        batchInput.placeholder = "97";
-        batchInput.style.cssText = `${chromeInputCss({ width: "120px", fontSize: "10px", padding: "4px 6px", textAlign: "right" })}`;
-        batchRow.append(batchLabel, batchInput);
-        form.appendChild(batchRow);
-
-        const batchHelp = document.createElement("div");
-        batchHelp.style.cssText = "margin-left:90px;font-size:10px;color:#8f9cab;line-height:1.4;";
-        batchHelp.textContent = "Default batch chunk ceiling for this template. The active frame constraint still snaps/clamps the final chunk size.";
-        form.appendChild(batchHelp);
+        // ── Hard constraints ──
+        sectionHeader("Hard Constraints", "Enforced by snapping — divisibility, the frame rule, and the fps allow-list.");
+        const dimStepInput = numInput(hard.dimensionStep, "step");
+        const dimOffsetInput = numInput(hard.dimensionOffset, "offset");
+        labeledRow("Divisible by / offset", dimStepInput, dimOffsetInput);
 
         const evenLatentRow = document.createElement("label");
-        evenLatentRow.style.cssText = "display:flex;align-items:center;gap:8px;margin-left:90px;font-size:10px;color:#d9e1e8;";
+        evenLatentRow.style.cssText = "display:flex;align-items:center;gap:8px;font-size:10px;color:#d9e1e8;";
         const evenLatentInput = document.createElement("input");
         evenLatentInput.type = "checkbox";
-        evenLatentInput.checked = editingTemplate?.constraints?.evenLatentDimensions !== false;
+        evenLatentInput.checked = hard.evenLatentDimensions === true;
         evenLatentRow.append(evenLatentInput, document.createTextNode("Even latent dimensions"));
         form.appendChild(evenLatentRow);
 
-        const evenLatentHelp = document.createElement("div");
-        evenLatentHelp.style.cssText = "margin-left:90px;font-size:10px;color:#8f9cab;line-height:1.4;";
-        evenLatentHelp.textContent = "After width/height snapping, round latent width and height to even values when the dimension step represents the latent scale.";
-        form.appendChild(evenLatentHelp);
+        const frameStepInput = numInput(hard.frameStep, "step");
+        const frameOffsetInput = numInput(hard.frameOffset, "offset");
+        labeledRow("Frame step / offset", frameStepInput, frameOffsetInput);
+        const framePreview = document.createElement("div");
+        framePreview.style.cssText = helpCss;
+        form.appendChild(framePreview);
+        const refreshFramePreview = () => {
+            const step = parseDraftNumber(frameStepInput.value);
+            const offset = parseDraftNumber(frameOffsetInput.value) ?? 0;
+            const constraint = (step && step > 1) ? { step, offset } : null;
+            framePreview.textContent = constraint
+                ? `Formula: ${describeConstraintFormula(constraint)} | Sample: ${previewConstraintValues(constraint, 5).join(", ")}`
+                : "Formula: Any";
+        };
+        frameStepInput.addEventListener("input", refreshFramePreview);
+        frameOffsetInput.addEventListener("input", refreshFramePreview);
+        refreshFramePreview();
+
+        const fpsInput = textInput(Array.isArray(hard.fps) ? hard.fps.join(", ") : "", "24, 25, 48, 50");
+        labeledRow("Allowed fps", fpsInput);
+
+        // ── Soft recommendations ──
+        sectionHeader("Soft Recommendations", "Advisory only — surfaced as hints; never clamps input.");
+        const minDimInput = numInput(soft.minDimension, "64");
+        labeledRow("Min dimension", minDimInput);
+        const recResInput = textInput(fmtResList(soft.recommendedRes), "1280x720, 720x1280");
+        labeledRow("Recommended res", recResInput);
+        const recResPreview = document.createElement("div");
+        recResPreview.style.cssText = helpCss;
+        form.appendChild(recResPreview);
+        const maxResInput = textInput(fmtResPair(soft.maxRes), "3840x2160");
+        labeledRow("Max res (warn)", maxResInput);
+        const maxResPreview = document.createElement("div");
+        maxResPreview.style.cssText = helpCss;
+        form.appendChild(maxResPreview);
+        // Pixel-budget preview (W×H) beneath each res box, mirroring the frame formula preview.
+        const refreshResPreviews = () => {
+            const recPairs = parseResList(recResInput.value);
+            recResPreview.textContent = recPairs.length
+                ? `Pixel budget: ${recPairs.map(([w, h]) => `${w}×${h} = ${(w * h).toLocaleString()} px`).join(", ")}`
+                : "";
+            const maxPair = parseResPair(maxResInput.value);
+            maxResPreview.textContent = maxPair
+                ? `Pixel budget: ${maxPair[0]}×${maxPair[1]} = ${(maxPair[0] * maxPair[1]).toLocaleString()} px`
+                : "";
+        };
+        recResInput.addEventListener("input", refreshResPreviews);
+        maxResInput.addEventListener("input", refreshResPreviews);
+        refreshResPreviews();
+        const durMinInput = numInput(soft.recommendedDuration?.minSec, "min s", "0.1");
+        const durMaxInput = numInput(soft.recommendedDuration?.maxSec, "max s", "0.1");
+        labeledRow("Duration min / max (s)", durMinInput, durMaxInput);
 
         const actionRow = document.createElement("div");
         actionRow.style.cssText = "display:flex;justify-content:flex-end;gap:8px;margin-top:4px;";
@@ -808,26 +854,43 @@ function showSettingsPanel() {
             const nextTemplate = {
                 id: editingTemplate?.id || makeUniqueTemplateId(name),
                 name,
-                constraints: {},
+                hard: {
+                    dimensionStep: parseDraftNumber(dimStepInput.value),
+                    dimensionOffset: parseDraftNumber(dimOffsetInput.value),
+                    evenLatentDimensions: !!evenLatentInput.checked,
+                    frameStep: parseDraftNumber(frameStepInput.value),
+                    frameOffset: parseDraftNumber(frameOffsetInput.value),
+                    fps: parseFpsList(fpsInput.value),
+                },
+                soft: {
+                    minDimension: parseDraftNumber(minDimInput.value),
+                    recommendedRes: parseResList(recResInput.value),
+                    maxRes: parseResPair(maxResInput.value),
+                    recommendedDuration: {
+                        minSec: parseDraftNumber(durMinInput.value, false),
+                        maxSec: parseDraftNumber(durMaxInput.value, false),
+                    },
+                },
             };
-            for (const paramKey of MODEL_TEMPLATE_PARAM_KEYS) {
-                const constraint = buildConstraintDraft(paramKey, constraintInputs[paramKey]);
-                if (constraint) {
-                    nextTemplate.constraints[paramKey] = constraint;
-                }
-            }
-            const batchMaxFrames = Number(batchInput.value);
-            if (Number.isFinite(batchMaxFrames) && batchMaxFrames > 0) {
-                nextTemplate.constraints.batchMaxFrames = Math.round(batchMaxFrames);
-            }
-            nextTemplate.constraints.evenLatentDimensions = !!evenLatentInput.checked;
-            const nextCustomTemplates = editingTemplate
-                ? customTemplates.map((template) => template.id === editingTemplate.id ? nextTemplate : template)
-                : [...customTemplates, nextTemplate];
             this._templateFormState = { expanded: false, editId: "" };
-            this._updateSettings({
-                modelTemplates: { customTemplates: nextCustomTemplates },
-            });
+            if (editingTemplate && editingTemplate.builtIn) {
+                // Editing a built-in writes a browser-local override keyed by its id;
+                // deep-merge preserves other overrides + customTemplates.
+                this._updateSettings({
+                    modelTemplates: {
+                        builtinOverrides: {
+                            [editingTemplate.id]: { name: nextTemplate.name, hard: nextTemplate.hard, soft: nextTemplate.soft },
+                        },
+                    },
+                });
+            } else {
+                const nextCustomTemplates = editingTemplate
+                    ? customTemplates.map((template) => template.id === editingTemplate.id ? nextTemplate : template)
+                    : [...customTemplates, nextTemplate];
+                this._updateSettings({
+                    modelTemplates: { customTemplates: nextCustomTemplates },
+                });
+            }
         });
 
         const cancelBtn = document.createElement("button");

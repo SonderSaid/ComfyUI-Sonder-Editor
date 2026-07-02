@@ -14,10 +14,11 @@ import {
     DEFAULT_SAVE_PRESET,
     SAVE_PRESET_OPTIONS,
     getTemplateById,
+    getTemplateFpsValues,
+    snapFpsToAllowed,
     getEditorSettings,
     notificationCoreConfig,
     resolveFrameConstraintForTemplate,
-    snapToConstraint,
     subscribeEditorSettings,
 } from "./editor_settings.js";
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
@@ -92,11 +93,11 @@ function style(el, cssText) {
 
 function snapFpsToTemplate(fps, template) {
     const numeric = Math.max(0, Number(fps) || 0);
-    const constraint = template?.constraints?.fps;
-    if (template?.id === "free" || !constraint || typeof constraint !== "object") {
+    const values = getTemplateFpsValues(template);
+    if (template?.id === "free" || !values.length) {
         return numeric;
     }
-    return Number(snapToConstraint(numeric, constraint).toFixed(3));
+    return Number(snapFpsToAllowed(numeric, values).toFixed(3));
 }
 
 // ── Widget hide/show helpers ───────────────────────────────────────────

@@ -97,12 +97,15 @@ const free = mod.getTemplateById("free", settings);
 const customDefault = mod.getTemplateById("custom-default", settings);
 const customOff = mod.getTemplateById("custom-off", settings);
 console.log(JSON.stringify({
-    ltxConstraints: ltx.constraints,
+    ltxHard: ltx.hard,
+    ltxFps: mod.getTemplateFpsValues(ltx),
+    ltxRecRes: mod.getRecommendedResolutions(ltx),
+    ltxFrameConstraint: mod.getFrameConstraint(ltx),
     ltx480p43: mod.computeResolutionFromTier(640, 4, 3, ltx),
     free480p43: mod.computeResolutionFromTier(640, 4, 3, free),
-    customDefaultEven: customDefault.constraints.evenLatentDimensions,
+    customDefaultEven: customDefault.hard.evenLatentDimensions,
     customDefault480p43: mod.computeResolutionFromTier(640, 4, 3, customDefault),
-    customOffEven: customOff.constraints.evenLatentDimensions,
+    customOffEven: customOff.hard.evenLatentDimensions,
     customOff480p43: mod.computeResolutionFromTier(640, 4, 3, customOff),
 }));
 """.replace("__MODULE_URL__", json.dumps(module_url)).replace("__SETTINGS__", json.dumps(stored_settings))
@@ -115,18 +118,85 @@ console.log(JSON.stringify({
     )
 
     result = json.loads(completed.stdout)
-    assert result["ltxConstraints"]["width"]["max"] == 4096
-    assert result["ltxConstraints"]["height"]["max"] == 4096
-    assert result["ltxConstraints"]["frames"]["max"] == 481
-    assert result["ltxConstraints"]["fps"] == {"min": 24, "max": 50}
-    assert result["ltxConstraints"]["batchMaxFrames"] == 121
-    assert result["ltxConstraints"]["evenLatentDimensions"] is True
+    # Templates v2: hard/soft shape. Divisibility + frame rule + fps allow-list are HARD.
+    assert result["ltxHard"]["dimensionStep"] == 32
+    assert result["ltxHard"]["evenLatentDimensions"] is True
+    assert result["ltxFps"] == [24, 25, 48, 50]
+    # recommendedRes collapses orientation-swapped duplicates (total-pixel basis).
+    assert result["ltxRecRes"] == [[1280, 720]]
+    assert result["ltxFrameConstraint"] == {"step": 8, "offset": 1}
     assert result["ltx480p43"] == {"width": 768, "height": 576}
     assert result["free480p43"] == {"width": 739, "height": 554}
+    # Legacy custom template with no explicit even flag migrates to the v1 default (true).
     assert result["customDefaultEven"] is True
     assert result["customDefault480p43"] == {"width": 768, "height": 576}
     assert result["customOffEven"] is False
     assert result["customOff480p43"] == {"width": 736, "height": 544}
+
+
+def test_editor_settings_builtin_template_overrides():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+
+    module_path = Path(__file__).resolve().parents[1] / "web" / "js" / "editor_settings.js"
+    module_url = module_path.as_uri()
+    stored_settings = {
+        "modelTemplates": {
+            "builtinOverrides": {
+                # An edit to a built-in: only fps + name changed here.
+                "ltx-2.3": {
+                    "name": "LTX 2.3 (mine)",
+                    "hard": {
+                        "dimensionStep": 32, "dimensionOffset": 0, "evenLatentDimensions": True,
+                        "frameStep": 8, "frameOffset": 1, "fps": [30],
+                    },
+                    "soft": {"minDimension": 64, "recommendedRes": [[1280, 720]]},
+                },
+                # A null override models a "reset to defaults" and must be dropped.
+                "wan": None,
+            },
+        },
+    }
+    script = """
+const storedSettings = __SETTINGS__;
+globalThis.window = {
+    localStorage: {
+        getItem(key) {
+            return key === "sonder-editor-settings" ? JSON.stringify(storedSettings) : null;
+        },
+        setItem() {},
+    },
+    addEventListener() {},
+};
+const mod = await import(__MODULE_URL__);
+const settings = mod.getEditorSettings();
+console.log(JSON.stringify({
+    ltxFps: mod.getTemplateFpsValues(mod.getTemplateById("ltx-2.3", settings)),
+    ltxName: mod.getTemplateById("ltx-2.3", settings).name,
+    ltxBuiltIn: mod.getTemplateById("ltx-2.3", settings).builtIn,
+    wanFps: mod.getTemplateFpsValues(mod.getTemplateById("wan", settings)),
+    overrideKeys: Object.keys(settings.modelTemplates.builtinOverrides).sort(),
+    isBuiltinLtx: mod.isBuiltinModelTemplate("ltx-2.3"),
+}));
+""".replace("__MODULE_URL__", json.dumps(module_url)).replace("__SETTINGS__", json.dumps(stored_settings))
+
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    result = json.loads(completed.stdout)
+    # Override is applied over the code default, identity/builtIn flag preserved.
+    assert result["ltxFps"] == [30]
+    assert result["ltxName"] == "LTX 2.3 (mine)"
+    assert result["ltxBuiltIn"] is True
+    # Null override dropped → wan resolves to its default fps, not present in overrides.
+    assert result["wanFps"] == [16]
+    assert result["overrideKeys"] == ["ltx-2.3"]
+    assert result["isBuiltinLtx"] is True
 
 
 def test_editor_settings_detects_snapped_resolution_presets_and_session_memory():

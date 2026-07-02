@@ -116,22 +116,112 @@ export const SNAP_TARGET_OPTIONS = [
     { key: "sceneBounds", label: "Scene Bounds" },
 ];
 
+// Legacy flat-constraint param keys — retained only so `normalizeCustomTemplate`
+// can migrate pre-v2 custom templates (see migration block below). Templates v2
+// stores hard/soft blocks instead of a per-param `constraints` map.
 export const MODEL_TEMPLATE_PARAM_KEYS = ["width", "height", "frames", "fps"];
 
+// Model templates v2: `hard` = enforced by snapping/validation (divisibility, the
+// `Nn+1` frame rule, fps allow-list); `soft` = advisory hints that never clamp
+// (recommended/ceiling resolution, aspect ratios, duration band). Constraint
+// VALUES come from official model repos/cards — see plans/ notes. Soft duration
+// bands are tunable defaults, not hard limits.
 export const BUILTIN_MODEL_TEMPLATES = [
-    { id: "free", name: "No Model Template", builtIn: true, constraints: {} },
+    { id: "free", name: "No Model Template", builtIn: true, hard: {}, soft: {} },
     {
         id: "ltx-2.3",
         name: "LTX 2.3",
         builtIn: true,
-        hintTier: 720,
-        constraints: {
-            width: { step: 32, offset: 0, min: 64, max: 4096 },
-            height: { step: 32, offset: 0, min: 64, max: 4096 },
-            frames: { step: 8, offset: 1, min: 1, max: 481 },
-            fps: { min: 24, max: 50 },
-            batchMaxFrames: 121,
-            evenLatentDimensions: true,
+        hard: {
+            dimensionStep: 32, dimensionOffset: 0, evenLatentDimensions: true,
+            frameStep: 8, frameOffset: 1,
+            fps: [24, 25, 48, 50],
+        },
+        soft: {
+            minDimension: 64,
+            recommendedRes: [[1280, 720]],
+            maxRes: [3840, 2160],
+            recommendedDuration: { minSec: 1, maxSec: 20 },
+        },
+    },
+    {
+        id: "wan",
+        name: "Wan 2.1 / 2.2 (14B)",
+        builtIn: true,
+        hard: {
+            dimensionStep: 16, dimensionOffset: 0, evenLatentDimensions: false,
+            frameStep: 4, frameOffset: 1,
+            fps: [16],
+        },
+        soft: {
+            minDimension: 64,
+            recommendedRes: [[832, 480], [1280, 720], [832, 832]],
+            maxRes: [1280, 720],
+            recommendedDuration: { minSec: 2, maxSec: 5 },
+        },
+    },
+    {
+        id: "wan-2.2-5b",
+        name: "Wan 2.2 (TI2V-5B)",
+        builtIn: true,
+        hard: {
+            dimensionStep: 32, dimensionOffset: 0, evenLatentDimensions: false,
+            frameStep: 4, frameOffset: 1,
+            fps: [24],
+        },
+        soft: {
+            minDimension: 64,
+            recommendedRes: [[1280, 720]],
+            maxRes: [1280, 720],
+            recommendedDuration: { minSec: 2, maxSec: 5 },
+        },
+    },
+    {
+        id: "hunyuan-1.5",
+        name: "HunyuanVideo 1.5",
+        builtIn: true,
+        hard: {
+            dimensionStep: 16, dimensionOffset: 0, evenLatentDimensions: false,
+            frameStep: 4, frameOffset: 1,
+            fps: [24],
+        },
+        soft: {
+            minDimension: 64,
+            recommendedRes: [[1280, 720]],
+            maxRes: [1920, 1080],
+            recommendedDuration: { minSec: 5, maxSec: 10 },
+        },
+    },
+    {
+        id: "cogvideox-1.5",
+        name: "CogVideoX 1.5 (T2V)",
+        builtIn: true,
+        hard: {
+            dimensionStep: 16, dimensionOffset: 0, evenLatentDimensions: false,
+            frameStep: 16, frameOffset: 1,
+            fps: [16],
+        },
+        soft: {
+            minDimension: 768,
+            recommendedRes: [[1360, 768]],
+            maxRes: [1360, 768],
+            recommendedDuration: { minSec: 5, maxSec: 10 },
+        },
+    },
+    {
+        id: "cogvideox-1.5-i2v",
+        name: "CogVideoX 1.5 (I2V)",
+        builtIn: true,
+        hard: {
+            dimensionStep: 16, dimensionOffset: 0, evenLatentDimensions: false,
+            frameStep: 8, frameOffset: 1,
+            fps: [8],
+        },
+        soft: {
+            minDimension: 768,
+            recommendedRes: [[1360, 768]],
+            maxRes: [1360, 1360],
+            recommendedDuration: { minSec: 2, maxSec: 6 },
         },
     },
 ];
@@ -251,6 +341,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     modelTemplates: {
         customTemplates: [],
+        builtinOverrides: {},
     },
     promptTemplates: [],
     prompts: {
@@ -415,26 +506,60 @@ function sanitizeTemplateId(value, fallback = "custom-template") {
     return normalized || fallback;
 }
 
-function normalizeConstraint(constraint, key) {
-    if (!constraint || typeof constraint !== "object" || Array.isArray(constraint)) {
-        return undefined;
+// ── Templates v2 soft-field normalizers ───────────────────────────────
+export function normalizeTemplateFpsList(raw) {
+    let values = [];
+    if (Array.isArray(raw)) {
+        values = raw;
+    } else if (raw && typeof raw === "object") {
+        // Legacy {min,max} fps range → discrete endpoints (v1 migration).
+        values = [raw.min, raw.max];
     }
-    const integer = key !== "fps";
-    const normalized = {};
-    const step = coerceFiniteNumber(constraint.step, { integer, min: integer ? 1 : 0 });
-    const offset = coerceFiniteNumber(constraint.offset, { integer });
-    const min = coerceFiniteNumber(constraint.min, { integer });
-    const max = coerceFiniteNumber(constraint.max, { integer });
-    if (step !== undefined && step > 0) normalized.step = step;
-    if (offset !== undefined) normalized.offset = offset;
-    if (min !== undefined) normalized.min = min;
-    if (max !== undefined) normalized.max = max;
-    if (normalized.min !== undefined && normalized.max !== undefined && normalized.max < normalized.min) {
-        normalized.max = normalized.min;
-    }
-    return Object.keys(normalized).length ? normalized : undefined;
+    const cleaned = values
+        .map((value) => coerceFiniteNumber(value, { min: 0 }))
+        .filter((value) => value !== undefined && value > 0);
+    return Array.from(new Set(cleaned)).sort((a, b) => a - b);
 }
 
+function normalizeResolutionPair(raw) {
+    if (!Array.isArray(raw)) return null;
+    const w = coerceFiniteNumber(raw[0], { integer: true, min: 1 });
+    const h = coerceFiniteNumber(raw[1], { integer: true, min: 1 });
+    return w !== undefined && h !== undefined ? [w, h] : null;
+}
+
+function normalizeResolutionPairList(raw) {
+    if (!Array.isArray(raw)) return [];
+    // Collapse orientation-swapped duplicates (same total pixels) — recommendedRes
+    // only drives the total-pixel tier marker, so listing both orientations is redundant.
+    const seen = new Set();
+    const deduped = [];
+    for (const pair of raw.map(normalizeResolutionPair).filter(Boolean)) {
+        const key = `${Math.min(pair[0], pair[1])}x${Math.max(pair[0], pair[1])}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(pair);
+    }
+    return deduped;
+}
+
+function normalizeDurationBand(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const minSec = coerceFiniteNumber(raw.minSec, { min: 0 });
+    const maxSec = coerceFiniteNumber(raw.maxSec, { min: 0 });
+    const hasMin = minSec !== undefined && minSec > 0;
+    const hasMax = maxSec !== undefined && maxSec > 0;
+    if (!hasMin && !hasMax) return null;
+    const lo = hasMin ? minSec : maxSec;
+    const hi = hasMax ? maxSec : minSec;
+    return { minSec: Math.min(lo, hi), maxSec: Math.max(lo, hi) };
+}
+
+// Accepts a templates-v2 template ({hard, soft}) OR a legacy v1 template
+// (flat `constraints` map) and normalizes to the v2 shape. Legacy width/height
+// step+offset collapse to the isotropic dimensionStep/dimensionOffset; frames
+// step/offset become frameStep/frameOffset; the old fps {min,max} range becomes
+// a discrete allow-list; batchMaxFrames + hintTier are intentionally dropped.
 function normalizeCustomTemplate(template, index = 0) {
     if (!template || typeof template !== "object" || Array.isArray(template)) {
         return null;
@@ -443,26 +568,53 @@ function normalizeCustomTemplate(template, index = 0) {
         ? template.name.trim()
         : `Custom Template ${index + 1}`;
     const id = sanitizeTemplateId(template.id, sanitizeTemplateId(name, `custom-template-${index + 1}`));
-    const constraints = {};
-    for (const key of MODEL_TEMPLATE_PARAM_KEYS) {
-        const normalizedConstraint = normalizeConstraint(template.constraints?.[key], key);
-        if (normalizedConstraint) {
-            constraints[key] = normalizedConstraint;
-        }
-    }
-    const batchMaxFrames = coerceFiniteNumber(template.constraints?.batchMaxFrames, { integer: true, min: 1 });
-    if (batchMaxFrames !== undefined) {
-        constraints.batchMaxFrames = batchMaxFrames;
-    }
-    constraints.evenLatentDimensions = template.constraints?.evenLatentDimensions !== false;
-    const hintTier = coerceFiniteNumber(template.hintTier, { integer: true, min: 1 });
-    return {
-        id,
-        name,
-        builtIn: false,
-        ...(hintTier !== undefined ? { hintTier } : {}),
-        constraints,
+
+    const legacy = template.constraints && typeof template.constraints === "object" && !Array.isArray(template.constraints)
+        ? template.constraints
+        : null;
+    const hardSource = template.hard && typeof template.hard === "object" ? template.hard : {};
+    const softSource = template.soft && typeof template.soft === "object" ? template.soft : {};
+
+    const pick = (a, b) => (a !== undefined ? a : b);
+    const dimensionStep = pick(
+        coerceFiniteNumber(hardSource.dimensionStep, { integer: true, min: 1 }),
+        coerceFiniteNumber(pick(legacy?.width?.step, legacy?.height?.step), { integer: true, min: 1 }),
+    );
+    const dimensionOffset = pick(
+        coerceFiniteNumber(hardSource.dimensionOffset, { integer: true }),
+        coerceFiniteNumber(pick(legacy?.width?.offset, legacy?.height?.offset), { integer: true }),
+    );
+    const frameStep = pick(
+        coerceFiniteNumber(hardSource.frameStep, { integer: true, min: 1 }),
+        coerceFiniteNumber(legacy?.frames?.step, { integer: true, min: 1 }),
+    );
+    const frameOffset = pick(
+        coerceFiniteNumber(hardSource.frameOffset, { integer: true }),
+        coerceFiniteNumber(legacy?.frames?.offset, { integer: true }),
+    );
+    // Legacy v1 templates defaulted evenLatentDimensions to TRUE when unspecified;
+    // v2 defaults to FALSE. Preserve each so migration never silently flips behavior.
+    const isLegacyOnly = !!legacy && !(template.hard && typeof template.hard === "object");
+    const evenExplicit = pick(hardSource.evenLatentDimensions, legacy?.evenLatentDimensions);
+    const evenLatentDimensions = evenExplicit === undefined ? isLegacyOnly : evenExplicit === true;
+
+    const hard = {
+        dimensionStep: dimensionStep ?? 0,
+        dimensionOffset: dimensionOffset ?? 0,
+        evenLatentDimensions,
+        frameStep: frameStep ?? 0,
+        frameOffset: frameOffset ?? 0,
+        fps: normalizeTemplateFpsList(pick(hardSource.fps, legacy?.fps)),
     };
+
+    const soft = {
+        minDimension: coerceFiniteNumber(softSource.minDimension, { integer: true, min: 1 }) ?? 64,
+        recommendedRes: normalizeResolutionPairList(softSource.recommendedRes),
+        maxRes: normalizeResolutionPair(softSource.maxRes),
+        recommendedDuration: normalizeDurationBand(softSource.recommendedDuration),
+    };
+
+    return { id, name, builtIn: false, hard, soft };
 }
 
 function normalizeCustomTemplates(templates) {
@@ -485,6 +637,25 @@ function normalizeCustomTemplates(templates) {
         normalized.push(template);
     }
     return normalized;
+}
+
+// Browser-local edits to BUILT-IN templates, keyed by built-in id. Each entry is a
+// full normalized {name, hard, soft}; a null/invalid entry (or `free`) is dropped —
+// that is how a "reset to defaults" clears an override. Reuses normalizeCustomTemplate
+// for the hard/soft validation, forcing the built-in id + falling back to its name.
+function normalizeBuiltinOverrides(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const result = {};
+    for (const [id, entry] of Object.entries(raw)) {
+        if (!BUILTIN_MODEL_TEMPLATE_IDS.has(id) || id === "free") continue;
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        const base = BUILTIN_MODEL_TEMPLATES.find((template) => template.id === id);
+        const normalized = normalizeCustomTemplate({ ...entry, id, name: entry.name || base?.name }, 0);
+        if (normalized) {
+            result[id] = { name: normalized.name, hard: normalized.hard, soft: normalized.soft };
+        }
+    }
+    return result;
 }
 
 // Writing-mode drafts: authoring scratch keyed `project::scene`. Unknown keys
@@ -992,6 +1163,7 @@ function normalizeEditorSettings(source = null) {
         },
         modelTemplates: {
             customTemplates,
+            builtinOverrides: normalizeBuiltinOverrides(stored?.modelTemplates?.builtinOverrides),
         },
         promptTemplates: normalizePromptTemplates(stored?.promptTemplates),
         prompts: normalizePromptsSettings(stored?.prompts, defaults.prompts),
@@ -1141,8 +1313,24 @@ export function subscribeEditorSettings(listener) {
     };
 }
 
+export function isBuiltinModelTemplate(id) {
+    return BUILTIN_MODEL_TEMPLATE_IDS.has(normalizeModelTemplateId(id));
+}
+
 export function getAllModelTemplates(settings) {
-    return [...BUILTIN_MODEL_TEMPLATES, ...(settings?.modelTemplates?.customTemplates || [])];
+    const overrides = settings?.modelTemplates?.builtinOverrides || {};
+    const builtins = BUILTIN_MODEL_TEMPLATES.map((template) => {
+        const override = overrides[template.id];
+        if (!override) return template;
+        // Built-in identity + builtIn flag are preserved; hard/soft (and name) are the edit.
+        return {
+            ...template,
+            name: override.name || template.name,
+            hard: override.hard,
+            soft: override.soft,
+        };
+    });
+    return [...builtins, ...(settings?.modelTemplates?.customTemplates || [])];
 }
 
 export function getTemplateById(id, settings) {
@@ -1150,12 +1338,85 @@ export function getTemplateById(id, settings) {
     return getAllModelTemplates(settings).find((template) => template.id === wanted) || BUILTIN_MODEL_TEMPLATES[0];
 }
 
+// ── Templates v2 hard/soft accessors ──────────────────────────────────
+// Adapt the hard/soft storage shape to the {step, offset} constraint objects the
+// snapping engine already expects. Dimension/frame constraints carry NO min/max,
+// so snapToConstraint's clamp branch never fires — soft ceilings never clamp.
+export function getDimensionConstraint(template) {
+    const step = Number(template?.hard?.dimensionStep);
+    if (!Number.isFinite(step) || step <= 0) return null;
+    return { step, offset: Number(template?.hard?.dimensionOffset) || 0 };
+}
+
+export function getFrameConstraint(template) {
+    const step = Number(template?.hard?.frameStep);
+    if (!Number.isFinite(step) || step <= 1) return null;
+    return { step, offset: Number(template?.hard?.frameOffset) || 0 };
+}
+
+export function getTemplateFpsValues(template) {
+    const values = template?.hard?.fps;
+    if (!Array.isArray(values)) return [];
+    const cleaned = values
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0);
+    return Array.from(new Set(cleaned)).sort((a, b) => a - b);
+}
+
+export function templateFpsIsFixed(template) {
+    return getTemplateFpsValues(template).length === 1;
+}
+
+export function snapFpsToAllowed(fps, values) {
+    const numeric = Math.max(0, Number(fps) || 0);
+    if (!Array.isArray(values) || !values.length) return numeric;
+    let best = values[0];
+    let bestDiff = Math.abs(numeric - best);
+    for (const value of values) {
+        const diff = Math.abs(numeric - value);
+        if (diff < bestDiff) {
+            best = value;
+            bestDiff = diff;
+        }
+    }
+    return best;
+}
+
+export function getRecommendedDurationSec(template) {
+    const band = template?.soft?.recommendedDuration;
+    if (!band || typeof band !== "object") return null;
+    const minSec = Number(band.minSec);
+    const maxSec = Number(band.maxSec);
+    const hasMin = Number.isFinite(minSec) && minSec > 0;
+    const hasMax = Number.isFinite(maxSec) && maxSec > 0;
+    if (!hasMin && !hasMax) return null;
+    const lo = hasMin ? minSec : maxSec;
+    const hi = hasMax ? maxSec : minSec;
+    return { minSec: Math.min(lo, hi), maxSec: Math.max(lo, hi) };
+}
+
+export function getRecommendedResolutions(template) {
+    const list = template?.soft?.recommendedRes;
+    if (!Array.isArray(list)) return [];
+    return list
+        .filter((pair) => Array.isArray(pair) && Number(pair[0]) > 0 && Number(pair[1]) > 0)
+        .map((pair) => [Math.round(Number(pair[0])), Math.round(Number(pair[1]))]);
+}
+
+export function getMaxRes(template) {
+    const pair = template?.soft?.maxRes;
+    if (!Array.isArray(pair)) return null;
+    const w = Math.round(Number(pair[0]));
+    const h = Math.round(Number(pair[1]));
+    return w > 0 && h > 0 ? [w, h] : null;
+}
+
+
+// Durable projection of the template's frame rule, persisted as project.frame_constraint
+// so a browser lacking the template def still snaps frames. Shape stays {step, offset}
+// for all downstream consumers and the backend passthrough blob.
 export function resolveFrameConstraintForTemplate(templateId, settings) {
-    const template = getTemplateById(templateId, settings);
-    const frames = template?.constraints?.frames;
-    if (!frames || typeof frames !== "object") return null;
-    if (!Object.keys(frames).length) return null;
-    return frames;
+    return getFrameConstraint(getTemplateById(templateId, settings));
 }
 
 export function frameConstraintsEqual(a, b) {
@@ -1201,10 +1462,11 @@ export function snapToConstraint(value, constraint) {
 }
 
 function templateUsesEvenLatentDimensions(template) {
-    return !!template && template.id !== "free" && template.constraints?.evenLatentDimensions !== false;
+    return !!template && template.id !== "free" && template?.hard?.evenLatentDimensions === true;
 }
 
-function snapDimensionToTemplate(value, constraint, template) {
+function snapDimensionToTemplate(value, template) {
+    const constraint = getDimensionConstraint(template);
     const snapped = Math.round(snapToConstraint(value, constraint));
     if (!templateUsesEvenLatentDimensions(template)) return snapped;
     const step = Number(constraint?.step);
@@ -1227,15 +1489,15 @@ export function computeResolutionFromTier(c, a, b, template) {
     if (a <= 0 || b <= 0) return null;
     const rawW = Number(c) * Math.sqrt(a / b);
     const rawH = Number(c) * Math.sqrt(b / a);
-    const width = snapDimensionToTemplate(rawW, template?.constraints?.width, template);
-    const height = snapDimensionToTemplate(rawH, template?.constraints?.height, template);
+    const width = snapDimensionToTemplate(rawW, template);
+    const height = snapDimensionToTemplate(rawH, template);
     return { width, height };
 }
 
 export function snapResolution(width, height, template) {
     return {
-        width: snapDimensionToTemplate(width, template?.constraints?.width, template),
-        height: snapDimensionToTemplate(height, template?.constraints?.height, template),
+        width: snapDimensionToTemplate(width, template),
+        height: snapDimensionToTemplate(height, template),
     };
 }
 
@@ -1354,22 +1616,21 @@ export function createResolutionToolbarSelectionMemory() {
 export const resolutionToolbarSelectionMemory = createResolutionToolbarSelectionMemory();
 
 export function resolveBatchChunkSize({ settings, template, preContext = 0, postContext = 0 } = {}) {
-    // `batchMaxFrames` is a TOTAL rendered-tensor budget per chunk (LTX 2.3 default
-    // of 97 = the model's frame ceiling). Selection chunk size = total budget minus
-    // context. Mirrors the four-snap policy in editor_node.py / editor_widget.js:
-    // pre snaps to G (when > 0), post snaps to multiples of step, total snaps UP
-    // (ceil) to next G, selection budget snaps to V (multiples of step when pre>0,
-    // G when pre==0).
+    // Per-chunk TOTAL rendered-tensor budget. Batch chunk size is a user choice —
+    // it comes from the global batchRender.maxFramesPerChunk setting (else 97); it
+    // is NOT a template field. Selection chunk size = total budget minus context.
+    // Mirrors the four-snap policy in editor_node.py / editor_widget.js: pre snaps
+    // to G (when > 0), post snaps to multiples of step, total snaps UP (ceil) to
+    // next G, selection budget snaps to V (multiples of step when pre>0, G when pre==0).
     const requested = pickDefined(
         settings?.batchRender?.maxFramesPerChunk > 0 ? settings.batchRender.maxFramesPerChunk : undefined,
-        template?.constraints?.batchMaxFrames,
         97,
     );
     const numeric = Math.max(1, Math.round(Number(requested) || 97));
     const pre = Math.max(0, Math.round(Number(preContext) || 0));
     const post = Math.max(0, Math.round(Number(postContext) || 0));
-    const frameConstraint = template?.constraints?.frames;
-    if (!frameConstraint || typeof frameConstraint !== "object" || !frameConstraint.step || frameConstraint.step <= 1) {
+    const frameConstraint = getFrameConstraint(template);
+    if (!frameConstraint || !frameConstraint.step || frameConstraint.step <= 1) {
         // Free / no-constraint: just subtract context from the requested budget.
         return Math.max(1, numeric - pre - post);
     }
@@ -1412,7 +1673,7 @@ export function resolveBatchChunkSizes({ settings, template, preContext = 0, pos
     // unaffected. Subsequent chunks (which grab pre-context from the prior take) stay
     // at chunkSize.
     const chunkSize = resolveBatchChunkSize({ settings, template, preContext, postContext });
-    const frameConstraint = template?.constraints?.frames;
+    const frameConstraint = getFrameConstraint(template);
     const step = frameConstraint?.step;
     const offset = frameConstraint?.offset || 0;
     const firstChunkLacksPreContext = preContext > 0 && (parseInt(selectionStart, 10) || 0) <= 0;

@@ -236,6 +236,13 @@ import {
     getEditorSettings,
     getAllModelTemplates,
     getTemplateById,
+    getDimensionConstraint,
+    getTemplateFpsValues,
+    snapFpsToAllowed,
+    templateFpsIsFixed,
+    getRecommendedDurationSec,
+    getRecommendedResolutions,
+    getMaxRes,
     resolveBatchChunkSizes,
     resolveFrameConstraintForTemplate,
     resolutionToolbarSelectionMemory,
@@ -2842,29 +2849,36 @@ export class EditorWidget {
     }
 
     _syncSceneFpsControl() {
-        if (!this._fpsInput) return;
-        this._fpsInput.value = this._formatSceneFpsValue(this.activeScene?.fps);
-        this._fpsInput.placeholder = String(this.fps);
+        if (this._fpsInput) {
+            this._fpsInput.value = this._formatSceneFpsValue(this.activeScene?.fps);
+            this._fpsInput.placeholder = String(this.fps);
+        }
+        if (this._fpsSelect && this._fpsSelect.style.display !== "none") {
+            const snapped = this._snapSceneFpsToTemplate(this._effectiveFps);
+            if (Array.from(this._fpsSelect.options).some((option) => option.value === String(snapped))) {
+                this._fpsSelect.value = String(snapped);
+            }
+        }
     }
 
     _snapSceneFpsToTemplate(fps, template = this._getActiveTemplate()) {
         const numeric = Math.max(0, Number(fps) || 0);
-        const constraint = template?.constraints?.fps;
-        if (template?.id === "free" || !constraint || typeof constraint !== "object") {
+        const values = getTemplateFpsValues(template);
+        if (template?.id === "free" || !values.length) {
             return numeric;
         }
-        return Number(snapToConstraint(numeric, constraint).toFixed(3));
+        return Number(snapFpsToAllowed(numeric, values).toFixed(3));
     }
 
     async _applyActiveTemplateFpsConstraint() {
         if (!this.activeScene) return;
         const template = this._getActiveTemplate();
-        const constraint = template?.constraints?.fps;
-        if (template.id === "free" || !constraint || typeof constraint !== "object") return;
+        const values = getTemplateFpsValues(template);
+        if (template.id === "free" || !values.length) return;
 
         const currentFps = this._effectiveFps;
         const nextFps = this._snapSceneFpsToTemplate(currentFps, template);
-        const fixedFps = constraint.min != null && constraint.max != null && constraint.min === constraint.max;
+        const fixedFps = templateFpsIsFixed(template);
         const changedByConstraint = Math.abs(nextFps - currentFps) > 0.0005;
         if (!fixedFps && !changedByConstraint) return;
 
@@ -2878,7 +2892,7 @@ export class EditorWidget {
 
     _snapSceneDurationToTemplate(frames) {
         const numeric = Math.max(1, parseInt(frames, 10) || 1);
-        const frameConstraint = this._getActiveTemplate()?.constraints?.frames;
+        const frameConstraint = this._getActiveFrameConstraint();
         if (!frameConstraint) return numeric;
         const durationConstraint = { ...frameConstraint };
         delete durationConstraint.max;
@@ -2891,7 +2905,7 @@ export class EditorWidget {
         // via the existing _snapSelectionFrame path (selection endpoint snap).
         const numeric = Math.max(0, Math.round(Number(value) || 0));
         if (numeric <= 0) return 0;
-        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        const constraint = this._getActiveFrameConstraint();
         const step = constraint?.step;
         if (!step || step <= 1) return numeric;
         const offset = constraint.offset || 0;
@@ -2907,7 +2921,7 @@ export class EditorWidget {
         // not the tail).
         const numeric = Math.max(0, Math.round(Number(value) || 0));
         if (numeric <= 0) return 0;
-        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        const constraint = this._getActiveFrameConstraint();
         const step = constraint?.step;
         if (!step || step <= 1) return numeric;
         const rounded = direction === "down" ? Math.floor(numeric / step) : Math.ceil(numeric / step);
@@ -2924,7 +2938,7 @@ export class EditorWidget {
         const capValue = Math.max(0, Math.round(Number(cap) || 0));
         if (capValue <= 0 || numeric <= 0) return 0;
         if (numeric >= capValue) return capValue;
-        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        const constraint = this._getActiveFrameConstraint();
         const step = constraint?.step;
         if (!step || step <= 1) return Math.min(numeric, capValue);
         const rounded = direction === "down" ? Math.floor(numeric / step) : Math.ceil(numeric / step);
@@ -2936,7 +2950,7 @@ export class EditorWidget {
         const numeric = Math.max(0, Math.round(Number(value) || 0));
         // Frame 0 is always a valid selection endpoint; template constraint snapping must never push it above 0.
         if (numeric <= 0) return 0;
-        const constraint = this._getActiveTemplate()?.constraints?.frames;
+        const constraint = this._getActiveFrameConstraint();
         if (!constraint?.step) return clampMax != null ? Math.min(numeric, Math.max(0, clampMax)) : numeric;
         const step = constraint.step;
         const offset = constraint.offset || 0;
@@ -2951,6 +2965,11 @@ export class EditorWidget {
 
     _getActiveTemplate() {
         return getTemplateById(this._templateId, this._settings);
+    }
+
+    // Derived {step, offset} frame rule for the active template (null = no rule).
+    _getActiveFrameConstraint() {
+        return resolveFrameConstraintForTemplate(this._templateId, this._settings);
     }
 
     _aspectRatioOptionValue(a, b) {
@@ -3083,6 +3102,31 @@ export class EditorWidget {
     _setResolutionInputs(width, height) {
         if (this._resWInput) this._resWInput.value = width || "";
         if (this._resHInput) this._resHInput.value = height || "";
+        this._updateResMaxHint();
+    }
+
+    // Non-blocking soft warning: the current resolution exceeds the active template's
+    // recommended max-res PIXEL BUDGET (total pixels, orientation-agnostic — same
+    // total-pixel basis as the recommended-tier calc). maxRes never clamps.
+    _updateResMaxHint() {
+        if (!this._resMaxHint) return;
+        const template = this._getActiveTemplate();
+        const maxRes = getMaxRes(template);
+        const { width, height } = this._readResolutionInputs();
+        if (template.id === "free" || !maxRes || !(width > 0 && height > 0)) {
+            this._resMaxHint.style.display = "none";
+            return;
+        }
+        const budget = maxRes[0] * maxRes[1];
+        // Small hidden tolerance (5%): a resolution that only overshoots the budget by a
+        // single divisibility-snap step (e.g. 720→736 at ÷32, the recommended res itself)
+        // must not warn. A genuinely larger tier is far past this.
+        if (width * height <= budget * 1.05) {
+            this._resMaxHint.style.display = "none";
+            return;
+        }
+        this._resMaxHint.title = `${template.name}: above recommended max ${maxRes[0]}×${maxRes[1]} (${budget.toLocaleString()} px budget). Higher resolutions may exceed the model's tested range.`;
+        this._resMaxHint.style.display = "";
     }
 
     _readResolutionInputs() {
@@ -3169,27 +3213,27 @@ export class EditorWidget {
         const template = this._getActiveTemplate();
         if (axis === "h" && height > 0) {
             if (template.id !== "free") {
-                height = Math.round(snapToConstraint(height, template?.constraints?.height));
+                height = Math.round(snapToConstraint(height, getDimensionConstraint(template)));
             }
             width = Math.max(1, Math.round(height * a / b));
             if (template.id !== "free") {
-                width = Math.round(snapToConstraint(width, template?.constraints?.width));
+                width = Math.round(snapToConstraint(width, getDimensionConstraint(template)));
             }
         } else if (width > 0) {
             if (template.id !== "free") {
-                width = Math.round(snapToConstraint(width, template?.constraints?.width));
+                width = Math.round(snapToConstraint(width, getDimensionConstraint(template)));
             }
             height = Math.max(1, Math.round(width * b / a));
             if (template.id !== "free") {
-                height = Math.round(snapToConstraint(height, template?.constraints?.height));
+                height = Math.round(snapToConstraint(height, getDimensionConstraint(template)));
             }
         } else if (height > 0) {
             if (template.id !== "free") {
-                height = Math.round(snapToConstraint(height, template?.constraints?.height));
+                height = Math.round(snapToConstraint(height, getDimensionConstraint(template)));
             }
             width = Math.max(1, Math.round(height * a / b));
             if (template.id !== "free") {
-                width = Math.round(snapToConstraint(width, template?.constraints?.width));
+                width = Math.round(snapToConstraint(width, getDimensionConstraint(template)));
             }
         } else {
             return null;
@@ -3221,14 +3265,56 @@ export class EditorWidget {
         this._templateSelect.value = this._templateId;
     }
 
+    // Resolution tiers offered for a template: the global RESOLUTION_TIERS plus a
+    // template-specific option for any recommended resolution that NO standard tier
+    // approximates (within 5% on the total-pixel / geometric-mean basis). This is how
+    // an unconventional native res (e.g. CogVideoX 1360×768) becomes directly selectable.
+    _templateResolutionTiers(template) {
+        const TOL = 0.05;
+        const tiers = RESOLUTION_TIERS.map((tier) => ({ value: String(tier.c), label: tier.label, c: tier.c }));
+        for (const [w, h] of getRecommendedResolutions(template)) {
+            const c = Math.sqrt(w * h);
+            if (RESOLUTION_TIERS.some((tier) => Math.abs(tier.c - c) / tier.c <= TOL)) continue;
+            const value = String(Math.round(c));
+            if (tiers.some((tier) => tier.value === value)) continue;
+            tiers.push({ value, label: `${w}×${h}`, c });
+        }
+        return tiers;
+    }
+
+    // Tier value (a number matching a tier's option value) to mark with the ★. Stars
+    // the exact template-specific tier when the primary recommended res has no near
+    // standard tier; otherwise the nearest standard tier.
+    _recommendedTierValue(template) {
+        const recommended = getRecommendedResolutions(template);
+        if (!recommended.length) return null;
+        const [w, h] = recommended[0];
+        const c = Math.sqrt(w * h);
+        const TOL = 0.05;
+        let nearest = null;
+        let nearestDiff = Infinity;
+        for (const tier of RESOLUTION_TIERS) {
+            const diff = Math.abs(tier.c - c);
+            if (diff < nearestDiff) {
+                nearest = tier.c;
+                nearestDiff = diff;
+            }
+        }
+        if (nearest != null && nearestDiff / nearest <= TOL) return nearest;
+        return Math.round(c);
+    }
+
     _rebuildResolutionTierOptions(selectedValue = this._resTierSelect?.value || "custom") {
         if (!this._resTierSelect) return;
         const template = this._getActiveTemplate();
+        const tiers = this._templateResolutionTiers(template);
+        const recommendedValue = this._recommendedTierValue(template);
+        const recommendedStr = recommendedValue != null ? String(recommendedValue) : null;
         this._resTierSelect.innerHTML = "";
-        for (const tier of RESOLUTION_TIERS) {
+        for (const tier of tiers) {
             const option = document.createElement("option");
-            option.value = String(tier.c);
-            option.textContent = tier.label + (template.hintTier === tier.c ? " (default)" : "");
+            option.value = tier.value;
+            option.textContent = tier.label + (recommendedStr === tier.value ? " ★" : "");
             this._resTierSelect.appendChild(option);
         }
         const customOption = document.createElement("option");
@@ -3242,29 +3328,64 @@ export class EditorWidget {
 
     _applyTemplateConstraintMetadata() {
         const template = this._getActiveTemplate();
-        const widthConstraint = template?.constraints?.width || null;
-        const heightConstraint = template?.constraints?.height || null;
-        const frameConstraint = template?.constraints?.frames || null;
-        const fpsConstraint = template?.constraints?.fps || null;
+        const dimensionConstraint = getDimensionConstraint(template);
+        const frameConstraint = this._getActiveFrameConstraint();
+        // minDimension / maxRes are SOFT: minDimension is an advisory input floor,
+        // and there is no hard max clamp (maxRes only drives warnings). The input
+        // `max` stays a high sanity bound, not the template ceiling.
+        const minDimension = template?.soft?.minDimension;
         if (this._resWInput) {
-            this._resWInput.step = String(widthConstraint?.step || 1);
-            this._resWInput.min = String(widthConstraint?.min ?? 0);
-            this._resWInput.max = String(widthConstraint?.max ?? 8192);
+            this._resWInput.step = String(dimensionConstraint?.step || 1);
+            this._resWInput.min = String(minDimension ?? 0);
+            this._resWInput.max = "8192";
         }
         if (this._resHInput) {
-            this._resHInput.step = String(heightConstraint?.step || 1);
-            this._resHInput.min = String(heightConstraint?.min ?? 0);
-            this._resHInput.max = String(heightConstraint?.max ?? 8192);
+            this._resHInput.step = String(dimensionConstraint?.step || 1);
+            this._resHInput.min = String(minDimension ?? 0);
+            this._resHInput.max = "8192";
         }
         if (this.durationInput) {
             this.durationInput.step = String(frameConstraint?.step || 1);
-            this.durationInput.min = String(frameConstraint?.min ?? 1);
+            this.durationInput.min = "1";
         }
         if (this._fpsInput) {
-            this._fpsInput.min = String(fpsConstraint?.min ?? 0);
-            this._fpsInput.max = String(fpsConstraint?.max ?? 240);
-            this._fpsInput.step = String(fpsConstraint?.step || 0.001);
+            this._fpsInput.min = "0";
+            this._fpsInput.max = "240";
+            this._fpsInput.step = "0.001";
         }
+        this._rebuildFpsControl();
+        this._updateResMaxHint();
+    }
+
+    // fps is a HARD allow-list: constrained templates expose a discrete <select>
+    // (single value = effectively locked); `free` keeps the free-entry number input.
+    _rebuildFpsControl() {
+        const template = this._getActiveTemplate();
+        const values = getTemplateFpsValues(template);
+        const constrained = template.id !== "free" && values.length > 0;
+        if (this._fpsSelect) {
+            this._fpsSelect.style.display = constrained ? "" : "none";
+            if (constrained) {
+                const current = this._snapSceneFpsToTemplate(this._effectiveFps, template);
+                this._fpsSelect.innerHTML = "";
+                for (const value of values) {
+                    const option = document.createElement("option");
+                    option.value = String(value);
+                    option.textContent = `${value} fps`;
+                    this._fpsSelect.appendChild(option);
+                }
+                this._fpsSelect.value = String(current);
+            }
+        }
+        if (this._fpsInput) {
+            this._fpsInput.style.display = constrained ? "none" : "";
+        }
+    }
+
+    _onTemplateFpsSelected() {
+        const value = Number(this._fpsSelect?.value);
+        if (!Number.isFinite(value) || value <= 0) return;
+        this._updateSceneFps(value);
     }
 
     _updateResolutionInputMode() {
@@ -3317,6 +3438,7 @@ export class EditorWidget {
             this._rebuildTemplateOptions();
             return;
         }
+        const previousFrameConstraint = this._getActiveFrameConstraint();
         this._templateId = nextTemplateId;
         this._rebuildTemplateOptions();
         this._rebuildResolutionTierOptions();
@@ -3336,6 +3458,18 @@ export class EditorWidget {
             await this._recalculateResolution();
         }
         await this._applyActiveTemplateFpsConstraint();
+        // When the frame RULE actually changed (e.g. LTX 8n+1 → Cog 16n+1), the
+        // existing selection sits on the old grid — clear it rather than silently
+        // re-snapping endpoints the user placed. Same-rule switches (wan → hunyuan,
+        // both 4n+1) keep the selection. Context/mask widgets re-snap onto the new
+        // grid via _refreshContextInputs (its documented snap-on-reconcile pass);
+        // the backend re-snap at execute stays authoritative either way.
+        if (!frameConstraintsEqual(previousFrameConstraint, this._getActiveFrameConstraint())) {
+            if (this.selectionEnd > this.selectionStart) {
+                this._clearTimelineSelection();
+            }
+            this._refreshContextInputs();
+        }
         this._updateViewportHeader();
     }
 
@@ -3578,6 +3712,7 @@ export class EditorWidget {
         const selected = end - start;
         if (selected <= 0) {
             this._genReadout.textContent = "Full scene";
+            this._updateGenDurationHint(0);
             return;
         }
         const pre = this._contextFrameValue("pre_context_frames");
@@ -3589,6 +3724,37 @@ export class EditorWidget {
         const mode = this._timecodeMode === "timecode" ? "timecode" : "frames";
         const unit = mode === "timecode" ? "" : "f";
         this._genReadout.textContent = `${formatQueueTime(selected, this._effectiveFps, mode)}${unit} · ${formatQueueTime(source, this._effectiveFps, mode)} src`;
+        this._updateGenDurationHint(selected);
+    }
+
+    // Non-blocking hint: flag when the SELECTION length falls outside the active
+    // template's soft recommended-duration band (evaluated per-selection, not per
+    // scene — a scene may mix multiple generation lengths). Advisory only.
+    _updateGenDurationHint(selectedFrames) {
+        if (!this._genDurationHint) return;
+        const template = this._getActiveTemplate();
+        const band = getRecommendedDurationSec(template);
+        const fps = Number(this._effectiveFps) || 0;
+        const frames = Math.max(0, Math.round(Number(selectedFrames) || 0));
+        if (template.id === "free" || !band || frames <= 0 || fps <= 0) {
+            this._genDurationHint.style.display = "none";
+            return;
+        }
+        const seconds = frames / fps;
+        const epsilon = 1e-6;
+        if (seconds >= band.minSec - epsilon && seconds <= band.maxSec + epsilon) {
+            this._genDurationHint.style.display = "none";
+            return;
+        }
+        const fmt = (value) => (Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2))));
+        const minFrames = Math.max(1, Math.round(band.minSec * fps));
+        const maxFrames = Math.max(minFrames, Math.round(band.maxSec * fps));
+        const secLabel = band.minSec === band.maxSec
+            ? `${fmt(band.minSec)}s`
+            : `${fmt(band.minSec)}–${fmt(band.maxSec)}s`;
+        const frameLabel = minFrames === maxFrames ? `${minFrames} frames` : `${minFrames}–${maxFrames} frames`;
+        this._genDurationHint.title = `${template.name}: recommended ${secLabel} (${frameLabel} at ${fmt(fps)} fps)`;
+        this._genDurationHint.style.display = "";
     }
 
     _readStoredTimelineSelection(scene = this.activeScene, settings = this._settings) {

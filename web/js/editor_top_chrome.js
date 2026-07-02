@@ -325,6 +325,11 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget._resHInput.placeholder = "H";
     widget._resHInput.style.cssText = resolutionInputStyle;
     widget._resHInput.addEventListener("change", () => widget._onResolutionChange("h"));
+    // Non-blocking soft warning when the resolution exceeds the template's max-res
+    // pixel budget; hover reveals the recommended ceiling. maxRes never clamps.
+    widget._resMaxHint = document.createElement("span");
+    widget._resMaxHint.textContent = "⚠";
+    widget._resMaxHint.style.cssText = `font-size:10px; color:${COLORS.warningText}; cursor:help; margin-left:1px; display:none;`;
 
     widget._aspectRatioSelect = document.createElement("select");
     widget._aspectRatioSelect.style.cssText = topSelectCss({ width: "48px", fontSize: "9px", padding: "1px 4px" });
@@ -376,6 +381,12 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
             widget._updateSceneFps(value);
         }
     });
+    // fps is a HARD allow-list: constrained templates swap this number input for a
+    // discrete <select> (single value = effectively locked). `free` keeps the input.
+    widget._fpsSelect = document.createElement("select");
+    widget._fpsSelect.title = "Model frame rate (set by the active template)";
+    widget._fpsSelect.style.cssText = `${topSelectCss({ width: "60px", fontSize: "9px", padding: "1px 4px" })} display:none;`;
+    widget._fpsSelect.addEventListener("change", () => widget._onTemplateFpsSelected());
 
     // Context + Mask sub-group — placed inside the generation-window block by the toolbar.
     widget._ctxMaskGroup = document.createElement("div");
@@ -394,9 +405,9 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     widget._sceneGeometryGroup.style.cssText = "display:flex; align-items:center; align-content:flex-start; justify-content:center; gap:6px; row-gap:4px; flex-wrap:wrap-reverse; min-width:0; max-width:100%; flex:0 0.5 720px; margin-bottom:3px;";
     widget._sceneGeometryGroup.append(
         makeInlineGroup(widget._durLabel, widget.durationInput),
-        makeInlineGroup(resLabel, widget._resWInput, xLabel, widget._resHInput),
+        makeInlineGroup(resLabel, widget._resWInput, xLabel, widget._resHInput, widget._resMaxHint),
         widget._aspectRatioSelect, widget._resTierSelect, widget._templateSelect,
-        makeInlineGroup(fpsLabel, widget._fpsInput)
+        makeInlineGroup(fpsLabel, widget._fpsInput, widget._fpsSelect)
     );
 }
 
@@ -586,6 +597,11 @@ export function buildEditorToolbar(widget) {
     genLabel.textContent = "Gen";
     widget._genReadout = document.createElement("span");
     widget._genReadout.style.cssText = `font-size:9px; color:${THEME.accentHi}; white-space:nowrap; border-left:1px solid ${THEME.accentLo}; padding-left:7px; margin-left:3px; min-width:64px; box-sizing:border-box;`;
+    // Non-blocking soft-duration warning: shown when the selection length falls
+    // outside the active template's recommended band; hover reveals the range.
+    widget._genDurationHint = document.createElement("span");
+    widget._genDurationHint.textContent = "⚠";
+    widget._genDurationHint.style.cssText = `font-size:10px; color:${COLORS.warningText}; cursor:help; margin-left:1px; display:none;`;
     widget._genWindowGroup = document.createElement("div");
     widget._genWindowGroup.style.cssText = `display:flex; align-items:center; gap:4px 5px; flex-wrap:wrap; min-width:0; max-width:100%; flex:0 1 auto; box-sizing:border-box; border:1px solid ${THEME.accentLo}; border-radius:7px; padding:3px 9px;`;
     widget._genWindowGroup.append(
@@ -595,7 +611,7 @@ export function buildEditorToolbar(widget) {
         makeInlineGroup(inLabel, widget._selectionStartInput, makeStepButtons("Selection in-point", (direction) => widget._stepSelectionInput("start", direction))),
         makeInlineGroup(outLabel, widget._selectionEndInput, makeStepButtons("Selection out-point", (direction) => widget._stepSelectionInput("end", direction))),
         clearSelBtn, widget._bookmarkBtn,
-        widget._ctxMaskGroup, widget._genReadout
+        widget._ctxMaskGroup, widget._genReadout, widget._genDurationHint
     );
 
     // Four side-by-side flex groups (the toolbar container is nowrap, so they never stack):
