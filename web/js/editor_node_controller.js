@@ -2266,7 +2266,8 @@ export class EditorNodeController {
 
         try {
             if (syncAssets) {
-                const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets`), {
+                const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/sync`), {
+                    method: "POST",
                     signal: aborter.signal,
                 });
                 if (!resp.ok) {

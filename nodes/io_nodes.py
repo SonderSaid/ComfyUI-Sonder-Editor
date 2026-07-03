@@ -20,6 +20,19 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server.project_manager import load_project, save_project
+from ..server.path_security import (
+    PathSecurityError,
+    log_path_quarantine,
+    normalize_project_relative_path,
+    path_within,
+    project_bridge_path,
+    project_bridge_root,
+    project_cache_path,
+    project_media_path,
+    project_media_root,
+    resolve_under_root,
+    safe_route_token,
+)
 from ..server.project_commit import (
     _copy_generated_asset_registration,
     _same_path_placeholder_can_upgrade,
@@ -310,9 +323,42 @@ def _mark_queue_job_completed(project, queue_job_id: str, result_asset_id: str) 
     return True
 
 
-def _bridge_root_for_project(project_dir: str) -> str:
-    return os.path.join(project_dir, "cache", "bridge_out")
+def _require_project_media_root(project) -> str:
+    media_dir = project_media_root(project)
+    if not media_dir:
+        raise ValueError("Invalid project media directory")
+    os.makedirs(media_dir, exist_ok=True)
+    return media_dir
 
+
+def _project_media_file(project, filename: str, *, purpose: str) -> tuple[str, str]:
+    rel_path = os.path.join("media", filename)
+    abs_path = project_media_path(project, filename, purpose=purpose)
+    if not abs_path:
+        raise ValueError(f"Invalid {purpose}")
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    return rel_path, abs_path
+
+
+def _project_thumbnail_path(project, asset_id: str, *, purpose: str = "generated thumbnail path") -> str:
+    try:
+        safe_id = safe_route_token(asset_id, "asset id")
+    except PathSecurityError as exc:
+        log_path_quarantine(
+            purpose=purpose,
+            path=str(asset_id or ""),
+            root=getattr(project, "project_dir", "") or "",
+            reason=str(exc),
+        )
+        return ""
+    thumb_path = project_cache_path(
+        project,
+        os.path.join("thumbnails", f"{safe_id}.png"),
+        purpose=purpose,
+    )
+    if thumb_path:
+        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+    return thumb_path
 
 _BRIDGE_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -322,6 +368,29 @@ def _sanitize_bridge_component(value: str) -> str:
     while "__" in replaced:
         replaced = replaced.replace("__", "_")
     return replaced.strip("_")
+
+
+def _safe_output_stem(value: str, fallback: str = "output") -> str:
+    return (_sanitize_bridge_component(value) or fallback)[:120]
+
+
+def _safe_bridge_dir_name(prompt_key: str, bridge_node_id: str) -> str:
+    prompt_part = _safe_output_stem(prompt_key, "prompt")
+    node_part = _safe_output_stem(bridge_node_id, "bridge")
+    try:
+        return safe_route_token(f"{prompt_part}_{node_part}", "bridge directory")
+    except PathSecurityError:
+        return f"prompt_{uuid.uuid4().hex[:8]}_bridge"
+
+
+def _safe_extension_from_filename(filename: str) -> str:
+    _stem, ext = os.path.splitext(os.path.basename(str(filename or "")))
+    if not ext:
+        return ""
+    ext = re.sub(r"[^A-Za-z0-9.]+", "_", ext)
+    if ext in {"", "."}:
+        return ""
+    return ext[:32]
 
 
 def _build_bridge_naming_stem(project, context: dict, prefix: str) -> str:
@@ -340,17 +409,30 @@ def _build_bridge_naming_stem(project, context: dict, prefix: str) -> str:
 
 
 def _safe_bridge_relpath(path: str, root: str) -> str:
-    return os.path.relpath(path, root).replace("\\", "/")
+    rel_path = os.path.relpath(os.path.realpath(path), os.path.realpath(root)).replace("\\", "/")
+    return normalize_project_relative_path(rel_path)
 
 
 def _write_bridge_sidecar(bridge_dir: str, existed: list[str]) -> None:
-    sidecar_path = os.path.join(bridge_dir, BRIDGE_SCAN_SIDECAR)
+    sidecar_path = resolve_under_root(
+        bridge_dir,
+        BRIDGE_SCAN_SIDECAR,
+        purpose="bridge scan sidecar",
+    )
+    if not sidecar_path:
+        raise ValueError("Invalid bridge sidecar path")
     with open(sidecar_path, "w", encoding="utf-8") as handle:
         json.dump({"existed": sorted(set(existed))}, handle, indent=2)
 
 
 def _read_bridge_sidecar(bridge_dir: str) -> set[str]:
-    sidecar_path = os.path.join(bridge_dir, BRIDGE_SCAN_SIDECAR)
+    sidecar_path = resolve_under_root(
+        bridge_dir,
+        BRIDGE_SCAN_SIDECAR,
+        purpose="bridge scan sidecar",
+        must_exist=True,
+        log=False,
+    )
     if not os.path.isfile(sidecar_path):
         return set()
     try:
@@ -368,10 +450,62 @@ def _read_bridge_sidecar(bridge_dir: str) -> set[str]:
 
 def _list_bridge_files(bridge_dir: str) -> list[str]:
     results = []
-    for root, _dirs, files in os.walk(bridge_dir):
+    bridge_real = os.path.realpath(str(bridge_dir or ""))
+    if not os.path.isdir(bridge_real):
+        return results
+    for root, dirs, files in os.walk(bridge_real):
+        kept_dirs = []
+        for dirname in dirs:
+            dir_path = os.path.join(root, dirname)
+            try:
+                if os.path.islink(dir_path):
+                    log_path_quarantine(
+                        purpose="bridge output scan",
+                        path=dir_path,
+                        root=bridge_real,
+                        reason="symlink directory skipped",
+                    )
+                    continue
+                if not path_within(bridge_real, dir_path):
+                    log_path_quarantine(
+                        purpose="bridge output scan",
+                        path=dir_path,
+                        root=bridge_real,
+                        reason="directory escapes bridge root",
+                    )
+                    continue
+            except OSError:
+                continue
+            kept_dirs.append(dirname)
+        dirs[:] = kept_dirs
         for filename in files:
             full_path = os.path.join(root, filename)
-            rel_path = _safe_bridge_relpath(full_path, bridge_dir).strip("/")
+            try:
+                if os.path.islink(full_path) or not os.path.isfile(full_path):
+                    log_path_quarantine(
+                        purpose="bridge output scan",
+                        path=full_path,
+                        root=bridge_real,
+                        reason="non-regular file skipped",
+                    )
+                    continue
+                if not path_within(bridge_real, full_path):
+                    log_path_quarantine(
+                        purpose="bridge output scan",
+                        path=full_path,
+                        root=bridge_real,
+                        reason="file escapes bridge root",
+                    )
+                    continue
+                rel_path = _safe_bridge_relpath(full_path, bridge_real).strip("/")
+            except (OSError, PathSecurityError) as exc:
+                log_path_quarantine(
+                    purpose="bridge output scan",
+                    path=full_path,
+                    root=bridge_real,
+                    reason=str(exc),
+                )
+                continue
             if rel_path == BRIDGE_SCAN_SIDECAR:
                 continue
             results.append(rel_path)
@@ -379,31 +513,41 @@ def _list_bridge_files(bridge_dir: str) -> list[str]:
 
 
 def _latest_bridge_change_time(bridge_dir: str) -> float:
-    latest = os.path.getmtime(bridge_dir) if os.path.isdir(bridge_dir) else 0.0
-    for root, dirs, files in os.walk(bridge_dir):
+    bridge_real = os.path.realpath(str(bridge_dir or ""))
+    latest = os.path.getmtime(bridge_real) if os.path.isdir(bridge_real) else 0.0
+    for root, dirs, files in os.walk(bridge_real):
         for name in [*dirs, *files]:
+            path = os.path.join(root, name)
             try:
-                latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+                if os.path.islink(path) or not path_within(bridge_real, path):
+                    continue
+                latest = max(latest, os.path.getmtime(path))
             except OSError:
                 continue
     return latest
 
 
 def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
-    bridge_root = os.path.abspath(_bridge_root_for_project(project_dir))
+    bridge_root = project_bridge_root(project_dir, must_exist=True)
     if not os.path.isdir(bridge_root):
         return
     cutoff = time.time() - BRIDGE_STALE_DIR_TTL_SEC
     for entry in os.scandir(bridge_root):
-        if not entry.is_dir():
+        if not entry.is_dir(follow_symlinks=False):
             continue
         try:
             if entry.stat().st_mtime >= cutoff:
                 continue
         except OSError:
             continue
-        target = os.path.abspath(entry.path)
-        if not target.startswith(bridge_root + os.sep):
+        target = os.path.realpath(entry.path)
+        if not path_within(bridge_root, target):
+            log_path_quarantine(
+                purpose="stale bridge cleanup",
+                path=entry.path,
+                root=bridge_root,
+                reason="entry escapes bridge root",
+            )
             continue
         recovered_stem = f"bridge_recovered_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         orphan_entry = {
@@ -424,15 +568,36 @@ def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
             _finalize_bridge_entry(orphan_entry)
         except Exception:
             logger.exception("Failed to adopt stale bridge dir %s", target)
-            shutil.rmtree(target, ignore_errors=True)
+            if path_within(bridge_root, target):
+                shutil.rmtree(target, ignore_errors=True)
 
 
 def _build_bridge_output_paths(project, prompt_key: str, bridge_node_id: str, naming_stem: str) -> tuple[str, str]:
-    bridge_dir = os.path.join(_bridge_root_for_project(project.project_dir), f"{prompt_key}_{bridge_node_id}")
-    output_root = folder_paths.get_output_directory()
-    relative_dir = os.path.relpath(bridge_dir, output_root).replace("\\", "/")
-    stem = (naming_stem or "").strip() or "out"
-    filename_prefix = f"{relative_dir}/{stem}"
+    bridge_name = _safe_bridge_dir_name(prompt_key, bridge_node_id)
+    bridge_dir = project_bridge_path(project, bridge_name, purpose="bridge output directory")
+    if not bridge_dir:
+        raise ValueError("Invalid bridge output directory")
+    import folder_paths as current_folder_paths
+
+    bridge_real = os.path.realpath(bridge_dir)
+    stem = _safe_output_stem(naming_stem, "out")
+    filename_prefix = ""
+    output_root_raw = str(current_folder_paths.get_output_directory() or "")
+    if output_root_raw:
+        output_root = os.path.realpath(output_root_raw)
+        if path_within(output_root, bridge_real):
+            relative_dir = os.path.relpath(bridge_real, output_root).replace("\\", "/")
+            try:
+                relative_dir = normalize_project_relative_path(relative_dir)
+            except PathSecurityError as exc:
+                raise ValueError(f"Invalid bridge output prefix: {exc}") from exc
+            filename_prefix = f"{relative_dir}/{stem}"
+        else:
+            logger.warning(
+                "Bridge output directory %s is outside ComfyUI output root %s; native filename_prefix disabled",
+                bridge_real,
+                output_root,
+            )
     return bridge_dir, filename_prefix
 
 
@@ -449,7 +614,7 @@ def _bridge_unique_media_name(media_dir: str, basename: str) -> str:
     stem, ext = os.path.splitext(basename)
     candidate = basename
     suffix = 1
-    while os.path.exists(os.path.join(media_dir, candidate)):
+    while os.path.lexists(os.path.join(media_dir, candidate)):
         candidate = f"{stem}_{suffix}{ext}"
         suffix += 1
     return candidate
@@ -459,7 +624,7 @@ def _unique_media_subfolder(media_dir: str, folder_name: str) -> str:
     stem = _sanitize_bridge_component(folder_name) or "output"
     candidate = stem
     suffix = 1
-    while os.path.exists(os.path.join(media_dir, candidate)):
+    while os.path.lexists(os.path.join(media_dir, candidate)):
         candidate = f"{stem}_{suffix}"
         suffix += 1
     return candidate
@@ -469,8 +634,9 @@ def _save_image_asset_thumbnail(project, asset: Asset, filepath: str) -> None:
     try:
         from ..server.thumbnail_service import ensure_thumbnail
 
-        thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
-        ensure_thumbnail("image", filepath, thumb_path)
+        thumb_path = _project_thumbnail_path(project, asset.asset_id, purpose="image asset thumbnail path")
+        if thumb_path:
+            ensure_thumbnail("image", filepath, thumb_path)
     except Exception as exc:
         logger.warning("Failed to generate image thumbnail for %s: %s", filepath, exc)
 
@@ -482,21 +648,20 @@ def _save_custom_png_sequence(
     metadata: dict,
     file_metadata: dict[str, str] | None = None,
 ) -> tuple[str, list[Asset]]:
-    media_dir = os.path.join(project.project_dir, "media")
-    os.makedirs(media_dir, exist_ok=True)
-    stem = _sanitize_bridge_component(filename_prefix) or "output"
+    media_dir = _require_project_media_root(project)
+    stem = _safe_output_stem(filename_prefix, "output")
     frame_count, h, w = rgb_frames.shape[:3]
     compression = int(metadata.get("custom_png_compression", 0) or 0)
     assets: list[Asset] = []
 
     if frame_count == 1:
         filename = _bridge_unique_media_name(media_dir, f"{stem}.png")
-        filepath = os.path.join(media_dir, filename)
+        rel_path, filepath = _project_media_file(project, filename, purpose="custom PNG output path")
         write_png(filepath, rgb_frames[0], compression=compression, metadata=file_metadata)
         asset = Asset(
             name=filename,
             asset_type="image",
-            path=os.path.join("media", filename),
+            path=rel_path,
             width=w,
             height=h,
             frame_count=1,
@@ -512,13 +677,18 @@ def _save_custom_png_sequence(
         return filepath, [asset]
 
     folder_name = _unique_media_subfolder(media_dir, stem)
-    folder_path = os.path.join(media_dir, folder_name)
+    folder_path = project_media_path(project, folder_name, purpose="custom PNG sequence folder")
+    if not folder_path:
+        raise ValueError("Invalid custom PNG sequence folder")
     os.makedirs(folder_path, exist_ok=True)
     _ensure_asset_folder_metadata(project, folder_name)
 
     for idx, frame in enumerate(rgb_frames, start=1):
         filename = f"{stem}_{idx:04d}.png"
-        filepath = os.path.join(folder_path, filename)
+        rel_path = os.path.join("media", folder_name, filename)
+        filepath = project_media_path(project, os.path.join(folder_name, filename), purpose="custom PNG sequence frame")
+        if not filepath:
+            raise ValueError("Invalid custom PNG sequence frame path")
         write_png(filepath, frame, compression=compression, metadata=file_metadata if idx == 1 else None)
         frame_metadata = dict(metadata)
         editor_export = frame_metadata.get("editor_export")
@@ -530,7 +700,7 @@ def _save_custom_png_sequence(
         asset = Asset(
             name=filename,
             asset_type="image",
-            path=os.path.join("media", folder_name, filename),
+            path=rel_path,
             width=w,
             height=h,
             frame_count=1,
@@ -779,9 +949,28 @@ def _cleanup_prompt_key_state(prompt_key: str) -> None:
             _BRIDGE_PROMPT_KEY_BY_OBJECT_ID.pop(object_id, None)
 
 
-def _cleanup_bridge_output_dir(bridge_dir: str) -> None:
-    if os.path.isdir(bridge_dir):
-        shutil.rmtree(bridge_dir, ignore_errors=True)
+def _validated_bridge_dir(project, bridge_dir: str, *, must_exist: bool = True) -> str:
+    root = project_bridge_root(project, must_exist=must_exist)
+    if not root:
+        return ""
+    target = os.path.realpath(str(bridge_dir or ""))
+    if not target or not path_within(root, target):
+        log_path_quarantine(
+            purpose="bridge output directory",
+            path=str(bridge_dir or ""),
+            root=root,
+            reason="entry escapes bridge root",
+        )
+        return ""
+    if must_exist and not os.path.isdir(target):
+        return ""
+    return target
+
+
+def _cleanup_bridge_output_dir(project, bridge_dir: str) -> None:
+    target = _validated_bridge_dir(project, bridge_dir, must_exist=True)
+    if target and os.path.isdir(target):
+        shutil.rmtree(target, ignore_errors=True)
 
 
 def _normalize_asset_path_for_compare(path: str) -> str:
@@ -807,8 +996,10 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     _pre_item_ids = snapshot_item_ids(project)
     queue_job_id = str(entry.get("queue_job_id") or "")
     target_folder = _normalize_asset_folder(entry.get("target_folder", ""))
-    bridge_dir = entry["bridge_dir"]
-    naming_stem = str(entry.get("naming_stem") or "").strip() or "bridge_out"
+    bridge_dir = _validated_bridge_dir(project, entry.get("bridge_dir", ""), must_exist=True)
+    if not bridge_dir:
+        raise ValueError("Invalid bridge output directory")
+    naming_stem = _safe_output_stem(entry.get("naming_stem") or "", "bridge_out")
 
     existed = _read_bridge_sidecar(bridge_dir)
     new_files = sorted(
@@ -818,8 +1009,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     )
 
     registered_assets = []
-    media_dir = os.path.join(project.project_dir, "media")
-    os.makedirs(media_dir, exist_ok=True)
+    media_dir = _require_project_media_root(project)
 
     counter = 0
     planned_final_names = set()
@@ -840,33 +1030,106 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
                 return final_name
             suffix += 1
 
+    def _move_bridge_output_file(pending: dict) -> str:
+        source_path = resolve_under_root(
+            bridge_dir,
+            pending["rel_path"],
+            purpose="bridge output source file",
+            must_exist=True,
+        )
+        final_path = pending["final_path"]
+        if (
+            not source_path
+            or os.path.islink(source_path)
+            or not os.path.isfile(source_path)
+            or not path_within(bridge_dir, source_path)
+            or not path_within(media_dir, os.path.dirname(final_path))
+            or os.path.lexists(final_path)
+        ):
+            log_path_quarantine(
+                purpose="bridge finalized move",
+                path=str(pending.get("source_path") or ""),
+                root=bridge_dir,
+                reason="source or destination failed final containment check",
+            )
+            return ""
+        try:
+            shutil.move(source_path, final_path)
+        except OSError as exc:
+            log_path_quarantine(
+                purpose="bridge finalized move",
+                path=str(source_path or ""),
+                root=bridge_dir,
+                reason=f"move failed: {exc}",
+            )
+            return ""
+        if os.path.islink(final_path) or not os.path.isfile(final_path) or not path_within(media_dir, final_path):
+            log_path_quarantine(
+                purpose="bridge finalized move",
+                path=str(final_path or ""),
+                root=media_dir,
+                reason="moved output failed media containment check",
+            )
+            try:
+                if path_within(media_dir, os.path.dirname(final_path)) and os.path.lexists(final_path):
+                    os.unlink(final_path)
+            except OSError:
+                logger.warning("Failed to remove rejected bridge output %s", final_path)
+            return ""
+        return final_path
+
     for rel_path in new_files:
-        source_path = os.path.join(bridge_dir, rel_path)
-        if not os.path.isfile(source_path):
+        source_path = resolve_under_root(
+            bridge_dir,
+            rel_path,
+            purpose="bridge output source file",
+            must_exist=True,
+        )
+        if not source_path or os.path.islink(source_path) or not os.path.isfile(source_path):
             continue
 
         counter += 1
         source_basename = os.path.basename(source_path)
-        _stem_part, ext = os.path.splitext(source_basename)
+        ext = _safe_extension_from_filename(source_basename)
         target_basename = f"{naming_stem}_{counter:04d}{ext}"
         final_name = _reserve_final_name(target_basename)
-        final_path = os.path.join(media_dir, final_name)
+        final_rel_path, final_path = _project_media_file(project, final_name, purpose="bridge finalized media path")
 
-        asset_type, artifact_kind = classify_asset_path(final_path)
+        pending_moves.append({
+            "final_name": final_name,
+            "final_rel_path": final_rel_path,
+            "source_path": source_path,
+            "source_basename": source_basename,
+            "final_path": final_path,
+            "rel_path": rel_path,
+        })
+
+    completed_moves = []
+    for pending in pending_moves:
+        moved_path = _move_bridge_output_file(pending)
+        if not moved_path:
+            continue
+        pending["final_path"] = moved_path
+        asset_type, artifact_kind = classify_asset_path(moved_path)
         try:
-            metadata = _extract_bridge_asset_metadata(source_path, asset_type)
+            metadata = _extract_bridge_asset_metadata(moved_path, asset_type)
         except MediaProbeError as exc:
-            logger.warning("Skipping unprobeable bridge media output %s: %s", source_basename, exc)
+            logger.warning("Skipping unprobeable bridge media output %s: %s", pending["source_basename"], exc)
+            try:
+                if path_within(media_dir, moved_path) and os.path.isfile(moved_path):
+                    os.remove(moved_path)
+            except OSError:
+                logger.warning("Failed to remove unregistered bridge output %s", moved_path)
             continue
         generation_params = _generation_params_with_detected_workflow(
             dict(entry.get("generation_params") or {}),
-            source_path,
+            moved_path,
         )
         asset = Asset(
-            name=final_name,
+            name=pending["final_name"],
             asset_type=asset_type,
             artifact_kind=artifact_kind,
-            path=os.path.join("media", final_name),
+            path=pending["final_rel_path"],
             prompt=str(entry.get("prompt_text") or ""),
             generation_params=generation_params,
             width=metadata["width"],
@@ -881,13 +1144,10 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         asset, upgraded_placeholder = _upgrade_bridge_placeholder_asset(project, asset)
         if not upgraded_placeholder:
             project.add_asset(asset)
-        pending_moves.append({
-            "asset": asset,
-            "asset_type": asset_type,
-            "source_path": source_path,
-            "final_path": final_path,
-        })
-        registered_assets.append((rel_path, asset))
+        pending["asset"] = asset
+        pending["asset_type"] = asset_type
+        registered_assets.append((pending["rel_path"], asset))
+        completed_moves.append(pending)
 
     changed = bool(registered_assets)
     if target_folder and registered_assets:
@@ -917,14 +1177,14 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     if changed:
         committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
         asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) if committed_project is not None else {}
-        for pending in pending_moves:
-            shutil.move(pending["source_path"], pending["final_path"])
+        for pending in completed_moves:
             if pending["asset_type"] in {"video", "image", "audio"}:
                 from ..server.thumbnail_service import ensure_thumbnail
                 asset = pending["asset"]
                 committed_asset_id = asset_id_remap.get(asset.asset_id, asset.asset_id)
-                thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{committed_asset_id}.png")
-                ensure_thumbnail(pending["asset_type"], pending["final_path"], thumb_path)
+                thumb_path = _project_thumbnail_path(project, committed_asset_id, purpose="bridge asset thumbnail path")
+                if thumb_path:
+                    ensure_thumbnail(pending["asset_type"], pending["final_path"], thumb_path)
 
     logger.info(
         "Bridge finalize: prompt=%s node=%s moved=%d target_folder=%s stem=%s",
@@ -935,7 +1195,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         naming_stem,
     )
 
-    _cleanup_bridge_output_dir(bridge_dir)
+    _cleanup_bridge_output_dir(project, bridge_dir)
     return [asset for _rel_path, asset in registered_assets]
 
 
@@ -1132,8 +1392,7 @@ class SonderSaveVideo:
                     extra_pnginfo=None,
                     unique_id=None):
         # Save to media/ so it appears in the project's asset gallery
-        media_dir = os.path.join(project.project_dir, "media")
-        os.makedirs(media_dir, exist_ok=True)
+        media_dir = _require_project_media_root(project)
         # Baseline for the created-set hand-off: anything added to `project` below
         # is "generated this run". Pre-existing generated items the user deletes
         # mid-generation stay deleted (not resurrected) by the conflict-path merge.
@@ -1155,8 +1414,9 @@ class SonderSaveVideo:
         if preset_id == CUSTOM_SAVE_VIDEO_PRESET and custom_spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE and mode == "Take":
             raise ValueError("Custom PNG Sequence export is not available in Take mode. Choose Video mode or a video preset.")
         extension = output_extension_for_custom_options(custom_options) if custom_spec else output_extension_for_preset(preset_id)
-        output_filename = f"{filename_prefix}_{uuid.uuid4().hex[:6]}{extension}"
-        output_path = os.path.join(media_dir, output_filename)
+        safe_prefix = _safe_output_stem(filename_prefix, "output")
+        output_filename = f"{safe_prefix}_{uuid.uuid4().hex[:6]}{extension}"
+        output_rel_path, output_path = _project_media_file(project, output_filename, purpose="save video output path")
 
         tensor_mode = custom_spec["tensor_mode"] if custom_spec else tensor_mode_for_preset(preset_id)
         rgb_frames = tensor_to_uint8_frames(frames, mode=tensor_mode)
@@ -1196,7 +1456,7 @@ class SonderSaveVideo:
             output_path, png_assets = _save_custom_png_sequence(
                 project,
                 rgb_frames,
-                filename_prefix,
+                safe_prefix,
                 asset_metadata,
                 file_metadata=file_metadata,
             )
@@ -1293,7 +1553,7 @@ class SonderSaveVideo:
         asset = Asset(
             name=output_filename,
             asset_type="video",
-            path=os.path.join("media", output_filename),
+            path=output_rel_path,
             width=w,
             height=h,
             frame_count=total_frames,
@@ -1306,11 +1566,9 @@ class SonderSaveVideo:
 
         # Generate thumbnail
         from ..server.thumbnail_service import ensure_thumbnail
-        thumb_path = os.path.join(
-            project.project_dir, "cache", "thumbnails",
-            f"{asset.asset_id}.png"
-        )
-        ensure_thumbnail("video", output_path, thumb_path)
+        thumb_path = _project_thumbnail_path(project, asset.asset_id, purpose="save video thumbnail path")
+        if thumb_path:
+            ensure_thumbnail("video", output_path, thumb_path)
 
         # --- Take mode: auto-place on timeline ---
         if mode == "Take" and hasattr(project, '_execution_context') and project._execution_context:
@@ -1395,7 +1653,7 @@ class SonderSaveVideo:
                     clip_total_source_frames = max(0, total_frames - frame_count_padding)
 
                 clip = ClipReference(
-                    source_path=os.path.join("media", output_filename),
+                    source_path=output_rel_path,
                     timeline_start_frame=timeline_start_frame,
                     timeline_end_frame=timeline_end_frame,
                     source_in_frame=source_in_frame,
@@ -1412,8 +1670,7 @@ class SonderSaveVideo:
                 placed_audio_track = None
                 if place_audio_on_timeline and has_audio and audio is not None:
                     audio_filename = f"{os.path.splitext(output_filename)[0]}_audio.wav"
-                    audio_rel_path = os.path.join("media", audio_filename)
-                    audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
+                    audio_rel_path, audio_abs_path = _project_media_file(project, audio_filename, purpose="take audio output path")
                     try:
                         sample_rate, waveform = _save_audio_waveform(audio, audio_abs_path)
                         audio_duration_sec = waveform.shape[-1] / sample_rate if sample_rate > 0 else 0.0
@@ -1428,11 +1685,9 @@ class SonderSaveVideo:
                         )
                         project.add_asset(audio_asset)
 
-                        audio_thumb_path = os.path.join(
-                            project.project_dir, "cache", "thumbnails",
-                            f"{audio_asset.asset_id}.png"
-                        )
-                        ensure_thumbnail("audio", audio_abs_path, audio_thumb_path)
+                        audio_thumb_path = _project_thumbnail_path(project, audio_asset.asset_id, purpose="take audio thumbnail path")
+                        if audio_thumb_path:
+                            ensure_thumbnail("audio", audio_abs_path, audio_thumb_path)
 
                         existing_audio_lanes = [track.lane_index for track in scene.audio_tracks] if scene.audio_tracks else [-1]
                         new_audio_lane = max(existing_audio_lanes) + 1

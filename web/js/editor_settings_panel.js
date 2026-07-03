@@ -591,10 +591,13 @@ function showSettingsPanel() {
             const nameWrap = document.createElement("div");
             const isOverriddenBuiltin = template.builtIn && !!this._settings.modelTemplates?.builtinOverrides?.[template.id];
             const badge = template.builtIn ? (isOverriddenBuiltin ? "Built-in (edited)" : "Built-in") : "Custom";
-            nameWrap.innerHTML = `
-                <div style="font-size:11px;font-weight:700;color:${COLORS.text};">${template.name}</div>
-                <div style="font-size:10px;color:${COLORS.textMuted};">${badge}${template.id === this._templateId ? " &bull; Active Project Template" : ""}</div>
-            `;
+            const nameEl = document.createElement("div");
+            nameEl.style.cssText = `font-size:11px;font-weight:700;color:${COLORS.text};`;
+            nameEl.textContent = template.name;
+            const badgeEl = document.createElement("div");
+            badgeEl.style.cssText = `font-size:10px;color:${COLORS.textMuted};`;
+            badgeEl.textContent = `${badge}${template.id === this._templateId ? " • Active Project Template" : ""}`;
+            nameWrap.append(nameEl, badgeEl);
             head.appendChild(nameWrap);
 
             // `free` is the no-op template — no edit/reset. Built-ins are editable

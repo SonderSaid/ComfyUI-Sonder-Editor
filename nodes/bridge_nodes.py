@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover - tests stub these via importorskip
         return isinstance(value[0], str) and isinstance(value[1], (int, float))
 
 from ..server.media_helpers import decode_video_frame, fit_frame_to_canvas
+from ..server.path_security import resolve_existing_project_path
 from ..server.timeline_state import GuideFrame
 
 logger = logging.getLogger(__name__)
@@ -213,7 +214,11 @@ def _filtered_guides(project):
         asset = project.get_asset(getattr(guide, "asset_id", ""))
         if asset is None:
             continue
-        asset_path = os.path.join(project.project_dir, asset.path)
+        asset_path = resolve_existing_project_path(
+            project,
+            asset.path,
+            purpose=f"bridge guide asset {getattr(asset, 'asset_id', '') or '(unknown)'}",
+        )
         if not os.path.isfile(asset_path):
             continue
         out.append({

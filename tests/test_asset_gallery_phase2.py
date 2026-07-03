@@ -387,9 +387,15 @@ def test_sync_media_folder_skips_new_unprobeable_media(tmp_path, monkeypatch):
 def test_import_rejects_unprobeable_media_and_removes_copy(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project = _make_project(tmp_path)
-    source_path = tmp_path / "source.mp3"
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    source_path = input_dir / "source.mp3"
     source_path.write_bytes(b"not-media")
     save_calls = []
+    monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(
+        get_input_directory=lambda: str(input_dir),
+        get_output_directory=lambda: str(tmp_path / "output"),
+    ))
 
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project", lambda saved_project: save_calls.append(saved_project))
@@ -400,7 +406,7 @@ def test_import_rejects_unprobeable_media_and_removes_copy(tmp_path, monkeypatch
     monkeypatch.setattr(route_module, "_extract_asset_media_metadata", fail_probe)
 
     handler = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/assets/import")
-    response = asyncio.run(handler(DummyRequest(body={"source_path": str(source_path)})))
+    response = asyncio.run(handler(DummyRequest(body={"source_path": "source.mp3"})))
     payload = _response_json(response)
 
     assert response.status == 400
@@ -702,8 +708,14 @@ def test_replace_project_asset_updates_references_when_path_changes(tmp_path, mo
     media_dir = tmp_path / "project" / "media"
     old_path = media_dir / "clip.mp4"
     old_path.write_bytes(b"old")
-    replacement_source = tmp_path / "replacement.mov"
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    replacement_source = input_dir / "replacement.mov"
     replacement_source.write_bytes(b"new")
+    monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(
+        get_input_directory=lambda: str(input_dir),
+        get_output_directory=lambda: str(tmp_path / "output"),
+    ))
 
     asset = Asset(asset_id="asset-1", asset_type="video", path="media/clip.mp4", name="clip.mp4")
     scene = Scene(scene_id="scene-1", name="Opening", order=1)
@@ -725,7 +737,7 @@ def test_replace_project_asset_updates_references_when_path_changes(tmp_path, mo
         },
     )
 
-    updated = routes._replace_project_asset(project, asset, str(replacement_source))
+    updated = routes._replace_project_asset(project, asset, "replacement.mov")
     normalized_path = updated.path.replace("\\", "/")
 
     assert normalized_path.startswith("media/")
@@ -1151,7 +1163,35 @@ def test_trash_purge_honors_retention_days_and_decimal_mb_cap(tmp_path):
     assert os.path.exists(recent_newest_path)
 
 
-def test_asset_list_route_forwards_trash_retention_query_params(tmp_path, monkeypatch):
+def test_asset_list_route_is_read_only_and_does_not_sync(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    called = []
+    load_repair_flags = []
+
+    def fake_sync(*_args, **_kwargs):
+        called.append(True)
+        return project
+
+    def fake_load(_request, *, repair_missing_frames=True):
+        load_repair_flags.append(repair_missing_frames)
+        return project
+
+    monkeypatch.setattr(module, "_load_project_from_request", fake_load)
+    monkeypatch.setattr(module, "_sync_media_folder_versioned", fake_sync)
+
+    request = DummyRequest(
+        match_info={"project_id": "phase-2"},
+        query={"include_trashed": "true", "retention_days": "7", "max_size_mb": "1.5"},
+    )
+    response = asyncio.run(module.api_list_assets(request))
+
+    assert response.status == 200
+    assert load_repair_flags == [False]
+    assert called == []
+
+
+def test_asset_sync_route_forwards_trash_retention_query_params(tmp_path, monkeypatch):
     module = _load_route_module(monkeypatch)
     project = _make_project(tmp_path)
     captured = {}
@@ -1166,11 +1206,12 @@ def test_asset_list_route_forwards_trash_retention_query_params(tmp_path, monkey
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(module, "_sync_media_folder", fake_sync)
 
+    handler = _route_handler(module, "POST", "/sonder-editor/project/{project_id}/assets/sync")
     request = DummyRequest(
         match_info={"project_id": "phase-2"},
         query={"include_trashed": "true", "retention_days": "7", "max_size_mb": "1.5"},
     )
-    response = asyncio.run(module.api_list_assets(request))
+    response = asyncio.run(handler(request))
 
     assert response.status == 200
     assert captured == {

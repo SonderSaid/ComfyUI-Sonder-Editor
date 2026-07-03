@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -73,15 +74,21 @@ def test_summary_counts_include_artifacts():
     }
 
 
-def test_replace_artifact_updates_artifact_kind():
+def test_replace_artifact_updates_artifact_kind(monkeypatch):
     with tempfile.TemporaryDirectory() as base_dir:
         project = create_project("Artifact Replace", base_dir=base_dir)
         original_path = os.path.join(project.project_dir, "media", "metadata.json")
-        replacement_path = os.path.join(base_dir, "notes.txt")
+        input_dir = os.path.join(base_dir, "input")
+        os.makedirs(input_dir, exist_ok=True)
+        replacement_path = os.path.join(input_dir, "notes.txt")
         with open(original_path, "w", encoding="utf-8") as handle:
             handle.write('{"hello":"world"}')
         with open(replacement_path, "w", encoding="utf-8") as handle:
             handle.write("hello")
+        monkeypatch.setitem(sys.modules, "folder_paths", SimpleNamespace(
+            get_input_directory=lambda: input_dir,
+            get_output_directory=lambda: base_dir,
+        ))
 
         asset = Asset(
             asset_id="artifact-1",
@@ -92,7 +99,7 @@ def test_replace_artifact_updates_artifact_kind():
         )
         project.assets.append(asset)
 
-        _replace_project_asset(project, asset, replacement_path)
+        _replace_project_asset(project, asset, "notes.txt")
 
         assert asset.asset_type == "artifact"
         assert asset.artifact_kind == "text"

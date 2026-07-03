@@ -1272,6 +1272,13 @@ def test_guide_extraction_and_loader_paths_are_measured(tmp_path, monkeypatch):
     route_video = media_dir / "route_source.mp4"
     route_video.write_bytes(video_path.read_bytes())
     project = route_state.TimelineProject(project_dir=str(project_dir), name="Route Diagnostics")
+    project.assets = [
+        route_state.Asset(
+            asset_id="route-video",
+            asset_type="video",
+            path=os.path.join("media", "route_source.mp4"),
+        )
+    ]
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(route_module, "save_project", lambda project: None)
     monkeypatch.setattr(route_module, "ensure_thumbnail", lambda *args, **kwargs: None)
@@ -1279,7 +1286,7 @@ def test_guide_extraction_and_loader_paths_are_measured(tmp_path, monkeypatch):
 
     handler = _route_handler(route_module, "POST", extract_route)
     response = asyncio.run(
-        handler(_JsonRequest(match_info={"project_id": "project"}, body={"source_path": "media/route_source.mp4", "frame_index": 0}))
+        handler(_JsonRequest(match_info={"project_id": "project"}, body={"asset_id": "route-video", "frame_index": 0}))
     )
     assert response.status == 201
     payload = json.loads(response.body.decode("utf-8"))
@@ -1289,7 +1296,7 @@ def test_guide_extraction_and_loader_paths_are_measured(tmp_path, monkeypatch):
 
     response_scaled = asyncio.run(
         handler(_JsonRequest(match_info={"project_id": "project"}, body={
-            "source_path": "media/route_source.mp4",
+            "asset_id": "route-video",
             "frame_index": 0,
             "target_long_edge": 64,
         }))

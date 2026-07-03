@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from ..server.media_helpers import decode_video_range, fit_frame_to_canvas
+from ..server.path_security import resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig
 
 logger = logging.getLogger(__name__)
@@ -240,9 +241,19 @@ def _project_dir_value(project_or_dir) -> str:
 
 
 def _abs_driver_path(project_or_dir, source_path: str) -> str:
-    if os.path.isfile(source_path):
-        return source_path
-    return os.path.join(_project_dir_value(project_or_dir), source_path)
+    return resolve_existing_project_path(
+        _project_dir_value(project_or_dir),
+        source_path,
+        purpose="driver media source",
+    )
+
+
+def _driver_path_is_contained(project_or_dir, source_path: str) -> bool:
+    return bool(resolve_project_path(
+        _project_dir_value(project_or_dir),
+        source_path,
+        purpose="driver media source",
+    ))
 
 
 def _decode_driver_clip(project, clip, overlap_start: int, overlap_len: int, width: int, height: int) -> torch.Tensor:
@@ -399,6 +410,8 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
         or bool(getattr(clip, "muted", False))
     )
     if editor_absent and override_state != "on":
+        return ref
+    if not _driver_path_is_contained(project, getattr(clip, "source_path", "") or ""):
         return ref
 
     local_idx = int(overlap_start - render_start)

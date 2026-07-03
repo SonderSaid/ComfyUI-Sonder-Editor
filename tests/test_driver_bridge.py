@@ -282,3 +282,15 @@ def test_driver_bridge_decode_failure_for_effective_clip_raises(tmp_path, monkey
 
     with pytest.raises(RuntimeError, match="Driver media not found"):
         bridge.SonderDriverBridge().execute(driver_ref)
+
+
+def test_driver_selector_treats_quarantined_source_path_as_absent(tmp_path, monkeypatch):
+    bridge, _timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    scene.clips[0].source_path = os.path.join("..", "outside.mp4")
+
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(project, driver_lane_index=0)
+    _images, _frame_idx, strength = bridge.SonderDriverBridge().execute(driver_ref)
+
+    assert has_driver == 0
+    assert driver_ref["has_driver"] == 0
+    assert strength == pytest.approx(0.0)

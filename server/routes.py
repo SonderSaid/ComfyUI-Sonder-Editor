@@ -7,6 +7,7 @@ import shutil
 import time
 import uuid
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -25,6 +26,17 @@ from .media_helpers import (
     probe_media_metadata,
     resize_frame_to_long_edge,
     write_png,
+)
+from .path_security import (
+    PathSecurityError,
+    normalize_project_relative_path,
+    log_path_quarantine,
+    path_within as _security_path_within,
+    project_media_root,
+    resolve_comfy_input_path,
+    resolve_project_path,
+    resolve_static_path,
+    safe_route_token as _security_safe_route_token,
 )
 from .project_manager import (
     ProjectVersionConflict,
@@ -68,6 +80,27 @@ _TIMELINE_EXPORTS = TimelineExportManager()
 _ASSET_DERIVED_CACHE_HEADERS = {
     "Cache-Control": "public, max-age=0, must-revalidate",
 }
+_BAD_PROJECT_REQUEST_PREFIX = "__sonder_bad_project_request__:"
+_SONDER_MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_SONDER_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "X-Frame-Options": "SAMEORIGIN",
+}
+_SONDER_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "media-src 'self' data: blob:; "
+    "font-src 'self' data:; "
+    "connect-src 'self' ws: wss:; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'self'"
+)
 
 # Defer route registration until ComfyUI's PromptServer is available.
 try:
@@ -79,6 +112,10 @@ except Exception:
 
 
 def _json_error(msg: str, status: int = 400) -> web.Response:
+    msg = str(msg)
+    if status == 404 and msg.startswith(_BAD_PROJECT_REQUEST_PREFIX):
+        msg = msg[len(_BAD_PROJECT_REQUEST_PREFIX):]
+        status = 400
     return web.json_response({"error": msg}, status=status)
 
 
@@ -94,6 +131,54 @@ def _attach_project_version_headers(
     if modified_at:
         response.headers["X-Sonder-Project-Modified-At"] = modified_at
     return response
+
+
+def _request_host_candidates(request: web.Request) -> set[str]:
+    candidates = set()
+    headers = getattr(request, "headers", {}) or {}
+    for value in (
+        getattr(request, "host", ""),
+        headers.get("Host", ""),
+        headers.get("X-Forwarded-Host", ""),
+    ):
+        first = str(value or "").split(",", 1)[0].strip().lower()
+        if first:
+            candidates.add(first)
+    return candidates
+
+
+def _same_origin_request(request: web.Request) -> bool:
+    origin = str((getattr(request, "headers", {}) or {}).get("Origin", "") or "").strip()
+    if not origin:
+        return True
+    parsed = urlsplit(origin)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    return parsed.netloc.lower() in _request_host_candidates(request)
+
+
+def _apply_sonder_security_headers(request: web.Request, response: web.StreamResponse) -> web.StreamResponse:
+    path = str(getattr(request, "path", "") or "")
+    if not path.startswith("/sonder-editor/"):
+        return response
+    for key, value in _SONDER_SECURITY_HEADERS.items():
+        response.headers.setdefault(key, value)
+    response.headers.setdefault("Content-Security-Policy", _SONDER_CSP)
+    return response
+
+
+@web.middleware
+async def _sonder_security_middleware(request: web.Request, handler):
+    path = str(getattr(request, "path", "") or "")
+    method = str(getattr(request, "method", "") or "").upper()
+    if path.startswith("/sonder-editor/") and method in _SONDER_MUTATING_METHODS and not _same_origin_request(request):
+        response = web.json_response(
+            {"error": "Cross-origin Sonder Editor request blocked", "code": "cross_origin_blocked"},
+            status=403,
+        )
+        return _apply_sonder_security_headers(request, response)
+    response = await handler(request)
+    return _apply_sonder_security_headers(request, response)
 
 
 def _remember_request_project(request: web.Request, project: TimelineProject) -> None:
@@ -219,6 +304,14 @@ try:
         setattr(app, "_sonder_project_version_header_middleware", True)
 except Exception:
     logger.debug("Could not install Sonder project version header middleware", exc_info=True)
+
+
+try:
+    if app is not None and not getattr(app, "_sonder_security_middleware", False):
+        app.middlewares.append(_sonder_security_middleware)
+        setattr(app, "_sonder_security_middleware", True)
+except Exception:
+    logger.debug("Could not install Sonder security middleware", exc_info=True)
 
 
 # Route-timing diagnostic. When `SONDER_DEBUG_SESSION` is enabled, logs any
@@ -353,19 +446,11 @@ def _ffmpeg_no_audio_stderr(stderr: str) -> bool:
 
 
 def _resolve_source_path(source_path: str) -> str:
-    source_path = str(source_path or "")
-    if source_path and os.path.isfile(source_path):
-        return source_path
-
-    try:
-        import folder_paths
-        input_path = os.path.join(folder_paths.get_input_directory(), source_path)
-        if os.path.isfile(input_path):
-            return input_path
-    except Exception:
-        pass
-
-    return source_path
+    return resolve_comfy_input_path(
+        str(source_path or ""),
+        purpose="comfy input source",
+        must_exist=True,
+    )
 
 
 def _detect_asset_type(source_path: str, fallback: str = "video") -> str:
@@ -2276,7 +2361,14 @@ def _apply_queue_mutation_operations(project: TimelineProject, operations: list)
 
 
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
-    return os.path.join(project.project_dir, asset.path) if getattr(asset, "path", "") else ""
+    asset_path = getattr(asset, "path", "") or ""
+    if not asset_path:
+        return ""
+    return resolve_project_path(
+        project,
+        asset_path,
+        purpose=f"asset source {getattr(asset, 'asset_id', '') or '(unknown)'}",
+    )
 
 
 def _asset_missing(project: TimelineProject, asset: Asset) -> bool:
@@ -2296,9 +2388,10 @@ def _media_probe_signature_from_stat(stat_result) -> str:
 
 
 def _snapshot_files_under(root_dir: str, rel_prefix: str = "") -> dict[str, dict]:
-    root_dir = os.path.abspath(root_dir)
+    root_dir = os.path.realpath(root_dir)
     if not os.path.isdir(root_dir):
         return {}
+    root_real = os.path.realpath(root_dir)
 
     root_rel = _normalize_project_relpath(rel_prefix)
     snapshot: dict[str, dict] = {}
@@ -2310,12 +2403,39 @@ def _snapshot_files_under(root_dir: str, rel_prefix: str = "") -> dict[str, dict
                 for entry in scan:
                     rel_path = _normalize_project_relpath(os.path.join(current_rel, entry.name))
                     try:
+                        try:
+                            if entry.is_symlink():
+                                log_path_quarantine(
+                                    purpose="media snapshot",
+                                    path=rel_path,
+                                    root=root_real,
+                                    reason="symlink skipped",
+                                )
+                                continue
+                        except (AttributeError, OSError):
+                            continue
                         if entry.is_dir(follow_symlinks=False):
+                            if not _security_path_within(root_real, entry.path):
+                                log_path_quarantine(
+                                    purpose="media snapshot",
+                                    path=rel_path,
+                                    root=root_real,
+                                    reason="directory escapes root",
+                                )
+                                continue
                             stack.append((entry.path, rel_path))
                             continue
-                        if not entry.is_file(follow_symlinks=True):
+                        if not entry.is_file(follow_symlinks=False):
                             continue
-                        stat_result = entry.stat(follow_symlinks=True)
+                        if not _security_path_within(root_real, entry.path):
+                            log_path_quarantine(
+                                purpose="media snapshot",
+                                path=rel_path,
+                                root=root_real,
+                                reason="file escapes root",
+                            )
+                            continue
+                        stat_result = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
                     snapshot[rel_path] = {
@@ -2329,26 +2449,65 @@ def _snapshot_files_under(root_dir: str, rel_prefix: str = "") -> dict[str, dict
 
 
 def _project_media_snapshot(project: TimelineProject) -> dict[str, dict]:
-    return _snapshot_files_under(os.path.join(project.project_dir, "media"), "media")
+    media_dir = project_media_root(project, must_exist=True)
+    return _snapshot_files_under(media_dir, "media") if media_dir else {}
 
 
 def _project_thumbnail_snapshot(project: TimelineProject) -> dict[str, dict]:
-    return _snapshot_files_under(os.path.join(project.project_dir, "cache", "thumbnails"))
+    cache_dir = resolve_project_path(project, os.path.join("cache", "thumbnails"), purpose="thumbnail cache root", must_exist=True)
+    return _snapshot_files_under(cache_dir) if cache_dir else {}
 
 
 def _project_asset_for_source_path(project: TimelineProject, source_path: str) -> Asset | None:
     normalized = _normalize_project_relpath(source_path)
-    abs_source = source_path if os.path.isabs(source_path) else os.path.abspath(os.path.join(project.project_dir, source_path))
+    abs_source = resolve_project_path(project, source_path, purpose="asset lookup", log=False)
     for asset in getattr(project, "assets", []) or []:
         asset_path = getattr(asset, "path", "") or ""
         if _normalize_project_relpath(asset_path) == normalized:
             return asset
         try:
-            if os.path.abspath(os.path.join(project.project_dir, asset_path)) == abs_source:
+            asset_abs = _asset_abspath(project, asset)
+            if asset_abs and abs_source and os.path.normcase(asset_abs) == os.path.normcase(abs_source):
                 return asset
         except Exception:
             continue
     return None
+
+
+def _extract_frame_source(project: TimelineProject, body: dict) -> tuple[str, str]:
+    asset_id = str(body.get("asset_id") or "").strip()
+    if asset_id:
+        try:
+            asset_id = _safe_route_token(asset_id, "asset id")
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        asset = project.get_asset(asset_id)
+        if not asset:
+            raise FileNotFoundError(f"Asset not found: {asset_id}")
+    else:
+        raw_source_path = str(body.get("source_path") or "")
+        if not raw_source_path:
+            raise ValueError("asset_id or source_path is required")
+        try:
+            source_rel_path = normalize_project_relative_path(raw_source_path)
+        except PathSecurityError as exc:
+            raise ValueError(f"Invalid source_path: {exc}") from exc
+        asset = next(
+            (
+                item for item in getattr(project, "assets", []) or []
+                if _normalize_project_relpath(getattr(item, "path", "") or "") == source_rel_path
+            ),
+            None,
+        )
+        if not asset:
+            raise ValueError("source_path is not a registered project asset")
+
+    if getattr(asset, "asset_type", "") != "video":
+        raise ValueError("Frame extraction requires a video asset")
+    abs_path = _asset_abspath(project, asset)
+    if not abs_path or not os.path.isfile(abs_path):
+        raise FileNotFoundError(f"Source file not found: {getattr(asset, 'path', '') or asset_id}")
+    return getattr(asset, "path", "") or "", abs_path
 
 
 def _asset_payload(
@@ -2361,15 +2520,13 @@ def _asset_payload(
     payload = asset.to_dict()
     source_path = _asset_abspath(project, asset)
     source_rel = _normalize_project_relpath(getattr(asset, "path", "") or "")
-    thumb_path = os.path.join(
-        project.project_dir, "cache", "thumbnails",
-        f"{asset.asset_id}.png"
-    )
-    thumb_key = _normalize_project_relpath(f"{asset.asset_id}.png")
+    cache_key = _asset_cache_key(project, asset)
+    thumb_path = _asset_thumbnail_path(project, asset) if cache_key else ""
+    thumb_key = _normalize_project_relpath(f"{cache_key}.png") if cache_key else ""
     payload["has_thumbnail"] = (
-        thumb_key in thumbnail_snapshot
+        bool(thumb_key) and thumb_key in thumbnail_snapshot
         if thumbnail_snapshot is not None
-        else os.path.isfile(thumb_path)
+        else bool(thumb_path) and os.path.isfile(thumb_path)
     )
     if media_snapshot is not None and source_rel.startswith("media/"):
         source_info = media_snapshot.get(source_rel)
@@ -2663,10 +2820,15 @@ def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset 
     video has no usable audio. Blocking (ffmpeg/ffprobe/thumbnail) — call via
     asyncio.to_thread from route handlers.
     """
-    video_path = os.path.join(project.project_dir, asset.path)
-    audio_filename = f"{asset.asset_id}_audio.wav"
+    video_path = _asset_abspath(project, asset)
+    asset_key = _asset_storage_key(project, asset, purpose="derived audio asset id")
+    if not asset_key:
+        return None
+    audio_filename = f"{asset_key}_audio.wav"
     audio_rel_path = os.path.join("media", audio_filename)
-    audio_abs_path = os.path.join(project.project_dir, audio_rel_path)
+    audio_abs_path = resolve_project_path(project, audio_rel_path, purpose="derived audio path")
+    if not audio_abs_path:
+        return None
     audio_rel_norm = _normalize_project_relpath(audio_rel_path)
     existing_audio_asset = next(
         (
@@ -2678,6 +2840,8 @@ def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset 
 
     extracted = True
     if not os.path.isfile(audio_abs_path):
+        if not video_path or not os.path.isfile(video_path):
+            return None
         extracted = _extract_audio_from_video(video_path, audio_abs_path)
 
     audio_dur = 0.0
@@ -2705,11 +2869,9 @@ def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset 
                 media_probe_signature=_media_probe_signature(audio_abs_path),
             )
             project.add_asset(audio_asset)
-            thumb_path = os.path.join(
-                project.project_dir, "cache", "thumbnails",
-                f"{audio_asset.asset_id}.png"
-            )
-            ensure_thumbnail("audio", audio_abs_path, thumb_path)
+            thumb_path = _asset_thumbnail_path(project, audio_asset)
+            if thumb_path:
+                ensure_thumbnail("audio", audio_abs_path, thumb_path)
         return audio_asset
 
     # Empty/failed extraction: clean up the orphan unless an asset references it
@@ -2747,7 +2909,7 @@ def _sync_media_folder(
             retention_days=trash_retention_days,
             max_size_mb=trash_max_size_mb,
         )
-    media_dir = os.path.join(project.project_dir, "media")
+    media_dir = project_media_root(project, must_exist=True)
     if not os.path.isdir(media_dir):
         return changed
     media_snapshot = _project_media_snapshot(project)
@@ -2772,7 +2934,9 @@ def _sync_media_folder(
         if "/" in media_child:
             continue
 
-        filepath = file_info.get("path") or os.path.join(project.project_dir, rel_path)
+        filepath = file_info.get("path") or resolve_project_path(project, rel_path, purpose="media sync file")
+        if not filepath:
+            continue
         filename = os.path.basename(rel_path)
         # Skip transient work files that node/export code may write into media/ and
         # delete moments later (save_video / export audio mux, export *.tmp output).
@@ -2815,11 +2979,9 @@ def _sync_media_folder(
         project.add_asset(asset)
 
         if asset_type in {"video", "image", "audio"}:
-            thumb_path = os.path.join(
-                project.project_dir, "cache", "thumbnails",
-                f"{asset.asset_id}.png"
-            )
-            ensure_thumbnail(asset_type, filepath, thumb_path)
+            thumb_path = _asset_thumbnail_path(project, asset)
+            if thumb_path:
+                ensure_thumbnail(asset_type, filepath, thumb_path)
 
         changed = True
         logger.info("Auto-registered asset: %s (%s)", filename, asset_type)
@@ -2833,7 +2995,9 @@ def _sync_media_folder(
         file_info = media_snapshot.get(rel_path)
         if not file_info:
             continue
-        filepath = file_info.get("path") or os.path.join(project.project_dir, rel_path)
+        filepath = file_info.get("path") or resolve_project_path(project, rel_path, purpose="video repair file")
+        if not filepath:
+            continue
         signature = file_info.get("signature") or _media_probe_signature(filepath)
         checked = bool(getattr(asset, "has_audio_checked", False))
         stored_signature = getattr(asset, "media_probe_signature", "") or ""
@@ -2876,7 +3040,9 @@ def _sync_media_folder(
         file_info = media_snapshot.get(rel_path)
         if not file_info:
             continue
-        filepath = file_info.get("path") or os.path.join(project.project_dir, rel_path)
+        filepath = file_info.get("path") or resolve_project_path(project, rel_path, purpose="audio repair file")
+        if not filepath:
+            continue
         signature = file_info.get("signature") or _media_probe_signature(filepath)
         checked = bool(getattr(asset, "duration_checked", False))
         stored_signature = getattr(asset, "media_probe_signature", "") or ""
@@ -3007,24 +3173,28 @@ def _get_base_dir() -> str:
         return ""
 
 
+def _bad_project_request(message: str) -> FileNotFoundError:
+    return FileNotFoundError(f"{_BAD_PROJECT_REQUEST_PREFIX}{message}")
+
+
+def _configured_base_dir() -> str:
+    base_dir = _get_base_dir()
+    return os.path.realpath(base_dir) if base_dir else ""
+
+
 def _path_within(parent: str, child: str) -> bool:
-    try:
-        parent_real = os.path.realpath(parent)
-        child_real = os.path.realpath(child)
-        return os.path.commonpath([parent_real, child_real]) == parent_real
-    except (OSError, ValueError):
-        return False
+    return _security_path_within(parent, child)
 
 
 def _safe_route_token(value: str, label: str) -> str:
-    value = str(value or "").strip()
-    if not value or "/" in value or "\\" in value or "\x00" in value or ".." in value:
-        raise ValueError(f"Invalid {label}")
-    return value
+    try:
+        return _security_safe_route_token(value, label)
+    except PathSecurityError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _direct_project_dir_for_cached_asset(request: web.Request) -> str | None:
-    if request.query.get("path"):
+    if "path" in request.query:
         return None
     project_id = _safe_route_token(request.match_info.get("project_id", ""), "project id")
     base_dir = _get_base_dir()
@@ -3041,7 +3211,7 @@ def _direct_project_dir_for_cached_asset(request: web.Request) -> str | None:
 
 
 def _direct_project_dir_from_request(request: web.Request) -> str | None:
-    if request.query.get("path"):
+    if "path" in request.query:
         return None
     try:
         project_id = _safe_route_token(request.match_info.get("project_id", ""), "project id")
@@ -3057,6 +3227,56 @@ def _direct_project_dir_from_request(request: web.Request) -> str | None:
     if not os.path.isfile(os.path.join(project_dir, "project.json")):
         return None
     return project_dir
+
+
+def _project_file_matches_request(data: dict, requested_id: str, folder_name: str) -> bool:
+    canonical_id = str(data.get("project_id", "") or "")
+    return requested_id == folder_name or requested_id == canonical_id
+
+
+def _find_project_dir_in_base(base_dir: str, requested_id: str) -> str:
+    base_real = os.path.realpath(base_dir)
+    direct_dir = os.path.realpath(os.path.join(base_real, requested_id))
+    if _path_within(base_real, direct_dir):
+        direct_file = os.path.join(direct_dir, "project.json")
+        if os.path.isfile(direct_file):
+            return direct_dir
+
+    try:
+        entries = os.listdir(base_real)
+    except OSError:
+        return ""
+    for entry in entries:
+        try:
+            safe_entry = _safe_route_token(entry, "project folder")
+        except ValueError:
+            continue
+        entry_path = os.path.realpath(os.path.join(base_real, safe_entry))
+        if not _path_within(base_real, entry_path) or not os.path.isdir(entry_path):
+            continue
+        pfile = os.path.join(entry_path, "project.json")
+        if not os.path.isfile(pfile):
+            continue
+        try:
+            with open(pfile, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if _project_file_matches_request(data, requested_id, safe_entry):
+                return entry_path
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.debug("Skipping unreadable project index at %s: %s", pfile, exc)
+            continue
+    return ""
+
+
+def _validate_loaded_project_request(project: TimelineProject, requested_id: str, project_dir: str, base_dir: str) -> None:
+    base_real = os.path.realpath(base_dir)
+    project_real = os.path.realpath(project_dir)
+    if not _path_within(base_real, project_real):
+        raise _bad_project_request("Project path escapes configured base directory")
+    folder_name = os.path.basename(os.path.normpath(project_real))
+    canonical_id = str(getattr(project, "project_id", "") or "")
+    if requested_id not in {folder_name, canonical_id}:
+        raise _bad_project_request("Requested project id does not match loaded project")
 
 
 def _reveal_in_file_manager(path: str) -> tuple[bool, str]:
@@ -3114,11 +3334,15 @@ def _fast_cached_asset_response(
     if not project_dir:
         return None
     _safe_route_token(request.match_info.get("asset_id", ""), "asset id")
-    cache_dir = os.path.realpath(os.path.join(project_dir, "cache", cache_subdir))
-    target_path = os.path.realpath(os.path.join(cache_dir, filename))
-    if not _path_within(project_dir, cache_dir) or not _path_within(cache_dir, target_path):
-        raise ValueError("Invalid cached asset path")
-    if not os.path.isfile(target_path):
+    _safe_route_token(cache_subdir, "cache subdir")
+    _safe_route_token(filename, "cached asset filename")
+    target_path = resolve_project_path(
+        project_dir,
+        os.path.join("cache", cache_subdir, filename),
+        purpose="cached asset file",
+        must_exist=True,
+    )
+    if not target_path or not os.path.isfile(target_path):
         return None
     return _cached_asset_file_response(target_path, content_type=content_type)
 
@@ -3150,32 +3374,26 @@ def _validate_request_project_version(request: web.Request, project: TimelinePro
     )
 
 
-def _load_project_from_request(request: web.Request) -> TimelineProject:
+def _load_project_from_request(request: web.Request, *, repair_missing_frames: bool = True) -> TimelineProject:
     """Load project from project_id path parameter."""
-    project_id = request.match_info.get("project_id", "")
-    project_dir = request.query.get("path", "")
-    if not project_dir:
-        project_dir = _direct_project_dir_from_request(request) or ""
-    if not project_dir:
-        base_dir = _get_base_dir()
-        if base_dir:
-            # Try to find by project_id in base_dir
-            for entry in os.listdir(base_dir):
-                entry_path = os.path.join(base_dir, entry)
-                pfile = os.path.join(entry_path, "project.json")
-                if os.path.isfile(pfile):
-                    try:
-                        with open(pfile, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        if data.get("project_id", "") == project_id or entry == project_id:
-                            project_dir = entry_path
-                            break
-                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                        logger.debug("Skipping unreadable project index at %s: %s", pfile, exc)
-                        continue
+    if "path" in request.query:
+        raise _bad_project_request("?path is no longer supported for project routes")
+    try:
+        project_id = _safe_route_token(request.match_info.get("project_id", ""), "project id")
+    except ValueError as exc:
+        raise _bad_project_request(str(exc)) from exc
+    base_dir = _configured_base_dir()
+    if not base_dir:
+        raise _bad_project_request("Project base directory is not configured")
+    project_dir = _find_project_dir_in_base(base_dir, project_id)
     if not project_dir:
         raise FileNotFoundError(f"Project not found: {project_id}")
     project = load_project(project_dir)
+    _validate_loaded_project_request(project, project_id, project_dir, base_dir)
+    if not repair_missing_frames:
+        _validate_request_project_version(request, project)
+        _remember_request_project(request, project)
+        return project
 
     # Auto-repair clips/audio missing total_source_frames (field added in Phase 3)
     changed = False
@@ -3207,6 +3425,24 @@ def _load_project_from_request(request: web.Request) -> TimelineProject:
     _remember_request_project(request, project)
 
     return project
+
+
+def _session_relay_project_id(request: web.Request) -> str:
+    """Validated RAW route project id for session-registry relay routes.
+
+    The session registry is raw-string keyed and every frontend surface
+    (canvas-host WS registration, tab claim/heartbeat/presence polls) keys by
+    the folder basename it sends. Do NOT canonicalize to project.project_id
+    here — a canonical-UUID lookup misses hosts registered under the folder id
+    (the 2026-07-03 mounted-tab "Canvas not connected" regression) — and do not
+    load the project from disk: the mounted tab polls widget_state every 2s.
+    """
+    if "path" in request.query:
+        raise _bad_project_request("?path is no longer supported for project routes")
+    try:
+        return _safe_route_token(request.match_info.get("project_id", ""), "project id")
+    except ValueError as exc:
+        raise _bad_project_request(str(exc)) from exc
 
 
 def _pick_active_scene(project: TimelineProject, scene_id: str = "") -> Scene | None:
@@ -3716,17 +3952,63 @@ def _resolve_assets_from_ids(project: TimelineProject, asset_ids) -> list[Asset]
 
 
 def _delete_asset_cache_files(project: TimelineProject, asset: Asset) -> None:
-    thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
-    strip_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}_strip.jpg")
-    strip_info_path = strip_path + ".json"
-    waveform_path = os.path.join(project.project_dir, "cache", "waveforms", f"{asset.asset_id}.json")
-    extracted_audio_path = os.path.join(project.project_dir, "cache", "waveforms", f"{asset.asset_id}_audio.wav")
-    for cache_path in [thumb_path, strip_path, strip_info_path, waveform_path, extracted_audio_path]:
+    cache_paths = _asset_cache_file_paths(project, asset)
+    for cache_path in cache_paths:
         if os.path.isfile(cache_path):
             try:
                 os.remove(cache_path)
             except OSError:
                 logger.warning("Failed to clear asset cache file: %s", cache_path)
+
+
+def _asset_storage_key(project: TimelineProject, asset: Asset, *, purpose: str) -> str:
+    raw_asset_id = str(getattr(asset, "asset_id", "") or "")
+    try:
+        return _safe_route_token(raw_asset_id, "asset id")
+    except ValueError as exc:
+        log_path_quarantine(
+            purpose=purpose,
+            path=raw_asset_id,
+            root=getattr(project, "project_dir", "") or "",
+            reason=str(exc),
+        )
+        return ""
+
+
+def _asset_cache_key(project: TimelineProject, asset: Asset) -> str:
+    return _asset_storage_key(project, asset, purpose="asset cache key")
+
+
+def _asset_cache_file(project: TimelineProject, asset: Asset, rel_dir: str, filename: str) -> str:
+    if not filename:
+        return ""
+    return resolve_project_path(
+        project,
+        os.path.join("cache", rel_dir, filename),
+        purpose="asset derived cache file",
+    )
+
+
+def _asset_thumbnail_path(project: TimelineProject, asset: Asset) -> str:
+    cache_key = _asset_cache_key(project, asset)
+    return _asset_cache_file(project, asset, "thumbnails", f"{cache_key}.png") if cache_key else ""
+
+
+def _asset_cache_file_paths(project: TimelineProject, asset: Asset) -> list[str]:
+    cache_key = _asset_cache_key(project, asset)
+    if not cache_key:
+        return []
+    strip_path = _asset_cache_file(project, asset, "thumbnails", f"{cache_key}_strip.jpg")
+    return [
+        path for path in [
+            _asset_cache_file(project, asset, "thumbnails", f"{cache_key}.png"),
+            strip_path,
+            _asset_cache_file(project, asset, "thumbnails", f"{cache_key}_strip.jpg.json"),
+            _asset_cache_file(project, asset, "waveforms", f"{cache_key}.json"),
+            _asset_cache_file(project, asset, "waveforms", f"{cache_key}_audio.wav"),
+        ]
+        if path
+    ]
 
 
 def _delete_asset_source_file(project: TimelineProject, asset: Asset, excluded_asset_ids: set[str] | None = None) -> None:
@@ -3822,7 +4104,7 @@ def _purge_expired_trashed_assets(
 
 
 def _render_cache_dir(project: TimelineProject) -> str:
-    return os.path.realpath(os.path.join(project.project_dir, "cache", "renders"))
+    return resolve_project_path(project, os.path.join("cache", "renders"), purpose="render cache root")
 
 
 def _resolve_render_cache_file(project: TimelineProject, filename: str) -> str:
@@ -3835,25 +4117,30 @@ def _resolve_render_cache_file(project: TimelineProject, filename: str) -> str:
         or not filename.endswith(".pt")
     ):
         raise ValueError("Invalid render cache filename")
-    cache_dir = _render_cache_dir(project)
-    target_path = os.path.realpath(os.path.join(cache_dir, filename))
-    if os.path.commonpath([cache_dir, target_path]) != cache_dir:
+    target_path = resolve_project_path(
+        project,
+        os.path.join("cache", "renders", filename),
+        purpose="render cache file",
+    )
+    if not target_path:
         raise ValueError("Invalid render cache filename")
     return target_path
 
 
 def _list_render_cache_entries(project: TimelineProject) -> list[dict]:
     cache_dir = _render_cache_dir(project)
-    if not os.path.isdir(cache_dir):
+    if not cache_dir or not os.path.isdir(cache_dir):
         return []
 
     entries = []
     with os.scandir(cache_dir) as scan:
         for entry in scan:
-            if not entry.name.endswith(".pt") or not entry.is_file():
-                continue
             try:
-                stat = entry.stat()
+                if entry.is_symlink() or not entry.name.endswith(".pt") or not entry.is_file(follow_symlinks=False):
+                    continue
+                if not _path_within(cache_dir, entry.path):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
             entries.append({
@@ -3941,7 +4228,9 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
         strict=_media_asset_requires_probe(asset.asset_type),
     )
 
-    media_dir = os.path.join(project.project_dir, "media")
+    media_dir = project_media_root(project)
+    if not media_dir:
+        raise ValueError("Invalid project media directory")
     os.makedirs(media_dir, exist_ok=True)
 
     old_rel_path = asset.path
@@ -3949,11 +4238,14 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     old_ext = os.path.splitext(old_rel_path or "")[1].lower()
     new_ext = os.path.splitext(resolved_source)[1].lower()
 
-    if old_rel_path and old_ext and old_ext == new_ext:
+    if old_abs_path and old_rel_path and old_ext and old_ext == new_ext:
         next_rel_path = old_rel_path
     else:
         next_rel_path = os.path.join("media", f"{uuid.uuid4().hex[:8]}_{os.path.basename(resolved_source)}")
-    next_abs_path = os.path.join(project.project_dir, next_rel_path)
+    next_abs_path = resolve_project_path(project, next_rel_path, purpose="asset replacement destination")
+    if not next_abs_path:
+        raise ValueError("Invalid replacement destination")
+    os.makedirs(os.path.dirname(next_abs_path), exist_ok=True)
 
     if os.path.abspath(resolved_source) != os.path.abspath(next_abs_path):
         shutil.copy2(resolved_source, next_abs_path)
@@ -4018,6 +4310,16 @@ def _timeline_export_job_response(request: web.Request, job) -> dict:
     return payload
 
 
+def _timeline_job_matches_project(job, project: TimelineProject) -> bool:
+    job_project_dir = str(getattr(job, "project_dir", "") or "")
+    project_dir = str(getattr(project, "project_dir", "") or "")
+    if job_project_dir and project_dir:
+        return os.path.normcase(os.path.realpath(job_project_dir)) == os.path.normcase(os.path.realpath(project_dir))
+    job_project_id = str(getattr(job, "project_id", "") or "")
+    project_id = str(getattr(project, "project_id", "") or "")
+    return bool(job_project_id and project_id and job_project_id == project_id)
+
+
 if routes is not None:
 
     # -----------------------------------------------------------------------
@@ -4033,9 +4335,14 @@ if routes is not None:
 
     @routes.get("/sonder-editor/static/{filename:.*}")
     async def api_editor_static(request: web.Request) -> web.StreamResponse:
-        web_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
-        requested = os.path.abspath(os.path.join(web_root, request.match_info.get("filename", "")))
-        if requested != web_root and not requested.startswith(web_root + os.sep):
+        web_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "web"))
+        requested = resolve_static_path(
+            web_root,
+            request.match_info.get("filename", ""),
+            purpose="editor static file",
+            must_exist=False,
+        )
+        if not requested:
             return _json_error("Invalid static path", 400)
         if not os.path.isfile(requested):
             return _json_error("Static file not found", 404)
@@ -4161,8 +4468,12 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/widget_state")
     async def api_get_editor_widget_state(request: web.Request) -> web.Response:
         remember_event_loop()
+        try:
+            project_id = _session_relay_project_id(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
         payload = await get_widget_state(
-            request.match_info.get("project_id", ""),
+            project_id,
             str(request.query.get("source_node_id") or ""),
             host_id=str(request.query.get("host_id") or ""),
         )
@@ -4171,6 +4482,10 @@ if routes is not None:
     @routes.put("/sonder-editor/project/{project_id}/widget_state")
     async def api_put_editor_widget_state(request: web.Request) -> web.Response:
         remember_event_loop()
+        try:
+            project_id = _session_relay_project_id(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
         try:
             body = await request.json()
         except json.JSONDecodeError:
@@ -4185,7 +4500,7 @@ if routes is not None:
         replace = bool(body.get("replace") or body.get("seed"))
         if replace:
             payload = await seed_widget_state(
-                request.match_info.get("project_id", ""),
+                project_id,
                 source_node_id,
                 session_id,
                 values,
@@ -4193,7 +4508,7 @@ if routes is not None:
             )
         else:
             payload = await update_widget_state(
-                request.match_info.get("project_id", ""),
+                project_id,
                 source_node_id,
                 session_id,
                 values,
@@ -4208,7 +4523,9 @@ if routes is not None:
 
     @routes.get("/sonder-editor/projects")
     async def api_list_projects(request: web.Request) -> web.Response:
-        base_dir = request.query.get("base_dir", "") or _get_base_dir()
+        if "base_dir" in request.query:
+            return _json_error("base_dir query is no longer supported", 400)
+        base_dir = _configured_base_dir()
         if not base_dir:
             return _json_error("base_dir required", 400)
         projects = list_projects(base_dir)
@@ -4253,7 +4570,9 @@ if routes is not None:
         template_id = body.get("template_id", "free") or "free"
         raw_frame_constraint = body.get("frame_constraint")
         frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
-        base_dir = body.get("base_dir", "") or _get_base_dir()
+        if "base_dir" in body or "base_dir" in request.query:
+            return _json_error("base_dir is no longer accepted", 400)
+        base_dir = _configured_base_dir()
 
         if not base_dir:
             return _json_error("base_dir is required", 400)
@@ -4353,14 +4672,30 @@ if routes is not None:
 
     @routes.get("/sonder-editor/project/{project_id}/render_timeline/{job_id}")
     async def api_get_render_timeline_job(request: web.Request) -> web.Response:
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
         job = _TIMELINE_EXPORTS.get(request.match_info.get("job_id", ""))
         if not job:
+            return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
+        if not _timeline_job_matches_project(job, project):
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
         return web.json_response(_timeline_export_job_response(request, job))
 
     @routes.post("/sonder-editor/project/{project_id}/render_timeline/{job_id}/cancel")
     async def api_cancel_render_timeline_job(request: web.Request) -> web.Response:
-        job = _TIMELINE_EXPORTS.cancel(request.match_info.get("job_id", ""))
+        try:
+            project = _load_project_from_request(request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        job_id = request.match_info.get("job_id", "")
+        job = _TIMELINE_EXPORTS.get(job_id)
+        if not job:
+            return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
+        if not _timeline_job_matches_project(job, project):
+            return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
+        job = _TIMELINE_EXPORTS.cancel(job_id)
         if not job:
             return web.json_response({"error": "Export job not found", "code": "not_found"}, status=404)
         return web.json_response(job.public_status())
@@ -4415,9 +4750,33 @@ if routes is not None:
 
     @routes.get("/sonder-editor/project/{project_id}/assets")
     async def api_list_assets(request: web.Request) -> web.Response:
-        """List all assets in a project, optionally filtered by type.
-        Auto-discovers untracked files in media/ folder.
-        """
+        """List saved assets in a project, optionally filtered by type."""
+        try:
+            project = await asyncio.to_thread(_load_project_from_request, request, repair_missing_frames=False)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        asset_type = request.query.get("type", "")
+        include_trashed = _query_flag(request.query.get("include_trashed"))
+        if asset_type:
+            assets = project.get_assets_by_type(asset_type)
+        else:
+            assets = project.assets
+        if not include_trashed:
+            assets = [asset for asset in assets if not _asset_is_trashed(asset)]
+
+        result = await asyncio.to_thread(_asset_payloads, project, assets)
+
+        return web.json_response({
+            "project_id": project.project_id,
+            "modified_at": project.modified_at,
+            "assets": result,
+            "folders": _collect_asset_folders(project),
+        })
+
+    @routes.post("/sonder-editor/project/{project_id}/assets/sync")
+    async def api_sync_assets(request: web.Request) -> web.Response:
+        """Synchronize media-folder discovery/repair/trash cleanup, then return assets."""
         try:
             project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
@@ -4432,15 +4791,6 @@ if routes is not None:
             None,
         )
 
-        # Auto-discover untracked files in media/ folder.
-        # `_sync_media_folder` walks the project's media dir, ffprobes every
-        # unknown file, regenerates thumbnails, and re-probes existing video
-        # and audio assets to repair missing `has_audio` / `duration_sec`.
-        # On a project with many files, that synchronous work can take tens
-        # of seconds and would freeze the aiohttp event loop, which trips
-        # canvas-host / session TTLs and triggers spurious disconnects. Run
-        # it on a worker thread so heartbeats and the sweeper keep firing.
-        # BUG-4 fix: persist newly discovered assets so IDs remain stable.
         project = await asyncio.to_thread(
             _sync_media_folder_versioned,
             project,
@@ -4460,7 +4810,6 @@ if routes is not None:
             assets = [asset for asset in assets if not _asset_is_trashed(asset)]
 
         result = await asyncio.to_thread(_asset_payloads, project, assets)
-
         return web.json_response({
             "project_id": project.project_id,
             "modified_at": project.modified_at,
@@ -4512,11 +4861,16 @@ if routes is not None:
             artifact_kind = artifact_kind if asset_type == "artifact" else ""
 
         # Copy to project media directory
-        media_dir = os.path.join(project.project_dir, "media")
+        media_dir = project_media_root(project)
+        if not media_dir:
+            return _json_error("Invalid project media directory", 400)
         os.makedirs(media_dir, exist_ok=True)
         basename = os.path.basename(source_path)
         dest_filename = f"{uuid.uuid4().hex[:8]}_{basename}"
-        dest_path = os.path.join(media_dir, dest_filename)
+        dest_rel_path = os.path.join("media", dest_filename)
+        dest_path = resolve_project_path(project, dest_rel_path, purpose="asset import destination")
+        if not dest_path:
+            return _json_error("Invalid asset import destination", 400)
         shutil.copy2(source_path, dest_path)
 
         try:
@@ -4537,7 +4891,7 @@ if routes is not None:
             name=basename,
             asset_type=asset_type,
             artifact_kind=artifact_kind,
-            path=os.path.join("media", dest_filename),
+            path=dest_rel_path,
             width=metadata["width"],
             height=metadata["height"],
             frame_count=metadata["frame_count"],
@@ -4558,11 +4912,9 @@ if routes is not None:
         save_project(project)
 
         if asset_type in {"video", "image", "audio"}:
-            thumb_path = os.path.join(
-                project.project_dir, "cache", "thumbnails",
-                f"{asset.asset_id}.png"
-            )
-            ensure_thumbnail(asset_type, dest_path, thumb_path)
+            thumb_path = _asset_thumbnail_path(project, asset)
+            if thumb_path:
+                ensure_thumbnail(asset_type, dest_path, thumb_path)
 
         return web.json_response(_asset_payload(project, asset), status=201)
 
@@ -4701,10 +5053,15 @@ if routes is not None:
             return _json_error(f"Invalid snapshot image: {e}", 400)
 
         try:
-            media_dir = os.path.join(project.project_dir, "media")
+            media_dir = project_media_root(project)
+            if not media_dir:
+                return _json_error("Invalid project media directory", 400)
             os.makedirs(media_dir, exist_ok=True)
             out_filename = f"{uuid.uuid4().hex[:8]}_snapshot_f{source_frame_index}.png"
-            out_path = os.path.join(media_dir, out_filename)
+            out_rel_path = os.path.join("media", out_filename)
+            out_path = resolve_project_path(project, out_rel_path, purpose="viewport snapshot destination")
+            if not out_path:
+                return _json_error("Invalid snapshot destination", 400)
             with open(out_path, "wb") as handle:
                 handle.write(file_bytes)
 
@@ -4720,7 +5077,7 @@ if routes is not None:
             asset = Asset(
                 name=f"Viewport Snapshot {timeline_frame_index}",
                 asset_type="image",
-                path=os.path.join("media", out_filename),
+                path=out_rel_path,
                 width=w,
                 height=h,
                 generation_params=generation_params,
@@ -4728,11 +5085,9 @@ if routes is not None:
             project.add_asset(asset)
             save_project(project)
 
-            thumb_path = os.path.join(
-                project.project_dir, "cache", "thumbnails",
-                f"{asset.asset_id}.png"
-            )
-            ensure_thumbnail("image", out_path, thumb_path)
+            thumb_path = _asset_thumbnail_path(project, asset)
+            if thumb_path:
+                ensure_thumbnail("image", out_path, thumb_path)
             return web.json_response(_asset_payload(project, asset), status=201)
         except Exception as e:
             logger.warning("Failed to register viewport snapshot: %s", e)
@@ -4746,26 +5101,30 @@ if routes is not None:
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        body = await request.json()
-        source_path = body.get("source_path", "")
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
         frame_index = _coerce_nonnegative_int(body.get("frame_index"), 0)
         target_long_edge = _coerce_nonnegative_int(body.get("target_long_edge"), 0)
 
-        if not source_path:
-            return _json_error("source_path is required", 400)
-
-        # Resolve path relative to project dir
-        abs_path = source_path
-        if not os.path.isabs(source_path):
-            abs_path = os.path.join(project.project_dir, source_path)
-        if not os.path.isfile(abs_path):
-            return _json_error(f"Source file not found: {source_path}", 404)
+        try:
+            source_path, abs_path = _extract_frame_source(project, body)
+        except ValueError as e:
+            return _json_error(str(e), 400)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
 
         try:
-            media_dir = os.path.join(project.project_dir, "media")
+            media_dir = project_media_root(project)
+            if not media_dir:
+                return _json_error("Invalid project media directory", 400)
             os.makedirs(media_dir, exist_ok=True)
             out_filename = f"{uuid.uuid4().hex[:8]}_frame_{frame_index}.png"
-            out_path = os.path.join(media_dir, out_filename)
+            out_rel_path = os.path.join("media", out_filename)
+            out_path = resolve_project_path(project, out_rel_path, purpose="frame extraction destination")
+            if not out_path:
+                return _json_error("Invalid frame extraction destination", 400)
 
             # Prefer ffmpeg for frame extraction to preserve video decode fidelity.
             # Fall back to OpenCV if ffmpeg is unavailable or fails.
@@ -4796,7 +5155,7 @@ if routes is not None:
             asset = Asset(
                 name=f"Frame {frame_index}",
                 asset_type="image",
-                path=os.path.join("media", out_filename),
+                path=out_rel_path,
                 width=w,
                 height=h,
                 generation_params={
@@ -4810,11 +5169,9 @@ if routes is not None:
             save_project(project)
 
             # Generate thumbnail
-            thumb_path = os.path.join(
-                project.project_dir, "cache", "thumbnails",
-                f"{asset.asset_id}.png"
-            )
-            ensure_thumbnail("image", out_path, thumb_path)
+            thumb_path = _asset_thumbnail_path(project, asset)
+            if thumb_path:
+                ensure_thumbnail("image", out_path, thumb_path)
 
             return web.json_response(_asset_payload(project, asset), status=201)
 
@@ -5160,8 +5517,9 @@ if routes is not None:
         _delete_asset_cache_files(project, asset)
 
         if not _asset_missing(project, asset):
-            thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
-            ensure_thumbnail(asset.asset_type, _asset_abspath(project, asset), thumb_path)
+            thumb_path = _asset_thumbnail_path(project, asset)
+            if thumb_path:
+                ensure_thumbnail(asset.asset_type, _asset_abspath(project, asset), thumb_path)
 
         save_project(project)
         return web.json_response({
@@ -5189,10 +5547,9 @@ if routes is not None:
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
-        thumb_path = os.path.join(
-            project.project_dir, "cache", "thumbnails",
-            f"{asset_id}.png"
-        )
+        thumb_path = _asset_thumbnail_path(project, asset)
+        if not thumb_path:
+            return _json_error("Thumbnail unavailable for missing asset", 404)
         if os.path.isfile(thumb_path):
             return _cached_asset_file_response(thumb_path)
 
@@ -5235,11 +5592,13 @@ if routes is not None:
         if not asset or asset.asset_type != "video":
             return _json_error(f"Video asset not found: {asset_id}", 404)
 
-        strip_path = os.path.join(
-            project.project_dir, "cache", "thumbnails",
-            f"{asset_id}_strip.jpg"
-        )
-        info_path = strip_path + ".json"
+        cache_key = _asset_cache_key(project, asset)
+        if not cache_key:
+            return _json_error("Thumbnail strip unavailable for missing asset", 404)
+        strip_path = _asset_cache_file(project, asset, "thumbnails", f"{cache_key}_strip.jpg")
+        info_path = _asset_cache_file(project, asset, "thumbnails", f"{cache_key}_strip.jpg.json")
+        if not strip_path or not info_path:
+            return _json_error("Thumbnail strip unavailable for missing asset", 404)
 
         # Generate if not cached. ffmpeg call must stay off the event loop.
         if not os.path.isfile(strip_path):
@@ -5289,10 +5648,12 @@ if routes is not None:
         if asset.asset_type == "video" and not asset.has_audio:
             return _json_error("Waveform unavailable for video without audio", 404)
 
-        waveform_path = os.path.join(
-            project.project_dir, "cache", "waveforms",
-            f"{asset_id}.json"
-        )
+        cache_key = _asset_cache_key(project, asset)
+        if not cache_key:
+            return _json_error("Waveform unavailable for missing asset", 404)
+        waveform_path = _asset_cache_file(project, asset, "waveforms", f"{cache_key}.json")
+        if not waveform_path:
+            return _json_error("Waveform unavailable for missing asset", 404)
 
         # Generate if not cached. ffmpeg calls must stay off the event loop.
         if not os.path.isfile(waveform_path):
@@ -5300,11 +5661,10 @@ if routes is not None:
             if not source_path or not os.path.isfile(source_path):
                 return _json_error("Waveform unavailable for missing asset", 404)
             waveform_source = source_path
-            extracted_audio_path = os.path.join(
-                project.project_dir, "cache", "waveforms",
-                f"{asset_id}_audio.wav"
-            )
+            extracted_audio_path = _asset_cache_file(project, asset, "waveforms", f"{cache_key}_audio.wav")
             if asset.asset_type == "video":
+                if not extracted_audio_path:
+                    return _json_error("Failed to extract video audio for waveform", 500)
                 if not os.path.isfile(extracted_audio_path):
                     ok = await asyncio.to_thread(_extract_audio_from_video, source_path, extracted_audio_path)
                     if not ok:

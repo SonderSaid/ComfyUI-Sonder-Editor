@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Callable
 
 from .atomic_io import atomic_replace
+from .path_security import path_within
 from .timeline_state import TimelineProject
 
 logger = logging.getLogger("sonder_editor")
@@ -208,10 +209,15 @@ def list_projects(base_dir: str) -> list[dict]:
     if not os.path.isdir(base_dir):
         return results
 
-    for entry in sorted(os.listdir(base_dir)):
-        entry_path = os.path.join(base_dir, entry)
-        project_file = os.path.join(entry_path, "project.json")
-        if os.path.isdir(entry_path) and os.path.isfile(project_file):
+    base_real = os.path.realpath(base_dir)
+    for entry in sorted(os.listdir(base_real)):
+        entry_path = os.path.join(base_real, entry)
+        entry_real = os.path.realpath(entry_path)
+        if not path_within(base_real, entry_real):
+            logger.warning("Skipping project entry outside base directory: %s", entry_path)
+            continue
+        project_file = os.path.join(entry_real, "project.json")
+        if os.path.isdir(entry_real) and os.path.isfile(project_file):
             try:
                 with open(project_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -224,7 +230,7 @@ def list_projects(base_dir: str) -> list[dict]:
                 results.append({
                     "project_id": data.get("project_id", ""),
                     "name": data.get("name", entry),
-                    "path": entry_path,
+                    "path": entry_real,
                     "fps": data.get("fps", 24.0),
                     "resolution": data.get("resolution", [768, 512]),
                     "scene_count": len(scenes),

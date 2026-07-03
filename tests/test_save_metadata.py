@@ -63,6 +63,15 @@ def _patch_save_deps(io_nodes, monkeypatch, calls):
     monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
 
 
+def _clear_bridge_state(io_nodes):
+    with io_nodes._BRIDGE_REGISTRY_LOCK:
+        io_nodes._BRIDGE_REGISTRY.clear()
+        io_nodes._BRIDGE_PROMPT_WATCHERS.clear()
+        io_nodes._BRIDGE_PROMPT_KEY_BY_OBJECT_ID.clear()
+        io_nodes._BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.clear()
+    io_nodes._BRIDGE_HOOKED_PROMPT_QUEUE_ID = None
+
+
 def test_save_video_editor_export_includes_schema_version(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
@@ -186,6 +195,7 @@ def test_save_video_take_mode_does_not_leak_sentinel(tmp_path, monkeypatch):
 
 def test_save_bridge_does_not_cache_prompt_workflow(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
     project = _project(tmp_path)
     project._execution_context = {
         "scene_id": "scene-1",

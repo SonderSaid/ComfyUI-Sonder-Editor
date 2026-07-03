@@ -68,6 +68,86 @@ def test_project_version_header_middleware_attaches_loaded_project_version(monke
     assert response.headers["X-Sonder-Project-Modified-At"] == "version-1"
 
 
+def test_sonder_security_middleware_adds_security_headers(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+
+    async def handler(_request):
+        return web.json_response({"status": "ok"})
+
+    request = DummyRequest(
+        method="GET",
+        path="/sonder-editor/project/project-1/assets",
+        headers={"Host": "127.0.0.1:7822"},
+    )
+    response = asyncio.run(route_module._sonder_security_middleware(request, handler))
+
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    assert response.headers["Cross-Origin-Resource-Policy"] == "same-origin"
+    assert "default-src 'self'" in response.headers["Content-Security-Policy"]
+    assert "frame-ancestors 'self'" in response.headers["Content-Security-Policy"]
+
+
+def test_sonder_security_middleware_blocks_cross_origin_mutation(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    called = []
+
+    async def handler(_request):
+        called.append(True)
+        return web.json_response({"status": "ok"})
+
+    request = DummyRequest(
+        method="POST",
+        path="/sonder-editor/project/project-1/assets/sync",
+        headers={"Host": "127.0.0.1:7822", "Origin": "https://example.invalid"},
+    )
+    response = asyncio.run(route_module._sonder_security_middleware(request, handler))
+    payload = _response_json(response)
+
+    assert response.status == 403
+    assert payload["code"] == "cross_origin_blocked"
+    assert called == []
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def test_sonder_security_middleware_allows_same_origin_mutation(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    called = []
+
+    async def handler(_request):
+        called.append(True)
+        return web.json_response({"status": "ok"})
+
+    request = DummyRequest(
+        method="POST",
+        path="/sonder-editor/project/project-1/assets/sync",
+        headers={"Host": "127.0.0.1:7822", "Origin": "http://127.0.0.1:7822"},
+    )
+    response = asyncio.run(route_module._sonder_security_middleware(request, handler))
+
+    assert response.status == 200
+    assert called == [True]
+
+
+def test_sonder_security_middleware_allows_absent_origin_mutation(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    called = []
+
+    async def handler(_request):
+        called.append(True)
+        return web.json_response({"status": "ok"})
+
+    request = DummyRequest(
+        method="POST",
+        path="/sonder-editor/project/project-1/assets/sync",
+        headers={"Host": "127.0.0.1:7822"},
+    )
+    response = asyncio.run(route_module._sonder_security_middleware(request, handler))
+
+    assert response.status == 200
+    assert called == [True]
+
+
 def test_scene_mutation_remove_lane_is_single_save_and_reindexes(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
     scene = Scene(scene_id="scene-1", name="Scene")
@@ -890,19 +970,22 @@ def test_queue_mutations_clear_completed_and_clear_all(monkeypatch, tmp_path):
 
 def test_queue_mutations_retry_stale_deletes_without_resurrection(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
-    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = TimelineProject(project_dir=str(project_dir), name="Project")
+    project.project_id = "proj"
     project.generation_queue = [
         GenerationJob(job_id="job-a"),
         GenerationJob(job_id="job-b"),
         GenerationJob(job_id="job-c"),
     ]
     route_module.save_project(project)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
     base_version = project.modified_at
     handler = _queue_mutations_handler(route_module)
 
     response = asyncio.run(handler(DummyRequest(
         match_info={"project_id": "proj"},
-        query={"path": str(tmp_path)},
         headers={"If-Match": base_version},
         method="POST",
         body={"operations": [{"type": "delete_job", "job_id": "job-a"}]},
@@ -911,13 +994,12 @@ def test_queue_mutations_retry_stale_deletes_without_resurrection(monkeypatch, t
 
     response = asyncio.run(handler(DummyRequest(
         match_info={"project_id": "proj"},
-        query={"path": str(tmp_path)},
         headers={"If-Match": base_version},
         method="POST",
         body={"operations": [{"type": "delete_job", "job_id": "job-b"}]},
     )))
     payload = _response_json(response)
-    restored = route_module.load_project(str(tmp_path))
+    restored = route_module.load_project(str(project_dir))
 
     assert response.status == 200
     assert [job["job_id"] for job in payload["queue"]] == ["job-c"]
@@ -926,25 +1008,28 @@ def test_queue_mutations_retry_stale_deletes_without_resurrection(monkeypatch, t
 
 def test_queue_update_retries_stale_version_and_preserves_newer_jobs(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
-    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = TimelineProject(project_dir=str(project_dir), name="Project")
+    project.project_id = "proj"
     project.generation_queue = [GenerationJob(job_id="job-a", status="pending")]
     route_module.save_project(project)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
     base_version = project.modified_at
 
-    current = route_module.load_project(str(tmp_path))
+    current = route_module.load_project(str(project_dir))
     current.generation_queue.append(GenerationJob(job_id="job-b", status="pending"))
     route_module.save_project(current)
 
     handler = _route_handler(route_module, "PUT", "/sonder-editor/project/{project_id}/queue/{job_id}")
     response = asyncio.run(handler(DummyRequest(
         match_info={"project_id": "proj", "job_id": "job-a"},
-        query={"path": str(tmp_path)},
         headers={"If-Match": base_version},
         method="PUT",
         body={"status": "completed", "progress": 1.0},
     )))
     payload = _response_json(response)
-    restored = route_module.load_project(str(tmp_path))
+    restored = route_module.load_project(str(project_dir))
 
     assert response.status == 200
     assert payload["status"] == "completed"
@@ -1141,7 +1226,12 @@ def test_load_project_repair_save_is_unversioned_and_non_fatal(monkeypatch, tmp_
         clip_id="clip-0", timeline_start_frame=0, timeline_end_frame=10,
         source_out_frame=10, total_source_frames=0, track_index=0,
     )]
-    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.project_id = "proj"
+    route_module.save_project(project)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
     monkeypatch.setattr(route_module, "load_project", lambda project_dir: project)
     save_calls = []
 
@@ -1153,7 +1243,6 @@ def test_load_project_repair_save_is_unversioned_and_non_fatal(monkeypatch, tmp_
 
     request = DummyRequest(
         match_info={"project_id": "proj"},
-        query={"path": str(tmp_path)},
         method="GET",
         path="/sonder-editor/project/proj/scenes",
     )
@@ -1173,7 +1262,12 @@ def test_scenes_get_serves_despite_contended_repair_save(monkeypatch, tmp_path):
         clip_id="clip-0", timeline_start_frame=0, timeline_end_frame=10,
         source_out_frame=10, total_source_frames=0, track_index=0,
     )]
-    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    project.project_id = "proj"
+    route_module.save_project(project)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
     monkeypatch.setattr(route_module, "load_project", lambda project_dir: project)
 
     def contended_save(saved_project, **kwargs):
@@ -1184,7 +1278,6 @@ def test_scenes_get_serves_despite_contended_repair_save(monkeypatch, tmp_path):
     handler = _route_handler(route_module, "GET", "/sonder-editor/project/{project_id}/scenes")
     response = asyncio.run(handler(DummyRequest(
         match_info={"project_id": "proj"},
-        query={"path": str(tmp_path)},
         method="GET",
         path="/sonder-editor/project/proj/scenes",
     )))

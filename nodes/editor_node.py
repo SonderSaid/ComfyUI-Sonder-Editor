@@ -18,6 +18,7 @@ import folder_paths
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 from ..server.media_helpers import decode_audio_samples, decode_video_frame, fit_frame_to_canvas
+from ..server.path_security import resolve_existing_project_path
 from ..server.timeline_renderer import render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
@@ -781,7 +782,11 @@ class SonderEditor:
                 if render_start <= idx < render_end:
                     asset = proj.get_asset(guide.asset_id)
                     if asset:
-                        asset_path = os.path.join(proj.project_dir, asset.path)
+                        asset_path = resolve_existing_project_path(
+                            proj,
+                            asset.path,
+                            purpose=f"guide asset {getattr(asset, 'asset_id', '') or '(unknown)'}",
+                        )
                         if os.path.isfile(asset_path):
                             img = self._load_guide_image(
                                 asset_path, asset.asset_type, proj_w, proj_h,
@@ -1024,17 +1029,15 @@ class SonderEditor:
                 continue
 
             raw_path = track.source_path
-            fallback_path = os.path.join(proj.project_dir, track.source_path)
-            src_path = raw_path
-            if not os.path.isfile(src_path):
-                # Try relative to project dir
-                src_path = fallback_path
+            src_path = resolve_existing_project_path(
+                proj,
+                raw_path,
+                purpose="scene audio track",
+            )
             if not os.path.isfile(src_path):
                 logger.info(
-                    "Skipping scene audio track %s: file not found (attempted: %s, %s)",
+                    "Skipping scene audio track %s: file not found or quarantined",
                     track.source_path,
-                    raw_path,
-                    fallback_path,
                 )
                 continue
 

@@ -3,6 +3,7 @@
 import importlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -613,3 +614,200 @@ def test_bridge_sanitize_collapses_repeated_separators(tmp_path, monkeypatch):
     assert io_nodes._sanitize_bridge_component("__abc__") == "abc"
     assert io_nodes._sanitize_bridge_component("!!!") == ""
     assert io_nodes._sanitize_bridge_component("A-B_C") == "A-B_C"
+
+
+def test_bridge_prepare_sanitizes_prompt_and_node_ids(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "_resolve_bridge_prompt_key", lambda _prompt: ("../prompt:key", "test"))
+
+    output_dir, filename_prefix = io_nodes.SonderSaveBridge().prepare_output(
+        project,
+        prompt={},
+        unique_id="../bridge:id",
+    )
+
+    bridge_root = (Path(project.project_dir) / "cache" / "bridge_out").resolve()
+    output_path = Path(output_dir).resolve()
+    assert output_path.is_relative_to(bridge_root)
+    assert ".." not in filename_prefix.replace("\\", "/").split("/")
+    assert "prompt_key_bridge_id" in str(output_path)
+
+
+def test_bridge_finalize_skips_symlinked_output_escape_when_supported(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(project, prompt={}, unique_id="bridge-1")
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    external_file = external_dir / "secret.png"
+    _write_png(external_file)
+    try:
+        (Path(output_dir) / "linked.png").symlink_to(external_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available in this environment")
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    assert restored.assets == []
+    assert external_file.is_file()
+    assert list((Path(project.project_dir) / "media").iterdir()) == []
+
+
+def test_save_video_sanitizes_prefix_to_project_media(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    def fake_encode(_frames, *, output_path, preset_id, custom_options=None, **_kwargs):
+        Path(output_path).write_bytes(b"video")
+        return io_nodes.metadata_for_save_preset(preset_id, custom_options)
+
+    monkeypatch.setattr(io_nodes, "encode_video", fake_encode)
+    monkeypatch.setattr(io_nodes, "save_project", lambda _project: None)
+
+    result = io_nodes.SonderSaveVideo().save_video(
+        project,
+        torch.zeros(1, 2, 2, 3),
+        filename_prefix="../outside/escape:name",
+        embed_metadata=False,
+    )
+
+    output_path = Path(result["result"][0])
+    assert output_path.parent.resolve() == (Path(project.project_dir) / "media").resolve()
+    assert output_path.name.startswith("outside_escape_name_")
+    assert ".." not in project.assets[0].path.replace("\\", "/").split("/")
+    assert project.assets[0].path.replace("\\", "/").startswith("media/outside_escape_name_")
+    assert not (tmp_path / "outside").exists()
+
+
+def test_save_video_rejects_symlinked_media_root_when_supported(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    media_dir = Path(project.project_dir) / "media"
+    shutil.rmtree(media_dir)
+    external_dir = tmp_path / "external-media"
+    external_dir.mkdir()
+    try:
+        media_dir.symlink_to(external_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available in this environment")
+
+    monkeypatch.setattr(io_nodes, "encode_video", lambda *args, **kwargs: pytest.fail("encode should not run"))
+
+    with pytest.raises(ValueError, match="Invalid project media directory"):
+        io_nodes.SonderSaveVideo().save_video(
+            project,
+            torch.zeros(1, 2, 2, 3),
+            filename_prefix="safe",
+            embed_metadata=False,
+        )
+
+
+def test_save_video_rejects_media_root_symlink_to_project_sibling_when_supported(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    media_dir = Path(project.project_dir) / "media"
+    cache_dir = Path(project.project_dir) / "cache"
+    shutil.rmtree(media_dir)
+    cache_dir.mkdir(exist_ok=True)
+    try:
+        media_dir.symlink_to(cache_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available in this environment")
+
+    monkeypatch.setattr(io_nodes, "encode_video", lambda *args, **kwargs: pytest.fail("encode should not run"))
+
+    with pytest.raises(ValueError, match="Invalid project media directory"):
+        io_nodes.SonderSaveVideo().save_video(
+            project,
+            torch.zeros(1, 2, 2, 3),
+            filename_prefix="safe",
+            embed_metadata=False,
+        )
+
+
+def test_bridge_prepare_omits_filename_prefix_outside_comfy_output_root(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    output_root = tmp_path / "comfy-output"
+    output_root.mkdir()
+    monkeypatch.setattr(sys.modules["folder_paths"], "get_output_directory", lambda: str(output_root))
+
+    output_dir, filename_prefix = io_nodes.SonderSaveBridge().prepare_output(
+        project,
+        prompt={},
+        unique_id="bridge-1",
+    )
+
+    bridge_root = (Path(project.project_dir) / "cache" / "bridge_out").resolve()
+    assert Path(output_dir).resolve().is_relative_to(bridge_root)
+    assert filename_prefix == ""
+
+
+def test_bridge_cleanup_rejects_bridge_root_symlink_to_project_when_supported(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    bridge_root = Path(project.project_dir) / "cache" / "bridge_out"
+    if bridge_root.is_symlink() or bridge_root.is_file():
+        bridge_root.unlink()
+    elif bridge_root.exists():
+        shutil.rmtree(bridge_root)
+    bridge_root.parent.mkdir(parents=True, exist_ok=True)
+    victim_dir = Path(project.project_dir) / "old-victim"
+    victim_dir.mkdir()
+    _write_png(victim_dir / "leftover.png")
+    old_ts = time.time() - (io_nodes.BRIDGE_STALE_DIR_TTL_SEC + 60)
+    os.utime(victim_dir / "leftover.png", (old_ts, old_ts))
+    os.utime(victim_dir, (old_ts, old_ts))
+    try:
+        bridge_root.symlink_to(Path(project.project_dir), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available in this environment")
+
+    io_nodes._cleanup_stale_bridge_dirs(project.project_dir)
+
+    assert victim_dir.exists()
+    assert (victim_dir / "leftover.png").is_file()
+    restored = _load_saved_project(project_manager, project)
+    assert restored.assets == []
+
+
+def test_bridge_finalize_does_not_register_output_swapped_to_symlink_when_supported(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(project, prompt={}, unique_id="bridge-1")
+    source_file = Path(output_dir) / "out.png"
+    _write_png(source_file)
+    external_file = tmp_path / "external.png"
+    _write_png(external_file)
+    probe_link = tmp_path / "probe-link.png"
+    try:
+        probe_link.symlink_to(external_file)
+        probe_link.unlink()
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available in this environment")
+
+    original_move = io_nodes.shutil.move
+
+    def swap_to_symlink_before_move(src, dst, *args, **kwargs):
+        source_path = Path(src)
+        source_path.unlink()
+        source_path.symlink_to(external_file)
+        return original_move(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(io_nodes.shutil, "move", swap_to_symlink_before_move)
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    assert restored.assets == []
+    assert external_file.is_file()
+    assert list((Path(project.project_dir) / "media").iterdir()) == []

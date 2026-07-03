@@ -14,8 +14,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
+import server.timeline_export as timeline_export
 from server.project_manager import load_project, save_project
-from server.timeline_export import TimelineExportManager, _resolve_committed_asset_id
+from server.timeline_export import (
+    TimelineExportManager,
+    _output_path,
+    _place_embedded_audio_take,
+    _register_export_asset,
+    _resolve_committed_asset_id,
+)
 from server.timeline_renderer import TimelineRenderCancelled, iter_scene_frames, render_scene_frames
 from server.timeline_state import Asset, AudioTrack, ClipReference, GuideFrame, LaneConfig, Scene, TimelineProject, classify_asset_path
 
@@ -57,6 +64,70 @@ def test_timeline_export_resolves_committed_asset_id_remap():
 
     assert _resolve_committed_asset_id(project, "produced-id") == "committed-id"
     assert _resolve_committed_asset_id(project, "other-id") == "other-id"
+
+
+def test_timeline_export_output_rejects_symlinked_media_root(tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    external_dir = tmp_path / "external-media"
+    external_dir.mkdir()
+    try:
+        (project_dir / "media").symlink_to(external_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available in this environment")
+    scene = Scene(scene_id="scene-1", name="Scene")
+
+    with pytest.raises(ValueError):
+        _output_path(str(project_dir), scene, "export", ".mp4", "")
+
+
+def test_timeline_export_embedded_audio_skips_hostile_asset_id(tmp_path, monkeypatch):
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    (media_dir / "clip.mp4").write_bytes(b"video")
+    project = TimelineProject(project_dir=str(project_dir), fps=24.0)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    video_asset = Asset(
+        asset_id=os.path.join("..", "..", "outside"),
+        asset_type="video",
+        path=os.path.join("media", "clip.mp4"),
+        has_audio=True,
+        fps=24.0,
+    )
+    project.assets = [video_asset]
+    monkeypatch.setattr(timeline_export, "run_ffmpeg_command", lambda *_args, **_kwargs: pytest.fail("ffmpeg should be skipped"))
+
+    assert _place_embedded_audio_take(project, scene, video_asset, 0, 24, "", {}, cleanup_paths=[]) is None
+
+
+def test_register_export_asset_skips_symlinked_thumbnail_cache(tmp_path, monkeypatch):
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    output_path = media_dir / "export.mp4"
+    output_path.write_bytes(b"video")
+    cache_dir = project_dir / "cache"
+    cache_dir.mkdir()
+    external_dir = tmp_path / "external-thumbnails"
+    external_dir.mkdir()
+    try:
+        (cache_dir / "thumbnails").symlink_to(external_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is not available in this environment")
+    project = TimelineProject(project_dir=str(project_dir))
+    monkeypatch.setattr(timeline_export, "ensure_thumbnail", lambda *_args, **_kwargs: pytest.fail("thumbnail generation should be skipped"))
+
+    asset = _register_export_asset(
+        project,
+        str(output_path),
+        asset_type="video",
+        folder="",
+        technical_metadata={},
+        generation_params={},
+    )
+
+    assert asset.path == "media/export.mp4"
 
 
 def test_render_scene_frames_cancel_avoids_cache_commit(tmp_path):
@@ -306,9 +377,12 @@ def test_render_timeline_routes_return_job_payload(monkeypatch, tmp_path):
     asset = Asset(asset_id="asset-1", name="export.mp4", asset_type="video", path="media/export.mp4")
     scene = Scene(scene_id="scene-1", name="Scene")
     project = TimelineProject(project_dir=str(project_dir), project_id="project-1", name="Project", scenes=[scene], assets=[asset])
+    project_dir_str = str(project_dir)
 
     class FakeJob:
         job_id = "job-1"
+        project_id = "project-1"
+        project_dir = project_dir_str
         status = "completed"
         phase = "done"
         result_asset_id = "asset-1"

@@ -31,6 +31,12 @@ from .media_helpers import (
     save_video_encode_timeout_seconds,
 )
 from .atomic_io import atomic_replace
+from .path_security import (
+    log_path_quarantine,
+    resolve_existing_project_path,
+    resolve_project_path,
+    safe_route_token as _security_safe_route_token,
+)
 from .project_commit import created_ids_since, save_generated_project, snapshot_item_ids
 from .project_manager import load_project
 from .thumbnail_service import ensure_thumbnail
@@ -158,6 +164,20 @@ def _safe_folder_components(folder: str) -> list[str]:
     return components
 
 
+def _safe_asset_token(project: TimelineProject, asset: Asset, *, purpose: str) -> str:
+    raw_asset_id = str(getattr(asset, "asset_id", "") or "")
+    try:
+        return _security_safe_route_token(raw_asset_id, "asset id")
+    except ValueError as exc:
+        log_path_quarantine(
+            purpose=purpose,
+            path=raw_asset_id,
+            root=getattr(project, "project_dir", "") or "",
+            reason=str(exc),
+        )
+        return ""
+
+
 def _ensure_asset_folder(project: TimelineProject, folder: str) -> None:
     normalized = _normalize_asset_folder(folder)
     if not normalized:
@@ -185,24 +205,58 @@ def _scene_resolution(project: TimelineProject, scene: Scene) -> tuple[int, int]
     return max(1, int(width or 1)), max(1, int(height or 1))
 
 
-def _media_output_dir(project_dir: str, folder: str) -> str:
-    media_dir = os.path.join(project_dir, "media")
+def _media_output_rel_path(folder: str, filename: str = "") -> str:
     components = _safe_folder_components(folder)
-    output_dir = os.path.join(media_dir, *components) if components else media_dir
+    parts = ["media", *components]
+    if filename:
+        parts.append(filename)
+    return os.path.join(*parts)
+
+
+def _media_output_dir(project_dir: str, folder: str) -> str:
+    output_dir = resolve_project_path(
+        project_dir,
+        _media_output_rel_path(folder),
+        purpose="timeline export media output directory",
+    )
+    if not output_dir:
+        raise ValueError("Invalid timeline export media output directory")
     os.makedirs(output_dir, exist_ok=True)
     return output_dir
 
 
+def _media_output_path(project_dir: str, folder: str, filename: str, *, purpose: str) -> str:
+    output_path = resolve_project_path(
+        project_dir,
+        _media_output_rel_path(folder, filename),
+        purpose=purpose,
+    )
+    if not output_path:
+        raise ValueError(f"Invalid {purpose}")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    return output_path
+
+
 def _output_path(project_dir: str, scene: Scene, prefix: str, extension: str, folder: str) -> str:
-    output_dir = _media_output_dir(project_dir, folder)
     safe_prefix = _safe_filename_component(prefix, "export")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = f"{safe_prefix}_{_scene_slug(scene)}_{timestamp}_{uuid.uuid4().hex[:6]}{extension}"
-    return os.path.join(output_dir, filename)
+    return _media_output_path(project_dir, folder, filename, purpose="timeline export output path")
 
 
 def _rel_media_path(project_dir: str, output_path: str) -> str:
-    return os.path.relpath(output_path, project_dir).replace("\\", "/")
+    project_real = os.path.realpath(project_dir)
+    output_real = os.path.realpath(output_path)
+    rel_path = os.path.relpath(output_real, project_real).replace("\\", "/")
+    resolved = resolve_project_path(
+        project_dir,
+        rel_path,
+        purpose="timeline export relative media path",
+        log=False,
+    )
+    if not resolved or os.path.normcase(os.path.realpath(resolved)) != os.path.normcase(output_real):
+        raise ValueError("Timeline export output escaped project")
+    return rel_path
 
 
 def _hidden_lane_indexes(configs: list) -> set[int]:
@@ -248,7 +302,11 @@ def _audio_sources(project: TimelineProject, scene: Scene, start: int, end: int)
         if overlap_end <= overlap_start:
             continue
         source_path = str(getattr(track, "source_path", "") or "")
-        abs_path = source_path if os.path.isfile(source_path) else os.path.join(project.project_dir, source_path)
+        abs_path = resolve_existing_project_path(
+            project,
+            source_path,
+            purpose="timeline export audio source",
+        )
         if not os.path.isfile(abs_path):
             continue
         asset = next((item for item in project.assets if item.path == source_path), None)
@@ -379,12 +437,24 @@ def _place_embedded_audio_take(
     if not getattr(video_asset, "has_audio", False):
         return None
 
-    video_path = os.path.join(project.project_dir, video_asset.path)
+    video_path = resolve_existing_project_path(
+        project,
+        video_asset.path,
+        purpose=f"timeline export embedded audio source {getattr(video_asset, 'asset_id', '') or '(unknown)'}",
+    )
     if not os.path.isfile(video_path):
         return None
 
-    audio_filename = f"{video_asset.asset_id}_audio.wav"
-    audio_abs_path = os.path.join(_media_output_dir(project.project_dir, folder), audio_filename)
+    audio_key = _safe_asset_token(project, video_asset, purpose="timeline export embedded audio asset id")
+    if not audio_key:
+        return None
+    audio_filename = f"{audio_key}_audio.wav"
+    audio_abs_path = _media_output_path(
+        project.project_dir,
+        folder,
+        audio_filename,
+        purpose="timeline export embedded audio output path",
+    )
     audio_rel_path = _rel_media_path(project.project_dir, audio_abs_path)
     if cleanup_paths is not None:
         cleanup_paths.append(audio_abs_path)
@@ -500,8 +570,18 @@ def _register_export_asset(
         _ensure_asset_folder(project, asset.folder)
     project.modified_at = datetime.now().isoformat()
     try:
-        thumb_path = os.path.join(project.project_dir, "cache", "thumbnails", f"{asset.asset_id}.png")
-        ensure_thumbnail(asset.asset_type, output_path, thumb_path)
+        cache_key = _safe_asset_token(project, asset, purpose="timeline export thumbnail asset id")
+        thumb_path = (
+            resolve_project_path(
+                project,
+                os.path.join("cache", "thumbnails", f"{cache_key}.png"),
+                purpose="timeline export thumbnail path",
+            )
+            if cache_key
+            else ""
+        )
+        if thumb_path:
+            ensure_thumbnail(asset.asset_type, output_path, thumb_path)
     except Exception as exc:
         logger.warning("Failed to generate export thumbnail for %s: %s", output_path, exc)
     return asset
@@ -680,7 +760,13 @@ class TimelineExportManager:
                 audio_spec = audio_only_export_spec(preset_id, custom_options)
                 extension = audio_spec["extension"]
             final_output_path = _output_path(project.project_dir, scene, job.request["filename_prefix"], extension, folder)
-            temp_output_path = f"{os.path.splitext(final_output_path)[0]}.{job.job_id}.tmp{extension}"
+            temp_filename = f"{os.path.splitext(os.path.basename(final_output_path))[0]}.{job.job_id}.tmp{extension}"
+            temp_output_path = _media_output_path(
+                project.project_dir,
+                folder,
+                temp_filename,
+                purpose="timeline export temp output path",
+            )
             cleanup_paths.append(temp_output_path)
             cleanup_paths.append(final_output_path)
 

@@ -1529,7 +1529,9 @@ export class EditorWidget {
 
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets?${this._assetListQueryString()}`));
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/sync?${this._assetListQueryString()}`), {
+                method: "POST",
+            });
             if (resp.ok) {
                 const data = await resp.json();
                 this.assets = { video: [], image: [], audio: [], artifact: [] };
@@ -1869,7 +1871,11 @@ export class EditorWidget {
                 display: flex; align-items: center; gap: 4px; margin-top: 4px;
             `;
             const collapsed = this._collapsedFolders?.[folderName] ?? false;
-            folderHeader.innerHTML = `<span>${collapsed ? "▸" : "▾"}</span> 📁 ${folderName} (${folders[folderName].length})`;
+            const marker = document.createElement("span");
+            marker.textContent = collapsed ? "▸" : "▾";
+            const label = document.createElement("span");
+            label.textContent = `📁 ${folderName} (${folders[folderName].length})`;
+            folderHeader.replaceChildren(marker, label);
             folderHeader.addEventListener("click", () => {
                 if (!this._collapsedFolders) this._collapsedFolders = {};
                 this._collapsedFolders[folderName] = !this._collapsedFolders[folderName];

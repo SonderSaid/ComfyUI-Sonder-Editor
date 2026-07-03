@@ -10,6 +10,7 @@ import torch
 
 from .atomic_io import atomic_replace
 from .media_helpers import fit_frame_to_canvas, get_ffmpeg_path, run_ffmpeg_command
+from .path_security import resolve_existing_project_path, resolve_project_path
 from .timeline_state import Scene, TimelineProject
 
 logger = logging.getLogger("sonder_editor")
@@ -25,10 +26,11 @@ def _check_cancel(cancel_event) -> None:
 
 
 def _resolve_project_media_path(project: TimelineProject, source_path: str) -> str:
-    source_path = str(source_path or "")
-    if source_path and os.path.isfile(source_path):
-        return source_path
-    return os.path.join(project.project_dir, source_path)
+    return resolve_existing_project_path(
+        project,
+        source_path,
+        purpose="timeline media source",
+    )
 
 
 def _scene_resolution(project: TimelineProject, scene: Scene) -> tuple[int, int]:
@@ -76,6 +78,9 @@ def iter_scene_frames(
 
     def get_cap(source_path: str):
         abs_path = _resolve_project_media_path(project, source_path)
+        if not abs_path:
+            logger.info("Skipping render clip %s: file not found or quarantined", source_path)
+            return None
         if abs_path not in captures:
             cap = video_capture_factory(abs_path)
             if cap.isOpened():
@@ -152,11 +157,15 @@ def render_scene_frames(
     if num_frames <= 0:
         return torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
 
-    cache_dir = os.path.join(project.project_dir, "cache", "renders")
     content_hash = scene.content_hash(render_start, render_end, project.resolution)
-    cache_path = os.path.join(cache_dir, f"{scene.scene_id}_{content_hash}.pt")
+    cache_filename = f"{scene.scene_id}_{content_hash}.pt"
+    cache_path = resolve_project_path(
+        project,
+        os.path.join("cache", "renders", cache_filename),
+        purpose="timeline render cache file",
+    )
 
-    if os.path.isfile(cache_path):
+    if cache_path and os.path.isfile(cache_path):
         _check_cancel(cancel_event)
         try:
             cached = torch.load(cache_path, weights_only=True)
@@ -184,8 +193,21 @@ def render_scene_frames(
     arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
     tensor = torch.from_numpy(arr)
 
+    cache_dir = resolve_project_path(
+        project,
+        os.path.join("cache", "renders"),
+        purpose="timeline render cache root",
+    )
+    tmp_path = ""
+    if cache_dir and cache_path:
+        tmp_path = resolve_project_path(
+            project,
+            os.path.join("cache", "renders", f".{scene.scene_id}_{content_hash}_{uuid.uuid4().hex[:8]}.tmp"),
+            purpose="timeline render cache temp file",
+        )
+    if not cache_dir or not cache_path or not tmp_path:
+        return tensor
     os.makedirs(cache_dir, exist_ok=True)
-    tmp_path = os.path.join(cache_dir, f".{scene.scene_id}_{content_hash}_{uuid.uuid4().hex[:8]}.tmp")
     try:
         _check_cancel(cancel_event)
         torch.save(tensor, tmp_path)
