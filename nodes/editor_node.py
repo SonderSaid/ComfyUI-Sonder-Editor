@@ -18,7 +18,12 @@ import folder_paths
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 from ..server.media_helpers import decode_audio_samples, decode_video_frame, fit_frame_to_canvas
-from ..server.path_security import resolve_existing_project_path
+from ..server.path_security import (
+    PathSecurityError,
+    path_within,
+    resolve_existing_project_path,
+    safe_route_token,
+)
 from ..server.timeline_renderer import render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
@@ -42,6 +47,19 @@ def _coerce_int(value, default: int = 0) -> int:
 
 def _get_projects_base_dir():
     return os.path.join(folder_paths.get_output_directory(), "sonder-projects")
+
+
+def _resolve_project_choice_dir(base_dir: str, project: str) -> str:
+    try:
+        project_id = safe_route_token(project, "project")
+    except PathSecurityError as exc:
+        raise ValueError(str(exc)) from exc
+
+    base_real = os.path.realpath(base_dir)
+    project_dir = os.path.realpath(os.path.join(base_real, project_id))
+    if not path_within(base_real, project_dir):
+        raise ValueError("Project path escapes configured base directory")
+    return project_dir
 
 
 def _list_project_choices():
@@ -553,7 +571,7 @@ class SonderEditor:
                     base_dir=base_dir,
                 )
             else:
-                project_dir = os.path.join(base_dir, project)
+                project_dir = _resolve_project_choice_dir(base_dir, project)
                 proj = load_project(project_dir)
 
             proj_fps = proj.fps

@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from ..server.media_helpers import decode_video_range, fit_frame_to_canvas
-from ..server.path_security import resolve_existing_project_path, resolve_project_path
+from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig
 
 logger = logging.getLogger(__name__)
@@ -240,6 +240,27 @@ def _project_dir_value(project_or_dir) -> str:
     return getattr(project_or_dir, "project_dir", "") or ""
 
 
+def _projects_base_dir() -> str:
+    try:
+        import folder_paths
+
+        base = os.path.join(folder_paths.get_output_directory(), "sonder-projects")
+    except Exception:
+        return ""
+    return os.path.realpath(base) if base else ""
+
+
+def _validated_driver_project_dir(project_dir: str) -> str:
+    raw = str(project_dir or "")
+    if not raw or "\x00" in raw:
+        return ""
+    base_dir = _projects_base_dir()
+    if not base_dir:
+        return ""
+    project_real = os.path.realpath(raw)
+    return project_real if path_within(base_dir, project_real) else ""
+
+
 def _abs_driver_path(project_or_dir, source_path: str) -> str:
     return resolve_existing_project_path(
         _project_dir_value(project_or_dir),
@@ -449,8 +470,12 @@ def decode_driver_ref(driver_ref) -> dict[str, Any]:
         raise RuntimeError("Driver ref is marked present but contains no positive overlap.")
 
     clip = ClipReference.from_dict(clip_data)
+    project_dir = _validated_driver_project_dir(str(ref.get("project_dir", "") or ""))
+    if not project_dir:
+        raise RuntimeError("Driver project directory is outside the configured project base.")
+
     images = _decode_driver_clip(
-        str(ref.get("project_dir", "") or ""),
+        project_dir,
         clip,
         _coerce_int(ref.get("overlap_start"), 0),
         overlap_len,

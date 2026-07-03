@@ -1,5 +1,6 @@
 """Tests for shared media helpers."""
 
+import builtins
 import os
 import sys
 import types
@@ -7,6 +8,7 @@ import wave
 
 import numpy as np
 import cv2
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,6 +30,38 @@ def _portrait(w=2, h=4, value=255):
 def test_default_mode_is_pad_edge():
     assert DEFAULT_FIT_MODE == "pad_edge"
     assert DEFAULT_CROP_POSITION == "center"
+
+
+def test_find_ffmpeg_does_not_pip_install_when_imageio_ffmpeg_missing(monkeypatch):
+    real_import = builtins.__import__
+    install_calls = []
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"imageio_ffmpeg", "folder_paths"}:
+            raise ImportError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(media_helpers.shutil, "which", lambda _name: "")
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(media_helpers.os.path, "isfile", lambda _path: False)
+    monkeypatch.setattr(media_helpers.os.path, "isdir", lambda _path: False)
+    monkeypatch.setattr(
+        media_helpers.subprocess,
+        "check_call",
+        lambda *args, **kwargs: install_calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    assert media_helpers._find_ffmpeg() == ""
+    assert install_calls == []
+
+
+def test_get_ffmpeg_path_reports_clear_install_time_dependency_error(monkeypatch):
+    monkeypatch.setattr(media_helpers, "_FFMPEG_PATH", None)
+    monkeypatch.setattr(media_helpers, "_find_ffmpeg", lambda: "")
+
+    with pytest.raises(RuntimeError, match="imageio-ffmpeg"):
+        media_helpers.get_ffmpeg_path()
 
 
 def test_fit_mode_letterboxes_with_black_bars_and_inner_bounds():

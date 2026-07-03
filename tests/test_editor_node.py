@@ -203,6 +203,56 @@ def _patch_render_and_audio(editor_node, monkeypatch):
     )
 
 
+def test_editor_project_choice_resolves_existing_project_under_base(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project_manager = importlib.import_module(f"{TEST_PACKAGE}.server.project_manager")
+    base_dir = tmp_path / "sonder-projects"
+    base_dir.mkdir()
+    project = project_manager.create_project("Valid Project", base_dir=str(base_dir))
+
+    resolved = editor_node._resolve_project_choice_dir(
+        str(base_dir),
+        os.path.basename(project.project_dir),
+    )
+
+    assert os.path.samefile(resolved, project.project_dir)
+
+
+@pytest.mark.parametrize(
+    "project_token",
+    [
+        "../outside",
+        r"C:\outside\project",
+        "/outside/project",
+        "bad%2fproject",
+        "bad:project",
+    ],
+)
+def test_editor_project_choice_rejects_malformed_project_tokens(tmp_path, monkeypatch, project_token):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    base_dir = tmp_path / "sonder-projects"
+    base_dir.mkdir()
+
+    with pytest.raises(ValueError):
+        editor_node._resolve_project_choice_dir(str(base_dir), project_token)
+
+
+def test_editor_execute_rejects_missing_project_after_token_validation(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    base_dir = tmp_path / "sonder-projects"
+    base_dir.mkdir()
+    monkeypatch.setattr(editor_node, "_get_projects_base_dir", lambda: str(base_dir))
+
+    with pytest.raises(FileNotFoundError, match="No project.json found"):
+        editor_node.SonderEditor().execute(
+            project="Missing-Project",
+            project_name="Ignored",
+            fps=24.0,
+            width=768,
+            height=512,
+        )
+
+
 def _execute_constraint_test(editor_node, project, monkeypatch):
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
     _patch_render_and_audio(editor_node, monkeypatch)

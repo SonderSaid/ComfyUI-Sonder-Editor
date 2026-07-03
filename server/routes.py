@@ -32,6 +32,7 @@ from .path_security import (
     normalize_project_relative_path,
     log_path_quarantine,
     path_within as _security_path_within,
+    project_media_path,
     project_media_root,
     resolve_comfy_input_path,
     resolve_project_path,
@@ -2364,9 +2365,18 @@ def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
     asset_path = getattr(asset, "path", "") or ""
     if not asset_path:
         return ""
-    return resolve_project_path(
+    normalized = str(asset_path).replace("\\", "/").strip("/")
+    if not normalized.startswith("media/"):
+        log_path_quarantine(
+            purpose=f"asset source {getattr(asset, 'asset_id', '') or '(unknown)'}",
+            path=asset_path,
+            root=getattr(project, "project_dir", "") or "",
+            reason="asset source outside project media directory",
+        )
+        return ""
+    return project_media_path(
         project,
-        asset_path,
+        normalized,
         purpose=f"asset source {getattr(asset, 'asset_id', '') or '(unknown)'}",
     )
 
@@ -2374,6 +2384,19 @@ def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
 def _asset_missing(project: TimelineProject, asset: Asset) -> bool:
     source_path = _asset_abspath(project, asset)
     return not source_path or not os.path.isfile(source_path)
+
+
+def _require_asset_media_source(project: TimelineProject, asset: Asset, *, operation: str) -> str:
+    source_path = _asset_abspath(project, asset)
+    if not source_path:
+        asset_id = getattr(asset, "asset_id", "") or "(unknown)"
+        raise ValueError(f"{operation} requires asset source under project media: {asset_id}")
+    return source_path
+
+
+def _require_asset_media_sources(project: TimelineProject, assets, *, operation: str) -> None:
+    for asset in assets:
+        _require_asset_media_source(project, asset, operation=operation)
 
 
 def _normalize_project_relpath(path: str) -> str:
@@ -2460,9 +2483,15 @@ def _project_thumbnail_snapshot(project: TimelineProject) -> dict[str, dict]:
 
 def _project_asset_for_source_path(project: TimelineProject, source_path: str) -> Asset | None:
     normalized = _normalize_project_relpath(source_path)
-    abs_source = resolve_project_path(project, source_path, purpose="asset lookup", log=False)
+    if not normalized.startswith("media/"):
+        return None
+    abs_source = project_media_path(project, source_path, purpose="asset lookup", log=False)
+    if not abs_source:
+        return None
     for asset in getattr(project, "assets", []) or []:
         asset_path = getattr(asset, "path", "") or ""
+        if not _normalize_project_relpath(asset_path).startswith("media/"):
+            continue
         if _normalize_project_relpath(asset_path) == normalized:
             return asset
         try:
@@ -3657,7 +3686,8 @@ def _project_trashed_assets(project: TimelineProject) -> list[Asset]:
     return [asset for asset in project.assets if _asset_is_trashed(asset)]
 
 
-def _trash_project_asset(asset: Asset) -> dict:
+def _trash_project_asset(project: TimelineProject, asset: Asset) -> dict:
+    _require_asset_media_source(project, asset, operation="Asset trash")
     if not _asset_is_trashed(asset):
         asset.trash_previous_folder = _normalize_asset_folder(getattr(asset, "folder", ""))
     asset.folder = ""
@@ -4012,8 +4042,8 @@ def _asset_cache_file_paths(project: TimelineProject, asset: Asset) -> list[str]
 
 
 def _delete_asset_source_file(project: TimelineProject, asset: Asset, excluded_asset_ids: set[str] | None = None) -> None:
-    source_path = _asset_abspath(project, asset)
-    if not source_path or not os.path.isfile(source_path):
+    source_path = _require_asset_media_source(project, asset, operation="Asset delete")
+    if not os.path.isfile(source_path):
         return
 
     excluded = excluded_asset_ids or set()
@@ -4066,6 +4096,12 @@ def _purge_expired_trashed_assets(
             try:
                 _delete_project_asset(project, asset)
                 changed = True
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping trashed asset purge for quarantined source %s: %s",
+                    getattr(asset, "path", ""),
+                    exc,
+                )
             except PermissionError:
                 logger.warning("Permission denied purging trashed asset: %s", getattr(asset, "path", ""))
 
@@ -4098,6 +4134,12 @@ def _purge_expired_trashed_assets(
             _delete_project_asset(project, asset)
             total_size -= sizes.get(asset.asset_id, 0)
             changed = True
+        except ValueError as exc:
+            logger.warning(
+                "Skipping trashed asset purge by size cap for quarantined source %s: %s",
+                getattr(asset, "path", ""),
+                exc,
+            )
         except PermissionError:
             logger.warning("Permission denied purging trashed asset by size cap: %s", getattr(asset, "path", ""))
     return changed
@@ -4163,8 +4205,9 @@ def _trash_project_asset_folder(project: TimelineProject, folder: str) -> tuple[
         raise FileNotFoundError(f"Folder not found: {current}")
 
     assets_to_trash = _find_assets_in_folder(project, current)
+    _require_asset_media_sources(project, assets_to_trash, operation="Asset folder trash")
     for asset in assets_to_trash:
-        _trash_project_asset(asset)
+        _trash_project_asset(project, asset)
 
     remaining_folders = [
         candidate for candidate in all_folders
@@ -4185,6 +4228,7 @@ def _delete_project_asset_folder(project: TimelineProject, folder: str) -> tuple
         raise FileNotFoundError(f"Folder not found: {current}")
 
     assets_to_delete = _find_assets_in_folder(project, current)
+    _require_asset_media_sources(project, assets_to_delete, operation="Asset folder delete")
     deleted_ids = {asset.asset_id for asset in assets_to_delete}
     for asset in assets_to_delete:
         _delete_asset_source_file(project, asset, deleted_ids)
@@ -4215,6 +4259,7 @@ def _update_asset_references_for_path(project: TimelineProject, old_path: str, n
 
 
 def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: str) -> Asset:
+    old_abs_path = _require_asset_media_source(project, asset, operation="Asset replace")
     resolved_source = _resolve_source_path(source_path)
     if not resolved_source or not os.path.isfile(resolved_source):
         raise FileNotFoundError(f"File not found: {source_path}")
@@ -4234,7 +4279,6 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     os.makedirs(media_dir, exist_ok=True)
 
     old_rel_path = asset.path
-    old_abs_path = _asset_abspath(project, asset)
     old_ext = os.path.splitext(old_rel_path or "")[1].lower()
     new_ext = os.path.splitext(resolved_source)[1].lower()
 
@@ -5251,9 +5295,13 @@ if routes is not None:
             return _json_error(str(e), 400)
 
         trashed_ids = []
-        for asset in assets:
-            _trash_project_asset(asset)
-            trashed_ids.append(asset.asset_id)
+        try:
+            _require_asset_media_sources(project, assets, operation="Asset bulk trash")
+            for asset in assets:
+                _trash_project_asset(project, asset)
+                trashed_ids.append(asset.asset_id)
+        except ValueError as e:
+            return _json_error(str(e), 400)
         save_project(project)
         return web.json_response({
             "trashed": trashed_ids,
@@ -5344,6 +5392,8 @@ if routes is not None:
 
         try:
             payload = _delete_project_asset(project, asset, usage["usage_count"])
+        except ValueError as e:
+            return _json_error(str(e), 400)
         except OSError as e:
             return _json_error(str(e), 500)
 
@@ -5380,9 +5430,12 @@ if routes is not None:
 
         deleted_ids = []
         try:
+            _require_asset_media_sources(project, assets, operation="Asset bulk delete")
             for asset in assets:
                 _delete_project_asset(project, asset)
                 deleted_ids.append(asset.asset_id)
+        except ValueError as e:
+            return _json_error(str(e), 400)
         except OSError as e:
             return _json_error(str(e), 500)
 
@@ -5401,9 +5454,13 @@ if routes is not None:
 
         deleted_ids = []
         try:
-            for asset in list(_project_trashed_assets(project)):
+            trashed_assets = list(_project_trashed_assets(project))
+            _require_asset_media_sources(project, trashed_assets, operation="Asset empty trash")
+            for asset in trashed_assets:
                 _delete_project_asset(project, asset)
                 deleted_ids.append(asset.asset_id)
+        except ValueError as e:
+            return _json_error(str(e), 400)
         except OSError as e:
             return _json_error(str(e), 500)
 
@@ -5485,7 +5542,10 @@ if routes is not None:
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
-        payload = _trash_project_asset(asset)
+        try:
+            payload = _trash_project_asset(project, asset)
+        except ValueError as e:
+            return _json_error(str(e), 400)
         save_project(project)
         return web.json_response(payload)
 

@@ -37,7 +37,7 @@ def _make_project(tmp_path, monkeypatch, *, lane_count=2, clip_lane=0, hidden=Fa
     bridge = _import_driver_bridge(tmp_path, monkeypatch)
     timeline_state = _timeline_state()
 
-    project_dir = tmp_path / "project"
+    project_dir = tmp_path / "sonder-projects" / "project"
     media_dir = project_dir / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
     (media_dir / "driver.mp4").write_bytes(b"driver")
@@ -281,6 +281,21 @@ def test_driver_bridge_decode_failure_for_effective_clip_raises(tmp_path, monkey
     assert has_driver == 1
 
     with pytest.raises(RuntimeError, match="Driver media not found"):
+        bridge.SonderDriverBridge().execute(driver_ref)
+
+
+def test_driver_bridge_rejects_forged_project_dir_outside_configured_base(tmp_path, monkeypatch):
+    bridge, _timeline_state, project, _scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(project, driver_lane_index=0)
+    outside_project = tmp_path / "outside-project"
+    outside_media = outside_project / "media"
+    outside_media.mkdir(parents=True)
+    (outside_media / "driver.mp4").write_bytes(b"outside")
+    driver_ref["project_dir"] = str(outside_project)
+
+    assert has_driver == 1
+    with pytest.raises(RuntimeError, match="outside the configured project base"):
         bridge.SonderDriverBridge().execute(driver_ref)
 
 

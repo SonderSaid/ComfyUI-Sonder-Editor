@@ -240,6 +240,51 @@ def test_replace_asset_accepts_comfy_input_handle(tmp_path, monkeypatch):
     assert (media_dir / "clip.mp4").read_bytes() == b"new"
 
 
+def test_delete_asset_rejects_registered_non_media_source_path(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    protected = project_dir / "project.json"
+    protected.write_bytes(b"protected")
+    asset = Asset(asset_id="asset-1", asset_type="video", path="project.json")
+    project = TimelineProject(project_dir=str(project_dir), assets=[asset])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda *_args, **_kwargs: pytest.fail("save should not run"))
+
+    handler = _route_handler(route_module, "DELETE", "/sonder-editor/project/{project_id}/assets/{asset_id}")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "asset_id": "asset-1"},
+    )))
+
+    assert response.status == 400
+    assert "under project media" in _response_json(response)["error"]
+    assert asset.trashed_at == ""
+    assert protected.read_bytes() == b"protected"
+
+
+def test_replace_asset_rejects_registered_non_media_source_path(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    protected = project_dir / "project.json"
+    protected.write_bytes(b"protected")
+    asset = Asset(asset_id="asset-1", asset_type="video", path="project.json")
+    project = TimelineProject(project_dir=str(project_dir), assets=[asset])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda _request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda *_args, **_kwargs: pytest.fail("save should not run"))
+
+    handler = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/assets/{asset_id}/replace")
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "project", "asset_id": "asset-1"},
+        body={"source_path": "replacement.mp4"},
+    )))
+
+    assert response.status == 400
+    assert "under project media" in _response_json(response)["error"]
+    assert asset.path == "project.json"
+    assert protected.read_bytes() == b"protected"
+
+
 def test_extract_frame_rejects_unregistered_absolute_source(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project = TimelineProject(project_dir=str(tmp_path / "project"))

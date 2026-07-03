@@ -178,23 +178,7 @@ def _find_ffmpeg() -> str:
         if path and os.path.isfile(path):
             return path
     except ImportError:
-        logger.info("imageio-ffmpeg not found, attempting to install...")
-        try:
-            import sys
-
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "imageio-ffmpeg"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=120,
-            )
-            import imageio_ffmpeg
-
-            path = imageio_ffmpeg.get_ffmpeg_exe()
-            if path and os.path.isfile(path):
-                return path
-        except Exception as exc:
-            logger.warning("Failed to install imageio-ffmpeg: %s", exc)
+        logger.info("imageio-ffmpeg is not installed; falling back to local ffmpeg candidates.")
     except Exception:
         pass
 
@@ -230,13 +214,18 @@ def _find_ffmpeg() -> str:
         r"C:\ffmpeg\bin\ffmpeg.exe",
         os.path.expanduser(r"~\ffmpeg\bin\ffmpeg.exe"),
     ])
-    return _first_existing_path(candidates) or "ffmpeg"
+    return _first_existing_path(candidates)
 
 
 def get_ffmpeg_path() -> str:
     global _FFMPEG_PATH
     if _FFMPEG_PATH is None:
         _FFMPEG_PATH = _find_ffmpeg()
+    if not _FFMPEG_PATH:
+        raise RuntimeError(
+            "FFmpeg is not available. Install this custom node's requirements "
+            "(including imageio-ffmpeg) or add ffmpeg to PATH."
+        )
     return _FFMPEG_PATH
 
 

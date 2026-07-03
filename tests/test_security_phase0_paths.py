@@ -82,7 +82,7 @@ def test_resolve_project_path_returns_empty_and_logs_for_hostile_path(tmp_path, 
     assert "Security quarantine" in caplog.text
 
 
-def test_asset_abspath_quarantines_absolute_paths_and_delete_skips_external_file(tmp_path):
+def test_asset_abspath_quarantines_absolute_paths_and_delete_refuses_asset(tmp_path):
     project_dir = tmp_path / "project"
     project_dir.mkdir()
     external = tmp_path / "external.mp4"
@@ -92,10 +92,29 @@ def test_asset_abspath_quarantines_absolute_paths_and_delete_skips_external_file
 
     assert routes._asset_abspath(project, asset) == ""
 
-    routes._delete_project_asset(project, asset)
+    with pytest.raises(ValueError, match="under project media"):
+        routes._delete_project_asset(project, asset)
 
     assert external.exists()
-    assert project.get_asset("asset-1") is None
+    assert project.get_asset("asset-1") is asset
+
+
+def test_asset_operations_reject_project_contained_non_media_source(tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    protected = project_dir / "project.json"
+    protected.write_bytes(b"protected")
+    asset = Asset(asset_id="asset-1", path="project.json", asset_type="video")
+    project = TimelineProject(project_dir=str(project_dir), assets=[asset])
+
+    assert routes._asset_abspath(project, asset) == ""
+    assert routes._project_asset_for_source_path(project, "project.json") is None
+
+    with pytest.raises(ValueError, match="under project media"):
+        routes._delete_project_asset(project, asset)
+
+    assert protected.read_bytes() == b"protected"
+    assert project.get_asset("asset-1") is asset
 
 
 def _make_hostile_asset_id_project(tmp_path, *, trashed: bool = False, folder: str = ""):
@@ -162,6 +181,65 @@ def test_trash_purge_skips_hostile_asset_id_cache_paths(tmp_path):
     assert changed is True
     assert project.get_asset(asset.asset_id) is None
     assert all(path.exists() for path in external_files)
+
+
+def test_trash_purge_skips_quarantined_non_media_asset_source(tmp_path, caplog):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    protected = project_dir / "project.json"
+    protected.write_bytes(b"protected")
+    asset = Asset(
+        asset_id="asset-1",
+        path="project.json",
+        asset_type="video",
+        trashed_at=(datetime.now() - timedelta(days=1)).isoformat(),
+    )
+    project = TimelineProject(project_dir=str(project_dir), assets=[asset])
+    caplog.set_level(logging.WARNING, logger="sonder_editor")
+
+    changed = routes._purge_expired_trashed_assets(project, retention_days=0)
+
+    assert changed is False
+    assert project.get_asset("asset-1") is asset
+    assert protected.read_bytes() == b"protected"
+    assert "Skipping trashed asset purge for quarantined source" in caplog.text
+
+
+def test_trash_size_cap_skips_quarantined_non_media_asset_and_continues(tmp_path, caplog):
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True)
+    protected = project_dir / "project.json"
+    protected.write_bytes(b"protected")
+    valid_path = media_dir / "valid.mp4"
+    valid_path.write_bytes(b"x" * 100)
+    quarantined = Asset(
+        asset_id="quarantined",
+        path="project.json",
+        asset_type="video",
+        trashed_at=(datetime.now() - timedelta(days=2)).isoformat(),
+    )
+    valid = Asset(
+        asset_id="valid",
+        path="media/valid.mp4",
+        asset_type="video",
+        trashed_at=(datetime.now() - timedelta(days=1)).isoformat(),
+    )
+    project = TimelineProject(project_dir=str(project_dir), assets=[quarantined, valid])
+    caplog.set_level(logging.WARNING, logger="sonder_editor")
+
+    changed = routes._purge_expired_trashed_assets(
+        project,
+        retention_days=30,
+        max_size_mb=0,
+    )
+
+    assert changed is True
+    assert project.get_asset("quarantined") is quarantined
+    assert project.get_asset("valid") is None
+    assert protected.read_bytes() == b"protected"
+    assert not valid_path.exists()
+    assert "Skipping trashed asset purge by size cap for quarantined source" in caplog.text
 
 
 def test_prepare_video_audio_asset_skips_hostile_asset_id_destination(tmp_path, monkeypatch):
