@@ -1,7 +1,9 @@
 import asyncio
 import copy
 import os
+import re
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -19,6 +21,7 @@ from server.project_manager import (
     save_project,
 )
 from server.session_registry import (
+    WIDGET_FIELD_NAMES,
     claim_session,
     create_handoff,
     get_canvas_host,
@@ -834,6 +837,47 @@ def test_widget_state_is_scoped_by_source_node_and_whitelisted():
         assert node_b["state"]["scene_id"] == "scene-b"
 
     asyncio.run(run())
+
+
+def test_take_placement_link_mute_fields_relay():
+    async def run():
+        project_id = "phase-8-take-placement-relay"
+        await release_session(project_id, "cleanup", force=True, host_id="host-a")
+
+        seeded = await seed_widget_state(project_id, "node-a", "session-a", {
+            "take_placement_mode": "untrimmed",
+            "take_placement_linked": False,
+            "take_placement_muted": True,
+        }, host_id="host-a")
+        assert seeded["values"] == {
+            "take_placement_mode": "untrimmed",
+            "take_placement_linked": False,
+            "take_placement_muted": True,
+        }
+
+        await update_widget_state(project_id, "node-a", "", {
+            "take_placement_linked": True,
+            "take_placement_muted": False,
+        }, host_id="host-a")
+
+        state = (await get_widget_state(project_id, "node-a", host_id="host-a"))["state"]
+        assert state["take_placement_linked"] is True
+        assert state["take_placement_muted"] is False
+
+    asyncio.run(run())
+
+
+def test_widget_allowlist_matches_frontend_editor_widget_fields():
+    # The relayed field list exists in two places: EDITOR_WIDGET_FIELDS
+    # (canvas seed source + apply filter) and the server allowlist that
+    # _clean_widget_values enforces. A field present on only one side is
+    # silently dropped in relay (the mounted-tab take link/mute bug).
+    controller_js = Path(__file__).resolve().parents[1] / "web" / "js" / "editor_node_controller.js"
+    source = controller_js.read_text(encoding="utf-8")
+    match = re.search(r"EDITOR_WIDGET_FIELDS\s*=\s*\[(.*?)\]", source, re.DOTALL)
+    assert match, "EDITOR_WIDGET_FIELDS not found in editor_node_controller.js"
+    frontend_fields = set(re.findall(r'"([^"]+)"', match.group(1)))
+    assert frontend_fields == WIDGET_FIELD_NAMES
 
 
 def test_canvas_host_presence_is_source_node_scoped():

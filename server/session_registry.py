@@ -25,6 +25,8 @@ WIDGET_FIELD_NAMES = {
     "mask_pre_offset",
     "mask_post_offset",
     "take_placement_mode",
+    "take_placement_linked",
+    "take_placement_muted",
     "render_queue_active",
 }
 
