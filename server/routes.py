@@ -168,16 +168,20 @@ def _apply_sonder_security_headers(request: web.Request, response: web.StreamRes
     return response
 
 
+def _cross_origin_blocked_response(request: web.Request) -> web.StreamResponse:
+    response = web.json_response(
+        {"error": "Cross-origin Sonder Editor request blocked", "code": "cross_origin_blocked"},
+        status=403,
+    )
+    return _apply_sonder_security_headers(request, response)
+
+
 @web.middleware
 async def _sonder_security_middleware(request: web.Request, handler):
     path = str(getattr(request, "path", "") or "")
     method = str(getattr(request, "method", "") or "").upper()
     if path.startswith("/sonder-editor/") and method in _SONDER_MUTATING_METHODS and not _same_origin_request(request):
-        response = web.json_response(
-            {"error": "Cross-origin Sonder Editor request blocked", "code": "cross_origin_blocked"},
-            status=403,
-        )
-        return _apply_sonder_security_headers(request, response)
+        return _cross_origin_blocked_response(request)
     response = await handler(request)
     return _apply_sonder_security_headers(request, response)
 
@@ -7285,7 +7289,9 @@ if routes is not None:
     # -----------------------------------------------------------------------
 
     @routes.get("/sonder-editor/ws")
-    async def api_websocket(request: web.Request) -> web.WebSocketResponse:
+    async def api_websocket(request: web.Request) -> web.StreamResponse:
+        if not _same_origin_request(request):
+            return _cross_origin_blocked_response(request)
         remember_event_loop()
         ws = web.WebSocketResponse()
         await ws.prepare(request)
