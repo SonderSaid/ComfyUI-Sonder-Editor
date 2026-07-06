@@ -58,8 +58,8 @@ def test_bridge_live_resolution_with_ctx_window():
     assert payload["source"] == "live"
     assert payload["global_prompt"] == "global style"
     # Rebased real frames: walks covers [0,10), runs holds [10,40)
-    assert payload["smart_prompt"] == "[VISUAL]: walks [0-10] | [VISUAL]: runs [10-40]"
-    assert payload["local_prompts"] == "[VISUAL]: walks | [VISUAL]: runs"
+    assert payload["smart_prompt"] == "walks [0-10] | runs [10-40]"
+    assert payload["local_prompts"] == "walks | runs"
     assert payload["segment_lengths"] == "10,30"
 
 
@@ -89,7 +89,7 @@ def test_bridge_respects_boundary_threshold():
     project._execution_context = {"scene_id": "scene-1", "context_start": 0, "context_end": 42}
 
     payload = prompt_bridge.build_window_relay_payload(project)
-    assert payload["local_prompts"] == "[VISUAL]: a"
+    assert payload["local_prompts"] == "a"
     assert payload["segment_lengths"] == "42"
 
 
@@ -146,7 +146,7 @@ def test_bridge_legacy_v1_snapshot_flat_prompt_dicts():
         "queue_job_ref_id": "job-1",
     }
     payload = prompt_bridge.build_window_relay_payload(project)
-    assert payload["smart_prompt"] == "[VISUAL]: old flat text [0-40]"
+    assert payload["smart_prompt"] == "old flat text [0-40]"
     assert payload["global_prompt"] == ""
 
 
@@ -262,7 +262,7 @@ def test_prompt_payload_route_live_and_snapshot(monkeypatch, tmp_path):
     assert payload["source"] == "live"
     assert payload["window_end"] == 80
     # Full-scene window: gap-fill extends the only section over everything
-    assert payload["relay"]["smart_prompt"] == "[VISUAL]: mid [0-80]"
+    assert payload["relay"]["smart_prompt"] == "mid [0-80]"
     assert payload["global_prompt"] == "global"
 
     # A running snapshot job wins

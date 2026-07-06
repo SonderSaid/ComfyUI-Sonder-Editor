@@ -727,8 +727,8 @@ def test_queue_route_composes_frozen_prompt_server_side(monkeypatch, tmp_path):
     assert response.status == 200
     job = project.generation_queue[0]
     # Server-side override: multi-segment compose with the project delimiter
-    # and channel-grouped labels, NOT the client display value
-    assert job.prompt == "global [VISUAL]: first, second"
+    # and default labels-off behavior, NOT the client display value
+    assert job.prompt == "global first, second"
     assert job.params["prompt_section_delimiter"] == ","
     # Legacy non-snapshot body keeps the client value
     response = asyncio.run(handler(DummyRequest(
@@ -780,7 +780,7 @@ def test_queue_batch_chunks_get_differing_composed_prompts(monkeypatch, tmp_path
     assert response.status == 201
     assert len(saves) == 1
     prompts = [job.prompt for job in project.generation_queue]
-    assert prompts == ["g [VISUAL]: chunk one action", "g [VISUAL]: chunk two action"]
+    assert prompts == ["g chunk one action", "g chunk two action"]
 
 
 def test_queue_prompt_history_dedup_and_cap(monkeypatch, tmp_path):

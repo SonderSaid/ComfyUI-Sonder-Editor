@@ -9,6 +9,8 @@ import {
 } from "./keyboard_ownership.js";
 import {
     CLIP_LABEL_MODE_OPTIONS,
+    CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS,
+    CLIP_LABEL_VERTICAL_ALIGN_OPTIONS,
     CROP_POSITION_OPTIONS,
     DEFAULT_EDITOR_SETTINGS,
     DEFAULT_SAVE_PRESET,
@@ -29,10 +31,12 @@ import {
 } from "./editor_settings.js";
 
 const RENDER_CACHE_ENTRY_PRESETS = [
-    { value: "3", label: "3" },
-    { value: "5", label: "5" },
-    { value: "10", label: "10" },
-    { value: "25", label: "25" },
+    { value: "0", label: "Off" },
+    { value: "1", label: "Keep 1" },
+    { value: "3", label: "Keep 3" },
+    { value: "5", label: "Keep 5" },
+    { value: "10", label: "Keep 10" },
+    { value: "25", label: "Keep 25" },
     { value: "unlimited", label: "Unlimited" },
 ];
 
@@ -193,6 +197,8 @@ function syncSettingsPanelControls() {
     if (controls.timelineBrightness) controls.timelineBrightness.value = String(this._settings.appearance.timelineBrightness);
     if (controls.timelineBrightnessLabel) controls.timelineBrightnessLabel.textContent = `${this._settings.appearance.timelineBrightness}%`;
     if (controls.clipLabelMode) controls.clipLabelMode.value = this._settings.appearance.clipLabelMode;
+    if (controls.clipLabelVerticalAlign) controls.clipLabelVerticalAlign.value = this._settings.appearance.clipLabelVerticalAlign;
+    if (controls.clipLabelHorizontalAlign) controls.clipLabelHorizontalAlign.value = this._settings.appearance.clipLabelHorizontalAlign;
     if (controls.sceneOutline) controls.sceneOutline.checked = this._settings.appearance.sceneOutline !== false;
     for (const tintKey of ["video", "audio", "motion_driver"]) {
         const tintInput = controls[`laneTintOverride_${tintKey}`];
@@ -226,13 +232,16 @@ function syncSettingsPanelControls() {
     if (controls.defaultSceneDuration) controls.defaultSceneDuration.value = String(this._settings.projectDefaults.newSceneDuration);
     if (controls.defaultGuideStrength) controls.defaultGuideStrength.value = String(this._settings.projectDefaults.defaultGuideStrength);
     if (controls.defaultMotionDriverStrength) controls.defaultMotionDriverStrength.value = String(this._settings.projectDefaults.defaultMotionDriverStrength);
-    if (controls.defaultFitMode) controls.defaultFitMode.value = this._settings.projectDefaults.defaultFitMode || "pad_edge";
+    if (controls.defaultFitMode) controls.defaultFitMode.value = this._settings.projectDefaults.defaultFitMode || DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultFitMode;
     if (controls.defaultCropPosition) controls.defaultCropPosition.value = this._settings.projectDefaults.defaultCropPosition || "center";
     if (controls.defaultTemplateId) controls.defaultTemplateId.value = this._settings.projectDefaults.defaultTemplateId || "free";
     if (controls.gallerySortMode) controls.gallerySortMode.value = this._settings.gallery.sortMode;
     if (controls.galleryInspectorCollapsed) controls.galleryInspectorCollapsed.checked = !!this._settings.gallery.inspectorCollapsed;
     if (controls.galleryThumbnailSize) controls.galleryThumbnailSize.value = this._settings.gallery.thumbnailSize;
     if (controls.galleryArtifactInspectorExpanded) controls.galleryArtifactInspectorExpanded.checked = !!this._settings.gallery.artifactInspectorExpanded;
+    if (controls.promptChannelLabels) controls.promptChannelLabels.checked = this._promptChannelLabels === true;
+    if (controls.promptSectionDelimiter) controls.promptSectionDelimiter.value = String(this._promptSectionDelimiter ?? ".");
+    if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
     this._renderModelTemplateSettings?.();
 }
 
@@ -260,7 +269,7 @@ function showSettingsPanel() {
     const titleWrap = document.createElement("div");
     titleWrap.innerHTML = `
         <div style="font-size:15px;font-weight:700;color:#fff;">Editor Settings</div>
-        <div style="font-size:11px;color:#909090;margin-top:3px;">Local browser preferences for layout, playback, appearance, project defaults, and gallery behavior.</div>
+        <div style="font-size:11px;color:#909090;margin-top:3px;">Most settings are browser-local; project-wide controls are labeled inline.</div>
     `;
     const closeBtn = document.createElement("button");
     closeBtn.textContent = "Close";
@@ -329,6 +338,20 @@ function showSettingsPanel() {
         row.append(labelWrap, controlWrap);
         section.appendChild(row);
         return controlWrap;
+    };
+
+    const addSectionReset = (section, label, description, applyReset) => {
+        const controlWrap = createRow(section, label, description);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = "Reset Section";
+        button.style.cssText = chromeButtonCss({ variant: "subtle", padding: "5px 12px", fontSize: "11px", radius: "6px" });
+        button.addEventListener("click", () => {
+            applyReset?.();
+            syncSettingsPanelControls.call(this);
+        });
+        controlWrap.appendChild(button);
+        return button;
     };
 
     const createCheckbox = (section, key, label, description, getter, onChange) => {
@@ -917,12 +940,12 @@ function showSettingsPanel() {
     createScaleRow(layoutSection, "TrackHeaders", "Track Headers", "Lane labels, icons, and left-side track controls.", () => this._settings.layout.scaleTrackHeaders);
     createScaleRow(layoutSection, "Timeline", "Timeline", "Ruler, track heights, clip blocks, and inline editors.", () => this._settings.layout.scaleTimeline);
     createScaleRow(layoutSection, "Gallery", "Asset Gallery", "Gallery lists, tabs, metadata text, and inspector chrome.", () => this._settings.layout.scaleGallery);
-    const resetControls = createRow(layoutSection, "Reset Editor Layout", "Clear saved fullscreen widths, label widths, and UI scale overrides.");
-    const resetBtn = document.createElement("button");
-    resetBtn.textContent = "Reset";
-    resetBtn.style.cssText = chromeButtonCss({ variant: "subtle", padding: "5px 12px", fontSize: "11px", radius: "6px" });
-    resetBtn.addEventListener("click", () => this._resetEditorLayout());
-    resetControls.appendChild(resetBtn);
+    addSectionReset(
+        layoutSection,
+        "Reset Layout Section",
+        "Clear saved fullscreen widths, label widths, track collapses, and UI scale overrides.",
+        () => this._resetEditorLayout()
+    );
 
     const timelineSection = createSection(
         "Timeline Behavior",
@@ -983,6 +1006,12 @@ function showSettingsPanel() {
         TIMECODE_MODE_OPTIONS,
         () => this._settings.timelineBehavior.timecodeMode,
         (value) => this._setTimecodeMode(value)
+    );
+    addSectionReset(
+        timelineSection,
+        "Reset Timeline Section",
+        "Restore snapping, snap targets, and time display defaults.",
+        () => this._updateSettings({ timelineBehavior: DEFAULT_EDITOR_SETTINGS.timelineBehavior })
     );
 
     const playbackSection = createSection(
@@ -1047,7 +1076,7 @@ function showSettingsPanel() {
         playbackSection,
         "prebufferBoundaryDepth",
         "Prebuffer Boundary Depth",
-        "How many upcoming clip boundaries to warm ahead.",
+        "How many upcoming clip boundaries to warm ahead. Lower does less speculative work; higher protects dense edits farther ahead.",
         {
             min: 1,
             max: 12,
@@ -1060,7 +1089,7 @@ function showSettingsPanel() {
         playbackSection,
         "prebufferMaxEntries",
         "Prebuffer Max Warmed Clips",
-        "Cap on clips warmed ahead at once.",
+        "Cap on clips warmed ahead at once. Lower uses less memory/cache pressure; higher keeps more upcoming clips ready.",
         {
             min: 1,
             max: 64,
@@ -1073,7 +1102,7 @@ function showSettingsPanel() {
         playbackSection,
         "decodeConcurrency",
         "Playback Decode Concurrency",
-        "Max video clips decoded at once during playback. Lower avoids contention on heavy stacked scenes.",
+        "Max video clips decoded at once during playback. Lower reduces CPU/disk contention; higher can keep stacked or rapid-cut scenes smoother.",
         {
             min: 1,
             max: 8,
@@ -1082,16 +1111,22 @@ function showSettingsPanel() {
             onChange: (value) => updateCategory("playback", "decodeConcurrency", Math.round(value)),
         }
     );
+    addSectionReset(
+        playbackSection,
+        "Reset Playback Section",
+        "Restore playback flow, prebuffering, and decode tuning defaults.",
+        () => this._updateSettings({ playback: DEFAULT_EDITOR_SETTINGS.playback })
+    );
 
     const notificationsSection = createSection(
         "Notifications",
-        "Toast auto-dismiss timing. Hovering a toast pauses its countdown."
+        "Browser-local toast timing. Hovering a toast pauses its countdown."
     );
     createNumberInput(
         notificationsSection,
         "toastDurationMs",
         "Toast Duration (ms)",
-        "How long info and success toasts stay before auto-dismissing.",
+        "How long info, success, and warning toasts stay before auto-dismissing. Errors use separate timing.",
         {
             min: 1000,
             max: 30000,
@@ -1113,10 +1148,16 @@ function showSettingsPanel() {
             onChange: (value) => updateCategory("notifications", "errorToastDurationMs", Math.max(0, Math.round(value))),
         }
     );
+    addSectionReset(
+        notificationsSection,
+        "Reset Notifications Section",
+        "Restore info/success/warning and error toast timing defaults.",
+        () => this._updateSettings({ notifications: DEFAULT_EDITOR_SETTINGS.notifications })
+    );
 
     const renderSection = createSection(
         "Render",
-        "Take placement, cache retention, trash cleanup, and batch render defaults."
+        "Browser-local take placement and cleanup policies. Cache/trash cleanup runs during editor open and asset sync."
     );
     createSelect(
         renderSection,
@@ -1156,10 +1197,10 @@ function showSettingsPanel() {
         renderSection,
         "maxRenderCacheEntries",
         "Render Cache Entries",
-        "Maximum cached render tensors to retain for this project. Older entries are evicted when the editor opens or this cap changes.",
+        "Off prevents new timeline preview render-cache writes. Higher keep counts retain more project-local tensors; cleanup runs when the editor opens or this cap changes.",
         {
             options: RENDER_CACHE_ENTRY_PRESETS,
-            min: 1,
+            min: 0,
             max: 100000,
             step: 1,
             integer: true,
@@ -1175,7 +1216,7 @@ function showSettingsPanel() {
         renderSection,
         "trashRetentionDays",
         "Trash Retention Days",
-        "Hard-delete trashed assets after this many days during asset refresh.",
+        "Hard-delete trashed assets after this many days during asset refresh/open sync.",
         {
             min: 0,
             max: 36500,
@@ -1188,7 +1229,7 @@ function showSettingsPanel() {
         renderSection,
         "trashMaxSizeMB",
         "Trash Max Size",
-        "Optional decimal-MB cap for trashed asset source files. Oldest trash is purged first.",
+        "Optional decimal-MB cap for trashed asset source files. Oldest trash is purged first during asset refresh/open sync.",
         {
             options: TRASH_SIZE_MB_PRESETS,
             min: 0,
@@ -1205,7 +1246,7 @@ function showSettingsPanel() {
         renderSection,
         "batchRenderMaxFramesPerChunk",
         "Batch Max Frames",
-        "Maximum total frames per chunk including pre/post context (the rendered tensor size cap). Snaps up to the active template's frame constraint. A value of 0 uses the active template's batch ceiling.",
+        "Maximum total frames per chunk including pre/post context. Values above 0 snap up to the active template's frame rule; 0 uses the internal 97-frame budget.",
         {
             min: 0,
             max: 10000,
@@ -1213,6 +1254,23 @@ function showSettingsPanel() {
             getter: () => this._settings.batchRender.maxFramesPerChunk,
             onChange: (value) => updateCategory("batchRender", "maxFramesPerChunk", Math.max(0, Math.round(value))),
         }
+    );
+    addSectionReset(
+        renderSection,
+        "Reset Render Section",
+        "Restore take placement, save preset, render cache, trash cleanup, and batch-frame defaults.",
+        () => this._updateSettings({
+            render: {
+                takePlacementMode: DEFAULT_EDITOR_SETTINGS.render.takePlacementMode,
+                linkedTakePlacement: DEFAULT_EDITOR_SETTINGS.render.linkedTakePlacement,
+                takePlacementMuted: DEFAULT_EDITOR_SETTINGS.render.takePlacementMuted,
+                defaultSavePreset: DEFAULT_EDITOR_SETTINGS.render.defaultSavePreset,
+                maxRenderCacheEntries: DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries,
+                trashRetentionDays: DEFAULT_EDITOR_SETTINGS.render.trashRetentionDays,
+                trashMaxSizeMB: DEFAULT_EDITOR_SETTINGS.render.trashMaxSizeMB,
+            },
+            batchRender: DEFAULT_EDITOR_SETTINGS.batchRender,
+        })
     );
 
     const guidesSection = createSection(
@@ -1256,20 +1314,26 @@ function showSettingsPanel() {
             onChange: (value) => updateCategory("guides", "hoverPreviewSize", Math.max(96, Math.min(360, Math.round(value)))),
         }
     );
+    addSectionReset(
+        guidesSection,
+        "Reset Guides Section",
+        "Restore guide snapshot and hover preview defaults.",
+        () => this._updateSettings({ guides: DEFAULT_EDITOR_SETTINGS.guides })
+    );
 
     const promptsSection = createSection(
         "Prompts",
-        "Prompt lane behavior. The first two controls are PROJECT-WIDE and change the text sent to the model; the rest are browser-local preferences."
+        "Prompt lane behavior. Channel labels, section delimiter, and boundary threshold are PROJECT-WIDE; the rest are browser-local preferences."
     );
     // — Project-wide (host-owned versioned project PUTs, not settings writes).
     //   syncSettingsPanelControls only syncs settings-backed controls, so
-    //   these two read host getters directly at build time.
+    //   these read host getters directly at build time.
     createCheckbox(
         promptsSection,
         "promptChannelLabels",
         "Channel Labels (project-wide)",
         "Prefix channels as [VISUAL]: / [SPEECH]: / [SOUNDS]: in composed prompt output. Saved into the project.",
-        () => this._promptChannelLabels !== false,
+        () => this._promptChannelLabels === true,
         (checked) => {
             Promise.resolve(this._togglePromptChannelLabels(checked)).catch(() => {});
         }
@@ -1296,6 +1360,7 @@ function showSettingsPanel() {
             e.stopPropagation();
         });
         delimiterControls.appendChild(delimiterInput);
+        controls.promptSectionDelimiter = delimiterInput;
     }
     {
         const thresholdControls = createRow(
@@ -1308,12 +1373,12 @@ function showSettingsPanel() {
         thresholdInput.min = "0";
         thresholdInput.max = "100";
         thresholdInput.step = "1";
-        thresholdInput.value = String(this._promptFrameThreshold ?? 0);
+        thresholdInput.value = String(this._promptFrameThreshold ?? 10);
         thresholdInput.style.cssText = chromeInputCss({ width: "72px", textAlign: "center" });
         const commitThreshold = () => {
             Promise.resolve(this._setPromptFrameThreshold(thresholdInput.value))
-                .then(() => { thresholdInput.value = String(this._promptFrameThreshold ?? 0); })
-                .catch(() => { thresholdInput.value = String(this._promptFrameThreshold ?? 0); });
+                .then(() => { thresholdInput.value = String(this._promptFrameThreshold ?? 10); })
+                .catch(() => { thresholdInput.value = String(this._promptFrameThreshold ?? 10); });
         };
         thresholdInput.addEventListener("change", commitThreshold);
         thresholdInput.addEventListener("keydown", (e) => {
@@ -1321,6 +1386,7 @@ function showSettingsPanel() {
             e.stopPropagation();
         });
         thresholdControls.appendChild(thresholdInput);
+        controls.promptFrameThreshold = thresholdInput;
     }
     // — Browser-local preferences
     createCheckbox(
@@ -1341,6 +1407,17 @@ function showSettingsPanel() {
             updateCategory("prompts", "hoverPreviewEnabled", checked);
             if (!checked) this._hidePromptHoverPreview();
         }
+    );
+    addSectionReset(
+        promptsSection,
+        "Reset Prompts Section",
+        "Restore browser-local prompt queueing and hover preview defaults. Project-wide prompt controls are not changed.",
+        () => this._updateSettings({
+            prompts: {
+                queueSectionBatch: DEFAULT_EDITOR_SETTINGS.prompts.queueSectionBatch,
+                hoverPreviewEnabled: DEFAULT_EDITOR_SETTINGS.prompts.hoverPreviewEnabled,
+            },
+        })
     );
 
     const appearanceSection = createSection(
@@ -1382,6 +1459,24 @@ function showSettingsPanel() {
         CLIP_LABEL_MODE_OPTIONS,
         () => this._settings.appearance.clipLabelMode,
         (value) => updateCategory("appearance", "clipLabelMode", value)
+    );
+    createSelect(
+        appearanceSection,
+        "clipLabelVerticalAlign",
+        "Clip Label Vertical Alignment",
+        "Vertical placement for video and audio timeline labels.",
+        CLIP_LABEL_VERTICAL_ALIGN_OPTIONS,
+        () => this._settings.appearance.clipLabelVerticalAlign,
+        (value) => updateCategory("appearance", "clipLabelVerticalAlign", value)
+    );
+    createSelect(
+        appearanceSection,
+        "clipLabelHorizontalAlign",
+        "Clip Label Horizontal Alignment",
+        "Horizontal placement for video and audio timeline labels.",
+        CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS,
+        () => this._settings.appearance.clipLabelHorizontalAlign,
+        (value) => updateCategory("appearance", "clipLabelHorizontalAlign", value)
     );
 
     createCheckbox(
@@ -1468,6 +1563,12 @@ function showSettingsPanel() {
             getter: () => this._settings.appearance.editorMargins?.sides ?? 0,
             onChange: (value) => updateCategory("appearance", "editorMargins", { ...(this._settings.appearance.editorMargins || {}), sides: value }),
         }
+    );
+    addSectionReset(
+        appearanceSection,
+        "Reset Appearance Section",
+        "Restore waveform, label display, lane tint, scene outline, and editor margin defaults.",
+        () => this._updateSettings({ appearance: DEFAULT_EDITOR_SETTINGS.appearance })
     );
 
     const projectDefaultsSection = createSection(
@@ -1579,6 +1680,12 @@ function showSettingsPanel() {
         () => this._settings.projectDefaults.defaultTemplateId || "free",
         (value) => updateCategory("projectDefaults", "defaultTemplateId", value)
     );
+    addSectionReset(
+        projectDefaultsSection,
+        "Reset Project Defaults Section",
+        "Restore new-project, new-scene, guide, driver, fit, crop, and template defaults.",
+        () => this._updateSettings({ projectDefaults: DEFAULT_EDITOR_SETTINGS.projectDefaults })
+    );
     body.appendChild(modelTemplatesSection);
     this._renderModelTemplateSettings();
 
@@ -1619,6 +1726,12 @@ function showSettingsPanel() {
         "Show the artifact metadata inspector in its expanded state by default.",
         () => this._settings.gallery.artifactInspectorExpanded,
         (checked) => updateCategory("gallery", "artifactInspectorExpanded", checked)
+    );
+    addSectionReset(
+        gallerySection,
+        "Reset Gallery Section",
+        "Restore gallery sort, scope, view, thumbnail, and inspector defaults.",
+        () => this._updateSettings({ gallery: DEFAULT_EDITOR_SETTINGS.gallery })
     );
 
     backdrop.appendChild(panel);

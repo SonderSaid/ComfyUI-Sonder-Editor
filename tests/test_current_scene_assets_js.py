@@ -199,6 +199,79 @@ console.log(JSON.stringify({
     assert result["isBuiltinLtx"] is True
 
 
+def test_editor_settings_launch_defaults_and_clip_label_options():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+
+    module_path = Path(__file__).resolve().parents[1] / "web" / "js" / "editor_settings.js"
+    module_url = module_path.as_uri()
+    script = """
+globalThis.window = {
+    localStorage: {
+        getItem() { return null; },
+        setItem() {},
+    },
+    addEventListener() {},
+};
+const mod = await import(__MODULE_URL__);
+const settings = mod.getEditorSettings();
+console.log(JSON.stringify({
+    defaultSavePreset: mod.DEFAULT_SAVE_PRESET,
+    labelModes: mod.CLIP_LABEL_MODE_OPTIONS.map((option) => option.value),
+    labelVertical: mod.CLIP_LABEL_VERTICAL_ALIGN_OPTIONS.map((option) => option.value),
+    labelHorizontal: mod.CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS.map((option) => option.value),
+    notifications: settings.notifications,
+    playback: settings.playback,
+    render: {
+        defaultSavePreset: settings.render.defaultSavePreset,
+        maxRenderCacheEntries: settings.render.maxRenderCacheEntries,
+        trashRetentionDays: settings.render.trashRetentionDays,
+        trashMaxSizeMB: settings.render.trashMaxSizeMB,
+    },
+    batchRender: settings.batchRender,
+    prompts: settings.prompts,
+    appearance: settings.appearance,
+    projectDefaults: settings.projectDefaults,
+    gallery: settings.gallery,
+}));
+""".replace("__MODULE_URL__", json.dumps(module_url))
+
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    result = json.loads(completed.stdout)
+    assert result["defaultSavePreset"] == "High Quality MP4"
+    assert "duration_only" in result["labelModes"]
+    assert result["labelVertical"] == ["top", "middle", "bottom"]
+    assert result["labelHorizontal"] == ["start", "middle", "end"]
+    assert result["notifications"] == {"toastDurationMs": 4000, "errorToastDurationMs": 0}
+    assert result["playback"]["prebufferBoundaryDepth"] == 12
+    assert result["playback"]["prebufferMaxEntries"] == 64
+    assert result["playback"]["decodeConcurrency"] == 8
+    assert result["render"] == {
+        "defaultSavePreset": "High Quality MP4",
+        "maxRenderCacheEntries": 0,
+        "trashRetentionDays": 5,
+        "trashMaxSizeMB": 5000,
+    }
+    assert result["batchRender"] == {"maxFramesPerChunk": 121}
+    assert result["prompts"]["queueSectionBatch"] is False
+    assert result["appearance"]["waveformAccent"] == "#89a4bc"
+    assert result["appearance"]["clipLabelVerticalAlign"] == "middle"
+    assert result["appearance"]["clipLabelHorizontalAlign"] == "start"
+    assert result["appearance"]["editorMargins"] == {"top": 16, "bottom": 16, "sides": 0}
+    assert result["projectDefaults"]["width"] == 1280
+    assert result["projectDefaults"]["height"] == 720
+    assert result["projectDefaults"]["newSceneDuration"] == 241
+    assert result["projectDefaults"]["defaultFitMode"] == "cover"
+    assert result["gallery"]["thumbnailSize"] == "small"
+
+
 def test_editor_settings_detects_snapped_resolution_presets_and_session_memory():
     node = shutil.which("node")
     if not node:

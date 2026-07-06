@@ -2201,16 +2201,16 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
     metadata = metadata if isinstance(metadata, dict) else {}
     labels_on = params.get(
         "prompt_channel_labels",
-        metadata.get("prompt_channel_labels", True),
-    ) is not False
+        metadata.get("prompt_channel_labels", False),
+    ) is True
     delimiter = str(metadata.get("prompt_section_delimiter",
                                  prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
     params["prompt_section_delimiter"] = delimiter  # frozen for reproducibility
     try:
         threshold = float(params.get("prompt_frame_threshold",
-                                     metadata.get("prompt_frame_threshold", 0.0)) or 0.0)
+                                     metadata.get("prompt_frame_threshold", 10.0)) or 0.0)
     except (TypeError, ValueError):
-        threshold = 0.0
+        threshold = 10.0
     params["prompt_frame_threshold"] = threshold  # frozen for reproducibility
     job.params = params
     window_start = max(0, int(getattr(job, "selection_start", 0) or 0)
@@ -3597,13 +3597,13 @@ def _build_dormant_summary(
         # fallback lives in _build_selection_summary). Snapshot jobs carry
         # their own frozen preview_prompt — see _dormant_queue_job_payload.
         metadata = project.metadata if isinstance(getattr(project, "metadata", None), dict) else {}
-        labels_on = metadata.get("prompt_channel_labels", True) is not False
+        labels_on = metadata.get("prompt_channel_labels", False) is True
         delimiter = str(metadata.get("prompt_section_delimiter",
                                      prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
         try:
-            threshold = float(metadata.get("prompt_frame_threshold", 0.0) or 0.0)
+            threshold = float(metadata.get("prompt_frame_threshold", 10.0) or 0.0)
         except (TypeError, ValueError):
-            threshold = 0.0
+            threshold = 10.0
         preview_prompt = active_scene.get_prompt_for_range(
             selection["context_start_frame"],
             selection["context_end_frame"],
@@ -4613,8 +4613,8 @@ if routes is not None:
 
         name = body.get("name", "Untitled")
         fps = body.get("fps", 24.0)
-        width = body.get("width", 768)
-        height = body.get("height", 512)
+        width = body.get("width", 1280)
+        height = body.get("height", 720)
         template_id = body.get("template_id", "free") or "free"
         raw_frame_constraint = body.get("frame_constraint")
         frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
@@ -6297,24 +6297,24 @@ if routes is not None:
 
         def _coerce_threshold(source) -> float:
             if not isinstance(source, dict):
-                return 0.0
+                return 10.0
             try:
-                return float(source.get("prompt_frame_threshold", 0.0) or 0.0)
+                return float(source.get("prompt_frame_threshold", 10.0) or 0.0)
             except (TypeError, ValueError):
-                return 0.0
+                return 10.0
 
         if active_job is not None:
             params = getattr(active_job, "params", {}) or {}
-            labels_on = params.get("prompt_channel_labels", True) is not False \
-                if isinstance(params, dict) else True
+            labels_on = params.get("prompt_channel_labels", False) is True \
+                if isinstance(params, dict) else False
             threshold = _coerce_threshold(params)
             global_text = str(getattr(active_job, "scene_prompt", "") or "")
             sections = list(getattr(active_job, "prompt_sections", []) or [])
             source_label = "snapshot"
         else:
             metadata = getattr(project, "metadata", None)
-            labels_on = metadata.get("prompt_channel_labels", True) is not False \
-                if isinstance(metadata, dict) else True
+            labels_on = metadata.get("prompt_channel_labels", False) is True \
+                if isinstance(metadata, dict) else False
             threshold = _coerce_threshold(metadata)
             global_hidden = bool(getattr(scene.global_prompt_track_config, "hidden", False))
             sections_hidden = bool(getattr(scene.prompt_track_config, "hidden", False))

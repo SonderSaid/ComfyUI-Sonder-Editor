@@ -239,13 +239,13 @@ def test_dormant_live_preview_prompt_over_context_window():
         pre_context_frames=10, post_context_frames=10,
     )
     assert summary["active_scene"]["preview_prompt"] == (
-        "global [VISUAL]: first, second"
+        "global first, second"
     )
 
     # Empty selection params → full-scene fallback compose
     summary = _build_dormant_summary(project, scene_id="scene-1")
     assert summary["active_scene"]["preview_prompt"] == (
-        "global [VISUAL]: first, second"
+        "global first, second"
     )
 
     # Hidden lanes are honored on the live branch

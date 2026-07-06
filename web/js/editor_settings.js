@@ -63,7 +63,20 @@ export const STREAMING_MODE_OPTIONS = INTERNAL_STREAMING_MODE_OPTIONS.filter(
 export const CLIP_LABEL_MODE_OPTIONS = [
     { value: "name_duration", label: "Name + Duration" },
     { value: "name_only", label: "Name Only" },
+    { value: "duration_only", label: "Duration Only" },
     { value: "hidden", label: "Hidden" },
+];
+
+export const CLIP_LABEL_VERTICAL_ALIGN_OPTIONS = [
+    { value: "top", label: "Top" },
+    { value: "middle", label: "Middle" },
+    { value: "bottom", label: "Bottom" },
+];
+
+export const CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS = [
+    { value: "start", label: "Start" },
+    { value: "middle", label: "Middle" },
+    { value: "end", label: "End" },
 ];
 
 export const TAKE_PLACEMENT_MODE_OPTIONS = [
@@ -72,15 +85,15 @@ export const TAKE_PLACEMENT_MODE_OPTIONS = [
 ];
 
 export const SAVE_PRESET_OPTIONS = [
-    { value: "Compatible MP4", label: "Compatible MP4", description: "MP4, H.264, yuv420p, AAC 192 kbps, browser preview compatible." },
-    { value: "High Quality MP4", label: "High Quality MP4", description: "MP4, H.264 CRF 14, yuv420p, AAC 256 kbps, browser preview compatible." },
-    { value: "Editing Master MP4", label: "Editing Master MP4", description: "MP4, H.264 CRF 10, yuv444p, AAC 256 kbps; browser preview may not decode it." },
-    { value: "ProRes 422 HQ", label: "ProRes 422 HQ", description: "MOV, ProRes 422 HQ, yuv422p10le, PCM audio; editing handoff file." },
+    { value: "Compatible MP4", label: "Compatible MP4", description: "MP4, H.264, yuv420p, AAC 192 kbps, BT.709 tagged, browser preview compatible." },
+    { value: "High Quality MP4", label: "High Quality MP4", description: "MP4, H.264 CRF 14, yuv420p, AAC 256 kbps, BT.709 tagged, browser preview compatible." },
+    { value: "Editing Master MP4", label: "Editing Master MP4", description: "MP4, H.264 CRF 10, yuv444p, AAC 256 kbps, BT.709 tagged; browser preview may not decode it." },
+    { value: "ProRes 422 HQ", label: "ProRes 422 HQ", description: "MOV, ProRes 422 HQ, yuv422p10le, PCM audio, BT.709 tagged; editing handoff file." },
     { value: "Lossless FFV1 (RGB)", label: "Lossless FFV1 (RGB)", description: "MKV, FFV1 lossless RGB, gbrp, FLAC audio; archive/diagnostic output." },
     { value: "Custom", label: "Custom", description: "Expose allowlisted expert controls for video files or PNG image sequences." },
 ];
 
-export const DEFAULT_SAVE_PRESET = "Compatible MP4";
+export const DEFAULT_SAVE_PRESET = "High Quality MP4";
 
 export const CUSTOM_OUTPUT_KIND_VIDEO = "Video File";
 export const CUSTOM_OUTPUT_KIND_PNG_SEQUENCE = "PNG Sequence";
@@ -287,12 +300,11 @@ export const DEFAULT_EDITOR_SETTINGS = {
         resolution: "full",
         prebufferEnabled: true,
         prebufferLookaheadMs: 5000,
-        // Warm-ahead tuning. Defaults reproduce legacy playback behavior; depth/cap
-        // warm more clip boundaries ahead, while decodeConcurrency bounds simultaneous
-        // video seek+decode work on heavy stacked scenes.
-        prebufferBoundaryDepth: 2,
-        prebufferMaxEntries: 8,
-        decodeConcurrency: 2,
+        // Warm-ahead tuning. Depth/cap warm more clip boundaries ahead, while
+        // decodeConcurrency bounds simultaneous video seek+decode work.
+        prebufferBoundaryDepth: 12,
+        prebufferMaxEntries: 64,
+        decodeConcurrency: 8,
         streamingMode: "auto",
         adaptiveRebuffer: true,
         rebufferEnterMs: 250,
@@ -303,28 +315,30 @@ export const DEFAULT_EDITOR_SETTINGS = {
         errorToastDurationMs: 0, // 0 = stay until dismissed
     },
     appearance: {
-        waveformAccent: "#dcffdc",
+        waveformAccent: "#89a4bc",
         timelineBrightness: 100,
         clipLabelMode: "name_duration",
+        clipLabelVerticalAlign: "middle",
+        clipLabelHorizontalAlign: "start",
         sceneOutline: true,
         laneTintOverrides: {
             video: "",
             audio: "",
             motion_driver: "",
         },
-        editorMargins: { top: 8, bottom: 8, sides: 8 }, // px; `sides` = left & right
+        editorMargins: { top: 16, bottom: 16, sides: 0 }, // px; `sides` = left & right
     },
     batchRender: {
-        maxFramesPerChunk: 0,
+        maxFramesPerChunk: 121,
     },
     render: {
         takePlacementMode: "trimmed",
         linkedTakePlacement: true,
         takePlacementMuted: false,
         defaultSavePreset: DEFAULT_SAVE_PRESET,
-        maxRenderCacheEntries: 3,
-        trashRetentionDays: 30,
-        trashMaxSizeMB: null,
+        maxRenderCacheEntries: 0,
+        trashRetentionDays: 5,
+        trashMaxSizeMB: 5000,
         export: {
             lastPreset: DEFAULT_SAVE_PRESET,
             lastCustomEncode: null,
@@ -337,7 +351,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
     guides: {
         guideSnapshotMaxLongEdge: 0,
         hoverPreviewEnabled: true,
-        hoverPreviewSize: 180,
+        hoverPreviewSize: 240,
     },
     modelTemplates: {
         customTemplates: [],
@@ -345,7 +359,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     promptTemplates: [],
     prompts: {
-        queueSectionBatch: true,
+        queueSectionBatch: false,
         hoverPreviewEnabled: true,
         panelMode: "structured",
         panelChannelBoxHeight: 0,
@@ -355,13 +369,13 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     projectDefaults: {
         fps: 24,
-        width: 768,
-        height: 512,
-        newSceneDuration: 200,
-        defaultGuideStrength: 1.0,
-        defaultMotionDriverStrength: 1.0,
+        width: 1280,
+        height: 720,
+        newSceneDuration: 241,
+        defaultGuideStrength: 0.7,
+        defaultMotionDriverStrength: 0.95,
         defaultTemplateId: "free",
-        defaultFitMode: "pad_edge",
+        defaultFitMode: "cover",
         defaultCropPosition: "center",
     },
     gallery: {
@@ -370,7 +384,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         scopeMode: "all",
         viewMode: "folders",
         inspectorCollapsed: false,
-        thumbnailSize: "medium",
+        thumbnailSize: "small",
         artifactInspectorExpanded: false,
     },
     inspector: {
@@ -390,6 +404,8 @@ const VALID_GALLERY_VIEWS = new Set(GALLERY_VIEW_OPTIONS.map((entry) => entry.va
 const VALID_PLAYBACK_RESOLUTIONS = new Set(PLAYBACK_RESOLUTION_OPTIONS.map((entry) => entry.value));
 const VALID_STREAMING_MODES = new Set(INTERNAL_STREAMING_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => entry.value));
+const VALID_CLIP_LABEL_VERTICAL_ALIGNS = new Set(CLIP_LABEL_VERTICAL_ALIGN_OPTIONS.map((entry) => entry.value));
+const VALID_CLIP_LABEL_HORIZONTAL_ALIGNS = new Set(CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS.map((entry) => entry.value));
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
 const VALID_SAVE_PRESETS = new Set(SAVE_PRESET_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
@@ -433,7 +449,7 @@ export const CROP_POSITION_OPTIONS = [
 ];
 export const VALID_FIT_MODES = new Set(FIT_MODE_OPTIONS.map((entry) => entry.value));
 export const VALID_CROP_POSITIONS = new Set(CROP_POSITION_OPTIONS.map((entry) => entry.value));
-export const DEFAULT_FIT_MODE = "pad_edge";
+export const DEFAULT_FIT_MODE = "cover";
 export const DEFAULT_CROP_POSITION = "center";
 const VALID_CUSTOM_CONTAINERS = new Set(CUSTOM_CONTAINER_OPTIONS);
 const VALID_CUSTOM_VIDEO_CODECS = new Set(CUSTOM_VIDEO_CODEC_OPTIONS);
@@ -1084,6 +1100,12 @@ function normalizeEditorSettings(source = null) {
             clipLabelMode: VALID_CLIP_LABEL_MODES.has(stored?.appearance?.clipLabelMode)
                 ? stored.appearance.clipLabelMode
                 : defaults.appearance.clipLabelMode,
+            clipLabelVerticalAlign: VALID_CLIP_LABEL_VERTICAL_ALIGNS.has(stored?.appearance?.clipLabelVerticalAlign)
+                ? stored.appearance.clipLabelVerticalAlign
+                : defaults.appearance.clipLabelVerticalAlign,
+            clipLabelHorizontalAlign: VALID_CLIP_LABEL_HORIZONTAL_ALIGNS.has(stored?.appearance?.clipLabelHorizontalAlign)
+                ? stored.appearance.clipLabelHorizontalAlign
+                : defaults.appearance.clipLabelHorizontalAlign,
             sceneOutline: stored?.appearance?.sceneOutline == null
                 ? defaults.appearance.sceneOutline
                 : !!stored.appearance.sceneOutline,
@@ -1120,7 +1142,7 @@ function normalizeEditorSettings(source = null) {
                 ? null
                 : clampNumber(
                     stored?.render?.maxRenderCacheEntries,
-                    1,
+                    0,
                     100000,
                     defaults.render.maxRenderCacheEntries,
                     true,

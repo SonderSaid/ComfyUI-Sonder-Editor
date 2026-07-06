@@ -600,8 +600,11 @@ export class EditorWidget {
 
         // Project settings (fetched from server)
         this.fps = 24;
-        this.sceneWidth = 768;
-        this.sceneHeight = 512;
+        this.sceneWidth = DEFAULT_EDITOR_SETTINGS.projectDefaults.width;
+        this.sceneHeight = DEFAULT_EDITOR_SETTINGS.projectDefaults.height;
+        this._promptChannelLabels = false;
+        this._promptSectionDelimiter = ".";
+        this._promptFrameThreshold = 10;
 
         // Animatic toggle state
         this._animaticMode = false;
@@ -1214,7 +1217,7 @@ export class EditorWidget {
         } else {
             this._playbackWarmSceneSignature = nextWarmSignature;
         }
-        this.totalFrames = scene.duration_frames || 200;
+        this.totalFrames = scene.duration_frames || DEFAULT_EDITOR_SETTINGS.projectDefaults.newSceneDuration;
         this._refreshDurationInput();
         this._updateSceneIdentity(scene.name || "Untitled Scene");
 
@@ -2821,12 +2824,12 @@ export class EditorWidget {
 
     get _effectiveSceneWidth() {
         const sceneWidth = this.activeScene?.width || 0;
-        return sceneWidth > 0 ? sceneWidth : (this.sceneWidth || 768);
+        return sceneWidth > 0 ? sceneWidth : (this.sceneWidth || DEFAULT_EDITOR_SETTINGS.projectDefaults.width);
     }
 
     get _effectiveSceneHeight() {
         const sceneHeight = this.activeScene?.height || 0;
-        return sceneHeight > 0 ? sceneHeight : (this.sceneHeight || 512);
+        return sceneHeight > 0 ? sceneHeight : (this.sceneHeight || DEFAULT_EDITOR_SETTINGS.projectDefaults.height);
     }
 
     _framesToSeconds(frames) { return frames / this._effectiveFps; }
@@ -3537,11 +3540,11 @@ export class EditorWidget {
         const height = this.activeScene?.height || 0;
         if (this._resWInput) {
             this._resWInput.value = width || "";
-            this._resWInput.placeholder = String(this.sceneWidth || 768);
+            this._resWInput.placeholder = String(this.sceneWidth || DEFAULT_EDITOR_SETTINGS.projectDefaults.width);
         }
         if (this._resHInput) {
             this._resHInput.value = height || "";
-            this._resHInput.placeholder = String(this.sceneHeight || 512);
+            this._resHInput.placeholder = String(this.sceneHeight || DEFAULT_EDITOR_SETTINGS.projectDefaults.height);
         }
         this._rebuildTemplateOptions();
         this._rebuildResolutionTierOptions();
@@ -4275,7 +4278,7 @@ export class EditorWidget {
     _defaultFitMode() {
         const value = this._settings?.projectDefaults?.defaultFitMode
             ?? DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultFitMode;
-        return VALID_FIT_MODES.has(value) ? value : "pad_edge";
+        return VALID_FIT_MODES.has(value) ? value : DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultFitMode;
     }
 
     _defaultCropPosition() {
@@ -4525,7 +4528,7 @@ export class EditorWidget {
         if (!Number.isFinite(numeric)) {
             return DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries;
         }
-        return Math.max(1, Math.round(numeric));
+        return Math.max(0, Math.round(numeric));
     }
 
     _trashRetentionDays(settings = this._settings) {
@@ -4595,6 +4598,7 @@ export class EditorWidget {
         this._setWidgetValue("take_placement_mode", mode);
         this._setWidgetValue("take_placement_linked", settings?.render?.linkedTakePlacement !== false);
         this._setWidgetValue("take_placement_muted", !!settings?.render?.takePlacementMuted);
+        this._setWidgetValue("render_cache_enabled", this._renderCacheEntryLimit(settings) !== 0);
     }
 
     _trackCollapseSceneKey(scene = this.activeScene) {
@@ -4735,6 +4739,16 @@ export class EditorWidget {
         const nextStreamingMode = nextSettings?.playback?.streamingMode ?? "auto";
         const prevLaneTintSignature = JSON.stringify(this._settings?.appearance?.laneTintOverrides || {});
         const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
+        const prevClipLabelSignature = JSON.stringify({
+            mode: this._settings?.appearance?.clipLabelMode,
+            v: this._settings?.appearance?.clipLabelVerticalAlign,
+            h: this._settings?.appearance?.clipLabelHorizontalAlign,
+        });
+        const nextClipLabelSignature = JSON.stringify({
+            mode: nextSettings?.appearance?.clipLabelMode,
+            v: nextSettings?.appearance?.clipLabelVerticalAlign,
+            h: nextSettings?.appearance?.clipLabelHorizontalAlign,
+        });
         const prevSceneOutline = this._settings?.appearance?.sceneOutline !== false;
         const nextSceneOutline = nextSettings?.appearance?.sceneOutline !== false;
         const prevMarginSignature = JSON.stringify(this._settings?.appearance?.editorMargins || {});
@@ -4779,6 +4793,9 @@ export class EditorWidget {
             }
         }
         if (prevLaneTintSignature !== nextLaneTintSignature && this.timelineCanvas) {
+            this._renderTimeline();
+        }
+        if (prevClipLabelSignature !== nextClipLabelSignature && this.timelineCanvas) {
             this._renderTimeline();
         }
         if (prevSceneOutline !== nextSceneOutline && !this.isPlaying) {
@@ -4953,6 +4970,16 @@ export class EditorWidget {
 
     _clipLabelMode() {
         return this._settings?.appearance?.clipLabelMode || DEFAULT_EDITOR_SETTINGS.appearance.clipLabelMode;
+    }
+
+    _clipLabelVerticalAlign() {
+        return this._settings?.appearance?.clipLabelVerticalAlign
+            || DEFAULT_EDITOR_SETTINGS.appearance.clipLabelVerticalAlign;
+    }
+
+    _clipLabelHorizontalAlign() {
+        return this._settings?.appearance?.clipLabelHorizontalAlign
+            || DEFAULT_EDITOR_SETTINGS.appearance.clipLabelHorizontalAlign;
     }
 
     _defaultNewSceneDuration() {
@@ -9601,7 +9628,7 @@ export class EditorWidget {
             this._hidePromptHoverPreview();
             return;
         }
-        const labelsOn = this._promptChannelLabels !== false;
+        const labelsOn = this._promptChannelLabels === true;
         const isGlobal = hit.type === "prompt_global";
         const hidden = isGlobal ? this._isGlobalPromptTrackHidden() : (this._isPromptTrackHidden() || !!hit.data?.muted);
         const hiddenLabel = !isGlobal && hit.data?.muted ? "Muted" : "Hidden";
@@ -12147,7 +12174,7 @@ export class EditorWidget {
         const name = this._assetDisplayName(asset, clip?.source_path || "");
         const dur = Math.max(1, (clip?.timeline_end_frame || 0) - (clip?.timeline_start_frame || 0));
         const durationText = this._timecodeMode === "timecode" ? this._frameToTimecode(dur) : `${dur}f`;
-        let label = mode === "name_only" ? name : `${name} | ${durationText}`;
+        let label = mode === "duration_only" ? durationText : (mode === "name_only" ? name : `${name} | ${durationText}`);
         if (isMissingClip) {
             label = `Missing | ${label}`;
         }
@@ -12164,7 +12191,7 @@ export class EditorWidget {
         const name = this._assetDisplayName(asset, track?.source_path || "");
         const dur = Math.max(1, (track?.timeline_end_frame || 0) - (track?.timeline_start_frame || 0));
         const durationText = this._timecodeMode === "timecode" ? this._frameToTimecode(dur) : `${dur}f`;
-        let label = mode === "name_only" ? name : `${name} | ${durationText}`;
+        let label = mode === "duration_only" ? durationText : (mode === "name_only" ? name : `${name} | ${durationText}`);
         if (isMissingAudio) {
             label = `Missing | ${label}`;
         }
@@ -12685,7 +12712,7 @@ export class EditorWidget {
 
         const promptHidden = !!this.activeScene.prompt_track_config?.hidden;
         const globalHidden = !!this.activeScene.global_prompt_track_config?.hidden;
-        const labelsOn = this._promptChannelLabels !== false;
+        const labelsOn = this._promptChannelLabels === true;
         const scenePrompt = globalHidden ? "" : (this.activeScene.prompt || "");
         const sections = promptHidden ? [] : (this.activeScene.prompt_sections || []);
         // Freeze ALL window-overlapping sections (channel-bearing) — the relay
@@ -13508,16 +13535,16 @@ export class EditorWidget {
                 const data = await resp.json();
                 this.fps = data.fps || 24;
                 if (data.resolution) {
-                    this.sceneWidth = data.resolution[0] || 768;
-                    this.sceneHeight = data.resolution[1] || 512;
+                    this.sceneWidth = data.resolution[0] || DEFAULT_EDITOR_SETTINGS.projectDefaults.width;
+                    this.sceneHeight = data.resolution[1] || DEFAULT_EDITOR_SETTINGS.projectDefaults.height;
                 }
                 this._templateId = getTemplateById(data.template_id, this._settings).id;
-                // Project-durable channel-labels toggle (render-affecting; default true)
-                this._promptChannelLabels = data.metadata?.prompt_channel_labels !== false;
+                // Project-durable channel-labels toggle (render-affecting; default off)
+                this._promptChannelLabels = data.metadata?.prompt_channel_labels === true;
                 // Project-durable section-seam delimiter (render-affecting; default ".")
                 this._promptSectionDelimiter = String(data.metadata?.prompt_section_delimiter ?? ".");
-                // Project-durable boundary-spill threshold % (render-affecting; default 0 = off)
-                this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold) || 0;
+                // Project-durable boundary-spill threshold % (render-affecting; default 10)
+                this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold ?? 10) || 0;
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 this._syncSceneResolutionControls({ detectSelections: false });
                 this._updateViewportHeader();

@@ -83,8 +83,8 @@ def register_project_saved_hook(hook: Callable[[TimelineProject], None]) -> None
 def create_project(
     name: str,
     fps: float = 24.0,
-    width: int = 768,
-    height: int = 512,
+    width: int = 1280,
+    height: int = 720,
     template_id: str = "free",
     base_dir: str = "",
 ) -> TimelineProject:
@@ -232,7 +232,7 @@ def list_projects(base_dir: str) -> list[dict]:
                     "name": data.get("name", entry),
                     "path": entry_real,
                     "fps": data.get("fps", 24.0),
-                    "resolution": data.get("resolution", [768, 512]),
+                    "resolution": data.get("resolution", [1280, 720]),
                     "scene_count": len(scenes),
                     "clip_count": clip_count,
                     "asset_count": len(assets),

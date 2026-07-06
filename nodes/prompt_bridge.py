@@ -72,17 +72,17 @@ def _snapshot_version(queue_job) -> int:
 def _project_labels_on(project) -> bool:
     metadata = getattr(project, "metadata", None)
     if isinstance(metadata, dict):
-        return metadata.get("prompt_channel_labels", True) is not False
-    return True
+        return metadata.get("prompt_channel_labels", False) is True
+    return False
 
 
-def _threshold_from(source) -> float:
+def _threshold_from(source, default: float = 10.0) -> float:
     if not isinstance(source, dict):
-        return 0.0
+        return default
     try:
-        return float(source.get("prompt_frame_threshold", 0.0) or 0.0)
+        return float(source.get("prompt_frame_threshold", default) or 0.0)
     except (TypeError, ValueError):
-        return 0.0
+        return default
 
 
 def resolve_window_prompt_state(project):
@@ -98,8 +98,8 @@ def resolve_window_prompt_state(project):
     queue_job = _find_ref_job(project)
     if queue_job is not None and _snapshot_version(queue_job) > 0:
         params = getattr(queue_job, "params", {}) or {}
-        labels_on = params.get("prompt_channel_labels", True) is not False \
-            if isinstance(params, dict) else True
+        labels_on = params.get("prompt_channel_labels", False) is True \
+            if isinstance(params, dict) else False
         return (
             str(getattr(queue_job, "scene_prompt", "") or ""),
             list(getattr(queue_job, "prompt_sections", []) or []),

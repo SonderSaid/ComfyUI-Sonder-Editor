@@ -3222,14 +3222,14 @@ export class EditorNodeController {
                 queueWidth
                     || parseInt(scene?.width, 10)
                     || parseInt(summary?.active_scene?.effective_width, 10)
-                    || 768
+                    || 1280
             ),
             frameHeight: Math.max(
                 1,
                 queueHeight
                     || parseInt(scene?.height, 10)
                     || parseInt(summary?.active_scene?.effective_height, 10)
-                    || 512
+                    || 720
             ),
         };
     }

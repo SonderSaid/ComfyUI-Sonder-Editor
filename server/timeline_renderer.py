@@ -145,6 +145,7 @@ def render_scene_frames(
     *,
     cancel_event=None,
     video_capture_factory=None,
+    use_cache: bool = True,
 ) -> torch.Tensor:
     """Composite visible render clips into an RGB float tensor for [start_frame, end_frame)."""
     _check_cancel(cancel_event)
@@ -157,15 +158,18 @@ def render_scene_frames(
     if num_frames <= 0:
         return torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
 
-    content_hash = scene.content_hash(render_start, render_end, project.resolution)
-    cache_filename = f"{scene.scene_id}_{content_hash}.pt"
-    cache_path = resolve_project_path(
-        project,
-        os.path.join("cache", "renders", cache_filename),
-        purpose="timeline render cache file",
-    )
+    cache_path = ""
+    content_hash = ""
+    if use_cache:
+        content_hash = scene.content_hash(render_start, render_end, project.resolution)
+        cache_filename = f"{scene.scene_id}_{content_hash}.pt"
+        cache_path = resolve_project_path(
+            project,
+            os.path.join("cache", "renders", cache_filename),
+            purpose="timeline render cache file",
+        )
 
-    if cache_path and os.path.isfile(cache_path):
+    if use_cache and cache_path and os.path.isfile(cache_path):
         _check_cancel(cancel_event)
         try:
             cached = torch.load(cache_path, weights_only=True)
@@ -192,6 +196,8 @@ def render_scene_frames(
     ))
     arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
     tensor = torch.from_numpy(arr)
+    if not use_cache:
+        return tensor
 
     cache_dir = resolve_project_path(
         project,

@@ -11,6 +11,7 @@ import {
     CUSTOM_OUTPUT_KIND_VIDEO,
     CUSTOM_PIX_FMT_OPTIONS,
     CUSTOM_VIDEO_CODEC_OPTIONS,
+    DEFAULT_EDITOR_SETTINGS,
     DEFAULT_SAVE_PRESET,
     SAVE_PRESET_OPTIONS,
     getTemplateById,
@@ -34,6 +35,7 @@ injectSonderFontFaces();
 // into a Core foreground notification keyed by node id. The tab page never
 // receives these (its api shim's addEventListener is a no-op) — canvas only.
 const _sonderEncodeNotifs = new Map(); // nodeId(string) -> notification handle
+const LEGACY_SAVE_VIDEO_WIDGET_DEFAULT = "Compatible MP4";
 
 function _sonderSaveNodeInfo(nodeId) {
     try {
@@ -276,7 +278,8 @@ async function createProjectFromNode(node, projectWidget) {
     const widthWidget = node.widgets.find((widget) => widget.name === "width");
     const heightWidget = node.widgets.find((widget) => widget.name === "height");
     const settings = getEditorSettings();
-    const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || 200));
+    const defaults = DEFAULT_EDITOR_SETTINGS.projectDefaults;
+    const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || defaults.newSceneDuration));
     const templateId = settings.projectDefaults.defaultTemplateId || "free";
     const template = getTemplateById(templateId, settings);
 
@@ -290,9 +293,9 @@ async function createProjectFromNode(node, projectWidget) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             name: projectName,
-            fps: snapFpsToTemplate(Number(fpsWidget?.value || 24), template),
-            width: Number(widthWidget?.value || 768),
-            height: Number(heightWidget?.value || 512),
+            fps: snapFpsToTemplate(Number(fpsWidget?.value || defaults.fps), template),
+            width: Number(widthWidget?.value || defaults.width),
+            height: Number(heightWidget?.value || defaults.height),
             template_id: templateId,
             frame_constraint: resolveFrameConstraintForTemplate(templateId, settings),
         }),
@@ -359,7 +362,12 @@ function applySaveVideoDefaults(node) {
     const defaultPreset = getEditorSettings()?.render?.defaultSavePreset || DEFAULT_SAVE_PRESET;
     const validPresets = new Set(SAVE_PRESET_OPTIONS.map((option) => option.value));
     if (!validPresets.has(defaultPreset)) return;
-    if (presetWidget.value && validPresets.has(presetWidget.value) && presetWidget.value !== DEFAULT_SAVE_PRESET) return;
+    if (
+        presetWidget.value
+        && validPresets.has(presetWidget.value)
+        && presetWidget.value !== DEFAULT_SAVE_PRESET
+        && presetWidget.value !== LEGACY_SAVE_VIDEO_WIDGET_DEFAULT
+    ) return;
     presetWidget.value = defaultPreset;
     presetWidget.callback?.(defaultPreset);
 }
@@ -1040,6 +1048,7 @@ app.registerExtension({
                     "take_placement_mode",
                     "take_placement_linked",
                     "take_placement_muted",
+                    "render_cache_enabled",
                     "render_queue_active",
                 ];
 

@@ -16,6 +16,33 @@ export {
     TRACK_TYPE,
 } from "./editor_timeline_constants.js";
 
+function timelineLabelPoint(host, rectX, rectY, rectW, rectH, fontSize) {
+    const scale = host._scaleTimeline || 1;
+    const padY = Math.max(2, Math.round(3 * scale));
+    const horizontal = host._clipLabelHorizontalAlign?.() || "start";
+    const vertical = host._clipLabelVerticalAlign?.() || "middle";
+    const align = horizontal === "end" ? "right" : (horizontal === "middle" ? "center" : "left");
+    const x = align === "right"
+        ? rectX + rectW
+        : (align === "center" ? rectX + rectW / 2 : rectX);
+
+    let y;
+    if (vertical === "top") {
+        y = rectY + padY + fontSize;
+    } else if (vertical === "bottom") {
+        y = rectY + rectH - padY;
+    } else {
+        y = rectY + rectH / 2 + Math.round(fontSize * 0.34);
+    }
+    const minY = rectY + Math.min(rectH - 1, fontSize);
+    const maxY = rectY + Math.max(1, rectH - padY);
+    return {
+        x,
+        y: Math.max(Math.min(minY, maxY), Math.min(maxY, y)),
+        align,
+    };
+}
+
 export function _trackY(host, layoutIdx) {
     const ts = host._scaleTimeline;
     let y = Math.round(RULER_HEIGHT * ts);
@@ -774,15 +801,19 @@ export function _drawClips(host, ctx, width) {
                 const label = host._formatClipTimelineLabel(clip, clipAsset, isMissingClip);
                 if (label) {
                     ctx.fillStyle = isMissingClip ? COLORS.missingMediaText : COLORS.text;
-                    ctx.font = host._canvasSansFont(Math.round(9 * host._scaleTimeline), 600);
-                    ctx.textAlign = "left";
+                    const fontSize = Math.round(9 * host._scaleTimeline);
+                    ctx.font = host._canvasSansFont(fontSize, 600);
                     const railPad = Math.round(9 * host._scaleTimeline);
                     const labelX = isMotionDriverLane ? x1 + Math.round(30 * host._scaleTimeline) : x1 + railPad;
+                    const labelW = Math.max(0, x2 - labelX - 4);
+                    const labelH = videoH - 4;
+                    const labelPoint = timelineLabelPoint(host, labelX, videoY + 2, labelW, labelH, fontSize);
                     ctx.save();
                     ctx.beginPath();
-                    ctx.rect(labelX, videoY + 2, Math.max(0, x2 - labelX - 4), videoH - 4);
+                    ctx.rect(labelX, videoY + 2, labelW, labelH);
                     ctx.clip();
-                    ctx.fillText(label, labelX, videoY + videoH / 2 + Math.round(3 * host._scaleTimeline));
+                    ctx.textAlign = labelPoint.align;
+                    ctx.fillText(label, labelPoint.x, labelPoint.y);
                     ctx.restore();
                 }
 
@@ -944,14 +975,18 @@ export function _drawClips(host, ctx, width) {
                     const audioLabel = host._formatAudioTimelineLabel(track, audioAsset, isMissingAudio);
                     if (audioLabel) {
                         ctx.fillStyle = isMissingAudio ? COLORS.missingMediaText : COLORS.text;
-                        ctx.font = host._canvasSansFont(Math.round(8 * host._scaleTimeline), 600);
-                        ctx.textAlign = "left";
+                        const fontSize = Math.round(8 * host._scaleTimeline);
+                        ctx.font = host._canvasSansFont(fontSize, 600);
                         const labelX = x1 + Math.round(9 * host._scaleTimeline);
+                        const labelW = Math.max(0, x2 - labelX - 4);
+                        const labelH = audioH - 4;
+                        const labelPoint = timelineLabelPoint(host, labelX, audioY + 2, labelW, labelH, fontSize);
                         ctx.save();
                         ctx.beginPath();
-                        ctx.rect(labelX, audioY + 2, Math.max(0, x2 - labelX - 4), audioH - 4);
+                        ctx.rect(labelX, audioY + 2, labelW, labelH);
                         ctx.clip();
-                        ctx.fillText(audioLabel, labelX, audioY + audioH / 2 + Math.round(3 * host._scaleTimeline));
+                        ctx.textAlign = labelPoint.align;
+                        ctx.fillText(audioLabel, labelPoint.x, labelPoint.y);
                         ctx.restore();
                     }
                 }

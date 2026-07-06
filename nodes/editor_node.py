@@ -132,11 +132,11 @@ class SonderEditor:
                     "tooltip": "Frame rate. Only used when creating a new project.",
                 }),
                 "width": ("INT", {
-                    "default": 768, "min": 64, "max": 4096, "step": 8,
+                    "default": 1280, "min": 64, "max": 4096, "step": 8,
                     "tooltip": "Video width. Only used when creating a new project.",
                 }),
                 "height": ("INT", {
-                    "default": 512, "min": 64, "max": 4096, "step": 8,
+                    "default": 720, "min": 64, "max": 4096, "step": 8,
                     "tooltip": "Video height. Only used when creating a new project.",
                 }),
             },
@@ -181,6 +181,10 @@ class SonderEditor:
                 "take_placement_muted": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Whether newly placed takes enter the timeline muted.",
+                }),
+                "render_cache_enabled": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Whether timeline preview renders may read/write the project render cache.",
                 }),
                 "render_queue_active": ("BOOLEAN", {
                     "default": True,
@@ -543,7 +547,7 @@ class SonderEditor:
                 mask_pre_offset=0, mask_post_offset=0,
                 prompt=None, unique_id=None, take_placement_mode="trimmed",
                 take_placement_linked=True, take_placement_muted=False,
-                render_queue_active=True):
+                render_cache_enabled=False, render_queue_active=True):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
         selection_start = max(0, _coerce_int(selection_start, 0))
@@ -555,6 +559,7 @@ class SonderEditor:
         take_placement_mode = take_placement_mode if take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
         take_placement_linked = self._coerce_bool(take_placement_linked, True)
         take_placement_muted = self._coerce_bool(take_placement_muted, False)
+        render_cache_enabled = self._coerce_bool(render_cache_enabled, False)
         render_queue_active = self._coerce_bool(render_queue_active, True)
         proj = None
         queue_job = None
@@ -765,7 +770,13 @@ class SonderEditor:
             # --- Render composited frames ---
             render_started_at = time.perf_counter()
             logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
-            rendered_frames = self._render_scene_frames(proj, scene, render_start, render_end)
+            rendered_frames = self._render_scene_frames(
+                proj,
+                scene,
+                render_start,
+                render_end,
+                use_cache=render_cache_enabled,
+            )
             if frame_count_padding > 0:
                 rendered_frames = self._pad_image_batch_to_frame_count(rendered_frames, target_frame_count)
                 frame_count = target_frame_count
@@ -829,17 +840,17 @@ class SonderEditor:
             # --- Get prompt for render range ---
             # Channel-label + delimiter composition honors the project-durable
             # knobs; queued jobs use their frozen composed prompt instead.
-            prompt_labels_on = True
+            prompt_labels_on = False
             prompt_delimiter = "."
-            prompt_threshold = 0.0
+            prompt_threshold = 10.0
             proj_metadata = getattr(proj, "metadata", None)
             if isinstance(proj_metadata, dict):
-                prompt_labels_on = proj_metadata.get("prompt_channel_labels", True) is not False
+                prompt_labels_on = proj_metadata.get("prompt_channel_labels", False) is True
                 prompt_delimiter = str(proj_metadata.get("prompt_section_delimiter", ".") or "")
                 try:
-                    prompt_threshold = float(proj_metadata.get("prompt_frame_threshold", 0.0) or 0.0)
+                    prompt_threshold = float(proj_metadata.get("prompt_frame_threshold", 10.0) or 0.0)
                 except (TypeError, ValueError):
-                    prompt_threshold = 0.0
+                    prompt_threshold = 10.0
             if queue_job:
                 prompt_text = getattr(queue_job, "prompt", "")
                 if snapshot_version <= 0 and not prompt_text:
@@ -934,7 +945,8 @@ class SonderEditor:
             raise
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
-                              render_start: int, render_end: int) -> torch.Tensor:
+                              render_start: int, render_end: int,
+                              *, use_cache: bool = True) -> torch.Tensor:
         """Composite all visible video clips into frames for the given range.
 
         Returns (N, H, W, 3) float32 RGB tensor. Uses caching to skip
@@ -946,6 +958,7 @@ class SonderEditor:
             render_start,
             render_end,
             video_capture_factory=cv2.VideoCapture,
+            use_cache=use_cache,
         )
 
     @staticmethod

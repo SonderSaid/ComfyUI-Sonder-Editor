@@ -243,7 +243,7 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
             const sec = parseFloat(widget.durationInput.value) || 0;
             widget.totalFrames = Math.max(1, widget._secondsToFrames(sec));
         } else {
-            widget.totalFrames = Math.max(1, parseInt(widget.durationInput.value, 10) || 200);
+            widget.totalFrames = Math.max(1, parseInt(widget.durationInput.value, 10) || widget._defaultNewSceneDuration?.() || 241);
         }
         widget.totalFrames = widget._snapSceneDurationToTemplate(widget.totalFrames);
         widget._refreshDurationInput();

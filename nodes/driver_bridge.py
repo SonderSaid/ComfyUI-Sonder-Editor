@@ -66,7 +66,7 @@ def _resolve_active_scene(project):
 
 
 def _resolve_render_window(project, scene):
-    proj_w, proj_h = getattr(project, "resolution", (768, 512))
+    proj_w, proj_h = getattr(project, "resolution", (1280, 720))
     if scene is not None:
         if getattr(scene, "width", 0) and scene.width > 0:
             proj_w = scene.width

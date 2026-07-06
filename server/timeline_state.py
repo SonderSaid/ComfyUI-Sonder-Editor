@@ -416,7 +416,7 @@ class Scene:
         return max(c.timeline_end_frame for c in self.clips)
 
     def content_hash(self, selection_start: int = 0, selection_end: int = 0,
-                     resolution: tuple = (768, 512)) -> str:
+                     resolution: tuple = (1280, 720)) -> str:
         """Deterministic hash of all state that affects rendered output."""
         import hashlib
         import json
@@ -946,7 +946,7 @@ class TimelineProject:
     project_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     name: str = "Untitled Project"
     fps: float = 24.0
-    resolution: tuple = (768, 512)
+    resolution: tuple = (1280, 720)
     template_id: str = "free"
     frame_constraint: dict | None = None
     scenes: list = field(default_factory=list)           # list[Scene] — ordered compositions
@@ -1088,7 +1088,7 @@ class TimelineProject:
             project_id=data.get("project_id", uuid.uuid4().hex),
             name=data.get("name", "Untitled Project"),
             fps=data.get("fps", 24.0),
-            resolution=tuple(data.get("resolution", [768, 512])),
+            resolution=tuple(data.get("resolution", [1280, 720])),
             template_id=data.get("template_id", "free"),
             frame_constraint=data.get("frame_constraint"),
             metadata=data.get("metadata", {}),

@@ -960,7 +960,6 @@ def test_guide_image_output_letterboxes_to_project_canvas(tmp_path, monkeypatch)
 def test_render_scene_frames_excludes_motion_driver_clips(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
-    cv2 = importlib.import_module("cv2")
     np = importlib.import_module("numpy")
 
     project_dir = tmp_path / "project"
@@ -1014,7 +1013,6 @@ def test_render_scene_frames_excludes_motion_driver_clips(tmp_path, monkeypatch)
 def test_render_scene_frames_uses_take_source_in_without_repeating_seam_frame(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
-    cv2 = importlib.import_module("cv2")
     np = importlib.import_module("numpy")
 
     project_dir = tmp_path / "project"
@@ -2773,6 +2771,50 @@ def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):
 
     assert str(cache_path) in removed
     assert tuple(result.shape) == (4, 6, 8, 3)
+
+
+def test_render_scene_frames_can_disable_cache_writes(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    cv2 = importlib.import_module("cv2")
+    np = importlib.import_module("numpy")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True)
+    (project_dir / "media" / "clip.mp4").write_bytes(b"clip")
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), resolution=(1, 1))
+    scene = timeline_state.Scene(scene_id="scene-1", duration_frames=2)
+    scene.video_lane_configs = [timeline_state.LaneConfig()]
+    scene.clips = [
+        timeline_state.ClipReference(
+            source_path=os.path.join("media", "clip.mp4"),
+            timeline_start_frame=0,
+            timeline_end_frame=2,
+        )
+    ]
+
+    class FakeCapture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def set(self, prop, value):
+            pass
+
+        def read(self):
+            return True, np.full((1, 1, 3), 255, dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(editor_node.cv2, "VideoCapture", FakeCapture)
+
+    result = editor_node.SonderEditor()._render_scene_frames(project, scene, 0, 2, use_cache=False)
+
+    assert tuple(result.shape) == (2, 1, 1, 3)
+    assert not (project_dir / "cache" / "renders").exists()
 
 
 def test_load_scene_audio_caps_track_to_timeline_trim(tmp_path, monkeypatch):
