@@ -1126,7 +1126,7 @@ function showSettingsPanel() {
         notificationsSection,
         "toastDurationMs",
         "Toast Duration (ms)",
-        "How long info, success, and warning toasts stay before auto-dismissing. Errors use separate timing.",
+        "How long info and success toasts stay before auto-dismissing. Warnings and errors use separate timing.",
         {
             min: 1000,
             max: 30000,
@@ -1138,8 +1138,8 @@ function showSettingsPanel() {
     createNumberInput(
         notificationsSection,
         "errorToastDurationMs",
-        "Error Toast Duration (ms)",
-        "How long error toasts stay before auto-dismissing. 0 keeps them until dismissed.",
+        "Warning/Error Toast Duration (ms)",
+        "How long warning and error toasts stay before auto-dismissing. 0 keeps them until dismissed.",
         {
             min: 0,
             max: 120000,
@@ -1151,7 +1151,7 @@ function showSettingsPanel() {
     addSectionReset(
         notificationsSection,
         "Reset Notifications Section",
-        "Restore info/success/warning and error toast timing defaults.",
+        "Restore toast timing defaults.",
         () => this._updateSettings({ notifications: DEFAULT_EDITOR_SETTINGS.notifications })
     );
 

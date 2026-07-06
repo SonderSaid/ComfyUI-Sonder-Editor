@@ -24,6 +24,14 @@ const PLAYBACK_WARM_MAX_ENTRIES = 6000;
 const PLAYBACK_REBUFFER_REENTRY_MS = 500;
 const PLAYBACK_REBUFFER_NEXT_BOUNDARY_SOFT_MAX_MS = 500;
 const PLAYBACK_REBUFFER_TELEMETRY_THROTTLE_MS = 500;
+const PLAYBACK_REBUFFER_TOAST_DELAY_MS = 700;
+const PLAYBACK_REBUFFER_TOAST_DECAY_MS = 1800;
+const PLAYBACK_REBUFFER_TOAST_MIN_VISIBLE_MS = 1200;
+const PLAYBACK_REBUFFER_TOAST_LINGER_MS = 6000;
+const PLAYBACK_REBUFFER_HEAVY_PRESSURE_THRESHOLD = 2.5;
+const PLAYBACK_REBUFFER_HEAVY_PRESSURE_DECAY_MS = 12000;
+const PLAYBACK_REBUFFER_HEAVY_PRESSURE_PER_BUFFER = 1;
+const PLAYBACK_REBUFFER_HEAVY_WARNING_COOLDOWN_MS = 6000;
 const DECODE_PRIORITY_HIGH = "high";
 const DECODE_PRIORITY_URGENT = "urgent";
 const DECODE_PRIORITY_LOW = "low";
@@ -1079,7 +1087,15 @@ export function createViewportSurface(options = {}) {
         playbackRebufferResumeDeferredSig: "",
         playbackRebufferResumeDeferredAtMs: 0,
         playbackRebufferToastHandle: null,
-        playbackRebufferCapHandle: null,
+        playbackRebufferToastTimer: null,
+        playbackRebufferToastDismissTimer: null,
+        playbackRebufferToastLevel: "",
+        playbackRebufferToastShownAtMs: 0,
+        playbackRebufferToastPressureMs: 0,
+        playbackRebufferToastPressureAtMs: 0,
+        playbackRebufferHeavyPressure: 0,
+        playbackRebufferHeavyPressureAtMs: 0,
+        playbackRebufferHeavyWarningAtMs: 0,
         playbackWarmTelemetrySig: "",
         playbackWarmTelemetryAtMs: 0,
         playbackWarmTelemetrySuppressed: 0,
@@ -6061,6 +6077,205 @@ export function createViewportSurface(options = {}) {
 
     // --- Phase 2 adaptive rebuffer ------------------------------------------------
     // Full reset for session start / stop / dormant teardown.
+    function clearRebufferToastTimer() {
+        if (state.playbackRebufferToastTimer !== null) {
+            window.clearTimeout(state.playbackRebufferToastTimer);
+            state.playbackRebufferToastTimer = null;
+        }
+    }
+
+    function clearRebufferToastDismissTimer() {
+        if (state.playbackRebufferToastDismissTimer !== null) {
+            window.clearTimeout(state.playbackRebufferToastDismissTimer);
+            state.playbackRebufferToastDismissTimer = null;
+        }
+    }
+
+    function setRebufferToastPressure(value, now = performance.now()) {
+        const pressure = Math.max(
+            0,
+            Math.min(PLAYBACK_REBUFFER_TOAST_DELAY_MS, Number(value) || 0),
+        );
+        state.playbackRebufferToastPressureMs = pressure;
+        state.playbackRebufferToastPressureAtMs = pressure > 0 ? now : 0;
+    }
+
+    function decayedRebufferToastPressure(now = performance.now()) {
+        const pressure = Math.max(0, Number(state.playbackRebufferToastPressureMs) || 0);
+        const at = Number(state.playbackRebufferToastPressureAtMs) || 0;
+        if (!pressure || !at) return 0;
+        const elapsed = Math.max(0, now - at);
+        if (elapsed >= PLAYBACK_REBUFFER_TOAST_DECAY_MS) return 0;
+        return pressure * (1 - (elapsed / PLAYBACK_REBUFFER_TOAST_DECAY_MS));
+    }
+
+    function captureRebufferToastPressure(now = performance.now()) {
+        const pressure = decayedRebufferToastPressure(now);
+        setRebufferToastPressure(pressure, now);
+        return pressure;
+    }
+
+    function currentRebufferToastPressure(now = performance.now()) {
+        const base = Math.max(0, Number(state.playbackRebufferToastPressureMs) || 0);
+        const heldMs = state.playbackRebufferSinceMs !== null
+            ? Math.max(0, now - state.playbackRebufferSinceMs)
+            : 0;
+        return Math.min(PLAYBACK_REBUFFER_TOAST_DELAY_MS, base + heldMs);
+    }
+
+    function setRebufferHeavyPressure(value, now = performance.now()) {
+        const pressure = Math.max(
+            0,
+            Math.min(PLAYBACK_REBUFFER_HEAVY_PRESSURE_THRESHOLD, Number(value) || 0),
+        );
+        state.playbackRebufferHeavyPressure = pressure;
+        state.playbackRebufferHeavyPressureAtMs = pressure > 0 ? now : 0;
+    }
+
+    function decayedRebufferHeavyPressure(now = performance.now()) {
+        const pressure = Math.max(0, Number(state.playbackRebufferHeavyPressure) || 0);
+        const at = Number(state.playbackRebufferHeavyPressureAtMs) || 0;
+        if (!pressure || !at) return 0;
+        const elapsed = Math.max(0, now - at);
+        if (elapsed >= PLAYBACK_REBUFFER_HEAVY_PRESSURE_DECAY_MS) return 0;
+        return pressure * (1 - (elapsed / PLAYBACK_REBUFFER_HEAVY_PRESSURE_DECAY_MS));
+    }
+
+    function captureRebufferHeavyPressure(now = performance.now()) {
+        const pressure = decayedRebufferHeavyPressure(now);
+        setRebufferHeavyPressure(pressure, now);
+        return pressure;
+    }
+
+    function clearRebufferHeavyPressure() {
+        setRebufferHeavyPressure(0, 0);
+        state.playbackRebufferHeavyWarningAtMs = 0;
+    }
+
+    function addRebufferHeavyPressure(value = PLAYBACK_REBUFFER_HEAVY_PRESSURE_PER_BUFFER, now = performance.now()) {
+        const pressure = Math.min(
+            PLAYBACK_REBUFFER_HEAVY_PRESSURE_THRESHOLD,
+            decayedRebufferHeavyPressure(now) + Math.max(0, Number(value) || 0),
+        );
+        setRebufferHeavyPressure(pressure, now);
+        if (pressure < PLAYBACK_REBUFFER_HEAVY_PRESSURE_THRESHOLD) return false;
+        if (state.playbackRebufferToastLevel === "warning") return false;
+        const lastWarningAt = Number(state.playbackRebufferHeavyWarningAtMs) || 0;
+        if (lastWarningAt && now - lastWarningAt < PLAYBACK_REBUFFER_HEAVY_WARNING_COOLDOWN_MS) {
+            return false;
+        }
+        escalateRebufferToast(now);
+        return true;
+    }
+
+    function dismissRebufferToastNow() {
+        if (state.playbackRebufferToastHandle) {
+            try { state.playbackRebufferToastHandle.dismiss(); } catch (e) { /* ignore */ }
+            state.playbackRebufferToastHandle = null;
+        }
+        state.playbackRebufferToastLevel = "";
+        state.playbackRebufferToastShownAtMs = 0;
+    }
+
+    function clearRebufferToast() {
+        clearRebufferToastTimer();
+        clearRebufferToastDismissTimer();
+        dismissRebufferToastNow();
+        setRebufferToastPressure(0, 0);
+        clearRebufferHeavyPressure();
+    }
+
+    function dismissRebufferToastAfterMinimum(now = performance.now()) {
+        clearRebufferToastDismissTimer();
+        if (!state.playbackRebufferToastHandle) {
+            state.playbackRebufferToastShownAtMs = 0;
+            state.playbackRebufferToastLevel = "";
+            return;
+        }
+        const shownAt = Number(state.playbackRebufferToastShownAtMs) || now;
+        const remainingMs = PLAYBACK_REBUFFER_TOAST_MIN_VISIBLE_MS - Math.max(0, now - shownAt);
+        if (remainingMs <= 0) {
+            dismissRebufferToastNow();
+            return;
+        }
+        state.playbackRebufferToastDismissTimer = window.setTimeout(() => {
+            state.playbackRebufferToastDismissTimer = null;
+            if (state.playbackRebuffering) return;
+            dismissRebufferToastNow();
+        }, remainingMs);
+    }
+
+    function rebufferToastDurationMs() {
+        const maxMs = Number(getRebufferMaxMs());
+        return Math.max(
+            PLAYBACK_REBUFFER_TOAST_LINGER_MS,
+            (Number.isFinite(maxMs) ? maxMs : 0) + 1000,
+        );
+    }
+
+    function showRebufferToast(now = performance.now()) {
+        if (!state.playbackRebuffering || state.playbackRebufferCapped) return;
+        clearRebufferToastDismissTimer();
+        if (state.playbackRebufferToastLevel === "warning") {
+            addRebufferHeavyPressure(PLAYBACK_REBUFFER_HEAVY_PRESSURE_PER_BUFFER, now);
+            escalateRebufferToast(now);
+            return;
+        }
+        const durationMs = rebufferToastDurationMs();
+        if (state.playbackRebufferToastHandle) {
+            state.playbackRebufferToastHandle.update({
+                tier: "info",
+                message: "Buffering...",
+                durationMs,
+            });
+        } else {
+            state.playbackRebufferToastHandle = notifyInfo("Buffering...", {
+                source: "playback-rebuffer",
+                durationMs,
+            });
+        }
+        state.playbackRebufferToastShownAtMs = now;
+        state.playbackRebufferToastLevel = "buffering";
+        // Once the toast is visible, keep cooldown pressure decaying from this
+        // display time so follow-up stalls are judged in recent playback context.
+        setRebufferToastPressure(PLAYBACK_REBUFFER_TOAST_DELAY_MS, now);
+        addRebufferHeavyPressure(PLAYBACK_REBUFFER_HEAVY_PRESSURE_PER_BUFFER, now);
+    }
+
+    function scheduleRebufferToast(now = performance.now()) {
+        clearRebufferToastDismissTimer();
+        if (state.playbackRebufferToastHandle) {
+            showRebufferToast(now);
+            return;
+        }
+        if (state.playbackRebufferToastTimer !== null) return;
+        const remainingMs = PLAYBACK_REBUFFER_TOAST_DELAY_MS - currentRebufferToastPressure(now);
+        if (remainingMs <= 0) {
+            showRebufferToast(now);
+            return;
+        }
+        state.playbackRebufferToastTimer = window.setTimeout(() => {
+            state.playbackRebufferToastTimer = null;
+            showRebufferToast(performance.now());
+        }, remainingMs);
+    }
+
+    function settleRebufferToastOnRecovery(heldMs, now = performance.now()) {
+        clearRebufferToastTimer();
+        const totalPressure = Math.max(
+            0,
+            (Number(state.playbackRebufferToastPressureMs) || 0) + Math.max(0, Number(heldMs) || 0),
+        );
+        if (!state.playbackRebufferToastHandle && totalPressure >= PLAYBACK_REBUFFER_TOAST_DELAY_MS) {
+            showRebufferToast(now);
+        }
+        if (state.playbackRebufferToastHandle) {
+            dismissRebufferToastAfterMinimum(now);
+        } else {
+            setRebufferToastPressure(totalPressure, now);
+        }
+    }
+
     function resetRebufferState() {
         state.playbackRebuffering = false;
         state.playbackRebufferFrame = 0;
@@ -6072,19 +6287,14 @@ export function createViewportSurface(options = {}) {
         state.playbackRebufferEntryDecisionSig = "";
         clearRebufferSafetyState();
         clearDeferredNextBoundaryTargets("rebuffer-reset");
-        if (state.playbackRebufferToastHandle) {
-            try { state.playbackRebufferToastHandle.dismiss(); } catch (e) { /* ignore */ }
-            state.playbackRebufferToastHandle = null;
-        }
-        if (state.playbackRebufferCapHandle) {
-            try { state.playbackRebufferCapHandle.dismiss(); } catch (e) { /* ignore */ }
-            state.playbackRebufferCapHandle = null;
-        }
+        clearRebufferToast();
     }
 
     function enterRebuffer(now, details = {}, decision = {}) {
         const blockReason = typeof details === "string" ? details : (details?.reason || "");
         const blockTargetKey = decision.blockTargetKey || rebufferBlockTargetKey(details);
+        captureRebufferToastPressure(now);
+        captureRebufferHeavyPressure(now);
         state.playbackRebuffering = true;
         // Hold at the current (runaway) frame: audio has already played to ~here, so
         // catching the frozen video up to this frame keeps audio continuous (no
@@ -6100,12 +6310,7 @@ export function createViewportSurface(options = {}) {
         for (const active of state.activePlaybackAudios.values()) {
             active.audio.pause();
         }
-        if (!state.playbackRebufferToastHandle) {
-            state.playbackRebufferToastHandle = notifyInfo(
-                "Heavy scene — buffering for smooth playback",
-                { source: "playback-rebuffer" }
-            );
-        }
+        scheduleRebufferToast(now);
         recordPlaybackTelemetry("playback_rebuffer_enter", {
             frame: state.playbackRebufferFrame,
             committedFrame: state.playbackLastCommittedFrame,
@@ -6122,10 +6327,11 @@ export function createViewportSurface(options = {}) {
     // holding pointless). resume:true re-pins the clock and re-seeks audio to the
     // buffering frame so A/V resume in sync.
     function finishRebuffer({ resume, reason } = {}) {
-        if (!state.playbackRebuffering && !state.playbackRebufferToastHandle) return;
+        if (!state.playbackRebuffering && !state.playbackRebufferToastHandle && state.playbackRebufferToastTimer === null) return;
+        const now = performance.now();
         const wasBuffering = state.playbackRebuffering;
         const heldMs = state.playbackRebufferSinceMs !== null
-            ? performance.now() - state.playbackRebufferSinceMs
+            ? now - state.playbackRebufferSinceMs
             : 0;
         const exitTargetKey = state.playbackRebufferBlockTargetKey || "";
         const resumeSafetyTargetCount = state.playbackRebufferSafetyTargets?.length || 0;
@@ -6147,21 +6353,18 @@ export function createViewportSurface(options = {}) {
             buildFrameSnapshot(resumeFrame),
             playbackEndFrame,
         );
+        settleRebufferToastOnRecovery(heldMs, now);
         state.playbackRebuffering = false;
         state.playbackRebufferSinceMs = null;
         state.playbackRebufferCapped = false;
-        state.playbackRebufferLastExitMs = performance.now();
+        state.playbackRebufferLastExitMs = now;
         state.playbackRebufferLastExitTargetKey = exitTargetKey;
         state.playbackRebufferBlockTargetKey = "";
         clearRebufferSafetyState();
-        if (state.playbackRebufferToastHandle) {
-            try { state.playbackRebufferToastHandle.resolve(); } catch (e) { /* ignore */ }
-            state.playbackRebufferToastHandle = null;
-        }
         if (resume) {
             // Re-pin the clock and re-seek audio to the buffering frame so A/V resume
             // locked together (covers both the held-tick and async prepare-ready paths).
-            state.playbackStartTime = performance.now();
+            state.playbackStartTime = now;
             state.playbackStartFrame = resumeFrame;
             if (currentFrame() !== resumeFrame) {
                 applyFrame(resumeFrame, { reason: "playback-rebuffer-resume" });
@@ -6199,22 +6402,27 @@ export function createViewportSurface(options = {}) {
         }
     }
 
-    function escalateRebufferToast() {
-        // The transient buffering info toast may have already auto-dismissed during a
-        // long hold, so update()-ing it would be a no-op. Emit a SEPARATE sticky
-        // warning instead. It persists (warning tier) until playback stops, since the
-        // "too heavy" verdict stays valid across brief recovery windows; coalesces by
-        // source so repeated caps don't stack.
+    function escalateRebufferToast(now = performance.now()) {
+        clearRebufferToastTimer();
+        clearRebufferToastDismissTimer();
+        const patch = {
+            tier: "warning",
+            message: "Scene too heavy for smooth live playback",
+            durationMs: PLAYBACK_REBUFFER_TOAST_LINGER_MS,
+        };
         if (state.playbackRebufferToastHandle) {
-            try { state.playbackRebufferToastHandle.dismiss(); } catch (e) { /* ignore */ }
-            state.playbackRebufferToastHandle = null;
+            state.playbackRebufferToastHandle.update(patch);
+        } else {
+            state.playbackRebufferToastHandle = notifyWarning(patch.message, {
+                source: "playback-rebuffer",
+                durationMs: patch.durationMs,
+            });
         }
-        if (!state.playbackRebufferCapHandle) {
-            state.playbackRebufferCapHandle = notifyWarning(
-                "Scene too heavy for smooth live playback",
-                { source: "playback-rebuffer-cap" }
-            );
-        }
+        state.playbackRebufferToastShownAtMs = now;
+        state.playbackRebufferToastLevel = "warning";
+        setRebufferToastPressure(PLAYBACK_REBUFFER_TOAST_DELAY_MS, now);
+        setRebufferHeavyPressure(PLAYBACK_REBUFFER_HEAVY_PRESSURE_THRESHOLD, now);
+        state.playbackRebufferHeavyWarningAtMs = now;
     }
 
     // Freeze the wall clock at the buffering frame so the prepare target stops

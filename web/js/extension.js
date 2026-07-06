@@ -24,7 +24,7 @@ import {
 } from "./editor_settings.js";
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
-import { notifyProgress, configureNotifications } from "./editor_notifications.js";
+import { notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
 import { mountNodeVideoPreview, unmountNodeVideoPreview } from "./node_video_preview.js";
 
 injectSonderFontFaces();
@@ -190,34 +190,16 @@ async function listProjectAssetFolders(projectId) {
     return uniqueFolderValues(data?.folders || []).filter(Boolean);
 }
 
-function showSonderToast(message, duration = 2600) {
+function notifySourceWorkflow(message, tier = "warning") {
     console.info(`[Sonder] ${message}`);
-    const doc = globalThis.document;
-    if (!doc?.body) return;
-    let toast = doc.getElementById("sonder-global-toast");
-    if (!toast) {
-        toast = doc.createElement("div");
-        toast.id = "sonder-global-toast";
-        toast.style.cssText = `
-            position:fixed;left:50%;bottom:22px;transform:translateX(-50%);
-            z-index:100000;padding:8px 12px;border-radius:6px;
-            background:${THEME.bg2};border:1px solid ${THEME.line2};
-            color:${THEME.fg0};font-family:${FONT.sans};font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,0.35);
-            opacity:0;transition:opacity 140ms ease;pointer-events:none;
-        `;
-        doc.body.appendChild(toast);
-    }
-    if (toast._sonderTimer) globalThis.clearTimeout(toast._sonderTimer);
-    toast.textContent = message;
-    toast.style.opacity = "1";
-    toast._sonderTimer = globalThis.setTimeout(() => {
-        toast.style.opacity = "0";
-    }, duration);
+    const opts = { source: "source-workflow" };
+    if (tier === "info") notifyInfo(message, opts);
+    else notifyWarning(message, opts);
 }
 
 async function openWorkflowJson(workflow, name = "Sonder Source Workflow") {
     if (!workflow || typeof workflow !== "object") {
-        showSonderToast("Source workflow unavailable");
+        notifySourceWorkflow("Source workflow unavailable");
         return false;
     }
     const openWorkflow = app?.workflowManager?.openWorkflow;
@@ -230,10 +212,10 @@ async function openWorkflowJson(workflow, name = "Sonder Source Workflow") {
         }
     }
     if (typeof app?.loadGraphData !== "function") {
-        showSonderToast("Source workflow unavailable");
+        notifySourceWorkflow("Source workflow unavailable");
         return false;
     }
-    showSonderToast("Opening workflow will replace current canvas");
+    notifySourceWorkflow("Opening workflow will replace current canvas", "info");
     return await withGraphLoadBypass(async () => {
         await app.loadGraphData(workflow);
         return true;
@@ -244,7 +226,7 @@ async function openSourceWorkflowForAsset(projectDir, asset) {
     const projectId = projectIdFromProjectValue(projectDir);
     const assetId = asset?.asset_id || asset?.id || "";
     if (!projectId || !assetId) {
-        showSonderToast("Source workflow unavailable");
+        notifySourceWorkflow("Source workflow unavailable");
         return false;
     }
     try {
@@ -256,14 +238,14 @@ async function openSourceWorkflowForAsset(projectDir, asset) {
                 const payload = await resp.json();
                 reason = payload?.reason || payload?.error || reason;
             } catch (_) { /* ignore */ }
-            showSonderToast(`Source workflow ${reason}`);
+            notifySourceWorkflow(`Source workflow ${reason}`);
             return false;
         }
         const payload = await resp.json();
         return await openWorkflowJson(payload?.workflow, asset?.name || "Sonder Source Workflow");
     } catch (error) {
         console.warn("[Sonder] Open Source Workflow failed:", error);
-        showSonderToast("Source workflow unavailable");
+        notifySourceWorkflow("Source workflow unavailable");
         return false;
     }
 }

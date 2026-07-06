@@ -32,6 +32,11 @@ function _ttlForTier(tier) {
     return typeof v === "number" && v > 0 ? v : null;
 }
 
+function _ttlOverride(value) {
+    const v = Number(value);
+    return Number.isFinite(v) && v > 0 ? v : null;
+}
+
 // Push lifetime overrides (ms; 0 = sticky). Only known keys are applied.
 export function configureNotifications(patch = {}) {
     for (const key of ["info", "success", "warning", "error"]) {
@@ -175,12 +180,16 @@ function _applyOpts(notif, opts) {
     if ("foreground" in opts) notif.foreground = !!opts.foreground;
     if ("onRetry" in opts) notif.onRetry = opts.onRetry ?? null;
     if ("actions" in opts) notif.actions = opts.actions ?? null;
-    notif._ttl = _ttlForTier(notif.tier);
+    if ("durationMs" in opts) {
+        notif._hasDurationOverride = true;
+        notif._durationOverride = _ttlOverride(opts.durationMs);
+    }
+    notif._ttl = notif._hasDurationOverride ? notif._durationOverride : _ttlForTier(notif.tier);
 }
 
 // ── Core API ───────────────────────────────────────────────────────────────────
 
-// notify({ tier, verb, message, detail, progress, foreground, source, onRetry, actions })
+// notify({ tier, verb, message, detail, progress, foreground, source, onRetry, actions, durationMs })
 // Returns a handle: { id, update, progress, resolve, dismiss }.
 export function notify(opts = {}) {
     const s = _ensure();
@@ -201,6 +210,7 @@ export function notify(opts = {}) {
     }
 
     const id = `sn${++s.seq}`;
+    const hasDurationOverride = "durationMs" in opts;
     const notif = {
         id,
         tier,
@@ -216,7 +226,9 @@ export function notify(opts = {}) {
         createdAt: _now(),
         updatedAt: _now(),
         _key: key,
-        _ttl: _ttlForTier(tier),
+        _hasDurationOverride: hasDurationOverride,
+        _durationOverride: hasDurationOverride ? _ttlOverride(opts.durationMs) : null,
+        _ttl: hasDurationOverride ? _ttlOverride(opts.durationMs) : _ttlForTier(tier),
         _remaining: null,
         _armedAt: 0,
     };
