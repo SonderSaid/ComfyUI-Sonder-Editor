@@ -2743,7 +2743,9 @@ def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):
 
     cache_dir = tmp_path / "cache" / "renders"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / "scene-1_hash.pt"
+    # Filename carries the render-cache color-pipeline salt (_cm1); pre-salt
+    # caches are simply never read again.
+    cache_path = cache_dir / "scene-1_hash_cm1.pt"
     cache_path.write_bytes(b"corrupt")
 
     class DummyScene:

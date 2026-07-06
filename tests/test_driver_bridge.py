@@ -86,7 +86,7 @@ def _make_project(tmp_path, monkeypatch, *, lane_count=2, clip_lane=0, hidden=Fa
 def _stub_decode(monkeypatch, bridge):
     import numpy as np
 
-    def fake_decode(_path, start, end):
+    def fake_decode(_path, start, end, **_kwargs):
         for frame_no in range(start, end):
             yield np.full((2, 2, 3), frame_no, dtype=np.uint8)
 

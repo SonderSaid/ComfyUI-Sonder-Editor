@@ -9,9 +9,30 @@ import numpy as np
 import torch
 
 from .atomic_io import atomic_replace
-from .media_helpers import fit_frame_to_canvas, get_ffmpeg_path, run_ffmpeg_command
+from .media_helpers import (
+    apply_rgb_color_correction,
+    color_correction_for_interpretation,
+    fit_frame_to_canvas,
+    get_ffmpeg_path,
+    resolve_source_color_interpretation,
+    run_ffmpeg_command,
+)
 from .path_security import resolve_existing_project_path, resolve_project_path
 from .timeline_state import Scene, TimelineProject
+
+# Composited render caches are invalidated when color handling changes;
+# bump this salt alongside any change to the decode color pipeline.
+_RENDER_CACHE_COLOR_VERSION = "cm1"
+
+
+def _default_video_capture(path: str):
+    # Pin the FFmpeg backend: the color-correction constants (fixed BT.601
+    # matrix assumption) were measured against it. Fall back to the single-arg
+    # form for VideoCapture substitutes that only accept a path.
+    try:
+        return cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+    except TypeError:
+        return cv2.VideoCapture(path)
 
 logger = logging.getLogger("sonder_editor")
 
@@ -68,7 +89,7 @@ def iter_scene_frames(
 ):
     """Yield uncached uint8 RGB scene frames for [start_frame, end_frame)."""
     _check_cancel(cancel_event)
-    video_capture_factory = video_capture_factory or cv2.VideoCapture
+    video_capture_factory = video_capture_factory or _default_video_capture
     proj_w, proj_h = _scene_resolution(project, scene)
     render_start = max(0, int(start_frame or 0))
     render_end = max(render_start, int(end_frame or render_start))
@@ -84,7 +105,9 @@ def iter_scene_frames(
         if abs_path not in captures:
             cap = video_capture_factory(abs_path)
             if cap.isOpened():
-                captures[abs_path] = cap
+                asset = project.asset_for_source_path(source_path)
+                interpretation = resolve_source_color_interpretation(asset, abs_path)
+                captures[abs_path] = (cap, color_correction_for_interpretation(interpretation))
             else:
                 logger.warning("Cannot open video: %s", abs_path)
                 return None
@@ -103,9 +126,10 @@ def iter_scene_frames(
 
             for clip in active:
                 _check_cancel(cancel_event)
-                cap = get_cap(clip.source_path)
-                if cap is None:
+                capture_entry = get_cap(clip.source_path)
+                if capture_entry is None:
                     continue
+                cap, color_affine = capture_entry
                 source_frame = clip.source_in_frame + (frame_index - clip.timeline_start_frame)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
                 ok, frame_bgr = cap.read()
@@ -113,6 +137,7 @@ def iter_scene_frames(
                     continue
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_rgb = apply_rgb_color_correction(frame_rgb, color_affine)
                 placed, (dx, dy, dw, dh) = fit_frame_to_canvas(
                     frame_rgb, proj_w, proj_h,
                     mode=getattr(clip, "fit_mode", "pad_edge"),
@@ -133,7 +158,7 @@ def iter_scene_frames(
                     )
             yield np.ascontiguousarray(canvas)
     finally:
-        for cap in captures.values():
+        for cap, _affine in captures.values():
             cap.release()
 
 
@@ -149,7 +174,7 @@ def render_scene_frames(
 ) -> torch.Tensor:
     """Composite visible render clips into an RGB float tensor for [start_frame, end_frame)."""
     _check_cancel(cancel_event)
-    video_capture_factory = video_capture_factory or cv2.VideoCapture
+    video_capture_factory = video_capture_factory or _default_video_capture
     proj_w, proj_h = _scene_resolution(project, scene)
     render_start = max(0, int(start_frame or 0))
     render_end = max(render_start, int(end_frame or render_start))
@@ -162,7 +187,7 @@ def render_scene_frames(
     content_hash = ""
     if use_cache:
         content_hash = scene.content_hash(render_start, render_end, project.resolution)
-        cache_filename = f"{scene.scene_id}_{content_hash}.pt"
+        cache_filename = f"{scene.scene_id}_{content_hash}_{_RENDER_CACHE_COLOR_VERSION}.pt"
         cache_path = resolve_project_path(
             project,
             os.path.join("cache", "renders", cache_filename),
@@ -208,7 +233,7 @@ def render_scene_frames(
     if cache_dir and cache_path:
         tmp_path = resolve_project_path(
             project,
-            os.path.join("cache", "renders", f".{scene.scene_id}_{content_hash}_{uuid.uuid4().hex[:8]}.tmp"),
+            os.path.join("cache", "renders", f".{scene.scene_id}_{content_hash}_{_RENDER_CACHE_COLOR_VERSION}_{uuid.uuid4().hex[:8]}.tmp"),
             purpose="timeline render cache temp file",
         )
     if not cache_dir or not cache_path or not tmp_path:

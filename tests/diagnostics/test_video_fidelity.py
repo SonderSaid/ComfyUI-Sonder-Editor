@@ -258,6 +258,87 @@ def _probe_ffprobe(ffmpeg: str, media_path: Path) -> dict:
     }
 
 
+# Exact BT.709 conversion + tagging args appended to every YUV video encode.
+# BOTH tagging mechanisms are required: setparams frame properties work on
+# ffmpeg 7.x (where the CLI flags are inert) while the CLI -color* flags are
+# the working mechanism on 4.x-6.x (where frame properties never reach the
+# encoder). MOV outputs additionally need `-movflags +write_colr` on 4.x.
+EXPECTED_BT709_COLOR_VF = (
+    "scale=out_color_matrix=bt709:out_range=tv,"
+    "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"
+)
+EXPECTED_BT709_COLOR_FLAGS = [
+    "-colorspace", "bt709",
+    "-color_primaries", "bt709",
+    "-color_trc", "bt709",
+    "-color_range", "tv",
+]
+
+
+_SATURATED_PATCHES = {
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "blue": (0, 0, 255),
+    "magenta": (255, 0, 255),
+    "skin": (224, 172, 138),
+    "gray": (128, 128, 128),
+}
+
+# Colors that stay inside [0,255] when a BT.709 stream is misdecoded with
+# BT.601 coefficients. cv2's uint8 output CLIPS out-of-gamut intermediates, and
+# a linear correction cannot recover clipped information — so the decode-side
+# correction is exact only for in-gamut colors (saturated primaries retain the
+# same residual the pre-color-management cancellation pipeline had).
+_IN_GAMUT_PATCHES = {
+    "red_soft": (200, 40, 40),
+    "green_soft": (40, 200, 40),
+    "blue_soft": (40, 40, 200),
+    "magenta_soft": (200, 40, 200),
+    "skin": (224, 172, 138),
+    "gray": (128, 128, 128),
+}
+
+
+def _make_color_patch_frame(width: int = 1280, height: int = 720, patches=None):
+    """Flat color patches with center-region sampling boxes — patch means
+    survive 4:2:0 subsampling, unlike the busy diagnostic frames."""
+    np = pytest.importorskip("numpy")
+    patches = patches or _SATURATED_PATCHES
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    cols = 3
+    patch_w, patch_h = width // cols, height // 2
+    regions = {}
+    for index, (name, rgb) in enumerate(patches.items()):
+        row, col = divmod(index, cols)
+        y0, x0 = row * patch_h, col * patch_w
+        frame[y0 : y0 + patch_h, x0 : x0 + patch_w] = rgb
+        regions[name] = (y0 + patch_h // 4, y0 + 3 * patch_h // 4, x0 + patch_w // 4, x0 + 3 * patch_w // 4)
+    return frame, regions
+
+
+def _patch_mean_deltas(reference, decoded, regions) -> dict:
+    np = pytest.importorskip("numpy")
+    deltas = {}
+    for name, (y0, y1, x0, x1) in regions.items():
+        ref = reference[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
+        got = decoded[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
+        deltas[name] = float(np.abs(got - ref).max())
+    return deltas
+
+
+def _decode_first_frame_rgb(ffmpeg: str, media_path, width: int, height: int, vf: str = ""):
+    np = pytest.importorskip("numpy")
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(media_path)]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace")[:300])
+    frame_size = width * height * 3
+    return np.frombuffer(result.stdout[:frame_size], dtype=np.uint8).reshape(height, width, 3)
+
+
 def _make_diagnostic_rgb_frames(frame_count: int = 8, width: int = 160, height: int = 96):
     np = pytest.importorskip("numpy")
     cv2 = pytest.importorskip("cv2")
@@ -590,11 +671,22 @@ def test_sonder_save_and_preview_real_ffmpeg_paths_match_diagnostic_flags(tmp_pa
     save_cmd = _cmd_for(save_path.name)
     preview_cmd = _cmd_for(preview_video)
     save_tail = save_cmd[save_cmd.index("-c:v") :]
-    assert save_tail[:10] == ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    assert save_tail[:20] == [
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-vf", EXPECTED_BT709_COLOR_VF,
+        *EXPECTED_BT709_COLOR_FLAGS,
+    ]
+    assert save_cmd.count("-movflags") == 1  # a second pair would override +faststart
     assert preview_cmd[preview_cmd.index("-c:v") + 1] == "libx264"
     assert preview_cmd[preview_cmd.index("-pix_fmt", preview_cmd.index("-c:v")) + 1] == "yuv420p"
+    assert preview_cmd[preview_cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
+    assert preview_cmd[preview_cmd.index("-colorspace") + 1] == "bt709"
     assert project.assets[0].generation_params["save_preset"] == "Compatible MP4"
     assert project.assets[0].generation_params["tensor_mode"] == "round"
+    assert project.assets[0].generation_params["color_managed"] is True
+    assert project.assets[0].generation_params["color_space"] == "bt709"
+    assert project.assets[0].generation_params["color_range"] == "tv"
 
     height, width = frames_rgb.shape[1:3]
     save_metrics = _metrics(frames_rgb, _decode_ffmpeg_rgb(ffmpeg, save_path, width, height))
@@ -641,8 +733,24 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
         assert meta["codec"] == codec
         assert meta["pix_fmt"] == pix_fmt
         assert meta["tensor_mode"] == tensor_mode
+        assert meta["color_managed"] is True
         assert cmd[cmd.index("-c:v") + 1] == codec
         assert cmd[cmd.index("-pix_fmt", cmd.index("-c:v")) + 1] == pix_fmt
+        if pix_fmt == "gbrp":
+            assert "-vf" not in cmd
+            assert "-colorspace" not in cmd
+            assert meta["color_space"] == "rgb"
+        else:
+            assert cmd[cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
+            for offset, flag in enumerate(EXPECTED_BT709_COLOR_FLAGS):
+                assert cmd[cmd.index("-colorspace") + offset] == flag
+            assert meta["color_space"] == "bt709"
+            assert meta["color_range"] == "tv"
+        if extension == ".mov":
+            assert cmd[cmd.index("-movflags") + 1] == "+write_colr"
+        elif extension == ".mp4":
+            assert cmd.count("-movflags") == 1
+            assert cmd[cmd.index("-movflags") + 1] == "+faststart"
         for idx, arg in enumerate(audio_args):
             assert cmd[cmd.index(audio_args[0]) + idx] == arg
 
@@ -675,6 +783,8 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert cmd[cmd.index("-c:v") + 1] == "libx265"
     assert cmd[cmd.index("-crf") + 1] == "21"
     assert cmd[cmd.index("-preset") + 1] == "medium"
+    assert cmd[cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
+    assert meta["color_space"] == "bt709"
     assert cmd[cmd.index("-c:a") + 1] == "aac"
     assert cmd[cmd.index("-b:a") + 1] == "320k"
     assert cmd.count("-map") == 2
@@ -699,6 +809,7 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert prores_meta["codec"] == "prores_ks"
     assert prores_meta["audio_mode"] == "pcm_s16le"
     assert prores_cmd[prores_cmd.index("-profile:v") + 1] == "3"
+    assert prores_cmd[prores_cmd.index("-movflags") + 1] == "+write_colr"
     assert prores_cmd[prores_cmd.index("-c:a") + 1] == "pcm_s16le"
 
     ffv1_meta = media_helpers.encode_video(
@@ -718,6 +829,8 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     ffv1_cmd = captured["cmds"][-1]
     assert ffv1_meta["codec"] == "ffv1"
     assert ffv1_meta["pix_fmt"] == "gbrp"
+    assert ffv1_meta["color_space"] == "rgb"
+    assert "-vf" not in ffv1_cmd
     assert ffv1_cmd[ffv1_cmd.index("-slicecrc") + 1] == "1"
     assert ffv1_cmd[ffv1_cmd.index("-c:a") + 1] == "flac"
 
@@ -737,6 +850,213 @@ def test_encode_video_preset_commands_and_tensor_modes(tmp_path, monkeypatch):
     assert no_audio_cmd.count("-i") == 1
     assert "-map" not in no_audio_cmd
     assert "-c:a" not in no_audio_cmd
+    assert no_audio_cmd[no_audio_cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
+    assert no_audio_cmd.count("-movflags") == 1  # mp4: color args must not add a second pair
+
+
+def test_encode_video_evens_odd_dimensions(tmp_path, monkeypatch):
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    odd_frames = np.zeros((1, 481, 853, 3), dtype=np.uint8)
+    media_helpers.encode_video(
+        odd_frames,
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "odd.mp4"),
+        fps=24,
+    )
+    cmd = captured["cmds"][-1]
+    assert cmd[cmd.index("-s") + 1] == "853x481"
+    vf_value = cmd[cmd.index("-vf") + 1]
+    assert vf_value.startswith("scale=852:480:out_color_matrix=bt709:out_range=tv")
+    assert "setparams=colorspace=bt709" in vf_value
+
+    even_frames = np.zeros((1, 480, 852, 3), dtype=np.uint8)
+    media_helpers.encode_video(
+        even_frames,
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "even.mp4"),
+        fps=24,
+    )
+    even_cmd = captured["cmds"][-1]
+    assert even_cmd[even_cmd.index("-vf") + 1] == EXPECTED_BT709_COLOR_VF
+
+
+def test_browser_simulation_round_trip_bt709(tmp_path, monkeypatch):
+    """The original color-shift bug as a regression test: BT.709-decoding a new
+    encode (what browsers do) must be near-lossless, while the same decode of a
+    legacy-style untagged encode shows the ~40/255 green shift."""
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    ffmpeg = _require_ffmpeg(io_nodes)
+    np = pytest.importorskip("numpy")
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
+
+    frame, regions = _make_color_patch_frame(width=640, height=360)
+    frames = np.stack([frame] * 8, axis=0)
+
+    new_path = tmp_path / "managed.mp4"
+    media_helpers.encode_video(frames, preset_id="Compatible MP4", output_path=str(new_path), fps=24)
+    browser_decode = _decode_first_frame_rgb(ffmpeg, new_path, 640, 360, vf="scale=in_color_matrix=bt709:in_range=tv")
+    new_deltas = _patch_mean_deltas(frame, browser_decode, regions)
+    print("BROWSER_SIM_BT709_DELTAS=" + json.dumps(new_deltas, sort_keys=True))
+    assert max(new_deltas.values()) <= 8.0
+
+    # Legacy-style encode: same preset args, no color management (pre-fix behavior).
+    legacy_path = tmp_path / "legacy.mp4"
+    legacy_cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "640x360", "-r", "24", "-i", "pipe:0",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(legacy_path),
+    ]
+    subprocess.run(legacy_cmd, input=frame.tobytes() * 8, capture_output=True, timeout=120, check=True)
+    legacy_decode = _decode_first_frame_rgb(ffmpeg, legacy_path, 640, 360, vf="scale=in_color_matrix=bt709:in_range=tv")
+    legacy_deltas = _patch_mean_deltas(frame, legacy_decode, regions)
+    assert legacy_deltas["green"] >= 25.0
+
+    probe = _probe_ffprobe(ffmpeg, new_path)
+    if probe.get("available") and not probe.get("error"):
+        assert probe["color_space"] == "bt709"
+        assert probe["color_range"] == "tv"
+
+
+def test_cv2_decode_correction_round_trip(tmp_path, monkeypatch):
+    """Decode-side correction end to end: cv2 (fixed BT.601) decoding a tagged
+    BT.709 file is visibly wrong; resolver + affine correction recovers the
+    source exactly for in-gamut colors; re-encoding the corrected frame and
+    browser-decoding it matches the original (the cancellation-replacement
+    proof). Saturated primaries clip inside cv2's uint8 output and are pinned
+    separately below — the correction leaves them exactly where the old
+    accidental-cancellation pipeline left them, no worse."""
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    ffmpeg = _require_ffmpeg(io_nodes)
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
+
+    frame, regions = _make_color_patch_frame(width=640, height=360, patches=_IN_GAMUT_PATCHES)
+    frames = np.stack([frame] * 8, axis=0)
+    source_path = tmp_path / "tagged_709.mp4"
+    media_helpers.encode_video(frames, preset_id="Compatible MP4", output_path=str(source_path), fps=24)
+
+    cap = cv2.VideoCapture(str(source_path), cv2.CAP_FFMPEG)
+    try:
+        assert cap.isOpened()
+        ok, frame_bgr = cap.read()
+        assert ok
+    finally:
+        cap.release()
+    decoded_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+    uncorrected_deltas = _patch_mean_deltas(frame, decoded_rgb, regions)
+    interpretation = media_helpers.resolve_source_color_interpretation(None, str(source_path))
+    assert interpretation == ("bt709", "tv")
+    affine = media_helpers.color_correction_for_interpretation(interpretation)
+    assert affine is not None
+    corrected_rgb = media_helpers.apply_rgb_color_correction(decoded_rgb, affine)
+    corrected_deltas = _patch_mean_deltas(frame, corrected_rgb, regions)
+    print("CV2_CORRECTION_DELTAS=" + json.dumps({"uncorrected": uncorrected_deltas, "corrected": corrected_deltas}, sort_keys=True))
+    assert uncorrected_deltas["green_soft"] >= 15.0
+    assert max(corrected_deltas.values()) <= 5.0
+
+    passthrough_path = tmp_path / "passthrough.mp4"
+    media_helpers.encode_video(
+        np.stack([corrected_rgb] * 4, axis=0),
+        preset_id="Compatible MP4",
+        output_path=str(passthrough_path),
+        fps=24,
+    )
+    browser_decode = _decode_first_frame_rgb(ffmpeg, passthrough_path, 640, 360, vf="scale=in_color_matrix=bt709:in_range=tv")
+    passthrough_deltas = _patch_mean_deltas(frame, browser_decode, regions)
+    assert max(passthrough_deltas.values()) <= 7.0
+
+
+def test_cv2_decode_correction_clipped_saturation_matches_model(tmp_path, monkeypatch):
+    """KNOWN LIMITATION pin: colors that fall out of gamut under cv2's wrong
+    BT.601 decode (e.g. pure 709 green wants G≈299) are clipped to uint8 before
+    the correction runs, so the correction cannot fully recover them. The
+    corrected output must instead match the clip-aware model prediction —
+    which is byte-identical to what the pre-color-management pipeline's
+    accidental 601/709 cancellation produced, so saturated passthrough is
+    never WORSE than before this change. Full fix requires ffmpeg-side decode
+    for mismatched sources (documented follow-up)."""
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    ffmpeg = _require_ffmpeg(io_nodes)
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
+
+    frame, regions = _make_color_patch_frame(width=640, height=360, patches=_SATURATED_PATCHES)
+    source_path = tmp_path / "tagged_709_saturated.mp4"
+    media_helpers.encode_video(np.stack([frame] * 8, axis=0), preset_id="Compatible MP4",
+                               output_path=str(source_path), fps=24)
+
+    cap = cv2.VideoCapture(str(source_path), cv2.CAP_FFMPEG)
+    try:
+        assert cap.isOpened()
+        ok, frame_bgr = cap.read()
+        assert ok
+    finally:
+        cap.release()
+    decoded_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    affine = media_helpers.color_correction_for_interpretation(("bt709", "tv"))
+    corrected_rgb = media_helpers.apply_rgb_color_correction(decoded_rgb, affine)
+
+    # Clip-aware model: encode 709 -> decode 601 (clipped uint8) -> correction affine.
+    encode_709, offset_709 = media_helpers._yuv_encode_matrix("bt709", "tv")
+    encode_601, offset_601 = media_helpers._yuv_encode_matrix("bt601", "tv")
+    decode_601 = np.linalg.inv(encode_601)
+    model_deltas = {}
+    for name, (y0, y1, x0, x1) in regions.items():
+        source_rgb = frame[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0) / 255.0
+        yuv = encode_709 @ source_rgb + offset_709
+        wrong = np.clip(decode_601 @ (yuv - offset_601) * 255.0, 0, 255)
+        model = np.clip(affine[:, :3] @ wrong + affine[:, 3], 0, 255)
+        got = corrected_rgb[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
+        model_deltas[name] = float(np.abs(got - model).max())
+    print("CV2_CLIP_MODEL_DELTAS=" + json.dumps(model_deltas, sort_keys=True))
+    assert max(model_deltas.values()) <= 4.0
+
+
+def test_cv2_fixed_bt601_assumption(tmp_path, monkeypatch):
+    """Pin CV2_ASSUMED_MATRIX: cv2's FFmpeg backend must keep decoding with
+    fixed BT.601 coefficients (ignoring bt709 stream tags). If a future OpenCV
+    build starts honoring tags, this fails loudly — the correction constants in
+    media_helpers must then key off detected behavior instead."""
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    ffmpeg = _require_ffmpeg(io_nodes)
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
+
+    frame, _regions = _make_color_patch_frame(width=640, height=360)
+    source_path = tmp_path / "tagged_709.mp4"
+    media_helpers.encode_video(np.stack([frame] * 8, axis=0), preset_id="Compatible MP4", output_path=str(source_path), fps=24)
+
+    cap = cv2.VideoCapture(str(source_path), cv2.CAP_FFMPEG)
+    try:
+        assert cap.isOpened()
+        ok, frame_bgr = cap.read()
+        assert ok
+    finally:
+        cap.release()
+    cv2_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
+
+    ref_601 = _decode_first_frame_rgb(ffmpeg, source_path, 640, 360, vf="scale=in_color_matrix=bt601:in_range=tv").astype(np.int16)
+    ref_709 = _decode_first_frame_rgb(ffmpeg, source_path, 640, 360, vf="scale=in_color_matrix=bt709:in_range=tv").astype(np.int16)
+    mae_601 = float(np.mean(np.abs(cv2_rgb - ref_601)))
+    mae_709 = float(np.mean(np.abs(cv2_rgb - ref_709)))
+    print(f"CV2_ASSUMPTION_MAE bt601={mae_601:.3f} bt709={mae_709:.3f}")
+    assert mae_601 < 2.0, "cv2 no longer decodes with fixed BT.601 — re-pin CV2_ASSUMED_MATRIX"
+    assert mae_601 < mae_709
 
 
 def test_save_video_encode_timeout_extends_large_high_cost_presets():

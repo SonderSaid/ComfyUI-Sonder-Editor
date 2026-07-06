@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..server.media_helpers import decode_video_range, fit_frame_to_canvas
+from ..server.media_helpers import decode_video_range, fit_frame_to_canvas, resolve_source_color_interpretation
 from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig
 
@@ -287,8 +287,14 @@ def _decode_driver_clip(project, clip, overlap_start: int, overlap_len: int, wid
         raise RuntimeError(f"Driver media not found: {source_path or abs_path}")
 
     frames = []
+    asset_lookup = getattr(project, "asset_for_source_path", None)
+    asset = asset_lookup(source_path) if callable(asset_lookup) else None
+    interpretation = resolve_source_color_interpretation(asset, abs_path)
     try:
-        decoded = decode_video_range(abs_path, source_start, source_start + overlap_len)
+        decoded = decode_video_range(
+            abs_path, source_start, source_start + overlap_len,
+            color_interpretation=interpretation,
+        )
         for offset in range(overlap_len):
             try:
                 frame_rgb = next(decoded)

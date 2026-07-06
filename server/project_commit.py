@@ -55,6 +55,11 @@ def _copy_generated_asset_registration(target, source) -> bool:
         "duration_sec",
         "sample_rate",
         "has_audio",
+        "color_space",
+        "color_transfer",
+        "color_primaries",
+        "color_range",
+        "color_probed",
         "folder",
     ):
         value = getattr(source, attr, None)

@@ -17,7 +17,14 @@ import folder_paths
 
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
-from ..server.media_helpers import decode_audio_samples, decode_video_frame, fit_frame_to_canvas
+from ..server.media_helpers import (
+    apply_rgb_color_correction,
+    color_correction_for_interpretation,
+    decode_audio_samples,
+    decode_video_frame,
+    fit_frame_to_canvas,
+    resolve_source_color_interpretation,
+)
 from ..server.path_security import (
     PathSecurityError,
     path_within,
@@ -821,6 +828,7 @@ class SonderEditor:
                                 asset_path, asset.asset_type, proj_w, proj_h,
                                 fit_mode=getattr(guide, "fit_mode", "pad_edge"),
                                 crop_position=getattr(guide, "crop_position", "center"),
+                                asset=asset,
                             )
                             if img is not None:
                                 guide_images.append(img)
@@ -957,7 +965,6 @@ class SonderEditor:
             scene,
             render_start,
             render_end,
-            video_capture_factory=cv2.VideoCapture,
             use_cache=use_cache,
         )
 
@@ -976,13 +983,15 @@ class SonderEditor:
 
     def _load_guide_image(self, path: str, asset_type: str,
                           target_w: int, target_h: int,
-                          fit_mode: str = "pad_edge", crop_position: str = "center") -> torch.Tensor | None:
+                          fit_mode: str = "pad_edge", crop_position: str = "center",
+                          asset=None) -> torch.Tensor | None:
         """Load an image file and return as (H, W, 3) float32 RGB tensor."""
         try:
             if asset_type == "video":
-                frame_rgb = decode_video_frame(path, 0)
+                interpretation = resolve_source_color_interpretation(asset, path)
+                frame_rgb = decode_video_frame(path, 0, color_interpretation=interpretation)
                 if frame_rgb is None:
-                    cap = cv2.VideoCapture(path)
+                    cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
                     try:
                         if not cap.isOpened():
                             return None
@@ -990,6 +999,9 @@ class SonderEditor:
                         if not ret:
                             return None
                         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        frame_rgb = apply_rgb_color_correction(
+                            frame_rgb, color_correction_for_interpretation(interpretation)
+                        )
                     finally:
                         cap.release()
             else:

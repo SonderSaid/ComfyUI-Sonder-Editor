@@ -62,6 +62,14 @@ class Asset:
     has_audio_checked: bool = False          # video files: audio probe has completed for current signature
     duration_checked: bool = False           # audio files: duration probe has completed for current signature
     media_probe_signature: str = ""          # file size + mtime marker for cached probes
+    # Source color tags (video): normalized ffprobe/banner values, "" = untagged.
+    # color_space "rgb" is a sentinel for matrix-free RGB content. A manually
+    # set color_space overrides probing (mis-tagged-file escape hatch).
+    color_space: str = ""
+    color_transfer: str = ""
+    color_primaries: str = ""
+    color_range: str = ""
+    color_probed: bool = False               # video files: color probe has completed for current signature
     imported_at: str = field(default_factory=lambda: datetime.now().isoformat())
     folder: str = ""                            # organizational folder (e.g., "Takes/Scene 1")
     favorite: bool = False                  # user-pinned in the asset gallery
@@ -87,6 +95,11 @@ class Asset:
             "has_audio_checked": self.has_audio_checked,
             "duration_checked": self.duration_checked,
             "media_probe_signature": self.media_probe_signature,
+            "color_space": self.color_space,
+            "color_transfer": self.color_transfer,
+            "color_primaries": self.color_primaries,
+            "color_range": self.color_range,
+            "color_probed": self.color_probed,
             "imported_at": self.imported_at,
             "folder": self.folder,
             "favorite": bool(self.favorite),
@@ -114,12 +127,40 @@ class Asset:
             has_audio_checked=data.get("has_audio_checked", False),
             duration_checked=data.get("duration_checked", False),
             media_probe_signature=data.get("media_probe_signature", ""),
+            color_space=data.get("color_space", ""),
+            color_transfer=data.get("color_transfer", ""),
+            color_primaries=data.get("color_primaries", ""),
+            color_range=data.get("color_range", ""),
+            color_probed=data.get("color_probed", False),
             imported_at=data.get("imported_at", datetime.now().isoformat()),
             folder=data.get("folder", ""),
             favorite=bool(data.get("favorite", False)),
             trashed_at=data.get("trashed_at", ""),
             trash_previous_folder=data.get("trash_previous_folder", ""),
         )
+
+
+def _normalize_asset_relpath(path: str) -> str:
+    value = str(path or "").replace("\\", "/").strip()
+    while value.startswith("./"):
+        value = value[2:]
+    return value.casefold()
+
+
+def apply_color_metadata(asset: "Asset", metadata: dict) -> bool:
+    """Copy probed color fields from a media-metadata dict onto an asset.
+    Returns True when anything changed."""
+    changed = False
+    for field in ("color_space", "color_transfer", "color_primaries", "color_range"):
+        value = str(metadata.get(field, "") or "")
+        if getattr(asset, field, "") != value:
+            setattr(asset, field, value)
+            changed = True
+    probed = bool(metadata.get("color_probed", False))
+    if getattr(asset, "color_probed", False) != probed:
+        asset.color_probed = probed
+        changed = True
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1002,6 +1043,17 @@ class TimelineProject:
     def get_assets_by_type(self, asset_type: str) -> list:
         """Return assets filtered by type: 'video', 'image', 'audio', or 'artifact'."""
         return [a for a in self.assets if a.asset_type == asset_type]
+
+    def asset_for_source_path(self, source_path: str) -> "Asset | None":
+        """Registry lookup by normalized project-relative path (clip.source_path
+        convention). Pure string comparison — no filesystem access."""
+        normalized = _normalize_asset_relpath(source_path)
+        if not normalized:
+            return None
+        for asset in self.assets:
+            if _normalize_asset_relpath(getattr(asset, "path", "") or "") == normalized:
+                return asset
+        return None
 
     def add_asset(self, asset: "Asset") -> None:
         self.assets.append(asset)

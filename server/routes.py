@@ -17,13 +17,17 @@ from .media_helpers import (
     DEFAULT_FIT_MODE,
     FIT_MODES,
     MediaProbeError,
+    apply_rgb_color_correction,
+    color_correction_for_interpretation,
     decode_video_frame,
     get_ffmpeg_path,
     get_ffprobe_path,
     is_valid_media_metadata,
+    resolve_source_color_interpretation,
     probe_audio_duration,
     probe_media_has_audio,
     probe_media_metadata,
+    probe_video_color_metadata,
     resize_frame_to_long_edge,
     write_png,
 )
@@ -70,7 +74,7 @@ from .session_registry import (
 )
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
-    ClipReference, LaneConfig, GenerationJob, classify_asset_path,
+    ClipReference, LaneConfig, GenerationJob, apply_color_metadata, classify_asset_path,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
@@ -2489,6 +2493,9 @@ def _project_asset_for_source_path(project: TimelineProject, source_path: str) -
     normalized = _normalize_project_relpath(source_path)
     if not normalized.startswith("media/"):
         return None
+    direct = project.asset_for_source_path(source_path)
+    if direct is not None:
+        return direct
     abs_source = project_media_path(project, source_path, purpose="asset lookup", log=False)
     if not abs_source:
         return None
@@ -3009,6 +3016,8 @@ def _sync_media_folder(
             duration_checked=asset_type == "audio" and _metadata_checked_for_asset(asset_type, metadata),
             media_probe_signature=file_info.get("signature") or _media_probe_signature(filepath),
         )
+        if asset_type == "video":
+            apply_color_metadata(asset, metadata)
         project.add_asset(asset)
 
         if asset_type in {"video", "image", "audio"}:
@@ -3059,10 +3068,30 @@ def _sync_media_folder(
             if getattr(asset, field, None) != metadata[field]:
                 setattr(asset, field, metadata[field])
                 changed = True
+        changed = apply_color_metadata(asset, metadata) or changed
         if metadata.get("has_audio"):
             logger.info("Detected audio in video: %s", asset.name)
         repaired_video_assets[rel_path] = int(metadata["frame_count"])
         changed = _mark_probe_state(asset, signature, has_audio=True) or changed
+
+    # One-time color backfill for video assets that predate color probing and
+    # were skipped by the repair pass above (valid metadata, unchanged file).
+    # Rides the sync save, which is no-bump/no-notify by design — do not add
+    # broadcasts here (runaway /assets WS loop, fixed 2026-06-26).
+    for asset in project.assets:
+        if asset.asset_type != "video" or getattr(asset, "color_probed", False):
+            continue
+        rel_path = _normalize_project_relpath(getattr(asset, "path", "") or "")
+        file_info = media_snapshot.get(rel_path)
+        if not file_info:
+            continue
+        filepath = file_info.get("path") or resolve_project_path(project, rel_path, purpose="color probe file")
+        if not filepath:
+            continue
+        color_metadata = probe_video_color_metadata(filepath)
+        if not color_metadata.get("color_probed"):
+            continue
+        changed = apply_color_metadata(asset, color_metadata) or changed
 
     # Repair existing audio assets with missing duration
     repaired_assets = {}
@@ -4322,6 +4351,10 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     asset.has_audio_checked = asset.asset_type == "video" and _metadata_checked_for_asset(asset.asset_type, metadata)
     asset.duration_checked = asset.asset_type == "audio" and _metadata_checked_for_asset(asset.asset_type, metadata)
     asset.media_probe_signature = _media_probe_signature(next_abs_path)
+    if asset.asset_type == "video":
+        apply_color_metadata(asset, metadata)
+    else:
+        apply_color_metadata(asset, {})
     asset.artifact_kind = replacement_artifact_kind if asset.asset_type == "artifact" else ""
 
     old_basename = os.path.basename(old_rel_path or "")
@@ -4953,6 +4986,8 @@ if routes is not None:
             prompt=body.get("prompt", ""),
             generation_params=body.get("generation_params", {}),
         )
+        if asset_type == "video":
+            apply_color_metadata(asset, metadata)
         if body.get("folder"):
             asset.folder = _normalize_asset_folder(body["folder"])
             _ensure_asset_folder(project, asset.folder)
@@ -5176,11 +5211,13 @@ if routes is not None:
 
             # Prefer ffmpeg for frame extraction to preserve video decode fidelity.
             # Fall back to OpenCV if ffmpeg is unavailable or fails.
-            frame_rgb = decode_video_frame(abs_path, frame_index)
+            source_asset = _project_asset_for_source_path(project, source_path)
+            interpretation = resolve_source_color_interpretation(source_asset, abs_path)
+            frame_rgb = decode_video_frame(abs_path, frame_index, color_interpretation=interpretation)
             extraction_mode = "ffmpeg"
             if frame_rgb is None:
                 import cv2
-                cap = cv2.VideoCapture(abs_path)
+                cap = cv2.VideoCapture(abs_path, cv2.CAP_FFMPEG)
                 try:
                     if not cap.isOpened():
                         return _json_error("Could not open video file", 500)
@@ -5193,6 +5230,9 @@ if routes is not None:
                 if not ret:
                     return _json_error(f"Could not read frame {frame_index}", 500)
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_rgb = apply_rgb_color_correction(
+                    frame_rgb, color_correction_for_interpretation(interpretation)
+                )
                 extraction_mode = "opencv_fallback"
 
             if target_long_edge > 0:

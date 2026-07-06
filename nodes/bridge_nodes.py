@@ -27,7 +27,13 @@ except ImportError:  # pragma: no cover - tests stub these via importorskip
             return False
         return isinstance(value[0], str) and isinstance(value[1], (int, float))
 
-from ..server.media_helpers import decode_video_frame, fit_frame_to_canvas
+from ..server.media_helpers import (
+    apply_rgb_color_correction,
+    color_correction_for_interpretation,
+    decode_video_frame,
+    fit_frame_to_canvas,
+    resolve_source_color_interpretation,
+)
 from ..server.path_security import resolve_existing_project_path
 from ..server.timeline_state import GuideFrame
 
@@ -61,9 +67,10 @@ def _load_guide_image_bridge(path: str, asset_type: str, target_w: int, target_h
                              fit_mode: str = "pad_edge", crop_position: str = "center"):
     try:
         if asset_type == "video":
-            frame_rgb = decode_video_frame(path, 0)
+            interpretation = resolve_source_color_interpretation(None, path)
+            frame_rgb = decode_video_frame(path, 0, color_interpretation=interpretation)
             if frame_rgb is None:
-                cap = cv2.VideoCapture(path)
+                cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
                 try:
                     if not cap.isOpened():
                         return None
@@ -71,6 +78,9 @@ def _load_guide_image_bridge(path: str, asset_type: str, target_w: int, target_h
                     if not ok:
                         return None
                     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                    frame_rgb = apply_rgb_color_correction(
+                        frame_rgb, color_correction_for_interpretation(interpretation)
+                    )
                 finally:
                     cap.release()
         else:
