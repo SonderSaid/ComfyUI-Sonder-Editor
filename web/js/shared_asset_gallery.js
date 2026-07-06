@@ -2267,9 +2267,17 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const nextAssetId = successorAssetIdAfterRemoval(ids);
         try {
-            const result = await options.onBulkDeleteAssets(ids, false);
+            const assets = ids.map((assetId) => data.assets.find((entry) => entry.asset_id === assetId)).filter(Boolean);
+            let force = await resolveTrashForceDecision(assets);
+            if (force === null) return false;
+            let result = await options.onBulkDeleteAssets(ids, force === true);
             if (result?.status === "conflict") {
-                throw new Error("Bulk trash unexpectedly reported a conflict.");
+                force = confirmTrashProtection(assets, result);
+                if (force !== true) return false;
+                result = await options.onBulkDeleteAssets(ids, true);
+                if (result?.status === "conflict") {
+                    throw new Error(result?.error || "Bulk trash still reported a conflict.");
+                }
             }
 
             for (const assetId of ids) {
@@ -2349,6 +2357,66 @@ export function mountSharedAssetGallery(container, options = {}) {
             };
         }
         return { usages: [], usage_count: 0 };
+    }
+
+    function localFavoriteCount(assets = []) {
+        return (assets || []).filter((asset) => !!asset?.favorite).length;
+    }
+
+    function protectedFavoriteCount(assets = [], usagePayload = {}) {
+        const localCount = localFavoriteCount(assets);
+        const serverCount = Number(usagePayload?.favorite_count || 0) || (usagePayload?.favorite ? 1 : 0);
+        return Math.max(localCount, serverCount);
+    }
+
+    function buildTrashWarningMessage(assets = [], usagePayload = {}, { folderName = "" } = {}) {
+        const activeAssets = (assets || []).filter((asset) => asset?.asset_id && !isTrashed(asset));
+        const usageCount = Number(usagePayload?.usage_count || 0) || 0;
+        const favoriteCount = protectedFavoriteCount(activeAssets, usagePayload);
+        const counts = summarizeUsageTypes(usagePayload?.usages || []);
+        const title = folderName
+            ? `Move folder "${folderName}" and its ${activeAssets.length} asset(s) to Trash?`
+            : activeAssets.length === 1
+                ? `Move "${assetDisplayName(activeAssets[0])}" to Trash?`
+                : `Move ${activeAssets.length} selected asset(s) to Trash?`;
+        const lines = [title];
+        if (usageCount > 0) {
+            lines.push(
+                "",
+                activeAssets.length === 1
+                    ? "This asset is still used in the current project."
+                    : "One or more assets are still used in the current project.",
+                `Clips: ${counts.clip}`,
+                `Audio: ${counts.audio_track}`,
+                `Guides: ${counts.guide_frame}`,
+                `Queue: ${counts.generation_job}`,
+            );
+        }
+        if (favoriteCount > 0) {
+            lines.push(
+                "",
+                activeAssets.length === 1 && favoriteCount === 1
+                    ? "This asset is marked as a Favorite."
+                    : `Favorites: ${favoriteCount}`,
+            );
+        }
+        lines.push("", "You can restore from Trash later.");
+        return lines.join("\n");
+    }
+
+    function confirmTrashProtection(assets = [], usagePayload = {}, meta = {}) {
+        const activeAssets = (assets || []).filter((asset) => asset?.asset_id && !isTrashed(asset));
+        const usageCount = Number(usagePayload?.usage_count || 0) || 0;
+        const favoriteCount = protectedFavoriteCount(activeAssets, usagePayload);
+        if (usageCount <= 0 && favoriteCount <= 0) return false;
+        return confirm(buildTrashWarningMessage(activeAssets, usagePayload, meta)) ? true : null;
+    }
+
+    async function resolveTrashForceDecision(assets = [], meta = {}) {
+        const activeAssets = (assets || []).filter((asset) => asset?.asset_id && !isTrashed(asset));
+        if (!activeAssets.length) return false;
+        const usage = await getBulkUsagePayload(activeAssets.map((asset) => asset.asset_id));
+        return confirmTrashProtection(activeAssets, usage, meta);
     }
 
     async function handleAssetPermanentDelete(asset) {
@@ -5561,9 +5629,16 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!asset?.asset_id || !options.onDeleteAsset) return false;
         const nextAssetId = successorAssetIdAfterRemoval([asset.asset_id]);
         try {
-            const result = await options.onDeleteAsset(asset.asset_id, false);
+            let force = await resolveTrashForceDecision([asset]);
+            if (force === null) return false;
+            let result = await options.onDeleteAsset(asset.asset_id, force === true);
             if (result?.status === "conflict") {
-                throw new Error("Asset trash unexpectedly reported a conflict.");
+                force = confirmTrashProtection([asset], result);
+                if (force !== true) return false;
+                result = await options.onDeleteAsset(asset.asset_id, true);
+                if (result?.status === "conflict") {
+                    throw new Error(result?.error || "Asset trash still reported a conflict.");
+                }
             }
 
             updateAsset({
@@ -5624,15 +5699,29 @@ export function mountSharedAssetGallery(container, options = {}) {
     async function handleFolderDelete(folderName) {
         if (!folderName || !options.onDeleteFolder) return;
         try {
-            const containedAssets = folderAssetsRecursive(folderName);
-            const message = containedAssets.length > 0
-                ? `Move folder "${folderName}" and its ${containedAssets.length} asset(s) to Trash? You can restore the assets later from Trash.`
-                : `Delete empty folder "${folderName}"?`;
-            if (!confirm(message)) return;
+            const containedAssets = folderAssetsRecursive(folderName).filter((asset) => !isTrashed(asset));
+            let force = false;
+            const protectedDecision = containedAssets.length > 0
+                ? await resolveTrashForceDecision(containedAssets, { folderName })
+                : false;
+            if (protectedDecision === null) return;
+            if (protectedDecision === true) {
+                force = true;
+            } else {
+                const message = containedAssets.length > 0
+                    ? `Move folder "${folderName}" and its ${containedAssets.length} asset(s) to Trash? You can restore the assets later from Trash.`
+                    : `Delete empty folder "${folderName}"?`;
+                if (!confirm(message)) return;
+            }
 
-            const result = await options.onDeleteFolder(folderName, false);
+            let result = await options.onDeleteFolder(folderName, force);
             if (result?.status === "conflict") {
-                throw new Error("Folder trash unexpectedly reported a conflict.");
+                force = confirmTrashProtection(containedAssets, result, { folderName });
+                if (force !== true) return;
+                result = await options.onDeleteFolder(folderName, true);
+                if (result?.status === "conflict") {
+                    throw new Error(result?.error || "Folder trash still reported a conflict.");
+                }
             }
 
             for (const asset of containedAssets) {

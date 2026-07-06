@@ -1605,6 +1605,82 @@ def _apply_update_audio_track(scene: Scene, track_id: str, fields: dict) -> Audi
     return track
 
 
+def _replacement_source_range(start_frame: int, end_frame: int, source_in_frame: int, total_source_frames: int) -> tuple[int, int, int]:
+    total = max(0, int(total_source_frames or 0))
+    if total <= 0:
+        _mutation_error("Replacement asset has no usable duration", 400, "invalid_source_asset")
+    old_duration = max(1, int(end_frame or 0) - int(start_frame or 0))
+    old_source_in = max(0, int(source_in_frame or 0))
+    source_in = old_source_in if old_source_in < total else 0
+    visible_duration = min(old_duration, max(1, total - source_in))
+    return source_in, source_in + visible_duration, visible_duration
+
+
+def _resolve_replacement_asset(project: TimelineProject, asset_id: str, expected_type: str) -> Asset:
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        _mutation_error("asset_id is required", 400, "invalid_source_asset")
+    asset = project.get_asset(asset_id)
+    if not asset:
+        _mutation_error(f"Asset not found: {asset_id}", 404, "item_not_found")
+    if _asset_is_trashed(asset):
+        _mutation_error("Replacement asset is in Trash", 409, "asset_trashed")
+    if getattr(asset, "asset_type", "") != expected_type:
+        _mutation_error(f"Replacement asset must be {expected_type}", 400, "invalid_source_asset")
+    return asset
+
+
+def _apply_replace_clip_source(project: TimelineProject, scene: Scene, clip_id: str, asset_id: str) -> ClipReference:
+    clip = _find_clip(scene, clip_id)
+    _require_clip_unlocked(scene, clip)
+    asset = _resolve_replacement_asset(project, asset_id, "video")
+    frame_count = _valid_source_frame_count(asset)
+    if frame_count <= 0:
+        _mutation_error("Replacement video has no frame count", 400, "invalid_source_asset")
+
+    source_in, source_out, visible_duration = _replacement_source_range(
+        clip.timeline_start_frame,
+        clip.timeline_end_frame,
+        clip.source_in_frame,
+        frame_count,
+    )
+    clip.source_path = asset.path
+    clip.source_in_frame = source_in
+    clip.source_out_frame = source_out
+    clip.total_source_frames = frame_count
+    clip.source_origin_frame = 0
+    clip.timeline_end_frame = int(clip.timeline_start_frame or 0) + visible_duration
+    clip.is_generated = False
+    clip.generation_params = {}
+    clip.takes = []
+    clip.active_take = 0
+    clip.take_metadata = {}
+    _validate_single_driver_per_lane(scene)
+    return clip
+
+
+def _apply_replace_audio_source(project: TimelineProject, scene: Scene, track_id: str, asset_id: str) -> AudioTrack:
+    track = _find_audio_track(scene, track_id)
+    _require_audio_unlocked(scene, track)
+    asset = _resolve_replacement_asset(project, asset_id, "audio")
+    duration_frames = _valid_audio_duration_frames(asset, getattr(project, "fps", 24.0) or 24.0)
+    if duration_frames <= 0:
+        _mutation_error("Replacement audio has no duration", 400, "invalid_source_asset")
+
+    source_in, _source_out, visible_duration = _replacement_source_range(
+        track.timeline_start_frame,
+        track.timeline_end_frame,
+        track.source_in_frame,
+        duration_frames,
+    )
+    track.source_path = asset.path
+    track.source_in_frame = source_in
+    track.total_source_frames = duration_frames
+    track.source_origin_frame = 0
+    track.timeline_end_frame = int(track.timeline_start_frame or 0) + visible_duration
+    return track
+
+
 def _delete_clip(scene: Scene, clip_id: str, preserve_lane: bool = False) -> None:
     clip = _find_clip(scene, clip_id)
     _require_clip_unlocked(scene, clip)
@@ -1967,6 +2043,14 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             return {"type": op_type, "clip_id": str(op.get("clip_id", "")), "linked": True}
         clip = _apply_update_clip(project, scene, str(op.get("clip_id", "")), op.get("fields", {}))
         return {"type": op_type, "clip_id": clip.clip_id}
+    if op_type == "replace_clip_source":
+        clip = _apply_replace_clip_source(
+            project,
+            scene,
+            str(op.get("clip_id", "")),
+            str(op.get("asset_id", "")),
+        )
+        return {"type": op_type, "clip_id": clip.clip_id, "asset_id": str(op.get("asset_id", ""))}
     if op_type == "delete_clip":
         if op.get("apply_linked"):
             _apply_delete_link_refs(scene, [_link_ref("clip", str(op.get("clip_id", "")))], bool(op.get("preserve_lane", False)))
@@ -1979,6 +2063,14 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             return {"type": op_type, "track_id": str(op.get("track_id", "")), "linked": True}
         track = _apply_update_audio_track(scene, str(op.get("track_id", "")), op.get("fields", {}))
         return {"type": op_type, "track_id": track.track_id}
+    if op_type == "replace_audio_source":
+        track = _apply_replace_audio_source(
+            project,
+            scene,
+            str(op.get("track_id", "")),
+            str(op.get("asset_id", "")),
+        )
+        return {"type": op_type, "track_id": track.track_id, "asset_id": str(op.get("asset_id", ""))}
     if op_type == "delete_audio_track":
         if op.get("apply_linked"):
             _apply_delete_link_refs(scene, [_link_ref("audio", str(op.get("track_id", "")))], bool(op.get("preserve_lane", False)))
@@ -3993,6 +4085,45 @@ def _aggregate_asset_usages(project: TimelineProject, assets: list[Asset]) -> di
     }
 
 
+def _favorite_asset_summary(asset: Asset) -> dict:
+    return {
+        "asset_id": getattr(asset, "asset_id", ""),
+        "asset_name": getattr(asset, "name", "") or os.path.basename(getattr(asset, "path", "") or "") or getattr(asset, "asset_id", ""),
+        "asset_path": getattr(asset, "path", ""),
+        "asset_type": getattr(asset, "asset_type", ""),
+    }
+
+
+def _asset_trash_protection(project: TimelineProject, assets: list[Asset]) -> dict:
+    usage = _aggregate_asset_usages(project, assets)
+    favorites = [
+        _favorite_asset_summary(asset)
+        for asset in assets
+        if bool(getattr(asset, "favorite", False))
+    ]
+    return {
+        **usage,
+        "favorite_count": len(favorites),
+        "favorite_asset_ids": [favorite["asset_id"] for favorite in favorites],
+        "favorites": favorites,
+        "favorite": bool(favorites),
+        "protected": usage["usage_count"] > 0 or bool(favorites),
+    }
+
+
+def _asset_trash_conflict_payload(project: TimelineProject, assets: list[Asset], error: str) -> dict:
+    protection = _asset_trash_protection(project, assets)
+    return {
+        "error": error,
+        "usages": protection["usages"],
+        "usage_count": protection["usage_count"],
+        "favorite_count": protection["favorite_count"],
+        "favorite_asset_ids": protection["favorite_asset_ids"],
+        "favorites": protection["favorites"],
+        "favorite": protection["favorite"],
+    }
+
+
 def _resolve_assets_from_ids(project: TimelineProject, asset_ids) -> list[Asset]:
     if not isinstance(asset_ids, list):
         raise ValueError("asset_ids must be a list")
@@ -5070,6 +5201,15 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
+        force = bool(body.get("force", False))
+        if not force and assets_to_delete:
+            protection = _asset_trash_protection(project, assets_to_delete)
+            if protection["protected"]:
+                return web.json_response(
+                    _asset_trash_conflict_payload(project, assets_to_delete, "One or more assets in this folder are used or favorited"),
+                    status=409,
+                )
+
         try:
             _folders, trashed_assets = _trash_project_asset_folder(project, folder)
         except FileNotFoundError as e:
@@ -5338,6 +5478,15 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
+        force = bool(body.get("force", False))
+        if not force:
+            protection = _asset_trash_protection(project, assets)
+            if protection["protected"]:
+                return web.json_response(
+                    _asset_trash_conflict_payload(project, assets, "One or more assets are used or favorited"),
+                    status=409,
+                )
+
         trashed_ids = []
         try:
             _require_asset_media_sources(project, assets, operation="Asset bulk trash")
@@ -5585,6 +5734,20 @@ if routes is not None:
         asset = project.get_asset(asset_id)
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        force = bool(body.get("force", False))
+        if not force:
+            protection = _asset_trash_protection(project, [asset])
+            if protection["protected"]:
+                return web.json_response(
+                    _asset_trash_conflict_payload(project, [asset], "Asset is used or favorited"),
+                    status=409,
+                )
 
         try:
             payload = _trash_project_asset(project, asset)

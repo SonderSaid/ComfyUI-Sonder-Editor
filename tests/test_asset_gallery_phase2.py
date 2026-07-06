@@ -936,7 +936,7 @@ def test_update_asset_route_accepts_favorite_without_disturbing_name_folder(tmp_
     assert payload["favorite"] is False
 
 
-def test_delete_asset_route_soft_deletes_in_use_asset(tmp_path, monkeypatch):
+def test_delete_asset_route_returns_409_for_in_use_soft_delete(tmp_path, monkeypatch):
     module = _load_route_module(monkeypatch)
     project = _make_project(tmp_path)
     asset = Asset(asset_id="asset-1", asset_type="video", path="media/clip.mp4", name="Clip")
@@ -952,13 +952,123 @@ def test_delete_asset_route_soft_deletes_in_use_asset(tmp_path, monkeypatch):
     response = asyncio.run(module.api_delete_asset(request))
     payload = _response_json(response)
 
+    assert response.status == 409
+    assert payload["error"] == "Asset is used or favorited"
+    assert payload["usage_count"] == 1
+    assert payload["favorite_count"] == 0
+    assert project.get_asset("asset-1") is asset
+    assert asset.trashed_at == ""
+    assert asset.folder == ""
+    assert scene.clips[0].source_path == "media/clip.mp4"
+
+
+def test_delete_asset_route_force_soft_deletes_in_use_asset(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    asset = Asset(asset_id="asset-1", asset_type="video", path="media/clip.mp4", name="Clip")
+    scene = Scene(scene_id="scene-1", name="Opening", order=1)
+    scene.clips = [ClipReference(clip_id="clip-1", source_path="media/clip.mp4", timeline_start_frame=0, timeline_end_frame=24)]
+    project.assets = [asset]
+    project.scenes = [scene]
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    request = DummyRequest(match_info={"project_id": "phase-2", "asset_id": "asset-1"}, body={"force": True})
+    response = asyncio.run(module.api_delete_asset(request))
+    payload = _response_json(response)
+
     assert response.status == 200
     assert payload["trashed"] is True
     assert payload["asset_id"] == "asset-1"
     assert project.get_asset("asset-1") is asset
     assert asset.trashed_at
-    assert asset.folder == ""
     assert scene.clips[0].source_path == "media/clip.mp4"
+
+
+def test_delete_asset_route_returns_409_for_favorite_soft_delete(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    asset = Asset(asset_id="asset-1", asset_type="image", path="media/ref.png", name="Ref", favorite=True)
+    project.assets = [asset]
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    request = DummyRequest(match_info={"project_id": "phase-2", "asset_id": "asset-1"}, body={"force": False})
+    response = asyncio.run(module.api_delete_asset(request))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["usage_count"] == 0
+    assert payload["favorite_count"] == 1
+    assert payload["favorite_asset_ids"] == ["asset-1"]
+    assert asset.trashed_at == ""
+
+
+def test_delete_asset_route_force_soft_deletes_favorite_asset(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    asset = Asset(asset_id="asset-1", asset_type="image", path="media/ref.png", name="Ref", favorite=True)
+    project.assets = [asset]
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    request = DummyRequest(match_info={"project_id": "phase-2", "asset_id": "asset-1"}, body={"force": True})
+    response = asyncio.run(module.api_delete_asset(request))
+
+    assert response.status == 200
+    assert asset.trashed_at
+    assert asset.favorite is True
+
+
+def test_bulk_delete_assets_route_returns_409_for_used_or_favorite_assets(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    used = Asset(asset_id="used", asset_type="video", path="media/used.mp4", name="Used")
+    favorite = Asset(asset_id="fav", asset_type="image", path="media/fav.png", name="Fav", favorite=True)
+    plain = Asset(asset_id="plain", asset_type="audio", path="media/plain.wav", name="Plain")
+    scene = Scene(scene_id="scene-1", name="Opening", order=1)
+    scene.clips = [ClipReference(clip_id="clip-1", source_path="media/used.mp4")]
+    project.assets = [used, favorite, plain]
+    project.scenes = [scene]
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    request = DummyRequest(match_info={"project_id": "phase-2"}, body={"asset_ids": ["used", "fav", "plain"], "force": False})
+    response = asyncio.run(module.api_bulk_delete_assets(request))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["usage_count"] == 1
+    assert payload["favorite_count"] == 1
+    assert payload["favorite_asset_ids"] == ["fav"]
+    assert all(asset.trashed_at == "" for asset in [used, favorite, plain])
+
+
+def test_bulk_delete_assets_route_force_soft_deletes_protected_selection(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    used = Asset(asset_id="used", asset_type="video", path="media/used.mp4", name="Used")
+    favorite = Asset(asset_id="fav", asset_type="image", path="media/fav.png", name="Fav", favorite=True)
+    scene = Scene(scene_id="scene-1", name="Opening", order=1)
+    scene.clips = [ClipReference(clip_id="clip-1", source_path="media/used.mp4")]
+    project.assets = [used, favorite]
+    project.scenes = [scene]
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    request = DummyRequest(match_info={"project_id": "phase-2"}, body={"asset_ids": ["used", "fav"], "force": True})
+    response = asyncio.run(module.api_bulk_delete_assets(request))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["trashed"] == ["used", "fav"]
+    assert used.trashed_at
+    assert favorite.trashed_at
 
 
 def test_restore_asset_route_restores_previous_folder(tmp_path, monkeypatch):
@@ -1058,7 +1168,7 @@ def test_delete_asset_folder_route_soft_deletes_contained_assets(tmp_path, monke
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(module, "save_project", lambda project: None)
 
-    request = DummyRequest(match_info={"project_id": "phase-2"}, body={"folder": "Shots", "force": False})
+    request = DummyRequest(match_info={"project_id": "phase-2"}, body={"folder": "Shots", "force": True})
     response = asyncio.run(module.api_delete_asset_folder(request))
     payload = _response_json(response)
 
@@ -1069,6 +1179,35 @@ def test_delete_asset_folder_route_soft_deletes_contained_assets(tmp_path, monke
     assert project.get_asset("a2").trashed_at
     assert project.get_asset("a1").folder == ""
     assert project.get_asset("a2").folder == ""
+    assert project.get_asset("a3").trashed_at == ""
+
+
+def test_delete_asset_folder_route_returns_409_for_used_or_favorite_contents(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    project.assets = [
+        Asset(asset_id="a1", folder="Shots", path="media/a1.mp4", asset_type="video"),
+        Asset(asset_id="a2", folder="Shots/Cutaways", path="media/a2.png", asset_type="image", favorite=True),
+        Asset(asset_id="a3", folder="Other", path="media/a3.wav", asset_type="audio"),
+    ]
+    project.metadata["asset_folders"] = ["Shots", "Shots/Cutaways", "Other"]
+    scene = Scene(scene_id="scene-1", name="Opening", order=1)
+    scene.clips = [ClipReference(clip_id="clip-1", source_path="media/a1.mp4", timeline_start_frame=0, timeline_end_frame=24)]
+    project.scenes = [scene]
+
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    request = DummyRequest(match_info={"project_id": "phase-2"}, body={"folder": "Shots", "force": False})
+    response = asyncio.run(module.api_delete_asset_folder(request))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["usage_count"] == 1
+    assert payload["favorite_count"] == 1
+    assert payload["favorite_asset_ids"] == ["a2"]
+    assert project.get_asset("a1").trashed_at == ""
+    assert project.get_asset("a2").trashed_at == ""
     assert project.get_asset("a3").trashed_at == ""
 
 

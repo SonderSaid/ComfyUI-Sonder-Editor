@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
-from server.timeline_state import AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, Scene, TimelineProject
+from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, Scene, TimelineProject
 
 
 class DummyRequest(dict):
@@ -356,6 +356,154 @@ def test_scene_mutation_linked_move_rejects_locked_member(monkeypatch, tmp_path)
     assert saves == []
     assert scene.clips[0].timeline_start_frame == 0
     assert scene.audio_tracks[0].timeline_start_frame == 0
+
+
+def test_scene_mutation_replace_clip_source_clamps_and_clears_generated_provenance(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    clip = ClipReference(
+        clip_id="clip-1",
+        source_path="media/old.mp4",
+        timeline_start_frame=10,
+        timeline_end_frame=70,
+        source_in_frame=20,
+        source_out_frame=80,
+        total_source_frames=120,
+        source_origin_frame=20,
+        opacity=0.5,
+        track_index=2,
+        is_generated=True,
+        generation_params={"seed": 1},
+        takes=[{"asset_id": "old"}],
+        active_take=1,
+        take_metadata={"scene_id": "scene-1"},
+    )
+    scene.clips = [clip]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    project.assets = [
+        Asset(asset_id="old", asset_type="video", path="media/old.mp4", frame_count=120),
+        Asset(asset_id="new", asset_type="video", path="media/new.mp4", frame_count=45),
+    ]
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "replace_clip_source",
+            "clip_id": "clip-1",
+            "asset_id": "new",
+        }]},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert clip.source_path == "media/new.mp4"
+    assert clip.timeline_start_frame == 10
+    assert clip.timeline_end_frame == 35
+    assert clip.source_in_frame == 20
+    assert clip.source_out_frame == 45
+    assert clip.total_source_frames == 45
+    assert clip.source_origin_frame == 0
+    assert clip.opacity == 0.5
+    assert clip.track_index == 2
+    assert clip.is_generated is False
+    assert clip.generation_params == {}
+    assert clip.takes == []
+    assert clip.active_take == 0
+    assert clip.take_metadata == {}
+    assert payload["scene"]["clips"][0]["source_path"] == "media/new.mp4"
+
+
+def test_scene_mutation_replace_audio_source_clamps_and_preserves_track_edits(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    track = AudioTrack(
+        track_id="audio-1",
+        source_path="media/old.wav",
+        timeline_start_frame=5,
+        timeline_end_frame=65,
+        source_in_frame=30,
+        total_source_frames=120,
+        source_origin_frame=30,
+        volume=0.25,
+        muted=True,
+        lane_index=3,
+    )
+    scene.audio_tracks = [track]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", fps=24, scenes=[scene])
+    project.assets = [
+        Asset(asset_id="old", asset_type="audio", path="media/old.wav", duration_sec=5.0),
+        Asset(asset_id="new", asset_type="audio", path="media/new.wav", duration_sec=2.0),
+    ]
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+
+    response = asyncio.run(_mutation_handler(route_module)(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{
+            "type": "replace_audio_source",
+            "track_id": "audio-1",
+            "asset_id": "new",
+        }]},
+    )))
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert track.source_path == "media/new.wav"
+    assert track.timeline_start_frame == 5
+    assert track.timeline_end_frame == 23
+    assert track.source_in_frame == 30
+    assert track.total_source_frames == 48
+    assert track.source_origin_frame == 0
+    assert track.volume == 0.25
+    assert track.muted is True
+    assert track.lane_index == 3
+
+
+def test_scene_mutation_replace_source_rejects_invalid_replacement_assets(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    clip = ClipReference(clip_id="clip-1", source_path="media/old.mp4", timeline_start_frame=0, timeline_end_frame=24)
+    track = AudioTrack(track_id="audio-1", source_path="media/old.wav", timeline_start_frame=0, timeline_end_frame=24)
+    scene.clips = [clip]
+    scene.audio_tracks = [track]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    project.assets = [
+        Asset(asset_id="image", asset_type="image", path="media/ref.png"),
+        Asset(asset_id="trashed-video", asset_type="video", path="media/trashed.mp4", frame_count=30, trashed_at="2026-07-06T00:00:00"),
+        Asset(asset_id="bad-audio", asset_type="audio", path="media/bad.wav", duration_sec=0.0),
+    ]
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    handler = _mutation_handler(route_module)
+
+    wrong_type = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{"type": "replace_clip_source", "clip_id": "clip-1", "asset_id": "image"}]},
+    )))
+    trashed = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{"type": "replace_clip_source", "clip_id": "clip-1", "asset_id": "trashed-video"}]},
+    )))
+    invalid_duration = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene-1"},
+        body={"operations": [{"type": "replace_audio_source", "track_id": "audio-1", "asset_id": "bad-audio"}]},
+    )))
+
+    assert wrong_type.status == 400
+    assert _response_json(wrong_type)["code"] == "invalid_source_asset"
+    assert trashed.status == 409
+    assert _response_json(trashed)["code"] == "asset_trashed"
+    assert invalid_duration.status == 400
+    assert _response_json(invalid_duration)["code"] == "invalid_source_asset"
+    assert saves == []
+    assert clip.source_path == "media/old.mp4"
+    assert track.source_path == "media/old.wav"
 
 
 def test_scene_mutation_update_clip_rejects_driver_lane_collision_atomically(monkeypatch, tmp_path):

@@ -6662,6 +6662,11 @@ export class EditorWidget {
                         disabled: itemLocked || !canConvertRole,
                     });
                     menuItems.push({
+                        label: itemLocked ? "Replace clip with… (locked)" : "Replace clip with…",
+                        action: itemLocked ? () => {} : () => this._replaceClipSource(hit.data),
+                        disabled: itemLocked,
+                    });
+                    menuItems.push({
                         label: "Set Selection to Clip",
                         action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
                     });
@@ -6686,6 +6691,11 @@ export class EditorWidget {
                     menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
                 } else if (hit.type === "audio") {
                     menuItems.push({ label: itemLocked ? "Move to New Lane (locked)" : "Move to New Lane", action: itemLocked ? () => {} : () => this._moveItemToNewLane(hit), disabled: itemLocked });
+                    menuItems.push({
+                        label: itemLocked ? "Replace audio with… (locked)" : "Replace audio with…",
+                        action: itemLocked ? () => {} : () => this._replaceAudioSource(hit.data),
+                        disabled: itemLocked,
+                    });
                     menuItems.push({
                         label: "Set Selection to Audio",
                         action: () => this._setSelectionToFrameRange(hit.data.timeline_start_frame || 0, hit.data.timeline_end_frame || 0),
@@ -10920,14 +10930,20 @@ export class EditorWidget {
         }
     }
 
-    // ── Image picker (project image chooser) ─────────────────────────
-    // Minimal modal listing the project's image assets (name filter + lazy thumbnails),
-    // calls onPick(asset_id) when one is chosen. Shared by "Replace guide with…" on the
-    // timeline guide right-click and the Guide Management popup. Not a gallery clone.
-    _showImagePicker({ title = "Choose an image", currentAssetId = "", onPick = () => {} } = {}) {
+    // ── Asset replacement picker ─────────────────────────────────────
+    // Minimal modal listing one project asset type (name filter + lazy thumbnails),
+    // calls onPick(asset_id) when one is chosen. Shared by timeline source replacement.
+    _showImagePicker({
+        title = "Choose an image",
+        currentAssetId = "",
+        onPick = () => {},
+        assetType = "image",
+        assetTypeLabel = "",
+    } = {}) {
         this._hideImagePicker();
         const dirName = this._projectDirName();
-        const images = (this.assets?.image || []).filter((asset) => asset && !asset.trashed && !asset.missing);
+        const typeLabel = assetTypeLabel || assetType || "asset";
+        const images = (this.assets?.[assetType] || []).filter((asset) => asset && !asset.trashed && !asset.trashed_at && !asset.missing);
 
         const backdrop = document.createElement("div");
         backdrop.style.cssText = `position:fixed;inset:0;z-index:10002;background:rgba(7,10,14,0.80);display:flex;align-items:center;justify-content:center;padding:20px;`;
@@ -10947,7 +10963,7 @@ export class EditorWidget {
         titleEl.style.cssText = `font-size:14px;font-weight:700;color:#fff;flex:0 0 auto;`;
         const search = document.createElement("input");
         search.type = "search";
-        search.placeholder = "Filter images…";
+        search.placeholder = `Filter ${typeLabel}s…`;
         search.style.cssText = `${chromeInputCss({ fontSize: "12px", padding: "6px 9px", textAlign: "left" })} flex:1 1 auto;min-width:0;`;
         const closeBtn = document.createElement("button");
         closeBtn.textContent = "Close";
@@ -10970,7 +10986,7 @@ export class EditorWidget {
             });
             if (!matches.length) {
                 const empty = document.createElement("div");
-                empty.textContent = images.length ? "No images match the filter." : "No image assets in this project.";
+                empty.textContent = images.length ? `No ${typeLabel}s match the filter.` : `No ${typeLabel} assets in this project.`;
                 empty.style.cssText = `grid-column:1/-1;color:${COLORS.textMuted};font-size:12px;padding:24px 0;text-align:center;`;
                 grid.appendChild(empty);
                 return;
@@ -10983,7 +10999,7 @@ export class EditorWidget {
                 thumb.style.cssText = `aspect-ratio:16/10;border-radius:5px;background:#000;border:1px solid rgba(255,255,255,0.12);overflow:hidden;display:flex;align-items:center;justify-content:center;color:${COLORS.textMuted};font-size:10px;`;
                 const thumbUrl = (asset.has_thumbnail && dirName)
                     ? api.apiURL(`/sonder-editor/project/${dirName}/thumbnail/${asset.asset_id}`)
-                    : (asset.path ? this._buildViewURL(asset.path) : null);
+                    : (assetType === "image" && asset.path ? this._buildViewURL(asset.path) : null);
                 if (thumbUrl) {
                     const img = document.createElement("img");
                     img.src = thumbUrl;
@@ -10994,10 +11010,10 @@ export class EditorWidget {
                     img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
                     thumb.appendChild(img);
                 } else {
-                    thumb.textContent = "No image";
+                    thumb.textContent = assetType === "audio" ? "Audio" : (assetType === "video" ? "Video" : "No image");
                 }
                 const nameEl = document.createElement("div");
-                nameEl.textContent = asset.name || asset.path?.split(/[/\\]/).pop() || asset.asset_id || "Image";
+                nameEl.textContent = asset.name || asset.path?.split(/[/\\]/).pop() || asset.asset_id || typeLabel;
                 nameEl.title = nameEl.textContent;
                 nameEl.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e5e9ee;font-size:11px;";
                 card.append(thumb, nameEl);
@@ -11073,6 +11089,78 @@ export class EditorWidget {
                 } catch (e) {
                     this._discardLastUndo("replace guide");
                     console.warn("[Sonder] Failed to replace guide:", e);
+                }
+            },
+        });
+    }
+
+    _replaceClipSource(clip) {
+        if (!clip?.clip_id || !this.activeScene || !this.projectDir) return;
+        const hit = this._findSceneItemBySelection("clip", clip.clip_id) || { type: "clip", id: clip.clip_id, data: clip };
+        if (this._isItemLocked(hit)) {
+            notifyWarning("Clip lane is locked.", { source: "clip-replace-locked" });
+            return;
+        }
+        const currentAsset = this._getAssetForSourcePath(clip.source_path);
+        this._showImagePicker({
+            title: "Replace clip with…",
+            currentAssetId: currentAsset?.asset_id || "",
+            assetType: "video",
+            assetTypeLabel: "video",
+            onPick: async (assetId) => {
+                if (!assetId || assetId === currentAsset?.asset_id) return;
+                const undoLabel = "replace clip";
+                this._pushUndo(undoLabel);
+                try {
+                    await this._runSceneMutation(
+                        [{ type: "replace_clip_source", clip_id: clip.clip_id, asset_id: assetId }],
+                        {
+                            key: `clip:${clip.clip_id}:replace-source:${Date.now()}`,
+                            label: undoLabel,
+                            coalesce: false,
+                        },
+                    );
+                    this._renderTimeline();
+                    this._renderViewportFrame();
+                } catch (e) {
+                    this._discardLastUndo(undoLabel);
+                    console.warn("[Sonder] Failed to replace clip source:", e);
+                }
+            },
+        });
+    }
+
+    _replaceAudioSource(track) {
+        if (!track?.track_id || !this.activeScene || !this.projectDir) return;
+        const hit = this._findSceneItemBySelection("audio", track.track_id) || { type: "audio", id: track.track_id, data: track };
+        if (this._isItemLocked(hit)) {
+            notifyWarning("Audio lane is locked.", { source: "audio-replace-locked" });
+            return;
+        }
+        const currentAsset = this._getAssetForSourcePath(track.source_path);
+        this._showImagePicker({
+            title: "Replace audio with…",
+            currentAssetId: currentAsset?.asset_id || "",
+            assetType: "audio",
+            assetTypeLabel: "audio",
+            onPick: async (assetId) => {
+                if (!assetId || assetId === currentAsset?.asset_id) return;
+                const undoLabel = "replace audio";
+                this._pushUndo(undoLabel);
+                try {
+                    await this._runSceneMutation(
+                        [{ type: "replace_audio_source", track_id: track.track_id, asset_id: assetId }],
+                        {
+                            key: `audio:${track.track_id}:replace-source:${Date.now()}`,
+                            label: undoLabel,
+                            coalesce: false,
+                        },
+                    );
+                    this._renderTimeline();
+                    this._renderViewportFrame();
+                } catch (e) {
+                    this._discardLastUndo(undoLabel);
+                    console.warn("[Sonder] Failed to replace audio source:", e);
                 }
             },
         });
