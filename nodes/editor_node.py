@@ -25,6 +25,10 @@ from ..server.media_helpers import (
     fit_frame_to_canvas,
     resolve_source_color_interpretation,
 )
+from ..server.color_correction import (
+    DRIFT_STASH_CONTEXT_KEY,
+    build_context_reference_stash,
+)
 from ..server.path_security import (
     PathSecurityError,
     path_within,
@@ -885,6 +889,22 @@ class SonderEditor:
                 if raw_mode in ("trimmed", "untrimmed"):
                     take_placement_mode = raw_mode
 
+            # Drift-correction reference: downsampled copies of the mask-protected
+            # context frames, paired by index at save time (never persisted — the
+            # `_` prefix is stripped by _public_execution_context).
+            drift_stash = None
+            try:
+                drift_stash = build_context_reference_stash(
+                    rendered_frames,
+                    frame_count=frame_count,
+                    source_frame_count=source_frame_count,
+                    mask_start_frame=mask_start_pixel,
+                    mask_end_frame=mask_end_pixel,
+                    frame_constraint=frame_constraint,
+                )
+            except Exception as e:
+                logger.warning("color drift stash failed: scene_id=%s error=%s", scene.scene_id, e)
+
             # --- Attach execution context for downstream nodes (e.g., SonderSaveVideo Take mode) ---
             proj._execution_context = {
                 "scene_id": scene.scene_id,
@@ -901,6 +921,7 @@ class SonderEditor:
                 "mask_post_offset": mask_post_offset,
                 "mask_start_frame": mask_start_pixel,
                 "mask_end_frame": mask_end_pixel,
+                DRIFT_STASH_CONTEXT_KEY: drift_stash,
                 "template_id": template_id,
                 "frame_constraint": frame_constraint,
                 "source_frame_count": source_frame_count,

@@ -41,6 +41,11 @@ from ..server.project_commit import (
     snapshot_item_ids,
 )
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY, collector_chain_for_consumer
+from ..server.color_correction import (
+    COLOR_DRIFT_METADATA_KEY,
+    fit_drift_correction,
+    transform_tensor_to_uint8_frames,
+)
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
     CUSTOM_CONTAINER_OPTIONS,
@@ -1338,7 +1343,7 @@ class SonderSaveVideo:
     RETURN_NAMES = ("output_path",)
     OUTPUT_TOOLTIPS = ("Absolute path to the saved video file.",)
     FUNCTION = "save_video"
-    DESCRIPTION = "Encodes an IMAGE tensor to a project video asset. Optionally muxes audio. Shows a thumbnail preview of the first frame."
+    DESCRIPTION = "Encodes an IMAGE tensor to a project video asset. Optionally muxes audio. Shows a thumbnail preview of the first frame. Optionally auto-corrects VAE color drift using the render's protected context frames."
 
     @classmethod
     def INPUT_TYPES(s):
@@ -1366,6 +1371,7 @@ class SonderSaveVideo:
                 "custom_audio_bitrate_kbps": ("INT", {"default": 192, "min": 1, "max": 10000, "tooltip": "Custom AAC audio only. Audio bitrate in kbps."}),
                 "custom_png_compression": ("INT", {"default": 0, "min": 0, "max": 9, "tooltip": "Custom PNG Sequence only. 0 is fastest/largest; 9 is smallest/slowest."}),
                 "autoplay_preview": ("BOOLEAN", {"default": False, "tooltip": "Autoplay the inline video player on this node card after a run. When off, it opens paused on the first frame. Display-only — does not affect the saved file."}),
+                "color_drift_correction": ("BOOLEAN", {"default": True, "tooltip": "Corrects accumulated VAE color drift by matching this render's untouched context frames back to the editor's pre-encode reference. Fitted per save; skipped automatically when no context exists or the correction would exceed safe bounds (outcome recorded in asset metadata)."}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -1388,6 +1394,7 @@ class SonderSaveVideo:
                     custom_png_compression=0,
                     embed_metadata=True,
                     autoplay_preview=False,  # frontend display-only; accepted and ignored here
+                    color_drift_correction=True,
                     prompt=None,
                     extra_pnginfo=None,
                     unique_id=None):
@@ -1419,9 +1426,27 @@ class SonderSaveVideo:
         output_rel_path, output_path = _project_media_file(project, output_filename, purpose="save video output path")
 
         tensor_mode = custom_spec["tensor_mode"] if custom_spec else tensor_mode_for_preset(preset_id)
-        rgb_frames = tensor_to_uint8_frames(frames, mode=tensor_mode)
-        h, w = rgb_frames[0].shape[:2]
         execution_context = _copy_execution_context(project)
+        # Drift correction fits on the mask-protected context frames the editor
+        # stashed and applies fused into the uint8 conversion; `frames` itself is
+        # never mutated (ComfyUI caches node outputs).
+        drift_correction, drift_record = fit_drift_correction(
+            frames, execution_context, enabled=bool(color_drift_correction)
+        )
+        if drift_correction is not None:
+            logger.info(
+                "color drift correction applied (%s): frames_used=%d mae %.3f -> %.3f",
+                drift_record.get("mode", "global"),
+                len(drift_record.get("frames_used") or []),
+                drift_record["residual_before"]["mae"],
+                drift_record["residual_after"]["mae"],
+            )
+            rgb_frames = transform_tensor_to_uint8_frames(frames, drift_correction, mode=tensor_mode)
+        else:
+            if bool(color_drift_correction):
+                logger.info("color drift correction skipped: %s", drift_record.get("skip_reason"))
+            rgb_frames = tensor_to_uint8_frames(frames, mode=tensor_mode)
+        h, w = rgb_frames[0].shape[:2]
         workflow = _workflow_from_extra_pnginfo(extra_pnginfo)
         embed_metadata_enabled = bool(embed_metadata)
 
@@ -1453,6 +1478,7 @@ class SonderSaveVideo:
             encode_metadata = metadata_for_save_preset(preset_id, custom_options)
             asset_metadata = dict(encode_metadata)
             asset_metadata["editor_export"] = asset_editor_export
+            asset_metadata[COLOR_DRIFT_METADATA_KEY] = drift_record
             output_path, png_assets = _save_custom_png_sequence(
                 project,
                 rgb_frames,
@@ -1547,6 +1573,7 @@ class SonderSaveVideo:
         )
         asset_generation_params = dict(encode_metadata)
         asset_generation_params["editor_export"] = asset_editor_export
+        asset_generation_params[COLOR_DRIFT_METADATA_KEY] = drift_record
 
         # Auto-register as a project asset
         total_frames = len(rgb_frames)
