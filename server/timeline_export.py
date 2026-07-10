@@ -14,8 +14,12 @@ from typing import Any
 import cv2
 
 from .media_helpers import (
+    CROP_POSITIONS,
     CUSTOM_OUTPUT_KIND_VIDEO,
     CUSTOM_SAVE_VIDEO_PRESET,
+    DEFAULT_CROP_POSITION,
+    DEFAULT_FIT_MODE,
+    FIT_MODES,
     MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS,
     MediaOperationCancelled,
     audio_only_export_spec,
@@ -129,6 +133,16 @@ def _coerce_bool(value, default: bool = False) -> bool:
         if normalized in {"0", "false", "no", "off"}:
             return False
     return default
+
+
+def _take_fit_mode(value) -> str:
+    mode = str(value or DEFAULT_FIT_MODE).strip().lower()
+    return mode if mode in FIT_MODES else DEFAULT_FIT_MODE
+
+
+def _take_crop_position(value) -> str:
+    position = str(value or DEFAULT_CROP_POSITION).strip().lower()
+    return position if position in CROP_POSITIONS else DEFAULT_CROP_POSITION
 
 
 def _coerce_int(value, default: int = 0) -> int:
@@ -394,6 +408,8 @@ def _place_video_take(
     end: int,
     *,
     muted: bool = False,
+    fit_mode: str = DEFAULT_FIT_MODE,
+    crop_position: str = DEFAULT_CROP_POSITION,
 ) -> ClipReference:
     total_frames = max(1, int(asset.frame_count or (end - start) or 1))
     existing_lanes = [int(getattr(clip, "track_index", 0) or 0) for clip in getattr(scene, "clips", [])]
@@ -413,6 +429,8 @@ def _place_video_take(
         timeline_end_frame=end,
         track_index=new_lane,
         muted=bool(muted),
+        fit_mode=_take_fit_mode(fit_mode),
+        crop_position=_take_crop_position(crop_position),
         is_generated=True,
         generation_params=dict(asset.generation_params),
         take_metadata=dict(asset.generation_params),
@@ -684,6 +702,8 @@ class TimelineExportManager:
             "place_as_take": include_video and _coerce_bool(body.get("place_as_take"), True),
             "take_placement_linked": _coerce_bool(body.get("take_placement_linked", body.get("take_linked")), True),
             "take_placement_muted": _coerce_bool(body.get("take_placement_muted", body.get("take_muted")), False),
+            "take_fit_mode": _take_fit_mode(body.get("take_fit_mode")),
+            "take_crop_position": _take_crop_position(body.get("take_crop_position")),
         }
 
     def _set_phase(self, job: TimelineExportJob, phase: str, message: str) -> None:
@@ -713,6 +733,8 @@ class TimelineExportManager:
             place_as_take = bool(job.request["place_as_take"])
             take_placement_linked = bool(job.request.get("take_placement_linked", True))
             take_placement_muted = bool(job.request.get("take_placement_muted", False))
+            take_fit_mode = _take_fit_mode(job.request.get("take_fit_mode"))
+            take_crop_position = _take_crop_position(job.request.get("take_crop_position"))
             width, height = _scene_resolution(project, scene)
             frame_count = end - start
 
@@ -865,6 +887,8 @@ class TimelineExportManager:
                     start,
                     end,
                     muted=take_placement_muted,
+                    fit_mode=take_fit_mode,
+                    crop_position=take_crop_position,
                 )
                 job.placed_clip = clip.to_dict()
                 job.result_scene_id = current_scene.scene_id

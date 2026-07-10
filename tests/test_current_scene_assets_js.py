@@ -375,3 +375,39 @@ console.log(JSON.stringify({
         "customAspectLabel": "",
     }
     assert result["memory"]["isolated"] is None
+
+
+def test_native_control_theme_and_guide_snapshot_default_seams():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+
+    root = Path(__file__).resolve().parents[1]
+    theme_url = (root / "web" / "js" / "editor_theme.js").as_uri()
+    script = """
+const mod = await import(__THEME_URL__);
+const root = { style: {} };
+mod.applyNativeControlTheme(root);
+console.log(JSON.stringify(root.style));
+""".replace("__THEME_URL__", json.dumps(theme_url))
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "colorScheme": "dark",
+        "accentColor": "#6686a3",
+    }
+
+    widget_source = (root / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    snapshot_start = widget_source.index("async _addClipFrameToGuides(clip)")
+    snapshot_end = widget_source.index("async _deleteSelectedItems()", snapshot_start)
+    snapshot_source = widget_source[snapshot_start:snapshot_end]
+    assert "strength: this._defaultGuideStrength()" in snapshot_source
+    assert "this._seedFitDefaults({" in snapshot_source
+    assert "applyNativeControlTheme(overlay);" in widget_source
+
+    tab_source = (root / "web" / "js" / "tab_entry.js").read_text(encoding="utf-8")
+    assert "applyNativeControlTheme(document.documentElement);" in tab_source

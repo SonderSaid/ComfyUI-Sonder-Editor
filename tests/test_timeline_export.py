@@ -66,6 +66,25 @@ def test_timeline_export_resolves_committed_asset_id_remap():
     assert _resolve_committed_asset_id(project, "other-id") == "other-id"
 
 
+def test_timeline_export_take_fit_defaults_fall_back_to_fixed_constants():
+    project = TimelineProject()
+    scene = Scene(scene_id="scene-1", name="Scene")
+    asset = Asset(path="media/take.mp4", frame_count=4)
+
+    clip = timeline_export._place_video_take(
+        project,
+        scene,
+        asset,
+        0,
+        4,
+        fit_mode="not-a-fit-mode",
+        crop_position="not-a-crop-position",
+    )
+
+    assert clip.fit_mode == "pad_edge"
+    assert clip.crop_position == "center"
+
+
 def test_timeline_export_output_rejects_symlinked_media_root(tmp_path):
     project_dir = tmp_path / "project"
     project_dir.mkdir()
@@ -580,6 +599,8 @@ def test_timeline_export_registration_reloads_current_project(tmp_path, monkeypa
         "save_preset": "Compatible MP4",
         "place_as_take": True,
         "save_provenance": True,
+        "take_fit_mode": "cover",
+        "take_crop_position": "top",
     })
 
     assert encode_started.wait(timeout=5)
@@ -597,6 +618,8 @@ def test_timeline_export_registration_reloads_current_project(tmp_path, monkeypa
     assert len(saved_scene.clips) == 1
     assert saved_scene.clips[0].timeline_start_frame == 0
     assert saved_scene.clips[0].timeline_end_frame == 4
+    assert saved_scene.clips[0].fit_mode == "cover"
+    assert saved_scene.clips[0].crop_position == "top"
 
 
 def test_timeline_export_non_take_writes_under_media_exports(tmp_path, monkeypatch):

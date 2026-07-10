@@ -310,6 +310,16 @@ export function chromeSelectCss(options = {}) {
     return `${chromeInputCss(options)}cursor:pointer;`;
 }
 
+// Scope browser-native controls to the Quiet Darkroom baseline without trying
+// to style Chromium's media-control shadow DOM. Call this on an editor-owned
+// root; never apply it to the surrounding ComfyUI document wholesale.
+export function applyNativeControlTheme(element) {
+    if (!element?.style) return element;
+    element.style.colorScheme = "dark";
+    element.style.accentColor = THEME.accent;
+    return element;
+}
+
 export function chromeScrollbarCss() {
     return `
         scrollbar-width: thin;

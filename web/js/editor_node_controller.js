@@ -104,6 +104,8 @@ const EDITOR_WIDGET_FIELDS = [
     "take_placement_mode",
     "take_placement_linked",
     "take_placement_muted",
+    "take_fit_mode",
+    "take_crop_position",
     "render_queue_active",
 ];
 
@@ -1711,10 +1713,12 @@ export class EditorNodeController {
         for (const name of EDITOR_WIDGET_FIELDS) {
             const fallback = name === "scene_id" ? ""
                 : name === "take_placement_mode" ? "trimmed"
-                    : name === "take_placement_linked" ? true
-                        : name === "take_placement_muted" ? false
-                            : name === "render_queue_active" ? true
-                                : 0;
+                : name === "take_placement_linked" ? true
+                    : name === "take_placement_muted" ? false
+                        : name === "take_fit_mode" ? "pad_edge"
+                            : name === "take_crop_position" ? "center"
+                                : name === "render_queue_active" ? true
+                                    : 0;
             values[name] = this._getWidgetValue(name, fallback);
         }
         return values;

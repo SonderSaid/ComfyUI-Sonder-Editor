@@ -27,6 +27,8 @@ WIDGET_FIELD_NAMES = {
     "take_placement_mode",
     "take_placement_linked",
     "take_placement_muted",
+    "take_fit_mode",
+    "take_crop_position",
     "render_queue_active",
 }
 

@@ -120,7 +120,7 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -144,6 +144,8 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         mask_post_offset="1",
         take_placement_linked=False,
         take_placement_muted=True,
+        take_fit_mode="cover",
+        take_crop_position="top",
     )
 
     assert result[6] == 14
@@ -155,6 +157,10 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     assert project._execution_context["mask_post_offset"] == 1
     assert project._execution_context["take_placement_linked"] is False
     assert project._execution_context["take_placement_muted"] is True
+    assert project._execution_context["take_fit_mode"] == "cover"
+    assert project._execution_context["take_crop_position"] == "top"
+    optional_fields = list(editor_node.SonderEditor.INPUT_TYPES()["optional"])
+    assert optional_fields[-2:] == ["take_fit_mode", "take_crop_position"]
 
 
 class _FrameConstraintScene:
@@ -2328,6 +2334,8 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
         "pre_context_frames": 2,
         "post_context_frames": 1,
         "queue_job_id": "job-1",
+        "take_fit_mode": "cover",
+        "take_crop_position": "top",
     }
 
     save_calls = []
@@ -2351,6 +2359,8 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
     assert len(scene.audio_tracks) == 0
     assert scene.clips[0].timeline_start_frame == 4
     assert scene.clips[0].timeline_end_frame == 12
+    assert scene.clips[0].fit_mode == "cover"
+    assert scene.clips[0].crop_position == "top"
     assert result["result"][0].endswith(".mp4")
 
 
@@ -2396,6 +2406,8 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
     assert trimmed.source_out_frame == 6
     assert trimmed.source_origin_frame == 0
     assert trimmed.total_source_frames == 7
+    assert trimmed.fit_mode == "pad_edge"
+    assert trimmed.crop_position == "center"
 
     project._execution_context = {
         "scene_id": "scene-1",
@@ -2405,6 +2417,8 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
         "actual_pre_context_frames": 2,
         "actual_post_context_frames": 1,
         "take_placement_mode": "untrimmed",
+        "take_fit_mode": "invalid",
+        "take_crop_position": "invalid",
     }
     node.save_video(project, torch.zeros(8, 2, 2, 3, dtype=torch.float32), filename_prefix="untrimmed", fps=24.0, mode="Take")
     untrimmed = scene.clips[-1]
@@ -2415,6 +2429,8 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
     assert untrimmed.source_out_frame == 8
     assert untrimmed.source_origin_frame == 0
     assert untrimmed.total_source_frames == 8
+    assert untrimmed.fit_mode == "pad_edge"
+    assert untrimmed.crop_position == "center"
 
 
 def test_save_video_take_trimmed_with_mask_offsets(tmp_path, monkeypatch):

@@ -205,6 +205,7 @@ import {
     EDITOR_COLORS as COLORS,
     FONT,
     LANE_PALETTE,
+    applyNativeControlTheme,
     lightenColor,
     scaleColor,
 } from "./editor_theme.js";
@@ -4598,9 +4599,19 @@ export class EditorWidget {
 
     _syncTakePlacementModeWidget(settings = this._settings) {
         const mode = settings?.render?.takePlacementMode === "untrimmed" ? "untrimmed" : "trimmed";
+        const configuredFitMode = settings?.projectDefaults?.defaultFitMode;
+        const configuredCropPosition = settings?.projectDefaults?.defaultCropPosition;
+        const fitMode = VALID_FIT_MODES.has(configuredFitMode)
+            ? configuredFitMode
+            : DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultFitMode;
+        const cropPosition = VALID_CROP_POSITIONS.has(configuredCropPosition)
+            ? configuredCropPosition
+            : DEFAULT_EDITOR_SETTINGS.projectDefaults.defaultCropPosition;
         this._setWidgetValue("take_placement_mode", mode);
         this._setWidgetValue("take_placement_linked", settings?.render?.linkedTakePlacement !== false);
         this._setWidgetValue("take_placement_muted", !!settings?.render?.takePlacementMuted);
+        this._setWidgetValue("take_fit_mode", fitMode);
+        this._setWidgetValue("take_crop_position", cropPosition);
         this._setWidgetValue("render_cache_enabled", this._renderCacheEntryLimit(settings) !== 0);
     }
 
@@ -9845,7 +9856,7 @@ export class EditorWidget {
                 frame_index: this.playhead,
                 asset_id: asset.asset_id,
                 source: "asset",
-                strength: 1.0,
+                strength: this._defaultGuideStrength(),
             });
             this._pushUndo("add guide");
             this._applyLocalCreateGuide(fields);
@@ -11561,6 +11572,7 @@ export class EditorWidget {
             background: ${COLORS.bg}; display: none;
             flex-direction: column;
         `;
+        applyNativeControlTheme(overlay);
 
         // Toolbar
         const toolbar = document.createElement("div");

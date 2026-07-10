@@ -879,6 +879,20 @@ def test_widget_allowlist_matches_frontend_editor_widget_fields():
     frontend_fields = set(re.findall(r'"([^"]+)"', match.group(1)))
     assert frontend_fields == WIDGET_FIELD_NAMES
 
+    extension_js = controller_js.with_name("extension.js")
+    extension_source = extension_js.read_text(encoding="utf-8")
+    hidden_match = re.search(r"hiddenWidgetNames\s*=\s*\[(.*?)\]", extension_source, re.DOTALL)
+    assert hidden_match, "hiddenWidgetNames not found in extension.js"
+    hidden_fields = set(re.findall(r'"([^"]+)"', hidden_match.group(1)))
+    assert frontend_fields <= hidden_fields
+
+    tab_js = controller_js.with_name("tab_entry.js")
+    tab_source = tab_js.read_text(encoding="utf-8")
+    defaults_match = re.search(r"DEFAULT_WIDGET_VALUES\s*=\s*\{(.*?)\n\};", tab_source, re.DOTALL)
+    assert defaults_match, "DEFAULT_WIDGET_VALUES not found in tab_entry.js"
+    default_fields = set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", defaults_match.group(1), re.MULTILINE))
+    assert frontend_fields <= default_fields
+
 
 def test_canvas_host_presence_is_source_node_scoped():
     async def run():

@@ -492,6 +492,8 @@ function buildExportPanel(host) {
             place_as_take: placeAsTake.checked,
             take_placement_linked: linkedTakePlacement.checked,
             take_placement_muted: takePlacementMuted.checked,
+            take_fit_mode: host._defaultFitMode(),
+            take_crop_position: host._defaultCropPosition(),
         }, ui);
     });
 

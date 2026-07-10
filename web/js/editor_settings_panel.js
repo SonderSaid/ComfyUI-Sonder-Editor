@@ -1656,7 +1656,7 @@ function showSettingsPanel() {
         projectDefaultsSection,
         "defaultGuideStrength",
         "Default Guide Strength",
-        "Applied to new guide frames created from image drops.",
+        "Applied to new guide frames, including image drops and clip snapshots.",
         {
             min: 0,
             max: 1,

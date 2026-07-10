@@ -1,11 +1,12 @@
 import { installComfyApiShim } from "./comfy_api_shim.js";
-import { FONT, THEME, injectSonderFontFaces, statusPillCss } from "./editor_theme.js";
+import { FONT, THEME, applyNativeControlTheme, injectSonderFontFaces, statusPillCss } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
 import { configureNotifications } from "./editor_notifications.js";
 import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
+applyNativeControlTheme(document.documentElement);
 
 const { api } = window.comfyAPI.api;
 
@@ -73,6 +74,8 @@ const DEFAULT_WIDGET_VALUES = {
     take_placement_mode: "trimmed",
     take_placement_linked: true,
     take_placement_muted: false,
+    take_fit_mode: "pad_edge",
+    take_crop_position: "center",
 };
 
 function setStatus(message) {

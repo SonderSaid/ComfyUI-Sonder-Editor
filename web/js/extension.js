@@ -1032,6 +1032,8 @@ app.registerExtension({
                     "take_placement_muted",
                     "render_cache_enabled",
                     "render_queue_active",
+                    "take_fit_mode",
+                    "take_crop_position",
                 ];
 
                 // Store original types

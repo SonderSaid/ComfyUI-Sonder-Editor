@@ -57,7 +57,11 @@ from ..server.media_helpers import (
     CUSTOM_PIX_FMT_OPTIONS,
     CUSTOM_SAVE_VIDEO_PRESET,
     CUSTOM_VIDEO_CODEC_OPTIONS,
+    CROP_POSITIONS,
+    DEFAULT_CROP_POSITION,
+    DEFAULT_FIT_MODE,
     DEFAULT_SAVE_VIDEO_PRESET,
+    FIT_MODES,
     MediaProbeError,
     SAVE_VIDEO_PRESET_ORDER,
     SAVE_VIDEO_PRESETS,
@@ -1674,6 +1678,12 @@ class SonderSaveVideo:
                 take_placement_mode = ctx.get("take_placement_mode", "trimmed")
                 take_placement_linked = ctx.get("take_placement_linked", True) is not False
                 take_placement_muted = bool(ctx.get("take_placement_muted", False))
+                take_fit_mode = str(ctx.get("take_fit_mode", DEFAULT_FIT_MODE) or DEFAULT_FIT_MODE).strip().lower()
+                if take_fit_mode not in FIT_MODES:
+                    take_fit_mode = DEFAULT_FIT_MODE
+                take_crop_position = str(ctx.get("take_crop_position", DEFAULT_CROP_POSITION) or DEFAULT_CROP_POSITION).strip().lower()
+                if take_crop_position not in CROP_POSITIONS:
+                    take_crop_position = DEFAULT_CROP_POSITION
 
                 mask_pre = max(0, min(actual_pre, context_int("mask_pre_offset", 0)))
                 mask_post = max(0, min(actual_post, context_int("mask_post_offset", 0)))
@@ -1725,6 +1735,8 @@ class SonderSaveVideo:
                     source_origin_frame=source_origin_frame,
                     track_index=new_lane,
                     muted=take_placement_muted,
+                    fit_mode=take_fit_mode,
+                    crop_position=take_crop_position,
                     is_generated=True,
                     generation_params=dict(take_generation_params),
                     take_metadata=dict(take_generation_params),

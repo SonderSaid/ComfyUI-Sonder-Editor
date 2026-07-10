@@ -19,6 +19,10 @@ from ..server.project_manager import ProjectVersionConflict, load_project, creat
 from ..server import external_links
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 from ..server.media_helpers import (
+    CROP_POSITIONS,
+    DEFAULT_CROP_POSITION,
+    DEFAULT_FIT_MODE,
+    FIT_MODES,
     apply_rgb_color_correction,
     color_correction_for_interpretation,
     decode_audio_samples,
@@ -206,6 +210,16 @@ class SonderEditor:
                 "render_queue_active": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "When enabled, queue jobs drive editor execution. Disable to render the live selection without consuming queue jobs.",
+                }),
+                # Append new hidden widgets so existing workflow widget_values keep
+                # their established positional mapping.
+                "take_fit_mode": ("STRING", {
+                    "default": DEFAULT_FIT_MODE,
+                    "tooltip": "Fit mode stamped on newly placed takes (set by editor settings).",
+                }),
+                "take_crop_position": ("STRING", {
+                    "default": DEFAULT_CROP_POSITION,
+                    "tooltip": "Crop anchor stamped on newly placed takes (set by editor settings).",
                 }),
             },
             "hidden": {
@@ -564,7 +578,8 @@ class SonderEditor:
                 mask_pre_offset=0, mask_post_offset=0,
                 prompt=None, unique_id=None, take_placement_mode="trimmed",
                 take_placement_linked=True, take_placement_muted=False,
-                render_cache_enabled=False, render_queue_active=True):
+                render_cache_enabled=False, render_queue_active=True,
+                take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
         selection_start = max(0, _coerce_int(selection_start, 0))
@@ -576,6 +591,12 @@ class SonderEditor:
         take_placement_mode = take_placement_mode if take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
         take_placement_linked = self._coerce_bool(take_placement_linked, True)
         take_placement_muted = self._coerce_bool(take_placement_muted, False)
+        take_fit_mode = str(take_fit_mode or DEFAULT_FIT_MODE).strip().lower()
+        if take_fit_mode not in FIT_MODES:
+            take_fit_mode = DEFAULT_FIT_MODE
+        take_crop_position = str(take_crop_position or DEFAULT_CROP_POSITION).strip().lower()
+        if take_crop_position not in CROP_POSITIONS:
+            take_crop_position = DEFAULT_CROP_POSITION
         render_cache_enabled = self._coerce_bool(render_cache_enabled, False)
         render_queue_active = self._coerce_bool(render_queue_active, True)
         proj = None
@@ -936,6 +957,8 @@ class SonderEditor:
                 "take_placement_mode": take_placement_mode,
                 "take_placement_linked": take_placement_linked,
                 "take_placement_muted": take_placement_muted,
+                "take_fit_mode": take_fit_mode,
+                "take_crop_position": take_crop_position,
                 "prompt": prompt_text,
                 # Consume-only completion handle for save nodes — do NOT set on peek
                 "queue_job_id": queue_job.job_id if queue_job and queue_job_consumed else "",
