@@ -78,6 +78,7 @@ from .timeline_state import (
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
+from . import external_links
 from . import prompt_payload
 
 logger = logging.getLogger("sonder_editor")
@@ -2511,54 +2512,72 @@ def _media_probe_signature_from_stat(stat_result) -> str:
 
 
 def _snapshot_files_under(root_dir: str, rel_prefix: str = "") -> dict[str, dict]:
-    root_dir = os.path.realpath(root_dir)
+    trust_links = external_links.is_enabled()
+    root_dir = os.path.abspath(root_dir) if trust_links else os.path.realpath(root_dir)
     if not os.path.isdir(root_dir):
         return {}
-    root_real = os.path.realpath(root_dir)
+    root_anchor = root_dir
 
     root_rel = _normalize_project_relpath(rel_prefix)
     snapshot: dict[str, dict] = {}
     stack = [(root_dir, root_rel)]
+    visited_real_dirs: set[str] = set()
     while stack:
         current_dir, current_rel = stack.pop()
+        if trust_links:
+            try:
+                current_real = os.path.normcase(os.path.realpath(current_dir))
+            except OSError:
+                continue
+            if current_real in visited_real_dirs:
+                continue
+            visited_real_dirs.add(current_real)
         try:
             with os.scandir(current_dir) as scan:
                 for entry in scan:
                     rel_path = _normalize_project_relpath(os.path.join(current_rel, entry.name))
                     try:
                         try:
-                            if entry.is_symlink():
+                            if entry.is_symlink() and not trust_links:
                                 log_path_quarantine(
                                     purpose="media snapshot",
                                     path=rel_path,
-                                    root=root_real,
+                                    root=root_anchor,
                                     reason="symlink skipped",
                                 )
                                 continue
                         except (AttributeError, OSError):
                             continue
-                        if entry.is_dir(follow_symlinks=False):
-                            if not _security_path_within(root_real, entry.path):
+                        if entry.is_dir(follow_symlinks=trust_links):
+                            if not _security_path_within(root_anchor, entry.path):
                                 log_path_quarantine(
                                     purpose="media snapshot",
                                     path=rel_path,
-                                    root=root_real,
+                                    root=root_anchor,
                                     reason="directory escapes root",
                                 )
                                 continue
+                            if trust_links:
+                                try:
+                                    child_real = os.path.normcase(os.path.realpath(entry.path))
+                                except OSError:
+                                    continue
+                                if child_real in visited_real_dirs:
+                                    logger.debug("Skipping already-visited linked media directory: %s", entry.path)
+                                    continue
                             stack.append((entry.path, rel_path))
                             continue
-                        if not entry.is_file(follow_symlinks=False):
+                        if not entry.is_file(follow_symlinks=trust_links):
                             continue
-                        if not _security_path_within(root_real, entry.path):
+                        if not _security_path_within(root_anchor, entry.path):
                             log_path_quarantine(
                                 purpose="media snapshot",
                                 path=rel_path,
-                                root=root_real,
+                                root=root_anchor,
                                 reason="file escapes root",
                             )
                             continue
-                        stat_result = entry.stat(follow_symlinks=False)
+                        stat_result = entry.stat(follow_symlinks=trust_links)
                     except OSError:
                         continue
                     snapshot[rel_path] = {
@@ -3336,6 +3355,13 @@ def _configured_base_dir() -> str:
     return os.path.realpath(base_dir) if base_dir else ""
 
 
+def _project_dir_under_base(base_dir: str, project_id: str) -> str:
+    """Return one spelling-family project path from the real scan-root anchor."""
+    base_anchor = os.path.realpath(base_dir)
+    lexical_path = os.path.abspath(os.path.join(base_anchor, project_id))
+    return lexical_path if external_links.is_enabled() else os.path.realpath(lexical_path)
+
+
 def _path_within(parent: str, child: str) -> bool:
     return _security_path_within(parent, child)
 
@@ -3354,14 +3380,13 @@ def _direct_project_dir_for_cached_asset(request: web.Request) -> str | None:
     base_dir = _get_base_dir()
     if not base_dir:
         return None
-    project_dir = os.path.join(base_dir, project_id)
+    project_dir = _project_dir_under_base(base_dir, project_id)
     if not os.path.isdir(project_dir):
         return None
-    project_real = os.path.realpath(project_dir)
     base_real = os.path.realpath(base_dir)
-    if not _path_within(base_real, project_real):
+    if not _path_within(base_real, project_dir):
         return None
-    return project_real
+    return project_dir
 
 
 def _direct_project_dir_from_request(request: web.Request) -> str | None:
@@ -3375,7 +3400,7 @@ def _direct_project_dir_from_request(request: web.Request) -> str | None:
     if not base_dir:
         return None
     base_real = os.path.realpath(base_dir)
-    project_dir = os.path.realpath(os.path.join(base_dir, project_id))
+    project_dir = _project_dir_under_base(base_real, project_id)
     if not _path_within(base_real, project_dir):
         return None
     if not os.path.isfile(os.path.join(project_dir, "project.json")):
@@ -3390,7 +3415,7 @@ def _project_file_matches_request(data: dict, requested_id: str, folder_name: st
 
 def _find_project_dir_in_base(base_dir: str, requested_id: str) -> str:
     base_real = os.path.realpath(base_dir)
-    direct_dir = os.path.realpath(os.path.join(base_real, requested_id))
+    direct_dir = _project_dir_under_base(base_real, requested_id)
     if _path_within(base_real, direct_dir):
         direct_file = os.path.join(direct_dir, "project.json")
         if os.path.isfile(direct_file):
@@ -3405,7 +3430,7 @@ def _find_project_dir_in_base(base_dir: str, requested_id: str) -> str:
             safe_entry = _safe_route_token(entry, "project folder")
         except ValueError:
             continue
-        entry_path = os.path.realpath(os.path.join(base_real, safe_entry))
+        entry_path = _project_dir_under_base(base_real, safe_entry)
         if not _path_within(base_real, entry_path) or not os.path.isdir(entry_path):
             continue
         pfile = os.path.join(entry_path, "project.json")
@@ -3424,10 +3449,10 @@ def _find_project_dir_in_base(base_dir: str, requested_id: str) -> str:
 
 def _validate_loaded_project_request(project: TimelineProject, requested_id: str, project_dir: str, base_dir: str) -> None:
     base_real = os.path.realpath(base_dir)
-    project_real = os.path.realpath(project_dir)
-    if not _path_within(base_real, project_real):
+    project_path = os.path.abspath(project_dir) if external_links.is_enabled() else os.path.realpath(project_dir)
+    if not _path_within(base_real, project_path):
         raise _bad_project_request("Project path escapes configured base directory")
-    folder_name = os.path.basename(os.path.normpath(project_real))
+    folder_name = os.path.basename(os.path.normpath(project_path))
     canonical_id = str(getattr(project, "project_id", "") or "")
     if requested_id not in {folder_name, canonical_id}:
         raise _bad_project_request("Requested project id does not match loaded project")
@@ -4455,6 +4480,16 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
         raise ValueError("Invalid replacement destination")
     os.makedirs(os.path.dirname(next_abs_path), exist_ok=True)
 
+    # In trust mode a same-extension replacement can target a linked media file.
+    # Copying directly through that link would overwrite the external original; replace
+    # the link itself with a normal project file instead.
+    if (
+        external_links.is_enabled()
+        and old_rel_path == next_rel_path
+        and os.path.islink(next_abs_path)
+    ):
+        os.unlink(next_abs_path)
+
     if os.path.abspath(resolved_source) != os.path.abspath(next_abs_path):
         shutil.copy2(resolved_source, next_abs_path)
 
@@ -4728,6 +4763,65 @@ if routes is not None:
             )
         status = 200 if payload.get("ok", True) else 409
         return web.json_response(payload, status=status)
+
+    # -----------------------------------------------------------------------
+    # Install-level server settings and external project links
+    # -----------------------------------------------------------------------
+
+    @routes.get("/sonder-editor/server-settings")
+    async def api_get_server_settings(_request: web.Request) -> web.Response:
+        return web.json_response({
+            "allow_external_project_links": external_links.is_enabled(),
+        })
+
+    @routes.put("/sonder-editor/server-settings")
+    async def api_update_server_settings(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict) or not isinstance(body.get("allow_external_project_links"), bool):
+            return _json_error("allow_external_project_links must be a boolean", 400)
+        try:
+            await asyncio.to_thread(external_links.set_enabled, body["allow_external_project_links"])
+        except external_links.LinkError as exc:
+            return _json_error(str(exc), exc.status)
+        except OSError as exc:
+            logger.exception("Failed to save Sonder server settings")
+            return _json_error(f"Could not save server settings: {exc}", 500)
+        return web.json_response({
+            "allow_external_project_links": external_links.is_enabled(),
+        })
+
+    @routes.post("/sonder-editor/projects/link")
+    async def api_link_project(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("JSON object required", 400)
+        try:
+            linked = await asyncio.to_thread(external_links.create_project_link, body.get("path", ""))
+        except external_links.LinkError as exc:
+            return _json_error(str(exc), exc.status)
+        return web.json_response({"project": linked}, status=201)
+
+    @routes.post("/sonder-editor/projects/unlink")
+    async def api_unlink_project(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("JSON object required", 400)
+        try:
+            removed = await asyncio.to_thread(external_links.remove_project_link, body.get("project_id", ""))
+        except external_links.LinkError as exc:
+            return _json_error(str(exc), exc.status)
+        if not removed:
+            return _json_error("Project link not found", 404)
+        return web.json_response({"ok": True})
 
     # -----------------------------------------------------------------------
     # Project CRUD

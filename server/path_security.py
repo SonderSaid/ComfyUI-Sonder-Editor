@@ -12,17 +12,46 @@ logger = logging.getLogger("sonder_editor")
 
 _ENCODED_SEPARATOR_RE = re.compile(r"%(?:2f|5c)", re.IGNORECASE)
 _LOGGED_QUARANTINES: set[tuple[str, str, str, str]] = set()
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 class PathSecurityError(ValueError):
     """Raised when a path would escape its intended containment root."""
 
 
+def _external_links_enabled() -> bool:
+    """Read the install-level opt-in without making this module import-cycle prone."""
+    try:
+        from .external_links import is_enabled
+
+        return bool(is_enabled())
+    except Exception:
+        return False
+
+
+def _is_windows_reserved_basename(value: str) -> bool:
+    """Whether a path component spells a Windows device file (including ``CON.txt``)."""
+    cleaned = str(value or "").rstrip(". ")
+    stem = cleaned.split(".", 1)[0].upper()
+    return stem in _WINDOWS_RESERVED_BASENAMES
+
+
 def path_within(parent: str, child: str) -> bool:
     try:
-        parent_real = os.path.normcase(os.path.realpath(str(parent or "")))
-        child_real = os.path.normcase(os.path.realpath(str(child or "")))
-        return os.path.commonpath([parent_real, child_real]) == parent_real
+        if _external_links_enabled():
+            # Trust-on spelling family: the caller supplies an anchor that has already
+            # been realpath'd once, then every descendant remains lexical. Re-realpathing
+            # a child here would erase a project junction and mix path families.
+            parent_path = os.path.normcase(os.path.abspath(str(parent or "")))
+            child_path = os.path.normcase(os.path.abspath(str(child or "")))
+        else:
+            parent_path = os.path.normcase(os.path.realpath(str(parent or "")))
+            child_path = os.path.normcase(os.path.realpath(str(child or "")))
+        return os.path.commonpath([parent_path, child_path]) == parent_path
     except (OSError, ValueError):
         return False
 
@@ -38,6 +67,8 @@ def safe_route_token(value: str, label: str) -> str:
         or ":" in value
         or _ENCODED_SEPARATOR_RE.search(value)
     ):
+        raise PathSecurityError(f"Invalid {label}")
+    if _external_links_enabled() and _is_windows_reserved_basename(value):
         raise PathSecurityError(f"Invalid {label}")
     return value
 
@@ -72,6 +103,8 @@ def normalize_project_relative_path(path: str, *, allow_empty: bool = False) -> 
     parts = normalized.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise PathSecurityError("Traversal path components are not allowed")
+    if _external_links_enabled() and any(_is_windows_reserved_basename(part) for part in parts):
+        raise PathSecurityError("Windows reserved path components are not allowed")
     return "/".join(parts)
 
 
@@ -116,6 +149,17 @@ def resolve_under_root(
 ) -> str:
     try:
         rel = normalize_project_relative_path(relative_path)
+        if _external_links_enabled():
+            # ``root`` is a spelling-family anchor (e.g. real scan root + junction
+            # basename). Keep the lexical descendant so project links remain usable.
+            root_path = os.path.abspath(str(root or ""))
+            target = os.path.abspath(os.path.join(root_path, *rel.split("/")))
+            if not path_within(root_path, target):
+                raise PathSecurityError("Resolved path escapes root")
+            if must_exist and not os.path.exists(target):
+                return ""
+            return target
+
         root_real = os.path.realpath(str(root or ""))
         target = os.path.abspath(os.path.join(root_real, *rel.split("/")))
         target_real = os.path.realpath(target)
@@ -163,10 +207,10 @@ def project_root(project_or_dir, *, must_exist: bool = False) -> str:
             reason="invalid project root",
         )
         return ""
-    root_real = os.path.realpath(root)
-    if must_exist and not os.path.isdir(root_real):
+    root_path = os.path.abspath(root) if _external_links_enabled() else os.path.realpath(root)
+    if must_exist and not os.path.isdir(root_path):
         return ""
-    return root_real
+    return root_path
 
 
 def resolve_existing_project_path(
@@ -205,9 +249,12 @@ def _project_subroot(
         target = os.path.abspath(os.path.join(root, *rel.split("/")))
         if not path_within(root, target):
             raise PathSecurityError("Subroot escapes project")
-        target_real = os.path.realpath(target)
-        if os.path.normcase(target_real) != os.path.normcase(target):
-            raise PathSecurityError("Subroot resolves outside its canonical project location")
+        if not _external_links_enabled():
+            target_real = os.path.realpath(target)
+            if os.path.normcase(target_real) != os.path.normcase(target):
+                raise PathSecurityError("Subroot resolves outside its canonical project location")
+        else:
+            target_real = target
         if os.path.lexists(target) and not os.path.isdir(target):
             raise PathSecurityError("Subroot is not a directory")
         if must_exist and not os.path.isdir(target):

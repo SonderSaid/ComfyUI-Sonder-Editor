@@ -242,6 +242,14 @@ function syncSettingsPanelControls() {
     if (controls.promptChannelLabels) controls.promptChannelLabels.checked = this._promptChannelLabels === true;
     if (controls.promptSectionDelimiter) controls.promptSectionDelimiter.value = String(this._promptSectionDelimiter ?? ".");
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
+    if (controls.allowExternalProjectLinks) {
+        const resolved = this._serverSettingsLoaded === true;
+        controls.allowExternalProjectLinks.disabled = !resolved;
+        controls.allowExternalProjectLinks.checked = this._serverSettings?.allow_external_project_links === true;
+        controls.allowExternalProjectLinks.title = resolved
+            ? ""
+            : "Loading server settingâ€¦";
+    }
     this._renderModelTemplateSettings?.();
 }
 
@@ -1321,6 +1329,23 @@ function showSettingsPanel() {
         () => this._updateSettings({ guides: DEFAULT_EDITOR_SETTINGS.guides })
     );
 
+    const serverSection = createSection(
+        "Server",
+        "Install-level trust settings. These apply to everyone who can reach this ComfyUI server."
+    );
+    const externalLinksToggle = createCheckbox(
+        serverSection,
+        "allowExternalProjectLinks",
+        "Allow External Project Links",
+        "Follow symlinks/junctions everywhere the editor resolves files. Anything inside linked folders becomes readable by anyone who can reach your ComfyUI server.",
+        () => this._serverSettings?.allow_external_project_links === true,
+        (checked) => {
+            Promise.resolve(this._setAllowExternalProjectLinks(checked)).catch(() => {});
+        }
+    );
+    externalLinksToggle.disabled = true;
+    externalLinksToggle.title = "Loading server settingâ€¦";
+
     const promptsSection = createSection(
         "Prompts",
         "Prompt lane behavior. Channel labels, section delimiter, and boundary threshold are PROJECT-WIDE; the rest are browser-local preferences."
@@ -1738,6 +1763,7 @@ function showSettingsPanel() {
     document.body.appendChild(backdrop);
     this._settingsPanelEl = backdrop;
     syncSettingsPanelControls.call(this);
+    Promise.resolve(this._loadServerSettings?.()).catch(() => {});
 
     backdrop.addEventListener("click", (e) => {
         if (e.target === backdrop) this._hideSettingsPanel();

@@ -605,6 +605,9 @@ export class EditorWidget {
         this._promptChannelLabels = false;
         this._promptSectionDelimiter = ".";
         this._promptFrameThreshold = 10;
+        this._serverSettings = null;
+        this._serverSettingsLoaded = false;
+        this._activeProjectLinked = false;
 
         // Animatic toggle state
         this._animaticMode = false;
@@ -4890,6 +4893,10 @@ export class EditorWidget {
             get _promptChannelLabels() { return editor._promptChannelLabels; },
             get _promptSectionDelimiter() { return editor._promptSectionDelimiter; },
             get _promptFrameThreshold() { return editor._promptFrameThreshold; },
+            get _serverSettings() { return editor._serverSettings; },
+            get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
+            _loadServerSettings: () => editor._loadServerSettings(),
+            _setAllowExternalProjectLinks: (enabled) => editor._setAllowExternalProjectLinks(enabled),
             _togglePromptChannelLabels: (on) => editor._togglePromptChannelLabels(on),
             _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
             _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
@@ -11286,12 +11293,150 @@ export class EditorWidget {
         ]);
     }
 
-    _showProjectMenu(anchorEl) {
+    async _showProjectMenu(anchorEl) {
+        try {
+            const projects = await this._listProjectEntries();
+            const activeName = this._projectDirName();
+            this._activeProjectLinked = projects.some((project) => (
+                this._projectFolderName(project) === activeName && project?.linked === true
+            ));
+        } catch (_) {
+            // Keep the existing project actions available when the list request fails.
+        }
         const rect = anchorEl.getBoundingClientRect();
-        this._showContextMenu(rect.left, rect.bottom + 4, [
+        const items = [
             { label: "Reveal projects folder", action: () => this._revealProjectFolder() },
             { label: "Copy folder path", action: () => this._copyProjectPath() },
-        ]);
+            { type: "separator" },
+            { label: "Link project folder\u2026", action: () => this._linkProjectFolder() },
+        ];
+        if (this._activeProjectLinked) {
+            items.push({ label: "Unlink this project", action: () => this._unlinkActiveProject(), danger: true });
+        }
+        this._showContextMenu(rect.left, rect.bottom + 4, items);
+    }
+
+    _projectFolderName(project) {
+        return String(project?.path || "").split(/[/\\]/).pop() || "";
+    }
+
+    async _listProjectEntries() {
+        const resp = await fetch(api.apiURL("/sonder-editor/projects"));
+        if (!resp.ok) throw new Error(`Failed to list projects: ${resp.status}`);
+        const data = await resp.json();
+        return Array.isArray(data?.projects) ? data.projects : [];
+    }
+
+    async _refreshProjectChoicesAndSwitch(preferredFolder = "") {
+        const projects = await this._listProjectEntries();
+        const projectNames = projects.map((project) => this._projectFolderName(project)).filter(Boolean);
+        const currentFolder = this._projectDirName();
+        this._activeProjectLinked = projects.some((project) => (
+            this._projectFolderName(project) === currentFolder && project?.linked === true
+        ));
+
+        const projectWidget = this.node?.widgets?.find((widget) => widget.name === "project");
+        if (projectWidget) {
+            projectWidget.options = projectWidget.options || {};
+            projectWidget.options.values = ["+ Create New", ...projectNames];
+        }
+
+        const targetFolder = projectNames.includes(preferredFolder)
+            ? preferredFolder
+            : (projectNames.includes(currentFolder) ? currentFolder : (projectNames[0] || "+ Create New"));
+        const targetProject = projects.find((project) => this._projectFolderName(project) === targetFolder) || null;
+
+        if (projectWidget && typeof projectWidget.callback === "function") {
+            if (projectWidget.value !== targetFolder) {
+                projectWidget.value = targetFolder;
+                projectWidget.callback(targetFolder);
+            }
+        } else if (targetProject?.path && targetProject.path !== this.projectDir) {
+            this._clearProjectNotFound();
+            this.updateProject(targetProject.path);
+        }
+        return projects;
+    }
+
+    async _loadServerSettings() {
+        this._serverSettingsLoaded = false;
+        this._syncSettingsPanelControls();
+        try {
+            const resp = await fetch(api.apiURL("/sonder-editor/server-settings"));
+            if (!resp.ok) throw new Error(`Failed to load server settings: ${resp.status}`);
+            const data = await resp.json();
+            if (typeof data?.allow_external_project_links !== "boolean") {
+                throw new Error("Server settings response was invalid");
+            }
+            this._serverSettings = data;
+            this._serverSettingsLoaded = true;
+            return data;
+        } catch (error) {
+            console.warn("[Sonder] Failed to load server settings:", error);
+            this._serverSettings = null;
+            this._serverSettingsLoaded = false;
+            return null;
+        } finally {
+            this._syncSettingsPanelControls();
+        }
+    }
+
+    async _setAllowExternalProjectLinks(enabled) {
+        const requested = enabled === true;
+        try {
+            const resp = await fetch(api.apiURL("/sonder-editor/server-settings"), {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ allow_external_project_links: requested }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data?.error || "Could not update server setting");
+            this._serverSettings = data;
+            this._serverSettingsLoaded = true;
+            await this._refreshProjectChoicesAndSwitch();
+            notifySuccess(requested ? "External project links enabled" : "External project links disabled");
+        } catch (error) {
+            notifyError(error?.message || "Could not update external project links", { source: "external-project-links" });
+        } finally {
+            this._syncSettingsPanelControls();
+        }
+    }
+
+    async _linkProjectFolder() {
+        const targetPath = prompt("Paste the path of an existing Sonder project folder:", "");
+        if (!targetPath?.trim()) return;
+        try {
+            const resp = await fetch(api.apiURL("/sonder-editor/projects/link"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ path: targetPath.trim() }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data?.error || "Could not link project folder");
+            const folder = String(data?.project?.name || "");
+            await this._refreshProjectChoicesAndSwitch(folder);
+            notifySuccess("Project folder linked");
+        } catch (error) {
+            notifyError(error?.message || "Could not link project folder", { source: "external-project-links" });
+        }
+    }
+
+    async _unlinkActiveProject() {
+        const projectId = this._projectDirName();
+        if (!projectId) return;
+        try {
+            const resp = await fetch(api.apiURL("/sonder-editor/projects/unlink"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ project_id: projectId }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data?.error || "Could not unlink project folder");
+            await this._refreshProjectChoicesAndSwitch();
+            notifySuccess("Project link removed; external files were left untouched");
+        } catch (error) {
+            notifyError(error?.message || "Could not unlink project folder", { source: "external-project-links" });
+        }
     }
 
     async _copyProjectPath() {

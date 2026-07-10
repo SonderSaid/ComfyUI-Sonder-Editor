@@ -16,6 +16,7 @@ import torch
 import folder_paths
 
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
+from ..server import external_links
 from ..server.timeline_state import GuideFrame, TimelineProject, Scene
 from ..server.media_helpers import (
     apply_rgb_color_correction,
@@ -67,7 +68,8 @@ def _resolve_project_choice_dir(base_dir: str, project: str) -> str:
         raise ValueError(str(exc)) from exc
 
     base_real = os.path.realpath(base_dir)
-    project_dir = os.path.realpath(os.path.join(base_real, project_id))
+    lexical_project_dir = os.path.abspath(os.path.join(base_real, project_id))
+    project_dir = lexical_project_dir if external_links.is_enabled() else os.path.realpath(lexical_project_dir)
     if not path_within(base_real, project_dir):
         raise ValueError("Project path escapes configured base directory")
     return project_dir
@@ -78,8 +80,12 @@ def _list_project_choices():
     base = _get_projects_base_dir()
     entries = [CREATE_NEW]
     if os.path.isdir(base):
-        for name in sorted(os.listdir(base)):
-            if os.path.isfile(os.path.join(base, name, "project.json")):
+        base_real = os.path.realpath(base)
+        trust_links = external_links.is_enabled()
+        for name in sorted(os.listdir(base_real)):
+            if not trust_links and external_links.is_reparse_child(base_real, name):
+                continue
+            if os.path.isfile(os.path.join(base_real, name, "project.json")):
                 entries.append(name)
     return entries
 

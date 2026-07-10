@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Callable
 
 from .atomic_io import atomic_replace
+from . import external_links
 from .path_security import path_within
 from .timeline_state import TimelineProject
 
@@ -210,14 +211,22 @@ def list_projects(base_dir: str) -> list[dict]:
         return results
 
     base_real = os.path.realpath(base_dir)
+    trust_links = external_links.is_enabled()
     for entry in sorted(os.listdir(base_real)):
         entry_path = os.path.join(base_real, entry)
-        entry_real = os.path.realpath(entry_path)
-        if not path_within(base_real, entry_real):
+        linked = external_links.is_reparse_child(base_real, entry)
+        if linked and not trust_links:
+            logger.warning("Skipping linked project while external links are disabled: %s", entry_path)
+            continue
+        # Trust-on paths retain the scan-root anchor plus the lexical entry name. A
+        # realpath here would turn a junction-backed project into its external target
+        # and break the single-root resolver family used by routes and nodes.
+        resolved_entry = os.path.abspath(entry_path) if trust_links else os.path.realpath(entry_path)
+        if not path_within(base_real, resolved_entry):
             logger.warning("Skipping project entry outside base directory: %s", entry_path)
             continue
-        project_file = os.path.join(entry_real, "project.json")
-        if os.path.isdir(entry_real) and os.path.isfile(project_file):
+        project_file = os.path.join(resolved_entry, "project.json")
+        if os.path.isdir(resolved_entry) and os.path.isfile(project_file):
             try:
                 with open(project_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -230,7 +239,8 @@ def list_projects(base_dir: str) -> list[dict]:
                 results.append({
                     "project_id": data.get("project_id", ""),
                     "name": data.get("name", entry),
-                    "path": entry_real,
+                    "path": resolved_entry,
+                    "linked": linked,
                     "fps": data.get("fps", 24.0),
                     "resolution": data.get("resolution", [1280, 720]),
                     "scene_count": len(scenes),

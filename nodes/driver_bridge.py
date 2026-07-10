@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from ..server.media_helpers import decode_video_range, fit_frame_to_canvas, resolve_source_color_interpretation
+from ..server import external_links
 from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig
 
@@ -257,8 +258,8 @@ def _validated_driver_project_dir(project_dir: str) -> str:
     base_dir = _projects_base_dir()
     if not base_dir:
         return ""
-    project_real = os.path.realpath(raw)
-    return project_real if path_within(base_dir, project_real) else ""
+    project_path = os.path.abspath(raw) if external_links.is_enabled() else os.path.realpath(raw)
+    return project_path if path_within(base_dir, project_path) else ""
 
 
 def _abs_driver_path(project_or_dir, source_path: str) -> str:

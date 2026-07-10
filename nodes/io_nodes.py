@@ -19,6 +19,7 @@ import folder_paths
 from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
+from ..server import external_links
 from ..server.project_manager import load_project, save_project
 from ..server.path_security import (
     PathSecurityError,
@@ -418,6 +419,20 @@ def _safe_bridge_relpath(path: str, root: str) -> str:
     return normalize_project_relative_path(rel_path)
 
 
+def _strict_realpath_within(parent: str, child: str) -> bool:
+    """Contain bridge scans by real paths even when external-link trust is enabled.
+
+    Bridge output is machine-managed. A planted directory junction there must never be
+    walked into or moved from, so this deliberately does not use path_security.path_within.
+    """
+    try:
+        parent_real = os.path.normcase(os.path.realpath(str(parent or "")))
+        child_real = os.path.normcase(os.path.realpath(str(child or "")))
+        return os.path.commonpath([parent_real, child_real]) == parent_real
+    except (OSError, ValueError):
+        return False
+
+
 def _write_bridge_sidecar(bridge_dir: str, existed: list[str]) -> None:
     sidecar_path = resolve_under_root(
         bridge_dir,
@@ -463,7 +478,7 @@ def _list_bridge_files(bridge_dir: str) -> list[str]:
         for dirname in dirs:
             dir_path = os.path.join(root, dirname)
             try:
-                if os.path.islink(dir_path):
+                if os.path.islink(dir_path) or external_links.is_reparse_child(root, dirname):
                     log_path_quarantine(
                         purpose="bridge output scan",
                         path=dir_path,
@@ -471,7 +486,7 @@ def _list_bridge_files(bridge_dir: str) -> list[str]:
                         reason="symlink directory skipped",
                     )
                     continue
-                if not path_within(bridge_real, dir_path):
+                if not _strict_realpath_within(bridge_real, dir_path):
                     log_path_quarantine(
                         purpose="bridge output scan",
                         path=dir_path,
@@ -494,7 +509,7 @@ def _list_bridge_files(bridge_dir: str) -> list[str]:
                         reason="non-regular file skipped",
                     )
                     continue
-                if not path_within(bridge_real, full_path):
+                if not _strict_realpath_within(bridge_real, full_path):
                     log_path_quarantine(
                         purpose="bridge output scan",
                         path=full_path,
@@ -521,10 +536,23 @@ def _latest_bridge_change_time(bridge_dir: str) -> float:
     bridge_real = os.path.realpath(str(bridge_dir or ""))
     latest = os.path.getmtime(bridge_real) if os.path.isdir(bridge_real) else 0.0
     for root, dirs, files in os.walk(bridge_real):
-        for name in [*dirs, *files]:
-            path = os.path.join(root, name)
+        kept_dirs = []
+        for dirname in dirs:
+            dir_path = os.path.join(root, dirname)
             try:
-                if os.path.islink(path) or not path_within(bridge_real, path):
+                if os.path.islink(dir_path) or external_links.is_reparse_child(root, dirname):
+                    continue
+                if not _strict_realpath_within(bridge_real, dir_path):
+                    continue
+                latest = max(latest, os.path.getmtime(dir_path))
+            except OSError:
+                continue
+            kept_dirs.append(dirname)
+        dirs[:] = kept_dirs
+        for filename in files:
+            path = os.path.join(root, filename)
+            try:
+                if os.path.islink(path) or not _strict_realpath_within(bridge_real, path):
                     continue
                 latest = max(latest, os.path.getmtime(path))
             except OSError:
@@ -540,12 +568,20 @@ def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
     for entry in os.scandir(bridge_root):
         if not entry.is_dir(follow_symlinks=False):
             continue
+        if external_links.is_reparse_child(bridge_root, entry.name):
+            log_path_quarantine(
+                purpose="stale bridge cleanup",
+                path=entry.path,
+                root=bridge_root,
+                reason="reparse directory skipped",
+            )
+            continue
         try:
             if entry.stat().st_mtime >= cutoff:
                 continue
         except OSError:
             continue
-        target = os.path.realpath(entry.path)
+        target = os.path.abspath(entry.path) if external_links.is_enabled() else os.path.realpath(entry.path)
         if not path_within(bridge_root, target):
             log_path_quarantine(
                 purpose="stale bridge cleanup",
@@ -584,14 +620,14 @@ def _build_bridge_output_paths(project, prompt_key: str, bridge_node_id: str, na
         raise ValueError("Invalid bridge output directory")
     import folder_paths as current_folder_paths
 
-    bridge_real = os.path.realpath(bridge_dir)
+    bridge_path = os.path.abspath(bridge_dir) if external_links.is_enabled() else os.path.realpath(bridge_dir)
     stem = _safe_output_stem(naming_stem, "out")
     filename_prefix = ""
     output_root_raw = str(current_folder_paths.get_output_directory() or "")
     if output_root_raw:
         output_root = os.path.realpath(output_root_raw)
-        if path_within(output_root, bridge_real):
-            relative_dir = os.path.relpath(bridge_real, output_root).replace("\\", "/")
+        if path_within(output_root, bridge_path):
+            relative_dir = os.path.relpath(bridge_path, output_root).replace("\\", "/")
             try:
                 relative_dir = normalize_project_relative_path(relative_dir)
             except PathSecurityError as exc:
@@ -600,7 +636,7 @@ def _build_bridge_output_paths(project, prompt_key: str, bridge_node_id: str, na
         else:
             logger.warning(
                 "Bridge output directory %s is outside ComfyUI output root %s; native filename_prefix disabled",
-                bridge_real,
+                bridge_path,
                 output_root,
             )
     return bridge_dir, filename_prefix
@@ -958,7 +994,7 @@ def _validated_bridge_dir(project, bridge_dir: str, *, must_exist: bool = True) 
     root = project_bridge_root(project, must_exist=must_exist)
     if not root:
         return ""
-    target = os.path.realpath(str(bridge_dir or ""))
+    target = os.path.abspath(str(bridge_dir or "")) if external_links.is_enabled() else os.path.realpath(str(bridge_dir or ""))
     if not target or not path_within(root, target):
         log_path_quarantine(
             purpose="bridge output directory",
