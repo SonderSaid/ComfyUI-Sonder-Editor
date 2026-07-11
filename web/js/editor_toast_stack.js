@@ -338,6 +338,7 @@ export function mountToastStack(target = document.body) {
 
         // Full text for right-click copy, and (re)apply collapse/expand state.
         el._copyText = [n.verb ? `${n.verb}: ${n.message}` : n.message, n.detail].filter(Boolean).join("\n");
+        el.title = [n.detail, "Hover to expand · right-click to copy"].filter(Boolean).join("\n\n");
         applyExpand(el);
     }
 

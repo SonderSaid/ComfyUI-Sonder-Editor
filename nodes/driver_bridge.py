@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -18,7 +19,7 @@ import torch
 from ..server.media_helpers import decode_video_range, fit_frame_to_canvas, resolve_source_color_interpretation
 from ..server import external_links
 from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
-from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig
+from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig, effective_scene_fps
 
 logger = logging.getLogger(__name__)
 
@@ -120,8 +121,12 @@ def _resolve_driver_source(project, scene):
     queue_job = _find_ref_job(project)
     if queue_job is not None and _snapshot_version(queue_job) > 0:
         lane_count = max(1, _coerce_int(getattr(queue_job, "driver_lane_count", 1), 1))
+        snapshot_fps = _coerce_float(getattr(queue_job, "scene_fps", 0.0), 0.0)
+        if not math.isfinite(snapshot_fps) or snapshot_fps <= 0:
+            snapshot_fps = effective_scene_fps(project, scene)
         return {
             "source": "snapshot",
+            "scene_fps": snapshot_fps,
             "clips": [
                 ClipReference.from_dict(item)
                 for item in (getattr(queue_job, "driver_clip_snapshots", []) or [])
@@ -143,6 +148,7 @@ def _resolve_driver_source(project, scene):
         configs.append(LaneConfig())
     return {
         "source": "live",
+        "scene_fps": effective_scene_fps(project, scene),
         "clips": list(getattr(scene, "clips", []) or []) if scene else [],
         "lane_count": lane_count,
         "lane_configs": configs[:lane_count],
@@ -278,7 +284,19 @@ def _driver_path_is_contained(project_or_dir, source_path: str) -> bool:
     ))
 
 
-def _decode_driver_clip(project, clip, overlap_start: int, overlap_len: int, width: int, height: int) -> torch.Tensor:
+def _decode_driver_clip(
+    project,
+    clip,
+    overlap_start: int,
+    overlap_len: int,
+    width: int,
+    height: int,
+    *,
+    rate_ratio: float = 1.0,
+    native_frame_count: int = 0,
+) -> torch.Tensor:
+    if overlap_len <= 0:
+        raise RuntimeError("Driver media produced no frames")
     source_start = _coerce_int(getattr(clip, "source_in_frame", 0), 0) + (
         overlap_start - _coerce_int(getattr(clip, "timeline_start_frame", 0), 0)
     )
@@ -287,23 +305,39 @@ def _decode_driver_clip(project, clip, overlap_start: int, overlap_len: int, wid
     if not os.path.isfile(abs_path):
         raise RuntimeError(f"Driver media not found: {source_path or abs_path}")
 
+    ratio = _coerce_float(rate_ratio, 1.0)
+    if not math.isfinite(ratio) or ratio <= 0:
+        ratio = 1.0
+    native_count = max(0, _coerce_int(native_frame_count, 0))
+    native_indices = [
+        int(math.floor((source_start + offset + 0.5) * ratio))
+        for offset in range(overlap_len)
+    ]
+    if native_count > 0:
+        native_indices = [min(native_count - 1, max(0, index)) for index in native_indices]
+    native_start = min(native_indices)
+    native_end = max(native_indices) + 1
+
     frames = []
     asset_lookup = getattr(project, "asset_for_source_path", None)
     asset = asset_lookup(source_path) if callable(asset_lookup) else None
     interpretation = resolve_source_color_interpretation(asset, abs_path)
     try:
         decoded = decode_video_range(
-            abs_path, source_start, source_start + overlap_len,
+            abs_path, native_start, native_end,
             color_interpretation=interpretation,
         )
-        for offset in range(overlap_len):
+        decoded_frames = []
+        for native_frame in range(native_start, native_end):
             try:
                 frame_rgb = next(decoded)
             except StopIteration as exc:
-                frame_no = source_start + offset
                 raise RuntimeError(
-                    f"Driver media ended before expected frame {frame_no}: {source_path}"
+                    f"Driver media ended before expected frame {native_frame}: {source_path}"
                 ) from exc
+            decoded_frames.append(frame_rgb)
+        for native_frame in native_indices:
+            frame_rgb = decoded_frames[native_frame - native_start]
             placed, _bounds = fit_frame_to_canvas(
                 frame_rgb,
                 width,
@@ -378,6 +412,8 @@ def _base_driver_ref(
         "overlap_start": 0,
         "overlap_len": 0,
         "overlap_local_idx": int(fallback_idx),
+        "rate_ratio": 1.0,
+        "native_frame_count": 0,
     }
 
 
@@ -443,6 +479,14 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
         return ref
 
     local_idx = int(overlap_start - render_start)
+    asset_lookup = getattr(project, "asset_for_source_path", None)
+    asset = asset_lookup(getattr(clip, "source_path", "") or "") if callable(asset_lookup) else None
+    source_fps = _coerce_float(getattr(asset, "fps", 0.0), 0.0) if asset else 0.0
+    scene_fps = _coerce_float(source_info.get("scene_fps"), effective_scene_fps(project, scene))
+    if not math.isfinite(scene_fps) or scene_fps <= 0:
+        scene_fps = effective_scene_fps(project, scene)
+    rate_ratio = source_fps / scene_fps if math.isfinite(source_fps) and source_fps > 0 else 1.0
+    native_frame_count = max(0, _coerce_int(getattr(asset, "frame_count", 0), 0)) if asset else 0
     ref.update({
         "has_driver": 1,
         "clip": _clip_to_dict(clip),
@@ -451,6 +495,8 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
         "overlap_local_idx": local_idx,
         "driver_idx": local_idx,
         "strength": _coerce_float(getattr(clip, "strength", 1.0), 1.0),
+        "rate_ratio": rate_ratio,
+        "native_frame_count": native_frame_count,
     })
     return ref
 
@@ -488,6 +534,8 @@ def decode_driver_ref(driver_ref) -> dict[str, Any]:
         overlap_len,
         width,
         height,
+        rate_ratio=_coerce_float(ref.get("rate_ratio"), 1.0),
+        native_frame_count=_coerce_int(ref.get("native_frame_count"), 0),
     )
     return {
         "images": images,

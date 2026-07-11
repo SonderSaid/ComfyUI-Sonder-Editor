@@ -749,6 +749,13 @@ function normalizePromptTemplates(templates) {
             id: String(raw.id || `prompt-template-${index}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`),
             name,
             global: String(raw.global ?? ""),
+            // New templates capture their authoring FPS so section endpoints
+            // can preserve seconds when applied to a scene at another rate.
+            // Legacy templates have no rate metadata and retain frame-exact
+            // behavior via the 0 sentinel.
+            source_fps: Number.isFinite(Number(raw.source_fps)) && Number(raw.source_fps) > 0
+                ? Number(raw.source_fps)
+                : 0,
             sections,
         });
     }

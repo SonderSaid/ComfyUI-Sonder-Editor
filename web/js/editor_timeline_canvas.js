@@ -747,7 +747,11 @@ export function _drawClips(host, ctx, width) {
                         const destH = videoH - 4;
                         // Scale each strip frame to fill track height, preserving aspect ratio
                         const tileW = Math.max(1, Math.round(strip.frameWidth * destH / strip.img.naturalHeight));
-                        const totalSourceFrames = clipAsset.frame_count || 1;
+                        // Strip columns span the whole native file, while clip
+                        // source offsets are persisted in scene-frame units.
+                        // Use the full media duration in that same unit space;
+                        // clip.total_source_frames is only the split segment extent.
+                        const totalSourceFrames = host._mediaTimelineFrames(clipAsset);
                         const srcIn = clip.source_in_frame || 0;
                         const srcOut = clip.source_out_frame || totalSourceFrames;
                         // Tile frames across the clip width

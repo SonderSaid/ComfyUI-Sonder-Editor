@@ -2552,7 +2552,7 @@ export function createViewportSurface(options = {}) {
             if (!stillRelevant()) return null;
             await waitForMediaReady(video, 2, 1500);
             if (!stillRelevant()) return null;
-            const targetTime = sourceFrameTime(targetSourceFrame);
+            const targetTime = clampMediaTargetTime(video, sourceFrameTime(targetSourceFrame));
             entry.targetTime = targetTime;
             const sought = await seekMedia(video, targetTime, {
                 tolerance: prebufferTargetTimeTolerance(),
@@ -2593,7 +2593,7 @@ export function createViewportSurface(options = {}) {
         });
         if (!prepared) return null;
         if (!stillCurrent()) return null;
-        const targetTime = entry.targetTime ?? sourceFrameTime(targetSourceFrame);
+        const targetTime = clampMediaTargetTime(video, entry.targetTime ?? sourceFrameTime(targetSourceFrame));
         entry.ready = (video.readyState || 0) >= 2 && isMediaAtTarget(video, targetTime, prebufferTargetTimeTolerance());
         if (entry.ready) {
             publishPrebufferEntryReady(entry, layer, targetFrame, entry.readyPublishedFrom || "load-complete");
@@ -2607,7 +2607,11 @@ export function createViewportSurface(options = {}) {
     function prebufferEntryMediaAtTarget(entry, targetTime) {
         if (!entry?.video || entry.video.error) return false;
         if (entry.video.seeking || (entry.video.readyState || 0) < 2) return false;
-        return isMediaAtTarget(entry.video, targetTime, prebufferTargetTimeTolerance());
+        return isMediaAtTarget(
+            entry.video,
+            clampMediaTargetTime(entry.video, targetTime),
+            prebufferTargetTimeTolerance(),
+        );
     }
 
     function publishPrebufferEntryReady(entry, layer, frame, source = "media-state") {
@@ -4953,7 +4957,11 @@ export function createViewportSurface(options = {}) {
         if (!active?.video || !layer?.clip) return false;
         if (active.layerKey !== layer.key || active.sourcePath !== layer.clip.source_path) return false;
         if (active.video.seeking || (active.video.readyState || 0) < 2) return false;
-        return isMediaAtTarget(active.video, clipSourceTime(layer, frame), tolerance);
+        return isMediaAtTarget(
+            active.video,
+            clampMediaTargetTime(active.video, clipSourceTime(layer, frame)),
+            tolerance,
+        );
     }
 
     function isActiveVideoDrawable(active, layer, frame) {

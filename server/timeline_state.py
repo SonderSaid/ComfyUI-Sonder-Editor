@@ -1,4 +1,5 @@
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -138,6 +139,60 @@ class Asset:
             trashed_at=data.get("trashed_at", ""),
             trash_previous_folder=data.get("trash_previous_folder", ""),
         )
+
+
+def effective_scene_fps(project, scene) -> float:
+    """Return the scene's effective timeline rate with a safe legacy fallback."""
+    try:
+        scene_fps = float(getattr(scene, "fps", 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        scene_fps = 0.0
+    try:
+        project_fps = float(getattr(project, "fps", 24.0) or 24.0)
+    except (TypeError, ValueError, OverflowError):
+        project_fps = 24.0
+    fps = scene_fps if math.isfinite(scene_fps) and scene_fps > 0 else project_fps
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 24.0
+    return max(0.001, fps)
+
+
+def _half_up(value: float) -> int:
+    return int(math.floor(float(value) + 0.5))
+
+
+def media_timeline_frames(asset: Asset, fps: float) -> int:
+    """Return a media asset's duration in effective-scene frame units."""
+    asset_type = str(getattr(asset, "asset_type", "") or "")
+    if asset_type not in {"video", "audio"}:
+        return 0
+    try:
+        timeline_fps = float(fps)
+    except (TypeError, ValueError, OverflowError):
+        timeline_fps = 0.0
+    if not math.isfinite(timeline_fps) or timeline_fps <= 0:
+        timeline_fps = 24.0
+
+    try:
+        duration_sec = float(getattr(asset, "duration_sec", 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        duration_sec = 0.0
+    if math.isfinite(duration_sec) and duration_sec > 0:
+        return max(0, _half_up(duration_sec * timeline_fps))
+
+    if asset_type == "video":
+        try:
+            frame_count = int(float(getattr(asset, "frame_count", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            frame_count = 0
+        try:
+            source_fps = float(getattr(asset, "fps", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            source_fps = 0.0
+        if frame_count > 0 and math.isfinite(source_fps) and source_fps > 0:
+            return max(0, _half_up(frame_count * timeline_fps / source_fps))
+        return max(0, frame_count)
+    return 0
 
 
 def _normalize_asset_relpath(path: str) -> str:
@@ -841,6 +896,91 @@ class AudioTrack:
             muted=data.get("muted", False),
             lane_index=data.get("lane_index", 0),
         )
+
+
+def retime_scene_geometry(scene: Scene, old_fps: float, new_fps: float) -> None:
+    """Preserve scene time while changing its effective frame rate.
+
+    Persisted timeline/source geometry is expressed in scene-time frame units,
+    so every absolute endpoint follows the same half-up scale.
+    """
+    old_rate = float(old_fps)
+    new_rate = float(new_fps)
+    if not math.isfinite(old_rate) or old_rate <= 0:
+        raise ValueError("old_fps must be finite and positive")
+    if not math.isfinite(new_rate) or new_rate <= 0:
+        raise ValueError("new_fps must be finite and positive")
+    if old_rate == new_rate:
+        return
+    scale = new_rate / old_rate
+
+    def scaled(value) -> int:
+        return _half_up(int(value or 0) * scale)
+
+    old_duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+    if old_duration > 0:
+        scene.duration_frames = max(1, scaled(old_duration))
+
+    for item in [*(getattr(scene, "clips", []) or []), *(getattr(scene, "audio_tracks", []) or [])]:
+        old_origin = int(getattr(item, "source_origin_frame", 0) or 0)
+        old_total = max(0, int(getattr(item, "total_source_frames", 0) or 0))
+        for field_name in (
+            "timeline_start_frame",
+            "timeline_end_frame",
+            "source_in_frame",
+            "source_out_frame",
+            "source_origin_frame",
+        ):
+            if hasattr(item, field_name):
+                setattr(item, field_name, scaled(getattr(item, field_name, 0)))
+        item.total_source_frames = max(0, scaled(old_origin + old_total) - scaled(old_origin))
+        item.timeline_end_frame = max(
+            int(item.timeline_start_frame) + 1,
+            int(item.timeline_end_frame),
+        )
+
+    # Preserve the last-frame sentinel. For ordinary guides, process original
+    # time order so the earlier guide keeps a rounded collision frame.
+    guides = list(getattr(scene, "guide_frames", []) or [])
+    ordinary_guides = [
+        (index, guide, int(getattr(guide, "frame_index", 0) or 0))
+        for index, guide in enumerate(guides)
+        if int(getattr(guide, "frame_index", 0) or 0) >= 0
+    ]
+    ordinary_guides.sort(key=lambda entry: (entry[2], entry[0]))
+    occupied = set()
+    max_guide_frame = max(0, int(getattr(scene, "duration_frames", 0) or 0) - 1)
+    for _index, guide, old_frame in ordinary_guides:
+        frame = scaled(old_frame)
+        if int(getattr(scene, "duration_frames", 0) or 0) > 0:
+            frame = min(max_guide_frame, max(0, frame))
+        while frame in occupied and frame < max_guide_frame:
+            frame += 1
+        if frame in occupied:
+            # Saturated edge-case fallback: preserve uniqueness when an earlier
+            # collision chain reaches the scene tail.
+            frame = next((candidate for candidate in range(max_guide_frame + 1) if candidate not in occupied), frame)
+        guide.frame_index = frame
+        occupied.add(frame)
+
+    sections = list(getattr(scene, "prompt_sections", []) or [])
+    sections.sort(key=lambda section: (int(getattr(section, "start_frame", 0) or 0), int(getattr(section, "end_frame", 0) or 0)))
+    previous_end = 0
+    for section in sections:
+        start = max(scaled(getattr(section, "start_frame", 0)), previous_end)
+        end = max(start + 1, scaled(getattr(section, "end_frame", 0)))
+        section.start_frame = start
+        section.end_frame = end
+        previous_end = end
+    scene.prompt_sections = sections
+
+    for selection in getattr(scene, "saved_selections", []) or []:
+        if not isinstance(selection, dict):
+            continue
+        if "start" in selection:
+            selection["start"] = scaled(selection.get("start", 0))
+        if "end" in selection:
+            selection["end"] = scaled(selection.get("end", 0))
 
 
 # ---------------------------------------------------------------------------

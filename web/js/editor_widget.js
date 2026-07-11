@@ -1362,36 +1362,71 @@ export class EditorWidget {
 
     async _updateSceneFps(fps) {
         if (!this.activeScene || !this.projectDir) return;
-        const sceneRef = this.activeScene;
+        if (this._fpsUpdatePending) {
+            this._syncSceneFpsControl();
+            return;
+        }
+        this._fpsUpdatePending = true;
+        fps = Math.max(0, Number(fps) || 0);
         const sceneId = this.activeSceneId;
+        const oldEffectiveFps = Math.max(0.001, Number(this._effectiveFps) || 24);
+        const newEffectiveFps = Math.max(0.001, fps > 0 ? fps : (this.fps || 24));
+        const scale = newEffectiveFps / oldEffectiveFps;
+        const previousState = {
+            playhead: this.playhead,
+            selectionStart: this.selectionStart,
+            selectionEnd: this.selectionEnd,
+            scrollX: this.scrollX,
+            dragStartFrame: this._dragStartFrame,
+        };
+        const reconcileRetimedScene = (result) => {
+            const handled = this._reconcileActiveSceneFromMutation(result, { reason: "scene fps" });
+            if (!handled || result?.payload?.scene?.scene_id !== sceneId || this.activeSceneId !== sceneId) {
+                return handled;
+            }
+            this.playhead = Math.round(previousState.playhead * scale);
+            this.selectionStart = Math.round(previousState.selectionStart * scale);
+            this.selectionEnd = Math.round(previousState.selectionEnd * scale);
+            this.scrollX = Math.round(previousState.scrollX * scale);
+            this._dragStartFrame = Math.round(previousState.dragStartFrame * scale);
+            this.totalFrames = this.activeScene?.duration_frames || DEFAULT_EDITOR_SETTINGS.projectDefaults.newSceneDuration;
+            this._clampTimelineStateToDuration();
+            this._clampScrollX();
+            this._syncSceneFpsControl();
+            this._updateViewportHeader();
+            this._refreshDurationInput();
+            this._refreshContextInputs();
+            this._refreshSelectionInputs();
+            if (this._itemEditorEl && this.selectedItem) this._showItemEditor();
+            this._renderTimeline();
+            this._renderViewportFrame();
+            this._updateToolbar();
+            this._updateTransportUI();
+            return true;
+        };
+        this._pushUndo("change fps");
         try {
             await this._runSceneMutation(
                 [{ type: "update_scene_fields", fields: { fps } }],
                 {
                     key: `scene:${sceneId}:fps`,
                     label: "scene fps",
-                    coalesce: true,
-                    refreshScenes: false,
+                    coalesce: false,
+                    reconcileFromResult: reconcileRetimedScene,
+                    failureTier: (error) => error?.code === "queue_jobs_pending" ? "warning" : "error",
+                    failureMessage: (error) => error?.code === "queue_jobs_pending"
+                        ? "Scene FPS change refused."
+                        : "Scene FPS change failed — timeline restored.",
+                    failureDetail: (error) => error?.code === "queue_jobs_pending"
+                        ? "This scene has pending or running queue jobs. Finish or clear them before changing FPS so their frozen frame ranges stay valid."
+                        : null,
                 }
             );
-            sceneRef.fps = fps;
-            if (this.activeScene === sceneRef && this.activeSceneId === sceneId) {
-                this._syncSceneFpsControl();
-                this._updateViewportHeader();
-                if (this._timecodeMode === "timecode") {
-                    this._refreshDurationInput();
-                    this._refreshContextInputs();
-                    if (this._itemEditorEl && this.selectedItem) {
-                        this._showItemEditor();
-                    }
-                }
-                this._renderTimeline();
-                this._renderViewportFrame();
-                this._updateToolbar();
-                this._updateTransportUI();
-            }
         } catch (e) {
+            this._discardLastUndo("change fps");
             console.warn("[Sonder] Failed to update scene FPS:", e);
+        } finally {
+            this._fpsUpdatePending = false;
         }
     }
 
@@ -2012,6 +2047,8 @@ export class EditorWidget {
         reconcileFromResult = null,
         refreshKeysOnError = null,
         failureMessage = null,
+        failureDetail = null,
+        failureTier = "error",
         invalidateQueueFetch = false,
     }) {
         // Flicker-audit fix #1 (2026-06-11): invalidate any in-flight scenes GET
@@ -2047,7 +2084,13 @@ export class EditorWidget {
                 // omission of onRetry — failure paths auto-resync to authoritative
                 // state, so a retry would re-issue stale intent; source-coalesced
                 // so a burst of failures yields one counted toast.
-                notifyError(failureMessage || `${label || "Project change"} failed — timeline restored.`, { source: "project-mutation-failed" });
+                const message = typeof failureMessage === "function"
+                    ? failureMessage(error)
+                    : (failureMessage || `${label || "Project change"} failed — timeline restored.`);
+                const tier = typeof failureTier === "function" ? failureTier(error) : failureTier;
+                const detail = typeof failureDetail === "function" ? failureDetail(error) : failureDetail;
+                const notify = tier === "warning" ? notifyWarning : notifyError;
+                notify(message, { source: "project-mutation-failed", detail: detail || null });
                 if (Array.isArray(refreshKeysOnError) && refreshKeysOnError.length) {
                     this._deferProjectBackedRefresh(refreshKeysOnError, `${label || key}_error`);
                 } else if (refreshScenes) {
@@ -2066,6 +2109,9 @@ export class EditorWidget {
         refreshScenes = true,
         reconcileFromResult = null,
         sceneId = "",
+        failureMessage = null,
+        failureDetail = null,
+        failureTier = "error",
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -2086,6 +2132,9 @@ export class EditorWidget {
             intent,
             refreshScenes,
             reconcileFromResult,
+            failureMessage,
+            failureDetail,
+            failureTier,
             run: async (queuedIntent) => {
                 return await this._runVersionedProjectMutation(
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
@@ -2824,6 +2873,20 @@ export class EditorWidget {
     get _effectiveFps() {
         const sceneFps = this.activeScene?.fps || 0;
         return sceneFps > 0 ? sceneFps : (this.fps || 24);
+    }
+
+    _mediaTimelineFrames(asset) {
+        const fps = Number(this._effectiveFps) || 24;
+        const duration = Number(asset?.duration_sec);
+        if (Number.isFinite(duration) && duration > 0) {
+            return Math.max(1, Math.round(duration * fps));
+        }
+        const frameCount = Math.max(0, parseInt(asset?.frame_count, 10) || 0);
+        const sourceFps = Number(asset?.fps);
+        if (frameCount > 0 && Number.isFinite(sourceFps) && sourceFps > 0) {
+            return Math.max(1, Math.round(frameCount * fps / sourceFps));
+        }
+        return Math.max(1, frameCount || 1);
     }
 
     get _effectiveSceneWidth() {
@@ -6947,7 +7010,7 @@ export class EditorWidget {
             }
             this._pushUndo("add driver");
             const assetObj = this._findAssetById(asset.asset_id);
-            const dropDuration = assetObj ? Math.max(1, assetObj.frame_count || 1) : 30;
+            const dropDuration = assetObj ? this._mediaTimelineFrames(assetObj) : 30;
             const dropEnd = frame + dropDuration;
             const tempClipId = `temp-driver-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
             this.activeScene.clips = this.activeScene.clips || [];
@@ -7024,7 +7087,7 @@ export class EditorWidget {
                 && (assetObjForZone?.has_audio === true || asset?.has_audio === true);
             const dropFps = this._effectiveFps;
             const dropFrames = asset.asset_type === "video"
-                ? Math.max(1, parseInt(assetObjForZone?.frame_count ?? asset.frame_count ?? 0, 10) || 30)
+                ? this._mediaTimelineFrames(assetObjForZone || asset)
                 : Math.max(1, Math.round((assetObjForZone?.duration_sec || asset.duration_sec || 1) * dropFps));
             const dropEndFrame = frame + dropFrames;
             const laneHasOverlap = (laneType, laneIndex) => {
@@ -7170,7 +7233,7 @@ export class EditorWidget {
                 // only for ruler-zone dual drops)
                 const assetObj = _findAsset(asset.asset_id);
                 droppedVideoHasAudio = dualDrop;
-                const frameCount = Math.max(1, parseInt(assetObj?.frame_count ?? asset.frame_count ?? 0, 10) || 30);
+                const frameCount = this._mediaTimelineFrames(assetObj || asset);
                 optimisticClipId = `temp-clip-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
                 const optimisticClip = {
                     clip_id: optimisticClipId,
@@ -7261,11 +7324,8 @@ export class EditorWidget {
                 // ONLY its extracted audio (zone-model rule); the backend derives
                 // the audio asset from the video.
                 const assetObj = _findAsset(asset.asset_id);
-                const fps = this._effectiveFps;
-                let durationFrames = Math.max(1, Math.round((assetObj?.duration_sec || asset.duration_sec || 1) * fps));
+                const durationFrames = this._mediaTimelineFrames(assetObj || asset);
                 if (audioFromVideo) {
-                    const videoFrames = parseInt(assetObj?.frame_count ?? asset.frame_count ?? 0, 10) || 0;
-                    if (videoFrames > 0) durationFrames = videoFrames;
                     droppedVideoHasAudio = true; // extraction registers a derived audio asset
                 }
                 optimisticAudioId = `temp-audio-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
@@ -8728,7 +8788,7 @@ export class EditorWidget {
     /** Replace the scene's prompt state with a history entry / template:
      *  ONE mutation request (deletes high-index-first, then creates, then the
      *  global text) so the apply is a single save and a single undo step. */
-    async _applyPromptSetup({ global: globalText, sections, extendDurationTo = 0 } = {}) {
+    async _applyPromptSetup({ global: globalText, sections, extendDurationTo = 0, source_fps: sourceFps = 0 } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
             notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
@@ -8746,14 +8806,24 @@ export class EditorWidget {
                 expected: { start_frame: current[i].start_frame, end_frame: current[i].end_frame },
             });
         }
+        const capturedFps = Number(sourceFps);
+        const targetFps = Math.max(0.001, Number(this._effectiveFps) || 24);
+        const timeScale = Number.isFinite(capturedFps) && capturedFps > 0
+            ? targetFps / capturedFps
+            : 1.0;
+        let previousEnd = 0;
         const nextSections = (sections || [])
             .filter((s) => (s?.end_frame || 0) > (s?.start_frame || 0))
+            .sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0))
             .map((s) => {
                 const channels = normalizeChannels(s.channels, s.prompt);
+                const startFrame = Math.max(previousEnd, Math.round((s.start_frame || 0) * timeScale));
+                const endFrame = Math.max(startFrame + 1, Math.round((s.end_frame || 0) * timeScale));
+                previousEnd = endFrame;
                 return {
                     prompt_id: s.prompt_id || this._newLocalItemId("prompt"),
-                    start_frame: s.start_frame || 0,
-                    end_frame: s.end_frame || 0,
+                    start_frame: startFrame,
+                    end_frame: endFrame,
                     channels,
                     prompt: composeSectionText(channels, false),
                     muted: !!s.muted,
@@ -8816,6 +8886,7 @@ export class EditorWidget {
             id: `pt-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`,
             name: trimmed,
             global: scene.prompt || "",
+            source_fps: Math.max(0.001, Number(this._effectiveFps) || 24),
             sections: (scene.prompt_sections || []).map((s) => ({
                 start_frame: s.start_frame || 0,
                 end_frame: s.end_frame || 0,
@@ -9789,6 +9860,16 @@ export class EditorWidget {
         }
         const dirName = this._projectDirName();
         const sourceFrame = Math.max(0, this.playhead - clip.timeline_start_frame + (clip.source_in_frame || 0));
+        const sourceAsset = this._getAssetForSourcePath(clip.source_path);
+        const sourceFps = Number(sourceAsset?.fps);
+        const rateRatio = Number.isFinite(sourceFps) && sourceFps > 0
+            ? sourceFps / Math.max(0.001, Number(this._effectiveFps) || 24)
+            : 1.0;
+        let backendSourceFrame = Math.floor((sourceFrame + 0.5) * rateRatio);
+        const nativeFrameCount = Math.max(0, parseInt(sourceAsset?.frame_count, 10) || 0);
+        if (nativeFrameCount > 0) {
+            backendSourceFrame = Math.min(nativeFrameCount - 1, Math.max(0, backendSourceFrame));
+        }
         const targetLongEdge = this._resolveGuideSnapshotTargetLongEdge(clip);
 
         try {
@@ -9834,7 +9915,7 @@ export class EditorWidget {
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         source_path: clip.source_path,
-                        frame_index: sourceFrame,
+                        frame_index: backendSourceFrame,
                         target_long_edge: targetLongEdge,
                     }),
                 });
@@ -9845,7 +9926,8 @@ export class EditorWidget {
                 asset = await extractResp.json();
                 console.debug?.("[Sonder] Guide captured via backend fallback", {
                     source_path: clip.source_path,
-                    source_frame: sourceFrame,
+                    source_frame: backendSourceFrame,
+                    scene_source_frame: sourceFrame,
                     target_long_edge: targetLongEdge,
                 });
                 notifyInfo("Captured via backend (viewport snapshot unavailable)");

@@ -411,3 +411,60 @@ console.log(JSON.stringify(root.style));
 
     tab_source = (root / "web" / "js" / "tab_entry.js").read_text(encoding="utf-8")
     assert "applyNativeControlTheme(document.documentElement);" in tab_source
+
+
+def test_timeline_fps_frontend_semantics_are_wired_at_all_boundaries():
+    root = Path(__file__).resolve().parents[1]
+    widget_source = (root / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    canvas_source = (root / "web" / "js" / "editor_timeline_canvas.js").read_text(encoding="utf-8")
+    viewport_source = (root / "web" / "js" / "viewport_surface.js").read_text(encoding="utf-8")
+
+    helper_start = widget_source.index("_mediaTimelineFrames(asset)")
+    helper_end = widget_source.index("get _effectiveSceneWidth()", helper_start)
+    helper_source = widget_source[helper_start:helper_end]
+    assert "Math.round(duration * fps)" in helper_source
+    assert "Math.round(frameCount * fps / sourceFps)" in helper_source
+    assert widget_source.count("this._mediaTimelineFrames(") >= 4
+
+    fps_start = widget_source.index("async _updateSceneFps(fps)")
+    fps_end = widget_source.index("_cycleScene(dir)", fps_start)
+    fps_source = widget_source[fps_start:fps_end]
+    assert '_pushUndo("change fps")' in fps_source
+    assert "reconcileFromResult: reconcileRetimedScene" in fps_source
+    assert "queue_jobs_pending" in fps_source
+    assert "Scene FPS change refused." in fps_source
+    assert "pending or running queue jobs" in fps_source
+    assert "if (this._fpsUpdatePending)" in fps_source
+    assert "coalesce: false" in fps_source
+    assert "refreshScenes: false" not in fps_source
+    assert '_setWidgetValue("selection_start"' in widget_source
+
+    assert "host._mediaTimelineFrames(clipAsset)" in canvas_source
+    filmstrip_start = canvas_source.index("host._mediaTimelineFrames(clipAsset)")
+    filmstrip_end = canvas_source.index("ctx.restore();", filmstrip_start)
+    assert "clip.total_source_frames" not in canvas_source[filmstrip_start:filmstrip_end]
+
+    guide_start = widget_source.index("async _addClipFrameToGuides(clip)")
+    guide_end = widget_source.index("async _deleteSelectedItems()", guide_start)
+    guide_source = widget_source[guide_start:guide_end]
+    assert "Math.floor((sourceFrame + 0.5) * rateRatio)" in guide_source
+    assert "frame_index: backendSourceFrame" in guide_source
+
+    prebuffer_start = viewport_source.index("async function loadPrebufferEntry")
+    prebuffer_end = viewport_source.index("function publishPrebufferEntryReady", prebuffer_start)
+    assert "clampMediaTargetTime(video" in viewport_source[prebuffer_start:prebuffer_end]
+    playback_start = viewport_source.index("function playbackVideoAtFrame")
+    playback_end = viewport_source.index("function isActiveVideoDrawable", playback_start)
+    assert "clampMediaTargetTime(active.video" in viewport_source[playback_start:playback_end]
+
+    settings_source = (root / "web" / "js" / "editor_settings.js").read_text(encoding="utf-8")
+    toast_source = (root / "web" / "js" / "editor_toast_stack.js").read_text(encoding="utf-8")
+    template_start = widget_source.index("async _applyPromptSetup(")
+    template_end = widget_source.index("_deletePromptTemplate(templateId)", template_start)
+    template_source = widget_source[template_start:template_end]
+    assert "source_fps: sourceFps" in template_source
+    assert "targetFps / capturedFps" in template_source
+    assert "Math.round((s.start_frame || 0) * timeScale)" in template_source
+    assert "source_fps: Math.max(0.001, Number(this._effectiveFps) || 24)" in template_source
+    assert "source_fps: Number.isFinite(Number(raw.source_fps))" in settings_source
+    assert 'el.title = [n.detail, "Hover to expand · right-click to copy"]' in toast_source

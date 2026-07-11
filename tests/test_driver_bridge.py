@@ -130,6 +130,46 @@ def test_driver_bridge_emits_selected_lane_segment(tmp_path, monkeypatch):
     assert float(images[0].max()) > 0.0
 
 
+def test_driver_ref_carries_rate_data_and_decode_resamples_to_scene_length(tmp_path, monkeypatch):
+    bridge, timeline_state, project, _scene = _make_project(
+        tmp_path,
+        monkeypatch,
+        lane_count=1,
+        clip_lane=0,
+    )
+    project.assets = [
+        timeline_state.Asset(
+            asset_id="driver-asset",
+            asset_type="video",
+            path=os.path.join("media", "driver.mp4"),
+            fps=30.0,
+            frame_count=100,
+            duration_sec=100 / 30.0,
+        )
+    ]
+    decoded_ranges = []
+
+    def fake_decode(_path, start, end, **_kwargs):
+        decoded_ranges.append((start, end))
+        for frame_no in range(start, end):
+            yield np.full((2, 2, 3), frame_no, dtype=np.uint8)
+
+    import numpy as np
+    monkeypatch.setattr(bridge, "decode_video_range", fake_decode)
+
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(project, driver_lane_index=0)
+    images, _frame_idx, _strength = bridge.SonderDriverBridge().execute(driver_ref)
+
+    assert has_driver == 1
+    assert driver_ref["rate_ratio"] == pytest.approx(30.0 / 24.0)
+    assert driver_ref["native_frame_count"] == 100
+    assert decoded_ranges == [(15, 19)]
+    assert tuple(images.shape) == (3, 4, 6, 3)
+    assert [float(images[index, 0, 0, 0]) for index in range(3)] == pytest.approx(
+        [15 / 255.0, 16 / 255.0, 18 / 255.0]
+    )
+
+
 def test_driver_bridge_missing_hidden_muted_and_override_states(tmp_path, monkeypatch):
     bridge, _timeline_state, project, scene = _make_project(
         tmp_path,
@@ -231,6 +271,16 @@ def test_driver_bridge_uses_queue_snapshot_by_ref_id(tmp_path, monkeypatch, queu
     _stub_decode(monkeypatch, bridge)
 
     (Path(project.project_dir) / "media" / "snapshot.mp4").write_bytes(b"snapshot")
+    project.assets = [
+        timeline_state.Asset(
+            asset_id="snapshot-asset",
+            asset_type="video",
+            path=os.path.join("media", "snapshot.mp4"),
+            fps=30.0,
+            frame_count=100,
+            duration_sec=100 / 30.0,
+        )
+    ]
     scene.clips = []
     snapshot_clip = timeline_state.ClipReference(
         clip_id="snapshot-driver",
@@ -247,6 +297,7 @@ def test_driver_bridge_uses_queue_snapshot_by_ref_id(tmp_path, monkeypatch, queu
         scene_id="scene-1",
         selection_start=4,
         selection_end=8,
+        scene_fps=30.0,
         params={"snapshot_version": 1},
         driver_clip_snapshots=[snapshot_clip.to_dict()],
         driver_lane_count=1,
@@ -271,6 +322,7 @@ def test_driver_bridge_uses_queue_snapshot_by_ref_id(tmp_path, monkeypatch, queu
     assert frame_idx == 0
     assert strength == pytest.approx(0.7)
     assert has_driver == 1
+    assert driver_ref["rate_ratio"] == pytest.approx(1.0)
 
 
 def test_driver_bridge_decode_failure_for_effective_clip_raises(tmp_path, monkeypatch):

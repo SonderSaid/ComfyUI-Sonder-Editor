@@ -75,6 +75,7 @@ from .session_registry import (
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
     ClipReference, LaneConfig, GenerationJob, apply_color_metadata, classify_asset_path,
+    effective_scene_fps, media_timeline_frames, retime_scene_geometry,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
@@ -501,14 +502,7 @@ def _valid_source_frame_count(asset: Asset) -> int:
 
 
 def _valid_audio_duration_frames(asset: Asset, fps: float) -> int:
-    duration_sec = getattr(asset, "duration_sec", 0.0)
-    if not _finite_positive_number(duration_sec):
-        return 0
-    try:
-        frames = int(round(float(duration_sec) * float(fps or 24.0)))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return frames if frames > 0 else 0
+    return media_timeline_frames(asset, fps) if getattr(asset, "asset_type", "") == "audio" else 0
 
 
 def _asset_file_size(source_path: str) -> int:
@@ -593,6 +587,19 @@ def _mutation_error(message: str, status: int = 400, code: str = "invalid_projec
 
 def _mutation_json_error(exc: ProjectMutationRequestError) -> web.Response:
     return web.json_response({"error": exc.message, "code": exc.code}, status=exc.status)
+
+
+def _require_scene_queue_idle(project: TimelineProject, scene_id: str) -> None:
+    for job in getattr(project, "generation_queue", []) or []:
+        if str(getattr(job, "scene_id", "") or "") != str(scene_id or ""):
+            continue
+        status = str(getattr(job, "status", "pending") or "pending").lower()
+        if status in {"pending", "running"}:
+            _mutation_error(
+                "Finish or clear queued jobs for this scene before changing FPS",
+                409,
+                "queue_jobs_pending",
+            )
 
 
 def _mutation_int(value, field_name: str, default: int | None = None) -> int:
@@ -1356,7 +1363,7 @@ def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int, apply_
     }
 
 
-def _apply_scene_fields(scene: Scene, fields: dict) -> None:
+def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) -> None:
     if not isinstance(fields, dict):
         _mutation_error("update_scene_fields requires fields", 400)
     if "name" in fields:
@@ -1373,7 +1380,16 @@ def _apply_scene_fields(scene: Scene, fields: dict) -> None:
     if "height" in fields:
         scene.height = max(0, int(fields["height"]))
     if "fps" in fields:
-        scene.fps = max(0.0, float(fields["fps"]))
+        old_fps = effective_scene_fps(project, scene)
+        new_scene_fps = max(0.0, float(fields["fps"]))
+        previous_scene_fps = scene.fps
+        scene.fps = new_scene_fps
+        new_fps = effective_scene_fps(project, scene)
+        scene.fps = previous_scene_fps
+        if new_fps != old_fps:
+            _require_scene_queue_idle(project, scene.scene_id)
+            retime_scene_geometry(scene, old_fps, new_fps)
+        scene.fps = new_scene_fps
     if "video_lane_count" in fields:
         _set_scene_lane_count(scene, "video", max(1, int(fields["video_lane_count"])))
     if "motion_driver_lane_count" in fields:
@@ -1635,9 +1651,11 @@ def _apply_replace_clip_source(project: TimelineProject, scene: Scene, clip_id: 
     clip = _find_clip(scene, clip_id)
     _require_clip_unlocked(scene, clip)
     asset = _resolve_replacement_asset(project, asset_id, "video")
-    frame_count = _valid_source_frame_count(asset)
+    if _valid_source_frame_count(asset) <= 0 and not _finite_positive_number(getattr(asset, "duration_sec", 0.0)):
+        _mutation_error("Replacement video has no usable duration", 400, "invalid_source_asset")
+    frame_count = media_timeline_frames(asset, effective_scene_fps(project, scene))
     if frame_count <= 0:
-        _mutation_error("Replacement video has no frame count", 400, "invalid_source_asset")
+        _mutation_error("Replacement video has no usable duration", 400, "invalid_source_asset")
 
     source_in, source_out, visible_duration = _replacement_source_range(
         clip.timeline_start_frame,
@@ -1664,7 +1682,7 @@ def _apply_replace_audio_source(project: TimelineProject, scene: Scene, track_id
     track = _find_audio_track(scene, track_id)
     _require_audio_unlocked(scene, track)
     asset = _resolve_replacement_asset(project, asset_id, "audio")
-    duration_frames = _valid_audio_duration_frames(asset, getattr(project, "fps", 24.0) or 24.0)
+    duration_frames = _valid_audio_duration_frames(asset, effective_scene_fps(project, scene))
     if duration_frames <= 0:
         _mutation_error("Replacement audio has no duration", 400, "invalid_source_asset")
 
@@ -2001,7 +2019,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         _mutation_error("Mutation operation must be an object", 400)
     op_type = str(op.get("type", ""))
     if op_type == "update_scene_fields":
-        _apply_scene_fields(scene, op.get("fields", {}))
+        _apply_scene_fields(project, scene, op.get("fields", {}))
         return {"type": op_type}
     if op_type == "update_lane_configs":
         _apply_lane_configs(scene, op.get("fields", {}))
@@ -3182,7 +3200,7 @@ def _sync_media_folder(
         changed = apply_color_metadata(asset, metadata) or changed
         if metadata.get("has_audio"):
             logger.info("Detected audio in video: %s", asset.name)
-        repaired_video_assets[rel_path] = int(metadata["frame_count"])
+        repaired_video_assets[rel_path] = asset
         changed = _mark_probe_state(asset, signature, has_audio=True) or changed
 
     # One-time color backfill for video assets that predate color probing and
@@ -3231,7 +3249,7 @@ def _sync_media_folder(
         dur = _get_audio_duration(filepath)
         if dur and dur > 0:
             asset.duration_sec = dur
-            repaired_assets[_normalize_project_relpath(asset.path)] = dur
+            repaired_assets[_normalize_project_relpath(asset.path)] = asset
             changed = True
             logger.info("Repaired audio duration: %.2fs (%s)", dur, asset.name)
             changed = _mark_probe_state(asset, signature, duration=True) or changed
@@ -3244,13 +3262,13 @@ def _sync_media_folder(
 
     # Repair audio tracks with 1-frame duration (caused by previous 0-duration bug)
     if repaired_assets:
-        fps = project.fps or 24.0
         for scene in project.scenes:
+            fps = effective_scene_fps(project, scene)
             for track in scene.audio_tracks:
                 duration_frames = track.timeline_end_frame - track.timeline_start_frame
                 track_source = _normalize_project_relpath(getattr(track, "source_path", "") or "")
                 if duration_frames <= 1 and track_source in repaired_assets:
-                    new_duration = int(round(repaired_assets[track_source] * fps))
+                    new_duration = media_timeline_frames(repaired_assets[track_source], fps)
                     if new_duration > 1:
                         track.timeline_end_frame = track.timeline_start_frame + new_duration
                         track.total_source_frames = max(track.total_source_frames or 0, new_duration)
@@ -3261,8 +3279,11 @@ def _sync_media_folder(
         for scene in project.scenes:
             for clip in scene.clips:
                 clip_source = _normalize_project_relpath(getattr(clip, "source_path", "") or "")
-                source_frames = repaired_video_assets.get(clip_source)
-                if not source_frames:
+                repaired_asset = repaired_video_assets.get(clip_source)
+                if not repaired_asset:
+                    continue
+                source_frames = media_timeline_frames(repaired_asset, effective_scene_fps(project, scene))
+                if source_frames <= 0:
                     continue
                 duration_frames = int(getattr(clip, "timeline_end_frame", 0) or 0) - int(getattr(clip, "timeline_start_frame", 0) or 0)
                 if duration_frames > 0 and int(getattr(clip, "source_out_frame", 0) or 0) > 0 and int(getattr(clip, "total_source_frames", 0) or 0) > 0:
@@ -4780,6 +4801,7 @@ if routes is not None:
             body = await request.json()
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
+
         if not isinstance(body, dict) or not isinstance(body.get("allow_external_project_links"), bool):
             return _json_error("allow_external_project_links must be a boolean", 400)
         try:
@@ -6143,6 +6165,8 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
+        old_effective_fps = effective_scene_fps(project, scene)
+
         if "name" in body:
             scene.name = body["name"]
         if "duration_frames" in body:
@@ -6186,7 +6210,18 @@ if routes is not None:
         if "height" in body:
             scene.height = int(body["height"])
         if "fps" in body:
-            scene.fps = float(body["fps"])
+            new_scene_fps = max(0.0, float(body["fps"]))
+            previous_scene_fps = scene.fps
+            scene.fps = new_scene_fps
+            new_effective_fps = effective_scene_fps(project, scene)
+            scene.fps = previous_scene_fps
+            try:
+                if new_effective_fps != old_effective_fps:
+                    _require_scene_queue_idle(project, scene.scene_id)
+                    retime_scene_geometry(scene, old_effective_fps, new_effective_fps)
+            except ProjectMutationRequestError as e:
+                return _mutation_json_error(e)
+            scene.fps = new_scene_fps
         # Auto-pad configs to match lane counts
         while len(scene.video_lane_configs) < scene.video_lane_count:
             scene.video_lane_configs.append(LaneConfig())
@@ -6801,8 +6836,9 @@ if routes is not None:
         if role == "motion_driver" and asset.asset_type != "video":
             return _json_error("Driver clips require video assets", 400)
         start_frame = int(body.get("timeline_start_frame", 0))
-        frame_count = _valid_source_frame_count(asset)
-        if asset.asset_type == "video" and frame_count <= 0:
+        native_frame_count = _valid_source_frame_count(asset)
+        frame_count = media_timeline_frames(asset, effective_scene_fps(project, scene))
+        if asset.asset_type == "video" and native_frame_count <= 0 and not _finite_positive_number(getattr(asset, "duration_sec", 0.0)):
             return _json_error("Video asset has invalid duration metadata. Refresh assets or re-import the file.", 400)
         frame_count = frame_count or 1
         end_frame = start_frame + frame_count
@@ -6849,10 +6885,9 @@ if routes is not None:
             try:
                 audio_asset = await asyncio.to_thread(_prepare_video_audio_asset, project, asset)
                 if audio_asset:
-                    fps = project.fps or 24.0
-                    audio_frames = _valid_audio_duration_frames(audio_asset, fps)
-                    if audio_frames <= 0:
+                    if _valid_audio_duration_frames(audio_asset, effective_scene_fps(project, scene)) <= 0:
                         raise ValueError("Extracted audio has invalid duration metadata")
+                    audio_frames = frame_count
                     audio_track = AudioTrack(
                         source_path=audio_asset.path,
                         timeline_start_frame=start_frame,
@@ -7030,7 +7065,7 @@ if routes is not None:
 
         start_frame = int(body.get("timeline_start_frame", 0))
         # Calculate duration in frames from asset duration
-        fps = project.fps or 24.0
+        fps = effective_scene_fps(project, scene)
         duration_frames = _valid_audio_duration_frames(asset, fps)
         if asset.asset_type != "audio" or duration_frames <= 0:
             return _json_error("Audio asset has invalid duration metadata. Refresh assets or re-import the file.", 400)

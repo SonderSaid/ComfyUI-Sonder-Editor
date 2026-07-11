@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import uuid
 
@@ -18,11 +19,11 @@ from .media_helpers import (
     run_ffmpeg_command,
 )
 from .path_security import resolve_existing_project_path, resolve_project_path
-from .timeline_state import Scene, TimelineProject
+from .timeline_state import Scene, TimelineProject, effective_scene_fps
 
 # Composited render caches are invalidated when color handling changes;
 # bump this salt alongside any change to the decode color pipeline.
-_RENDER_CACHE_COLOR_VERSION = "cm1"
+_RENDER_CACHE_COLOR_VERSION = "cm2"
 
 
 def _default_video_capture(path: str):
@@ -95,6 +96,7 @@ def iter_scene_frames(
     render_end = max(render_start, int(end_frame or render_start))
 
     visible_clips = _visible_render_clips(scene)
+    scene_fps = effective_scene_fps(project, scene)
     captures = {}
 
     def get_cap(source_path: str):
@@ -107,7 +109,21 @@ def iter_scene_frames(
             if cap.isOpened():
                 asset = project.asset_for_source_path(source_path)
                 interpretation = resolve_source_color_interpretation(asset, abs_path)
-                captures[abs_path] = (cap, color_correction_for_interpretation(interpretation))
+                try:
+                    source_fps = float(getattr(asset, "fps", 0.0) or 0.0) if asset else 0.0
+                except (TypeError, ValueError, OverflowError):
+                    source_fps = 0.0
+                rate_ratio = source_fps / scene_fps if math.isfinite(source_fps) and source_fps > 0 else 1.0
+                try:
+                    native_frame_count = int(float(getattr(asset, "frame_count", 0) or 0)) if asset else 0
+                except (TypeError, ValueError, OverflowError):
+                    native_frame_count = 0
+                captures[abs_path] = (
+                    cap,
+                    color_correction_for_interpretation(interpretation),
+                    rate_ratio,
+                    max(0, native_frame_count),
+                )
             else:
                 logger.warning("Cannot open video: %s", abs_path)
                 return None
@@ -129,8 +145,11 @@ def iter_scene_frames(
                 capture_entry = get_cap(clip.source_path)
                 if capture_entry is None:
                     continue
-                cap, color_affine = capture_entry
-                source_frame = clip.source_in_frame + (frame_index - clip.timeline_start_frame)
+                cap, color_affine, rate_ratio, native_frame_count = capture_entry
+                source_units = clip.source_in_frame + (frame_index - clip.timeline_start_frame)
+                source_frame = int(math.floor((source_units + 0.5) * rate_ratio))
+                if native_frame_count > 0:
+                    source_frame = min(native_frame_count - 1, max(0, source_frame))
                 cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
                 ok, frame_bgr = cap.read()
                 if not ok:
@@ -158,7 +177,7 @@ def iter_scene_frames(
                     )
             yield np.ascontiguousarray(canvas)
     finally:
-        for cap, _affine in captures.values():
+        for cap, _affine, _rate_ratio, _native_frame_count in captures.values():
             cap.release()
 
 
@@ -263,18 +282,13 @@ def render_scene_frames(
     return tensor
 
 
-def _effective_scene_fps(project: TimelineProject, scene: Scene) -> float:
-    fps = float(getattr(scene, "fps", 0.0) or getattr(project, "fps", 24.0) or 24.0)
-    return max(0.001, fps)
-
-
 def _audio_contributors(
     project: TimelineProject,
     scene: Scene,
     start_frame: int,
     end_frame: int,
 ) -> list[dict]:
-    fps = _effective_scene_fps(project, scene)
+    fps = effective_scene_fps(project, scene)
     hidden_lanes = {
         idx
         for idx, cfg in enumerate(getattr(scene, "audio_lane_configs", []) or [])
@@ -317,7 +331,7 @@ def mix_scene_audio_to_wav(
 ) -> list[dict]:
     """Mix scene audio tracks into a stereo 44.1kHz WAV for [start_frame, end_frame)."""
     _check_cancel(cancel_event)
-    fps = _effective_scene_fps(project, scene)
+    fps = effective_scene_fps(project, scene)
     duration_sec = max(0.001, (max(start_frame, end_frame) - start_frame) / fps)
     contributors = _audio_contributors(project, scene, start_frame, end_frame)
     os.makedirs(os.path.dirname(output_wav), exist_ok=True)

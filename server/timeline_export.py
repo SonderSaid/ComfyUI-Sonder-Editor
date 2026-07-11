@@ -49,7 +49,10 @@ from .timeline_renderer import (
     iter_scene_frames,
     mix_scene_audio_to_wav,
 )
-from .timeline_state import Asset, AudioTrack, ClipReference, LaneConfig, Scene, TimelineProject
+from .timeline_state import (
+    Asset, AudioTrack, ClipReference, LaneConfig, Scene, TimelineProject,
+    effective_scene_fps,
+)
 
 
 def _transient_temp_dir() -> str:
@@ -206,10 +209,6 @@ def _ensure_asset_folder(project: TimelineProject, folder: str) -> None:
         project.metadata["asset_folders"] = sorted(existing)
 
 
-def _effective_scene_fps(project: TimelineProject, scene: Scene) -> float:
-    return max(0.001, float(getattr(scene, "fps", 0.0) or project.fps or 24.0))
-
-
 def _scene_resolution(project: TimelineProject, scene: Scene) -> tuple[int, int]:
     width, height = project.resolution
     if getattr(scene, "width", 0) > 0:
@@ -295,6 +294,7 @@ def _video_sources(project: TimelineProject, scene: Scene, start: int, end: int)
             continue
         asset = next((item for item in project.assets if item.path == clip.source_path), None)
         sources.append({
+            "units": "scene_frames",
             "asset_id": getattr(asset, "asset_id", "") if asset else "",
             "track_index": int(getattr(clip, "track_index", 0) or 0),
             "source_in": int(getattr(clip, "source_in_frame", 0) or 0) + (overlap_start - int(clip.timeline_start_frame or 0)),
@@ -357,7 +357,7 @@ def _editor_export_metadata(
         "scene_id": scene.scene_id,
         "scene_name": scene.name,
         "range": {"start": start, "end": end},
-        "fps": _effective_scene_fps(project, scene),
+        "fps": effective_scene_fps(project, scene),
         "resolution": {"width": width, "height": height},
         "preset": preset_id,
         "custom_encode": dict(custom_options) if custom_options else None,
@@ -509,7 +509,7 @@ def _place_embedded_audio_take(
             cleanup_paths.remove(audio_abs_path)
         return None
 
-    fps = max(0.001, float(getattr(video_asset, "fps", 0.0) or project.fps or 24.0))
+    fps = effective_scene_fps(project, scene)
     total_frames = max(1, end - start)
     audio_asset = _register_export_asset(
         project,
@@ -725,7 +725,7 @@ class TimelineExportManager:
                 raise ValueError(f"Scene not found: {job.request['scene_id']}")
             start = int(job.request["range"]["start"])
             end = int(job.request["range"]["end"])
-            fps = _effective_scene_fps(project, scene)
+            fps = effective_scene_fps(project, scene)
             preset_id = job.request["save_preset"]
             custom_options = job.request["custom_options"]
             include_video = bool(job.request["include_video"])
