@@ -47,6 +47,20 @@ def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
 
 
+def _apply_scene_operations(route_module, monkeypatch, project, scene_id, operations, saves):
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda saved_project: saves.append(saved_project))
+    handler = _route_handler(
+        route_module,
+        "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/mutations",
+    )
+    return asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": scene_id},
+        body={"operations": operations},
+    )))
+
+
 def test_project_version_header_middleware_attaches_loaded_project_version(monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project = TimelineProject(project_dir="", name="Project")
@@ -155,7 +169,7 @@ def test_scene_mutation_remove_lane_is_single_save_and_reindexes(monkeypatch, tm
     scene.video_lane_configs = [LaneConfig(name="V0"), LaneConfig(name="V1"), LaneConfig(name="V2")]
     scene.clips = [
         ClipReference(clip_id="clip-0", timeline_start_frame=0, timeline_end_frame=10, track_index=0),
-        ClipReference(clip_id="clip-1", timeline_start_frame=0, timeline_end_frame=10, track_index=1),
+        ClipReference(clip_id="clip-1", timeline_start_frame=10, timeline_end_frame=20, track_index=1),
         ClipReference(clip_id="clip-2", timeline_start_frame=0, timeline_end_frame=10, track_index=2),
     ]
     project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
@@ -1185,6 +1199,303 @@ def test_queue_update_retries_stale_version_and_preserves_newer_jobs(monkeypatch
         "job-a": "completed",
         "job-b": "pending",
     }
+
+
+def test_scene_mutation_consolidates_video_and_removes_only_vacated_lanes(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 5
+    scene.video_lane_configs = [LaneConfig(name=f"V{index}") for index in range(5)]
+    scene.audio_tracks = [AudioTrack(track_id="linked-audio", timeline_start_frame=0, timeline_end_frame=10)]
+    scene.clips = [
+        ClipReference(clip_id="clip-a", timeline_start_frame=0, timeline_end_frame=10, track_index=1),
+        ClipReference(clip_id="clip-b", timeline_start_frame=10, timeline_end_frame=20, track_index=3),
+        ClipReference(clip_id="target-adjacent", timeline_start_frame=20, timeline_end_frame=30, track_index=3),
+        ClipReference(clip_id="source-survivor", timeline_start_frame=40, timeline_end_frame=50, track_index=4),
+    ]
+    scene.linked_item_groups = [{
+        "group_id": "take-a",
+        "items": [{"type": "clip", "id": "clip-a"}, {"type": "audio", "id": "linked-audio"}],
+    }]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "consolidate_items",
+        "lane_type": "video",
+        "item_ids": ["clip-a", "clip-b"],
+        "target_lane": 3,
+        "remove_vacated_lanes": True,
+    }], saves)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert scene.video_lane_count == 4
+    assert [config.name for config in scene.video_lane_configs] == ["V0", "V2", "V3", "V4"]
+    assert {clip.clip_id: clip.track_index for clip in scene.clips} == {
+        "clip-a": 2,
+        "clip-b": 2,
+        "target-adjacent": 2,
+        "source-survivor": 3,
+    }
+    assert scene.linked_item_groups == [{
+        "group_id": "take-a",
+        "items": [{"type": "clip", "id": "clip-a"}, {"type": "audio", "id": "linked-audio"}],
+    }]
+    result = _response_json(response)["results"][0]
+    assert result == {
+        "type": "consolidate_items",
+        "lane_type": "video",
+        "moved_count": 2,
+        "removed_lanes": [1],
+        "target_lane": 2,
+    }
+
+
+def test_scene_mutation_consolidates_audio_and_keeps_nonvacated_source(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.audio_lane_count = 3
+    scene.audio_lane_configs = [LaneConfig(name=f"A{index}") for index in range(3)]
+    scene.audio_tracks = [
+        AudioTrack(track_id="audio-a", timeline_start_frame=0, timeline_end_frame=10, lane_index=0),
+        AudioTrack(track_id="audio-b", timeline_start_frame=10, timeline_end_frame=20, lane_index=2),
+        AudioTrack(track_id="source-survivor", timeline_start_frame=30, timeline_end_frame=40, lane_index=0),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "consolidate_items",
+        "lane_type": "audio",
+        "item_ids": ["audio-a", "audio-b"],
+        "target_lane": 2,
+        "remove_vacated_lanes": True,
+    }], saves)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    assert scene.audio_lane_count == 3
+    assert {track.track_id: track.lane_index for track in scene.audio_tracks} == {
+        "audio-a": 2,
+        "audio-b": 2,
+        "source-survivor": 0,
+    }
+    assert _response_json(response)["results"][0]["removed_lanes"] == []
+
+
+def test_scene_mutation_consolidation_collision_rejects_without_save(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig() for _ in range(3)]
+    scene.clips = [
+        ClipReference(clip_id="clip-a", timeline_start_frame=0, timeline_end_frame=12, track_index=0),
+        ClipReference(clip_id="clip-b", timeline_start_frame=10, timeline_end_frame=20, track_index=1),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "consolidate_items",
+        "lane_type": "video",
+        "item_ids": ["clip-a", "clip-b"],
+        "target_lane": 1,
+        "remove_vacated_lanes": True,
+    }], saves)
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "lane_collision"
+    assert saves == []
+    assert {clip.clip_id: clip.track_index for clip in scene.clips} == {"clip-a": 0, "clip-b": 1}
+
+
+def test_scene_mutation_consolidation_rejects_destination_item_collision(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig() for _ in range(3)]
+    scene.clips = [
+        ClipReference(clip_id="clip-a", timeline_start_frame=0, timeline_end_frame=10, track_index=0),
+        ClipReference(clip_id="clip-b", timeline_start_frame=10, timeline_end_frame=20, track_index=1),
+        ClipReference(clip_id="target", timeline_start_frame=5, timeline_end_frame=8, track_index=1),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "consolidate_items",
+        "lane_type": "video",
+        "item_ids": ["clip-a", "clip-b"],
+        "target_lane": 1,
+        "remove_vacated_lanes": True,
+    }], saves)
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "lane_collision"
+    assert saves == []
+
+
+def test_scene_mutation_consolidation_validates_selection_and_locks(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_count = 3
+    scene.video_lane_configs = [LaneConfig(), LaneConfig(locked=True), LaneConfig()]
+    scene.clips = [
+        ClipReference(clip_id="clip-a", timeline_start_frame=0, timeline_end_frame=10, track_index=0),
+        ClipReference(clip_id="driver", timeline_start_frame=10, timeline_end_frame=20, track_index=0, role="motion_driver"),
+        ClipReference(clip_id="clip-b", timeline_start_frame=10, timeline_end_frame=20, track_index=1),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+
+    for item_ids, expected_status, expected_code in [
+        (["clip-a", "clip-a"], 400, "invalid_consolidation"),
+        (["clip-a", "missing"], 404, "item_not_found"),
+        (["clip-a", "driver"], 400, "invalid_consolidation"),
+        (["clip-a", "clip-b"], 409, "track_locked"),
+    ]:
+        saves = []
+        response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+            "type": "consolidate_items",
+            "lane_type": "video",
+            "item_ids": item_ids,
+            "target_lane": 1,
+            "remove_vacated_lanes": True,
+        }], saves)
+        assert response.status == expected_status
+        assert _response_json(response)["code"] == expected_code
+        assert saves == []
+
+
+def test_scene_mutation_remove_lane_move_collision_never_deletes(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.motion_driver_lane_count = 2
+    scene.motion_driver_lane_configs = [LaneConfig(), LaneConfig()]
+    scene.clips = [
+        ClipReference(clip_id="driver-a", timeline_start_frame=0, timeline_end_frame=10, track_index=0, role="motion_driver"),
+        ClipReference(clip_id="driver-b", timeline_start_frame=0, timeline_end_frame=10, track_index=1, role="motion_driver"),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "remove_lane",
+        "lane_type": "motion_driver",
+        "lane_index": 1,
+        "item_policy": "move_items",
+        "target_lane": 0,
+    }], saves)
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "lane_collision"
+    assert saves == []
+    assert scene.motion_driver_lane_count == 2
+    assert {clip.clip_id for clip in scene.clips} == {"driver-a", "driver-b"}
+
+
+def test_scene_mutation_remove_lane_refuses_video_and_audio_collisions(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    cases = []
+
+    video_scene = Scene(scene_id="video-scene", name="Video")
+    video_scene.video_lane_count = 2
+    video_scene.video_lane_configs = [LaneConfig(), LaneConfig()]
+    video_scene.clips = [
+        ClipReference(clip_id="video-a", timeline_start_frame=0, timeline_end_frame=10, track_index=0),
+        ClipReference(clip_id="video-b", timeline_start_frame=5, timeline_end_frame=15, track_index=1),
+    ]
+    cases.append((video_scene, "video"))
+
+    audio_scene = Scene(scene_id="audio-scene", name="Audio")
+    audio_scene.audio_lane_count = 2
+    audio_scene.audio_lane_configs = [LaneConfig(), LaneConfig()]
+    audio_scene.audio_tracks = [
+        AudioTrack(track_id="audio-a", timeline_start_frame=0, timeline_end_frame=10, lane_index=0),
+        AudioTrack(track_id="audio-b", timeline_start_frame=5, timeline_end_frame=15, lane_index=1),
+    ]
+    cases.append((audio_scene, "audio"))
+
+    for scene, lane_type in cases:
+        project = TimelineProject(project_dir=str(tmp_path / lane_type), name="Project", scenes=[scene])
+        saves = []
+        response = _apply_scene_operations(route_module, monkeypatch, project, scene.scene_id, [{
+            "type": "remove_lane",
+            "lane_type": lane_type,
+            "lane_index": 1,
+            "item_policy": "move_items",
+            "target_lane": 0,
+        }], saves)
+        assert response.status == 409
+        assert _response_json(response)["code"] == "lane_collision"
+        assert saves == []
+
+
+def test_scene_mutation_trim_collision_guard_rejects_overlap_and_allows_adjacent(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_configs = [LaneConfig()]
+    scene.clips = [
+        ClipReference(clip_id="clip-a", timeline_start_frame=0, timeline_end_frame=10, source_out_frame=10, total_source_frames=30, track_index=0),
+        ClipReference(clip_id="clip-b", timeline_start_frame=15, timeline_end_frame=25, source_out_frame=10, total_source_frames=10, track_index=0),
+    ]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    rejected = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "update_clip",
+        "clip_id": "clip-a",
+        "fields": {"timeline_start_frame": 0, "timeline_end_frame": 20, "source_out_frame": 20},
+        "validate_lane_collision": True,
+    }], saves)
+    assert rejected.status == 409
+    assert _response_json(rejected)["code"] == "lane_collision"
+    assert saves == []
+    assert scene.clips[0].timeline_end_frame == 10
+
+    accepted = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "update_clip",
+        "clip_id": "clip-a",
+        "fields": {"timeline_start_frame": 0, "timeline_end_frame": 15, "source_out_frame": 15},
+        "validate_lane_collision": True,
+    }], saves)
+    assert accepted.status == 200
+    assert len(saves) == 1
+    assert scene.clips[0].timeline_end_frame == 15
+
+
+def test_scene_mutation_linked_trim_collision_refuses_atomically(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene")
+    scene.video_lane_configs = [LaneConfig()]
+    scene.audio_lane_configs = [LaneConfig()]
+    scene.clips = [
+        ClipReference(clip_id="clip-a", timeline_start_frame=0, timeline_end_frame=10, source_out_frame=10, total_source_frames=30, track_index=0),
+    ]
+    scene.audio_tracks = [
+        AudioTrack(track_id="audio-a", timeline_start_frame=0, timeline_end_frame=10, source_in_frame=0, total_source_frames=30, lane_index=0),
+        AudioTrack(track_id="audio-neighbor", timeline_start_frame=12, timeline_end_frame=20, source_in_frame=0, total_source_frames=8, lane_index=0),
+    ]
+    scene.linked_item_groups = [{
+        "group_id": "take-a",
+        "items": [{"type": "clip", "id": "clip-a"}, {"type": "audio", "id": "audio-a"}],
+    }]
+    project = TimelineProject(project_dir=str(tmp_path), name="Project", scenes=[scene])
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "update_clip",
+        "clip_id": "clip-a",
+        "fields": {"timeline_start_frame": 0, "timeline_end_frame": 15, "source_out_frame": 15},
+        "apply_linked": True,
+        "validate_lane_collision": True,
+    }], saves)
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "lane_collision"
+    assert saves == []
+    assert scene.clips[0].timeline_end_frame == 10
+    assert scene.audio_tracks[0].timeline_end_frame == 10
 
 
 def _mutations_handler(route_module):

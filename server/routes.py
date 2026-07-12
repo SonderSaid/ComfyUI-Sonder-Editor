@@ -1129,7 +1129,13 @@ def _apply_ref_bounds(scene: Scene, ref: dict, start: int, end: int,
         return
 
 
-def _apply_linked_bounds_update(project: TimelineProject, scene: Scene, anchor_ref: dict, fields: dict) -> None:
+def _apply_linked_bounds_update(
+    project: TimelineProject,
+    scene: Scene,
+    anchor_ref: dict,
+    fields: dict,
+    validate_lane_collision: bool = False,
+) -> None:
     if not isinstance(fields, dict):
         _mutation_error("Linked update requires fields", 400)
     refs = _expand_linked_refs(scene, [anchor_ref], True)
@@ -1181,6 +1187,18 @@ def _apply_linked_bounds_update(project: TimelineProject, scene: Scene, anchor_r
             prompt_targets[ref_id] = (_resolve_link_ref(scene, ref_type, ref_id), next_start, next_end)
 
     _validate_prompt_target_ranges(scene, prompt_targets)
+    media_targets = []
+    for ref in refs:
+        key = tuple(_link_ref_key(ref))
+        ref_type, ref_id = key
+        if ref_type not in {"clip", "audio"}:
+            continue
+        item = _find_clip(scene, ref_id) if ref_type == "clip" else _find_audio_track(scene, ref_id)
+        next_start, next_end = target_bounds.get(key, old_bounds[key])
+        lane_type, lane_index = _media_item_lane(item)
+        media_targets.append((item, next_start, next_end, lane_type, lane_index))
+    if validate_lane_collision and media_targets:
+        _require_media_target_bounds_fit(scene, media_targets)
     for ref in refs:
         key = tuple(_link_ref_key(ref))
         if key not in target_bounds:
@@ -1461,6 +1479,156 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
     return {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
 
 
+def _media_lane_items(scene: Scene, lane_type: str, lane_index: int) -> list:
+    if lane_type == "video":
+        return [
+            clip for clip in scene.clips
+            if _is_render_clip(clip) and int(clip.track_index or 0) == lane_index
+        ]
+    if lane_type == "motion_driver":
+        return [
+            clip for clip in scene.clips
+            if getattr(clip, "role", "render") == "motion_driver"
+            and int(clip.track_index or 0) == lane_index
+        ]
+    if lane_type == "audio":
+        return [
+            track for track in scene.audio_tracks
+            if int(track.lane_index or 0) == lane_index
+        ]
+    _mutation_error(f"Unknown lane type: {lane_type}", 400)
+
+
+def _media_item_id(item) -> str:
+    return str(getattr(item, "clip_id", "") or getattr(item, "track_id", "") or "")
+
+
+def _media_items_overlap(left, right) -> bool:
+    return _media_bounds_overlap(
+        int(getattr(left, "timeline_start_frame", 0) or 0),
+        int(getattr(left, "timeline_end_frame", 0) or 0),
+        int(getattr(right, "timeline_start_frame", 0) or 0),
+        int(getattr(right, "timeline_end_frame", 0) or 0),
+    )
+
+
+def _media_bounds_overlap(left_start: int, left_end: int, right_start: int, right_end: int) -> bool:
+    return left_start < right_end and left_end > right_start
+
+
+def _media_item_lane(item) -> tuple[str, int]:
+    if isinstance(item, ClipReference):
+        return _clip_lane_type(item), int(getattr(item, "track_index", 0) or 0)
+    return "audio", int(getattr(item, "lane_index", 0) or 0)
+
+
+def _require_media_target_bounds_fit(scene: Scene, targets: list[tuple[object, int, int, str, int]]) -> None:
+    target_ids = {_media_item_id(item) for item, *_rest in targets}
+    for index, (item, start, end, lane_type, lane_index) in enumerate(targets):
+        if end <= start:
+            _mutation_error("Timeline item range must be at least one frame", 409, "invalid_range")
+        for other, other_start, other_end, other_lane_type, other_lane_index in targets[index + 1:]:
+            if lane_type != other_lane_type or lane_index != other_lane_index:
+                continue
+            if _media_bounds_overlap(start, end, other_start, other_end):
+                _mutation_error("Timeline items cannot overlap on one lane", 409, "lane_collision")
+        for other in _media_lane_items(scene, lane_type, lane_index):
+            if _media_item_id(other) in target_ids:
+                continue
+            if _media_bounds_overlap(
+                start,
+                end,
+                int(getattr(other, "timeline_start_frame", 0) or 0),
+                int(getattr(other, "timeline_end_frame", 0) or 0),
+            ):
+                _mutation_error("Timeline item overlaps another item on the lane", 409, "lane_collision")
+
+
+def _require_media_items_fit_lane(moving_items: list, destination_items: list) -> None:
+    for index, item in enumerate(moving_items):
+        for other in moving_items[index + 1:]:
+            if _media_items_overlap(item, other):
+                _mutation_error(
+                    "Selected items overlap and cannot share one lane",
+                    409,
+                    "lane_collision",
+                )
+        for other in destination_items:
+            if _media_items_overlap(item, other):
+                _mutation_error(
+                    "Items overlap the destination lane",
+                    409,
+                    "lane_collision",
+                )
+
+
+def _consolidate_media_items(scene: Scene, op: dict) -> dict:
+    lane_type = str(op.get("lane_type", ""))
+    if lane_type not in {"video", "audio"}:
+        _mutation_error("Consolidation supports render-video or audio items only", 400, "invalid_consolidation")
+
+    raw_ids = op.get("item_ids", [])
+    if not isinstance(raw_ids, list):
+        _mutation_error("item_ids must be a list", 400, "invalid_consolidation")
+    item_ids = [str(item_id or "") for item_id in raw_ids]
+    if len(item_ids) < 2 or any(not item_id for item_id in item_ids):
+        _mutation_error("Select at least two items to consolidate", 400, "invalid_consolidation")
+    if len(set(item_ids)) != len(item_ids):
+        _mutation_error("Consolidation item IDs must be unique", 400, "invalid_consolidation")
+
+    lane_count = _scene_lane_count(scene, lane_type)
+    target_lane = _mutation_int(op.get("target_lane"), "target_lane")
+    if target_lane < 0 or target_lane >= lane_count:
+        _mutation_error("Consolidation target lane is out of range", 400, "invalid_consolidation")
+
+    if lane_type == "video":
+        selected_items = [_find_clip(scene, item_id) for item_id in item_ids]
+        if any(not _is_render_clip(item) for item in selected_items):
+            _mutation_error("Driver clips cannot be consolidated", 400, "invalid_consolidation")
+        item_lane = lambda item: int(item.track_index or 0)
+    else:
+        selected_items = [_find_audio_track(scene, item_id) for item_id in item_ids]
+        item_lane = lambda item: int(item.lane_index or 0)
+
+    source_lanes = {item_lane(item) for item in selected_items}
+    if source_lanes == {target_lane}:
+        _mutation_error("Selected items are already on the destination lane", 400, "invalid_consolidation")
+    for lane_index in source_lanes | {target_lane}:
+        if lane_index < 0 or lane_index >= lane_count:
+            _mutation_error("Selected item is on a missing lane", 409, "invalid_consolidation")
+        _require_lane_unlocked(scene, lane_type, lane_index)
+
+    selected_ids = set(item_ids)
+    destination_items = [
+        item for item in _media_lane_items(scene, lane_type, target_lane)
+        if _media_item_id(item) not in selected_ids
+    ]
+    _require_media_items_fit_lane(selected_items, destination_items)
+
+    for item in selected_items:
+        if lane_type == "video":
+            item.track_index = target_lane
+        else:
+            item.lane_index = target_lane
+
+    removed_lanes: list[int] = []
+    if bool(op.get("remove_vacated_lanes", False)):
+        for source_lane in sorted(source_lanes - {target_lane}, reverse=True):
+            if _media_lane_items(scene, lane_type, source_lane):
+                continue
+            _remove_media_lane(scene, lane_type, source_lane, "require_empty")
+            removed_lanes.append(source_lane)
+
+    final_target_lane = target_lane - sum(1 for lane_index in removed_lanes if lane_index < target_lane)
+    return {
+        "type": "consolidate_items",
+        "lane_type": lane_type,
+        "moved_count": len(selected_items),
+        "removed_lanes": sorted(removed_lanes),
+        "target_lane": final_target_lane,
+    }
+
+
 def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_policy: str, target_lane: int | None = None) -> None:
     if lane_type not in {"video", "motion_driver", "audio"}:
         _mutation_error(f"Cannot remove lane type: {lane_type}", 400)
@@ -1472,16 +1640,7 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
         _mutation_error(f"Lane index out of range: {lane_index}", 404, "item_not_found")
     _require_lane_unlocked(scene, lane_type, lane_index)
 
-    if lane_type == "video":
-        lane_items = [clip for clip in scene.clips if _is_render_clip(clip) and int(clip.track_index or 0) == lane_index]
-    elif lane_type == "motion_driver":
-        lane_items = [
-            clip for clip in scene.clips
-            if getattr(clip, "role", "render") == "motion_driver"
-            and int(clip.track_index or 0) == lane_index
-        ]
-    else:
-        lane_items = [track for track in scene.audio_tracks if int(track.lane_index or 0) == lane_index]
+    lane_items = _media_lane_items(scene, lane_type, lane_index)
 
     item_policy = str(item_policy or "require_empty")
     if lane_items and item_policy == "require_empty":
@@ -1494,6 +1653,10 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
         if target_lane < 0 or target_lane >= current_count or target_lane == lane_index:
             _mutation_error("Invalid target lane", 400)
         _require_lane_unlocked(scene, lane_type, target_lane)
+        _require_media_items_fit_lane(
+            lane_items,
+            _media_lane_items(scene, lane_type, target_lane),
+        )
         for item in lane_items:
             if lane_type in {"video", "motion_driver"}:
                 item.track_index = target_lane
@@ -1544,7 +1707,13 @@ def _validated_crop_position(value) -> str:
     return pos
 
 
-def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fields: dict) -> ClipReference:
+def _apply_update_clip(
+    project: TimelineProject,
+    scene: Scene,
+    clip_id: str,
+    fields: dict,
+    validate_lane_collision: bool = False,
+) -> ClipReference:
     if not isinstance(fields, dict):
         _mutation_error("update_clip requires fields", 400)
     clip = _find_clip(scene, clip_id)
@@ -1560,6 +1729,18 @@ def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fie
     if "track_index" in fields:
         target_lane_type = "video" if target_role in {"", "render"} else "motion_driver"
         _require_lane_unlocked(scene, target_lane_type, target_lane)
+
+    if validate_lane_collision and any(key in fields for key in ("timeline_start_frame", "timeline_end_frame", "track_index", "role")):
+        proposed_start = max(0, int(fields.get("timeline_start_frame", clip.timeline_start_frame)))
+        if "timeline_start_frame" in fields and "timeline_end_frame" not in fields:
+            proposed_end = proposed_start + (clip.timeline_end_frame - clip.timeline_start_frame)
+        else:
+            proposed_end = int(fields.get("timeline_end_frame", clip.timeline_end_frame))
+        target_lane_type = "video" if target_role in {"", "render"} else "motion_driver"
+        _require_media_target_bounds_fit(
+            scene,
+            [(clip, proposed_start, proposed_end, target_lane_type, target_lane)],
+        )
 
     if "timeline_start_frame" in fields:
         new_start = max(0, int(fields["timeline_start_frame"]))
@@ -1593,13 +1774,30 @@ def _apply_update_clip(project: TimelineProject, scene: Scene, clip_id: str, fie
     return clip
 
 
-def _apply_update_audio_track(scene: Scene, track_id: str, fields: dict) -> AudioTrack:
+def _apply_update_audio_track(
+    scene: Scene,
+    track_id: str,
+    fields: dict,
+    validate_lane_collision: bool = False,
+) -> AudioTrack:
     if not isinstance(fields, dict):
         _mutation_error("update_audio_track requires fields", 400)
     track = _find_audio_track(scene, track_id)
     _require_audio_unlocked(scene, track)
     if "lane_index" in fields:
         _require_lane_unlocked(scene, "audio", int(fields["lane_index"]))
+
+    if validate_lane_collision and any(key in fields for key in ("timeline_start_frame", "timeline_end_frame", "lane_index")):
+        proposed_start = max(0, int(fields.get("timeline_start_frame", track.timeline_start_frame)))
+        if "timeline_start_frame" in fields and "timeline_end_frame" not in fields:
+            proposed_end = proposed_start + (track.timeline_end_frame - track.timeline_start_frame)
+        else:
+            proposed_end = int(fields.get("timeline_end_frame", track.timeline_end_frame))
+        proposed_lane = int(fields.get("lane_index", track.lane_index) or 0)
+        _require_media_target_bounds_fit(
+            scene,
+            [(track, proposed_start, proposed_end, "audio", proposed_lane)],
+        )
 
     if "timeline_start_frame" in fields:
         new_start = max(0, int(fields["timeline_start_frame"]))
@@ -2039,6 +2237,8 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             op.get("target_lane"),
         )
         return {"type": op_type}
+    if op_type == "consolidate_items":
+        return _consolidate_media_items(scene, op)
     if op_type == "create_link_group":
         group = _add_link_group(scene, op.get("items", []), str(op.get("group_id", "") or ""))
         return {"type": op_type, "group_id": group["group_id"], "count": len(group["items"])}
@@ -2058,9 +2258,21 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return {"type": op_type, "group_id": group_id}
     if op_type == "update_clip":
         if op.get("apply_linked"):
-            _apply_linked_bounds_update(project, scene, _link_ref("clip", str(op.get("clip_id", ""))), op.get("fields", {}))
+            _apply_linked_bounds_update(
+                project,
+                scene,
+                _link_ref("clip", str(op.get("clip_id", ""))),
+                op.get("fields", {}),
+                bool(op.get("validate_lane_collision", False)),
+            )
             return {"type": op_type, "clip_id": str(op.get("clip_id", "")), "linked": True}
-        clip = _apply_update_clip(project, scene, str(op.get("clip_id", "")), op.get("fields", {}))
+        clip = _apply_update_clip(
+            project,
+            scene,
+            str(op.get("clip_id", "")),
+            op.get("fields", {}),
+            bool(op.get("validate_lane_collision", False)),
+        )
         return {"type": op_type, "clip_id": clip.clip_id}
     if op_type == "replace_clip_source":
         clip = _apply_replace_clip_source(
@@ -2078,9 +2290,20 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return {"type": op_type, "clip_id": str(op.get("clip_id", ""))}
     if op_type == "update_audio_track":
         if op.get("apply_linked"):
-            _apply_linked_bounds_update(project, scene, _link_ref("audio", str(op.get("track_id", ""))), op.get("fields", {}))
+            _apply_linked_bounds_update(
+                project,
+                scene,
+                _link_ref("audio", str(op.get("track_id", ""))),
+                op.get("fields", {}),
+                bool(op.get("validate_lane_collision", False)),
+            )
             return {"type": op_type, "track_id": str(op.get("track_id", "")), "linked": True}
-        track = _apply_update_audio_track(scene, str(op.get("track_id", "")), op.get("fields", {}))
+        track = _apply_update_audio_track(
+            scene,
+            str(op.get("track_id", "")),
+            op.get("fields", {}),
+            bool(op.get("validate_lane_collision", False)),
+        )
         return {"type": op_type, "track_id": track.track_id}
     if op_type == "replace_audio_source":
         track = _apply_replace_audio_source(

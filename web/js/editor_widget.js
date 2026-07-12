@@ -5369,6 +5369,54 @@ export class EditorWidget {
         return TimelineCanvas._hitTestEdge(this, x, rawY);
     }
 
+    _trimDeltaLimits(edgeHit, origStart, origEnd, origSourceIn, origSourceOut, origTotalSourceFrames) {
+        let minDelta = -Math.max(0, origSourceIn || 0);
+        let maxDelta = Math.max(0, (origTotalSourceFrames || 0) - (origSourceOut || 0));
+        const linkedItems = this._isLinkedItem(edgeHit) ? this._expandItemsWithLinked([edgeHit]) : [edgeHit];
+        const mediaItems = linkedItems.filter((item) => item?.type === "clip" || item?.type === "audio");
+        const excluded = new Set(mediaItems.map((item) => this._selectionItemKey(item)));
+
+        for (const item of mediaItems) {
+            const data = item.data || {};
+            const start = data.timeline_start_frame || 0;
+            const end = data.timeline_end_frame || 0;
+            const affected = edgeHit.edge === "left" ? start === origStart : end === origEnd;
+            if (!affected) continue;
+
+            const sourceIn = Math.max(0, data.source_in_frame || 0);
+            const duration = Math.max(1, end - start);
+            const sourceOut = item.type === "clip" && Number.isFinite(data.source_out_frame)
+                ? data.source_out_frame
+                : sourceIn + duration;
+            const totalSource = Number.isFinite(data.total_source_frames) && data.total_source_frames > 0
+                ? data.total_source_frames
+                : sourceOut + duration;
+            minDelta = Math.max(minDelta, -sourceIn);
+            maxDelta = Math.min(maxDelta, Math.max(0, totalSource - sourceOut));
+
+            const lane = item.type === "clip" ? (data.track_index || 0) : (data.lane_index || 0);
+            const others = item.type === "clip" ? (this.activeScene?.clips || []) : (this.activeScene?.audio_tracks || []);
+            for (const other of others) {
+                const otherId = item.type === "clip" ? other.clip_id : other.track_id;
+                if (excluded.has(this._selectionItemKey({ type: item.type, id: otherId }))) continue;
+                const otherLane = item.type === "clip" ? (other.track_index || 0) : (other.lane_index || 0);
+                if (otherLane !== lane) continue;
+                if (item.type === "clip" && this._clipTrackType(other) !== this._clipTrackType(data)) continue;
+                const otherStart = other.timeline_start_frame || 0;
+                const otherEnd = other.timeline_end_frame || 0;
+                if (edgeHit.edge === "left" && otherEnd <= start) {
+                    minDelta = Math.max(minDelta, otherEnd - start);
+                } else if (edgeHit.edge === "right" && otherStart >= end) {
+                    maxDelta = Math.min(maxDelta, otherStart - end);
+                }
+            }
+        }
+        return {
+            minStart: Math.max(0, origStart + minDelta),
+            maxEnd: origEnd + Math.max(0, maxDelta),
+        };
+    }
+
     /** Check if an item is in the current selection. */
     _isSelected(type, id) {
         return this.selectedItems.some(s => s.type === type && s.id === id);
@@ -5881,6 +5929,14 @@ export class EditorWidget {
                         const trimOrigTotalSource = (typeof edgeHit.data.total_source_frames === "number" && edgeHit.data.total_source_frames > 0)
                             ? edgeHit.data.total_source_frames
                             : (trimOrigSourceOut - trimOrigSourceIn) + (trimOrigEnd - trimOrigStart);
+                        const trimLimits = isPrompt ? {} : this._trimDeltaLimits(
+                            edgeHit,
+                            trimOrigStart,
+                            trimOrigEnd,
+                            trimOrigSourceIn,
+                            trimOrigSourceOut,
+                            trimOrigTotalSource,
+                        );
                         this._trimItem = {
                             ...edgeHit,
                             origStart: trimOrigStart,
@@ -5888,6 +5944,7 @@ export class EditorWidget {
                             origSourceIn: trimOrigSourceIn,
                             origSourceOut: trimOrigSourceOut,
                             origTotalSourceFrames: trimOrigTotalSource,
+                            ...trimLimits,
                         };
                         this.isDragging = true;
                         this.dragType = "trimEdge";
@@ -6090,7 +6147,7 @@ export class EditorWidget {
                     // Clips and audio — clamp to source media bounds
                     if (item.edge === "left") {
                         const delta = Math.max(-item.origSourceIn, snappedFrame - item.origStart);
-                        const newStart = Math.max(0, Math.min(item.origEnd - 1, item.origStart + delta));
+                        const newStart = Math.max(item.minStart ?? 0, Math.min(item.origEnd - 1, item.origStart + delta));
                         item.data.timeline_start_frame = newStart;
                         const sourceInDelta = newStart - item.origStart;
                         if (item.type === "clip") {
@@ -6102,7 +6159,7 @@ export class EditorWidget {
                         // Right-edge trim ceiling = total_source_frames - source_in_frame
                         // (post-trim tail remaining beyond the current visible end)
                         const tailRemaining = Math.max(0, item.origTotalSourceFrames - item.origSourceOut);
-                        const maxEnd = item.origEnd + tailRemaining;
+                        const maxEnd = Math.min(item.origEnd + tailRemaining, item.maxEnd ?? Number.POSITIVE_INFINITY);
                         const newEnd = Math.max(item.origStart + 1, Math.min(maxEnd, snappedFrame));
                         item.data.timeline_end_frame = newEnd;
                         if (item.type === "clip") {
@@ -6707,6 +6764,20 @@ export class EditorWidget {
                         label: itemLocked ? `${muteLabel} (locked)` : muteLabel,
                         action: itemLocked ? () => {} : () => void this._toggleSelectedMute(),
                         disabled: itemLocked,
+                    });
+                }
+                const consolidateItems = this._selectedConsolidationItems(hit);
+                const consolidateTargetLane = hit.type === "clip"
+                    ? (hit.data.track_index || 0)
+                    : hit.type === "audio" ? (hit.data.lane_index || 0) : -1;
+                if (consolidateItems.length >= 2 && consolidateItems.some((item) => {
+                    const lane = item.type === "clip" ? (item.data.track_index || 0) : (item.data.lane_index || 0);
+                    return lane !== consolidateTargetLane;
+                })) {
+                    const typeLabel = hit.type === "clip" ? "Clips" : "Audio";
+                    menuItems.push({
+                        label: `Consolidate Selected ${typeLabel} to This Lane (${consolidateItems.length})`,
+                        action: () => void this._consolidateSelectedItemsToLane(hit),
                     });
                 }
                 if (count > 1) {
@@ -7537,65 +7608,62 @@ export class EditorWidget {
         return idx >= 0 && this._trackLayout[idx]?.hidden;
     }
 
-    async _setTrackItemsMuted(entry, muted) {
-        const items = this._trackItemsForEntry(entry).filter((item) => "muted" in item);
+    _muteOperationForItem(item, muted, applyLinked = false) {
+        if (!item?.data) return null;
+        if (item.type === "clip") {
+            return { type: "update_clip", clip_id: item.data.clip_id || item.id, fields: { muted: !!muted }, apply_linked: applyLinked };
+        }
+        if (item.type === "audio") {
+            return { type: "update_audio_track", track_id: item.data.track_id || item.id, fields: { muted: !!muted }, apply_linked: applyLinked };
+        }
+        if (item.type === "guide") {
+            return {
+                type: "update_guide",
+                frame_index: item.id,
+                expected: {
+                    frame_index: item.data.frame_index ?? item.id,
+                    asset_id: item.data.asset_id || "",
+                    guide_id: item.data.guide_id || "",
+                },
+                fields: { muted: !!muted },
+                apply_linked: applyLinked,
+            };
+        }
+        if (item.type === "prompt") {
+            return {
+                type: "update_prompt_section",
+                index: item.id,
+                expected: {
+                    start_frame: item.data.start_frame,
+                    end_frame: item.data.end_frame,
+                    prompt_id: item.data.prompt_id || "",
+                },
+                fields: { muted: !!muted },
+                apply_linked: applyLinked,
+            };
+        }
+        return null;
+    }
+
+    _buildLinkedMuteOperations(items, muted) {
+        const expanded = this._expandItemsWithLinked(items)
+            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt");
+        if (expanded.some((item) => this._isItemLocked(item))) {
+            return { operations: [], targets: expanded, locked: true };
+        }
         const operations = [];
-        for (const item of items) {
-            if (!!item.muted === !!muted) continue;
-            item.muted = !!muted;
-            const type = entry.type === TRACK_TYPE.AUDIO
-                ? "audio"
-                : entry.type === TRACK_TYPE.GUIDES
-                    ? "guide"
-                    : entry.type === TRACK_TYPE.PROMPT
-                        ? "prompt"
-                        : "clip";
-            const id = type === "audio"
-                ? item.track_id
-                : type === "guide"
-                    ? item.frame_index
-                    : type === "prompt"
-                        ? (this.activeScene.prompt_sections || []).indexOf(item)
-                        : item.clip_id;
-            if (type === "clip") {
-                operations.push({ type: "update_clip", clip_id: id, fields: { muted: !!muted } });
-            } else if (type === "audio") {
-                operations.push({ type: "update_audio_track", track_id: id, fields: { muted: !!muted } });
-            } else {
-                if (type === "prompt") {
-                    if (id < 0) continue;
-                    operations.push({
-                        type: "update_prompt_section",
-                        index: id,
-                        expected: {
-                            start_frame: item.start_frame,
-                            end_frame: item.end_frame,
-                            prompt_id: item.prompt_id || "",
-                        },
-                        fields: { muted: !!muted },
-                    });
-                    continue;
-                }
-                operations.push({
-                    type: "update_guide",
-                    frame_index: id,
-                    expected: {
-                        frame_index: item.frame_index,
-                        asset_id: item.asset_id || "",
-                        guide_id: item.guide_id || "",
-                    },
-                    fields: { muted: !!muted },
-                });
+        const emittedGroups = new Set();
+        for (const item of expanded) {
+            const group = this._linkGroupForItem(item);
+            if (group) {
+                const groupKey = group.group_id || this._linkRefKey(this._linkRefForItem(item));
+                if (emittedGroups.has(groupKey)) continue;
+                emittedGroups.add(groupKey);
             }
+            const operation = this._muteOperationForItem(item, muted, !!group);
+            if (operation) operations.push(operation);
         }
-        if (operations.length > 0) {
-            await this._runSceneMutation(operations, {
-                key: `scene:${this.activeSceneId}:track-items-muted:${entry.type}:${entry.laneIndex ?? "track"}`,
-                label: "track item mute",
-                coalesce: false,
-                refreshScenes: false,
-            });
-        }
+        return { operations, targets: expanded, locked: false };
     }
 
     async _toggleHeaderVisibility(entry) {
@@ -7603,32 +7671,97 @@ export class EditorWidget {
         await this._applyHeaderVisibilityBulk([entry], this._trackVisibilityState(entry) === "visible");
     }
 
-    /** Apply one uniform hidden state to a set of lane header entries.
-     *  Showing a lane keeps the single-lane semantics: muted items on it are
-     *  unmuted unless the lane is locked. One lane-config save covers all. */
+    /** Apply one uniform header visibility command. Actual lane-hidden state is
+     *  lane-local; an inferred muted/partial state performs linked-aware unmute. */
     async _applyHeaderVisibilityBulk(entries, nextHidden) {
         const targets = (entries || []).filter(Boolean);
         if (!targets.length) return;
-        const unmuteTargets = [];
+        const visibilitySeq = (this._headerVisibilitySeq || 0) + 1;
+        this._headerVisibilitySeq = visibilitySeq;
+        const laneConfigTargets = [];
+        const unmuteSeeds = [];
         for (const target of targets) {
             if (nextHidden) {
-                target.hidden = true;
+                if (!target.hidden) laneConfigTargets.push(target);
             } else {
-                if (!target.locked && this._trackItemsForEntry(target).some((item) => !!item.muted)) {
-                    unmuteTargets.push(target);
+                if (target.hidden) {
+                    laneConfigTargets.push(target);
+                } else if (this._trackVisibilityState(target) !== "visible") {
+                    const type = target.type === TRACK_TYPE.AUDIO ? "audio"
+                        : target.type === TRACK_TYPE.GUIDES ? "guide"
+                            : target.type === TRACK_TYPE.PROMPT ? "prompt" : "clip";
+                    for (const data of this._trackItemsForEntry(target)) {
+                        if (!data?.muted) continue;
+                        const id = type === "audio" ? data.track_id
+                            : type === "guide" ? data.frame_index
+                                : type === "prompt" ? (this.activeScene?.prompt_sections || []).indexOf(data)
+                                    : data.clip_id;
+                        if (id !== undefined && id !== null && id !== -1) unmuteSeeds.push({ type, id, data });
+                    }
                 }
-                target.hidden = false;
             }
         }
-        this._clearPlaybackWarmOverlay("lane-visibility-change", { render: false });
-        await this._saveLaneConfig(targets);
-        if (unmuteTargets.length) {
-            for (const target of unmuteTargets) {
-                await this._setTrackItemsMuted(target, false);
+
+        const mutePlan = this._buildLinkedMuteOperations(unmuteSeeds, false);
+        if (mutePlan.locked) {
+            this._discardLastUndo("toggle track visibility");
+            notifyWarning("Linked unmute refused because one or more linked items are locked.", { source: "timeline-mute-refused" });
+            return;
+        }
+
+        const operations = [];
+        const sceneRef = this.activeScene;
+        for (const target of laneConfigTargets) {
+            target.hidden = !!nextHidden;
+            const laneType = this._laneTypeForEntry(target);
+            if (!laneType) continue;
+            const laneIndex = target.laneIndex || 0;
+            const fields = {
+                name: target.customName || "",
+                color: target.color || "",
+                locked: !!target.locked,
+                hidden: !!target.hidden,
+            };
+            operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields });
+            const cfg = { ...fields };
+            if (laneType === "guide") sceneRef.guide_track_config = cfg;
+            else if (laneType === "prompt") sceneRef.prompt_track_config = cfg;
+            else if (laneType === "prompt_global") sceneRef.global_prompt_track_config = cfg;
+            else {
+                const listKey = laneType === "video" ? "video_lane_configs"
+                    : laneType === "motion_driver" ? "motion_driver_lane_configs" : "audio_lane_configs";
+                const list = Array.isArray(sceneRef[listKey]) ? sceneRef[listKey] : [];
+                while (list.length <= laneIndex) list.push(this._defaultLaneConfig());
+                list[laneIndex] = cfg;
+                sceneRef[listKey] = list;
             }
-            await this._fetchScenes();
+        }
+        operations.push(...mutePlan.operations);
+        if (!operations.length) {
+            this._discardLastUndo("toggle track visibility");
+            return;
+        }
+
+        for (const item of mutePlan.targets) item.data.muted = false;
+        this._clearPlaybackWarmOverlay("lane-visibility-change", { render: false });
+        try {
+            await this._runSceneMutation(operations, {
+                key: `scene:${this.activeSceneId}:header-visibility`,
+                label: "toggle track visibility",
+                coalesce: false,
+                reconcileFromResult: (result) => {
+                    if (visibilitySeq !== this._headerVisibilitySeq) return true;
+                    return this._reconcileActiveSceneFromMutation(result, { reason: "toggle track visibility" });
+                },
+            });
             this._reconcileSelection();
             this._buildTrackLayout();
+        } catch (error) {
+            if (visibilitySeq === this._headerVisibilitySeq) {
+                this._discardLastUndo("toggle track visibility");
+                await this._fetchScenes({ ignoreMutationGate: true, reason: "header_visibility_error" });
+                this._buildTrackLayout();
+            }
         }
         this._renderTimeline();
         this._renderViewportFrame();
@@ -7830,6 +7963,122 @@ export class EditorWidget {
         return [];
     }
 
+    _mediaItemsOverlap(left, right) {
+        return (left?.timeline_start_frame || 0) < (right?.timeline_end_frame || 0)
+            && (left?.timeline_end_frame || 0) > (right?.timeline_start_frame || 0);
+    }
+
+    _laneMoveItemsRefusal(trackType, sourceLane, targetLane) {
+        if (this._isLaneLocked(trackType, sourceLane) || this._isLaneLocked(trackType, targetLane)) {
+            return "Move refused because the source or destination lane is locked.";
+        }
+        const moving = this._laneItemsForTrackType(trackType, sourceLane);
+        const destination = this._laneItemsForTrackType(trackType, targetLane);
+        for (let index = 0; index < moving.length; index++) {
+            for (let otherIndex = index + 1; otherIndex < moving.length; otherIndex++) {
+                if (this._mediaItemsOverlap(moving[index], moving[otherIndex])) {
+                    return "Move refused because items on the source lane overlap.";
+                }
+            }
+            if (destination.some((item) => this._mediaItemsOverlap(moving[index], item))) {
+                return "Move refused because items overlap the destination lane.";
+            }
+        }
+        return "";
+    }
+
+    _selectedConsolidationItems(hit) {
+        if (!hit || (hit.type !== "clip" && hit.type !== "audio")) return [];
+        if (hit.type === "clip" && !this._isRenderClip(hit.data)) return [];
+        const seen = new Set();
+        const items = [];
+        for (const selected of this.selectedItems || []) {
+            if (selected?.type !== hit.type) continue;
+            const current = this._findSceneItemBySelection(selected.type, selected.id) || selected;
+            if (current.type === "clip" && !this._isRenderClip(current.data)) continue;
+            const key = String(current.id);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            items.push(current);
+        }
+        return items;
+    }
+
+    _consolidationRefusal(items, hit) {
+        if (items.length < 2) return "Select at least two items of the same type.";
+        const trackType = hit.type === "clip" ? TRACK_TYPE.VIDEO : TRACK_TYPE.AUDIO;
+        const targetLane = hit.type === "clip" ? (hit.data.track_index || 0) : (hit.data.lane_index || 0);
+        const itemIds = new Set(items.map((item) => String(item.id)));
+        const sourceLanes = new Set(items.map((item) => item.type === "clip"
+            ? (item.data.track_index || 0)
+            : (item.data.lane_index || 0)));
+        if (sourceLanes.size === 1 && sourceLanes.has(targetLane)) {
+            return "Selected items are already on this lane.";
+        }
+        for (const lane of new Set([...sourceLanes, targetLane])) {
+            if (this._isLaneLocked(trackType, lane)) {
+                return "Consolidation refused because a source or destination lane is locked.";
+            }
+        }
+        for (let index = 0; index < items.length; index++) {
+            for (let otherIndex = index + 1; otherIndex < items.length; otherIndex++) {
+                if (this._mediaItemsOverlap(items[index].data, items[otherIndex].data)) {
+                    return "Selected items overlap and cannot share one lane.";
+                }
+            }
+        }
+        const destination = this._laneItemsForTrackType(trackType, targetLane)
+            .filter((item) => !itemIds.has(String(item.clip_id || item.track_id)));
+        for (const item of items) {
+            if (destination.some((other) => this._mediaItemsOverlap(item.data, other))) {
+                return "Selected items overlap existing items on this lane.";
+            }
+        }
+        return "";
+    }
+
+    async _consolidateSelectedItemsToLane(hit) {
+        if (!this.activeScene || !this.projectDir) return;
+        const items = this._selectedConsolidationItems(hit);
+        const refusal = this._consolidationRefusal(items, hit);
+        if (refusal) {
+            notifyWarning(refusal, { source: "timeline-consolidate-refused" });
+            return;
+        }
+        const laneType = hit.type === "clip" ? "video" : "audio";
+        const targetLane = hit.type === "clip" ? (hit.data.track_index || 0) : (hit.data.lane_index || 0);
+        const selectionSnapshot = (this.selectedItems || []).map((item) => ({ type: item.type, id: item.id }));
+        const selectedItemSnapshot = this.selectedItem ? { type: this.selectedItem.type, id: this.selectedItem.id } : null;
+        const undoLabel = "consolidate items";
+        this._pushUndo(undoLabel);
+        try {
+            await this._runSceneMutation([{
+                type: "consolidate_items",
+                lane_type: laneType,
+                item_ids: items.map((item) => String(item.id)),
+                target_lane: targetLane,
+                remove_vacated_lanes: true,
+            }], {
+                key: `scene:${this.activeSceneId}:consolidate:${laneType}:${Date.now()}`,
+                label: "consolidate items",
+                coalesce: false,
+                failureMessage: (error) => error?.message || "Consolidation failed — timeline restored.",
+                failureTier: "warning",
+            });
+            this.selectedItems = selectionSnapshot
+                .map((item) => this._findSceneItemBySelection(item.type, item.id))
+                .filter(Boolean);
+            this.selectedItem = selectedItemSnapshot
+                ? this._findSceneItemBySelection(selectedItemSnapshot.type, selectedItemSnapshot.id)
+                : (this.selectedItems[this.selectedItems.length - 1] || null);
+            this._buildTrackLayout();
+            this._renderTimeline();
+            this._renderViewportFrame();
+        } catch (error) {
+            this._discardLastUndo(undoLabel);
+        }
+    }
+
     async _removeLaneDeletingItems(trackType, laneIndex) {
         if (!this.activeScene || !this.projectDir) return;
         const laneType = this._laneTypeFromTrackType(trackType);
@@ -7982,11 +8231,17 @@ export class EditorWidget {
                 ? (this.activeScene?.motion_driver_lane_count || 1)
             : (this.activeScene?.audio_lane_count || 1);
 
-        // If target lane would be the same (only 1 lane) or no valid target, delete items instead
-        const willMove = currentCount > 1 && targetLane !== laneIndex && !(isDriver && this._driverClipInLane(targetLane));
-        const msg = willMove
-            ? `This ${label} lane has ${items.length} item(s). Move them to lane ${targetLane} and remove this lane?`
-            : `This ${label} lane has ${items.length} item(s). Delete them and remove this lane?`;
+        const willMove = currentCount > 1 && targetLane !== laneIndex;
+        if (!willMove) {
+            notifyWarning(`Cannot move items because there is no destination ${label} lane.`, { source: "timeline-lane-move-refused" });
+            return;
+        }
+        const refusal = this._laneMoveItemsRefusal(trackType, laneIndex, targetLane);
+        if (refusal) {
+            notifyWarning(refusal, { source: "timeline-lane-move-refused" });
+            return;
+        }
+        const msg = `This ${label} lane has ${items.length} item(s). Move them to lane ${targetLane + 1} and remove this lane?`;
         if (!confirm(msg)) return;
 
         const undoLabel = "remove lane";
@@ -7994,7 +8249,7 @@ export class EditorWidget {
             type: "remove_lane",
             lane_type: laneType,
             lane_index: laneIndex,
-            item_policy: willMove ? "move_items" : "delete_items",
+            item_policy: "move_items",
             target_lane: targetLane,
         };
 
@@ -10276,6 +10531,7 @@ export class EditorWidget {
                             source_out_frame: data.source_out_frame,
                         },
                         apply_linked: applyLinked,
+                        validate_lane_collision: true,
                     });
                 } else if (type === "audio") {
                     operations.push({
@@ -10287,6 +10543,7 @@ export class EditorWidget {
                             source_in_frame: data.source_in_frame || 0,
                         },
                         apply_linked: applyLinked,
+                        validate_lane_collision: true,
                     });
                 } else if (type === "prompt") {
                     if (this._isPromptTrackLocked()) return;

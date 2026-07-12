@@ -6001,6 +6001,7 @@ export function createViewportSurface(options = {}) {
         if (!snapshot.playableClipLayers.length && !snapshot.missingClipLayers.length && !snapshot.guide) {
             if (state.isPlaying) resetPlaybackCompositeState();
             drawViewportText(`Frame ${frame}`);
+            drawSceneOutline();
             return;
         }
         if (!snapshot.playableClipLayers.length && snapshot.missingClipLayers.length) {
@@ -6016,6 +6017,7 @@ export function createViewportSurface(options = {}) {
                 titleColor: "#dfb1b1",
                 subtitleColor: THEME.fg2,
             });
+            drawSceneOutline();
             return;
         }
         if (state.isPlaying) {

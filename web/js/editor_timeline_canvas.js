@@ -1267,7 +1267,8 @@ export function _hitTestTrackHeader(host, x, rawY) {
     /** Hit-test the header/timeline boundary for drag resize */
 export function _hitTestHeaderEdge(host, x, y) {
         const headerW = host._labelW;
-        return Math.abs(x - headerW) <= 4 && y >= 0;
+        const rulerHeight = Math.round(RULER_HEIGHT * (host._scaleTimeline || 1));
+        return Math.abs(x - headerW) <= 4 && y >= 0 && y < rulerHeight;
     }
 
 export function _hitTestClip(host, x, rawY) {
@@ -1362,14 +1363,29 @@ export function _hitTestEdge(host, x, rawY) {
         const layoutIdx = host._layoutIndexFromRawY(rawY);
         if (layoutIdx < 0) return null;
         const entry = host._trackLayout[layoutIdx];
+        const candidates = [];
+        const addCandidate = (type, id, data, edge, edgeX, startFrame) => {
+            const distance = Math.abs(x - edgeX);
+            if (distance >= edgePx) return;
+            candidates.push({
+                type,
+                id,
+                data,
+                edge,
+                edgeX,
+                startFrame,
+                distance,
+                selected: !!host._isSelected?.(type, id),
+            });
+        };
 
         if ((entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.MOTION_DRIVER) && !entry.collapsed) {
             for (const clip of (host.activeScene.clips || [])) {
                 if (!host._clipMatchesTrackEntry(clip, entry)) continue;
                 const x1 = host._frameToX(clip.timeline_start_frame);
                 const x2 = host._frameToX(clip.timeline_end_frame);
-                if (Math.abs(x - x1) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "left" };
-                if (Math.abs(x - x2) < edgePx) return { type: "clip", id: clip.clip_id, data: clip, edge: "right" };
+                addCandidate("clip", clip.clip_id, clip, "left", x1, clip.timeline_start_frame);
+                addCandidate("clip", clip.clip_id, clip, "right", x2, clip.timeline_start_frame);
             }
         }
 
@@ -1378,8 +1394,8 @@ export function _hitTestEdge(host, x, rawY) {
                 if ((track.lane_index || 0) !== entry.laneIndex) continue;
                 const x1 = host._frameToX(track.timeline_start_frame);
                 const x2 = host._frameToX(track.timeline_end_frame);
-                if (Math.abs(x - x1) < edgePx) return { type: "audio", id: track.track_id, data: track, edge: "left" };
-                if (Math.abs(x - x2) < edgePx) return { type: "audio", id: track.track_id, data: track, edge: "right" };
+                addCandidate("audio", track.track_id, track, "left", x1, track.timeline_start_frame);
+                addCandidate("audio", track.track_id, track, "right", x2, track.timeline_start_frame);
             }
         }
 
@@ -1389,10 +1405,29 @@ export function _hitTestEdge(host, x, rawY) {
                 const section = sections[i];
                 const x1 = host._frameToX(section.start_frame);
                 const x2 = host._frameToX(section.end_frame);
-                if (Math.abs(x - x1) < edgePx) return { type: "prompt", id: i, data: section, edge: "left" };
-                if (Math.abs(x - x2) < edgePx) return { type: "prompt", id: i, data: section, edge: "right" };
+                addCandidate("prompt", i, section, "left", x1, section.start_frame);
+                addCandidate("prompt", i, section, "right", x2, section.start_frame);
             }
         }
 
-        return null;
+        candidates.sort((left, right) => {
+            if (left.distance !== right.distance) return left.distance - right.distance;
+            const leftSideRank = x < left.edgeX
+                ? (left.edge === "right" ? 0 : 1)
+                : x > left.edgeX
+                    ? (left.edge === "left" ? 0 : 1)
+                    : (left.edge === "right" ? 0 : 1);
+            const rightSideRank = x < right.edgeX
+                ? (right.edge === "right" ? 0 : 1)
+                : x > right.edgeX
+                    ? (right.edge === "left" ? 0 : 1)
+                    : (right.edge === "right" ? 0 : 1);
+            if (leftSideRank !== rightSideRank) return leftSideRank - rightSideRank;
+            if (left.selected !== right.selected) return left.selected ? -1 : 1;
+            if (left.startFrame !== right.startFrame) return left.startFrame - right.startFrame;
+            return String(left.id).localeCompare(String(right.id));
+        });
+        const hit = candidates[0];
+        if (!hit) return null;
+        return { type: hit.type, id: hit.id, data: hit.data, edge: hit.edge };
     }
