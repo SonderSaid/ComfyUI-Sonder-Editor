@@ -134,6 +134,64 @@ console.log(JSON.stringify({
     assert result["customOff480p43"] == {"width": 736, "height": 544}
 
 
+def test_gallery_sticky_headers_setting_defaults_on_and_can_be_disabled():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+
+    module_path = Path(__file__).resolve().parents[1] / "web" / "js" / "editor_settings.js"
+    script = """
+globalThis.window = {
+    localStorage: { getItem() { return null; }, setItem() {} },
+    addEventListener() {},
+};
+const mod = await import(__MODULE_URL__);
+const initial = mod.getEditorSettings().gallery.stickyFolderHeaders;
+const updated = mod.updateEditorSettings({ gallery: { stickyFolderHeaders: false } });
+console.log(JSON.stringify({ initial, updated: updated.gallery.stickyFolderHeaders }));
+""".replace("__MODULE_URL__", json.dumps(module_path.as_uri()))
+
+    completed = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(completed.stdout) == {"initial": True, "updated": False}
+
+
+def test_asset_gallery_qol_regression_contracts_are_wired():
+    root = Path(__file__).resolve().parents[1]
+    gallery_source = (root / "web" / "js" / "shared_asset_gallery.js").read_text(encoding="utf-8")
+    viewport_source = (root / "web" / "js" / "viewport_surface.js").read_text(encoding="utf-8")
+    panel_source = (root / "web" / "js" / "editor_settings_panel.js").read_text(encoding="utf-8")
+
+    overlay_start = gallery_source.index("function overlayAssets()")
+    overlay_end = gallery_source.index("function currentOverlayAsset()", overlay_start)
+    assert "activeNavigableAssets()" in gallery_source[overlay_start:overlay_end]
+    assert "selectionAnchorAssetId" in gallery_source
+    assert "const anchorId = state.selectionAnchorAssetId" in gallery_source
+    assert "if (selectedAssetIdsList().length === 1)" in gallery_source
+    assert 'clearSelection({ renderNow: false })' in gallery_source
+    assert 'position:sticky;top:0;z-index:3;' in gallery_source
+
+    capture_start = viewport_source.index("async function captureSourceFrame")
+    capture_end = viewport_source.index("function clearMediaCache", capture_start)
+    capture_source = viewport_source[capture_start:capture_end]
+    assert "const seekTolerance = 0.25 / captureFps" in capture_source
+    assert "const decodedTolerance = 0.5 / captureFps" in capture_source
+    assert "tolerance: seekTolerance" in capture_source
+    assert "waitForDecodedVideoFrameAtTarget(video, targetTime, decodedTolerance" in capture_source
+    assert "const targetTime = (frameIndex + 0.5) / captureFps" in capture_source
+
+    gallery_section = panel_source.index('"Asset Gallery"')
+    render_section = panel_source.index('"Render"')
+    assert panel_source.index('"galleryStickyFolderHeaders"', gallery_section) > gallery_section
+    assert panel_source.index('"trashRetentionDays"', gallery_section) > gallery_section
+    assert '"trashRetentionDays"' not in panel_source[render_section:gallery_section]
+
+
 def test_editor_settings_builtin_template_overrides():
     node = shutil.which("node")
     if not node:

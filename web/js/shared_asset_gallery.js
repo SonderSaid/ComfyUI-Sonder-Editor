@@ -713,6 +713,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         query: "",
         selectedAssetId: "",
         selectedAssetIds: new Set(),
+        selectionAnchorAssetId: "",
         focusedAssetId: "",
         allowAutoFocus: true,
         liveMedia: null,
@@ -725,6 +726,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         manageMode: false,
         sortMode: initialSettings.gallery.sortMode || DEFAULT_SORT_MODE,
         thumbnailSize: initialSettings.gallery.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize,
+        stickyFolderHeaders: initialSettings.gallery.stickyFolderHeaders !== false,
         currentSceneAssetIds: normalizeAssetIdSet(options.initialData?.currentSceneAssetIds),
         storageProjectId: "",
         contextMenuEl: null,
@@ -1203,6 +1205,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.inspectorCollapsed = !!nextSettings?.gallery?.inspectorCollapsed;
         state.artifactInspectorExpanded = !!nextSettings?.gallery?.artifactInspectorExpanded;
         state.thumbnailSize = nextSettings?.gallery?.thumbnailSize || DEFAULT_EDITOR_SETTINGS.gallery.thumbnailSize;
+        state.stickyFolderHeaders = nextSettings?.gallery?.stickyFolderHeaders !== false;
         const inspector = nextSettings?.inspector || DEFAULT_INSPECTOR_SETTINGS;
         state.overlayState.compareLayout = inspector.compareLayout || DEFAULT_INSPECTOR_SETTINGS.compareLayout;
         state.overlayState.sideBySideLinkZoom = inspector.sideBySideLinkZoom !== false;
@@ -1896,6 +1899,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function selectAsset(assetId, options = {}) {
+        state.selectionAnchorAssetId = assetId || "";
         return applySelection(assetId ? [assetId] : [], assetId, options);
     }
 
@@ -1929,6 +1933,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function toggleAssetSelection(assetId, options = {}) {
+        state.selectionAnchorAssetId = assetId || "";
         const nextIds = new Set(selectedAssetIdsList());
         if (nextIds.has(assetId)) {
             nextIds.delete(assetId);
@@ -1942,7 +1947,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function selectAssetRange(assetId, assets, options = {}) {
         const navigableAssets = visibleNavigableAssets(assets);
-        const anchorId = state.selectedAssetId || state.focusedAssetId;
+        const anchorId = state.selectionAnchorAssetId || state.selectedAssetId || state.focusedAssetId;
         if (!anchorId) return selectAsset(assetId, options);
 
         const startIndex = navigableAssets.findIndex((asset) => asset.asset_id === anchorId);
@@ -1973,6 +1978,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const { renderNow = true } = options;
         state.selectedAssetIds = new Set();
         state.selectedAssetId = "";
+        state.selectionAnchorAssetId = "";
         state.focusedAssetId = "";
         state.allowAutoFocus = false;
         clearUsageView();
@@ -1988,6 +1994,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             clearSelection(options);
             return null;
         }
+        state.selectionAnchorAssetId = primaryId;
         return applySelection([primaryId], primaryId, options);
     }
 
@@ -3549,7 +3556,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function overlayAssets() {
-        return navigableAssets();
+        return activeNavigableAssets();
     }
 
     function currentOverlayAsset() {
@@ -5913,7 +5920,8 @@ export function mountSharedAssetGallery(container, options = {}) {
     function renderFolderHeader(folderName, assetCount) {
         const normalized = normalizeFolderName(folderName);
         const collapsed = isFolderCollapsed(normalized);
-        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${normalized ? THEME.bg2 : THEME.bg1};color:${THEME.fg1};font-size:10px;font-weight:600;border:1px solid transparent;`);
+        const stickyCss = state.stickyFolderHeaders ? "position:sticky;top:0;z-index:3;" : "";
+        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${normalized ? THEME.bg2 : THEME.bg1};color:${THEME.fg1};font-size:10px;font-weight:600;border:1px solid transparent;${stickyCss}`);
         header.dataset.folderDrop = normalized;
         header.dataset.folderHeader = normalized || "__root__";
         header.title = state.manageMode
@@ -5989,7 +5997,8 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function renderTrashFolderHeader(assetCount) {
         const collapsed = isFolderCollapsed(TRASH_FOLDER_COLLAPSE_KEY);
-        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${THEME.bg2};color:${THEME.fg1};font-size:10px;font-weight:600;border:1px solid ${THEME.statusPending}55;`);
+        const stickyCss = state.stickyFolderHeaders ? "position:sticky;top:0;z-index:3;" : "";
+        const header = style(document.createElement("div"), `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:6px;background:${THEME.bg2};color:${THEME.fg1};font-size:10px;font-weight:600;border:1px solid ${THEME.statusPending}55;${stickyCss}`);
         header.dataset.folderHeader = TRASH_FOLDER_COLLAPSE_KEY;
 
         const left = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;min-width:0;`);
@@ -6659,6 +6668,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             reduceSelectionToPrimary({ focusList: true });
             return;
         }
+        if (selectedAssetIdsList().length === 1) {
+            clearSelection({ renderNow: false });
+        }
         render();
     });
     searchInput.addEventListener("input", () => {
@@ -6985,6 +6997,9 @@ export function mountSharedAssetGallery(container, options = {}) {
             ? state.selectedAssetId
             : (preservedSelection[preservedSelection.length - 1] || data.assets[0]?.asset_id || "");
         applySelectionState(preservedSelection.length ? preservedSelection : (fallbackId ? [fallbackId] : []), fallbackId);
+        if (!data.assets.some((asset) => asset.asset_id === state.selectionAnchorAssetId)) {
+            state.selectionAnchorAssetId = fallbackId;
+        }
         if (!data.assets.some((asset) => asset.asset_id === state.focusedAssetId)) {
             state.focusedAssetId = data.assets[0]?.asset_id || "";
         }

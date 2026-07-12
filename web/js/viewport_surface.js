@@ -2461,7 +2461,13 @@ export function createViewportSurface(options = {}) {
         }
         const frameIndex = Math.max(0, Math.round(Number(sourceFrame) || 0));
         const captureFps = fps();
-        const tolerance = 0.5 / captureFps;
+        // Stay strictly below half a frame so frame 0 at currentTime=0 cannot
+        // satisfy the frame-center target without an actual seek/decode.
+        const seekTolerance = 0.25 / captureFps;
+        // requestVideoFrameCallback reports the frame presentation timestamp
+        // (normally the frame start), so allow half a frame when validating
+        // that the decoded frame belongs to our frame-center seek target.
+        const decodedTolerance = 0.5 / captureFps;
         const targetTime = (frameIndex + 0.5) / captureFps;
         const cacheKey = `snapshot:${sourcePath}`;
         let video = state.videoCache[cacheKey];
@@ -2475,13 +2481,13 @@ export function createViewportSurface(options = {}) {
             if (!loaded || state.destroyed) return null;
             await waitForMediaReady(video, 2, 1500);
             const sought = await seekMedia(video, targetTime, {
-                tolerance,
+                tolerance: seekTolerance,
                 timeoutMs: 900,
                 requireTarget: true,
                 waitForFrame: true,
             });
             if (!sought || (video.readyState || 0) < 2) return null;
-            const decodedAtTarget = await waitForDecodedVideoFrameAtTarget(video, targetTime, tolerance, 240);
+            const decodedAtTarget = await waitForDecodedVideoFrameAtTarget(video, targetTime, decodedTolerance, 240);
             return decodedAtTarget ? video : null;
         }, {
             shouldRun: () => !state.destroyed,

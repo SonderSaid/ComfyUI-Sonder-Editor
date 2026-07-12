@@ -386,6 +386,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         inspectorCollapsed: false,
         thumbnailSize: "small",
         artifactInspectorExpanded: false,
+        stickyFolderHeaders: true,
     },
     inspector: {
         compareLayout: "divider",
@@ -1251,6 +1252,9 @@ function normalizeEditorSettings(source = null) {
             artifactInspectorExpanded: stored?.gallery?.artifactInspectorExpanded == null
                 ? defaults.gallery.artifactInspectorExpanded
                 : !!stored.gallery.artifactInspectorExpanded,
+            stickyFolderHeaders: stored?.gallery?.stickyFolderHeaders == null
+                ? defaults.gallery.stickyFolderHeaders
+                : !!stored.gallery.stickyFolderHeaders,
         },
         inspector: {
             compareLayout: VALID_COMPARE_LAYOUTS.has(stored?.inspector?.compareLayout)

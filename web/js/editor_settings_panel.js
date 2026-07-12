@@ -225,6 +225,7 @@ function syncSettingsPanelControls() {
         sync();
     }
     if (controls.trashRetentionDays) controls.trashRetentionDays.value = String(this._trashRetentionDays());
+    if (controls.galleryStickyFolderHeaders) controls.galleryStickyFolderHeaders.checked = this._settings.gallery?.stickyFolderHeaders !== false;
     if (controls.batchRenderMaxFramesPerChunk) controls.batchRenderMaxFramesPerChunk.value = String(this._settings.batchRender.maxFramesPerChunk);
     if (controls.defaultProjectFps) controls.defaultProjectFps.value = String(this._settings.projectDefaults.fps);
     if (controls.defaultProjectWidth) controls.defaultProjectWidth.value = String(this._settings.projectDefaults.width);
@@ -1165,7 +1166,7 @@ function showSettingsPanel() {
 
     const renderSection = createSection(
         "Render",
-        "Browser-local take placement and cleanup policies. Cache/trash cleanup runs during editor open and asset sync."
+        "Browser-local take placement and render-cache policies."
     );
     createSelect(
         renderSection,
@@ -1222,36 +1223,6 @@ function showSettingsPanel() {
     );
     createNumberInput(
         renderSection,
-        "trashRetentionDays",
-        "Trash Retention Days",
-        "Hard-delete trashed assets after this many days during asset refresh/open sync.",
-        {
-            min: 0,
-            max: 36500,
-            step: 1,
-            getter: () => this._trashRetentionDays(),
-            onChange: (value) => updateCategory("render", "trashRetentionDays", Math.max(0, Math.round(value))),
-        }
-    );
-    createPresetNumberInput(
-        renderSection,
-        "trashMaxSizeMB",
-        "Trash Max Size",
-        "Optional decimal-MB cap for trashed asset source files. Oldest trash is purged first during asset refresh/open sync.",
-        {
-            options: TRASH_SIZE_MB_PRESETS,
-            min: 0,
-            max: 100000000,
-            step: 0.1,
-            integer: false,
-            allowNull: true,
-            customDefault: 250,
-            getter: () => this._settings.render?.trashMaxSizeMB ?? null,
-            onChange: (value) => updateCategory("render", "trashMaxSizeMB", value),
-        }
-    );
-    createNumberInput(
-        renderSection,
         "batchRenderMaxFramesPerChunk",
         "Batch Max Frames",
         "Maximum total frames per chunk including pre/post context. Values above 0 snap up to the active template's frame rule; 0 uses the internal 97-frame budget.",
@@ -1266,7 +1237,7 @@ function showSettingsPanel() {
     addSectionReset(
         renderSection,
         "Reset Render Section",
-        "Restore take placement, save preset, render cache, trash cleanup, and batch-frame defaults.",
+        "Restore take placement, save preset, render cache, and batch-frame defaults.",
         () => this._updateSettings({
             render: {
                 takePlacementMode: DEFAULT_EDITOR_SETTINGS.render.takePlacementMode,
@@ -1274,8 +1245,6 @@ function showSettingsPanel() {
                 takePlacementMuted: DEFAULT_EDITOR_SETTINGS.render.takePlacementMuted,
                 defaultSavePreset: DEFAULT_EDITOR_SETTINGS.render.defaultSavePreset,
                 maxRenderCacheEntries: DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries,
-                trashRetentionDays: DEFAULT_EDITOR_SETTINGS.render.trashRetentionDays,
-                trashMaxSizeMB: DEFAULT_EDITOR_SETTINGS.render.trashMaxSizeMB,
             },
             batchRender: DEFAULT_EDITOR_SETTINGS.batchRender,
         })
@@ -1752,11 +1721,55 @@ function showSettingsPanel() {
         () => this._settings.gallery.artifactInspectorExpanded,
         (checked) => updateCategory("gallery", "artifactInspectorExpanded", checked)
     );
+    createCheckbox(
+        gallerySection,
+        "galleryStickyFolderHeaders",
+        "Sticky Folder Headers",
+        "Keep the current Root, folder, or Trash header visible while scrolling the gallery.",
+        () => this._settings.gallery.stickyFolderHeaders !== false,
+        (checked) => updateCategory("gallery", "stickyFolderHeaders", checked)
+    );
+    createNumberInput(
+        gallerySection,
+        "trashRetentionDays",
+        "Trash Retention Days",
+        "Hard-delete trashed assets after this many days during asset refresh/open sync.",
+        {
+            min: 0,
+            max: 36500,
+            step: 1,
+            getter: () => this._trashRetentionDays(),
+            onChange: (value) => updateCategory("render", "trashRetentionDays", Math.max(0, Math.round(value))),
+        }
+    );
+    createPresetNumberInput(
+        gallerySection,
+        "trashMaxSizeMB",
+        "Trash Max Size",
+        "Optional decimal-MB cap for trashed asset source files. Oldest trash is purged first during asset refresh/open sync.",
+        {
+            options: TRASH_SIZE_MB_PRESETS,
+            min: 0,
+            max: 100000000,
+            step: 0.1,
+            integer: false,
+            allowNull: true,
+            customDefault: 250,
+            getter: () => this._settings.render?.trashMaxSizeMB ?? null,
+            onChange: (value) => updateCategory("render", "trashMaxSizeMB", value),
+        }
+    );
     addSectionReset(
         gallerySection,
         "Reset Gallery Section",
-        "Restore gallery sort, scope, view, thumbnail, and inspector defaults.",
-        () => this._updateSettings({ gallery: DEFAULT_EDITOR_SETTINGS.gallery })
+        "Restore gallery sort, scope, view, thumbnail, inspector, sticky-header, and trash-cleanup defaults.",
+        () => this._updateSettings({
+            gallery: DEFAULT_EDITOR_SETTINGS.gallery,
+            render: {
+                trashRetentionDays: DEFAULT_EDITOR_SETTINGS.render.trashRetentionDays,
+                trashMaxSizeMB: DEFAULT_EDITOR_SETTINGS.render.trashMaxSizeMB,
+            },
+        })
     );
 
     backdrop.appendChild(panel);
