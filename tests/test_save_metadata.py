@@ -250,3 +250,46 @@ def test_png_sequence_only_first_asset_advertises_embedded_workflow(tmp_path, mo
         assert "workflow" in image.info
     with Image.open(later_path) as image:
         assert "workflow" not in image.info
+
+
+def test_png_sequence_runs_prediction_gated_frame_check_before_return(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    calls = []
+    _patch_save_deps(io_nodes, monkeypatch, calls)
+    project = _project(tmp_path)
+    project._execution_context = {
+        "guide_injection": {
+            "predicted_unresolved": True,
+            "frame_count": 1,
+            "frame_constraint": {"step": 8, "offset": 1},
+            "max_excess_latents": 1,
+            "entries": [],
+        }
+    }
+    observed = []
+    monkeypatch.setattr(
+        io_nodes,
+        "_record_guide_bleed_if_needed",
+        lambda check, actual, path: observed.append((check, actual, path)) or False,
+    )
+
+    io_nodes.SonderSaveVideo().save_video(
+        project,
+        torch.zeros(1, 2, 2, 3),
+        save_preset=io_nodes.CUSTOM_SAVE_VIDEO_PRESET,
+        custom_output_kind=io_nodes.CUSTOM_OUTPUT_KIND_PNG_SEQUENCE,
+    )
+
+    assert observed == [(
+        {
+            "armed": True,
+            "expected_frame_count": 1,
+            "step": 8,
+            "max_excess_latents": 1,
+            "guide_ids": [],
+            "project_id": project.project_id,
+        },
+        1,
+        "save_video_tensor",
+    )]

@@ -196,7 +196,9 @@ def _filtered_guides(project):
 
     ctx = getattr(project, "_execution_context", None) or {}
     queue_job = None
-    queue_job_id = ctx.get("queue_job_id", "")
+    # Snapshot readers use the peek+consume reference. queue_job_id is the
+    # consume-only completion handle and is deliberately empty on peek runs.
+    queue_job_id = ctx.get("queue_job_ref_id", "")
     if queue_job_id:
         for job in getattr(project, "generation_queue", []) or []:
             if getattr(job, "job_id", "") == queue_job_id:
@@ -205,10 +207,13 @@ def _filtered_guides(project):
 
     snapshot_version = _queue_snapshot_version(queue_job) if queue_job else 0
     if queue_job and snapshot_version > 0:
-        guides_src = [
-            GuideFrame.from_dict(g) for g in getattr(queue_job, "guide_frame_snapshots", [])
-            if isinstance(g, dict)
-        ]
+        guides_src = []
+        for guide_index, guide in enumerate(getattr(queue_job, "guide_frame_snapshots", []) or []):
+            if not isinstance(guide, dict):
+                continue
+            guide_data = dict(guide)
+            guide_data["guide_id"] = str(guide_data.get("guide_id") or f"legacy-guide-{guide_index}")
+            guides_src.append(GuideFrame.from_dict(guide_data))
         live_guide_track_hidden = False
     else:
         guides_src = list(getattr(scene, "guide_frames", []) or [])
@@ -231,7 +236,8 @@ def _filtered_guides(project):
         )
         if not os.path.isfile(asset_path):
             continue
-        out.append({
+        item = {
+            "guide_id": str(getattr(guide, "guide_id", "") or ""),
             "guide_key": _bridge_guide_key(getattr(guide, "asset_id", ""), idx),
             "local_idx": idx - render_start,
             "frame_index": idx,
@@ -242,7 +248,23 @@ def _filtered_guides(project):
             "editor_muted": live_guide_track_hidden or bool(getattr(guide, "muted", False)),
             "fit_mode": getattr(guide, "fit_mode", "pad_edge"),
             "crop_position": getattr(guide, "crop_position", "center"),
-        })
+        }
+        manifest = ctx.get("guide_injection") if isinstance(ctx, dict) else None
+        if isinstance(manifest, dict) and manifest.get("auto_offset_enabled") is True:
+            guide_id = item["guide_id"]
+            entry = next(
+                (
+                    candidate for candidate in (manifest.get("entries") or [])
+                    if isinstance(candidate, dict) and str(candidate.get("guide_id") or "") == guide_id
+                ),
+                None,
+            )
+            if entry is not None:
+                try:
+                    item["local_idx"] = int(entry.get("effective_local_idx", item["local_idx"]))
+                except (TypeError, ValueError):
+                    pass
+        out.append(item)
     return out
 
 

@@ -2984,3 +2984,75 @@ def test_load_scene_audio_skips_failed_track_and_keeps_good_mix(tmp_path, monkey
     assert torch.allclose(mixed, torch.from_numpy(good_samples))
     assert "Failed to decode/mix scene audio track" in caplog.text
     assert "bad.wav" in caplog.text
+
+
+def test_execute_applies_guide_driver_collision_manifest(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    torch = pytest.importorskip("torch")
+
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    (media_dir / "guide.png").write_bytes(b"guide")
+    (media_dir / "driver.mp4").write_bytes(b"driver")
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        fps=24.0,
+        resolution=(8, 8),
+        template_id="ltx",
+        frame_constraint={"step": 8, "offset": 1},
+    )
+    project.assets = [
+        timeline_state.Asset(asset_id="guide-asset", asset_type="image", path="media/guide.png"),
+        timeline_state.Asset(asset_id="driver-asset", asset_type="video", path="media/driver.mp4"),
+    ]
+    scene = timeline_state.Scene(scene_id="scene", duration_frames=121)
+    scene.guide_frames = [
+        timeline_state.GuideFrame(guide_id="guide-1", frame_index=0, asset_id="guide-asset")
+    ]
+    scene.clips = [
+        timeline_state.ClipReference(
+            clip_id="driver-1",
+            source_path="media/driver.mp4",
+            timeline_start_frame=0,
+            timeline_end_frame=121,
+            role="motion_driver",
+            track_index=0,
+        )
+    ]
+    project.scenes = [scene]
+    monkeypatch.setattr(editor_node, "load_project", lambda _path: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, active_scene, start, end, **kwargs: torch.zeros(end - start, 8, 8, 3),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, active_scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_guide_image",
+        lambda self, *args, **kwargs: torch.zeros(8, 8, 3),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=8,
+        height=8,
+        scene_id="scene",
+        selection_start=0,
+        selection_end=121,
+        render_queue_active=False,
+    )
+
+    assert result[3] == "2"
+    manifest = result[0]._execution_context["guide_injection"]
+    assert manifest["entries"][0]["original_local_idx"] == 0
+    assert manifest["entries"][0]["effective_local_idx"] == 2
+    assert manifest["predicted_unresolved"] is False

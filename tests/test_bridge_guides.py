@@ -151,6 +151,47 @@ def test_filtered_guides_respects_render_window(tmp_path, monkeypatch):
     assert local_indices == [1, 3]
 
 
+def test_filtered_guides_peek_uses_queue_job_ref_snapshot_and_manifest(tmp_path, monkeypatch):
+    bridge, ts, project, scene = _make_project_with_guides(
+        tmp_path, monkeypatch,
+        [
+            {"frame_index": 2, "asset_id": "live"},
+            {"frame_index": 5, "asset_id": "frozen"},
+        ],
+    )
+    frozen = scene.guide_frames[1]
+    scene.guide_frames = [scene.guide_frames[0]]
+    job = ts.GenerationJob(
+        job_id="job-peek",
+        scene_id=scene.scene_id,
+        selection_start=0,
+        selection_end=scene.duration_frames,
+        guide_frame_snapshots=[frozen.to_dict()],
+        params={"snapshot_version": 1},
+    )
+    project.generation_queue = [job]
+    project._execution_context = {
+        "scene_id": scene.scene_id,
+        "context_start": 0,
+        "context_end": scene.duration_frames,
+        "queue_job_id": "",
+        "queue_job_ref_id": job.job_id,
+        "guide_injection": {
+            "auto_offset_enabled": True,
+            "entries": [{
+                "guide_id": frozen.guide_id,
+                "original_local_idx": 5,
+                "effective_local_idx": 7,
+                "collided": True,
+            }],
+        },
+    }
+
+    guides = bridge._filtered_guides(project)
+
+    assert [(guide["asset_id"], guide["local_idx"]) for guide in guides] == [("frozen", 7)]
+
+
 # ── Start: -1 frame_index resolves to last frame ──────────────────────
 def test_negative_one_resolves_last_frame(tmp_path, monkeypatch):
     bridge, _ts, project, scene = _make_project_with_guides(

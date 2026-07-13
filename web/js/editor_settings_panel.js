@@ -221,6 +221,7 @@ function syncSettingsPanelControls() {
     if (controls.guideSnapshotMaxLongEdge) controls.guideSnapshotMaxLongEdge.value = String(this._settings.guides?.guideSnapshotMaxLongEdge ?? 0);
     if (controls.hoverPreviewEnabled) controls.hoverPreviewEnabled.checked = this._settings.guides?.hoverPreviewEnabled ?? true;
     if (controls.hoverPreviewSize) controls.hoverPreviewSize.value = String(this._guideHoverPreviewSize());
+    if (controls.guideCollisionAutoOffset) controls.guideCollisionAutoOffset.checked = this._guideCollisionAutoOffset !== false;
     for (const sync of controls._syncPresetNumberControls || []) {
         sync();
     }
@@ -1252,7 +1253,17 @@ function showSettingsPanel() {
 
     const guidesSection = createSection(
         "Guides",
-        "Guide capture defaults for clip-frame extraction."
+        "Guide capture preferences and project-wide guide injection behavior."
+    );
+    createCheckbox(
+        guidesSection,
+        "guideCollisionAutoOffset",
+        "Collision Auto-Offset (project-wide)",
+        "Move single-image guides to the nearest free temporal coordinate when a Driver or guide occupies the same LTX RoPE slot. Defaults on, affects render output, freezes per queued job, and is saved into the project.",
+        () => this._guideCollisionAutoOffset !== false,
+        (checked) => {
+            Promise.resolve(this._toggleGuideCollisionAutoOffset(checked)).catch(() => {});
+        }
     );
     createNumberInput(
         guidesSection,
@@ -1294,7 +1305,7 @@ function showSettingsPanel() {
     addSectionReset(
         guidesSection,
         "Reset Guides Section",
-        "Restore guide snapshot and hover preview defaults.",
+        "Restore browser-local guide snapshot and hover preview defaults. The project-wide collision toggle is unchanged.",
         () => this._updateSettings({ guides: DEFAULT_EDITOR_SETTINGS.guides })
     );
 

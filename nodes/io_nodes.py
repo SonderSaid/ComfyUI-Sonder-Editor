@@ -47,6 +47,8 @@ from ..server.color_correction import (
     fit_drift_correction,
     transform_tensor_to_uint8_frames,
 )
+from ..server.guide_collision import check_frame_count_excess
+from ..server.session_registry import record_diag_event
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
     CUSTOM_CONTAINER_OPTIONS,
@@ -200,7 +202,75 @@ def _compact_editor_export(project, context: dict, *, has_embedded_workflow=Fals
     digest = _workflow_digest(workflow) if has_embedded_workflow else ""
     if digest:
         export["workflow_sha256"] = digest
+    manifest = context.get("guide_injection") if isinstance(context, dict) else None
+    if isinstance(manifest, dict) and (
+        int(manifest.get("collision_count", 0) or 0) > 0
+        or int(manifest.get("driver_driver_collision_count", 0) or 0) > 0
+    ):
+        detected = [
+            {
+                "guide_id": str(entry.get("guide_id") or ""),
+                "from": int(entry.get("original_local_idx", 0) or 0),
+                "to": int(entry.get("effective_local_idx", 0) or 0),
+                "collided_with": str(entry.get("collided_with") or ""),
+            }
+            for entry in (manifest.get("entries") or [])
+            if isinstance(entry, dict) and entry.get("collided") is True
+        ]
+        enabled = manifest.get("auto_offset_enabled") is True
+        export["guide_collision"] = {
+            "enabled": enabled,
+            "applied": detected if enabled else [],
+            "detected": detected,
+            "driver_driver_collision_count": int(manifest.get("driver_driver_collision_count", 0) or 0),
+            "predicted_unresolved": manifest.get("predicted_unresolved") is True,
+        }
     return export
+
+
+def _guide_bleed_check_from_context(context: dict, project_id: str = "") -> dict:
+    manifest = context.get("guide_injection") if isinstance(context, dict) else None
+    if not isinstance(manifest, dict):
+        return {"armed": False}
+    constraint = manifest.get("frame_constraint")
+    constraint = constraint if isinstance(constraint, dict) else {}
+    return {
+        "armed": manifest.get("predicted_unresolved") is True,
+        "expected_frame_count": int(manifest.get("frame_count", context.get("frame_count", 0)) or 0),
+        "step": int(constraint.get("step", 1) or 1),
+        "max_excess_latents": int(manifest.get("max_excess_latents", 0) or 0),
+        "guide_ids": [
+            str(entry.get("guide_id") or "") for entry in (manifest.get("entries") or [])
+            if isinstance(entry, dict) and entry.get("collided") is True
+        ],
+        "project_id": str(project_id or ""),
+    }
+
+
+def _record_guide_bleed_if_needed(check: dict, actual_frame_count: int, path: str) -> bool:
+    if not isinstance(check, dict) or check.get("armed") is not True:
+        return False
+    expected = int(check.get("expected_frame_count", 0) or 0)
+    actual = int(actual_frame_count or 0)
+    if not check_frame_count_excess(
+        expected, actual, int(check.get("step", 1) or 1),
+        int(check.get("max_excess_latents", 0) or 0),
+    ):
+        return False
+    details = {
+        "path": str(path or ""),
+        "expected_frame_count": expected,
+        "actual_frame_count": actual,
+        "excess_frames": actual - expected,
+        "guide_ids": list(check.get("guide_ids") or []),
+    }
+    logger.warning("guide bleed suspected: %s", details)
+    record_diag_event(
+        "guide_bleed_suspected",
+        project_id=str(check.get("project_id") or ""),
+        **details,
+    )
+    return True
 
 
 def _bridge_generation_params(project, context: dict, prompt=None, consumer_unique_id=None) -> dict:
@@ -1166,6 +1236,12 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
             except OSError:
                 logger.warning("Failed to remove unregistered bridge output %s", moved_path)
             continue
+        if asset_type == "video":
+            _record_guide_bleed_if_needed(
+                entry.get("guide_bleed_check") or {},
+                int(metadata.get("frame_count", 0) or 0),
+                "bridge",
+            )
         generation_params = _generation_params_with_detected_workflow(
             dict(entry.get("generation_params") or {}),
             moved_path,
@@ -1486,6 +1562,13 @@ class SonderSaveVideo:
             if bool(color_drift_correction):
                 logger.info("color drift correction skipped: %s", drift_record.get("skip_reason"))
             rgb_frames = tensor_to_uint8_frames(frames, mode=tensor_mode)
+        _record_guide_bleed_if_needed(
+            _guide_bleed_check_from_context(
+                execution_context, str(getattr(project, "project_id", "") or "")
+            ),
+            len(rgb_frames),
+            "save_video_tensor",
+        )
         h, w = rgb_frames[0].shape[:2]
         workflow = _workflow_from_extra_pnginfo(extra_pnginfo)
         embed_metadata_enabled = bool(embed_metadata)
@@ -1888,6 +1971,9 @@ class SonderSaveBridge:
             "generation_params": generation_params,
             "naming_stem": naming_stem,
             "base_modified_at": str(execution_context.get("base_modified_at") or ""),
+            "guide_bleed_check": _guide_bleed_check_from_context(
+                execution_context, str(getattr(project, "project_id", "") or "")
+            ),
         }
 
         with _BRIDGE_REGISTRY_LOCK:

@@ -604,6 +604,7 @@ export class EditorWidget {
         this.sceneWidth = DEFAULT_EDITOR_SETTINGS.projectDefaults.width;
         this.sceneHeight = DEFAULT_EDITOR_SETTINGS.projectDefaults.height;
         this._promptChannelLabels = false;
+        this._guideCollisionAutoOffset = true;
         this._promptSectionDelimiter = ".";
         this._promptFrameThreshold = 10;
         this._serverSettings = null;
@@ -4967,11 +4968,13 @@ export class EditorWidget {
             get _promptChannelLabels() { return editor._promptChannelLabels; },
             get _promptSectionDelimiter() { return editor._promptSectionDelimiter; },
             get _promptFrameThreshold() { return editor._promptFrameThreshold; },
+            get _guideCollisionAutoOffset() { return editor._guideCollisionAutoOffset; },
             get _serverSettings() { return editor._serverSettings; },
             get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
             _loadServerSettings: () => editor._loadServerSettings(),
             _setAllowExternalProjectLinks: (enabled) => editor._setAllowExternalProjectLinks(enabled),
             _togglePromptChannelLabels: (on) => editor._togglePromptChannelLabels(on),
+            _toggleGuideCollisionAutoOffset: (on) => editor._toggleGuideCollisionAutoOffset(on),
             _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
             _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
             _keyboardConsumerId: (suffix) => editor._keyboardConsumerId(suffix),
@@ -11666,6 +11669,46 @@ export class EditorWidget {
         this._showContextMenu(rect.left, rect.bottom + 4, items);
     }
 
+    /** Project-durable render-affecting guide collision policy. Snapshot jobs
+     * freeze it at enqueue so queued execution stays reproducible. */
+    async _toggleGuideCollisionAutoOffset(on) {
+        const dirName = this._projectDirName();
+        if (!dirName) return;
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ metadata: { guide_collision_auto_offset: !!on } }),
+                },
+                { projectId: dirName }
+            );
+            this._guideCollisionAutoOffset = !!on;
+            this._syncSettingsPanelControls();
+        } catch (e) {
+            this._syncSettingsPanelControls();
+            notifyWarning(e?.message || "Failed to update guide collision auto-offset.", {
+                source: "guide-collision-toggle-refused",
+            });
+            throw e;
+        }
+    }
+
+    _warnForGuideCollisionPredictions(jobs) {
+        const predictions = (Array.isArray(jobs) ? jobs : [jobs])
+            .map((job) => job?.params?.guide_collision_prediction)
+            .filter((value) => value && value.predicted_unresolved === true);
+        if (!predictions.length) return;
+        const driverCollisions = predictions.reduce(
+            (total, value) => total + (parseInt(value.driver_driver_collision_count, 10) || 0), 0
+        );
+        const message = driverCollisions > 0
+            ? "Multiple drivers share LTX temporal coordinates. Drivers are not moved; disable or reposition one to avoid guide-crop undercount and tail bleed."
+            : "A guide shares an LTX temporal coordinate with another injection. Enable guide collision auto-offset or move the guide to avoid tail bleed.";
+        notifyWarning(message, { source: "guide-collision-predicted" });
+    }
+
     _projectFolderName(project) {
         return String(project?.path || "").split(/[/\\]/).pop() || "";
     }
@@ -13526,6 +13569,7 @@ export class EditorWidget {
             });
             const createdJob = result?.payload;
             if (createdJob?.job_id) {
+                this._warnForGuideCollisionPredictions(createdJob);
                 this._renderQueue = (this._renderQueue || []).map((job) => job.job_id === tempId ? createdJob : job);
                 this._flashQueueButton(this._queueBtn);
                 this._applyStoredQueueBatchCollapseState();
@@ -13620,6 +13664,7 @@ export class EditorWidget {
             });
             const payload = result?.payload || {};
             const createdJobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
+            this._warnForGuideCollisionPredictions(createdJobs);
             this._renderQueue = (this._renderQueue || []).map((job) => {
                 if (!tempIds.has(job.job_id)) return job;
                 const tempIndex = tempJobs.findIndex((temp) => temp.job_id === job.job_id);
@@ -14125,6 +14170,7 @@ export class EditorWidget {
                 this._templateId = getTemplateById(data.template_id, this._settings).id;
                 // Project-durable channel-labels toggle (render-affecting; default off)
                 this._promptChannelLabels = data.metadata?.prompt_channel_labels === true;
+                this._guideCollisionAutoOffset = data.metadata?.guide_collision_auto_offset !== false;
                 // Project-durable section-seam delimiter (render-affecting; default ".")
                 this._promptSectionDelimiter = String(data.metadata?.prompt_section_delimiter ?? ".");
                 // Project-durable boundary-spill threshold % (render-affecting; default 10)

@@ -17,7 +17,8 @@ import folder_paths
 
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server import external_links
-from ..server.timeline_state import GuideFrame, TimelineProject, Scene
+from ..server.timeline_state import ClipReference, GuideFrame, TimelineProject, Scene
+from ..server.guide_collision import resolve_execution_window, resolve_guide_collisions
 from ..server.media_helpers import (
     CROP_POSITIONS,
     DEFAULT_CROP_POSITION,
@@ -724,9 +725,6 @@ class SonderEditor:
             # context extends the render range to include surrounding frames for temporal consistency
             generation_start = render_start
             generation_end = render_end
-            actual_pre = min(pre_context_frames, generation_start)
-            actual_post = min(post_context_frames, scene.duration_frames - generation_end)
-
             template_id = self._execution_template_id(proj, queue_job)
             frame_constraint = self._execution_frame_constraint(proj, queue_job)
 
@@ -743,44 +741,28 @@ class SonderEditor:
             # `_snap_pixel_to_constraint` helper below fires on the mask boundary as a
             # last resort. In the common case the helper is a no-op since boundaries
             # are already on grid by construction.
-            if frame_constraint and _coerce_int(frame_constraint.get("step"), 1) > 1:
-                step = max(1, _coerce_int(frame_constraint.get("step"), 1))
-                # 1. actual_pre -> next G value (when pre > 0).
-                if actual_pre > 0:
-                    grid_aligned_pre = self._snap_pixel_to_constraint(
-                        actual_pre, frame_constraint, "end"
-                    )
-                    pre_extension = max(0, grid_aligned_pre - actual_pre)
-                    if pre_extension <= (generation_start - actual_pre):
-                        actual_pre += pre_extension
-                # 2. actual_post -> next multiple of step.
-                post_remainder = actual_post % step
-                post_extension = (step - post_remainder) % step
-                if post_extension <= (scene.duration_frames - generation_end - actual_post):
-                    actual_post += post_extension
-                # 3 & 4. Mask offsets snap to their valid sets within the (now snapped)
-                # context caps. These calls absorb the previous pre-snap clamp.
-                mask_pre_offset = self._snap_mask_pre_offset_up(
-                    mask_pre_offset, actual_pre, step
-                )
-                mask_post_offset = self._snap_mask_post_offset_up(
-                    mask_post_offset, actual_post, step
-                )
-            else:
-                # No template constraint: just clamp offsets to context bounds (old behavior).
-                mask_pre_offset = max(0, min(mask_pre_offset, actual_pre))
-                mask_post_offset = max(0, min(mask_post_offset, actual_post))
-
-            if actual_pre > 0 or actual_post > 0:
-                render_start = generation_start - actual_pre
-                render_end = generation_end + actual_post
-
+            execution_window = resolve_execution_window(
+                scene_duration=scene.duration_frames,
+                selection_start=generation_start,
+                selection_end=generation_end,
+                pre_context_frames=pre_context_frames,
+                post_context_frames=post_context_frames,
+                mask_pre_offset=mask_pre_offset,
+                mask_post_offset=mask_post_offset,
+                frame_constraint=frame_constraint,
+            )
+            actual_pre = execution_window["actual_pre"]
+            actual_post = execution_window["actual_post"]
+            mask_pre_offset = execution_window["mask_pre_offset"]
+            mask_post_offset = execution_window["mask_post_offset"]
+            render_start = execution_window["render_start"]
+            render_end = execution_window["render_end"]
             context_start = render_start
             context_end = render_end
-            source_frame_count = render_end - render_start
+            source_frame_count = execution_window["source_frame_count"]
             frame_count = source_frame_count
-            target_frame_count = self._round_up_frame_count(frame_count, frame_constraint)
-            frame_count_padding = max(0, target_frame_count - frame_count)
+            target_frame_count = execution_window["frame_count"]
+            frame_count_padding = execution_window["frame_count_padding"]
             logger.info(
                 "render frame plan: scene_id=%s template=%s constraint=%s source_frames=%d padded_frames=%d padding=%d",
                 scene.scene_id,
@@ -829,18 +811,151 @@ class SonderEditor:
             guide_images = []
             guide_indices = []
             guide_strengths = []
-            guide_frames = scene.guide_frames
+            guide_frames = list(scene.guide_frames)
+            guide_track_hidden = bool(getattr(getattr(scene, "guide_track_config", None), "hidden", False))
             if queue_job and snapshot_version > 0:
-                guide_frames = [
-                    GuideFrame.from_dict(guide)
-                    for guide in getattr(queue_job, "guide_frame_snapshots", [])
-                    if isinstance(guide, dict)
-                ]
-            elif getattr(getattr(scene, "guide_track_config", None), "hidden", False):
                 guide_frames = []
+                for guide_index, guide in enumerate(getattr(queue_job, "guide_frame_snapshots", []) or []):
+                    if not isinstance(guide, dict):
+                        continue
+                    guide_data = dict(guide)
+                    guide_data["guide_id"] = str(guide_data.get("guide_id") or f"legacy-guide-{guide_index}")
+                    guide_frames.append(GuideFrame.from_dict(guide_data))
+                guide_track_hidden = False
+
+            proj_metadata = getattr(proj, "metadata", None)
+            proj_metadata = proj_metadata if isinstance(proj_metadata, dict) else {}
+            auto_offset_enabled = proj_metadata.get("guide_collision_auto_offset", True) is not False
+            if queue_job:
+                job_params = getattr(queue_job, "params", {}) or {}
+                if isinstance(job_params, dict) and "guide_collision_auto_offset" in job_params:
+                    auto_offset_enabled = job_params.get("guide_collision_auto_offset") is not False
+
+            structural_guides = []
+            guide_identity_by_object = {}
+            seen_guide_ids = set()
+            for guide_index, guide in enumerate(guide_frames):
+                idx = _coerce_int(getattr(guide, "frame_index", 0), 0)
+                if idx == -1:
+                    idx = scene.duration_frames - 1
+                if not (render_start <= idx < render_end):
+                    continue
+                asset = proj.get_asset(getattr(guide, "asset_id", ""))
+                if asset is None:
+                    continue
+                asset_path = resolve_existing_project_path(
+                    proj, asset.path,
+                    purpose=f"guide asset {getattr(asset, 'asset_id', '') or '(unknown)'}",
+                )
+                if not asset_path or not os.path.isfile(asset_path):
+                    continue
+                guide_id = str(getattr(guide, "guide_id", "") or f"legacy-guide-{guide_index}")
+                if guide_id in seen_guide_ids:
+                    guide_id = f"{guide_id}#{guide_index}"
+                    logger.warning("duplicate guide_id normalized for execution: %s", guide_id)
+                seen_guide_ids.add(guide_id)
+                guide_identity_by_object[id(guide)] = guide_id
+                structural_guides.append({
+                    "guide_id": guide_id,
+                    "bridge_override_key": f"{getattr(guide, 'asset_id', '')}:{idx}",
+                    "local_idx": idx - render_start,
+                })
+
+            structural_drivers = []
+            driver_source = list(getattr(scene, "clips", []) or [])
+            if queue_job and snapshot_version > 0:
+                driver_source = [
+                    ClipReference.from_dict(item)
+                    for item in (getattr(queue_job, "driver_clip_snapshots", []) or [])
+                    if isinstance(item, dict)
+                ]
+            for driver in driver_source:
+                if getattr(driver, "role", "render") != "motion_driver":
+                    continue
+                overlap_start = max(_coerce_int(getattr(driver, "timeline_start_frame", 0)), render_start)
+                overlap_end = min(_coerce_int(getattr(driver, "timeline_end_frame", 0)), render_end)
+                if overlap_end <= overlap_start:
+                    continue
+                asset_lookup = getattr(proj, "asset_for_source_path", None)
+                asset = asset_lookup(getattr(driver, "source_path", "") or "") if callable(asset_lookup) else None
+                if asset is None or getattr(asset, "asset_type", "") != "video":
+                    continue
+                driver_path = resolve_existing_project_path(
+                    proj, asset.path,
+                    purpose=f"driver asset {getattr(asset, 'asset_id', '') or '(unknown)'}",
+                )
+                if not driver_path or not os.path.isfile(driver_path):
+                    continue
+                structural_drivers.append({
+                    "clip_id": str(getattr(driver, "clip_id", "") or ""),
+                    "lane_index": _coerce_int(getattr(driver, "track_index", 0)),
+                    "local_idx": overlap_start - render_start,
+                    "pixel_len": overlap_end - overlap_start,
+                })
+
+            guide_injection = resolve_guide_collisions(
+                guides=structural_guides,
+                drivers=structural_drivers,
+                frame_count=target_frame_count,
+                frame_constraint=frame_constraint,
+                auto_offset_enabled=auto_offset_enabled,
+            )
+            guide_injection.update({
+                "schema": "sonder_guide_injection_v1",
+                "auto_offset_enabled": bool(auto_offset_enabled),
+                "frame_constraint": dict(frame_constraint) if isinstance(frame_constraint, dict) else None,
+                "frame_count": target_frame_count,
+            })
+            guide_entry_by_id = {
+                entry.get("guide_id"): entry for entry in guide_injection.get("entries", [])
+            }
+            for entry in guide_injection.get("entries", []):
+                if entry.get("collided") and auto_offset_enabled:
+                    logger.info(
+                        "guide auto-offset: guide=%s %s -> %s collider=%s",
+                        entry.get("guide_id"), entry.get("original_local_idx"),
+                        entry.get("effective_local_idx"), entry.get("collided_with"),
+                    )
+            if guide_injection.get("predicted_unresolved"):
+                logger.warning(
+                    "unresolved guide/driver coordinate collisions predicted: count=%s auto_offset=%s",
+                    guide_injection.get("unresolved_collision_count", 0), auto_offset_enabled,
+                )
+            # Best-effort graph warning only. CSV outputs and Guides Bridge are
+            # alternative injection paths; using both duplicates the actual
+            # graph injection even though the logical guide manifest is stable.
+            if isinstance(prompt, dict) and unique_id is not None:
+                editor_id = str(unique_id)
+                csv_guide_outputs_used = False
+                guides_bridge_used = False
+                for node_data in prompt.values():
+                    if not isinstance(node_data, dict):
+                        continue
+                    inputs = node_data.get("inputs") or {}
+                    if not isinstance(inputs, dict):
+                        continue
+                    for value in inputs.values():
+                        if (
+                            isinstance(value, (list, tuple)) and len(value) >= 2
+                            and str(value[0]) == editor_id
+                            and _coerce_int(value[1], -1) in {2, 3, 4}
+                        ):
+                            csv_guide_outputs_used = True
+                    if str(node_data.get("class_type") or "") == "SonderGuidesBridgeStart":
+                        project_link = inputs.get("project")
+                        if (
+                            isinstance(project_link, (list, tuple)) and len(project_link) >= 2
+                            and str(project_link[0]) == editor_id
+                        ):
+                            guides_bridge_used = True
+                if csv_guide_outputs_used and guides_bridge_used:
+                    logger.warning(
+                        "Both SonderEditor guide CSV outputs and SonderGuidesBridgeStart are wired; "
+                        "these are alternative injection paths and duplicate guide injection is unsupported."
+                    )
 
             for guide in guide_frames:
-                if getattr(guide, "muted", False):
+                if guide_track_hidden or getattr(guide, "muted", False):
                     continue
                 idx = guide.frame_index
                 if idx == -1:
@@ -864,6 +979,9 @@ class SonderEditor:
                             if img is not None:
                                 guide_images.append(img)
                                 local_idx = idx - render_start
+                                entry = guide_entry_by_id.get(guide_identity_by_object.get(id(guide), ""))
+                                if entry and auto_offset_enabled:
+                                    local_idx = _coerce_int(entry.get("effective_local_idx"), local_idx)
                                 guide_indices.append(str(local_idx))
                                 guide_strengths.append(f"{getattr(guide, 'strength', 1.0):.4f}")
 
@@ -960,6 +1078,7 @@ class SonderEditor:
                 "take_fit_mode": take_fit_mode,
                 "take_crop_position": take_crop_position,
                 "prompt": prompt_text,
+                "guide_injection": guide_injection,
                 # Consume-only completion handle for save nodes — do NOT set on peek
                 "queue_job_id": queue_job.job_id if queue_job and queue_job_consumed else "",
                 # Snapshot reference for read-only consumers (prompt relay bridge):

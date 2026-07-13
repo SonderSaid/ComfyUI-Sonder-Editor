@@ -39,6 +39,7 @@ from .path_security import (
     project_media_path,
     project_media_root,
     resolve_comfy_input_path,
+    resolve_existing_project_path,
     resolve_project_path,
     resolve_static_path,
     safe_route_token as _security_safe_route_token,
@@ -81,6 +82,7 @@ from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, gener
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 from . import external_links
 from . import prompt_payload
+from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
 logger = logging.getLogger("sonder_editor")
 _TIMELINE_EXPORTS = TimelineExportManager()
@@ -2562,6 +2564,123 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         labels_on=labels_on, delimiter=delimiter,
         boundary_threshold_pct=threshold,
     )
+
+
+def _freeze_guide_collision_param(project: TimelineProject, job: GenerationJob) -> None:
+    """Freeze the render-affecting project toggle into snapshot jobs."""
+    params = getattr(job, "params", {}) or {}
+    if not isinstance(params, dict):
+        params = {}
+    try:
+        snapshot_version = int(params.get("snapshot_version", 0) or 0)
+    except (TypeError, ValueError):
+        snapshot_version = 0
+    if snapshot_version <= 0:
+        return
+    metadata = getattr(project, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    params["guide_collision_auto_offset"] = metadata.get("guide_collision_auto_offset", True) is not False
+    job.params = params
+
+
+def _queue_guide_collision_prediction(project: TimelineProject, job: GenerationJob) -> None:
+    """Attach the backend-authoritative enqueue collision prediction."""
+    params = getattr(job, "params", {}) or {}
+    if not isinstance(params, dict):
+        return
+    try:
+        snapshot_version = int(params.get("snapshot_version", 0) or 0)
+    except (TypeError, ValueError):
+        snapshot_version = 0
+    if snapshot_version <= 0:
+        return
+    scene = project.get_scene(getattr(job, "scene_id", ""))
+    if scene is None:
+        return
+    window = resolve_execution_window(
+        scene_duration=getattr(scene, "duration_frames", 0),
+        selection_start=getattr(job, "selection_start", 0),
+        selection_end=getattr(job, "selection_end", 0),
+        pre_context_frames=getattr(job, "pre_context_frames", 0),
+        post_context_frames=getattr(job, "post_context_frames", 0),
+        mask_pre_offset=getattr(job, "mask_pre_offset", 0),
+        mask_post_offset=getattr(job, "mask_post_offset", 0),
+        frame_constraint=getattr(job, "frame_constraint", None),
+    )
+    render_start = window["render_start"]
+    render_end = window["render_end"]
+
+    guides = []
+    seen_ids = set()
+    for index, raw in enumerate(getattr(job, "guide_frame_snapshots", []) or []):
+        if not isinstance(raw, dict):
+            continue
+        idx = int(raw.get("frame_index", 0) or 0)
+        if idx == -1:
+            idx = max(0, int(getattr(scene, "duration_frames", 0) or 0) - 1)
+        if not (render_start <= idx < render_end):
+            continue
+        asset = project.get_asset(str(raw.get("asset_id") or ""))
+        if asset is None:
+            continue
+        path = resolve_existing_project_path(
+            project, asset.path, purpose="queue guide collision prediction", log=False
+        )
+        if not path or not os.path.isfile(path):
+            continue
+        guide_id = str(raw.get("guide_id") or f"legacy-guide-{index}")
+        if guide_id in seen_ids:
+            guide_id = f"{guide_id}#{index}"
+        seen_ids.add(guide_id)
+        guides.append({
+            "guide_id": guide_id,
+            "bridge_override_key": f"{raw.get('asset_id', '')}:{idx}",
+            "local_idx": idx - render_start,
+        })
+
+    drivers = []
+    for raw in getattr(job, "driver_clip_snapshots", []) or []:
+        if not isinstance(raw, dict) or str(raw.get("role") or "render") != "motion_driver":
+            continue
+        overlap_start = max(int(raw.get("timeline_start_frame", 0) or 0), render_start)
+        overlap_end = min(int(raw.get("timeline_end_frame", 0) or 0), render_end)
+        if overlap_end <= overlap_start:
+            continue
+        asset_lookup = getattr(project, "asset_for_source_path", None)
+        asset = asset_lookup(str(raw.get("source_path") or "")) if callable(asset_lookup) else None
+        if asset is None or getattr(asset, "asset_type", "") != "video":
+            continue
+        path = resolve_existing_project_path(
+            project, asset.path, purpose="queue driver collision prediction", log=False
+        )
+        if not path or not os.path.isfile(path):
+            continue
+        drivers.append({
+            "clip_id": str(raw.get("clip_id") or ""),
+            "lane_index": int(raw.get("track_index", 0) or 0),
+            "local_idx": overlap_start - render_start,
+            "pixel_len": overlap_end - overlap_start,
+        })
+
+    prediction = resolve_guide_collisions(
+        guides=guides,
+        drivers=drivers,
+        frame_count=window["frame_count"],
+        frame_constraint=getattr(job, "frame_constraint", None),
+        auto_offset_enabled=params.get("guide_collision_auto_offset") is not False,
+    )
+    # Queue rows need the decision and suggested guide moves, not every driver
+    # coordinate. Keep durable snapshot params compact; execution recomputes the
+    # full authoritative manifest from the frozen envelope.
+    prediction.pop("driver_coords", None)
+    prediction.update({
+        "schema": "sonder_guide_injection_v1",
+        "auto_offset_enabled": params.get("guide_collision_auto_offset") is not False,
+        "frame_count": window["frame_count"],
+        "execution_window": window,
+    })
+    params["guide_collision_prediction"] = prediction
+    job.params = params
 
 
 def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
@@ -7683,6 +7802,8 @@ if routes is not None:
         def add_one(project: TimelineProject) -> tuple[bool, dict]:
             job = _queue_job_from_body(body)
             _compose_frozen_job_prompt(project, job)
+            _freeze_guide_collision_param(project, job)
+            _queue_guide_collision_prediction(project, job)
             project.generation_queue.append(job)
             _record_prompt_history(project, [job])
             return True, job.to_dict()
@@ -7716,6 +7837,8 @@ if routes is not None:
             jobs = [_queue_job_from_body(item) for item in raw_jobs]
             for job in jobs:
                 _compose_frozen_job_prompt(project, job)
+                _freeze_guide_collision_param(project, job)
+                _queue_guide_collision_prediction(project, job)
             project.generation_queue.extend(jobs)
             _record_prompt_history(project, jobs)
             return True, {

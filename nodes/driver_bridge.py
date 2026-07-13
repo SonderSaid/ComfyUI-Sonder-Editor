@@ -135,8 +135,11 @@ def _resolve_driver_source(project, scene):
             "lane_count": lane_count,
             "lane_configs": _snapshot_lane_configs(queue_job, lane_count),
             "guides": [
-                GuideFrame.from_dict(item)
-                for item in (getattr(queue_job, "guide_frame_snapshots", []) or [])
+                GuideFrame.from_dict({
+                    **item,
+                    "guide_id": str(item.get("guide_id") or f"legacy-guide-{index}"),
+                })
+                for index, item in enumerate(getattr(queue_job, "guide_frame_snapshots", []) or [])
                 if isinstance(item, dict)
             ],
             "guide_track_hidden": False,
@@ -198,6 +201,15 @@ def _reserved_guide_indices(project, scene, source_info, render_start: int, rend
     if source_info.get("guide_track_hidden"):
         return set()
     reserved = set()
+    ctx = getattr(project, "_execution_context", None) or {}
+    manifest = ctx.get("guide_injection") if isinstance(ctx, dict) else None
+    effective_by_id = {}
+    if isinstance(manifest, dict) and manifest.get("auto_offset_enabled") is True:
+        effective_by_id = {
+            str(entry.get("guide_id") or ""): _coerce_int(entry.get("effective_local_idx"), -1)
+            for entry in (manifest.get("entries") or [])
+            if isinstance(entry, dict) and str(entry.get("guide_id") or "")
+        }
     duration = max(0, _coerce_int(getattr(scene, "duration_frames", 0), 0)) if scene else 0
     for guide in source_info.get("guides", []) or []:
         if bool(getattr(guide, "muted", False)):
@@ -206,7 +218,11 @@ def _reserved_guide_indices(project, scene, source_info, render_start: int, rend
         if idx == -1:
             idx = max(0, duration - 1)
         if render_start <= idx < render_end:
-            reserved.add(idx - render_start)
+            local_idx = idx - render_start
+            guide_id = str(getattr(guide, "guide_id", "") or "")
+            if guide_id in effective_by_id and effective_by_id[guide_id] >= 0:
+                local_idx = effective_by_id[guide_id]
+            reserved.add(local_idx)
     return reserved
 
 

@@ -85,6 +85,50 @@ def _load_saved_project(project_manager, project):
     return project_manager.load_project(project.project_dir)
 
 
+def test_compact_guide_collision_provenance_never_claims_disabled_offset(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    context = {
+        "guide_injection": {
+            "auto_offset_enabled": False,
+            "collision_count": 1,
+            "driver_driver_collision_count": 0,
+            "predicted_unresolved": True,
+            "entries": [{
+                "guide_id": "g1",
+                "original_local_idx": 0,
+                "effective_local_idx": 2,
+                "collided": True,
+                "collided_with": "driver:d1",
+            }],
+        }
+    }
+
+    export = io_nodes._compact_editor_export(project, context)
+
+    assert export["guide_collision"]["applied"] == []
+    assert export["guide_collision"]["detected"][0]["from"] == 0
+    assert export["guide_collision"]["detected"][0]["to"] == 2
+
+
+def test_guide_bleed_diagnostic_is_strictly_armed_and_bounded(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, _project = _make_project(tmp_path, monkeypatch)
+    events = []
+    monkeypatch.setattr(io_nodes, "record_diag_event", lambda kind, **details: events.append((kind, details)))
+    check = {
+        "armed": True,
+        "expected_frame_count": 121,
+        "step": 8,
+        "max_excess_latents": 1,
+        "guide_ids": ["g1"],
+        "project_id": "p1",
+    }
+
+    assert io_nodes._record_guide_bleed_if_needed(check, 129, "test") is True
+    assert events[0][0] == "guide_bleed_suspected"
+    assert io_nodes._record_guide_bleed_if_needed({**check, "armed": False}, 129, "test") is False
+    assert io_nodes._record_guide_bleed_if_needed(check, 137, "test") is False
+
+
 def test_bridge_registers_image_output(tmp_path, monkeypatch):
     io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
     _clear_bridge_state(io_nodes)
