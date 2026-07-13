@@ -254,6 +254,11 @@ import {
 } from "./editor_settings.js";
 import { fetchProjectJson, rememberProjectVersionFromPayload, getProjectVersion } from "./api_client.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
+import {
+    findConstrainedSelectionEndpoint,
+    isSelectionDurationWithinRecommendation,
+    resolveSelectionExecutionWindow,
+} from "./selection_constraints.js";
 
 function describeKeyboardDebugElement(element) {
     if (!element) return "null";
@@ -531,6 +536,10 @@ export class EditorWidget {
         this.totalFrames = this._settings.projectDefaults.newSceneDuration;
         this.selectionStart = 0;
         this.selectionEnd = 0;
+        // UI-only first endpoint for the two-stage manual In/Out workflow.
+        // A draft never enters workflow widgets, browser selection memory,
+        // saved selections, or queue snapshots.
+        this._selectionDraftAnchor = null;
         // Prompt-usage highlight: authored start_frames the live selection
         // window will output (used) vs dropped by the boundary threshold.
         this._promptUsedSections = new Set();
@@ -771,6 +780,10 @@ export class EditorWidget {
             });
             return;
         }
+        // A draft anchor is intentionally local and ephemeral. Any externally
+        // applied widget state supersedes it, even when the update only changes
+        // context or another related workflow field.
+        this._selectionDraftAnchor = null;
         this._applyingWidgetState = true;
         try {
             for (const [name, value] of Object.entries(values)) {
@@ -1183,6 +1196,7 @@ export class EditorWidget {
             : null;
 
         if (!isSameScene) {
+            this._selectionDraftAnchor = null;
             if (this._animaticMode && this._restoreAnimaticState()) {
                 this._saveLaneConfig(this._trackLayout.filter((e) => e.type === TRACK_TYPE.VIDEO));
             }
@@ -2979,7 +2993,7 @@ export class EditorWidget {
     _snapPreContextFrames(value, { direction = "up" } = {}) {
         // Pre context snaps UP to next G value (= step*k + offset, k>=0). 0 stays 0
         // because pre=0 means no pre context — the +1 then lives in the selection
-        // via the existing _snapSelectionFrame path (selection endpoint snap).
+        // length when the second manual endpoint is resolved from its anchor.
         const numeric = Math.max(0, Math.round(Number(value) || 0));
         if (numeric <= 0) return 0;
         const constraint = this._getActiveFrameConstraint();
@@ -3023,21 +3037,40 @@ export class EditorWidget {
         return snapped <= capValue ? snapped : capValue;
     }
 
-    _snapSelectionFrame(value, { direction = "up", clampMax = null } = {}) {
-        const numeric = Math.max(0, Math.round(Number(value) || 0));
-        // Frame 0 is always a valid selection endpoint; template constraint snapping must never push it above 0.
-        if (numeric <= 0) return 0;
-        const constraint = this._getActiveFrameConstraint();
-        if (!constraint?.step) return clampMax != null ? Math.min(numeric, Math.max(0, clampMax)) : numeric;
-        const step = constraint.step;
-        const offset = constraint.offset || 0;
-        const k = (numeric - offset) / step;
-        const rounded = direction === "up" ? Math.ceil(k) : Math.floor(k);
-        let snapped = rounded * step + offset;
-        if (clampMax != null && snapped > clampMax) {
-            snapped = Math.floor((clampMax - offset) / step) * step + offset;
-        }
-        return Math.max(0, snapped);
+    _selectionExecutionWindow(start = this.selectionStart, end = this.selectionEnd) {
+        const sceneDuration = Math.max(
+            0,
+            parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0
+        );
+        return resolveSelectionExecutionWindow({
+            sceneDuration,
+            selectionStart: start,
+            selectionEnd: end,
+            preContextFrames: this._contextFrameValue("pre_context_frames"),
+            postContextFrames: this._contextFrameValue("post_context_frames"),
+            maskPreOffset: this._contextFrameValue("mask_pre_offset"),
+            maskPostOffset: this._contextFrameValue("mask_post_offset"),
+            frameConstraint: this._getActiveFrameConstraint(),
+        });
+    }
+
+    _findManualSelectionEndpoint(edge, anchorFrame, candidateFrame, searchDirection) {
+        const sceneDuration = Math.max(
+            0,
+            parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0
+        );
+        return findConstrainedSelectionEndpoint({
+            edge,
+            anchorFrame,
+            candidateFrame,
+            searchDirection,
+            sceneDuration,
+            preContextFrames: this._contextFrameValue("pre_context_frames"),
+            postContextFrames: this._contextFrameValue("post_context_frames"),
+            maskPreOffset: this._contextFrameValue("mask_pre_offset"),
+            maskPostOffset: this._contextFrameValue("mask_post_offset"),
+            frameConstraint: this._getActiveFrameConstraint(),
+        });
     }
 
     _getActiveTemplate() {
@@ -3516,6 +3549,9 @@ export class EditorWidget {
             return;
         }
         const previousFrameConstraint = this._getActiveFrameConstraint();
+        if (this._selectionDraftAnchor) {
+            this._clearTimelineSelection();
+        }
         this._templateId = nextTemplateId;
         this._rebuildTemplateOptions();
         this._rebuildResolutionTierOptions();
@@ -3746,28 +3782,45 @@ export class EditorWidget {
     _stepSelectionInput(edge, direction) {
         const isStart = edge === "start";
         const input = isStart ? this._selectionStartInput : this._selectionEndInput;
-        const fallback = isStart ? this.selectionStart : this.selectionEnd;
+        const draft = this._selectionDraftAnchor;
+        const fallback = draft && draft.edge !== edge
+            ? draft.frame
+            : (isStart ? this.selectionStart : this.selectionEnd);
         const parsed = this._parsePositionInput(input?.value);
         const current = Number.isFinite(parsed) ? Math.round(parsed) : fallback;
-        const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
-        const nextRaw = current + (direction === "down" ? -1 : 1);
-        const next = this._snapSelectionFrame(nextRaw, { direction, clampMax: maxFrame });
-        if (isStart) {
-            this._setSelectionStartFrame(next);
-        } else {
-            this._setSelectionEndFrame(next);
-        }
+        const coordinateDirection = direction === "down" ? -1 : 1;
+        this._commitManualSelectionEndpoint(edge, current + coordinateDirection, {
+            searchDirection: coordinateDirection,
+        });
     }
 
     _refreshSelectionInputs({ force = false } = {}) {
+        const draft = this._selectionDraftAnchor;
+        const hasSelection = this.selectionStart < this.selectionEnd;
         if (this._selectionStartInput && (force || document.activeElement !== this._selectionStartInput)) {
-            this._selectionStartInput.value = this._formatPositionInput(this.selectionStart);
-            this._selectionStartInput.title = `Selection in-point: ${this._frameToTimecode(this.selectionStart)}`;
+            const value = draft
+                ? (draft.edge === "start" ? this._formatPositionInput(draft.frame) : "")
+                : (hasSelection ? this._formatPositionInput(this.selectionStart) : "");
+            this._selectionStartInput.value = value;
+            this._selectionStartInput.placeholder = !hasSelection && draft?.edge !== "start" ? "Set In" : "";
+            this._selectionStartInput.title = draft?.edge === "end"
+                ? "Choose an In point to complete the selection"
+                : !draft && !hasSelection
+                    ? "Set an In point to start a selection"
+                    : `Selection in-point: ${this._frameToTimecode(draft?.frame ?? this.selectionStart)}`;
         }
         if (this._selectionEndInput && (force || document.activeElement !== this._selectionEndInput)) {
-            this._selectionEndInput.value = this._formatPositionInput(this.selectionEnd);
+            const value = draft
+                ? (draft.edge === "end" ? this._formatPositionInput(draft.frame) : "")
+                : (hasSelection ? this._formatPositionInput(this.selectionEnd) : "");
+            this._selectionEndInput.value = value;
+            this._selectionEndInput.placeholder = !hasSelection && draft?.edge !== "end" ? "Set Out" : "";
             const duration = Math.max(0, this.selectionEnd - this.selectionStart);
-            this._selectionEndInput.title = `Selection out-point: ${this._frameToTimecode(this.selectionEnd)} (${this._frameToTimecode(duration)})`;
+            this._selectionEndInput.title = draft?.edge === "start"
+                ? "Choose an Out point to complete the selection"
+                : !draft && !hasSelection
+                    ? "Set an Out point to start a selection"
+                    : `Selection out-point: ${this._frameToTimecode(draft?.frame ?? this.selectionEnd)} (${this._frameToTimecode(duration)})`;
         }
         this._refreshPlayheadInput({ force });
         this._updateGenReadout();
@@ -3784,6 +3837,14 @@ export class EditorWidget {
     // (selection + context, clamped per-edge like the backend source_frame_count).
     _updateGenReadout() {
         if (!this._genReadout) return;
+        const draft = this._selectionDraftAnchor;
+        if (draft) {
+            const label = draft.edge === "start" ? "In" : "Out";
+            const next = draft.edge === "start" ? "Out" : "In";
+            this._genReadout.textContent = `${label} ${this._frameToTimecode(draft.frame)} set · Choose ${next}`;
+            this._updateGenDurationHint(0);
+            return;
+        }
         const start = Math.max(0, Math.round(Number(this.selectionStart) || 0));
         const end = Math.max(start, Math.round(Number(this.selectionEnd) || 0));
         const selected = end - start;
@@ -3792,15 +3853,18 @@ export class EditorWidget {
             this._updateGenDurationHint(0);
             return;
         }
-        const pre = this._contextFrameValue("pre_context_frames");
-        const post = this._contextFrameValue("post_context_frames");
-        const sceneDur = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
-        const renderStart = Math.max(0, start - pre);
-        const renderEnd = sceneDur ? Math.min(sceneDur, end + post) : (end + post);
-        const source = Math.max(selected, renderEnd - renderStart);
+        const window = this._selectionExecutionWindow(start, end);
+        const source = window.source_frame_count;
+        const tensor = window.frame_count;
+        const padding = window.frame_count_padding;
         const mode = this._timecodeMode === "timecode" ? "timecode" : "frames";
         const unit = mode === "timecode" ? "" : "f";
-        this._genReadout.textContent = `${formatQueueTime(selected, this._effectiveFps, mode)}${unit} · ${formatQueueTime(source, this._effectiveFps, mode)} src`;
+        const paddingText = padding > 0 ? ` (+${padding} pad)` : "";
+        this._genReadout.textContent = [
+            `${formatQueueTime(selected, this._effectiveFps, mode)}${unit} sel`,
+            `${formatQueueTime(source, this._effectiveFps, mode)}${unit} src`,
+            `${formatQueueTime(tensor, this._effectiveFps, mode)}${unit} tensor${paddingText}`,
+        ].join(" · ");
         this._updateGenDurationHint(selected);
     }
 
@@ -3817,9 +3881,13 @@ export class EditorWidget {
             this._genDurationHint.style.display = "none";
             return;
         }
-        const seconds = frames / fps;
-        const epsilon = 1e-6;
-        if (seconds >= band.minSec - epsilon && seconds <= band.maxSec + epsilon) {
+        if (isSelectionDurationWithinRecommendation({
+            frameCount: frames,
+            fps,
+            minSec: band.minSec,
+            maxSec: band.maxSec,
+            frameConstraint: this._getActiveFrameConstraint(),
+        })) {
             this._genDurationHint.style.display = "none";
             return;
         }
@@ -3868,10 +3936,11 @@ export class EditorWidget {
         });
     }
 
-    _setTimelineSelection(start, end, { persist = true, render = true } = {}) {
+    _setTimelineSelection(start, end, { persist = true, render = true, clearDraft = true } = {}) {
         const maxFrame = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
         const nextStart = Math.max(0, Math.min(maxFrame, Math.round(Number(start) || 0)));
         const nextEnd = Math.max(0, Math.min(maxFrame, Math.round(Number(end) || 0)));
+        if (clearDraft) this._selectionDraftAnchor = null;
         this.selectionStart = Math.min(nextStart, nextEnd);
         this.selectionEnd = Math.max(nextStart, nextEnd);
         this._setWidgetValue("selection_start", this.selectionStart);
@@ -3883,6 +3952,72 @@ export class EditorWidget {
             this._renderTimeline();
             this._updateToolbar();
         }
+    }
+
+    _setSelectionDraft(edge, frame) {
+        const maxFrame = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
+        const nextEdge = edge === "start" ? "start" : "end";
+        const nextFrame = Math.max(0, Math.min(maxFrame, Math.round(Number(frame) || 0)));
+        this._setTimelineSelection(0, 0, { render: false, clearDraft: true });
+        this._selectionDraftAnchor = { edge: nextEdge, frame: nextFrame };
+        this._refreshSelectionInputs({ force: true });
+        this._refreshPromptUsageHighlight();
+        this._renderTimeline();
+        this._updateToolbar();
+    }
+
+    _commitManualSelectionEndpoint(edge, frame, { searchDirection = null } = {}) {
+        const nextEdge = edge === "start" ? "start" : "end";
+        const maxFrame = Math.max(0, parseInt(this.activeScene?.duration_frames, 10) || this.totalFrames || 0);
+        const candidate = Math.max(0, Math.min(maxFrame, Math.round(Number(frame) || 0)));
+        const hasSelection = this.selectionStart < this.selectionEnd;
+        const draft = this._selectionDraftAnchor;
+
+        if (!hasSelection && (!draft || draft.edge === nextEdge)) {
+            this._setSelectionDraft(nextEdge, candidate);
+            return { status: "draft", endpoint: candidate };
+        }
+
+        const anchorFrame = hasSelection
+            ? (nextEdge === "start" ? this.selectionEnd : this.selectionStart)
+            : draft.frame;
+        const usable = nextEdge === "start" ? candidate < anchorFrame : candidate > anchorFrame;
+        if (!usable) {
+            if (hasSelection) {
+                this._setSelectionDraft(nextEdge, candidate);
+                return { status: "draft", endpoint: candidate };
+            }
+            notifyWarning(
+                nextEdge === "start"
+                    ? "Choose an In point before the anchored Out point."
+                    : "Choose an Out point after the anchored In point.",
+                { source: "selection-draft-invalid-endpoint" }
+            );
+            this._refreshSelectionInputs({ force: true });
+            return { status: "invalid", endpoint: candidate };
+        }
+
+        const direction = searchDirection == null
+            ? (nextEdge === "start" ? -1 : 1)
+            : (searchDirection < 0 ? -1 : 1);
+        const result = this._findManualSelectionEndpoint(nextEdge, anchorFrame, candidate, direction);
+        if (!result.valid) {
+            notifyWarning("The selected endpoint cannot form a non-empty range.", {
+                source: "selection-draft-empty-range",
+            });
+            this._refreshSelectionInputs({ force: true });
+            return { status: "invalid", endpoint: candidate };
+        }
+
+        const start = nextEdge === "start" ? result.endpoint : anchorFrame;
+        const end = nextEdge === "end" ? result.endpoint : anchorFrame;
+        this._setTimelineSelection(start, end);
+        return {
+            status: "complete",
+            endpoint: result.endpoint,
+            window: result.window,
+            usedPaddingFallback: result.used_padding_fallback,
+        };
     }
 
     _setSelectionStartFrame(frame) {
@@ -6419,6 +6554,11 @@ export class EditorWidget {
                 this._renderTimeline();
                 this._flushDeferredDragState();
                 return;
+            } else if (wasDragType === "playhead") {
+                // Ruler navigation must not finalize or clear an ephemeral In/Out
+                // draft; the user may be moving the playhead before pressing the
+                // opposite keyboard shortcut.
+                canvas.style.cursor = "crosshair";
             } else if (wasDragType === "boxSelect" || wasDragType === "laneSelect") {
                 this._finishDragSelect();
                 canvas.style.cursor = "crosshair";
@@ -11215,8 +11355,8 @@ export class EditorWidget {
                 ["Home / End", "Go to first / last frame"],
             ]) +
             this._shortcutSection("Selection", [
-                ["I", "Set in-point"],
-                ["O", "Set out-point"],
+                ["I", "Anchor/set In; second endpoint snaps"],
+                ["O", "Anchor/set Out; second endpoint snaps"],
                 ["X", "Clear selection"],
                 ["Drag empty timeline", "Select items in area"],
                 ["Drag lane header", "Select lanes in area"],
@@ -12519,13 +12659,11 @@ export class EditorWidget {
 
             // ── I / O = set in/out points (selection) ──
             if (key === "i" || key === "I") {
-                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
-                this._setSelectionStartFrame(this._snapSelectionFrame(this.playhead, { direction: "up", clampMax: maxFrame }));
+                this._commitManualSelectionEndpoint("start", this.playhead);
                 return true;
             }
             if (key === "o" || key === "O") {
-                const maxFrame = Math.max(0, this.activeScene?.duration_frames || this.totalFrames);
-                this._setSelectionEndFrame(this._snapSelectionFrame(this.playhead, { direction: "up", clampMax: maxFrame }));
+                this._commitManualSelectionEndpoint("end", this.playhead);
                 return true;
             }
 
@@ -12850,12 +12988,17 @@ export class EditorWidget {
 
         // Save current selection option
         const saveItem = document.createElement("div");
-        const hasSel = this.selectionStart < this.selectionEnd;
+        const draft = this._selectionDraftAnchor;
+        const hasSel = !draft && this.selectionStart < this.selectionEnd;
         saveItem.style.cssText = `
             padding: 6px 10px; cursor: ${hasSel ? "pointer" : "default"};
             color: ${hasSel ? lightenColor(COLORS.sceneBtnActive, 0.28) : COLORS.textMuted}; border-bottom: 1px solid ${COLORS.border};
         `;
-        saveItem.textContent = hasSel ? `💾 Save Selection (${this._frameToTimecode(this.selectionStart)}–${this._frameToTimecode(this.selectionEnd)})` : "💾 Save Selection (no selection)";
+        saveItem.textContent = hasSel
+            ? `💾 Save Selection (${this._frameToTimecode(this.selectionStart)}–${this._frameToTimecode(this.selectionEnd)})`
+            : draft
+                ? `💾 Save Selection (choose ${draft.edge === "start" ? "Out" : "In"})`
+                : "💾 Save Selection (no selection)";
         if (hasSel) {
             saveItem.addEventListener("mouseenter", () => { saveItem.style.background = COLORS.panelRaisedHover; });
             saveItem.addEventListener("mouseleave", () => { saveItem.style.background = ""; });
@@ -12943,6 +13086,13 @@ export class EditorWidget {
     }
 
     async _saveCurrentSelection() {
+        if (this._selectionDraftAnchor) {
+            notifyWarning(
+                `Choose ${this._selectionDraftAnchor.edge === "start" ? "Out" : "In"} before saving the selection.`,
+                { source: "selection-draft-save-guard" }
+            );
+            return;
+        }
         if (this.selectionStart >= this.selectionEnd || !this.activeScene) return;
         const name = prompt("Selection name:", `Sel ${(this.activeScene.saved_selections?.length || 0) + 1}`);
         if (!name || !name.trim()) return;
@@ -13046,7 +13196,7 @@ export class EditorWidget {
     }
 
     _resolveQueueSelectionRange() {
-        if (!this.activeScene) return null;
+        if (!this.activeScene || this._selectionDraftAnchor) return null;
         const sceneDuration = Math.max(0, parseInt(this.activeScene.duration_frames, 10) || 0);
         const hasSelection = this.selectionStart < this.selectionEnd;
         return {
@@ -13483,6 +13633,14 @@ export class EditorWidget {
     _updateBatchButtonLabel() {
         if (!this._batchQueueBtn) return;
 
+        if (this._selectionDraftAnchor) {
+            this._batchQueueBtn.textContent = "+ Batch";
+            this._batchQueueBtn.title = `Choose ${this._selectionDraftAnchor.edge === "start" ? "Out" : "In"} to complete the selection`;
+            this._batchQueueBtn.disabled = true;
+            return;
+        }
+        this._batchQueueBtn.disabled = false;
+
         const range = this._resolveQueueSelectionRange();
         if (!range) {
             this._batchQueueBtn.textContent = "+ Batch";
@@ -13520,6 +13678,13 @@ export class EditorWidget {
     }
 
     async _addToRenderQueue() {
+        if (this._selectionDraftAnchor) {
+            notifyWarning(
+                `Choose ${this._selectionDraftAnchor.edge === "start" ? "Out" : "In"} before queueing.`,
+                { source: "selection-draft-queue-guard" }
+            );
+            return;
+        }
         const range = this._resolveQueueSelectionRange();
         if (!range) return;
 
@@ -13587,6 +13752,13 @@ export class EditorWidget {
     }
 
     async _addBatchToRenderQueue() {
+        if (this._selectionDraftAnchor) {
+            notifyWarning(
+                `Choose ${this._selectionDraftAnchor.edge === "start" ? "Out" : "In"} before queueing a batch.`,
+                { source: "selection-draft-batch-guard" }
+            );
+            return;
+        }
         const range = this._resolveQueueSelectionRange();
         if (!range) return;
 

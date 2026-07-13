@@ -731,8 +731,9 @@ class SonderEditor:
             # Independent snaps for the four sections — mask offsets do NOT inflate the
             # rendered tensor (the bug fixed here). The LTX +1 (offset=1) lives once at
             # the start of the total tensor and is carried by `actual_pre` when pre > 0,
-            # or by `gen_len` via the existing selection-endpoint snap when pre == 0.
-            # post never carries the +1. Mask offsets snap to the valid grid-difference
+            # or by a constraint-valid generation length when pre == 0. Exact semantic
+            # ranges may instead carry the difference as `frame_count_padding`. Post
+            # never carries the +1. Mask offsets snap to the valid grid-difference
             # set within their context cap — they only choose which already-rendered
             # frames are masked, not how many frames get rendered.
             #

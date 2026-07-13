@@ -1773,13 +1773,15 @@ class SonderSaveVideo:
 
                 if take_placement_mode == "untrimmed":
                     # DIAGNOSTIC: untrimmed mode intentionally ignores mask_pre/post_offset (Phase 1 decision).
-                    # Places full rendered source (pre+generation+post) on the timeline so the seam is visible.
+                    # Places the full real rendered source (pre+generation+post) on the timeline so the seam is
+                    # visible. Constraint padding is a synthetic tensor tail and must never become source media.
+                    visible_source_frames = max(0, total_frames - frame_count_padding)
                     source_in_frame = 0
-                    source_out_frame = total_frames
+                    source_out_frame = visible_source_frames
                     timeline_start_frame = sel_start - actual_pre
-                    timeline_end_frame = timeline_start_frame + total_frames
+                    timeline_end_frame = timeline_start_frame + visible_source_frames
                     source_origin_frame = 0
-                    clip_total_source_frames = total_frames
+                    clip_total_source_frames = visible_source_frames
                 else:
                     # Trimmed (default): align the visible region with the mask region the
                     # renderer actually denoised. mask_start_frame / mask_end_frame are the
@@ -1854,14 +1856,13 @@ class SonderSaveVideo:
                         while len(scene.audio_lane_configs) < scene.audio_lane_count:
                             scene.audio_lane_configs.append(LaneConfig())
 
-                        if take_placement_mode != "untrimmed":
-                            visible_len = source_out_frame - source_in_frame
-                            assert (timeline_end_frame - timeline_start_frame) == visible_len, (
-                                f"audio invariant: timeline span {timeline_end_frame - timeline_start_frame} != visible_len {visible_len}"
-                            )
-                            assert clip_total_source_frames == max(0, total_frames - frame_count_padding), (
-                                f"audio invariant: total_source_frames {clip_total_source_frames} != total_frames - padding {max(0, total_frames - frame_count_padding)}"
-                            )
+                        visible_len = source_out_frame - source_in_frame
+                        assert (timeline_end_frame - timeline_start_frame) == visible_len, (
+                            f"audio invariant: timeline span {timeline_end_frame - timeline_start_frame} != visible_len {visible_len}"
+                        )
+                        assert clip_total_source_frames == max(0, total_frames - frame_count_padding), (
+                            f"audio invariant: total_source_frames {clip_total_source_frames} != total_frames - padding {max(0, total_frames - frame_count_padding)}"
+                        )
 
                         placed_audio_track = AudioTrack(
                             source_path=audio_rel_path,

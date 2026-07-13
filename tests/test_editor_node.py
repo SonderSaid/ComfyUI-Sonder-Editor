@@ -200,7 +200,7 @@ def _patch_render_and_audio(editor_node, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.ones(end - start, 4, 4, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, use_cache=False: torch.ones(end - start, 4, 4, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -867,7 +867,12 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
         timeline_state.GuideFrame(frame_index=1, asset_id="guide-a", strength=0.25),
         timeline_state.GuideFrame(frame_index=4, asset_id="guide-b", strength=0.9, muted=True),
     ]
-    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Guides", scenes=[scene])
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Guides",
+        resolution=(768, 512),
+        scenes=[scene],
+    )
     project.assets = [
         timeline_state.Asset(asset_id="guide-a", asset_type="image", path=os.path.join("media", "guide.png")),
         timeline_state.Asset(asset_id="guide-b", asset_type="image", path=os.path.join("media", "guide.png")),
@@ -877,7 +882,7 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -1060,7 +1065,7 @@ def test_render_scene_frames_uses_take_source_in_without_repeating_seam_frame(tm
             return True
 
         def set(self, prop, value):
-            if prop == cv2.CAP_PROP_POS_FRAMES:
+            if prop == editor_node.cv2.CAP_PROP_POS_FRAMES:
                 self.pos = int(value)
 
         def read(self):
@@ -1139,7 +1144,7 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -1254,7 +1259,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.zeros(
+        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(
             max(1, end - start),
             scene.height or proj.resolution[1],
             scene.width or proj.resolution[0],
@@ -1374,7 +1379,7 @@ def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: (
+        lambda self, proj, scene, start, end, **_kwargs: (
             render_ranges.append((start, end))
             or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
         ),
@@ -1465,7 +1470,7 @@ def test_unmarked_save_with_active_queue_peeks_without_completion(tmp_path, monk
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: (
+        lambda self, proj, scene, start, end, **_kwargs: (
             render_ranges.append((start, end))
             or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
         ),
@@ -1563,7 +1568,7 @@ def test_render_queue_inactive_ignores_terminal_save_queue(tmp_path, monkeypatch
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: (
+        lambda self, proj, scene, start, end, **_kwargs: (
             render_ranges.append((start, end))
             or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
         ),
@@ -1714,7 +1719,7 @@ def test_no_active_queue_runs_full_scene(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: (
+        lambda self, proj, scene, start, end, **_kwargs: (
             render_ranges.append((start, end))
             or torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
         ),
@@ -1805,7 +1810,7 @@ def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -1864,7 +1869,7 @@ def test_editor_to_bridge_marks_queue_complete_round_trip(tmp_path, monkeypatch)
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -2254,7 +2259,7 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -2416,11 +2421,12 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
         "selection_end": 24,
         "actual_pre_context_frames": 2,
         "actual_post_context_frames": 1,
+        "frame_count_padding": 2,
         "take_placement_mode": "untrimmed",
         "take_fit_mode": "invalid",
         "take_crop_position": "invalid",
     }
-    node.save_video(project, torch.zeros(8, 2, 2, 3, dtype=torch.float32), filename_prefix="untrimmed", fps=24.0, mode="Take")
+    node.save_video(project, torch.zeros(10, 2, 2, 3, dtype=torch.float32), filename_prefix="untrimmed", fps=24.0, mode="Take")
     untrimmed = scene.clips[-1]
 
     assert untrimmed.timeline_start_frame == 18
@@ -2431,6 +2437,57 @@ def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, 
     assert untrimmed.total_source_frames == 8
     assert untrimmed.fit_mode == "pad_edge"
     assert untrimmed.crop_position == "center"
+
+
+def test_save_video_untrimmed_take_audio_and_video_exclude_constraint_padding(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True, exist_ok=True)
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=48)
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Untrimmed Padding Test",
+        scenes=[scene],
+    )
+    project._execution_context = {
+        "scene_id": "scene-1",
+        "scene_name": "Scene 1",
+        "selection_start": 8,
+        "selection_end": 12,
+        "actual_pre_context_frames": 1,
+        "actual_post_context_frames": 1,
+        "frame_count_padding": 3,
+        "take_placement_mode": "untrimmed",
+    }
+
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "write_audio_wav", lambda path, samples, sample_rate: Path(path).write_bytes(b"audio"))
+
+    node = io_nodes.SonderSaveVideo()
+    frames = torch.zeros(9, 2, 2, 3, dtype=torch.float32)
+    sample_rate = 48000
+    audio = {
+        "waveform": torch.zeros(1, 2, int(round((9 / 24.0) * sample_rate)), dtype=torch.float32),
+        "sample_rate": sample_rate,
+    }
+    node.save_video(project, frames, filename_prefix="untrimmed_padding", fps=24.0, mode="Take", audio=audio)
+
+    clip = scene.clips[-1]
+    audio_track = scene.audio_tracks[-1]
+    assert (clip.timeline_start_frame, clip.timeline_end_frame) == (7, 13)
+    assert (clip.source_in_frame, clip.source_out_frame) == (0, 6)
+    assert clip.total_source_frames == 6
+    assert (audio_track.timeline_start_frame, audio_track.timeline_end_frame) == (7, 13)
+    assert audio_track.source_in_frame == 0
+    assert audio_track.total_source_frames == 6
 
 
 def test_save_video_take_trimmed_with_mask_offsets(tmp_path, monkeypatch):

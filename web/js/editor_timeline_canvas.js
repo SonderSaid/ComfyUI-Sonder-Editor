@@ -467,7 +467,34 @@ export function _drawTracks(host, ctx, width) {
 
 export function _drawSelection(host, ctx, width) {
         const range = host._selectionContextRange();
-        if (!range) return;
+        if (!range) {
+            const draft = host._selectionDraftAnchor;
+            if (!draft) return;
+            const x = host._frameToX(draft.frame);
+            const y = host._timelineRulerHeight();
+            const h = host._totalTracksHeight();
+            const label = draft.edge === "start" ? "In" : "Out";
+            ctx.save();
+            ctx.strokeStyle = COLORS.selectionBorder;
+            ctx.lineWidth = 2;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x, y + h);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font = host._canvasSansFont(Math.max(9, Math.round(9 * host._scaleTimeline)), 700);
+            const labelWidth = Math.ceil(ctx.measureText(label).width) + 8;
+            const labelX = Math.max(0, Math.min(width - labelWidth, x - labelWidth / 2));
+            ctx.fillStyle = COLORS.selectionBorder;
+            ctx.fillRect(labelX, y + 2, labelWidth, 16);
+            ctx.fillStyle = COLORS.text;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(label, labelX + labelWidth / 2, y + 10);
+            ctx.restore();
+            return;
+        }
 
         const x1 = host._frameToX(range.selectionStart);
         const x2 = host._frameToX(range.selectionEnd);

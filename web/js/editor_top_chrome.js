@@ -503,8 +503,7 @@ export function buildEditorToolbar(widget) {
         (value) => {
             const frame = widget._parsePositionInput(value);
             if (Number.isFinite(frame)) {
-                const maxFrame = Math.max(0, widget.activeScene?.duration_frames || widget.totalFrames);
-                widget._setSelectionStartFrame(widget._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
+                widget._commitManualSelectionEndpoint("start", frame);
                 widget._refreshSelectionInputs({ force: true });
             } else {
                 widget._refreshSelectionInputs({ force: true });
@@ -518,8 +517,7 @@ export function buildEditorToolbar(widget) {
         (value) => {
             const frame = widget._parsePositionInput(value);
             if (Number.isFinite(frame)) {
-                const maxFrame = Math.max(0, widget.activeScene?.duration_frames || widget.totalFrames);
-                widget._setSelectionEndFrame(widget._snapSelectionFrame(frame, { direction: "up", clampMax: maxFrame }));
+                widget._commitManualSelectionEndpoint("end", frame);
                 widget._refreshSelectionInputs({ force: true });
             } else {
                 widget._refreshSelectionInputs({ force: true });
@@ -739,5 +737,17 @@ export function updateEditorToolbar(widget) {
         applyTopButtonVariant(widget._toolBtnAnimatic, widget._animaticMode ? "primary" : "secondary", BUTTON_OPTIONS.secondary, "white-space:nowrap;");
     }
     widget._updateBatchButtonLabel();
+    const draft = widget._selectionDraftAnchor;
+    const draftPrompt = draft
+        ? `Choose ${draft.edge === "start" ? "Out" : "In"} to complete the selection`
+        : "";
+    if (widget._queueBtn) {
+        widget._queueBtn.disabled = !!draft;
+        widget._queueBtn.title = draftPrompt || "Add current selection to render queue";
+    }
+    if (widget._batchQueueBtn) {
+        widget._batchQueueBtn.disabled = !!draft;
+        if (draft) widget._batchQueueBtn.title = draftPrompt;
+    }
     updateQueueChromeStatus(widget);
 }
