@@ -9426,7 +9426,7 @@ export class EditorWidget {
                 thumb.src = thumbUrl;
                 thumb.alt = "";
                 thumb.title = guideAsset.name || "Guide asset";
-                thumb.style.cssText = "width:32px;height:20px;object-fit:cover;border-radius:3px;border:1px solid rgba(255,255,255,0.18);background:#000;";
+                thumb.style.cssText = "width:32px;height:20px;object-fit:contain;border-radius:3px;border:1px solid rgba(255,255,255,0.18);background:#000;";
                 editor.appendChild(thumb);
             }
 
@@ -10682,7 +10682,7 @@ export class EditorWidget {
                 const img = document.createElement("img");
                 img.src = thumbUrl;
                 img.alt = "";
-                img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+                img.style.cssText = "width:100%;height:100%;object-fit:contain;display:block;";
                 img.title = asset?.name || asset?.path || "Guide asset";
                 thumb.appendChild(img);
             }
@@ -10898,7 +10898,7 @@ export class EditorWidget {
                 const img = document.createElement("img");
                 img.src = thumbUrl;
                 img.alt = "";
-                img.style.cssText = "width:100%;height:100%;object-fit:cover;display:block;";
+                img.style.cssText = "width:100%;height:100%;object-fit:contain;display:block;";
                 img.title = asset?.name || asset?.path || "Guide asset";
                 thumb.appendChild(img);
             } else {
@@ -10929,14 +10929,14 @@ export class EditorWidget {
             frameInput.title = "Guide frame index";
             frameInput.disabled = locked;
             frameInput.style.cssText = `${chromeInputCss({ width: "66px", fontSize: "11px", padding: "5px 7px" })}`;
-            const commitFrameInput = () => {
+            const commitFrameInput = async () => {
                 if (locked) return;
                 const newIdx = this._parsePositionInput(frameInput.value);
                 const nextFrame = Math.round(newIdx);
                 if (!Number.isFinite(nextFrame) || nextFrame === frame) return;
                 const clamped = Math.max(0, Math.min(this.totalFrames - 1, nextFrame));
-                this._moveGuideToFrame(guide, clamped, guide.strength);
-                this._hideGuideManagementPopup();
+                await this._moveGuideToFrame(guide, clamped, guide.strength);
+                await refreshPanel();
             };
             frameInput.addEventListener("change", commitFrameInput);
             frameInput.addEventListener("keydown", (event) => {
