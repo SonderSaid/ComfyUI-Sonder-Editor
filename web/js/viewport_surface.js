@@ -92,7 +92,7 @@ function decodeDeadlineTelemetry(meta = {}) {
     };
 }
 
-function createDecodeConcurrencyLimiter({
+export function _createDecodeConcurrencyLimiter({
     getMaxConcurrent = () => 1,
     reserveHighSlotForLow = false,
     allowSingleSlotLow = () => true,
@@ -629,6 +629,77 @@ function createDecodeConcurrencyLimiter({
     return { run, promote, cancelQueued, flushStats, snapshotStats, resetStats };
 }
 
+function playbackLayerKey(layer) {
+    return layer?.key || "";
+}
+
+function uniquePlaybackLayers(layers = []) {
+    const seen = new Set();
+    const result = [];
+    for (const layer of layers || []) {
+        const key = playbackLayerKey(layer);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        result.push(layer);
+    }
+    return result;
+}
+
+// Internal executable scheduling seam. Callers provide already-resolved required
+// renderable video layers, so visibility/coverage ownership remains in the
+// viewport surface while transition novelty stays deterministic and testable.
+export function _planEffectivePlaybackBoundaryGroups({
+    candidateFrames = [],
+    requiredLayersAtFrame = () => [],
+    loopRange = null,
+} = {}) {
+    const loopStart = loopRange
+        ? Math.max(0, Math.round(Number(loopRange.start) || 0))
+        : null;
+    const loopEnd = loopRange
+        ? Math.max(loopStart + 1, Math.round(Number(loopRange.end) || loopStart + 1))
+        : null;
+    const groups = [];
+    const resolvedLayers = new Map();
+    const layersAtFrame = (frame) => {
+        if (!resolvedLayers.has(frame)) {
+            resolvedLayers.set(frame, uniquePlaybackLayers(requiredLayersAtFrame(frame)));
+        }
+        return resolvedLayers.get(frame);
+    };
+    for (const value of candidateFrames || []) {
+        const frame = Math.max(0, Math.round(Number(value) || 0));
+        if (loopRange && (frame < loopStart || frame >= loopEnd)) continue;
+        const afterLayers = layersAtFrame(frame);
+        if (!afterLayers.length) continue;
+        const loopWrap = !!loopRange && frame === loopStart;
+        let layers = afterLayers;
+        if (!loopWrap) {
+            if (frame <= 0) continue;
+            const beforeKeys = new Set(
+                layersAtFrame(frame - 1).map(playbackLayerKey),
+            );
+            layers = afterLayers.filter((layer) => !beforeKeys.has(playbackLayerKey(layer)));
+        }
+        if (layers.length) groups.push({ frame, layers, loopWrap });
+    }
+    return groups;
+}
+
+export function _classifyRebufferPrebufferEntry({
+    desired = false,
+    claimed = false,
+    waiting = false,
+    ready = false,
+    valid = true,
+} = {}) {
+    if (claimed) return "drop-reference";
+    if (!valid) return "cancel";
+    if (desired || waiting) return "preserve";
+    if (ready) return "preserve-ready";
+    return "cancel";
+}
+
 function emptyPrebufferScheduleStats(reason = "") {
     return {
         rawPlayableVideoCount: 0,
@@ -754,8 +825,9 @@ function clearCacheObject(cache) {
     }
 }
 
-function waitForMediaReady(mediaEl, minReadyState = 1, timeoutMs = 800) {
+function waitForMediaReady(mediaEl, minReadyState = 1, timeoutMs = 800, { signal = null } = {}) {
     if (!mediaEl) return Promise.resolve(null);
+    if (signal?.aborted) return Promise.resolve(null);
     if (mediaEl.error) return Promise.resolve(null);
     if ((mediaEl.readyState || 0) >= minReadyState) {
         return Promise.resolve(mediaEl);
@@ -780,14 +852,18 @@ function waitForMediaReady(mediaEl, minReadyState = 1, timeoutMs = 800) {
                 mediaEl.removeEventListener(eventName, finish);
             }
             mediaEl.removeEventListener("error", fail);
+            signal?.removeEventListener?.("abort", fail);
         };
         const timer = window.setTimeout(finish, timeoutMs);
         for (const eventName of ["loadedmetadata", "loadeddata", "canplay", "canplaythrough"]) {
             mediaEl.addEventListener(eventName, finish, { once: true });
         }
         mediaEl.addEventListener("error", fail, { once: true });
+        signal?.addEventListener?.("abort", fail, { once: true });
     });
 }
+
+export { waitForMediaReady as _waitForMediaReady };
 
 function clampMediaTargetTime(mediaEl, targetTime) {
     const duration = Number(mediaEl?.duration);
@@ -820,20 +896,22 @@ function videoFrameCallbackMetadataTelemetry(metadata) {
     };
 }
 
-function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120) {
+function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120, { signal = null } = {}) {
     if (!mediaEl || typeof mediaEl.requestVideoFrameCallback !== "function") {
-        return Promise.resolve(mediaEl);
+        return Promise.resolve(signal?.aborted ? null : mediaEl);
     }
+    if (signal?.aborted) return Promise.resolve(null);
     const startTs = performance.now();
     return new Promise((resolve) => {
         let settled = false;
         let callbackId = null;
         let viaCallback = false;
         let lastMetadata = null;
-        const finish = () => {
+        const finish = (result = mediaEl) => {
             if (settled) return;
             settled = true;
             window.clearTimeout(timer);
+            signal?.removeEventListener?.("abort", onAbort);
             if (callbackId !== null && typeof mediaEl.cancelVideoFrameCallback === "function") {
                 try {
                     mediaEl.cancelVideoFrameCallback(callbackId);
@@ -846,17 +924,19 @@ function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120) {
                 ready_state: mediaEl.readyState,
                 ...videoFrameCallbackMetadataTelemetry(lastMetadata),
             });
-            resolve(mediaEl);
+            resolve(result);
         };
-        const timer = window.setTimeout(finish, timeoutMs);
+        const onAbort = () => finish(null);
+        const timer = window.setTimeout(() => finish(mediaEl), timeoutMs);
+        signal?.addEventListener?.("abort", onAbort, { once: true });
         try {
             callbackId = mediaEl.requestVideoFrameCallback((_now, metadata = {}) => {
                 viaCallback = true;
                 lastMetadata = metadata;
-                finish();
+                finish(mediaEl);
             });
         } catch (error) {
-            finish();
+            finish(mediaEl);
         }
     });
 }
@@ -918,12 +998,15 @@ function seekMedia(mediaEl, targetTime, {
     timeoutMs = 250,
     requireTarget = false,
     waitForFrame = false,
+    signal = null,
 } = {}) {
     if (!mediaEl) return Promise.resolve(null);
-    return waitForMediaReady(mediaEl, 1).then((element) => {
+    if (signal?.aborted) return Promise.resolve(null);
+    return waitForMediaReady(mediaEl, 1, 800, { signal }).then((element) => {
         if (!element) return null;
         const safeTarget = clampMediaTargetTime(element, targetTime);
         const finishWithFrame = () => {
+            if (signal?.aborted) return Promise.resolve(null);
             const candidate = !requireTarget || isMediaAtTarget(element, safeTarget, tolerance)
                 ? element
                 : null;
@@ -931,8 +1014,8 @@ function seekMedia(mediaEl, targetTime, {
             if ((candidate.readyState || 0) >= 2 && !candidate.seeking && isMediaAtTarget(candidate, safeTarget, tolerance)) {
                 return Promise.resolve(candidate);
             }
-            return waitForDecodedVideoFrame(candidate, Math.min(200, Math.max(80, timeoutMs)))
-                .then(() => (!requireTarget || isMediaAtTarget(candidate, safeTarget, tolerance) ? candidate : null));
+            return waitForDecodedVideoFrame(candidate, Math.min(200, Math.max(80, timeoutMs)), { signal })
+                .then((decoded) => decoded && (!requireTarget || isMediaAtTarget(candidate, safeTarget, tolerance)) ? candidate : null);
         };
         if ((element.readyState || 0) >= 2 && isMediaAtTarget(element, safeTarget, tolerance)) {
             return finishWithFrame();
@@ -945,14 +1028,15 @@ function seekMedia(mediaEl, targetTime, {
                 finish(false);
             };
             const onError = () => finish(true, true);
-            const finish = (force = false) => {
+            const onAbort = () => finish(true, true);
+            const finish = (force = false, failed = false) => {
                 if (settled) return;
                 const ready = (element.readyState || 0) >= 2;
                 const atTarget = isMediaAtTarget(element, safeTarget, tolerance);
                 if (!force && (!sawSeeked || !ready || !atTarget)) return;
                 settled = true;
                 cleanup();
-                if (element.error || (requireTarget && !atTarget)) {
+                if (failed || element.error || (requireTarget && !atTarget)) {
                     resolve(null);
                     return;
                 }
@@ -960,20 +1044,26 @@ function seekMedia(mediaEl, targetTime, {
                     resolve(element);
                     return;
                 }
-                waitForDecodedVideoFrame(element, Math.min(200, Math.max(80, timeoutMs)))
-                    .then(() => {
-                        resolve(!requireTarget || isMediaAtTarget(element, safeTarget, tolerance) ? element : null);
+                waitForDecodedVideoFrame(element, Math.min(200, Math.max(80, timeoutMs)), { signal })
+                    .then((decoded) => {
+                        resolve(decoded && (!requireTarget || isMediaAtTarget(element, safeTarget, tolerance)) ? element : null);
                     });
             };
             const cleanup = () => {
                 window.clearTimeout(timer);
                 element.removeEventListener("seeked", onSeeked);
                 element.removeEventListener("error", onError);
+                signal?.removeEventListener?.("abort", onAbort);
             };
             const timer = window.setTimeout(() => finish(true), timeoutMs);
             element.addEventListener("seeked", onSeeked, { once: true });
             element.addEventListener("error", onError, { once: true });
+            signal?.addEventListener?.("abort", onAbort, { once: true });
             try {
+                if (signal?.aborted) {
+                    finish(true, true);
+                    return;
+                }
                 element.currentTime = safeTarget;
             } catch (error) {
                 finish(true);
@@ -2344,9 +2434,7 @@ export function createViewportSurface(options = {}) {
             const targetFrame = playbackSearchFrame(frame, offset, playbackEndFrame);
             if (targetFrame === null) continue;
             const targetSnapshot = buildFrameSnapshot(targetFrame);
-            for (const layer of requiredClipLayersAfterCoverage(targetSnapshot)) {
-                if (!isRenderableVideoLayer(layer)) continue;
-                if (!isCurrentPrebufferSafetyFrame(layer, targetFrame)) continue;
+            for (const layer of currentSafetyLayersAtFrame(targetSnapshot, targetFrame, offset)) {
                 const active = offset === 0 ? state.activePlaybackVideos.get(layer.key) : null;
                 if (offset === 0 && isActiveVideoDrawable(active, layer, targetFrame)) continue;
                 const candidates = prebufferCandidatesForLayerFrame(layer, targetFrame, { snapshot: targetSnapshot });
@@ -2357,12 +2445,12 @@ export function createViewportSurface(options = {}) {
         return true;
     }
 
-    const playbackDecodeLimiter = createDecodeConcurrencyLimiter({
+    const playbackDecodeLimiter = _createDecodeConcurrencyLimiter({
         getMaxConcurrent: normalizedDecodeConcurrency,
         reserveHighSlotForLow: true,
         allowSingleSlotLow: singleSlotLowAllowed,
     });
-    const guideDecodeLimiter = createDecodeConcurrencyLimiter({
+    const guideDecodeLimiter = _createDecodeConcurrencyLimiter({
         getMaxConcurrent: () => 1,
         reserveHighSlotForLow: false,
     });
@@ -2372,7 +2460,15 @@ export function createViewportSurface(options = {}) {
         if (entry.claimedByActive) return;
         removePlaybackWarmEntriesByOwner("prebuffer", entry.key, "prebuffer-discarded");
         entry.cancelled = true;
+        try {
+            entry.abortController?.abort?.();
+        } catch (error) {}
         removeMediaSource(entry.video);
+    }
+
+    function cancelQueuedPrebufferEntry(entry, reason) {
+        if (entry?.decodeJobState !== "queued" || !entry?.decodeJob) return false;
+        return playbackDecodeLimiter.cancelQueued(entry.decodeJob, reason);
     }
 
     function prebufferEntryMatchesTargetSource(entry, target) {
@@ -2528,6 +2624,7 @@ export function createViewportSurface(options = {}) {
         const targetSourceFrame = entry.targetSourceFrame;
         const sourceTargetKey = entry.sourceTargetKey;
         const warmToken = entry.warmToken;
+        const signal = entry.abortController?.signal || null;
         const sourceCacheKey = mediaSourceCacheKey(sourcePath);
         const stillCurrent = () => (
             !state.destroyed
@@ -2556,7 +2653,7 @@ export function createViewportSurface(options = {}) {
         }
         const prepared = await playbackDecodeLimiter.run(entry.decodePriority || DECODE_PRIORITY_LOW, async () => {
             if (!stillRelevant()) return null;
-            await waitForMediaReady(video, 2, 1500);
+            await waitForMediaReady(video, 2, 1500, { signal });
             if (!stillRelevant()) return null;
             const targetTime = clampMediaTargetTime(video, sourceFrameTime(targetSourceFrame));
             entry.targetTime = targetTime;
@@ -2565,12 +2662,13 @@ export function createViewportSurface(options = {}) {
                 timeoutMs: 700,
                 requireTarget: true,
                 waitForFrame: false,
+                signal,
             });
             if (!sought || !stillRelevant()) return null;
             if ((video.readyState || 0) >= 2 && !video.seeking && isMediaAtTarget(video, targetTime, prebufferTargetTimeTolerance())) {
                 publishPrebufferEntryReady(entry, layer, targetFrame, "seek-complete");
             }
-            await waitForMediaReady(video, 2, 500);
+            await waitForMediaReady(video, 2, 500, { signal });
             return stillRelevant() ? video : null;
         }, {
             front: entry.scheduleOrigin === "current-frame-recovery",
@@ -3242,6 +3340,7 @@ export function createViewportSurface(options = {}) {
             cancelled: false,
             consumed: false,
             claimedByActive: false,
+            abortController: typeof AbortController === "function" ? new AbortController() : null,
             warmToken,
             decodeJob: null,
             decodeJobState: "source-pending",
@@ -3395,8 +3494,9 @@ export function createViewportSurface(options = {}) {
     // Candidate boundary frames to consider warming: upcoming clip starts (a
     // not-yet-in-window clip first appears) UNION currently/soon-visible clip
     // ends (an upper covering clip ending can expose a lower clip) UNION the
-    // loop-wrap frame. Per-candidate buildFrameSnapshot then applies the real
-    // visibility filter stack, so extra candidates are harmlessly filtered out.
+    // loop-wrap frame. The effective-boundary planner resolves the real
+    // visibility filter stack on each candidate and its reachable predecessor,
+    // so raw endpoints that do not change required visible layers create no work.
     function collectPrebufferCandidateFrames(currentFrame, endFrame, horizonFrames) {
         const scene = getScene();
         const frames = new Set();
@@ -3438,6 +3538,34 @@ export function createViewportSurface(options = {}) {
         return requiredClipLayersAfterCoverage(snapshot).filter(isRenderableVideoLayer);
     }
 
+    function effectivePlaybackBoundaryGroups(candidateFrames) {
+        return _planEffectivePlaybackBoundaryGroups({
+            candidateFrames,
+            loopRange: state.playbackLoopRange,
+            requiredLayersAtFrame: (frame) => requiredRenderableVideoLayers(buildFrameSnapshot(frame)),
+        });
+    }
+
+    function effectivePlaybackBoundaryLayers(frame) {
+        return effectivePlaybackBoundaryGroups([frame])[0]?.layers || [];
+    }
+
+    function currentRecoveryEligibleLayers(snapshot) {
+        const frame = Math.max(0, Math.round(Number(snapshot?.frame) || 0));
+        const boundaryKeys = new Set(effectivePlaybackBoundaryLayers(frame).map(playbackLayerKey));
+        return requiredRenderableVideoLayers(snapshot).filter((layer) => {
+            const clipStart = Math.max(0, Math.round(Number(layer?.clip?.timeline_start_frame) || 0));
+            return boundaryKeys.has(playbackLayerKey(layer))
+                || (frame >= clipStart && frame - clipStart <= PLAYBACK_CURRENT_BOUNDARY_HOLD_FRAMES);
+        });
+    }
+
+    function currentSafetyLayersAtFrame(snapshot, targetFrame, offset) {
+        return offset === 0
+            ? currentRecoveryEligibleLayers(snapshot)
+            : effectivePlaybackBoundaryLayers(targetFrame);
+    }
+
     function playbackLayerKeySignature(layers) {
         return (layers || []).map((layer) => layer?.key || "").filter(Boolean).join("|");
     }
@@ -3455,12 +3583,16 @@ export function createViewportSurface(options = {}) {
         return target ? { ...target, scheduleOrigin } : target;
     }
 
-    function collectBoundaryPrebufferTargets(frame, currentKeys = new Set(), seenKeys = new Set(), targetOptions = {}) {
-        const futureSnapshot = buildFrameSnapshot(frame);
+    function collectBoundaryPrebufferTargets(
+        frame,
+        currentKeys = new Set(),
+        seenKeys = new Set(),
+        targetOptions = {},
+        boundaryLayers = null,
+    ) {
         const boundaryTargets = [];
         const boundaryKeys = new Set();
-        for (const layer of requiredClipLayersAfterCoverage(futureSnapshot)) {
-            if (!isRenderableVideoLayer(layer)) continue;
+        for (const layer of boundaryLayers || effectivePlaybackBoundaryLayers(frame)) {
             const target = prebufferTargetForLayer(layer, frame, targetOptions);
             const key = target?.key || "";
             if (!key || currentKeys.has(key) || seenKeys.has(key) || boundaryKeys.has(key)) continue;
@@ -3483,12 +3615,19 @@ export function createViewportSurface(options = {}) {
         const maxEntries = normalizedPrebufferMaxEntries();
         const horizonFrames = Math.max(1, Math.round((normalizedPrebufferLookaheadMs() / 1000) * fps()));
         const candidateFrames = collectPrebufferCandidateFrames(currentFrame, endFrame, horizonFrames);
+        const boundaryGroups = effectivePlaybackBoundaryGroups(candidateFrames);
         const targets = [];
         const seenKeys = new Set();
         let boundariesCovered = 0;
-        for (const frame of candidateFrames) {
+        for (const group of boundaryGroups) {
             if (boundariesCovered >= maxBoundaries) break;
-            const boundaryTargets = collectBoundaryPrebufferTargets(frame, currentKeys, seenKeys);
+            const boundaryTargets = collectBoundaryPrebufferTargets(
+                group.frame,
+                currentKeys,
+                seenKeys,
+                {},
+                group.layers,
+            );
             if (!boundaryTargets.length) continue;
             // Budget is whole-boundary: a partially-warmed boundary still cold-starts,
             // so stop before a boundary that would overflow the cap rather than
@@ -3509,36 +3648,23 @@ export function createViewportSurface(options = {}) {
         const currentFrame = Math.max(0, Math.round(Number(snapshot?.frame) || 0));
         const horizonFrames = Math.max(1, Math.round((normalizedPrebufferLookaheadMs() / 1000) * fps()));
         const candidateFrames = collectPrebufferCandidateFrames(currentFrame, endFrame, horizonFrames);
-        for (const frame of candidateFrames) {
-            const distance = playbackFrameDistance(currentFrame, frame, endFrame);
+        const boundaryGroups = effectivePlaybackBoundaryGroups(candidateFrames);
+        for (const group of boundaryGroups) {
+            const distance = playbackFrameDistance(currentFrame, group.frame, endFrame);
             if (Number.isFinite(maxDistanceFrames) && distance > maxDistanceFrames) break;
-            const boundaryTargets = collectBoundaryPrebufferTargets(frame, currentKeys, seenKeys, {
-                intent: "rebuffer-next-boundary",
-                decodePriority: DECODE_PRIORITY_URGENT,
-            });
+            const boundaryTargets = collectBoundaryPrebufferTargets(
+                group.frame,
+                currentKeys,
+                seenKeys,
+                {
+                    intent: "rebuffer-next-boundary",
+                    decodePriority: DECODE_PRIORITY_URGENT,
+                },
+                group.layers,
+            );
             if (boundaryTargets.length) return boundaryTargets;
         }
         return [];
-    }
-
-    function isCurrentPrebufferSafetyFrame(layer, frame) {
-        const clip = layer?.clip;
-        if (!clip) return false;
-        const current = Math.max(0, Math.round(Number(frame) || 0));
-        const clipStart = Math.max(0, Math.round(Number(clip.timeline_start_frame) || 0));
-        if (current >= clipStart && current - clipStart <= PLAYBACK_CURRENT_BOUNDARY_HOLD_FRAMES) {
-            return true;
-        }
-        const scene = getScene();
-        if ((scene?.clips || []).some((candidate) => (
-            Math.round(Number(candidate?.timeline_end_frame) || -1) === current
-        ))) {
-            return true;
-        }
-        const loopRange = state.playbackLoopRange;
-        if (!loopRange) return false;
-        const loopStart = Math.max(0, Math.round(Number(loopRange.start) || 0));
-        return current === loopStart;
     }
 
     function findCurrentPrebufferSafetyTargets(snapshot, { suppressContinuations = false } = {}) {
@@ -3553,10 +3679,8 @@ export function createViewportSurface(options = {}) {
             const targetFrame = playbackSearchFrame(frame, offset, playbackEndFrame);
             if (targetFrame === null) continue;
             const targetSnapshot = offset === 0 ? snapshot : buildFrameSnapshot(targetFrame);
-            const layersByVisualPriority = requiredClipLayersAfterCoverage(targetSnapshot);
+            const layersByVisualPriority = currentSafetyLayersAtFrame(targetSnapshot, targetFrame, offset);
             for (const layer of layersByVisualPriority) {
-                if (!isRenderableVideoLayer(layer)) continue;
-                if (!isCurrentPrebufferSafetyFrame(layer, targetFrame)) continue;
                 const active = offset === 0 ? state.activePlaybackVideos.get(layer.key) : null;
                 if (offset === 0 && activeHasMatchingPrepare(active, layer, targetFrame)) continue;
                 if (offset === 0 && isActiveVideoDrawable(active, layer, targetFrame)) continue;
@@ -4505,23 +4629,37 @@ export function createViewportSurface(options = {}) {
             ...targets.map(({ key }) => key).filter(Boolean),
             ...targets.map(({ currentFrameRecoveryPendingExistingKey }) => currentFrameRecoveryPendingExistingKey).filter(Boolean),
             ...deferredNextBoundaryTargets.map(({ key }) => key).filter(Boolean),
-            ...(state.playbackDeferredNextBoundaryTargets || []).map((target) => target?.key).filter(Boolean),
+            ...(!rebufferLimited ? (state.playbackDeferredNextBoundaryTargets || []) : [])
+                .map((target) => target?.key)
+                .filter(Boolean),
         ]);
         const preservingSuppressedHandoffWork = !rebufferLimited && currentHandoff.active && shouldSuppressFuture;
         for (const [key, entry] of Array.from(state.prebufferCache.entries())) {
+            if (rebufferLimited) {
+                const action = _classifyRebufferPrebufferEntry({
+                    desired: desiredKeys.has(key),
+                    claimed: !!entry?.claimedByActive,
+                    waiting: playbackWaitingForPrebufferEntry(entry),
+                    ready: !!entry?.ready,
+                    valid: !!entry
+                        && !entry.cancelled
+                        && !entry.consumed
+                        && entry.warmToken === state.playbackWarmContentToken,
+                });
+                if (action === "preserve" || action === "preserve-ready") continue;
+                state.prebufferCache.delete(key);
+                if (action === "cancel") {
+                    cancelQueuedPrebufferEntry(entry, "rebuffer-non-desired");
+                    discardPrebufferEntry(entry);
+                }
+                continue;
+            }
             if (desiredKeys.has(key)) continue;
             if (entry?.claimedByActive) {
                 state.prebufferCache.delete(key);
                 continue;
             }
             if (playbackWaitingForPrebufferEntry(entry)) continue;
-            if (rebufferLimited) {
-                if (entry?.cancelled || entry?.consumed || entry?.warmToken !== state.playbackWarmContentToken) {
-                    state.prebufferCache.delete(key);
-                    discardPrebufferEntry(entry);
-                }
-                continue;
-            }
             if (preservingSuppressedHandoffWork && shouldRetainNonDesiredPrebufferDuringHandoff(entry, key)) continue;
             state.prebufferCache.delete(key);
             discardPrebufferEntry(entry);
@@ -6320,6 +6458,9 @@ export function createViewportSurface(options = {}) {
         state.playbackRebufferCapped = false;
         state.playbackRebufferBlockTargetKey = blockTargetKey;
         clearRebufferSafetyState();
+        // Deferred ownership belongs to the previous rebuffer cycle. A new hold
+        // computes its own effective next boundary and must not protect stale work.
+        clearDeferredNextBoundaryTargets("rebuffer-reentry");
         for (const active of state.activePlaybackVideos.values()) {
             active.video.pause();
         }
