@@ -192,6 +192,7 @@ function surfaceRootCss(surface) {
             min-height: 0;
             height: 100%;
             overflow-y: auto;
+            overscroll-behavior-y: contain;
             padding-right: 2px;
             box-sizing: border-box;
             font-family: ${FONT.sans};
@@ -583,6 +584,13 @@ export function mountSharedRenderQueue(container, options = {}) {
     let current = normalizeOptions(options);
     let destroyed = false;
     const root = style(document.createElement("div"), surfaceRootCss(current.surface));
+    const handleWheel = (event) => {
+        if (current.surface !== "dormant") return;
+        // Keep ComfyUI/LiteGraph from claiming the wheel while preserving the
+        // browser's native scroll default for the bounded queue surface.
+        callConsume(current, event);
+    };
+    root.addEventListener("wheel", handleWheel, { passive: true });
     container.appendChild(root);
 
     const render = () => {
@@ -618,6 +626,7 @@ export function mountSharedRenderQueue(container, options = {}) {
         },
         destroy() {
             destroyed = true;
+            root.removeEventListener("wheel", handleWheel);
             root.remove();
         },
     };

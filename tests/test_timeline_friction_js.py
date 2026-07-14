@@ -63,6 +63,98 @@ console.log(JSON.stringify(result));
     assert (result["selectedExact"]["id"], result["selectedExact"]["edge"]) == ("left", "right")
 
 
+def test_timeline_edge_auto_scroll_delta_is_quadratic_and_bounded():
+    module_url = (ROOT / "web" / "js" / "editor_timeline_canvas.js").as_uri()
+    script = f"""
+const mod = await import({json.dumps(module_url)});
+const delta = (position) => mod._edgeAutoScrollDelta(position, 100, 300, 20, 8);
+console.log(JSON.stringify({{
+    center: delta(200),
+    topEdge: delta(100),
+    topHalf: delta(110),
+    topBandEnd: delta(120),
+    bottomBandStart: delta(280),
+    bottomHalf: delta(290),
+    bottomEdge: delta(300),
+    topOutside: delta(79),
+    invalidViewport: mod._edgeAutoScrollDelta(100, 100, 100, 20, 8),
+}}));
+"""
+    result = json.loads(_run_node(script))
+
+    assert result == {
+        "center": 0,
+        "topEdge": -8,
+        "topHalf": -2,
+        "topBandEnd": 0,
+        "bottomBandStart": 0,
+        "bottomHalf": 2,
+        "bottomEdge": 8,
+        "topOutside": 0,
+        "invalidViewport": 0,
+    }
+
+
+def test_editor_widget_wires_vertical_edge_scroll_and_content_anchored_drag_selection():
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+
+    assert 'const horizontalEdgeScrollDragTypes = new Set(["boxSelect", "moveItem", "playhead"])' in source
+    assert '|| this.dragType === "laneSelect"' in source
+    assert "const edgeScrollEnabled = () => horizontalEdgeScrollDragTypes.has(this.dragType)" in source
+    assert "if (!this.isDragging || !edgeScrollEnabled())" in source
+    assert '(this.dragType === "moveItem" && this._dragAnchorType === "clip")' in source
+    assert "this._totalTracksHeight() <= visibleH" in source
+    assert "const deltaPixels = edgeScrollDeltaPixels();" in source
+    assert "this.scrollY += deltaPixels;" in source
+    assert "this._clampScrollY();" in source
+    assert "startContentY: contentY" in source
+    assert "rect.currentContentY = this._dragSelectContentY(rawY);" in source
+    assert "const top = this._trackY(layoutIdx) - rulerH;" in source
+    assert "rulerH + rect.startContentY - this.scrollY" in source
+    assert "_lanesInContentRange(rect)" in source
+    assert "const top = this._trackY(i) - rulerH;" in source
+    assert "const drawY = Math.max(rulerH, y1);" in source
+
+
+def test_lane_drag_selection_range_remains_anchored_to_timeline_content():
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    method_start = source.index("    _lanesInContentRange(rect) {")
+    method_end = source.index("\n    _updateDragSelect(", method_start)
+    method_source = source[method_start:method_end].strip()
+    script = f"""
+const methodSource = {json.dumps(method_source)};
+const lanesInContentRange = new Function(
+    "return ({{" + methodSource + "}})._lanesInContentRange;"
+)();
+const host = {{
+    scrollY: 80,
+    _trackLayout: [
+        {{ type: "video", laneIndex: 0 }},
+        {{ type: "video", laneIndex: 1 }},
+        {{ type: "audio", laneIndex: 0 }},
+        {{ type: "spacer", laneIndex: 0 }},
+    ],
+    _timelineRulerHeight() {{ return 20; }},
+    _trackY(index) {{ return 20 + index * 40; }},
+    _trackH() {{ return 40; }},
+    _isHeaderControllableTrackType(type) {{ return type !== "spacer"; }},
+    _laneRefForEntry(entry) {{ return {{ type: entry.type, laneIndex: entry.laneIndex }}; }},
+}};
+const rect = {{ startContentY: 41, currentContentY: 119 }};
+const beforeScroll = lanesInContentRange.call(host, rect);
+host.scrollY = 0;
+const afterScroll = lanesInContentRange.call(host, rect);
+console.log(JSON.stringify({{ beforeScroll, afterScroll }}));
+"""
+    result = json.loads(_run_node(script))
+
+    expected = [
+        {"type": "video", "laneIndex": 1},
+        {"type": "audio", "laneIndex": 0},
+    ]
+    assert result == {"beforeScroll": expected, "afterScroll": expected}
+
+
 def test_viewport_empty_and_missing_states_draw_optional_scene_outline():
     module_url = (ROOT / "web" / "js" / "viewport_surface.js").as_uri()
     script = f"""

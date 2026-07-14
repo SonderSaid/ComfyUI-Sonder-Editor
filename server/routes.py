@@ -6195,7 +6195,9 @@ if routes is not None:
 
         body = {}
         try:
-            body = await request.json()
+            parsed_body = await request.json()
+            if isinstance(parsed_body, dict):
+                body = parsed_body
         except Exception:
             pass
         force = bool(body.get("force", False))

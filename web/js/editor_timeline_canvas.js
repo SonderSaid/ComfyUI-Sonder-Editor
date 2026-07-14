@@ -98,6 +98,28 @@ export function _layoutIndexFromRawY(host, rawY) {
     }
     return -1;
 }
+
+export function _edgeAutoScrollDelta(position, viewportStart, viewportEnd, threshold, maxStep) {
+    if (![position, viewportStart, viewportEnd, threshold, maxStep].every(Number.isFinite)) return 0;
+    if (viewportEnd <= viewportStart || threshold <= 0 || maxStep <= 0) return 0;
+
+    const startDepth = threshold - (position - viewportStart);
+    const endDepth = threshold - (viewportEnd - position);
+    let direction = 0;
+    let depth = 0;
+    if (startDepth > 0 && position >= viewportStart - threshold) {
+        direction = -1;
+        depth = Math.min(threshold, startDepth);
+    } else if (endDepth > 0) {
+        direction = 1;
+        depth = Math.min(threshold, endDepth);
+    }
+    if (!direction || depth <= 0) return 0;
+
+    const ratio = depth / threshold;
+    return direction * maxStep * ratio * ratio;
+}
+
 export function _drawTimelineItemRail(host, ctx, x, y, w, h, color) {
         if (w <= 4 || h <= 4 || !color) return;
         const railW = Math.min(Math.max(2, Math.round(4 * host._scaleTimeline)), Math.max(2, w - 4));

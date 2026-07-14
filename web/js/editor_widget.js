@@ -5643,8 +5643,19 @@ export class EditorWidget {
         return next;
     }
 
+    _dragSelectContentY(rawY) {
+        const rulerH = this._timelineRulerHeight();
+        const visibleH = this._visibleTimelineContentHeight();
+        const clampedRawY = Math.max(rulerH, Math.min(rulerH + visibleH, Number(rawY) || 0));
+        return Math.max(0, Math.min(
+            this._totalTracksHeight(),
+            clampedRawY - rulerH + this.scrollY,
+        ));
+    }
+
     _startItemDragSelect(x, rawY, event) {
         const additive = !!(event?.shiftKey || event?.ctrlKey || event?.metaKey);
+        const contentY = this._dragSelectContentY(rawY);
         this.isDragging = true;
         this.dragType = "boxSelect";
         this._dragSelectRect = {
@@ -5652,8 +5663,10 @@ export class EditorWidget {
             startX: x,
             startFrame: Math.max(0, this._xToFrame(x)),
             startRawY: rawY,
+            startContentY: contentY,
             currentX: x,
             currentRawY: rawY,
+            currentContentY: contentY,
             additive,
             activated: false,
         };
@@ -5668,14 +5681,17 @@ export class EditorWidget {
 
     _startLaneDragSelect(headerHit, rawY, event) {
         const additive = !!(event?.shiftKey || event?.ctrlKey || event?.metaKey);
+        const contentY = this._dragSelectContentY(rawY);
         this.isDragging = true;
         this.dragType = "laneSelect";
         this._dragSelectRect = {
             kind: "lanes",
             startX: 0,
             startRawY: rawY,
+            startContentY: contentY,
             currentX: this._labelW,
             currentRawY: rawY,
+            currentContentY: contentY,
             additive,
             activated: false,
         };
@@ -5695,12 +5711,13 @@ export class EditorWidget {
             : rect.startX;
         const minX = Math.min(startX, rect.currentX);
         const maxX = Math.max(startX, rect.currentX);
-        const minY = Math.min(rect.startRawY, rect.currentRawY);
-        const maxY = Math.max(rect.startRawY, rect.currentRawY);
+        const minY = Math.min(rect.startContentY, rect.currentContentY);
+        const maxY = Math.max(rect.startContentY, rect.currentContentY);
         if (maxX < this._labelW) return [];
+        const rulerH = this._timelineRulerHeight();
         const intersectsRow = (layoutIdx) => {
             if (layoutIdx < 0 || this._trackLayout[layoutIdx]?.collapsed) return false;
-            const top = this._trackY(layoutIdx) - this.scrollY;
+            const top = this._trackY(layoutIdx) - rulerH;
             const bottom = top + this._trackH(layoutIdx);
             return top <= maxY && bottom >= minY;
         };
@@ -5749,15 +5766,16 @@ export class EditorWidget {
         return this._dedupeSelectionItems(hits.filter((hit) => !this._isItemLocked(hit)));
     }
 
-    _lanesInRawRange(rect) {
+    _lanesInContentRange(rect) {
         if (!rect) return [];
-        const minY = Math.min(rect.startRawY, rect.currentRawY);
-        const maxY = Math.max(rect.startRawY, rect.currentRawY);
+        const minY = Math.min(rect.startContentY, rect.currentContentY);
+        const maxY = Math.max(rect.startContentY, rect.currentContentY);
+        const rulerH = this._timelineRulerHeight();
         const lanes = [];
         for (let i = 0; i < (this._trackLayout || []).length; i++) {
             const entry = this._trackLayout[i];
             if (!this._isHeaderControllableTrackType(entry.type)) continue;
-            const top = this._trackY(i) - this.scrollY;
+            const top = this._trackY(i) - rulerH;
             const bottom = top + this._trackH(i);
             if (top <= maxY && bottom >= minY) {
                 const ref = this._laneRefForEntry(entry);
@@ -5772,11 +5790,15 @@ export class EditorWidget {
         if (!rect) return;
         rect.currentX = x;
         rect.currentRawY = rawY;
-        if (Math.abs(rect.currentX - rect.startX) > 3 || Math.abs(rect.currentRawY - rect.startRawY) > 3) {
+        if (rect.kind === "items" || rect.kind === "lanes") {
+            rect.currentContentY = this._dragSelectContentY(rawY);
+        }
+        const verticalDistance = Math.abs(rect.currentContentY - rect.startContentY);
+        if (Math.abs(rect.currentX - rect.startX) > 3 || verticalDistance > 3) {
             rect.activated = true;
         }
         if (rect.kind === "lanes") {
-            this._setSelectedLanes([...(this._dragSelectBaseLanes || []), ...this._lanesInRawRange(rect)]);
+            this._setSelectedLanes([...(this._dragSelectBaseLanes || []), ...this._lanesInContentRange(rect)]);
             return;
         }
         if (rect.kind === "items") {
@@ -5806,8 +5828,11 @@ export class EditorWidget {
             : rect.startX;
         const x1 = rect.kind === "lanes" ? 0 : Math.max(this._labelW, Math.min(startX, rect.currentX));
         const x2 = rect.kind === "lanes" ? this._labelW : Math.max(startX, rect.currentX);
-        const y1 = Math.min(rect.startRawY, rect.currentRawY);
-        const y2 = Math.max(rect.startRawY, rect.currentRawY);
+        const rulerH = this._timelineRulerHeight();
+        const startRawY = rulerH + rect.startContentY - this.scrollY;
+        const currentRawY = rulerH + rect.currentContentY - this.scrollY;
+        const y1 = Math.min(startRawY, currentRawY);
+        const y2 = Math.max(startRawY, currentRawY);
         if (x2 - x1 < 1 || y2 - y1 < 1) return;
         ctx.save();
         ctx.fillStyle = "rgba(99, 179, 237, 0.16)";
@@ -5815,9 +5840,13 @@ export class EditorWidget {
         ctx.lineWidth = 1;
         ctx.setLineDash([4, 3]);
         const drawX = Math.max(0, x1);
-        const drawY = Math.max(0, y1);
+        const drawY = Math.max(rulerH, y1);
         const drawW = Math.max(0, Math.min(width, x2) - drawX);
         const drawH = Math.max(0, Math.min(height, y2) - drawY);
+        if (drawW < 1 || drawH < 1) {
+            ctx.restore();
+            return;
+        }
         ctx.fillRect(drawX, drawY, drawW, drawH);
         ctx.strokeRect(drawX + 0.5, drawY + 0.5, drawW, drawH);
         ctx.restore();
@@ -5909,29 +5938,33 @@ export class EditorWidget {
         const canvas = this.timelineCanvas;
         let edgeScrollRAF = 0;
         let edgeScrollLastEvent = null;
-        const edgeScrollDragTypes = new Set(["boxSelect", "moveItem", "playhead"]);
+        const horizontalEdgeScrollDragTypes = new Set(["boxSelect", "moveItem", "playhead"]);
+        const verticalEdgeScrollEnabled = () => this.dragType === "boxSelect"
+            || this.dragType === "laneSelect"
+            || (this.dragType === "moveItem" && this._dragAnchorType === "clip");
+        const edgeScrollEnabled = () => horizontalEdgeScrollDragTypes.has(this.dragType)
+            || verticalEdgeScrollEnabled();
         const edgeScrollDeltaFrames = () => {
-            if (!edgeScrollLastEvent || !this.isDragging || !edgeScrollDragTypes.has(this.dragType)) return 0;
+            if (!edgeScrollLastEvent || !this.isDragging || !horizontalEdgeScrollDragTypes.has(this.dragType)) return 0;
             const { x } = this._canvasMouseCoords(edgeScrollLastEvent);
             const width = canvas.width || canvas.getBoundingClientRect().width || 0;
             if (width <= this._labelW) return 0;
             const threshold = 24;
-            const leftDepth = threshold - (x - this._labelW);
-            const rightDepth = threshold - (width - x);
-            let direction = 0;
-            let depth = 0;
-            if (leftDepth > 0 && x >= this._labelW - threshold) {
-                direction = -1;
-                depth = Math.min(threshold, leftDepth);
-            } else if (rightDepth > 0) {
-                direction = 1;
-                depth = Math.min(threshold, rightDepth);
-            }
-            if (!direction || depth <= 0) return 0;
             const visibleFrames = this._visibleTimelineFrameSpan();
             const maxStep = Math.max(0.75, visibleFrames * 0.025);
-            const ratio = depth / threshold;
-            return direction * maxStep * ratio * ratio;
+            return TimelineCanvas._edgeAutoScrollDelta(x, this._labelW, width, threshold, maxStep);
+        };
+        const edgeScrollDeltaPixels = () => {
+            if (!edgeScrollLastEvent || !this.isDragging || !verticalEdgeScrollEnabled()) return 0;
+            const visibleH = this._visibleTimelineContentHeight();
+            if (visibleH <= 0 || this._totalTracksHeight() <= visibleH) return 0;
+            const { rawY } = this._canvasMouseCoords(edgeScrollLastEvent);
+            const rulerH = this._timelineRulerHeight();
+            const height = canvas.height || canvas.getBoundingClientRect().height || 0;
+            if (height <= rulerH) return 0;
+            const threshold = 24;
+            const maxStep = Math.max(2, visibleH * 0.025);
+            return TimelineCanvas._edgeAutoScrollDelta(rawY, rulerH, height, threshold, maxStep);
         };
         const stopEdgeScroll = () => {
             if (edgeScrollRAF) {
@@ -5948,23 +5981,27 @@ export class EditorWidget {
                 stopEdgeScroll();
                 return;
             }
-            const delta = edgeScrollDeltaFrames();
-            if (!delta) return;
-            const before = this.scrollX;
-            this.scrollX += delta;
+            const deltaFrames = edgeScrollDeltaFrames();
+            const deltaPixels = edgeScrollDeltaPixels();
+            if (!deltaFrames && !deltaPixels) return;
+            const beforeX = this.scrollX;
+            const beforeY = this.scrollY;
+            this.scrollX += deltaFrames;
+            this.scrollY += deltaPixels;
             this._clampScrollX();
-            if (this.scrollX === before) return;
+            this._clampScrollY();
+            if (this.scrollX === beforeX && this.scrollY === beforeY) return;
             if (edgeScrollLastEvent && onMouseMove) {
                 onMouseMove(edgeScrollLastEvent);
             }
         };
         const updateEdgeScroll = (event) => {
             edgeScrollLastEvent = event;
-            if (!this.isDragging || !edgeScrollDragTypes.has(this.dragType)) {
+            if (!this.isDragging || !edgeScrollEnabled()) {
                 stopEdgeScroll();
                 return;
             }
-            if (!edgeScrollRAF && edgeScrollDeltaFrames()) {
+            if (!edgeScrollRAF && (edgeScrollDeltaFrames() || edgeScrollDeltaPixels())) {
                 edgeScrollRAF = requestAnimationFrame(edgeScrollTick);
             }
         };
