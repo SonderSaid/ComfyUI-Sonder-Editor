@@ -12,7 +12,7 @@ from aiohttp import web
 import server
 import server.routes as routes
 from server.project_manager import create_project, list_projects
-from server.timeline_state import Asset, TimelineProject
+from server.timeline_state import Asset, ClipReference, Scene, TimelineProject
 
 
 class DummyRequest:
@@ -98,6 +98,49 @@ def test_project_route_rejects_traversal_project_id(tmp_path, monkeypatch):
     response = asyncio.run(handler(DummyRequest(match_info={"project_id": ".."})))
 
     assert response.status == 400
+
+
+def test_project_load_repair_save_is_version_guarded(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    base_dir = tmp_path / "projects"
+    project = create_project("Repair Race", base_dir=str(base_dir))
+    project.modified_at = "2026-07-14T20:00:00"
+    project.scenes = [Scene(
+        name="Scene",
+        duration_frames=10,
+        clips=[ClipReference(
+            source_path="media/clip.mp4",
+            timeline_start_frame=0,
+            timeline_end_frame=10,
+            source_out_frame=10,
+            total_source_frames=0,
+        )],
+    )]
+    route_module.save_project(project, bump_modified_at=False, notify=False)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(base_dir))
+
+    original_save = route_module.save_project
+    concurrent_version = "2026-07-14T20:00:01"
+    observed = {}
+
+    def race_repair_save(repair_project, **kwargs):
+        observed.update(kwargs)
+        latest = route_module.load_project(repair_project.project_dir)
+        latest.modified_at = concurrent_version
+        original_save(latest, bump_modified_at=False, notify=False)
+        return original_save(repair_project, **kwargs)
+
+    monkeypatch.setattr(route_module, "save_project", race_repair_save)
+
+    loaded = route_module._load_project_from_request(DummyRequest(
+        match_info={"project_id": os.path.basename(project.project_dir)},
+    ))
+    on_disk = route_module.load_project(project.project_dir)
+
+    assert loaded.scenes[0].clips[0].total_source_frames == 10
+    assert observed["expected_modified_at"] == "2026-07-14T20:00:00"
+    assert on_disk.modified_at == concurrent_version
+    assert on_disk.scenes[0].clips[0].total_source_frames == 0
 
 
 def test_project_list_and_create_reject_public_base_dir(tmp_path, monkeypatch):

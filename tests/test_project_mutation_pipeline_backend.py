@@ -1678,7 +1678,7 @@ def test_scene_mutation_update_lane_config_multi_op_single_save(monkeypatch, tmp
     assert scene.audio_lane_configs[0].locked is True
 
 
-def test_load_project_repair_save_is_unversioned_and_non_fatal(monkeypatch, tmp_path):
+def test_load_project_repair_save_is_version_guarded_and_non_fatal(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
     scene = Scene(scene_id="scene-1", name="Scene")
     scene.clips = [ClipReference(
@@ -1708,10 +1708,14 @@ def test_load_project_repair_save_is_unversioned_and_non_fatal(monkeypatch, tmp_
     loaded = route_module._load_project_from_request(request)
 
     # The repair is applied in memory and served despite the contended save,
-    # and the save is a no-bump/no-broadcast back-fill.
+    # and the save is a version-guarded, no-bump/no-broadcast back-fill.
     assert loaded is project
     assert scene.clips[0].total_source_frames == 10
-    assert save_calls == [{"bump_modified_at": False, "notify": False}]
+    assert save_calls == [{
+        "expected_modified_at": project.modified_at,
+        "bump_modified_at": False,
+        "notify": False,
+    }]
 
 
 def test_scenes_get_serves_despite_contended_repair_save(monkeypatch, tmp_path):

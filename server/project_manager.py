@@ -201,7 +201,7 @@ def load_project(project_dir: str) -> TimelineProject:
     for subdir in PROJECT_SUBDIRS:
         os.makedirs(os.path.join(project_dir, subdir), exist_ok=True)
 
-    logger.info("Loaded project '%s' from %s", project.name, project_dir)
+    logger.debug("Loaded project '%s' from %s", project.name, project_dir)
     return project
 
 

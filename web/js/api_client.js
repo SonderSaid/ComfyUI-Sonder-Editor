@@ -1,5 +1,8 @@
 const projectVersions = new Map();
+const projectAliases = new Map();
 let fetchPatchInstalled = false;
+
+const STALE_REPLAY_DELAYS_MS = [250, 1000, 4000];
 
 function normalizeProjectId(projectId) {
     return String(projectId || "").trim();
@@ -7,6 +10,21 @@ function normalizeProjectId(projectId) {
 
 function methodIsMutating(method) {
     return !["GET", "HEAD", "OPTIONS"].includes(String(method || "GET").toUpperCase());
+}
+
+function associateProjectIds(firstProjectId, secondProjectId) {
+    const first = normalizeProjectId(firstProjectId);
+    const second = normalizeProjectId(secondProjectId);
+    if (!first || !second || first === second) return;
+    const aliases = new Set([
+        first,
+        second,
+        ...(projectAliases.get(first) || []),
+        ...(projectAliases.get(second) || []),
+    ]);
+    for (const projectId of aliases) {
+        projectAliases.set(projectId, aliases);
+    }
 }
 
 export function projectIdFromUrl(url) {
@@ -22,12 +40,61 @@ export function rememberProjectVersion(projectId, modifiedAt) {
     // never move the map backwards (it would regress If-Match headers and
     // defeat version-gated apply checks). modified_at is an ISO timestamp —
     // lexicographic compare is order-correct, incl. the zero-microsecond
-    // short form. A legitimate backward jump (none exists today) would need
-    // an explicit map clear.
+    // short form. Legitimate backward jumps use resetProjectVersion through
+    // the stale-response breaker or lower-actual 409 recovery path below.
     const next = String(modifiedAt);
     const current = projectVersions.get(normalizedProjectId) || "";
     if (current && next < current) return;
     projectVersions.set(normalizedProjectId, next);
+}
+
+export function resetProjectVersion(projectId, modifiedAt) {
+    const normalizedProjectId = normalizeProjectId(projectId);
+    if (!normalizedProjectId || !modifiedAt) return;
+    const next = String(modifiedAt);
+    const aliases = projectAliases.get(normalizedProjectId) || new Set([normalizedProjectId]);
+    for (const alias of aliases) {
+        projectVersions.set(alias, next);
+    }
+}
+
+export function createStaleReplayGovernor() {
+    let activeProjectId = "";
+    let servedVersion = "";
+    let consecutiveRejections = 0;
+
+    const reset = (projectId = "") => {
+        activeProjectId = normalizeProjectId(projectId);
+        servedVersion = "";
+        consecutiveRejections = 0;
+    };
+
+    return {
+        reject(projectId, rawServedVersion) {
+            const normalizedProjectId = normalizeProjectId(projectId);
+            const nextServedVersion = String(rawServedVersion || "");
+            if (normalizedProjectId !== activeProjectId) {
+                reset(normalizedProjectId);
+            }
+            if (nextServedVersion === servedVersion) {
+                consecutiveRejections += 1;
+            } else {
+                servedVersion = nextServedVersion;
+                consecutiveRejections = 1;
+            }
+            if (consecutiveRejections > STALE_REPLAY_DELAYS_MS.length) {
+                const rejectionCount = consecutiveRejections;
+                reset(normalizedProjectId);
+                return { action: "accept", rejectionCount };
+            }
+            return {
+                action: "retry",
+                delayMs: STALE_REPLAY_DELAYS_MS[consecutiveRejections - 1],
+                rejectionCount: consecutiveRejections,
+            };
+        },
+        reset,
+    };
 }
 
 export function rememberProjectVersionFromPayload(payload, fallbackProjectId = "") {
@@ -35,6 +102,7 @@ export function rememberProjectVersionFromPayload(payload, fallbackProjectId = "
     const project = payload.project && typeof payload.project === "object" ? payload.project : payload;
     const projectId = normalizeProjectId(project.project_id);
     const fallback = normalizeProjectId(fallbackProjectId);
+    associateProjectIds(projectId, fallback);
     if (project.modified_at && projectId) {
         rememberProjectVersion(projectId, project.modified_at);
     }
@@ -47,9 +115,12 @@ export function rememberProjectVersionFromResponse(response, fallbackProjectId =
     if (!response?.headers) return;
     const headerProjectId = response.headers.get?.("X-Sonder-Project-Id") || "";
     const headerModifiedAt = response.headers.get?.("X-Sonder-Project-Modified-At") || "";
-    const projectId = normalizeProjectId(headerProjectId || fallbackProjectId);
-    if (projectId && headerModifiedAt) {
-        rememberProjectVersion(projectId, headerModifiedAt);
+    const projectId = normalizeProjectId(headerProjectId);
+    const fallback = normalizeProjectId(fallbackProjectId);
+    associateProjectIds(projectId, fallback);
+    if (headerModifiedAt) {
+        if (projectId) rememberProjectVersion(projectId, headerModifiedAt);
+        if (fallback && fallback !== projectId) rememberProjectVersion(fallback, headerModifiedAt);
     }
 }
 

@@ -252,7 +252,13 @@ import {
     subscribeEditorSettings,
     updateEditorSettings,
 } from "./editor_settings.js";
-import { fetchProjectJson, rememberProjectVersionFromPayload, getProjectVersion } from "./api_client.js";
+import {
+    createStaleReplayGovernor,
+    fetchProjectJson,
+    getProjectVersion,
+    rememberProjectVersionFromPayload,
+    resetProjectVersion,
+} from "./api_client.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
 import {
     findConstrainedSelectionEndpoint,
@@ -556,7 +562,10 @@ export class EditorWidget {
         this._pendingProjectRefreshDrain = false;
         this._timelineMutationDepth = 0;
         this._sceneFetchSeq = 0;
+        this._sceneMutationInvalidationSeq = 0;
         this._queueFetchSeq = 0;
+        this._staleReplayGovernors = new Map();
+        this._staleReplayTimers = new Map();
         this._projectMutationQueue = new ProjectMutationQueue({
             onIdle: () => this._replayDeferredProjectBackedRefresh(),
         });
@@ -1091,6 +1100,7 @@ export class EditorWidget {
         }
 
         const fetchSeq = ++this._sceneFetchSeq;
+        const mutationSeq = this._sceneMutationInvalidationSeq;
         try {
             const dirName = this.projectDir.split(/[/\\]/).pop();
             // Version-aware apply (mutation-integrity F2): capture the known
@@ -1109,10 +1119,22 @@ export class EditorWidget {
                         fetch_seq: fetchSeq,
                         current_seq: this._sceneFetchSeq,
                     });
-                    // A mutation (or newer fetch) invalidated this payload while
-                    // it was in flight; defer a replay so the discarded refresh
-                    // still converges after the queue drains.
-                    this._deferProjectBackedRefresh(["scenes"], "scene_refresh_stale_replay");
+                    // A newer scenes fetch superseded this one: latest-wins.
+                    // Re-deferring a dispatch-order rejection lets overlapping
+                    // chains invalidate one another forever at idle.
+                    return;
+                }
+                if (mutationSeq !== this._sceneMutationInvalidationSeq) {
+                    sessionDiagRecord("scene_refresh_mutation_invalidated", {
+                        reason,
+                        mutation_seq: mutationSeq,
+                        current_mutation_seq: this._sceneMutationInvalidationSeq,
+                    });
+                    // Mutations are the only invalidation source that needs a
+                    // replay. The mutation queue drain bounds this path and makes
+                    // refreshScenes:false writes converge after their in-flight
+                    // pre-mutation payload is discarded.
+                    this._deferProjectBackedRefresh(["scenes"], "scene_refresh_mutation_replay");
                     return;
                 }
                 // Commit-order race guard: a GET served by the backend BEFORE
@@ -1131,13 +1153,20 @@ export class EditorWidget {
                         header_version: headerVersion,
                         known_version: compareVersion,
                     });
-                    this._deferProjectBackedRefresh(["scenes"], "scene_refresh_stale_version_replay");
-                    return;
+                    const accepted = this._governStaleVersionReplay(
+                        "scenes",
+                        dirName,
+                        headerVersion,
+                        compareVersion,
+                        "scene_refresh_stale_version_replay",
+                    );
+                    if (!accepted) return;
                 }
                 if (this._shouldDeferSceneRefresh({ ignoreMutationGate })) {
                     this._deferSceneRefresh(reason, { stage: "apply" });
                     return;
                 }
+                this._markStaleReplayApplied("scenes", dirName);
                 this._pendingScenesRefresh = false;
                 this.scenes = data.scenes || [];
                 if (this.scenes.length > 0) {
@@ -1963,6 +1992,64 @@ export class EditorWidget {
         return !!this._projectMutationQueue?.isBusy?.();
     }
 
+    _staleReplayGovernor(surfaceKey) {
+        if (!this._staleReplayGovernors.has(surfaceKey)) {
+            this._staleReplayGovernors.set(surfaceKey, createStaleReplayGovernor());
+        }
+        return this._staleReplayGovernors.get(surfaceKey);
+    }
+
+    _clearStaleReplayTimer(surfaceKey) {
+        const timer = this._staleReplayTimers.get(surfaceKey);
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            this._staleReplayTimers.delete(surfaceKey);
+        }
+    }
+
+    _clearStaleReplayState() {
+        for (const timer of this._staleReplayTimers.values()) {
+            clearTimeout(timer);
+        }
+        this._staleReplayTimers.clear();
+        this._staleReplayGovernors.clear();
+    }
+
+    _markStaleReplayApplied(surfaceKey, projectId) {
+        this._clearStaleReplayTimer(surfaceKey);
+        this._staleReplayGovernors.get(surfaceKey)?.reset(projectId);
+    }
+
+    _governStaleVersionReplay(surfaceKey, projectId, headerVersion, knownVersion, reason) {
+        const decision = this._staleReplayGovernor(surfaceKey).reject(projectId, headerVersion);
+        this._clearStaleReplayTimer(surfaceKey);
+        if (decision.action === "retry") {
+            const expectedProjectDir = this.projectDir;
+            const timer = setTimeout(() => {
+                if (this._staleReplayTimers.get(surfaceKey) === timer) {
+                    this._staleReplayTimers.delete(surfaceKey);
+                }
+                if (this._destroyed || this.projectDir !== expectedProjectDir) return;
+                this._deferProjectBackedRefresh([surfaceKey], reason);
+            }, decision.delayMs);
+            this._staleReplayTimers.set(surfaceKey, timer);
+            return false;
+        }
+
+        resetProjectVersion(projectId, headerVersion);
+        sessionDiagRecord("stale_version_breaker_tripped", {
+            surface: surfaceKey,
+            project_id: projectId,
+            header_version: headerVersion,
+            known_version: knownVersion,
+            rejection_count: decision.rejectionCount,
+        });
+        console.warn(
+            `[Sonder] ${surfaceKey} refresh accepted stable older project version after bounded retries; client version state was reset.`,
+        );
+        return true;
+    }
+
     _deferProjectBackedRefresh(keys, reason = "project_mutation") {
         if (!this._pendingProjectRefreshKeys) {
             this._pendingProjectRefreshKeys = new Set();
@@ -2033,6 +2120,10 @@ export class EditorWidget {
         let attempt = 0;
         while (true) {
             attempt += 1;
+            const explicitIfMatch = new Headers(init?.headers || {}).get("If-Match") || "";
+            const sentVersion = String(explicitIfMatch || getProjectVersion(projectId) || "")
+                .replace(/^W\//, "")
+                .replace(/^"|"$/g, "");
             try {
                 return await fetchProjectJson(api.apiURL(path), init, { projectId });
             } catch (error) {
@@ -2041,6 +2132,10 @@ export class EditorWidget {
                     && error?.code === "project_version_conflict"
                     && attempt < maxAttempts
                 ) {
+                    const actualVersion = String(error.actualModifiedAt || "");
+                    if (actualVersion && sentVersion && actualVersion < sentVersion) {
+                        resetProjectVersion(projectId, actualVersion);
+                    }
                     if (error.project) {
                         rememberProjectVersionFromPayload(error.project, projectId);
                     }
@@ -2066,12 +2161,11 @@ export class EditorWidget {
         failureTier = "error",
         invalidateQueueFetch = false,
     }) {
-        // Flicker-audit fix #1 (2026-06-11): invalidate any in-flight scenes GET
-        // the moment a mutation is enqueued — its payload predates this local
-        // intent and must never apply (the _fetchScenes seq check discards it at
-        // apply time; the discard path defers a replay so state still converges).
-        // The reconcile path's bump only covers refreshScenes:true mutations.
-        this._sceneFetchSeq += 1;
+        // Invalidate any in-flight scenes GET when a mutation is enqueued.
+        // Mutation invalidation is deliberately separate from fetch dispatch
+        // identity: mutations need one post-drain convergence replay, while a
+        // fetch superseded by a newer fetch must simply bail latest-wins.
+        this._sceneMutationInvalidationSeq += 1;
         if (invalidateQueueFetch) {
             this._queueFetchSeq += 1;
         }
@@ -2255,7 +2349,6 @@ export class EditorWidget {
             this._deferProjectBackedRefresh(["scenes"], reason);
             return true;
         }
-        this._sceneFetchSeq += 1;
         this._pendingScenesRefresh = false;
         this._replaceSceneInList(scene);
         this._setActiveScene(scene);
@@ -13932,13 +14025,20 @@ export class EditorWidget {
                         header_version: headerVersion,
                         known_version: compareVersion,
                     });
-                    this._deferProjectBackedRefresh(["queue"], "queue_refresh_stale_version_replay");
-                    return;
+                    const accepted = this._governStaleVersionReplay(
+                        "queue",
+                        projectId,
+                        headerVersion,
+                        compareVersion,
+                        "queue_refresh_stale_version_replay",
+                    );
+                    if (!accepted) return;
                 }
                 if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
                     this._deferProjectBackedRefresh(["queue"], `${reason}_apply_deferred`);
                     return;
                 }
+                this._markStaleReplayApplied("queue", projectId);
                 this._renderQueue = Array.isArray(data) ? data : [];
                 this._applyStoredQueueBatchCollapseState();
                 this._renderQueuePanel();
@@ -14299,6 +14399,7 @@ export class EditorWidget {
     // ── Public API ─────────────────────────────────────────────────────
     updateProject(projectDir) {
         if (projectDir === this.projectDir) return;
+        this._clearStaleReplayState();
         this.projectDir = projectDir;
         this._frameConstraintHealedFor = "";
         this.activeSceneId = "";
@@ -15507,6 +15608,7 @@ export class EditorWidget {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        this._clearStaleReplayState();
 
         this._stopPlayback();
         if (this._seekAbort) {

@@ -3932,6 +3932,7 @@ def _load_project_from_request(request: web.Request, *, repair_missing_frames: b
         raise FileNotFoundError(f"Project not found: {project_id}")
     project = load_project(project_dir)
     _validate_loaded_project_request(project, project_id, project_dir, base_dir)
+    loaded_modified_at = str(getattr(project, "modified_at", "") or "")
     if not repair_missing_frames:
         _validate_request_project_version(request, project)
         _remember_request_project(request, project)
@@ -3959,7 +3960,12 @@ def _load_project_from_request(request: web.Request, *, repair_missing_frames: b
         # loaded the project (rare GET /scenes 500s came from atomic_replace
         # PermissionError escaping here). Repair simply re-runs on a later load.
         try:
-            save_project(project, bump_modified_at=False, notify=False)
+            save_project(
+                project,
+                expected_modified_at=loaded_modified_at,
+                bump_modified_at=False,
+                notify=False,
+            )
         except (ProjectVersionConflict, PermissionError) as exc:
             logger.debug("Skipped contended total_source_frames repair save for %s: %s", project_dir, exc)
 
@@ -5204,15 +5210,19 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}")
     async def api_get_project(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
-            return web.json_response(project.to_dict())
+            def load_and_serialize_project() -> str:
+                project = _load_project_from_request(request)
+                return json.dumps(project.to_dict(), ensure_ascii=False)
+
+            body = await asyncio.to_thread(load_and_serialize_project)
+            return web.Response(text=body, content_type="application/json")
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
     @routes.get("/sonder-editor/project/{project_id}/dormant_summary")
     async def api_get_dormant_summary(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
@@ -6413,13 +6423,17 @@ if routes is not None:
             # Off-loop load (mutation-integrity F5, parity with api_list_assets):
             # the loader can run the repair save whose atomic_replace retry
             # blocks up to ~375 ms — never on the aiohttp event loop.
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            def load_and_serialize_scenes() -> str:
+                project = _load_project_from_request(request)
+                return json.dumps({
+                    "scenes": [scene.to_dict() for scene in project.scenes_ordered()]
+                }, ensure_ascii=False)
+
+            body = await asyncio.to_thread(load_and_serialize_scenes)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        return web.json_response({
-            "scenes": [s.to_dict() for s in project.scenes_ordered()]
-        })
+        return web.Response(text=body, content_type="application/json")
 
     @routes.post("/sonder-editor/project/{project_id}/scenes")
     async def api_create_scene(request: web.Request) -> web.Response:
@@ -7786,11 +7800,15 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/queue")
     async def api_list_queue(request: web.Request) -> web.Response:
         try:
-            project = await asyncio.to_thread(_load_project_from_request, request)
+            def load_and_serialize_queue() -> str:
+                project = _load_project_from_request(request)
+                return json.dumps([job.to_dict() for job in project.generation_queue], ensure_ascii=False)
+
+            body = await asyncio.to_thread(load_and_serialize_queue)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        return web.json_response([j.to_dict() for j in project.generation_queue])
+        return web.Response(text=body, content_type="application/json")
 
     @routes.post("/sonder-editor/project/{project_id}/queue")
     async def api_add_queue_job(request: web.Request) -> web.Response:
