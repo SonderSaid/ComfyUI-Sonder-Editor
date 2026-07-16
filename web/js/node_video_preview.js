@@ -25,12 +25,17 @@
 import { THEME, RADIUS } from "./editor_theme.js";
 import { renderDormantMediaScrubBar, buttonStyle } from "./editor_node_controller.js";
 import { loadMediaAsBlob } from "./shared_asset_gallery.js";
+import {
+    registerGraphPreviewDiagnostic,
+    subscribeGraphPreviewSuppression,
+} from "./graph_preview_ownership.js";
 
 const MIN_HEIGHT = 128;
 const MAX_HEIGHT = 760;
 const DEFAULT_ASPECT = 16 / 9;
 // Widget height beyond the video itself: controls row + scrub row + container margin/border.
 const CONTROL_CHROME_PX = 76;
+export const NODE_VIDEO_HIBERNATE_MS = 30_000;
 
 // Autoplay is the node's `autoplay_preview` BOOLEAN input widget (persisted in the workflow
 // via widgets_values, per-node). Read it from the live widget; default off when absent.
@@ -131,6 +136,7 @@ function cleanupWidget(widget) {
 
     const video = widget._sonderVideoEl;
     try { video?.pause?.(); } catch (_) { /* pause is best-effort */ }
+    try { widget._sonderLifecycleCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
     try { widget._sonderMediaCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
     try { widget._sonderScrubCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
     try { widget._sonderEventCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
@@ -146,10 +152,12 @@ function cleanupWidget(widget) {
     try { widget._sonderContainerEl?.remove?.(); } catch (_) { /* detach is best-effort */ }
 
     widget._sonderMediaCleanup = null;
+    widget._sonderLifecycleCleanup = null;
     widget._sonderScrubCleanup = null;
     widget._sonderEventCleanup = null;
     widget._sonderSetHasAudio = null;
     widget._sonderApplyAutoplay = null;
+    widget._sonderSetSource = null;
     widget._sonderVideoEl = null;
     widget._sonderContainerEl = null;
     widget._sonderLoadedUrl = "";
@@ -254,11 +262,105 @@ function createWidget(node) {
 
     // Whether the current source carries an audio track — set from the descriptor on mount.
     let hasAudio = false;
+    let widget = null;
+    let desiredPlaying = false;
+    let suspendedByOwner = false;
+    let offscreen = false;
+    let documentHidden = typeof document !== "undefined" && document.visibilityState !== "visible";
+    let windowFocused = typeof document === "undefined" || typeof document.hasFocus !== "function"
+        ? true
+        : !!document.hasFocus();
+    let hibernateTimer = null;
+    let hibernated = false;
+    let savedTime = 0;
+    let lifecycleCleaned = false;
+    let intersectionObserver = null;
+    let unsubscribeSuppression = null;
+    let unregisterDiagnostic = null;
+
+    const previewRole = String(node?.type || node?.comfyClass || "").toLowerCase().includes("save")
+        ? "save"
+        : "preview";
+    const suspensionReasons = () => {
+        const reasons = [];
+        if (suspendedByOwner) reasons.push("editor-owner");
+        if (documentHidden) reasons.push("document-hidden");
+        if (!windowFocused) reasons.push("window-blur");
+        if (offscreen) reasons.push("offscreen");
+        return reasons;
+    };
+    const syncLifecycleDataset = () => {
+        if (!video.dataset) return;
+        const reasons = suspensionReasons();
+        video.dataset.sonderVideoRole = previewRole;
+        video.dataset.sonderPreviewSuspended = reasons.length ? "1" : "0";
+        video.dataset.sonderPreviewOffscreen = offscreen ? "1" : "0";
+        video.dataset.sonderPreviewHibernated = hibernated ? "1" : "0";
+    };
+    const clearHibernateTimer = () => {
+        if (hibernateTimer === null) return;
+        clearTimeout(hibernateTimer);
+        hibernateTimer = null;
+    };
+    const rememberCurrentTime = () => {
+        const current = Number(video.currentTime);
+        if (Number.isFinite(current) && current >= 0) savedTime = current;
+    };
+    const pauseForLifecycle = () => {
+        rememberCurrentTime();
+        try { video.pause?.(); } catch (_) { /* pause is best-effort */ }
+    };
+    const hibernate = () => {
+        hibernateTimer = null;
+        if (lifecycleCleaned || suspensionReasons().length === 0) return;
+        pauseForLifecycle();
+        try { widget?._sonderMediaCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
+        if (widget) widget._sonderMediaCleanup = null;
+        try {
+            video.removeAttribute("src");
+            video.load?.();
+        } catch (_) { /* decoder teardown is best-effort */ }
+        hibernated = true;
+        syncLifecycleDataset();
+    };
+    const scheduleHibernate = () => {
+        if (hibernateTimer !== null || hibernated || lifecycleCleaned) return;
+        hibernateTimer = setTimeout(hibernate, NODE_VIDEO_HIBERNATE_MS);
+    };
+    const playIfDesired = () => {
+        if (!desiredPlaying || suspensionReasons().length || hibernated || lifecycleCleaned) return;
+        try {
+            const promise = video.play?.();
+            if (promise?.catch) promise.catch(() => {});
+        } catch (_) { /* browser playback policy can reject play */ }
+    };
+    const loadDesiredSource = () => {
+        if (!widget?._sonderLoadedUrl || widget._sonderMediaCleanup || suspensionReasons().length) return;
+        const handle = loadMediaAsBlob(widget._sonderLoadedUrl, video, { mode: "blob" });
+        widget._sonderMediaCleanup = handle?.cleanup || null;
+        hibernated = false;
+        syncLifecycleDataset();
+    };
+    const evaluateLifecycle = () => {
+        const reasons = suspensionReasons();
+        if (reasons.length) {
+            pauseForLifecycle();
+            scheduleHibernate();
+            syncLifecycleDataset();
+            return;
+        }
+        clearHibernateTimer();
+        loadDesiredSource();
+        syncLifecycleDataset();
+        playIfDesired();
+    };
 
     const togglePlay = () => {
-        if (video.paused) {
-            video.play?.().catch(() => { /* play can be deferred/blocked by the browser */ });
+        if (video.paused || !desiredPlaying) {
+            desiredPlaying = true;
+            evaluateLifecycle();
         } else {
+            desiredPlaying = false;
             video.pause?.();
         }
     };
@@ -288,18 +390,28 @@ function createWidget(node) {
     // is async, so we can't decide this synchronously at mount time — `loadeddata` (first
     // frame available) is the reliable moment.
     const applyAutoplay = () => {
-        if (getNodeAutoplay(node)) {
-            const p = video.play?.();
-            if (p?.catch) p.catch(() => { /* play can be deferred/blocked by the browser */ });
-        } else {
-            try { video.pause?.(); } catch (_) { /* ignore */ }
+        desiredPlaying = getNodeAutoplay(node);
+        if (!desiredPlaying) {
+            try { video.pause?.(); } catch (_) { /* pause is best-effort */ }
         }
+        evaluateLifecycle();
+    };
+
+    const handleLoadedData = () => {
+        if (savedTime > 0) {
+            const duration = Number(video.duration);
+            const target = Number.isFinite(duration) && duration > 0
+                ? Math.min(savedTime, Math.max(0, duration - 0.001))
+                : savedTime;
+            try { video.currentTime = target; } catch (_) { /* restore is best-effort */ }
+        }
+        playIfDesired();
     };
 
     listen(video, "play", syncPlay);
     listen(video, "pause", syncPlay);
     listen(video, "volumechange", syncMute);
-    listen(video, "loadeddata", applyAutoplay);
+    listen(video, "loadeddata", handleLoadedData);
     syncPlay();
     syncMute();
 
@@ -313,7 +425,7 @@ function createWidget(node) {
         listen(container, evt, (e) => e.stopPropagation());
     }
 
-    const widget = node.addDOMWidget("sonder_video", "SonderVideoPreview", container, {
+    widget = node.addDOMWidget("sonder_video", "SonderVideoPreview", container, {
         serialize: false,
         hideOnZoom: false,
         getMinHeight: () => MIN_HEIGHT,
@@ -331,6 +443,82 @@ function createWidget(node) {
     };
     widget._sonderSetHasAudio = (value) => { hasAudio = !!value; syncMute(); };
     widget._sonderApplyAutoplay = applyAutoplay;
+    widget._sonderSetSource = (src) => {
+        const nextSource = String(src || "");
+        const sourceChanged = widget._sonderLoadedUrl !== nextSource;
+        if (sourceChanged) {
+            try { widget._sonderMediaCleanup?.(); } catch (_) { /* cleanup is best-effort */ }
+            widget._sonderMediaCleanup = null;
+            try {
+                video.removeAttribute("src");
+                video.load?.();
+            } catch (_) { /* source replacement teardown is best-effort */ }
+            widget._sonderLoadedUrl = nextSource;
+            savedTime = 0;
+            hibernated = false;
+        } else {
+            savedTime = 0;
+            try { video.currentTime = 0; } catch (_) { /* reset is best-effort */ }
+        }
+        desiredPlaying = getNodeAutoplay(node);
+        evaluateLifecycle();
+    };
+    const handleVisibilityChange = () => {
+        documentHidden = document.visibilityState !== "visible";
+        evaluateLifecycle();
+    };
+    const handleWindowFocus = () => {
+        windowFocused = true;
+        evaluateLifecycle();
+    };
+    const handleWindowBlur = () => {
+        windowFocused = false;
+        evaluateLifecycle();
+    };
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+        listen(document, "visibilitychange", handleVisibilityChange);
+    }
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+        listen(window, "focus", handleWindowFocus);
+        listen(window, "blur", handleWindowBlur);
+    }
+    if (typeof IntersectionObserver === "function") {
+        intersectionObserver = new IntersectionObserver((entries) => {
+            const entry = entries.find((candidate) => candidate.target === container) || entries[0];
+            if (!entry) return;
+            offscreen = !(entry.isIntersecting && Number(entry.intersectionRatio || 0) > 0);
+            evaluateLifecycle();
+        });
+        intersectionObserver.observe(container);
+    }
+    unsubscribeSuppression = subscribeGraphPreviewSuppression((suppressed) => {
+        suspendedByOwner = !!suppressed;
+        evaluateLifecycle();
+    });
+    unregisterDiagnostic = registerGraphPreviewDiagnostic(() => {
+        const reasons = suspensionReasons();
+        const hasNoClientRects = typeof container.getClientRects === "function"
+            && container.getClientRects().length === 0;
+        return {
+            role: previewRole,
+            playing: !video.paused && !video.ended,
+            hidden: reasons.length > 0 || hasNoClientRects,
+            suspended: reasons.length > 0,
+            hibernated,
+            suspensionReasons: reasons,
+        };
+    });
+    widget._sonderLifecycleCleanup = () => {
+        if (lifecycleCleaned) return;
+        lifecycleCleaned = true;
+        clearHibernateTimer();
+        intersectionObserver?.disconnect?.();
+        intersectionObserver = null;
+        unsubscribeSuppression?.();
+        unsubscribeSuppression = null;
+        unregisterDiagnostic?.();
+        unregisterDiagnostic = null;
+    };
     node._sonderVideoWidget = widget;
 
     // Lock the aspect once the real dimensions are known, then grow the node to fit.
@@ -387,16 +575,7 @@ export function mountNodeVideoPreview(node, descriptor) {
     // range in this DOM-widget context, which clamps every scrub seek back to frame 0.
     // `_sonderLoadedUrl` tracks the source /view URL (not the resulting blob: URL, which
     // never equals `src`) so re-runs with the same file don't refetch.
-    if (widget._sonderLoadedUrl !== src) {
-        try { widget._sonderMediaCleanup?.(); } catch (_) { /* prior load cleanup is best-effort */ }
-        const handle = loadMediaAsBlob(src, video, { mode: "blob" });
-        widget._sonderMediaCleanup = handle?.cleanup || null;
-        widget._sonderLoadedUrl = src;
-        // Autoplay is applied on `loadeddata` once the blob is decodable (see createWidget).
-    } else {
-        try { video.currentTime = 0; } catch (_) { /* ignore */ }
-        widget._sonderApplyAutoplay?.();
-    }
+    widget._sonderSetSource?.(src);
 }
 
 export function unmountNodeVideoPreview(node, { resize = true } = {}) {

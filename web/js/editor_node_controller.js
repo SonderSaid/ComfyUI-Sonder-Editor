@@ -28,6 +28,7 @@ import {
     readQueueBatchCollapseState,
 } from "./shared_render_queue.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEYBOARD_PRIORITY } from "./keyboard_ownership.js";
+import { acquireGraphPreviewSuppression } from "./graph_preview_ownership.js";
 import { notifyProgress, notifyInfo } from "./editor_notifications.js";
 import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
 import {
@@ -70,6 +71,14 @@ if (typeof window !== "undefined" && !window.SONDER_DEBUG_PLAYBACK_BOUNDARY) {
 
 function isSessionDiagEnabled() {
     return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
+}
+
+function currentSessionDiagCaptureId() {
+    if (typeof window === "undefined") return "";
+    if (!window.__SONDER_DIAG_CAPTURE_ID) {
+        window.__SONDER_DIAG_CAPTURE_ID = `${Date.now().toString(36)}-controller`;
+    }
+    return window.__SONDER_DIAG_CAPTURE_ID;
 }
 
 function dormantBoundaryDebugEvent(eventName, details = {}) {
@@ -1270,6 +1279,7 @@ export class EditorNodeController {
         this._pendingPreviewRefreshKeys = new Set();
         this._pendingPreviewRefreshSyncAssets = false;
         this.fullscreenSession = null;
+        this._releaseGraphPreviewOwnership = null;
         this._preFullscreenModuleId = "";
         this.modules = this._buildModules();
         this.card = new DormantNodeCard(this);
@@ -1336,6 +1346,7 @@ export class EditorNodeController {
             t_mono: performance.now(),
             build_marker: `canvas:${this._editorSessionId || ""}`,
             canvas_instance_id: this._canvasInstanceId,
+            capture_id: currentSessionDiagCaptureId(),
         };
         this._diagEvents.push({ ...this._diagBoot });
     }
@@ -1351,6 +1362,7 @@ export class EditorNodeController {
             t_wall: Date.now(),
             t_mono: performance.now(),
             kind,
+            capture_id: currentSessionDiagCaptureId(),
             ...payload,
         });
     }
@@ -1442,6 +1454,7 @@ export class EditorNodeController {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        this._releaseGraphPreviewSuppression();
 
         if (this._diagHotkeyUnregister) {
             try { this._diagHotkeyUnregister(); } catch (_) {}
@@ -2590,6 +2603,7 @@ export class EditorNodeController {
             this.collapseModule();
         }
         this.state.isFullscreenOpen = true;
+        this._acquireGraphPreviewSuppression();
         this.render();
 
         try {
@@ -2609,6 +2623,7 @@ export class EditorNodeController {
             }
             this.fullscreenSession = null;
             this.state.isFullscreenOpen = false;
+            this._releaseGraphPreviewSuppression();
             this._releaseFullscreenSession();
             if (this._preFullscreenModuleId && this.modules[this._preFullscreenModuleId]) {
                 this.expandModule(this._preFullscreenModuleId);
@@ -2619,6 +2634,7 @@ export class EditorNodeController {
     }
 
     onFullscreenSessionDestroyed(session) {
+        this._releaseGraphPreviewSuppression();
         if (this._destroyed) return;
         if (this.fullscreenSession === session) {
             this.fullscreenSession = null;
@@ -2640,6 +2656,22 @@ export class EditorNodeController {
             }
             this.render();
         });
+    }
+
+    _acquireGraphPreviewSuppression() {
+        if (this._releaseGraphPreviewOwnership) return;
+        this._releaseGraphPreviewOwnership = acquireGraphPreviewSuppression(this);
+    }
+
+    _releaseGraphPreviewSuppression() {
+        if (!this._releaseGraphPreviewOwnership) return;
+        const release = this._releaseGraphPreviewOwnership;
+        this._releaseGraphPreviewOwnership = null;
+        try {
+            release();
+        } catch (_) {
+            // Preview ownership release is best-effort during teardown.
+        }
     }
 
     handleNodeExecuted() {

@@ -1,4 +1,6 @@
 import { FONT, THEME } from "./editor_theme.js";
+import { snapshotGraphPreviewDiagnostics } from "./graph_preview_ownership.js";
+import { createPlaybackSourceCache } from "./playback_source_cache.js";
 
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
@@ -24,6 +26,8 @@ const PLAYBACK_WARM_MAX_ENTRIES = 6000;
 const PLAYBACK_REBUFFER_REENTRY_MS = 500;
 const PLAYBACK_REBUFFER_NEXT_BOUNDARY_SOFT_MAX_MS = 500;
 const PLAYBACK_REBUFFER_TELEMETRY_THROTTLE_MS = 500;
+const PLAYBACK_PERF_SUMMARY_INTERVAL_MS = 1000;
+const PLAYBACK_SLOW_VIEWPORT_RENDER_MS = 25;
 const PLAYBACK_REBUFFER_TOAST_DELAY_MS = 700;
 const PLAYBACK_REBUFFER_TOAST_DECAY_MS = 1800;
 const PLAYBACK_REBUFFER_TOAST_MIN_VISIBLE_MS = 1200;
@@ -40,6 +44,170 @@ const DECODE_DEADLINE_CURRENT_SAFETY = "current-safety";
 const DECODE_DEADLINE_REBUFFER_NEXT_BOUNDARY = "rebuffer-next-boundary";
 const DECODE_DEADLINE_URGENT_OTHER = "urgent-other";
 const DECODE_DEADLINE_NONE = "none";
+
+const PLAYBACK_PERF_STAGE_NAMES = [
+    "tick",
+    "frameCallback",
+    "snapshot",
+    "viewportRender",
+    "autoScroll",
+    "timeline",
+    "toolbar",
+    "transport",
+];
+
+function createPlaybackSourcePerfCounters() {
+    return {
+        cacheHits: 0,
+        cacheCoalesced: 0,
+        cacheMisses: 0,
+        fetchesStarted: 0,
+        fetchesCompleted: 0,
+        fetchesAborted: 0,
+        fetchesFailed: 0,
+        directFallbacks: 0,
+        evictions: 0,
+        evictionPending: 0,
+        fetchBytes: 0,
+        duplicateFetches: 0,
+        peakRetainedBytes: 0,
+        peakInFlightEntries: 0,
+        fetchedSourceKeys: new Set(),
+        evictionsByReason: new Map(),
+    };
+}
+
+function createPlaybackPerfCounters(startedAtMs = 0) {
+    return {
+        startedAtMs,
+        rafTicks: 0,
+        distinctFrames: 0,
+        repeatedFrames: 0,
+        skippedFrames: 0,
+        largestFrameAdvance: 0,
+        maxRafGapMs: 0,
+        maxFramesBehind: 0,
+        canvasBackingResizes: 0,
+        sourceCache: createPlaybackSourcePerfCounters(),
+        timings: Object.fromEntries(PLAYBACK_PERF_STAGE_NAMES.map((name) => [name, {
+            count: 0,
+            totalMs: 0,
+            maxMs: 0,
+        }])),
+    };
+}
+
+function addPlaybackPerfTiming(counters, stage, durationMs) {
+    const bucket = counters?.timings?.[stage];
+    const duration = Number(durationMs);
+    if (!bucket || !Number.isFinite(duration) || duration < 0) return;
+    bucket.count += 1;
+    bucket.totalMs += duration;
+    bucket.maxMs = Math.max(bucket.maxMs, duration);
+}
+
+function serializePlaybackPerfCounters(counters) {
+    const timings = {};
+    for (const [name, bucket] of Object.entries(counters?.timings || {})) {
+        timings[name] = {
+            count: bucket.count,
+            totalMs: Math.round(bucket.totalMs * 10) / 10,
+            averageMs: bucket.count ? Math.round((bucket.totalMs / bucket.count) * 10) / 10 : 0,
+            maxMs: Math.round(bucket.maxMs * 10) / 10,
+        };
+    }
+    return {
+        rafTicks: counters?.rafTicks || 0,
+        distinctFrames: counters?.distinctFrames || 0,
+        repeatedFrames: counters?.repeatedFrames || 0,
+        skippedFrames: counters?.skippedFrames || 0,
+        largestFrameAdvance: counters?.largestFrameAdvance || 0,
+        maxRafGapMs: Math.round((counters?.maxRafGapMs || 0) * 10) / 10,
+        maxFramesBehind: counters?.maxFramesBehind || 0,
+        canvasBackingResizes: counters?.canvasBackingResizes || 0,
+        sourceCache: {
+            cacheHits: counters?.sourceCache?.cacheHits || 0,
+            cacheCoalesced: counters?.sourceCache?.cacheCoalesced || 0,
+            cacheMisses: counters?.sourceCache?.cacheMisses || 0,
+            fetchesStarted: counters?.sourceCache?.fetchesStarted || 0,
+            fetchesCompleted: counters?.sourceCache?.fetchesCompleted || 0,
+            fetchesAborted: counters?.sourceCache?.fetchesAborted || 0,
+            fetchesFailed: counters?.sourceCache?.fetchesFailed || 0,
+            directFallbacks: counters?.sourceCache?.directFallbacks || 0,
+            evictions: counters?.sourceCache?.evictions || 0,
+            evictionPending: counters?.sourceCache?.evictionPending || 0,
+            fetchBytes: counters?.sourceCache?.fetchBytes || 0,
+            uniqueFetchedSources: counters?.sourceCache?.fetchedSourceKeys?.size || 0,
+            duplicateFetches: counters?.sourceCache?.duplicateFetches || 0,
+            peakRetainedBytes: counters?.sourceCache?.peakRetainedBytes || 0,
+            peakInFlightEntries: counters?.sourceCache?.peakInFlightEntries || 0,
+            evictionsByReason: Object.fromEntries(counters?.sourceCache?.evictionsByReason || []),
+        },
+        timings,
+    };
+}
+
+export function _summarizePlaybackRenderTiming(timings = {}, totalMs = 0) {
+    const normalized = {
+        syncVideoMs: Math.max(0, Number(timings.syncVideoMs) || 0),
+        prebufferScheduleMs: Math.max(0, Number(timings.prebufferScheduleMs) || 0),
+        syncAudioMs: Math.max(0, Number(timings.syncAudioMs) || 0),
+        compositePreflightMs: Math.max(0, Number(timings.compositePreflightMs) || 0),
+        compositeDrawMs: Math.max(0, Number(timings.compositeDrawMs) || 0),
+    };
+    const phases = Object.entries(normalized);
+    const dominant = phases.reduce((best, entry) => entry[1] > best[1] ? entry : best, ["unattributedMs", 0]);
+    const attributedMs = normalized.syncVideoMs
+        + normalized.prebufferScheduleMs
+        + normalized.syncAudioMs
+        + normalized.compositePreflightMs
+        + normalized.compositeDrawMs;
+    const normalizedTotal = Math.max(0, Number(totalMs) || 0);
+    const unattributedMs = Math.max(0, normalizedTotal - attributedMs);
+    if (unattributedMs > dominant[1]) {
+        dominant[0] = "unattributedMs";
+        dominant[1] = unattributedMs;
+    }
+    return {
+        ...normalized,
+        totalMs: normalizedTotal,
+        unattributedMs,
+        dominantPhase: dominant[0],
+        dominantPhaseMs: dominant[1],
+    };
+}
+
+export function _shouldSkipRepeatedPlaybackFrame({
+    isPlaying,
+    playbackCompositeCommitted,
+    playbackRebuffering,
+    nextFrame,
+    currentSceneFrame,
+    playbackLastCommittedFrame,
+    playbackSessionId,
+    playbackLastCommittedSessionId,
+    playbackWarmContentToken,
+    playbackLastCommittedContentToken,
+    canvasWidth,
+    canvasHeight,
+    playbackCanvasWidth,
+    playbackCanvasHeight,
+} = {}) {
+    return !!(
+        isPlaying
+        && playbackCompositeCommitted
+        && !playbackRebuffering
+        && Number.isFinite(nextFrame)
+        && nextFrame === currentSceneFrame
+        && nextFrame === playbackLastCommittedFrame
+        && playbackSessionId === playbackLastCommittedSessionId
+        && playbackWarmContentToken === playbackLastCommittedContentToken
+        && canvasWidth > 0
+        && canvasHeight > 0
+        && canvasWidth === playbackCanvasWidth
+        && canvasHeight === playbackCanvasHeight
+    );
+}
 
 function decodePriorityRank(priority) {
     if (priority === DECODE_PRIORITY_HIGH) return 3;
@@ -1085,6 +1253,12 @@ export function createViewportSurface(options = {}) {
         playbackSessionStartFrame: 0,
         playbackLoopRange: null,
         playbackSessionId: 0,
+        playbackRunSeq: 0,
+        playbackRunId: "",
+        playbackRunStartedAtMs: 0,
+        playbackPerfRunRecorded: false,
+        playbackLastRafTimestamp: null,
+        playbackLastCalculatedFrame: null,
         playbackPrepareToken: 0,
         playbackCompositeCommitted: false,
         playbackBlockedSinceMs: null,
@@ -1094,6 +1268,7 @@ export function createViewportSurface(options = {}) {
         playbackLastCommittedFrame: null,
         playbackLastCommittedSignature: "",
         playbackLastCommittedSessionId: 0,
+        playbackLastCommittedContentToken: -1,
         playbackFirstCommitStartedAt: null,
         playbackFirstCommitFrame: null,
         playbackFirstCommitHoldExpired: false,
@@ -1199,6 +1374,8 @@ export function createViewportSurface(options = {}) {
             blockReasons: new Map(),
             lastBlockFlushMs: 0,
         },
+        playbackPerfWindow: createPlaybackPerfCounters(),
+        playbackPerfRun: createPlaybackPerfCounters(),
     };
 
     const noop = () => {};
@@ -1238,6 +1415,16 @@ export function createViewportSurface(options = {}) {
     // update/resolve/dismiss, or null). No-op fallback keeps the surface decoupled.
     const notifyInfo = options.notifyInfo || (() => null);
     const notifyWarning = options.notifyWarning || (() => null);
+    const sourceCache = createPlaybackSourceCache({
+        getAssetForSourcePath,
+        getLiveSourcePaths: currentSceneSourcePaths,
+        getStreamingMode,
+        buildDirectUrl: buildViewUrl,
+        isDestroyed: () => state.destroyed,
+        isDiagnosticsEnabled: playbackPerfActive,
+        recordEvent: recordSourceCacheEvent,
+    });
+    state.sourceUrlCache = sourceCache.entries;
 
     function currentFrame() {
         return clamp(Math.round(Number(getFrame()) || 0), 0, totalFrames());
@@ -1305,11 +1492,308 @@ export function createViewportSurface(options = {}) {
         return Number.isFinite(numeric) ? Math.round(numeric * 10) / 10 : 0;
     }
 
+    function recordSourceCacheEvent(event = {}) {
+        if (!playbackPerfActive()) return;
+        const timestamp = performance.now();
+        const cacheSnapshot = sourceCache.snapshot(timestamp);
+        if (event.action === "fetch_completed") {
+            viewportDiagRecord("resolve_media_source", {
+                source_path: event.sourcePath || "",
+                mode: "blob",
+                duration_ms: roundTelemetryMs(event.durationMs),
+                blob_size: Math.max(0, Number(event.blobSize) || 0),
+                source_identity: event.sourceIdentity || "",
+            });
+        } else if (event.action === "direct_ready") {
+            viewportDiagRecord("resolve_media_source", {
+                source_path: event.sourcePath || "",
+                mode: "direct",
+                source_identity: event.sourceIdentity || "",
+            });
+        }
+        if (state.playbackRunId) {
+            updatePlaybackPerfCounters((counters) => {
+                const source = counters.sourceCache;
+                switch (event.action) {
+                    case "cache_hit": source.cacheHits += 1; break;
+                    case "cache_coalesced": source.cacheCoalesced += 1; break;
+                    case "cache_miss": source.cacheMisses += 1; break;
+                    case "fetch_started": {
+                        source.fetchesStarted += 1;
+                        const key = event.sourceIdentity || event.cacheKey || event.sourcePath || "";
+                        if (key && source.fetchedSourceKeys.has(key)) source.duplicateFetches += 1;
+                        if (key) source.fetchedSourceKeys.add(key);
+                        break;
+                    }
+                    case "fetch_completed":
+                        source.fetchesCompleted += 1;
+                        source.fetchBytes += Math.max(0, Number(event.blobSize) || 0);
+                        break;
+                    case "fetch_aborted": source.fetchesAborted += 1; break;
+                    case "fetch_failed": source.fetchesFailed += 1; break;
+                    case "fallback_direct": source.directFallbacks += 1; break;
+                    case "evicted": {
+                        source.evictions += 1;
+                        const reason = String(event.reason || "unknown");
+                        source.evictionsByReason.set(reason, (source.evictionsByReason.get(reason) || 0) + 1);
+                        break;
+                    }
+                    case "eviction_pending": source.evictionPending += 1; break;
+                    default: break;
+                }
+                source.peakRetainedBytes = Math.max(source.peakRetainedBytes, cacheSnapshot.retainedBytes || 0);
+                source.peakInFlightEntries = Math.max(source.peakInFlightEntries, cacheSnapshot.inFlightEntries || 0);
+            });
+        }
+        viewportDiagRecord("playback_source_cache_event", {
+            playbackRunId: state.playbackRunId,
+            playbackSessionId: state.playbackSessionId,
+            ...event,
+            cache: cacheSnapshot,
+        });
+    }
+
     function videoElementDimensions(video) {
         return {
             videoWidth: Math.round(Number(video?.videoWidth) || 0),
             videoHeight: Math.round(Number(video?.videoHeight) || 0),
         };
+    }
+
+    function playbackPerfActive() {
+        return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
+    }
+
+    function playbackEnvironmentSnapshot() {
+        let videos = [];
+        if (typeof document !== "undefined" && typeof document.querySelectorAll === "function") {
+            videos = Array.from(document.querySelectorAll("video"));
+        }
+        const isHiddenVideo = (video) => {
+            const hasNoClientRects = typeof video.getClientRects === "function"
+                && video.getClientRects().length === 0;
+            return !!(
+                video.hidden
+                || video.getAttribute?.("aria-hidden") === "true"
+                || video.dataset?.sonderPreviewOffscreen === "1"
+                || video.dataset?.sonderPreviewSuspended === "1"
+                || hasNoClientRects
+            );
+        };
+        const hiddenVideoCount = videos.filter(isHiddenVideo).length;
+        const playingHiddenVideoCount = videos.filter((video) => (
+            !video.paused && !video.ended && isHiddenVideo(video)
+        )).length;
+        return {
+            visibilityState: typeof document !== "undefined" ? document.visibilityState || "" : "",
+            hasFocus: typeof document !== "undefined" && typeof document.hasFocus === "function"
+                ? !!document.hasFocus()
+                : null,
+            domVideos: {
+                total: videos.length,
+                playing: videos.filter((video) => !video.paused && !video.ended).length,
+                paused: videos.filter((video) => !!video.paused || !!video.ended).length,
+                hidden: hiddenVideoCount,
+                playingHidden: playingHiddenVideoCount,
+            },
+            nodePreviews: snapshotGraphPreviewDiagnostics(),
+        };
+    }
+
+    function resetPlaybackPerfCounters(timestamp = performance.now()) {
+        state.playbackPerfWindow = createPlaybackPerfCounters(timestamp);
+        state.playbackPerfRun = createPlaybackPerfCounters(timestamp);
+        state.playbackLastRafTimestamp = null;
+        state.playbackLastCalculatedFrame = currentFrame();
+    }
+
+    function updatePlaybackPerfCounters(mutator) {
+        if (!playbackPerfActive() || !state.playbackRunId) return;
+        mutator(state.playbackPerfWindow);
+        mutator(state.playbackPerfRun);
+    }
+
+    function recordPlaybackPerfTiming(stage, durationMs) {
+        updatePlaybackPerfCounters((counters) => addPlaybackPerfTiming(counters, stage, durationMs));
+    }
+
+    function recordPlaybackHostMetrics(metrics) {
+        if (!metrics || typeof metrics !== "object") return;
+        recordPlaybackPerfTiming("autoScroll", metrics.autoScrollMs);
+        recordPlaybackPerfTiming("timeline", metrics.timelineMs);
+        recordPlaybackPerfTiming("toolbar", metrics.toolbarMs);
+        if (metrics.canvasBackingResized) {
+            updatePlaybackPerfCounters((counters) => { counters.canvasBackingResizes += 1; });
+        }
+    }
+
+    function playbackPerfPayload(counters, timestamp) {
+        const serialized = serializePlaybackPerfCounters(counters);
+        return {
+            playbackRunId: state.playbackRunId,
+            playbackSessionId: state.playbackSessionId,
+            windowMs: roundTelemetryMs(Math.max(0, timestamp - (counters?.startedAtMs || timestamp))),
+            frame: currentFrame(),
+            committedFrame: state.playbackLastCommittedFrame,
+            fps: fps(),
+            ...serialized,
+            sourceCache: {
+                ...serialized.sourceCache,
+                ...sourceCache.snapshot(timestamp),
+            },
+            ...playbackEnvironmentSnapshot(),
+        };
+    }
+
+    function flushPlaybackPerfSummary(timestamp = performance.now(), { force = false } = {}) {
+        if (!playbackPerfActive() || !state.playbackRunId) return;
+        const counters = state.playbackPerfWindow;
+        const elapsed = timestamp - (counters.startedAtMs || timestamp);
+        if (!force && elapsed < PLAYBACK_PERF_SUMMARY_INTERVAL_MS) return;
+        const hasMeasurements = counters.rafTicks
+            || Object.values(counters.timings || {}).some((bucket) => bucket.count > 0);
+        if (hasMeasurements) {
+            viewportDiagRecord("playback_perf_summary", playbackPerfPayload(counters, timestamp));
+        }
+        state.playbackPerfWindow = createPlaybackPerfCounters(timestamp);
+    }
+
+    function startPlaybackPerfRun(timestamp, reason = "playback-start") {
+        state.playbackRunSeq += 1;
+        state.playbackRunId = `${Date.now().toString(36)}-${state.playbackRunSeq.toString(36)}`;
+        state.playbackRunStartedAtMs = timestamp;
+        state.playbackPerfRunRecorded = false;
+        resetPlaybackPerfCounters(timestamp);
+        if (!playbackPerfActive()) return;
+        viewportDiagRecord("playback_run_start", {
+            playbackRunId: state.playbackRunId,
+            playbackSessionId: state.playbackSessionId,
+            reason,
+            frame: currentFrame(),
+            totalFrames: totalFrames(),
+            fps: fps(),
+            loopRange: state.playbackLoopRange ? { ...state.playbackLoopRange } : null,
+            canvasWidth: state.canvas?.width || 0,
+            canvasHeight: state.canvas?.height || 0,
+            prebufferEnabled: !!isPrebufferEnabled(),
+            prebufferBoundaryDepth: Math.max(0, Math.round(Number(getPrebufferBoundaryDepth()) || 0)),
+            prebufferMaxEntries: Math.max(0, Math.round(Number(getPrebufferMaxEntries()) || 0)),
+            decodeConcurrency: Math.max(1, Math.round(Number(getDecodeConcurrency()) || 1)),
+            sourceCache: sourceCache.snapshot(timestamp),
+            ...playbackEnvironmentSnapshot(),
+        });
+        state.playbackPerfRunRecorded = true;
+    }
+
+    function ensurePlaybackPerfRun(timestamp) {
+        if (!state.playbackRunId) {
+            startPlaybackPerfRun(timestamp, "diagnostics-enabled-mid-playback");
+            return;
+        }
+        if (state.playbackPerfRunRecorded || !playbackPerfActive()) return;
+        resetPlaybackPerfCounters(timestamp);
+        viewportDiagRecord("playback_run_start", {
+            playbackRunId: state.playbackRunId,
+            playbackSessionId: state.playbackSessionId,
+            reason: "diagnostics-enabled-mid-playback",
+            resumed: true,
+            frame: currentFrame(),
+            totalFrames: totalFrames(),
+            fps: fps(),
+            sourceCache: sourceCache.snapshot(timestamp),
+            ...playbackEnvironmentSnapshot(),
+        });
+        state.playbackPerfRunRecorded = true;
+    }
+
+    function finishPlaybackPerfRun(reason = "playback-stop", timestamp = performance.now()) {
+        if (!state.playbackRunId) return;
+        if (playbackPerfActive()) {
+            flushPlaybackPerfSummary(timestamp, { force: true });
+            viewportDiagRecord("playback_run_stop", {
+                ...playbackPerfPayload(state.playbackPerfRun, timestamp),
+                durationMs: roundTelemetryMs(Math.max(0, timestamp - state.playbackRunStartedAtMs)),
+                reason,
+            });
+        }
+        state.playbackRunId = "";
+        state.playbackRunStartedAtMs = 0;
+        state.playbackPerfRunRecorded = false;
+        state.playbackLastRafTimestamp = null;
+        state.playbackLastCalculatedFrame = null;
+    }
+
+    function restartPlaybackPerfCapture(timestamp = performance.now()) {
+        resetPlaybackPerfCounters(timestamp);
+        if (!state.isPlaying || !state.playbackRunId || !playbackPerfActive()) return;
+        viewportDiagRecord("playback_run_start", {
+            playbackRunId: state.playbackRunId,
+            playbackSessionId: state.playbackSessionId,
+            reason: "diagnostic-clear",
+            resumed: true,
+            frame: currentFrame(),
+            totalFrames: totalFrames(),
+            fps: fps(),
+            sourceCache: sourceCache.snapshot(timestamp),
+            ...playbackEnvironmentSnapshot(),
+        });
+        state.playbackPerfRunRecorded = true;
+    }
+
+    function notePlaybackPerfTick(timestamp, nextFrame) {
+        if (!playbackPerfActive()) return;
+        ensurePlaybackPerfRun(timestamp);
+        const previousTimestamp = state.playbackLastRafTimestamp;
+        const previousFrame = state.playbackLastCalculatedFrame;
+        const gapMs = Number.isFinite(previousTimestamp) ? Math.max(0, timestamp - previousTimestamp) : 0;
+        const frameAdvance = Number.isFinite(previousFrame) ? Math.max(0, nextFrame - previousFrame) : 0;
+        const repeated = Number.isFinite(previousFrame) && nextFrame === previousFrame;
+        updatePlaybackPerfCounters((counters) => {
+            counters.rafTicks += 1;
+            if (repeated) counters.repeatedFrames += 1;
+            else counters.distinctFrames += 1;
+            counters.largestFrameAdvance = Math.max(counters.largestFrameAdvance, frameAdvance);
+            counters.maxRafGapMs = Math.max(counters.maxRafGapMs, gapMs);
+        });
+        const gapThresholdMs = 50;
+        if (gapMs >= gapThresholdMs) {
+            viewportDiagRecord("playback_raf_gap", {
+                playbackRunId: state.playbackRunId,
+                playbackSessionId: state.playbackSessionId,
+                gapMs: roundTelemetryMs(gapMs),
+                gapThresholdMs: roundTelemetryMs(gapThresholdMs),
+                frame: nextFrame,
+                committedFrame: state.playbackLastCommittedFrame,
+                frameAdvance,
+                sourceCache: sourceCache.snapshot(timestamp),
+                ...playbackEnvironmentSnapshot(),
+            });
+        }
+        state.playbackLastRafTimestamp = timestamp;
+        state.playbackLastCalculatedFrame = nextFrame;
+    }
+
+    function notePlaybackPerfFrameSkipped() {
+        updatePlaybackPerfCounters((counters) => { counters.skippedFrames += 1; });
+    }
+
+    function canSkipRepeatedPlaybackFrame(nextFrame) {
+        return _shouldSkipRepeatedPlaybackFrame({
+            isPlaying: state.isPlaying,
+            playbackCompositeCommitted: state.playbackCompositeCommitted,
+            playbackRebuffering: state.playbackRebuffering,
+            nextFrame,
+            currentSceneFrame: currentFrame(),
+            playbackLastCommittedFrame: state.playbackLastCommittedFrame,
+            playbackSessionId: state.playbackSessionId,
+            playbackLastCommittedSessionId: state.playbackLastCommittedSessionId,
+            playbackWarmContentToken: state.playbackWarmContentToken,
+            playbackLastCommittedContentToken: state.playbackLastCommittedContentToken,
+            canvasWidth: state.canvas?.width || 0,
+            canvasHeight: state.canvas?.height || 0,
+            playbackCanvasWidth: state.playbackCanvasWidth,
+            playbackCanvasHeight: state.playbackCanvasHeight,
+        });
     }
 
     function resetPlaybackTelemetry() {
@@ -1370,6 +1854,11 @@ export function createViewportSurface(options = {}) {
         const committed = state.playbackLastCommittedFrame;
         if (committed === null || !Number.isFinite(committed)) return;
         const behind = nextFrame - committed;
+        if (behind > 0) {
+            updatePlaybackPerfCounters((counters) => {
+                counters.maxFramesBehind = Math.max(counters.maxFramesBehind, behind);
+            });
+        }
         if (behind < 2) return;
         const t = state.playbackTelemetry;
         if (behind > t.maxFramesBehind) t.maxFramesBehind = behind;
@@ -1466,8 +1955,7 @@ export function createViewportSurface(options = {}) {
                 state.playbackRebuffering ? state.playbackRebufferSafetySig : "",
             ].join("|");
             const suppressTelemetry = !!(
-                state.playbackRebuffering
-                && telemetrySig === state.playbackWarmTelemetrySig
+                telemetrySig === state.playbackWarmTelemetrySig
                 && now - state.playbackWarmTelemetryAtMs < PLAYBACK_REBUFFER_TELEMETRY_THROTTLE_MS
             );
             if (suppressTelemetry) {
@@ -1503,6 +1991,12 @@ export function createViewportSurface(options = {}) {
     function clearPlaybackWarmState(reason = "clear") {
         const hadEntries = state.playbackWarmEntries.size > 0;
         state.playbackWarmContentToken += 1;
+        if (reason !== "media-cache-clear") {
+            sourceCache.reconcile(reason, {
+                force: reason === "scene-switch",
+                releaseHolders: (mediaEl) => removeMediaSource(mediaEl),
+            });
+        }
         state.playbackWarmEntries.clear();
         state.prebufferMissTelemetryKeys.clear();
         state.prebufferMissTelemetryEmitted = 0;
@@ -1684,6 +2178,7 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedFrame = null;
         state.playbackLastCommittedSignature = "";
         state.playbackLastCommittedSessionId = 0;
+        state.playbackLastCommittedContentToken = -1;
         state.lastBoundaryCoverageSig = "";
         state.lastPrebufferScheduleStats = emptyPrebufferScheduleStats("composite-reset");
     }
@@ -1730,12 +2225,17 @@ export function createViewportSurface(options = {}) {
     }
 
     function notifyTransport() {
-        onTransportUpdate({
-            frame: currentFrame(),
-            totalFrames: totalFrames(),
-            isPlaying: state.isPlaying,
-            liveMediaEnabled: state.liveMediaEnabled,
-        });
+        const startedAt = playbackPerfActive() && state.playbackRunId ? performance.now() : 0;
+        try {
+            onTransportUpdate({
+                frame: currentFrame(),
+                totalFrames: totalFrames(),
+                isPlaying: state.isPlaying,
+                liveMediaEnabled: state.liveMediaEnabled,
+            });
+        } finally {
+            if (startedAt) recordPlaybackPerfTiming("transport", performance.now() - startedAt);
+        }
     }
 
     function updatePlaybackState(nextValue) {
@@ -1750,8 +2250,15 @@ export function createViewportSurface(options = {}) {
 
     function applyFrame(nextFrame, meta = {}) {
         const clampedFrame = clamp(Math.round(Number(nextFrame) || 0), 0, totalFrames());
-        setFrame(clampedFrame, meta);
-        onFrameChange(clampedFrame, meta);
+        const startedAt = playbackPerfActive() && state.playbackRunId ? performance.now() : 0;
+        let hostMetrics = null;
+        try {
+            setFrame(clampedFrame, meta);
+            hostMetrics = onFrameChange(clampedFrame, meta);
+        } finally {
+            if (startedAt) recordPlaybackPerfTiming("frameCallback", performance.now() - startedAt);
+        }
+        recordPlaybackHostMetrics(hostMetrics);
         notifyTransport();
         return clampedFrame;
     }
@@ -1815,12 +2322,13 @@ export function createViewportSurface(options = {}) {
     }
 
     function buildFrameSnapshot(frame) {
+        const startedAt = playbackPerfActive() && state.playbackRunId ? performance.now() : 0;
         const guide = getGuideAtFrame(frame);
         const guideAsset = guide ? getGuideAsset(guide) : null;
         const clipLayers = getVisibleClipLayers(frame);
         const playableClipLayers = clipLayers.filter((layer) => layer.asset && !layer.asset.missing);
         const missingClipLayers = clipLayers.filter((layer) => !layer.asset || !!layer.asset.missing);
-        return {
+        const snapshot = {
             frame,
             guide,
             guideAsset,
@@ -1829,6 +2337,8 @@ export function createViewportSurface(options = {}) {
             missingClipLayers,
             audioLayers: getVisibleAudioLayers(frame),
         };
+        if (startedAt) recordPlaybackPerfTiming("snapshot", performance.now() - startedAt);
+        return snapshot;
     }
 
     function getCanvasContext() {
@@ -2013,36 +2523,19 @@ export function createViewportSurface(options = {}) {
         return null;
     }
 
-    function effectiveSurfaceStreamingMode(forceBlob = false) {
-        if (forceBlob) return "blob";
-        return getStreamingMode() === "direct" ? "direct" : "blob";
-    }
-
     function mediaSourceCacheKey(sourcePath, { forceBlob = false } = {}) {
-        if (!sourcePath) return "";
-        return `${effectiveSurfaceStreamingMode(forceBlob)}:${sourcePath}`;
+        return sourceCache.cacheKeyFor(sourcePath, { forceBlob });
     }
 
     function maybeReleaseSourceCacheEntry(cacheKey) {
-        if (!cacheKey) return;
-        const entry = state.sourceUrlCache.get(cacheKey);
-        if (!entry || (entry.holders && entry.holders.size > 0)) return;
-        state.sourceUrlCache.delete(cacheKey);
-        if (entry.usesObjectUrl && entry.objectUrl) {
-            try {
-                URL.revokeObjectURL(entry.objectUrl);
-            } catch (error) {}
-        }
-        entry.objectUrl = null;
+        sourceCache.releaseIfUnused(cacheKey, "stale-request");
     }
 
     function releaseMediaElementSource(mediaEl) {
         if (!mediaEl) return;
         const cacheKey = mediaEl._sonderSourceCacheKey || "";
         if (cacheKey) {
-            const entry = state.sourceUrlCache.get(cacheKey);
-            if (entry?.holders) entry.holders.delete(mediaEl);
-            maybeReleaseSourceCacheEntry(cacheKey);
+            sourceCache.releaseHolder(cacheKey, mediaEl);
         }
         mediaEl._sonderSourceUrl = "";
         mediaEl._sonderSourceCacheKey = "";
@@ -2054,10 +2547,7 @@ export function createViewportSurface(options = {}) {
             return true;
         }
         releaseMediaElementSource(mediaEl);
-        const entry = state.sourceUrlCache.get(cacheKey);
-        if (!entry) return false;
-        if (!entry.holders) entry.holders = new Set();
-        entry.holders.add(mediaEl);
+        if (!sourceCache.addHolder(cacheKey, mediaEl)) return false;
         mediaEl._sonderSourceCacheKey = cacheKey;
         mediaEl._sonderSourceUrl = sourceUrl;
         mediaEl._sonderReleaseSourceRef = releaseMediaElementSource;
@@ -2070,81 +2560,10 @@ export function createViewportSurface(options = {}) {
     // path). Surface auto/blob loads and forced-blob loads share `blob:...`;
     // explicit direct opt-in gets its own `direct:...` entry.
     function resolveMediaSourceUrl(sourcePath, { forceBlob = false } = {}) {
-        if (!sourcePath) return Promise.resolve(null);
-        const mode = effectiveSurfaceStreamingMode(forceBlob);
-        const cacheKey = mediaSourceCacheKey(sourcePath, { forceBlob });
-        const cached = state.sourceUrlCache.get(cacheKey);
-        if (cached?.promise) {
-            return cached.promise;
-        }
-        const directUrl = buildViewUrl(sourcePath);
-        if (!directUrl) return Promise.resolve(null);
-        const entry = {
-            key: cacheKey,
-            sourcePath,
-            mode,
-            holders: new Set(),
-            objectUrl: null,
-            usesObjectUrl: false,
-            promise: null,
-        };
-        const loadAsBlob = () => {
-            const startedAt = performance.now();
-            return fetch(directUrl)
-                .then((response) => {
-                    if (!response.ok) {
-                        throw new Error(`Failed to fetch media: ${response.status}`);
-                    }
-                    return response.blob();
-                })
-                .then((blob) => {
-                    entry.objectUrl = URL.createObjectURL(blob);
-                    entry.usesObjectUrl = true;
-                    if (state.sourceUrlCache.get(cacheKey) !== entry || state.destroyed) {
-                        URL.revokeObjectURL(entry.objectUrl);
-                        entry.objectUrl = null;
-                        return null;
-                    }
-                    viewportDiagRecord("resolve_media_source", {
-                        source_path: sourcePath,
-                        mode: "blob",
-                        forced: forceBlob,
-                        duration_ms: Math.round(performance.now() - startedAt),
-                        blob_size: blob.size,
-                    });
-                    return entry.objectUrl;
-                })
-                .catch((error) => {
-                    if (state.sourceUrlCache.get(cacheKey) !== entry || state.destroyed) {
-                        return null;
-                    }
-                    console.warn("[Sonder] Failed to load media as blob, falling back to direct URL:", error);
-                    playbackDebugEvent("resolve-media-source-fallback", {
-                        sourcePath,
-                        requestedMode: mode,
-                        forced: forceBlob,
-                        error: String(error?.message || error || ""),
-                    });
-                    entry.objectUrl = directUrl;
-                    entry.usesObjectUrl = false;
-                    return directUrl;
-                });
-        };
-        entry.promise = Promise.resolve().then(() => {
-            if (state.sourceUrlCache.get(cacheKey) !== entry || state.destroyed) {
-                return null;
-            }
-            playbackDebugEvent("resolve-media-source", { sourcePath, mode, forced: forceBlob });
-            if (mode === "direct") {
-                entry.objectUrl = directUrl;
-                entry.usesObjectUrl = false;
-                viewportDiagRecord("resolve_media_source", { source_path: sourcePath, mode: "direct" });
-                return directUrl;
-            }
-            return loadAsBlob();
+        return sourceCache.resolve(sourcePath, {
+            forceBlob,
+            releaseHolders: (mediaEl) => removeMediaSource(mediaEl),
         });
-        state.sourceUrlCache.set(cacheKey, entry);
-        return entry.promise;
     }
 
     function getOrCreateVideo(layer) {
@@ -2280,6 +2699,20 @@ export function createViewportSurface(options = {}) {
             if (clip?.clip_id) keys.add(clip.clip_id);
         }
         return keys;
+    }
+
+    function currentSceneSourcePaths() {
+        const scene = getScene();
+        const paths = new Map();
+        const addPath = (sourcePath) => {
+            const raw = String(sourcePath || "");
+            const normalized = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+            if (normalized && !paths.has(normalized)) paths.set(normalized, raw);
+        };
+        for (const clip of scene?.clips || []) addPath(clip?.source_path);
+        for (const track of scene?.audio_tracks || []) addPath(track?.source_path);
+        for (const guide of scene?.guide_frames || []) addPath(getGuideAsset(guide)?.path);
+        return Array.from(paths.values());
     }
 
     function playbackFrameDistance(fromFrame, targetFrame, endFrame) {
@@ -2540,13 +2973,14 @@ export function createViewportSurface(options = {}) {
         if (!mediaEl || !sourcePath) return null;
         const requestToken = (Number(mediaEl._sonderSourceRequestToken) || 0) + 1;
         mediaEl._sonderSourceRequestToken = requestToken;
-        const cacheKey = mediaSourceCacheKey(sourcePath, { forceBlob });
-        const resolvedUrl = await resolveMediaSourceUrl(sourcePath, { forceBlob });
-        if (!resolvedUrl || state.destroyed || mediaEl._sonderSourceRequestToken !== requestToken) {
+        const requestedCacheKey = mediaSourceCacheKey(sourcePath, { forceBlob });
+        const resolved = await resolveMediaSourceUrl(sourcePath, { forceBlob });
+        const cacheKey = resolved?.cacheKey || requestedCacheKey;
+        if (!resolved?.url || state.destroyed || mediaEl._sonderSourceRequestToken !== requestToken) {
             maybeReleaseSourceCacheEntry(cacheKey);
             return null;
         }
-        if (!acquireMediaElementSource(mediaEl, cacheKey, resolvedUrl)) return null;
+        if (!acquireMediaElementSource(mediaEl, cacheKey, resolved.url)) return null;
         return await waitForMediaReady(mediaEl, 1);
     }
 
@@ -2625,7 +3059,7 @@ export function createViewportSurface(options = {}) {
         const sourceTargetKey = entry.sourceTargetKey;
         const warmToken = entry.warmToken;
         const signal = entry.abortController?.signal || null;
-        const sourceCacheKey = mediaSourceCacheKey(sourcePath);
+        const requestedSourceCacheKey = mediaSourceCacheKey(sourcePath);
         const stillCurrent = () => (
             !state.destroyed
             && !entry.cancelled
@@ -2638,8 +3072,9 @@ export function createViewportSurface(options = {}) {
             && state.prebufferCache.get(entry.key) === entry
         );
         const stillRelevant = () => stillCurrent() && prebufferEntryDecodeStillRelevant(entry);
-        const resolvedUrl = await resolveMediaSourceUrl(sourcePath);
-        if (!resolvedUrl || !stillCurrent()) {
+        const resolved = await resolveMediaSourceUrl(sourcePath);
+        const sourceCacheKey = resolved?.cacheKey || requestedSourceCacheKey;
+        if (!resolved?.url || !stillCurrent()) {
             maybeReleaseSourceCacheEntry(sourceCacheKey);
             return null;
         }
@@ -2647,7 +3082,7 @@ export function createViewportSurface(options = {}) {
         entry.decodeJob = null;
         entry.decodeJobState = "queued";
         entry.decodeJobPriority = entry.decodePriority || DECODE_PRIORITY_LOW;
-        if (!acquireMediaElementSource(video, sourceCacheKey, resolvedUrl)) {
+        if (!acquireMediaElementSource(video, sourceCacheKey, resolved.url)) {
             maybeReleaseSourceCacheEntry(sourceCacheKey);
             return null;
         }
@@ -6024,11 +6459,17 @@ export function createViewportSurface(options = {}) {
         });
     }
 
-    function drawPlaybackComposite(snapshot) {
+    function drawPlaybackComposite(snapshot, renderTiming = null) {
         const telemetryActive = playbackTelemetryActive();
         const compositeStartedAt = telemetryActive ? performance.now() : 0;
         const preflight = preflightPlaybackComposite(snapshot);
         if (preflight.blocked) {
+            if (renderTiming && telemetryActive) {
+                renderTiming.compositePreflightMs = roundTelemetryMs(performance.now() - compositeStartedAt);
+                renderTiming.compositeDrawMs = 0;
+                renderTiming.compositeTotalMs = renderTiming.compositePreflightMs;
+                renderTiming.blocked = true;
+            }
             commitPlaybackBlocked(snapshot, preflight.details, { suppressFallback: !!preflight.suppressFallback });
             return false;
         }
@@ -6089,6 +6530,19 @@ export function createViewportSurface(options = {}) {
             renderableCount: (preflight.renderables || []).length,
             committedVideoCount: committedVideoKeys.length,
         } : null;
+        if (renderTiming && compositeTiming) {
+            renderTiming.compositePreflightMs = compositeTiming.preflightMs;
+            renderTiming.compositeDrawMs = compositeTiming.drawMs;
+            renderTiming.compositeTotalMs = compositeTiming.totalMs;
+            renderTiming.videoDrawMs = compositeTiming.videoDrawMs;
+            renderTiming.imageDrawMs = compositeTiming.imageDrawMs;
+            renderTiming.guideDrawMs = compositeTiming.guideDrawMs;
+            renderTiming.outlineMs = compositeTiming.outlineMs;
+            renderTiming.renderableCount = compositeTiming.renderableCount;
+            renderTiming.committedVideoCount = compositeTiming.committedVideoCount;
+            renderTiming.videoDraws = videoDraws;
+            renderTiming.blocked = false;
+        }
         recordBoundaryCoverageTelemetry(snapshot, committedVideoKeys, compositeTiming, videoDraws);
         state.playbackCompositeCommitted = true;
         state.playbackBlockedSinceMs = null;
@@ -6098,6 +6552,7 @@ export function createViewportSurface(options = {}) {
         state.playbackLastCommittedFrame = snapshot.frame;
         state.playbackLastCommittedSignature = playbackLayerSignature(snapshot);
         state.playbackLastCommittedSessionId = state.playbackSessionId;
+        state.playbackLastCommittedContentToken = state.playbackWarmContentToken;
         clearPlaybackDecisionLogs();
         releaseAudioForSession("first-composite-commit", { frame: snapshot.frame });
         clearFirstCommitHold();
@@ -6122,14 +6577,106 @@ export function createViewportSurface(options = {}) {
         return drewAny;
     }
 
+    function playbackSlowRenderMediaDetails(snapshot) {
+        const details = [];
+        for (const layer of requiredClipLayersAfterCoverage(snapshot)) {
+            if (!isRenderableVideoLayer(layer)) continue;
+            const active = state.activePlaybackVideos.get(layer.key);
+            const video = active?.video || null;
+            const expectedTime = clipSourceTime(layer, snapshot.frame);
+            const currentTime = Number(video?.currentTime) || 0;
+            let quality = null;
+            try {
+                quality = video?.getVideoPlaybackQuality?.() || null;
+            } catch (_) {
+                quality = null;
+            }
+            details.push({
+                layerKey: layer.key || "",
+                clipId: layer.clip?.clip_id || "",
+                sourcePath: layer.clip?.source_path || "",
+                sourceFrame: clipSourceFrame(layer, snapshot.frame),
+                expectedTime: roundTelemetryMs(expectedTime),
+                currentTime: roundTelemetryMs(currentTime),
+                driftMs: roundTelemetryMs((currentTime - expectedTime) * 1000),
+                ...videoElementDimensions(video),
+                readyState: video?.readyState || 0,
+                seeking: !!video?.seeking,
+                paused: video ? !!video.paused : true,
+                activeReadyForDraw: !!active?.readyForDraw,
+                droppedVideoFrames: Math.max(0, Number(quality?.droppedVideoFrames) || 0),
+                totalVideoFrames: Math.max(0, Number(quality?.totalVideoFrames) || 0),
+            });
+        }
+        return details;
+    }
+
+    function recordSlowPlaybackRender(snapshot, timing, totalMs) {
+        if (!playbackPerfActive() || totalMs <= PLAYBACK_SLOW_VIEWPORT_RENDER_MS) return;
+        const summarized = _summarizePlaybackRenderTiming(timing, totalMs);
+        viewportDiagRecord("playback_slow_viewport_render", {
+            playbackRunId: state.playbackRunId,
+            playbackSessionId: state.playbackSessionId,
+            frame: snapshot?.frame ?? currentFrame(),
+            committedFrame: state.playbackLastCommittedFrame,
+            thresholdMs: PLAYBACK_SLOW_VIEWPORT_RENDER_MS,
+            timings: {
+                ...Object.fromEntries(Object.entries(summarized).map(([key, value]) => (
+                    typeof value === "number" ? [key, roundTelemetryMs(value)] : [key, value]
+                ))),
+                videoDrawMs: roundTelemetryMs(timing.videoDrawMs),
+                imageDrawMs: roundTelemetryMs(timing.imageDrawMs),
+                guideDrawMs: roundTelemetryMs(timing.guideDrawMs),
+                outlineMs: roundTelemetryMs(timing.outlineMs),
+            },
+            blocked: !!timing.blocked,
+            renderableCount: timing.renderableCount || 0,
+            committedVideoCount: timing.committedVideoCount || 0,
+            videoLayers: playbackSlowRenderMediaDetails(snapshot),
+            videoDraws: Array.isArray(timing.videoDraws) ? timing.videoDraws : [],
+            activeVideoCount: state.activePlaybackVideos.size,
+            activeAudioCount: state.activePlaybackAudios.size,
+            prebufferCount: state.prebufferCache.size,
+            videoCacheCount: Object.keys(state.videoCache).length,
+            audioCacheCount: Object.keys(state.audioCache).length,
+            imageCacheCount: Object.keys(state.imageCache).length,
+            sourceCacheCount: state.sourceUrlCache.size,
+            sourceCache: sourceCache.snapshot(),
+            ...playbackEnvironmentSnapshot(),
+        });
+    }
+
     function renderPlaybackFrame(snapshot) {
-        if (shouldReuseCommittedPlaybackFrame(snapshot)) return true;
-        notePlaybackWarmMissingLayers(snapshot, "missing-layer");
-        syncPlaybackVideoMedia(snapshot);
-        const handoffState = currentFrameHandoffRecoveryState(snapshot);
-        schedulePlaybackPrebuffer(snapshot, { handoffState });
-        syncPlaybackAudioMedia(snapshot);
-        return drawPlaybackComposite(snapshot);
+        const diagnosticsActive = playbackPerfActive() && !!state.playbackRunId;
+        const startedAt = diagnosticsActive ? performance.now() : 0;
+        const timing = diagnosticsActive ? {} : null;
+        let result = true;
+        try {
+            if (shouldReuseCommittedPlaybackFrame(snapshot)) return true;
+            notePlaybackWarmMissingLayers(snapshot, "missing-layer");
+            let phaseStartedAt = diagnosticsActive ? performance.now() : 0;
+            syncPlaybackVideoMedia(snapshot);
+            if (diagnosticsActive) {
+                timing.syncVideoMs = performance.now() - phaseStartedAt;
+                phaseStartedAt = performance.now();
+            }
+            const handoffState = currentFrameHandoffRecoveryState(snapshot);
+            schedulePlaybackPrebuffer(snapshot, { handoffState });
+            if (diagnosticsActive) {
+                timing.prebufferScheduleMs = performance.now() - phaseStartedAt;
+                phaseStartedAt = performance.now();
+            }
+            syncPlaybackAudioMedia(snapshot);
+            if (diagnosticsActive) timing.syncAudioMs = performance.now() - phaseStartedAt;
+            result = drawPlaybackComposite(snapshot, timing);
+            return result;
+        } finally {
+            if (startedAt) {
+                const totalMs = performance.now() - startedAt;
+                recordPlaybackPerfTiming("viewportRender", totalMs);
+                recordSlowPlaybackRender(snapshot, timing, totalMs);
+            }
+        }
     }
 
     function renderFrame() {
@@ -6642,6 +7189,7 @@ export function createViewportSurface(options = {}) {
 
     function restartPlaybackLoop(timestamp) {
         if (!state.playbackLoopRange) return;
+        flushPlaybackPerfSummary(timestamp, { force: true });
         const hadCommittedFrame = state.playbackCompositeCommitted;
         state.playbackSessionId += 1;
         clearPlaybackDecisionLogs();
@@ -6662,9 +7210,16 @@ export function createViewportSurface(options = {}) {
 
     function playbackTick(timestamp) {
         if (state.destroyed || !state.isPlaying) return;
+        const tickStartedAt = playbackPerfActive() ? performance.now() : 0;
+        const finishTick = () => {
+            if (tickStartedAt) recordPlaybackPerfTiming("tick", performance.now() - tickStartedAt);
+            flushPlaybackPerfSummary(timestamp);
+        };
         // Freeze the clock before any advance while rebuffering (mirrors the
         // first-commit hold) so the playhead never overshoots the buffering frame.
         if (maybeHoldForRebuffer(timestamp)) {
+            notePlaybackPerfTick(timestamp, currentFrame());
+            finishTick();
             return;
         }
         // RAF timestamps can lag a clock reset that happened during async rebuffer recovery.
@@ -6672,24 +7227,35 @@ export function createViewportSurface(options = {}) {
         const nextFrame = state.playbackStartFrame + Math.floor(elapsedSeconds * fps());
         const loopRange = state.playbackLoopRange;
         const endFrame = loopRange ? loopRange.end : totalFrames();
+        notePlaybackPerfTick(timestamp, nextFrame);
         if (holdPlaybackClockForFirstCommit(timestamp, nextFrame, endFrame)) {
+            finishTick();
             return;
         }
         if (nextFrame >= endFrame) {
             if (loopRange) {
                 restartPlaybackLoop(timestamp);
+                finishTick();
                 return;
             }
             applyFrame(totalFrames(), { reason: "playback-end" });
-            stopPlayback();
+            finishTick();
+            stopPlayback({ reason: "playback-end" });
+            return;
+        }
+        recordFramesBehindTelemetry(timestamp, nextFrame, endFrame);
+        if (canSkipRepeatedPlaybackFrame(nextFrame)) {
+            notePlaybackPerfFrameSkipped();
+            state.playbackRAF = requestAnimationFrame(playbackTick);
+            finishTick();
             return;
         }
         applyFrame(nextFrame, { reason: "playback" });
-        recordFramesBehindTelemetry(timestamp, nextFrame, endFrame);
         const snapshot = buildFrameSnapshot(nextFrame);
         invalidateAsyncPreviewRenders();
         renderPlaybackFrame(snapshot);
         state.playbackRAF = requestAnimationFrame(playbackTick);
+        finishTick();
     }
 
     function clearActivePlaybackMedia() {
@@ -6706,16 +7272,18 @@ export function createViewportSurface(options = {}) {
         drainPendingReleases(true);
     }
 
-    function stopPlayback({ preservePlayhead = false } = {}) {
+    function stopPlayback({ preservePlayhead = false, reason = "playback-stop" } = {}) {
         if (state.playbackRAF) {
             cancelAnimationFrame(state.playbackRAF);
             state.playbackRAF = null;
         }
         if (!state.isPlaying) {
+            finishPlaybackPerfRun(reason);
             notifyTransport();
             return;
         }
         updatePlaybackState(false);
+        finishPlaybackPerfRun(reason);
         flushBlockReasonTelemetry();
         resetRebufferState();
         clearActivePlaybackMedia();
@@ -6760,6 +7328,7 @@ export function createViewportSurface(options = {}) {
         resetPlaybackTelemetry();
         resetRebufferState();
         beginFirstCommitHold(state.playbackStartTime, startFrame);
+        startPlaybackPerfRun(state.playbackStartTime);
         updatePlaybackState(true);
         const snapshot = buildFrameSnapshot(startFrame);
         renderPlaybackFrame(snapshot);
@@ -6787,12 +7356,9 @@ export function createViewportSurface(options = {}) {
         for (const mediaEl of Object.values(state.audioCache)) {
             removeMediaSource(mediaEl);
         }
-        for (const entry of state.sourceUrlCache.values()) {
-            if (entry?.usesObjectUrl && entry.objectUrl) {
-                URL.revokeObjectURL(entry.objectUrl);
-            }
-        }
-        state.sourceUrlCache.clear();
+        sourceCache.clear("media-cache-clear", {
+            releaseHolders: (mediaEl) => removeMediaSource(mediaEl),
+        });
         clearCacheObject(state.videoCache);
         clearCacheObject(state.audioCache);
         clearCacheObject(state.imageCache);
@@ -6818,7 +7384,7 @@ export function createViewportSurface(options = {}) {
             return;
         }
         if (!enabled && state.isPlaying) {
-            stopPlayback({ preservePlayhead: true });
+            stopPlayback({ preservePlayhead: true, reason: "live-media-disabled" });
         }
         state.liveMediaEnabled = enabled;
         notifyTransport();
@@ -6827,6 +7393,7 @@ export function createViewportSurface(options = {}) {
 
     function destroy() {
         if (state.destroyed) return;
+        if (state.playbackRunId) finishPlaybackPerfRun("destroy");
         state.destroyed = true;
         if (state.playbackRAF) {
             cancelAnimationFrame(state.playbackRAF);
@@ -6844,6 +7411,7 @@ export function createViewportSurface(options = {}) {
     function diagClearHook() {
         clearPlaybackDecisionLogs();
         resetPlaybackTelemetry();
+        restartPlaybackPerfCapture();
     }
     function registerDiagClearHook() {
         if (typeof window === "undefined") return;

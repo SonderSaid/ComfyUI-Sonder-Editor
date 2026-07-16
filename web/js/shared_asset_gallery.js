@@ -256,19 +256,22 @@ export function loadMediaAsBlob(url, mediaEl, { mode = "blob" } = {}) {
     }
     let blobUrl = null;
     let aborted = false;
-    fetch(url)
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    fetch(url, controller ? { signal: controller.signal } : undefined)
         .then((resp) => resp.blob())
         .then((blob) => {
             if (aborted) return;
             blobUrl = URL.createObjectURL(blob);
             mediaEl.src = blobUrl;
         })
-        .catch(() => {
+        .catch((error) => {
+            if (error?.name === "AbortError") return;
             if (!aborted) mediaEl.src = url;
         });
     return {
         cleanup() {
             aborted = true;
+            try { controller?.abort?.(); } catch (_) { /* abort is best-effort */ }
             if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
         },
     };

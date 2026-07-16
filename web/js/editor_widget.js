@@ -38,6 +38,20 @@ let _sessionDiagInFlightKind = "";
 let _sessionDiagRafGapHandle = 0;
 let _sessionDiagLastRafTs = 0;
 let _sessionDiagLongTaskObserver = null;
+let _sessionDiagCaptureSeq = 0;
+
+function rotateSessionDiagCaptureId() {
+    if (typeof window === "undefined") return "";
+    _sessionDiagCaptureSeq += 1;
+    const captureId = `${Date.now().toString(36)}-${_sessionDiagCaptureSeq.toString(36)}`;
+    window.__SONDER_DIAG_CAPTURE_ID = captureId;
+    return captureId;
+}
+
+function currentSessionDiagCaptureId() {
+    if (typeof window === "undefined") return "";
+    return window.__SONDER_DIAG_CAPTURE_ID || rotateSessionDiagCaptureId();
+}
 
 function isSessionDiagEnabled() {
     return typeof window !== "undefined" && window.SONDER_DEBUG_SESSION === true;
@@ -60,6 +74,7 @@ function getDiagClearerRegistry() {
 
 function clearSessionDiagnostics() {
     let sources = 0;
+    const captureId = rotateSessionDiagCaptureId();
     const surface = typeof window !== "undefined" ? window.__SONDER_CANVAS_DIAG : null;
     if (surface && Array.isArray(surface.events)) {
         const boot = {
@@ -69,6 +84,7 @@ function clearSessionDiagnostics() {
             build_marker: "canvas_page",
             href: typeof location !== "undefined" ? String(location.href || "") : "",
             cleared: true,
+            capture_id: captureId,
         };
         // Mutate in place so the surface.record closure keeps the same array.
         surface.events.length = 0;
@@ -78,6 +94,7 @@ function clearSessionDiagnostics() {
     }
     _sessionDiagInFlightMarkerId = "";
     _sessionDiagInFlightKind = "";
+    _sessionDiagLastRafTs = 0;
     const registry = getDiagClearerRegistry();
     if (registry) {
         for (const clear of registry) {
@@ -101,6 +118,7 @@ function _sessionDiagInit() {
         t_mono: performance.now(),
         build_marker: "canvas_page",
         href: typeof location !== "undefined" ? String(location.href || "") : "",
+        capture_id: currentSessionDiagCaptureId(),
     };
     const events = [boot];
     const surface = {
@@ -112,6 +130,7 @@ function _sessionDiagInit() {
                 t_wall: Date.now(),
                 t_mono: performance.now(),
                 kind,
+                capture_id: currentSessionDiagCaptureId(),
                 ...payload,
             });
         },
@@ -5475,9 +5494,19 @@ export class EditorWidget {
 
     // ── Timeline Rendering ─────────────────────────────────────────────
     _renderTimeline() {
+        const measurePlayback = isSessionDiagEnabled() && this.isPlaying;
+        const timelineStartedAt = measurePlayback ? performance.now() : 0;
         this._refreshPlayheadInput?.();
-        TimelineCanvas._renderTimeline(this);
+        const canvasResult = TimelineCanvas._renderTimeline(this);
+        const timelineFinishedAt = measurePlayback ? performance.now() : 0;
         this._updateToolbar();
+        if (!measurePlayback) return null;
+        const toolbarFinishedAt = performance.now();
+        return {
+            timelineMs: timelineFinishedAt - timelineStartedAt,
+            toolbarMs: toolbarFinishedAt - timelineFinishedAt,
+            canvasBackingResized: !!canvasResult?.backingChanged,
+        };
     }
 
     get _labelW() {
@@ -14552,13 +14581,19 @@ export class EditorWidget {
             notifyInfo: (message, opts) => notifyInfo(message, opts),
             notifyWarning: (message, opts) => notifyWarning(message, opts),
             onFrameChange: (frame, meta = {}) => {
+                const measurePlayback = isSessionDiagEnabled() && this.isPlaying;
+                const autoScrollStartedAt = measurePlayback ? performance.now() : 0;
                 this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
                 if (meta.reason === "playback" || meta.reason === "playback-loop" || meta.reason === "playback-stop-return") {
                     this._maybeAutoScrollToPlayhead();
                 }
-                this._renderTimeline();
-                this._updateToolbar();
-                this._updateTransportUI();
+                const autoScrollFinishedAt = measurePlayback ? performance.now() : 0;
+                const timelineMetrics = this._renderTimeline();
+                if (!measurePlayback) return null;
+                return {
+                    autoScrollMs: autoScrollFinishedAt - autoScrollStartedAt,
+                    ...(timelineMetrics || {}),
+                };
             },
             onTransportUpdate: () => this._updateTransportUI(),
             onPlaybackStateChange: (isPlaying) => {
@@ -14567,7 +14602,6 @@ export class EditorWidget {
                     this._vpPlayBtn.textContent = isPlaying ? "Pause" : "Play";
                 }
                 this._renderTimeline();
-                this._updateToolbar();
             },
             onPlaybackWarmStateChange: (payload) => this._handlePlaybackWarmStateChange(payload),
             getAssetForSourcePath: (sourcePath) => this._getAssetForSourcePath(sourcePath),
@@ -15393,6 +15427,11 @@ export class EditorWidget {
             }
             this.playhead = this.totalFrames;
             this._stopPlayback();
+            return;
+        }
+
+        if (newFrame === this.playhead) {
+            this._playbackRAF = requestAnimationFrame((t) => this._playbackTick(t));
             return;
         }
 

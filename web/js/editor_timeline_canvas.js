@@ -43,6 +43,22 @@ function timelineLabelPoint(host, rectX, rectY, rectW, rectH, fontSize) {
     };
 }
 
+export function _syncTimelineCanvasDimensions(canvas, width, height) {
+    const styleWidth = width + "px";
+    const styleHeight = height + "px";
+    const widthChanged = canvas.width !== width;
+    const heightChanged = canvas.height !== height;
+    const styleWidthChanged = canvas.style.width !== styleWidth;
+    const styleHeightChanged = canvas.style.height !== styleHeight;
+    const backingChanged = widthChanged || heightChanged;
+    const styleChanged = styleWidthChanged || styleHeightChanged;
+    if (widthChanged) canvas.width = width;
+    if (heightChanged) canvas.height = height;
+    if (styleWidthChanged) canvas.style.width = styleWidth;
+    if (styleHeightChanged) canvas.style.height = styleHeight;
+    return { backingChanged, styleChanged };
+}
+
 export function _trackY(host, layoutIdx) {
     const ts = host._scaleTimeline;
     let y = Math.round(RULER_HEIGHT * ts);
@@ -140,10 +156,7 @@ export function _renderTimeline(host) {
         host._clampScrollY();
 
         // Canvas at 1:1 — per-section scales handle individual elements
-        canvas.width = width;
-        canvas.height = canvasH;
-        canvas.style.width = width + "px";
-        canvas.style.height = canvasH + "px";
+        const { backingChanged, styleChanged } = _syncTimelineCanvasDimensions(canvas, width, canvasH);
 
         const ctx = canvas.getContext("2d");
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -196,6 +209,7 @@ export function _renderTimeline(host) {
         host._drawSnapIndicator(ctx, width, canvasH);
         host._drawVerticalScrollbar(ctx, width, canvasH);
         ctx.restore();
+        return { backingChanged, styleChanged };
     }
 
 export function _labelW(host) {

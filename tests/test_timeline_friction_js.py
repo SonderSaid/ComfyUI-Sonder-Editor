@@ -220,3 +220,59 @@ def test_editor_widget_wires_linked_unmute_and_clicked_type_consolidation():
     assert "selected?.type !== hit.type" in source
     assert "type: \"consolidate_items\"" in source
     assert "remove_vacated_lanes: true" in source
+
+
+def test_timeline_canvas_backing_store_changes_only_when_dimensions_change():
+    module_url = (ROOT / "web" / "js" / "editor_timeline_canvas.js").as_uri()
+    script = f"""
+const {{ _syncTimelineCanvasDimensions: syncDimensions }} = await import({json.dumps(module_url)});
+let width = 400;
+let height = 200;
+let widthWrites = 0;
+let heightWrites = 0;
+let styleWidthWrites = 0;
+let styleHeightWrites = 0;
+let styleWidth = "400px";
+let styleHeight = "200px";
+const style = {{}};
+Object.defineProperty(style, "width", {{ get: () => styleWidth, set: (value) => {{ styleWidthWrites += 1; styleWidth = value; }} }});
+Object.defineProperty(style, "height", {{ get: () => styleHeight, set: (value) => {{ styleHeightWrites += 1; styleHeight = value; }} }});
+const canvas = {{ style }};
+Object.defineProperty(canvas, "width", {{ get: () => width, set: (value) => {{ widthWrites += 1; width = value; }} }});
+Object.defineProperty(canvas, "height", {{ get: () => height, set: (value) => {{ heightWrites += 1; height = value; }} }});
+const unchanged = syncDimensions(canvas, 400, 200);
+const changed = syncDimensions(canvas, 640, 360);
+const stableAgain = syncDimensions(canvas, 640, 360);
+console.log(JSON.stringify({{
+    unchanged,
+    changed,
+    stableAgain,
+    widthWrites,
+    heightWrites,
+    styleWidthWrites,
+    styleHeightWrites,
+}}));
+"""
+    result = json.loads(_run_node(script))
+
+    assert result == {
+        "unchanged": {"backingChanged": False, "styleChanged": False},
+        "changed": {"backingChanged": True, "styleChanged": True},
+        "stableAgain": {"backingChanged": False, "styleChanged": False},
+        "widthWrites": 1,
+        "heightWrites": 1,
+        "styleWidthWrites": 1,
+        "styleHeightWrites": 1,
+    }
+
+
+def test_viewport_playback_callbacks_do_not_duplicate_toolbar_or_transport_updates():
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    start = source.index("            onFrameChange: (frame, meta = {}) => {")
+    end = source.index("            onPlaybackWarmStateChange:", start)
+    callback_source = source[start:end]
+
+    assert callback_source.count("this._renderTimeline();") == 2
+    assert "this._updateToolbar();" not in callback_source
+    assert callback_source.count("this._updateTransportUI()") == 1
+    assert "if (newFrame === this.playhead)" in source
