@@ -324,27 +324,6 @@ async function readResponseError(resp, fallback = "Request failed.") {
     return fallback;
 }
 
-export async function uploadFileToComfyInput(file) {
-    if (!file) return "";
-
-    const formData = new FormData();
-    formData.append("image", file, file.name);
-    formData.append("overwrite", "true");
-
-    const uploadResp = await fetch(api.apiURL("/upload/image"), {
-        method: "POST",
-        body: formData,
-    });
-
-    if (!uploadResp.ok) {
-        const message = await uploadResp.text();
-        throw new Error(message || `Upload failed: ${uploadResp.status}`);
-    }
-
-    const uploadData = await uploadResp.json();
-    return uploadData.name || "";
-}
-
 export function buildProjectAssetViewURL(projectDir, sourcePath) {
     if (!projectDir || !sourcePath) return null;
     const dirName = projectDir.split(/[/\\]/).pop();
@@ -356,17 +335,13 @@ export function buildProjectAssetViewURL(projectDir, sourcePath) {
 
 export async function importFileIntoProject(projectDir, file, folder = "") {
     if (!projectDir || !file) return false;
-
-    const uploadedName = await uploadFileToComfyInput(file);
-
     const dirName = projectDir.split(/[/\\]/).pop();
+    const formData = new FormData();
+    formData.append("file", file, file.name);
+    if (folder) formData.append("folder", folder);
     const importResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/import`), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            source_path: uploadedName,
-            folder,
-        }),
+        body: formData,
     });
 
     if (!importResp.ok) {
@@ -379,24 +354,15 @@ export async function importFileIntoProject(projectDir, file, folder = "") {
 
 export async function replaceAssetInProject(projectDir, assetId, file) {
     if (!projectDir || !assetId || !file) return null;
-
-    const uploadedName = await uploadFileToComfyInput(file);
     const dirName = projectDir.split(/[/\\]/).pop();
+    const formData = new FormData();
+    formData.append("file", file, file.name);
     const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}/replace`), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source_path: uploadedName }),
+        body: formData,
     });
     if (!resp.ok) {
-        let message = `Asset replace failed: ${resp.status}`;
-        try {
-            const payload = await resp.json();
-            if (payload?.error) message = payload.error;
-        } catch {
-            const text = await resp.text();
-            if (text) message = text;
-        }
-        throw new Error(message);
+        throw new Error(await readResponseError(resp, `Asset replace failed: ${resp.status}`));
     }
     return await resp.json();
 }

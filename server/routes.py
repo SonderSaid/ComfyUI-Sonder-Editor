@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import shutil
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -43,6 +44,15 @@ from .path_security import (
     resolve_project_path,
     resolve_static_path,
     safe_route_token as _security_safe_route_token,
+    sanitize_filename_component,
+)
+from .atomic_io import atomic_replace
+from .upload_streaming import (
+    UPLOAD_STAGING_DIRNAME,
+    UploadRequestError,
+    active_upload_count,
+    ensure_upload_disk_space,
+    receive_project_upload,
 )
 from .project_manager import (
     ProjectVersionConflict,
@@ -2897,6 +2907,11 @@ def _snapshot_files_under(root_dir: str, rel_prefix: str = "") -> dict[str, dict
                 for entry in scan:
                     rel_path = _normalize_project_relpath(os.path.join(current_rel, entry.name))
                     try:
+                        # Direct browser uploads stage beside their final destination so
+                        # the publish rename stays on one physical volume. This reserved
+                        # directory is transactional state, never project media.
+                        if entry.name == UPLOAD_STAGING_DIRNAME:
+                            continue
                         try:
                             if entry.is_symlink() and not trust_links:
                                 log_path_quarantine(
@@ -4816,6 +4831,423 @@ def _update_asset_references_for_path(project: TimelineProject, old_path: str, n
                 track.source_path = new_path
 
 
+class _StreamedAssetChanged(RuntimeError):
+    pass
+
+
+_ASSET_CACHE_LOCKS_GUARD = threading.Lock()
+_ASSET_CACHE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _asset_cache_lock(project: TimelineProject, asset: Asset) -> threading.Lock:
+    key = f"{os.path.normcase(os.path.realpath(project.project_dir))}|{asset.asset_id}"
+    with _ASSET_CACHE_LOCKS_GUARD:
+        return _ASSET_CACHE_LOCKS.setdefault(key, threading.Lock())
+
+
+def _apply_uploaded_metadata(
+    asset: Asset,
+    metadata: dict,
+    asset_type: str,
+    artifact_kind: str,
+    source_path: str,
+) -> None:
+    asset.width = metadata["width"]
+    asset.height = metadata["height"]
+    asset.frame_count = metadata["frame_count"]
+    asset.fps = metadata["fps"]
+    asset.duration_sec = metadata["duration_sec"]
+    asset.sample_rate = metadata["sample_rate"]
+    asset.has_audio = metadata["has_audio"]
+    asset.has_audio_checked = asset_type == "video" and _metadata_checked_for_asset(asset_type, metadata)
+    asset.duration_checked = asset_type == "audio" and _metadata_checked_for_asset(asset_type, metadata)
+    asset.media_probe_signature = _media_probe_signature(source_path)
+    asset.artifact_kind = artifact_kind if asset_type == "artifact" else ""
+    if asset_type == "video":
+        apply_color_metadata(asset, metadata)
+    else:
+        apply_color_metadata(asset, {})
+
+
+def _same_path_import_placeholder(asset: Asset) -> bool:
+    return (
+        not str(getattr(asset, "trashed_at", "") or "")
+        and not str(getattr(asset, "prompt", "") or "")
+        and not (getattr(asset, "generation_params", None) or {})
+        and not str(getattr(asset, "folder", "") or "")
+    )
+
+
+def _unique_import_destination(project: TimelineProject, filename: str) -> tuple[str, str]:
+    safe_name = sanitize_filename_component(filename, fallback="imported_media")
+    known = {_normalize_project_relpath(getattr(asset, "path", "") or "") for asset in project.assets}
+    for _attempt in range(128):
+        rel_path = os.path.join("media", f"{uuid.uuid4().hex[:8]}_{safe_name}")
+        abs_path = resolve_project_path(project, rel_path, purpose="streamed asset destination")
+        if abs_path and _normalize_project_relpath(rel_path) not in known and not os.path.lexists(abs_path):
+            return rel_path, abs_path
+    raise RuntimeError("Could not allocate a unique project media path")
+
+
+def _allocate_asset_id(project: TimelineProject) -> str:
+    known = {str(getattr(asset, "asset_id", "") or "") for asset in project.assets}
+    for _attempt in range(128):
+        candidate = uuid.uuid4().hex[:8]
+        if candidate not in known:
+            return candidate
+    raise RuntimeError("Could not allocate a unique asset id")
+
+
+def _streamed_import_commit(project_dir: str, staged_path: str, filename: str, folder: str) -> tuple[TimelineProject, Asset]:
+    asset_type, artifact_kind = _classify_asset_for_registration(staged_path)
+    metadata = _extract_asset_media_metadata(
+        staged_path,
+        asset_type,
+        strict=_media_asset_requires_probe(asset_type),
+    )
+    first_project = load_project(project_dir)
+    rel_path, final_path = _unique_import_destination(first_project, filename)
+    candidate = Asset(
+        asset_id=_allocate_asset_id(first_project),
+        name=filename,
+        asset_type=asset_type,
+        artifact_kind=artifact_kind,
+        path=rel_path,
+    )
+    if folder:
+        candidate.folder = _normalize_asset_folder(folder)
+    _apply_uploaded_metadata(candidate, metadata, asset_type, artifact_kind, staged_path)
+    atomic_replace(staged_path, final_path)
+    candidate.media_probe_signature = _media_probe_signature(final_path)
+
+    last_conflict = None
+    try:
+        for _attempt in range(3):
+            current = load_project(project_dir)
+            base_modified_at = str(getattr(current, "modified_at", "") or "")
+            same_path = current.asset_for_source_path(rel_path)
+            if same_path is not None:
+                # Asset sync can observe the atomically published file before the
+                # registry save. Upgrade that discovery record instead of duplicating it.
+                if _same_path_import_placeholder(same_path):
+                    preserved_id = same_path.asset_id
+                    same_path.name = candidate.name
+                    same_path.asset_type = candidate.asset_type
+                    same_path.path = candidate.path
+                    same_path.folder = candidate.folder
+                    _apply_uploaded_metadata(same_path, metadata, asset_type, artifact_kind, final_path)
+                    same_path.asset_id = preserved_id
+                    committed_asset = same_path
+                else:
+                    committed_asset = same_path
+            else:
+                if current.get_asset(candidate.asset_id) is not None:
+                    candidate.asset_id = _allocate_asset_id(current)
+                current.add_asset(candidate)
+                committed_asset = candidate
+            if candidate.folder:
+                _ensure_asset_folder(current, candidate.folder)
+            try:
+                save_project(current, expected_modified_at=base_modified_at)
+                return current, committed_asset
+            except ProjectVersionConflict as exc:
+                last_conflict = exc
+        if last_conflict is not None:
+            raise last_conflict
+        raise RuntimeError("Import commit retry loop exhausted")
+    except Exception:
+        try:
+            latest = load_project(project_dir)
+            if latest.asset_for_source_path(rel_path) is None and os.path.isfile(final_path):
+                os.remove(final_path)
+        except Exception:
+            logger.warning("Could not clean an unregistered streamed import", exc_info=True)
+        raise
+
+
+def _is_reparse_entry(path: str) -> bool:
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    try:
+        return os.path.islink(path) or external_links.is_reparse_child(parent, name)
+    except OSError:
+        return os.path.islink(path)
+
+
+def _create_replacement_backup(source_path: str, staging_dir: str) -> tuple[str, str]:
+    extension = os.path.splitext(source_path)[1]
+    backup_path = os.path.join(staging_dir, f"{uuid.uuid4().hex}.rollback{extension}")
+    if _is_reparse_entry(source_path):
+        os.replace(source_path, backup_path)
+        return backup_path, "entry"
+    try:
+        os.link(source_path, backup_path, follow_symlinks=False)
+        return backup_path, "hardlink"
+    except (OSError, TypeError, NotImplementedError):
+        ensure_upload_disk_space(staging_dir, os.path.getsize(source_path))
+        shutil.copy2(source_path, backup_path)
+        return backup_path, "copy"
+
+
+def _rollback_same_path_replacement(final_path: str, staged_path: str, backup_path: str) -> None:
+    if os.path.lexists(final_path):
+        atomic_replace(final_path, staged_path)
+    if os.path.lexists(backup_path):
+        atomic_replace(backup_path, final_path)
+
+
+def _streamed_replace_commit(
+    project_dir: str,
+    asset_id: str,
+    initial_type: str,
+    initial_path: str,
+    initial_signature: str,
+    staged_path: str,
+    filename: str,
+) -> tuple[TimelineProject, Asset]:
+    replacement_type, artifact_kind = _classify_asset_for_registration(staged_path)
+    if replacement_type != initial_type:
+        raise ValueError(f"Replacement type mismatch: expected {initial_type}, got {replacement_type}")
+    metadata = _extract_asset_media_metadata(
+        staged_path,
+        replacement_type,
+        strict=_media_asset_requires_probe(replacement_type),
+    )
+    last_conflict = None
+
+    for _attempt in range(3):
+        current = load_project(project_dir)
+        asset = current.get_asset(asset_id)
+        if asset is None:
+            raise _StreamedAssetChanged("The asset was removed while its replacement uploaded")
+        current_abs = _require_asset_media_source(current, asset, operation="Asset replace")
+        if (
+            asset.asset_type != initial_type
+            or asset.path != initial_path
+            or _media_probe_signature(current_abs) != initial_signature
+        ):
+            raise _StreamedAssetChanged("The asset changed while its replacement uploaded; try again")
+
+        base_modified_at = str(getattr(current, "modified_at", "") or "")
+        old_rel_path = asset.path
+        old_abs_path = current_abs
+        old_ext = os.path.splitext(old_rel_path or "")[1].lower()
+        new_ext = os.path.splitext(filename)[1].lower()
+        same_path = bool(old_ext and old_ext == new_ext)
+        if same_path:
+            next_rel_path = old_rel_path
+            next_abs_path = old_abs_path
+        else:
+            rel_parent = os.path.dirname(old_rel_path)
+            safe_name = sanitize_filename_component(filename, fallback="replacement_media")
+            for _candidate_attempt in range(128):
+                next_rel_path = os.path.join(rel_parent, f"{uuid.uuid4().hex[:8]}_{safe_name}")
+                next_abs_path = resolve_project_path(current, next_rel_path, purpose="streamed replacement destination")
+                if next_abs_path and not os.path.lexists(next_abs_path) and current.asset_for_source_path(next_rel_path) is None:
+                    break
+            else:
+                raise RuntimeError("Could not allocate a unique replacement path")
+
+        backup_path = ""
+        published = False
+        try:
+            if same_path:
+                staging_dir = os.path.dirname(staged_path)
+                backup_path, _backup_mode = _create_replacement_backup(next_abs_path, staging_dir)
+            atomic_replace(staged_path, next_abs_path)
+            published = True
+
+            if old_rel_path != next_rel_path:
+                _update_asset_references_for_path(current, old_rel_path, next_rel_path)
+                asset.path = next_rel_path
+            _apply_uploaded_metadata(asset, metadata, replacement_type, artifact_kind, next_abs_path)
+            old_basename = os.path.basename(old_rel_path or "")
+            if not asset.name or asset.name == old_basename:
+                asset.name = os.path.basename(asset.path)
+
+            try:
+                save_project(current, expected_modified_at=base_modified_at)
+            except ProjectVersionConflict as exc:
+                last_conflict = exc
+                if same_path:
+                    _rollback_same_path_replacement(next_abs_path, staged_path, backup_path)
+                else:
+                    atomic_replace(next_abs_path, staged_path)
+                published = False
+                backup_path = ""
+                continue
+
+            if backup_path and os.path.lexists(backup_path):
+                os.remove(backup_path)
+            if old_rel_path != next_rel_path and os.path.isfile(old_abs_path):
+                shared_old_path = any(
+                    other.asset_id != asset.asset_id and other.path == old_rel_path
+                    for other in current.assets
+                )
+                if not shared_old_path:
+                    try:
+                        os.remove(old_abs_path)
+                    except OSError:
+                        logger.warning("Failed to remove replaced asset file: %s", old_abs_path)
+            return current, asset
+        except Exception:
+            if published:
+                try:
+                    if same_path:
+                        _rollback_same_path_replacement(next_abs_path, staged_path, backup_path)
+                    else:
+                        atomic_replace(next_abs_path, staged_path)
+                except Exception:
+                    logger.exception("Failed to roll back streamed asset replacement")
+            elif backup_path and os.path.lexists(backup_path) and not os.path.lexists(next_abs_path):
+                try:
+                    atomic_replace(backup_path, next_abs_path)
+                except Exception:
+                    logger.exception("Failed to restore replacement rollback entry")
+            elif backup_path and os.path.lexists(backup_path):
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    logger.warning("Failed to remove unused replacement rollback entry")
+            raise
+
+    if last_conflict is not None:
+        raise last_conflict
+    raise RuntimeError("Replacement commit retry loop exhausted")
+
+
+def _regenerate_thumbnail_if_current(project_dir: str, asset_id: str, expected_signature: str) -> None:
+    project = load_project(project_dir)
+    asset = project.get_asset(asset_id)
+    if asset is None:
+        return
+    lock = _asset_cache_lock(project, asset)
+    with lock:
+        project = load_project(project_dir)
+        asset = project.get_asset(asset_id)
+        if asset is None:
+            return
+        source_path = _asset_abspath(project, asset)
+        if not source_path or _media_probe_signature(source_path) != expected_signature:
+            return
+        thumb_path = _asset_thumbnail_path(project, asset)
+        if not thumb_path:
+            return
+        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+        temp_path = f"{thumb_path}.{uuid.uuid4().hex}.tmp.png"
+        try:
+            if not ensure_thumbnail(asset.asset_type, source_path, temp_path):
+                return
+            latest = load_project(project_dir)
+            latest_asset = latest.get_asset(asset_id)
+            latest_source = _asset_abspath(latest, latest_asset) if latest_asset else ""
+            if not latest_source or _media_probe_signature(latest_source) != expected_signature:
+                return
+            atomic_replace(temp_path, thumb_path)
+        finally:
+            if os.path.isfile(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+
+def _delete_asset_cache_files_locked(project: TimelineProject, asset: Asset) -> None:
+    with _asset_cache_lock(project, asset):
+        _delete_asset_cache_files(project, asset)
+
+
+def _generate_strip_if_current(project_dir: str, asset_id: str) -> bool:
+    project = load_project(project_dir)
+    asset = project.get_asset(asset_id)
+    if asset is None or asset.asset_type != "video":
+        return False
+    with _asset_cache_lock(project, asset):
+        project = load_project(project_dir)
+        asset = project.get_asset(asset_id)
+        source_path = _asset_abspath(project, asset) if asset else ""
+        expected_signature = _media_probe_signature(source_path) if source_path else ""
+        if not asset or asset.asset_type != "video" or not source_path or not expected_signature:
+            return False
+        cache_key = _asset_cache_key(project, asset)
+        strip_path = _asset_cache_file(project, asset, "thumbnails", f"{cache_key}_strip.jpg")
+        info_path = _asset_cache_file(project, asset, "thumbnails", f"{cache_key}_strip.jpg.json")
+        if not strip_path or not info_path:
+            return False
+        if os.path.isfile(strip_path) and os.path.isfile(info_path):
+            return True
+        temp_strip = f"{strip_path}.{uuid.uuid4().hex}.tmp.jpg"
+        temp_info = f"{info_path}.{uuid.uuid4().hex}.tmp.json"
+        try:
+            info = generate_thumbnail_strip(source_path, temp_strip)
+            if not info:
+                return False
+            with open(temp_info, "w", encoding="utf-8") as handle:
+                json.dump(info, handle)
+            latest = load_project(project_dir)
+            latest_asset = latest.get_asset(asset_id)
+            latest_source = _asset_abspath(latest, latest_asset) if latest_asset else ""
+            if not latest_source or _media_probe_signature(latest_source) != expected_signature:
+                return False
+            atomic_replace(temp_strip, strip_path)
+            atomic_replace(temp_info, info_path)
+            return True
+        finally:
+            for temp_path in (temp_strip, temp_info):
+                if os.path.isfile(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+
+def _generate_waveform_if_current(project_dir: str, asset_id: str) -> bool:
+    project = load_project(project_dir)
+    asset = project.get_asset(asset_id)
+    if asset is None or asset.asset_type not in {"audio", "video"}:
+        return False
+    with _asset_cache_lock(project, asset):
+        project = load_project(project_dir)
+        asset = project.get_asset(asset_id)
+        source_path = _asset_abspath(project, asset) if asset else ""
+        expected_signature = _media_probe_signature(source_path) if source_path else ""
+        if not asset or not source_path or not expected_signature:
+            return False
+        cache_key = _asset_cache_key(project, asset)
+        waveform_path = _asset_cache_file(project, asset, "waveforms", f"{cache_key}.json")
+        if not waveform_path:
+            return False
+        if os.path.isfile(waveform_path):
+            return True
+        temp_waveform = f"{waveform_path}.{uuid.uuid4().hex}.tmp.json"
+        temp_audio = ""
+        waveform_source = source_path
+        try:
+            if asset.asset_type == "video":
+                temp_audio = os.path.join(
+                    os.path.dirname(waveform_path),
+                    f"{cache_key}.{uuid.uuid4().hex}.tmp.wav",
+                )
+                if not _extract_audio_from_video(source_path, temp_audio):
+                    return False
+                waveform_source = temp_audio
+            if not generate_waveform_data(waveform_source, temp_waveform):
+                return False
+            latest = load_project(project_dir)
+            latest_asset = latest.get_asset(asset_id)
+            latest_source = _asset_abspath(latest, latest_asset) if latest_asset else ""
+            if not latest_source or _media_probe_signature(latest_source) != expected_signature:
+                return False
+            atomic_replace(temp_waveform, waveform_path)
+            return True
+        finally:
+            for temp_path in (temp_waveform, temp_audio):
+                if temp_path and os.path.isfile(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+
 def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: str) -> Asset:
     old_abs_path = _require_asset_media_source(project, asset, operation="Asset replace")
     resolved_source = _resolve_source_path(source_path)
@@ -5519,6 +5951,65 @@ if routes is not None:
     @routes.post("/sonder-editor/project/{project_id}/assets/import")
     async def api_import_asset(request: web.Request) -> web.Response:
         """Import a media file into the project's media directory."""
+        request_content_type = getattr(request, "content_type", "application/json")
+        if request_content_type == "multipart/form-data":
+            try:
+                project = await asyncio.to_thread(_load_project_from_request, request, repair_missing_frames=False)
+            except FileNotFoundError as e:
+                return _json_error(str(e), 404)
+            media_dir = project_media_root(project)
+            if not media_dir:
+                return _json_error("Invalid project media directory", 400)
+            started_at = time.monotonic()
+            try:
+                async with receive_project_upload(
+                    request,
+                    media_dir,
+                    allowed_text_fields={"folder"},
+                ) as upload:
+                    folder = _normalize_asset_folder(upload.fields.get("folder", ""))
+                    committed_project, asset = await asyncio.to_thread(
+                        _streamed_import_commit,
+                        project.project_dir,
+                        upload.path,
+                        upload.filename,
+                        folder,
+                    )
+                    if asset.asset_type in {"video", "image", "audio"}:
+                        await asyncio.to_thread(
+                            _regenerate_thumbnail_if_current,
+                            committed_project.project_dir,
+                            asset.asset_id,
+                            asset.media_probe_signature,
+                        )
+                    payload = await asyncio.to_thread(_asset_payload, committed_project, asset)
+                    logger.info(
+                        "Streamed asset import completed bytes=%s duration_ms=%s active=%s",
+                        upload.size,
+                        round((time.monotonic() - started_at) * 1000),
+                        active_upload_count(),
+                    )
+                    return web.json_response(payload, status=201)
+            except UploadRequestError as exc:
+                logger.info(
+                    "Streamed asset import rejected status=%s duration_ms=%s active=%s",
+                    exc.status,
+                    round((time.monotonic() - started_at) * 1000),
+                    active_upload_count(),
+                )
+                return _json_error(exc.message, exc.status)
+            except (ValueError, MediaProbeError) as exc:
+                logger.info(
+                    "Streamed asset import validation failed error_type=%s duration_ms=%s active=%s",
+                    type(exc).__name__,
+                    round((time.monotonic() - started_at) * 1000),
+                    active_upload_count(),
+                )
+                return _json_error(str(exc), 400)
+
+        if request_content_type != "application/json":
+            return _json_error("Content-Type must be application/json or multipart/form-data", 415)
+
         try:
             project = _load_project_from_request(request)
         except FileNotFoundError as e:
@@ -6228,6 +6719,94 @@ if routes is not None:
 
     @routes.post("/sonder-editor/project/{project_id}/assets/{asset_id}/replace")
     async def api_replace_asset(request: web.Request) -> web.Response:
+        request_content_type = getattr(request, "content_type", "application/json")
+        if request_content_type == "multipart/form-data":
+            try:
+                initial_project = await asyncio.to_thread(_load_project_from_request, request, repair_missing_frames=False)
+            except FileNotFoundError as e:
+                return _json_error(str(e), 404)
+            asset_id = request.match_info["asset_id"]
+            initial_asset = initial_project.get_asset(asset_id)
+            if not initial_asset:
+                return _json_error(f"Asset not found: {asset_id}", 404)
+            try:
+                initial_abs_path = await asyncio.to_thread(
+                    _require_asset_media_source,
+                    initial_project,
+                    initial_asset,
+                    operation="Asset replace",
+                )
+                initial_signature = await asyncio.to_thread(_media_probe_signature, initial_abs_path)
+            except (FileNotFoundError, ValueError) as exc:
+                return _json_error(str(exc), 400)
+            started_at = time.monotonic()
+            try:
+                async with receive_project_upload(
+                    request,
+                    os.path.dirname(initial_abs_path),
+                    allowed_text_fields=set(),
+                ) as upload:
+                    committed_project, committed_asset = await asyncio.to_thread(
+                        _streamed_replace_commit,
+                        initial_project.project_dir,
+                        asset_id,
+                        initial_asset.asset_type,
+                        initial_asset.path,
+                        initial_signature,
+                        upload.path,
+                        upload.filename,
+                    )
+                    await asyncio.to_thread(
+                        _delete_asset_cache_files_locked,
+                        committed_project,
+                        committed_asset,
+                    )
+                    await asyncio.to_thread(
+                        _regenerate_thumbnail_if_current,
+                        committed_project.project_dir,
+                        committed_asset.asset_id,
+                        committed_asset.media_probe_signature,
+                    )
+                    payload = await asyncio.to_thread(
+                        lambda: {
+                            "asset": _asset_payload(committed_project, committed_asset),
+                            "usage": _find_asset_usages(committed_project, committed_asset),
+                        }
+                    )
+                    logger.info(
+                        "Streamed asset replacement completed bytes=%s duration_ms=%s active=%s",
+                        upload.size,
+                        round((time.monotonic() - started_at) * 1000),
+                        active_upload_count(),
+                    )
+                    return web.json_response(payload)
+            except UploadRequestError as exc:
+                logger.info(
+                    "Streamed asset replacement rejected status=%s duration_ms=%s active=%s",
+                    exc.status,
+                    round((time.monotonic() - started_at) * 1000),
+                    active_upload_count(),
+                )
+                return _json_error(exc.message, exc.status)
+            except _StreamedAssetChanged as exc:
+                logger.info(
+                    "Streamed asset replacement conflicted duration_ms=%s active=%s",
+                    round((time.monotonic() - started_at) * 1000),
+                    active_upload_count(),
+                )
+                return _json_error(str(exc), 409)
+            except (ValueError, MediaProbeError) as exc:
+                logger.info(
+                    "Streamed asset replacement validation failed error_type=%s duration_ms=%s active=%s",
+                    type(exc).__name__,
+                    round((time.monotonic() - started_at) * 1000),
+                    active_upload_count(),
+                )
+                return _json_error(str(exc), 400)
+
+        if request_content_type != "application/json":
+            return _json_error("Content-Type must be application/json or multipart/form-data", 415)
+
         try:
             project = _load_project_from_request(request)
         except FileNotFoundError as e:
@@ -6295,8 +6874,14 @@ if routes is not None:
             return _json_error("Thumbnail unavailable for missing asset", 404)
         # Cache-miss generation calls ffmpeg synchronously; run off the event
         # loop so heartbeats and the sweeper keep firing.
-        ok = await asyncio.to_thread(ensure_thumbnail, asset.asset_type, source_path, thumb_path)
-        if not ok:
+        expected_signature = await asyncio.to_thread(_media_probe_signature, source_path)
+        await asyncio.to_thread(
+            _regenerate_thumbnail_if_current,
+            project.project_dir,
+            asset.asset_id,
+            expected_signature,
+        )
+        if not os.path.isfile(thumb_path):
             return _json_error("Failed to generate thumbnail", 500)
 
         return _cached_asset_file_response(thumb_path)
@@ -6339,15 +6924,8 @@ if routes is not None:
 
         # Generate if not cached. ffmpeg call must stay off the event loop.
         if not os.path.isfile(strip_path):
-            source_path = _asset_abspath(project, asset)
-            if not source_path or not os.path.isfile(source_path):
-                return _json_error("Thumbnail strip unavailable for missing asset", 404)
-            info = await asyncio.to_thread(generate_thumbnail_strip, source_path, strip_path)
-            if info:
-                import json as _json
-                with open(info_path, "w") as f:
-                    _json.dump(info, f)
-            else:
+            ok = await asyncio.to_thread(_generate_strip_if_current, project.project_dir, asset.asset_id)
+            if not ok:
                 return _json_error("Failed to generate thumbnail strip", 500)
 
         # Return info JSON or image
@@ -6394,21 +6972,8 @@ if routes is not None:
 
         # Generate if not cached. ffmpeg calls must stay off the event loop.
         if not os.path.isfile(waveform_path):
-            source_path = _asset_abspath(project, asset)
-            if not source_path or not os.path.isfile(source_path):
-                return _json_error("Waveform unavailable for missing asset", 404)
-            waveform_source = source_path
-            extracted_audio_path = _asset_cache_file(project, asset, "waveforms", f"{cache_key}_audio.wav")
-            if asset.asset_type == "video":
-                if not extracted_audio_path:
-                    return _json_error("Failed to extract video audio for waveform", 500)
-                if not os.path.isfile(extracted_audio_path):
-                    ok = await asyncio.to_thread(_extract_audio_from_video, source_path, extracted_audio_path)
-                    if not ok:
-                        return _json_error("Failed to extract video audio for waveform", 500)
-                waveform_source = extracted_audio_path
-            data = await asyncio.to_thread(generate_waveform_data, waveform_source, waveform_path)
-            if not data:
+            ok = await asyncio.to_thread(_generate_waveform_if_current, project.project_dir, asset.asset_id)
+            if not ok:
                 return _json_error("Failed to generate waveform data", 500)
 
         return _cached_asset_file_response(waveform_path, content_type="application/json")
