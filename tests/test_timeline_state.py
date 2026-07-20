@@ -348,119 +348,6 @@ def test_scene_fixed_track_config_roundtrip_and_defaults():
     assert legacy.prompt_track_config.hidden is False
 
 
-def test_scene_content_hash_changes_when_clip_role_changes_render_visibility():
-    base_clip = ClipReference(
-        source_path="media/clip.mp4",
-        timeline_start_frame=0,
-        timeline_end_frame=10,
-        source_in_frame=0,
-        opacity=1.0,
-        track_index=0,
-    )
-    render_scene = Scene(name="Render")
-    render_scene.clips = [base_clip]
-
-    driver_scene = Scene(name="Render")
-    driver_scene.clips = [ClipReference.from_dict({**base_clip.to_dict(), "role": "motion_driver"})]
-
-    assert render_scene.content_hash() != driver_scene.content_hash()
-
-
-def test_scene_content_hash_ignores_driver_only_state():
-    driver_clip = ClipReference(
-        source_path="media/driver.mp4",
-        timeline_start_frame=0,
-        timeline_end_frame=10,
-        role="motion_driver",
-        strength=0.25,
-        muted=False,
-    )
-    base_scene = Scene(name="Render", motion_driver_lane_count=1)
-    base_scene.clips = [driver_clip]
-    base_scene.motion_driver_lane_configs = [LaneConfig(hidden=False, name="Driver 1")]
-    base_hash = base_scene.content_hash()
-
-    changed_scene = Scene(name="Render", motion_driver_lane_count=1)
-    changed_scene.clips = [
-        ClipReference.from_dict({
-            **driver_clip.to_dict(),
-            "strength": 0.9,
-            "muted": True,
-        }),
-    ]
-    changed_scene.motion_driver_lane_configs = [LaneConfig(hidden=True, name="Renamed Driver")]
-
-    assert changed_scene.content_hash() == base_hash
-
-
-def test_scene_content_hash_changes_with_clip_and_guide_mute_state():
-    clip = ClipReference(
-        source_path="media/clip.mp4",
-        timeline_start_frame=0,
-        timeline_end_frame=10,
-    )
-    base_scene = Scene(name="Render")
-    base_scene.clips = [clip]
-    base_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
-
-    muted_clip_scene = Scene(name="Render")
-    muted_clip_scene.clips = [ClipReference.from_dict({**clip.to_dict(), "muted": True})]
-    muted_clip_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
-
-    muted_guide_scene = Scene(name="Render")
-    muted_guide_scene.clips = [ClipReference.from_dict(clip.to_dict())]
-    muted_guide_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a", muted=True)]
-
-    assert base_scene.content_hash() != muted_clip_scene.content_hash()
-    assert base_scene.content_hash() != muted_guide_scene.content_hash()
-
-    hidden_guides_scene = Scene(name="Render")
-    hidden_guides_scene.clips = [ClipReference.from_dict(clip.to_dict())]
-    hidden_guides_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
-    hidden_guides_scene.guide_track_config = LaneConfig(hidden=True)
-
-    assert base_scene.content_hash() != hidden_guides_scene.content_hash()
-
-
-def test_scene_content_hash_changes_with_fit_mode_and_crop_position():
-    clip = ClipReference(source_path="media/clip.mp4", timeline_start_frame=0, timeline_end_frame=10)
-    base_scene = Scene(name="Render")
-    base_scene.clips = [clip]
-    base_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
-
-    clip_fit_scene = Scene(name="Render")
-    clip_fit_scene.clips = [ClipReference.from_dict({**clip.to_dict(), "fit_mode": "cover"})]
-    clip_fit_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
-
-    clip_crop_scene = Scene(name="Render")
-    clip_crop_scene.clips = [ClipReference.from_dict({**clip.to_dict(), "fit_mode": "cover", "crop_position": "top"})]
-    clip_crop_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a")]
-
-    guide_fit_scene = Scene(name="Render")
-    guide_fit_scene.clips = [ClipReference.from_dict(clip.to_dict())]
-    guide_fit_scene.guide_frames = [GuideFrame(frame_index=0, asset_id="guide-a", fit_mode="stretch")]
-
-    assert base_scene.content_hash() != clip_fit_scene.content_hash()
-    assert clip_fit_scene.content_hash() != clip_crop_scene.content_hash()
-    assert base_scene.content_hash() != guide_fit_scene.content_hash()
-
-
-def test_scene_content_hash_stable_for_legacy_fit_default():
-    # A scene whose stored clip/guide dicts predate the fit fields must hash the
-    # same as one explicitly carrying the default constants (no spurious cache bust
-    # between a freshly-saved default item and a legacy one).
-    clip_legacy = ClipReference.from_dict({"source_path": "media/clip.mp4",
-                                           "timeline_start_frame": 0, "timeline_end_frame": 10})
-    clip_explicit = ClipReference.from_dict({"source_path": "media/clip.mp4",
-                                             "timeline_start_frame": 0, "timeline_end_frame": 10,
-                                             "fit_mode": "pad_edge", "crop_position": "center"})
-    legacy_scene = Scene(name="Render")
-    legacy_scene.clips = [clip_legacy]
-    explicit_scene = Scene(name="Render")
-    explicit_scene.clips = [clip_explicit]
-    assert legacy_scene.content_hash() == explicit_scene.content_hash()
-
-
 # --- ClipReference ---
 
 def test_clip_reference_roundtrip():
@@ -960,19 +847,6 @@ def test_scene_no_prompt_sections_uses_fallback():
     scene = Scene(prompt="the only prompt", prompt_sections=[])
     assert scene.get_prompt_at_frame(0) == "the only prompt"
     assert scene.get_prompt_for_range(0, 100) == "the only prompt"
-
-
-def test_content_hash_excludes_prompt_state():
-    # Prompts never affect rendered_frames (slot 9 is a sibling output), so
-    # prompt fields stay OUT of the render-cache hash — including the new
-    # channel + global-lane state.
-    scene = Scene(prompt="one", duration_frames=100)
-    base = scene.content_hash()
-    scene.prompt = "completely different"
-    scene.prompt_sections = [PromptSection(0, 50, channels={"visual": "x", "speech": "y", "sounds": ""})]
-    scene.prompt_track_config = LaneConfig(hidden=True)
-    scene.global_prompt_track_config = LaneConfig(hidden=True)
-    assert scene.content_hash() == base
 
 
 def test_generation_job_scene_prompt_roundtrip():

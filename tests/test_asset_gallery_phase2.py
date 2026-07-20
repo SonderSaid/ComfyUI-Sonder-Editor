@@ -1222,19 +1222,34 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
         handle.write(b"old")
     with open(new_path, "wb") as handle:
         handle.write(b"newer")
+    store_token = f"rc3_{'a' * 32}.cache"
+    store_path = os.path.join(cache_dir, store_token)
+    os.makedirs(store_path)
+    with open(os.path.join(store_path, "block_00000000.pt"), "wb") as handle:
+        handle.write(b"block")
     with open(os.path.join(cache_dir, "not-render.txt"), "wb") as handle:
         handle.write(b"ignore")
     os.utime(old_path, (100, 100))
     os.utime(new_path, (200, 200))
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    threaded_calls = []
+
+    async def tracked_to_thread(function, *args, **kwargs):
+        threaded_calls.append(function)
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(module.asyncio, "to_thread", tracked_to_thread)
 
     response = asyncio.run(module.api_list_render_cache(DummyRequest(match_info={"project_id": "phase-2"})))
     payload = _response_json(response)
 
     assert response.status == 200
-    assert [entry["filename"] for entry in payload] == ["scene-old.pt", "scene-new.pt"]
+    assert [entry["filename"] for entry in payload[:2]] == ["scene-old.pt", "scene-new.pt"]
+    assert payload[2]["filename"] == store_token
+    assert payload[2]["size_bytes"] == 5
     assert payload[0]["size_bytes"] == 3
+    assert threaded_calls[-2:] == [module._load_project_from_request, module._list_render_cache_entries]
 
     delete_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
         match_info={"project_id": "phase-2", "filename": "scene-old.pt"},
@@ -1242,6 +1257,13 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
     assert delete_response.status == 200
     assert not os.path.exists(old_path)
     assert os.path.exists(new_path)
+    assert threaded_calls[-2:] == [module._load_project_from_request, module.delete_render_cache_entry]
+
+    store_delete_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
+        match_info={"project_id": "phase-2", "filename": store_token},
+    )))
+    assert store_delete_response.status == 200
+    assert not os.path.exists(store_path)
 
     missing_response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
         match_info={"project_id": "phase-2", "filename": "missing.pt"},

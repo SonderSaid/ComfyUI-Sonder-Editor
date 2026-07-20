@@ -486,6 +486,30 @@ def test_execute_expands_pre_context_to_align_mask_with_ltx_boundary(tmp_path, m
     assert project._execution_context["mask_end_frame"] == 169
 
 
+def test_execute_logs_requested_and_effective_render_cache_flag(tmp_path, monkeypatch, caplog):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(tmp_path)
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    _patch_render_and_audio(editor_node, monkeypatch)
+    caplog.set_level("INFO", logger="sonder_editor")
+
+    editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=768,
+        height=512,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=1,
+        render_cache_enabled="true",
+        render_queue_active=False,
+    )
+
+    assert "render_cache_requested='true'" in caplog.text
+    assert "render_cache_enabled=True" in caplog.text
+
+
 def test_execute_expands_both_sides_for_ltx_alignment(tmp_path, monkeypatch):
     # Exercises pre- AND post-side context expansion in the same render. With pre=8,
     # post=5, mask_pre=0, mask_post=0 on LTX 8n+1: actual_pre grows 8 -> 9
@@ -2811,13 +2835,13 @@ def test_preview_muxes_audio_into_player(tmp_path, monkeypatch):
     assert result["ui"]["sonder_video"][0]["has_audio"] is True
 
 
-def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):
+def test_render_scene_frames_ignores_legacy_monolithic_cache(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
 
     cache_dir = tmp_path / "cache" / "renders"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # Filename carries the render-cache decode-pipeline salt (_cm2); pre-salt
-    # caches are simply never read again.
+    # Legacy monolithic cache files remain visible to retention but are never
+    # accepted by the block renderer.
     cache_path = cache_dir / "scene-1_hash_cm2.pt"
     cache_path.write_bytes(b"corrupt")
 
@@ -2828,15 +2852,11 @@ def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):
         video_lane_configs = []
         clips = []
 
-        @staticmethod
-        def content_hash(render_start, render_end, resolution):
-            return "hash"
-
     project = types.SimpleNamespace(project_dir=str(tmp_path), resolution=(8, 6))
     removed = []
 
     def fail_load(*args, **kwargs):
-        raise RuntimeError("corrupt cache")
+        raise AssertionError("legacy monolithic cache must not be loaded")
 
     monkeypatch.setattr(editor_node.torch, "load", fail_load)
     monkeypatch.setattr(editor_node.os, "remove", lambda path: removed.append(path))
@@ -2844,7 +2864,8 @@ def test_render_scene_frames_deletes_corrupt_cache(tmp_path, monkeypatch):
     node = editor_node.SonderEditor()
     result = node._render_scene_frames(project, DummyScene(), 0, 4)
 
-    assert str(cache_path) in removed
+    assert str(cache_path) not in removed
+    assert cache_path.exists()
     assert tuple(result.shape) == (4, 6, 8, 3)
 
 

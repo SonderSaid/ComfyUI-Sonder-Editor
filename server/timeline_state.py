@@ -511,35 +511,6 @@ class Scene:
             return 0
         return max(c.timeline_end_frame for c in self.clips)
 
-    def content_hash(self, selection_start: int = 0, selection_end: int = 0,
-                     resolution: tuple = (1280, 720)) -> str:
-        """Deterministic hash of all state that affects rendered output."""
-        import hashlib
-        import json
-        render_clips = [c for c in self.clips if getattr(c, "role", "render") in ("", "render")]
-        data = {
-            "clips": [(c.source_path, c.timeline_start_frame, c.timeline_end_frame,
-                        c.source_in_frame, c.opacity, c.track_index,
-                        getattr(c, "role", "render"), getattr(c, "muted", False),
-                        getattr(c, "fit_mode", "pad_edge"), getattr(c, "crop_position", "center"))
-                       for c in render_clips],
-            "guides": [(g.frame_index, g.asset_id, g.source,
-                        getattr(g, "strength", 1.0), getattr(g, "muted", False),
-                        getattr(g, "fit_mode", "pad_edge"), getattr(g, "crop_position", "center"))
-                       for g in self.guide_frames],
-            "audio": [(a.source_path, a.timeline_start_frame, a.timeline_end_frame,
-                        a.source_in_frame, a.volume, a.muted, a.lane_index)
-                       for a in self.audio_tracks],
-            "hidden_video": [i for i, c in enumerate(self.video_lane_configs) if c.hidden],
-            "hidden_audio": [i for i, c in enumerate(self.audio_lane_configs) if c.hidden],
-            "hidden_guides": bool(getattr(self.guide_track_config, "hidden", False)),
-            "sel": (selection_start, selection_end),
-            "res": resolution,
-            "scene_res": (self.width, self.height),
-            "scene_fps": self.fps,
-        }
-        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
-
     def get_prompt_at_frame(self, frame: int, labels_on: bool = True,
                             delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER,
                             boundary_threshold_pct: float = 0.0) -> str:

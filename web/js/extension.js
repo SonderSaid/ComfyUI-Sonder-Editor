@@ -26,6 +26,7 @@ import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_the
 import { mountToastStack } from "./editor_toast_stack.js";
 import { notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
 import { mountNodeVideoPreview, unmountNodeVideoPreview } from "./node_video_preview.js";
+import { applyRenderCacheSettingToNode, applyRenderCacheSettingToNodes } from "./render_cache_activation.js";
 
 injectSonderFontFaces();
 
@@ -576,6 +577,14 @@ function getActiveEditorNodes() {
     );
 }
 
+function getAllEditorNodes() {
+    return (app.graph?._nodes || app.graph?.nodes || []).filter((node) => node?.type === "SonderEditor");
+}
+
+function syncRenderCacheSettingToCanvas(settings = getEditorSettings()) {
+    return applyRenderCacheSettingToNodes(getAllEditorNodes(), settings);
+}
+
 function isSonderKeyboardDebugEnabled() {
     try {
         return window.__SONDER_KEYBOARD_DEBUG__ === true
@@ -1017,6 +1026,7 @@ app.registerExtension({
                 origOnNodeCreated?.apply(this, arguments);
 
                 const node = this;
+                applyRenderCacheSettingToNode(node, getEditorSettings());
                 const projectWidget = node.widgets.find((widget) => widget.name === "project");
                 const creationWidgetNames = ["project_name", "fps", "width", "height"];
                 const hiddenWidgetNames = [
@@ -1059,8 +1069,10 @@ app.registerExtension({
                             Number(info.size[1]) || 0,
                         ];
                     }
+                    const result = origNodeOnConfigure?.apply(this, arguments);
+                    applyRenderCacheSettingToNode(node, getEditorSettings());
                     window.setTimeout?.(() => node._sonderRunUpdateVisibility?.(), 0);
-                    return origNodeOnConfigure?.apply(this, arguments);
+                    return result;
                 };
 
                 const editorDOMWidget = node.addDOMWidget("sonder_editor_ui", "SonderEditorWidget", controller.getElement(), {
@@ -1358,9 +1370,14 @@ app.registerExtension({
         if (!document.querySelector("[data-sonder-toast-stack]")) {
             mountToastStack(document.body);
         }
-        // Push browser-local toast durations into the Core, and keep them synced.
+        // Push browser-local settings into their canvas-owned consumers. Cache
+        // activation is a direct serialized-widget mirror, never session relay.
         configureNotifications(notificationCoreConfig());
-        subscribeEditorSettings(() => configureNotifications(notificationCoreConfig()));
+        syncRenderCacheSettingToCanvas();
+        subscribeEditorSettings((settings) => {
+            configureNotifications(notificationCoreConfig(settings));
+            syncRenderCacheSettingToCanvas(settings);
+        });
         if (typeof api.addEventListener === "function") {
             api.addEventListener("status", (event) => {
                 const remaining = Number(event?.detail?.exec_info?.queue_remaining);

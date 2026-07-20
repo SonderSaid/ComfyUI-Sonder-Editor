@@ -1207,7 +1207,7 @@ function showSettingsPanel() {
         renderSection,
         "maxRenderCacheEntries",
         "Render Cache Entries",
-        "Off prevents new timeline preview render-cache writes. Higher keep counts retain more project-local tensors; cleanup runs when the editor opens or this cap changes.",
+        "Off prevents new timeline preview render-cache writes. Higher keep counts retain more project-local block stores; cleanup runs when the editor opens or this cap changes.",
         {
             options: RENDER_CACHE_ENTRY_PRESETS,
             min: 0,

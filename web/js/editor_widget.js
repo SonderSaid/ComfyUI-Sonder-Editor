@@ -4889,7 +4889,6 @@ export class EditorWidget {
         this._setWidgetValue("take_placement_muted", !!settings?.render?.takePlacementMuted);
         this._setWidgetValue("take_fit_mode", fitMode);
         this._setWidgetValue("take_crop_position", cropPosition);
-        this._setWidgetValue("render_cache_enabled", this._renderCacheEntryLimit(settings) !== 0);
     }
 
     _trackCollapseSceneKey(scene = this.activeScene) {

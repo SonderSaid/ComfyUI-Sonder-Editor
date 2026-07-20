@@ -1317,6 +1317,13 @@ export function getEditorSettings() {
     return clone(currentSettings);
 }
 
+export function isRenderCacheEnabled(settings = currentSettings) {
+    const value = settings?.render?.maxRenderCacheEntries;
+    if (value === null) return true;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0;
+}
+
 // Maps browser-local notification settings to the editor_notifications Core
 // config shape (ms; 0 = sticky). `toastDurationMs` drives info/success;
 // `errorToastDurationMs` drives warning/error (0 = stay until dismissed).

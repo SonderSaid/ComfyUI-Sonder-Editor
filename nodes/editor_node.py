@@ -583,6 +583,7 @@ class SonderEditor:
                 take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
+        render_cache_requested = render_cache_enabled
         selection_start = max(0, _coerce_int(selection_start, 0))
         selection_end = max(0, _coerce_int(selection_end, 0))
         pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
@@ -649,12 +650,16 @@ class SonderEditor:
                 mask_pre_offset = max(0, _coerce_int(getattr(queue_job, "mask_pre_offset", 0), 0))
                 mask_post_offset = max(0, _coerce_int(getattr(queue_job, "mask_post_offset", 0), 0))
             logger.info(
-                "execute begin: scene_id=%s selection=%d-%d terminal_save=%s unmarked_save=%s render_queue_active=%s queue_length=%d queue_job_mode=%s queue_job_id=%s snapshot_range=%s-%s",
+                "execute begin: scene_id=%s selection=%d-%d terminal_save=%s unmarked_save=%s "
+                "render_cache_requested=%r render_cache_enabled=%s render_queue_active=%s "
+                "queue_length=%d queue_job_mode=%s queue_job_id=%s snapshot_range=%s-%s",
                 scene_id or "",
                 selection_start,
                 selection_end,
                 terminal_save_reached,
                 unmarked_save_reached,
+                render_cache_requested,
+                render_cache_enabled,
                 render_queue_active,
                 queue_length,
                 queue_job_mode,

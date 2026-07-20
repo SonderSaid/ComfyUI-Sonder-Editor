@@ -47,6 +47,11 @@ from .path_security import (
     sanitize_filename_component,
 )
 from .atomic_io import atomic_replace
+from .render_cache import (
+    RenderCacheError,
+    delete_render_cache_entry,
+    list_render_cache_entries,
+)
 from .upload_streaming import (
     UPLOAD_STAGING_DIRNAME,
     UploadRequestError,
@@ -4718,53 +4723,8 @@ def _purge_expired_trashed_assets(
     return changed
 
 
-def _render_cache_dir(project: TimelineProject) -> str:
-    return resolve_project_path(project, os.path.join("cache", "renders"), purpose="render cache root")
-
-
-def _resolve_render_cache_file(project: TimelineProject, filename: str) -> str:
-    filename = str(filename or "").strip()
-    if (
-        not filename
-        or "/" in filename
-        or "\\" in filename
-        or filename in {".", ".."}
-        or not filename.endswith(".pt")
-    ):
-        raise ValueError("Invalid render cache filename")
-    target_path = resolve_project_path(
-        project,
-        os.path.join("cache", "renders", filename),
-        purpose="render cache file",
-    )
-    if not target_path:
-        raise ValueError("Invalid render cache filename")
-    return target_path
-
-
 def _list_render_cache_entries(project: TimelineProject) -> list[dict]:
-    cache_dir = _render_cache_dir(project)
-    if not cache_dir or not os.path.isdir(cache_dir):
-        return []
-
-    entries = []
-    with os.scandir(cache_dir) as scan:
-        for entry in scan:
-            try:
-                if entry.is_symlink() or not entry.name.endswith(".pt") or not entry.is_file(follow_symlinks=False):
-                    continue
-                if not _path_within(cache_dir, entry.path):
-                    continue
-                stat = entry.stat(follow_symlinks=False)
-            except OSError:
-                continue
-            entries.append({
-                "filename": entry.name,
-                "mtime": stat.st_mtime,
-                "size_bytes": stat.st_size,
-            })
-    entries.sort(key=lambda item: (item["mtime"], item["filename"]))
-    return entries
+    return list_render_cache_entries(project)
 
 
 def _trash_project_asset_folder(project: TimelineProject, folder: str) -> tuple[list[str], list[Asset]]:
@@ -5819,42 +5779,44 @@ if routes is not None:
     @routes.get("/sonder-editor/project/{project_id}/cache/renders")
     async def api_list_render_cache(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        return web.json_response(_list_render_cache_entries(project))
+        try:
+            entries = await asyncio.to_thread(_list_render_cache_entries, project)
+        except RenderCacheError as e:
+            return _json_error(str(e), 400)
+        except OSError as e:
+            logger.warning("Failed to list render cache entries: %s", e)
+            return _json_error("Failed to list render cache entries", 500)
+        return web.json_response(entries)
 
     @routes.delete("/sonder-editor/project/{project_id}/cache/renders/{filename}")
     async def api_delete_render_cache_entry(request: web.Request) -> web.Response:
         try:
-            project = _load_project_from_request(request)
+            project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
         try:
-            cache_path = _resolve_render_cache_file(project, request.match_info.get("filename", ""))
-        except ValueError as e:
-            return _json_error(str(e), 400)
-
-        if not os.path.isfile(cache_path):
-            return _json_error("Render cache file not found", 404)
-
-        try:
-            os.remove(cache_path)
+            payload = await asyncio.to_thread(
+                delete_render_cache_entry,
+                project,
+                request.match_info.get("filename", ""),
+            )
         except FileNotFoundError:
-            return _json_error("Render cache file not found", 404)
+            return _json_error("Render cache entry not found", 404)
+        except RenderCacheError as e:
+            return _json_error(str(e), 400)
         except PermissionError:
-            logger.warning("Permission denied deleting render cache file: %s", cache_path)
-            return _json_error("Render cache file is locked", 409)
+            logger.warning("Permission denied deleting render cache entry")
+            return _json_error("Render cache entry is locked", 409)
         except OSError as e:
-            logger.warning("Failed to delete render cache file %s: %s", cache_path, e)
-            return _json_error("Failed to delete render cache file", 500)
+            logger.warning("Failed to delete render cache entry: %s", e)
+            return _json_error("Failed to delete render cache entry", 500)
 
-        return web.json_response({
-            "deleted": True,
-            "filename": os.path.basename(cache_path),
-        })
+        return web.json_response(payload)
 
     # -----------------------------------------------------------------------
     # Asset management
