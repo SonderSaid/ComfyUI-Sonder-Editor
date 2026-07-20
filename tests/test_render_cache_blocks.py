@@ -13,9 +13,13 @@ from server.render_cache import (
     CACHE_FORMAT_VERSION,
     CACHE_PIPELINE_VERSION,
     RenderCacheError,
+    RenderCacheActiveError,
+    active_cache_store,
+    active_store_tokens,
     block_frame_count,
     cache_store,
     delete_render_cache_entry,
+    enforce_render_cache_budget,
     list_render_cache_entries,
     stage_block,
     discard_staged,
@@ -160,6 +164,62 @@ def test_cached_and_uncached_outputs_are_exact_for_all_uint8_values(tmp_path):
     )
     assert torch.equal(second, uncached)
     assert second_calls == []
+
+
+def test_renderer_enforces_budget_after_publication_while_store_is_active(tmp_path, monkeypatch):
+    project, scene, _path = _project_scene(tmp_path, duration=32)
+    observed = []
+    real_enforce = timeline_renderer.enforce_render_cache_budget
+
+    def tracked_enforce(project_arg, budget, *, protected_tokens=()):
+        store = cache_store(project_arg, scene.scene_id, 1, 1, 24.0)
+        observed.append((budget, set(protected_tokens), active_store_tokens(store.root)))
+        return real_enforce(project_arg, budget, protected_tokens=protected_tokens)
+
+    monkeypatch.setattr(timeline_renderer, "enforce_render_cache_budget", tracked_enforce)
+    render_scene_frames(
+        project,
+        scene,
+        0,
+        32,
+        cache_max_bytes=1,
+        video_capture_factory=_capture_factory([]),
+    )
+
+    store = cache_store(project, scene.scene_id, 1, 1, 24.0)
+    assert observed == [(1, {store.token}, {store.token})]
+    assert os.path.isdir(store.path)
+
+
+def test_warm_cache_hit_does_not_start_retention_sweep(tmp_path, monkeypatch):
+    project, scene, _path = _project_scene(tmp_path, duration=32)
+    render_scene_frames(
+        project,
+        scene,
+        0,
+        32,
+        cache_max_bytes=1,
+        video_capture_factory=_capture_factory([]),
+    )
+    monkeypatch.setattr(
+        timeline_renderer,
+        "enforce_render_cache_budget",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("warm cache hits do not start retention sweeps")
+        ),
+    )
+
+    calls = []
+    render_scene_frames(
+        project,
+        scene,
+        0,
+        32,
+        cache_max_bytes=1,
+        video_capture_factory=_capture_factory(calls),
+    )
+
+    assert calls == []
 
 
 def test_muted_take_writes_nothing_and_visible_tail_rewrites_only_intersecting_blocks(tmp_path):
@@ -499,9 +559,14 @@ def test_source_access_failures_return_fallback_without_cache_commit(tmp_path, f
     assert _block_digests(store.path) == {}
 
 
-def test_late_cancellation_publishes_no_blocks_or_temps(tmp_path):
+def test_late_cancellation_publishes_no_blocks_or_temps(tmp_path, monkeypatch):
     project, scene, _path = _project_scene(tmp_path, duration=64)
     cancel_event = threading.Event()
+    monkeypatch.setattr(
+        timeline_renderer,
+        "enforce_render_cache_budget",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cancelled renders do not sweep")),
+    )
     with pytest.raises(TimelineRenderCancelled):
         render_scene_frames(
             project, scene, 0, 64,
@@ -543,6 +608,11 @@ def test_any_staging_failure_suppresses_the_whole_request_publication(tmp_path, 
         return real_stage(*args, **kwargs)
 
     monkeypatch.setattr(timeline_renderer, "stage_block", fail_second_block)
+    monkeypatch.setattr(
+        timeline_renderer,
+        "enforce_render_cache_budget",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed staging does not sweep")),
+    )
     result = render_scene_frames(project, scene, 0, 64, video_capture_factory=_capture_factory([]))
     assert tuple(result.shape) == (64, 1, 1, 3)
     root = tmp_path / "project" / "cache" / "renders"
@@ -673,6 +743,111 @@ def test_store_listing_and_flat_safe_deletion(tmp_path):
     assert not os.path.exists(store.path)
 
 
+def test_byte_budget_evicts_oldest_whole_entries_at_exact_boundaries(tmp_path):
+    project, scene, _path = _project_scene(tmp_path)
+    root = render_cache.render_cache_root(project, create=True)
+    oldest = os.path.join(root, "oldest.pt")
+    newest = os.path.join(root, "newest.pt")
+    with open(oldest, "wb") as handle:
+        handle.write(b"a" * 3)
+    store = cache_store(project, scene.scene_id, 1, 1, 24.0)
+    os.makedirs(store.path)
+    block_path = os.path.join(store.path, "block_00000000.pt")
+    with open(block_path, "wb") as handle:
+        handle.write(b"b" * 5)
+    with open(newest, "wb") as handle:
+        handle.write(b"c" * 7)
+    os.utime(oldest, (100, 100))
+    os.utime(store.path, (200, 200))
+    os.utime(block_path, (200, 200))
+    os.utime(newest, (300, 300))
+
+    exact = enforce_render_cache_budget(project, 12)
+    assert exact["deleted"] == ["oldest.pt"]
+    assert exact["deleted_bytes"] == 3
+    assert exact["size_bytes"] == 12
+    assert exact["over_budget_bytes"] == 0
+    assert os.path.isdir(store.path)
+
+    smaller = enforce_render_cache_budget(project, 7)
+    assert smaller["deleted"] == [store.token]
+    assert smaller["size_bytes"] == 7
+    assert os.path.isfile(newest)
+
+
+def test_unlimited_budget_reports_usage_without_deleting_and_invalid_budgets_fail(tmp_path):
+    project, _scene, _path = _project_scene(tmp_path)
+    root = render_cache.render_cache_root(project, create=True)
+    legacy = os.path.join(root, "legacy.pt")
+    with open(legacy, "wb") as handle:
+        handle.write(b"cache")
+
+    result = enforce_render_cache_budget(project, None)
+    assert result["entry_count"] == 1
+    assert result["size_bytes"] == 5
+    assert result["deleted"] == []
+    assert result["pending"] is False
+    assert os.path.isfile(legacy)
+
+    for invalid in [True, -1, "bad", 1.5]:
+        with pytest.raises(RenderCacheError):
+            enforce_render_cache_budget(project, invalid)
+
+
+def test_active_store_is_protected_from_sweeps_and_explicit_deletion(tmp_path):
+    project, scene, _path = _project_scene(tmp_path)
+    root = render_cache.render_cache_root(project, create=True)
+    legacy = os.path.join(root, "old.pt")
+    with open(legacy, "wb") as handle:
+        handle.write(b"old")
+    store = cache_store(project, scene.scene_id, 1, 1, 24.0)
+    os.makedirs(store.path)
+    with open(os.path.join(store.path, "block_00000000.pt"), "wb") as handle:
+        handle.write(b"active")
+    os.utime(legacy, (100, 100))
+
+    with active_cache_store(store):
+        assert active_store_tokens(root) == {store.token}
+        result = enforce_render_cache_budget(project, 0)
+        assert result["deleted"] == ["old.pt"]
+        assert result["protected"] == [store.token]
+        assert result["over_budget_bytes"] == 6
+        assert result["pending"] is True
+        with pytest.raises(RenderCacheActiveError):
+            delete_render_cache_entry(project, store.token)
+        assert os.path.isdir(store.path)
+
+    assert active_store_tokens(root) == set()
+    cleared = enforce_render_cache_budget(project, 0)
+    assert cleared["deleted"] == [store.token]
+    assert cleared["size_bytes"] == 0
+    assert cleared["pending"] is False
+
+
+def test_concurrent_sweeps_serialize_and_preserve_active_store(tmp_path):
+    project, scene, _path = _project_scene(tmp_path)
+    store = cache_store(project, scene.scene_id, 1, 1, 24.0)
+    os.makedirs(store.path)
+    with open(os.path.join(store.path, "block_00000000.pt"), "wb") as handle:
+        handle.write(b"active")
+    results = []
+
+    with active_cache_store(store):
+        threads = [
+            threading.Thread(target=lambda: results.append(enforce_render_cache_budget(project, 0)))
+            for _index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+    assert len(results) == 2
+    assert all(result["protected"] == [store.token] for result in results)
+    assert all(result["pending"] is True for result in results)
+    assert os.path.isdir(store.path)
+
+
 def test_cache_outcome_diagnostics_cover_disabled_ready_and_fallbacks(tmp_path, monkeypatch, caplog):
     project, scene, _path = _project_scene(tmp_path, duration=40)
     caplog.set_level("INFO", logger="sonder_editor")
@@ -745,6 +920,11 @@ def test_cache_publication_failure_is_diagnostic_and_returns_output(tmp_path, mo
         timeline_renderer,
         "publish_staged",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("publish denied")),
+    )
+    monkeypatch.setattr(
+        timeline_renderer,
+        "enforce_render_cache_budget",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed publication does not sweep")),
     )
     result = render_scene_frames(
         project, scene, 0, 8,

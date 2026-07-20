@@ -25,8 +25,10 @@ from .render_cache import (
     CACHE_FORMAT_VERSION,
     CACHE_PIPELINE_VERSION,
     RenderCacheError,
+    active_cache_store,
     cache_store,
     discard_staged,
+    enforce_render_cache_budget,
     load_block,
     prepare_store,
     publish_staged,
@@ -395,6 +397,7 @@ def render_scene_frames(
     cancel_event=None,
     video_capture_factory=None,
     use_cache: bool = True,
+    cache_max_bytes: int | None = None,
 ) -> torch.Tensor:
     """Composite visible render clips into an RGB float tensor for [start_frame, end_frame)."""
     _check_cancel(cancel_event)
@@ -417,10 +420,11 @@ def render_scene_frames(
 
     if not use_cache:
         logger.info(
-            "Render cache outcome=disabled scene=%s range=%d-%d",
+            "Render cache outcome=disabled scene=%s range=%d-%d budget=%s",
             getattr(scene, "scene_id", ""),
             render_start,
             render_end,
+            0,
         )
         frames = list(iter_scene_frames(
             project,
@@ -458,10 +462,13 @@ def render_scene_frames(
             use_cache=False,
         )
 
+    store_activity = active_cache_store(store)
+    store_activity.__enter__()
     scene_duration = max(render_end, int(getattr(scene, "duration_frames", 0) or 0))
     try:
         prepare_store(store, scene_duration)
     except Exception as exc:
+        store_activity.__exit__(None, None, None)
         logger.warning(
             "Render cache outcome=prepare_failed scene=%s root=%s store=%s "
             "block_frames=%d range=%d-%d reason=%s",
@@ -497,7 +504,7 @@ def render_scene_frames(
     request_id = uuid.uuid4().hex
     logger.info(
         "Render cache outcome=ready scene=%s root=%s store=%s block_frames=%d "
-        "range=%d-%d requested_blocks=%s",
+        "range=%d-%d requested_blocks=%s budget=%s",
         scene.scene_id,
         store.root,
         store.token,
@@ -505,6 +512,7 @@ def render_scene_frames(
         render_start,
         render_end,
         requested_block_indices,
+        "unlimited" if cache_max_bytes is None else cache_max_bytes,
     )
 
     def render_attempt(staged):
@@ -691,6 +699,39 @@ def render_scene_frames(
                 exc,
             )
         else:
+            retention = None
+            should_enforce_retention = published_count > 0 or bool(delete_indices)
+            if should_enforce_retention:
+                try:
+                    retention = enforce_render_cache_budget(
+                        project,
+                        cache_max_bytes,
+                        protected_tokens={store.token},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Render cache retention_failed scene=%s store=%s budget=%s reason=%s",
+                        scene.scene_id,
+                        store.token,
+                        "unlimited" if cache_max_bytes is None else cache_max_bytes,
+                        exc,
+                    )
+            if retention is not None:
+                logger.info(
+                    "Render cache retention_ready scene=%s store=%s budget=%s "
+                    "entries=%d size_bytes=%d deleted=%s deleted_bytes=%d protected=%s "
+                    "over_budget_bytes=%d pending=%s",
+                    scene.scene_id,
+                    store.token,
+                    "unlimited" if cache_max_bytes is None else cache_max_bytes,
+                    retention["entry_count"],
+                    retention["size_bytes"],
+                    retention["deleted"],
+                    retention["deleted_bytes"],
+                    retention["protected"],
+                    retention["over_budget_bytes"],
+                    retention["pending"],
+                )
             logger.info(
                 "Render cache outcome=ready scene=%s root=%s store=%s block_frames=%d "
                 "requested_blocks=%s hit_blocks=%s miss_blocks=%s staged=%d published=%d deletions=%s",
@@ -714,6 +755,7 @@ def render_scene_frames(
         raise
     finally:
         discard_staged(staged)
+        store_activity.__exit__(None, None, None)
 
 
 def _audio_contributors(

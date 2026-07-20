@@ -161,6 +161,8 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     assert project._execution_context["take_crop_position"] == "top"
     optional_fields = list(editor_node.SonderEditor.INPUT_TYPES()["optional"])
     assert optional_fields[-2:] == ["take_fit_mode", "take_crop_position"]
+    assert "render_cache_max_bytes" in optional_fields
+    assert "render_cache_enabled" not in optional_fields
 
 
 class _FrameConstraintScene:
@@ -200,7 +202,7 @@ def _patch_render_and_audio(editor_node, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end, use_cache=False: torch.ones(end - start, 4, 4, 3, dtype=torch.float32),
+        lambda self, proj, scene, start, end, use_cache=False, **_kwargs: torch.ones(end - start, 4, 4, 3, dtype=torch.float32),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -486,7 +488,7 @@ def test_execute_expands_pre_context_to_align_mask_with_ltx_boundary(tmp_path, m
     assert project._execution_context["mask_end_frame"] == 169
 
 
-def test_execute_logs_requested_and_effective_render_cache_flag(tmp_path, monkeypatch, caplog):
+def test_execute_logs_requested_and_effective_render_cache_budget(tmp_path, monkeypatch, caplog):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(tmp_path)
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
@@ -502,12 +504,13 @@ def test_execute_logs_requested_and_effective_render_cache_flag(tmp_path, monkey
         scene_id="scene-1",
         selection_start=0,
         selection_end=1,
-        render_cache_enabled="true",
+        render_cache_max_bytes=5_000_000_000,
         render_queue_active=False,
     )
 
-    assert "render_cache_requested='true'" in caplog.text
-    assert "render_cache_enabled=True" in caplog.text
+    assert "render_cache_requested=5000000000" in caplog.text
+    assert "render_cache_max_bytes=5000000000" in caplog.text
+    assert "render_cache_active=True" in caplog.text
 
 
 def test_execute_expands_both_sides_for_ltx_alignment(tmp_path, monkeypatch):

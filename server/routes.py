@@ -48,8 +48,10 @@ from .path_security import (
 )
 from .atomic_io import atomic_replace
 from .render_cache import (
+    RenderCacheActiveError,
     RenderCacheError,
     delete_render_cache_entry,
+    enforce_render_cache_budget,
     list_render_cache_entries,
 )
 from .upload_streaming import (
@@ -5792,6 +5794,41 @@ if routes is not None:
             return _json_error("Failed to list render cache entries", 500)
         return web.json_response(entries)
 
+    @routes.post("/sonder-editor/project/{project_id}/cache/renders/sweep")
+    async def api_sweep_render_cache(request: web.Request) -> web.Response:
+        try:
+            project = await asyncio.to_thread(_load_project_from_request, request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError):
+            return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict) or "max_size_bytes" not in body:
+            return _json_error("max_size_bytes is required", 400)
+        raw_budget = body.get("max_size_bytes")
+        if raw_budget is None:
+            max_size_bytes = None
+        elif (
+            isinstance(raw_budget, bool)
+            or not isinstance(raw_budget, int)
+            or raw_budget < 0
+            or raw_budget > 9_007_199_254_740_991
+        ):
+            return _json_error("max_size_bytes must be a non-negative safe integer or null", 400)
+        else:
+            max_size_bytes = raw_budget
+
+        try:
+            result = await asyncio.to_thread(enforce_render_cache_budget, project, max_size_bytes)
+        except RenderCacheError as e:
+            return _json_error(str(e), 400)
+        except OSError as e:
+            logger.warning("Failed to sweep render cache: %s", e)
+            return _json_error("Failed to sweep render cache", 500)
+        return web.json_response(result)
+
     @routes.delete("/sonder-editor/project/{project_id}/cache/renders/{filename}")
     async def api_delete_render_cache_entry(request: web.Request) -> web.Response:
         try:
@@ -5807,6 +5844,8 @@ if routes is not None:
             )
         except FileNotFoundError:
             return _json_error("Render cache entry not found", 404)
+        except RenderCacheActiveError:
+            return _json_error("Render cache entry is active", 409)
         except RenderCacheError as e:
             return _json_error(str(e), 400)
         except PermissionError:

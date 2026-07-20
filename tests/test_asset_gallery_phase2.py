@@ -1276,6 +1276,70 @@ def test_render_cache_routes_list_and_delete_project_cache_files(tmp_path, monke
     assert invalid_response.status == 400
 
 
+def test_render_cache_sweep_route_validates_budget_and_runs_off_loop(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    cache_dir = os.path.join(project.project_dir, "cache", "renders")
+    os.makedirs(cache_dir, exist_ok=True)
+    old_path = os.path.join(cache_dir, "old.pt")
+    new_path = os.path.join(cache_dir, "new.pt")
+    with open(old_path, "wb") as handle:
+        handle.write(b"old")
+    with open(new_path, "wb") as handle:
+        handle.write(b"newer")
+    os.utime(old_path, (100, 100))
+    os.utime(new_path, (200, 200))
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    threaded_calls = []
+
+    async def tracked_to_thread(function, *args, **kwargs):
+        threaded_calls.append(function)
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(module.asyncio, "to_thread", tracked_to_thread)
+    response = asyncio.run(module.api_sweep_render_cache(DummyRequest(
+        match_info={"project_id": "phase-2"},
+        body={"max_size_bytes": 5},
+    )))
+    payload = _response_json(response)
+
+    assert response.status == 200
+    assert payload["deleted"] == ["old.pt"]
+    assert payload["deleted_bytes"] == 3
+    assert payload["entry_count"] == 1
+    assert payload["size_bytes"] == 5
+    assert payload["over_budget_bytes"] == 0
+    assert threaded_calls[-2:] == [module._load_project_from_request, module.enforce_render_cache_budget]
+
+    for invalid in [True, -1, 1.5, 9_007_199_254_740_992]:
+        invalid_response = asyncio.run(module.api_sweep_render_cache(DummyRequest(
+            match_info={"project_id": "phase-2"},
+            body={"max_size_bytes": invalid},
+        )))
+        assert invalid_response.status == 400
+    missing_response = asyncio.run(module.api_sweep_render_cache(DummyRequest(
+        match_info={"project_id": "phase-2"},
+        body={},
+    )))
+    assert missing_response.status == 400
+
+
+def test_render_cache_delete_route_reports_active_conflict(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(
+        module,
+        "delete_render_cache_entry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(module.RenderCacheActiveError("active")),
+    )
+
+    response = asyncio.run(module.api_delete_render_cache_entry(DummyRequest(
+        match_info={"project_id": "phase-2", "filename": f"rc3_{'a' * 32}.cache"},
+    )))
+    assert response.status == 409
+
+
 def test_trash_purge_honors_retention_days_and_decimal_mb_cap(tmp_path):
     project = _make_project(tmp_path)
     old_asset = Asset(

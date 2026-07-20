@@ -336,7 +336,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         linkedTakePlacement: true,
         takePlacementMuted: false,
         defaultSavePreset: DEFAULT_SAVE_PRESET,
-        maxRenderCacheEntries: 0,
+        maxRenderCacheSizeBytes: 0,
         trashRetentionDays: 5,
         trashMaxSizeMB: 5000,
         export: {
@@ -502,6 +502,12 @@ function clampNumber(value, min, max, fallback, round = false) {
     if (!Number.isFinite(numeric)) return fallback;
     const clamped = Math.max(min, Math.min(max, numeric));
     return round ? Math.round(clamped) : clamped;
+}
+
+function normalizeRenderCacheSizeBytes(value) {
+    if (value === null) return null;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) return 0;
+    return value;
 }
 
 function coerceFiniteNumber(value, { integer = false, min = null } = {}) {
@@ -1146,15 +1152,9 @@ function normalizeEditorSettings(source = null) {
             defaultSavePreset: VALID_SAVE_PRESETS.has(stored?.render?.defaultSavePreset)
                 ? stored.render.defaultSavePreset
                 : defaults.render.defaultSavePreset,
-            maxRenderCacheEntries: stored?.render?.maxRenderCacheEntries === null
-                ? null
-                : clampNumber(
-                    stored?.render?.maxRenderCacheEntries,
-                    0,
-                    100000,
-                    defaults.render.maxRenderCacheEntries,
-                    true,
-                ),
+            maxRenderCacheSizeBytes: normalizeRenderCacheSizeBytes(
+                stored?.render?.maxRenderCacheSizeBytes,
+            ),
             trashRetentionDays: clampNumber(
                 stored?.render?.trashRetentionDays,
                 0,
@@ -1317,11 +1317,12 @@ export function getEditorSettings() {
     return clone(currentSettings);
 }
 
-export function isRenderCacheEnabled(settings = currentSettings) {
-    const value = settings?.render?.maxRenderCacheEntries;
-    if (value === null) return true;
-    const numeric = Number(value);
-    return Number.isFinite(numeric) && numeric > 0;
+export function renderCacheMaxBytes(settings = currentSettings) {
+    const value = settings?.render?.maxRenderCacheSizeBytes;
+    if (value === null) return -1;
+    return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+        ? value
+        : 0;
 }
 
 // Maps browser-local notification settings to the editor_notifications Core

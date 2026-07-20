@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -33,10 +34,16 @@ _LEGACY_RE = re.compile(r"^[^/\\]+\.pt$")
 
 _LOCKS_GUARD = threading.Lock()
 _STORE_LOCKS: dict[str, threading.RLock] = {}
+_ROOT_LOCKS: dict[str, threading.RLock] = {}
+_ACTIVE_STORES: dict[str, dict[str, int]] = {}
 
 
 class RenderCacheError(ValueError):
     """A render-cache entry is invalid or unsafe to operate on."""
+
+
+class RenderCacheActiveError(RenderCacheError):
+    """A render-cache store cannot be deleted while a render is using it."""
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,55 @@ def _store_lock(path: str) -> threading.RLock:
             lock = threading.RLock()
             _STORE_LOCKS[key] = lock
         return lock
+
+
+def _root_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _root_lock(path: str) -> threading.RLock:
+    key = _root_key(path)
+    with _LOCKS_GUARD:
+        lock = _ROOT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ROOT_LOCKS[key] = lock
+        return lock
+
+
+def active_store_tokens(root: str) -> set[str]:
+    key = _root_key(root)
+    with _LOCKS_GUARD:
+        return {
+            token for token, count in _ACTIVE_STORES.get(key, {}).items()
+            if count > 0
+        }
+
+
+@contextmanager
+def active_cache_store(store: RenderCacheStore):
+    """Protect a store from retention and explicit deletion while it is in use."""
+    _validate_store_path(store)
+    key = _root_key(store.root)
+    root_lock = _root_lock(store.root)
+    with root_lock:
+        with _LOCKS_GUARD:
+            stores = _ACTIVE_STORES.setdefault(key, {})
+            stores[store.token] = stores.get(store.token, 0) + 1
+    try:
+        yield store
+    finally:
+        with root_lock:
+            with _LOCKS_GUARD:
+                stores = _ACTIVE_STORES.get(key)
+                if stores is not None:
+                    remaining = stores.get(store.token, 0) - 1
+                    if remaining > 0:
+                        stores[store.token] = remaining
+                    else:
+                        stores.pop(store.token, None)
+                    if not stores:
+                        _ACTIVE_STORES.pop(key, None)
 
 
 def _is_reparse(path: str) -> bool:
@@ -356,7 +412,7 @@ def _store_from_token(project, token: str) -> RenderCacheStore:
     return RenderCacheStore(root=root, path=path, token=token, block_frames=1)
 
 
-def list_render_cache_entries(project) -> list[dict]:
+def _list_render_cache_entries_unlocked(project) -> list[dict]:
     root = render_cache_root(project)
     if not root or not os.path.isdir(root):
         return []
@@ -386,11 +442,18 @@ def list_render_cache_entries(project) -> list[dict]:
     return entries
 
 
-def delete_render_cache_entry(project, token: str) -> dict:
+def list_render_cache_entries(project) -> list[dict]:
     root = render_cache_root(project)
-    if not root:
-        raise FileNotFoundError("Render cache entry not found")
+    if not root or not os.path.isdir(root):
+        return []
+    with _root_lock(root):
+        return _list_render_cache_entries_unlocked(project)
+
+
+def _delete_render_cache_entry_unlocked(project, root: str, token: str) -> dict:
     token = str(token or "").strip()
+    if token in active_store_tokens(root):
+        raise RenderCacheActiveError("Render cache entry is active")
     if _STORE_RE.fullmatch(token):
         store = _store_from_token(project, token)
         with _store_lock(store.path):
@@ -407,3 +470,96 @@ def delete_render_cache_entry(project, token: str) -> dict:
             raise FileNotFoundError("Render cache entry not found")
         os.remove(path)
     return {"deleted": True, "filename": token}
+
+
+def delete_render_cache_entry(project, token: str) -> dict:
+    root = render_cache_root(project)
+    if not root:
+        raise FileNotFoundError("Render cache entry not found")
+    with _root_lock(root):
+        return _delete_render_cache_entry_unlocked(project, root, token)
+
+
+def enforce_render_cache_budget(project, max_size_bytes: int | None, *,
+                                protected_tokens=()) -> dict:
+    """Evict oldest whole entries until the project cache fits its soft budget."""
+    if max_size_bytes is not None:
+        if isinstance(max_size_bytes, bool) or not isinstance(max_size_bytes, int):
+            raise RenderCacheError("Render cache budget must be a non-negative integer or null")
+        if max_size_bytes < 0:
+            raise RenderCacheError("Render cache budget must be a non-negative integer or null")
+
+    root = render_cache_root(project)
+    if not root or not os.path.isdir(root):
+        return {
+            "entry_count": 0,
+            "size_bytes": 0,
+            "deleted": [],
+            "deleted_bytes": 0,
+            "protected": [],
+            "over_budget_bytes": 0,
+            "pending": False,
+            "failures": [],
+        }
+
+    with _root_lock(root):
+        entries = _list_render_cache_entries_unlocked(project)
+        protected = {
+            str(token) for token in protected_tokens or ()
+            if isinstance(token, str) and token
+        }
+        protected.update(active_store_tokens(root))
+        total_size = sum(max(0, int(entry.get("size_bytes", 0) or 0)) for entry in entries)
+        deleted = []
+        deleted_bytes = 0
+        failures = []
+
+        if max_size_bytes is not None and total_size > max_size_bytes:
+            for entry in entries:
+                if total_size <= max_size_bytes:
+                    break
+                token = str(entry.get("filename") or "")
+                if not token or token in protected:
+                    continue
+                entry_size = max(0, int(entry.get("size_bytes", 0) or 0))
+                try:
+                    _delete_render_cache_entry_unlocked(project, root, token)
+                except FileNotFoundError:
+                    total_size = max(0, total_size - entry_size)
+                except (OSError, RenderCacheError) as exc:
+                    failures.append(token)
+                    logger.warning("Failed to evict render cache entry %s: %s", token, exc)
+                else:
+                    deleted.append(token)
+                    deleted_bytes += entry_size
+                    total_size = max(0, total_size - entry_size)
+
+        remaining = _list_render_cache_entries_unlocked(project)
+        total_size = sum(max(0, int(entry.get("size_bytes", 0) or 0)) for entry in remaining)
+        remaining_tokens = {str(entry.get("filename") or "") for entry in remaining}
+        protected_remaining = sorted(protected & remaining_tokens)
+        over_budget = 0 if max_size_bytes is None else max(0, total_size - max_size_bytes)
+        result = {
+            "entry_count": len(remaining),
+            "size_bytes": total_size,
+            "deleted": deleted,
+            "deleted_bytes": deleted_bytes,
+            "protected": protected_remaining,
+            "over_budget_bytes": over_budget,
+            "pending": bool(over_budget and (protected_remaining or failures)),
+            "failures": failures,
+        }
+        logger.info(
+            "Render cache retention budget=%s entries=%d size_bytes=%d deleted=%s "
+            "deleted_bytes=%d protected=%s over_budget_bytes=%d pending=%s failures=%s",
+            "unlimited" if max_size_bytes is None else max_size_bytes,
+            result["entry_count"],
+            result["size_bytes"],
+            result["deleted"],
+            result["deleted_bytes"],
+            result["protected"],
+            result["over_budget_bytes"],
+            result["pending"],
+            result["failures"],
+        )
+        return result

@@ -517,6 +517,10 @@ export class EditorWidget {
         this._destroyed = false;
         this._settings = getEditorSettings();
         this._settingsUnsubscribe = null;
+        this._renderCacheUsage = null;
+        this._renderCacheSweepPending = false;
+        this._renderCacheSweepSeq = 0;
+        this._renderCacheStatusHandler = null;
 
         // Scene state
         this.scenes = [];
@@ -699,6 +703,15 @@ export class EditorWidget {
         // Apply initial UI scales (bars + canvas will be scaled on first render)
         this._applyScales();
         this._settingsUnsubscribe = subscribeEditorSettings((settings) => this._handleSettingsChange(settings));
+        if (typeof api.addEventListener === "function") {
+            this._renderCacheStatusHandler = (event) => {
+                const remaining = Number(event?.detail?.exec_info?.queue_remaining);
+                if (remaining !== 0 || this._destroyed) return;
+                if (this._renderCacheSweepPending) this._sweepRenderCache();
+                else if (this._settingsPanelHandle) this._refreshRenderCacheUsage();
+            };
+            api.addEventListener("status", this._renderCacheStatusHandler);
+        }
 
         // Window resize handler for fullscreen
         this._windowResizeHandler = () => {
@@ -4802,14 +4815,12 @@ export class EditorWidget {
         return updateEditorSettings(partial);
     }
 
-    _renderCacheEntryLimit(settings = this._settings) {
-        const rawValue = settings?.render?.maxRenderCacheEntries;
+    _renderCacheMaxBytes(settings = this._settings) {
+        const rawValue = settings?.render?.maxRenderCacheSizeBytes;
         if (rawValue === null) return null;
-        const numeric = Number(rawValue);
-        if (!Number.isFinite(numeric)) {
-            return DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries;
-        }
-        return Math.max(0, Math.round(numeric));
+        return typeof rawValue === "number" && Number.isSafeInteger(rawValue) && rawValue > 0
+            ? rawValue
+            : 0;
     }
 
     _trashRetentionDays(settings = this._settings) {
@@ -4838,40 +4849,83 @@ export class EditorWidget {
         return params.toString();
     }
 
-    async _sweepRenderCache() {
-        const maxEntries = this._renderCacheEntryLimit();
+    async _refreshRenderCacheUsage() {
         const dirName = this._projectDirName();
-        if (maxEntries === null || !dirName) return;
+        const sweepSeq = this._renderCacheSweepSeq;
+        if (!dirName) {
+            this._renderCacheUsage = null;
+            this._renderCacheSweepPending = false;
+            this._syncSettingsPanelControls();
+            return null;
+        }
 
         try {
             const listResp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/cache/renders`));
-            if (!listResp.ok) return;
+            if (!listResp.ok) return null;
             const data = await listResp.json();
             const entries = Array.isArray(data) ? data : (Array.isArray(data.entries) ? data.entries : []);
-            const sortedEntries = entries
-                .filter((entry) => typeof entry?.filename === "string" && entry.filename)
-                .sort((a, b) => {
-                    const aTime = Number.isFinite(Number(a.mtime)) ? Number(a.mtime) : 0;
-                    const bTime = Number.isFinite(Number(b.mtime)) ? Number(b.mtime) : 0;
-                    if (aTime !== bTime) return aTime - bTime;
-                    return String(a.filename).localeCompare(String(b.filename));
-                });
-            const excess = sortedEntries.length - maxEntries;
-            if (excess <= 0) return;
+            const usage = {
+                entry_count: entries.length,
+                size_bytes: entries.reduce((sum, entry) => {
+                    const size = Number(entry?.size_bytes);
+                    return sum + (Number.isFinite(size) && size > 0 ? size : 0);
+                }, 0),
+                deleted: [],
+                deleted_bytes: 0,
+                protected: [],
+                over_budget_bytes: 0,
+                pending: false,
+                failures: [],
+            };
+            if (sweepSeq === this._renderCacheSweepSeq && dirName === this._projectDirName()) {
+                this._renderCacheUsage = usage;
+                this._renderCacheSweepPending = false;
+                this._syncSettingsPanelControls();
+            }
+            return usage;
+        } catch (error) {
+            console.warn("[Sonder] Failed to read render cache usage:", error);
+            return null;
+        }
+    }
 
-            const staleEntries = sortedEntries.slice(0, excess);
-            await Promise.all(staleEntries.map(async (entry) => {
-                const deleteResp = await fetch(
-                    api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/cache/renders/${encodeURIComponent(entry.filename)}`),
-                    { method: "DELETE" },
-                );
-                if (!deleteResp.ok && deleteResp.status !== 404) {
-                    console.warn("[Sonder] Render cache eviction skipped:", entry.filename, deleteResp.status);
-                }
-            }));
+    async _sweepRenderCache(maxSizeBytes = this._renderCacheMaxBytes()) {
+        const dirName = this._projectDirName();
+        const seq = ++this._renderCacheSweepSeq;
+        if (!dirName) {
+            this._renderCacheUsage = null;
+            this._renderCacheSweepPending = false;
+            this._syncSettingsPanelControls();
+            return null;
+        }
+        try {
+            const response = await fetch(
+                api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/cache/renders/sweep`),
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ max_size_bytes: maxSizeBytes }),
+                },
+            );
+            if (!response.ok) {
+                console.warn("[Sonder] Render cache sweep skipped:", response.status);
+                return null;
+            }
+            const result = await response.json();
+            if (seq === this._renderCacheSweepSeq && dirName === this._projectDirName()) {
+                this._renderCacheUsage = result;
+                this._renderCacheSweepPending = result?.pending === true;
+                this._syncSettingsPanelControls();
+            }
+            return result;
         } catch (error) {
             console.warn("[Sonder] Failed to sweep render cache:", error);
+            return null;
         }
+    }
+
+    async _clearRenderCache() {
+        return this._sweepRenderCache(0);
     }
 
     _syncTakePlacementModeWidget(settings = this._settings) {
@@ -5022,8 +5076,8 @@ export class EditorWidget {
         const nextTrackCollapseSignature = this._activeTrackCollapseSignature(nextSettings);
         const prevQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(this._settings);
         const nextQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(nextSettings);
-        const prevRenderCacheLimit = this._renderCacheEntryLimit(this._settings);
-        const nextRenderCacheLimit = this._renderCacheEntryLimit(nextSettings);
+        const prevRenderCacheLimit = this._renderCacheMaxBytes(this._settings);
+        const nextRenderCacheLimit = this._renderCacheMaxBytes(nextSettings);
         const prevTimecodeMode = this._timecodeMode;
         const prevStreamingMode = this._settings?.playback?.streamingMode ?? "auto";
         const nextStreamingMode = nextSettings?.playback?.streamingMode ?? "auto";
@@ -5171,6 +5225,10 @@ export class EditorWidget {
             _setSnappingEnabled: (enabled) => editor._setSnappingEnabled(enabled),
             _setTimecodeMode: (mode) => editor._setTimecodeMode(mode),
             _trashRetentionDays: (...args) => editor._trashRetentionDays(...args),
+            get _renderCacheUsage() { return editor._renderCacheUsage; },
+            get _renderCacheProjectName() { return editor._projectDirName(); },
+            _refreshRenderCacheUsage: () => editor._refreshRenderCacheUsage(),
+            _clearRenderCache: () => editor._clearRenderCache(),
             _guideHoverPreviewSize: () => editor._guideHoverPreviewSize(),
             _hideGuideHoverPreview: () => editor._hideGuideHoverPreview(),
             _hidePromptHoverPreview: () => editor._hidePromptHoverPreview(),
@@ -15661,6 +15719,10 @@ export class EditorWidget {
         if (this._settingsUnsubscribe) {
             this._settingsUnsubscribe();
             this._settingsUnsubscribe = null;
+        }
+        if (this._renderCacheStatusHandler && typeof api.removeEventListener === "function") {
+            api.removeEventListener("status", this._renderCacheStatusHandler);
+            this._renderCacheStatusHandler = null;
         }
 
         if (this._previewEl) {

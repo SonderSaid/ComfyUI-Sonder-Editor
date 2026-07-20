@@ -204,9 +204,9 @@ class SonderEditor:
                     "default": False,
                     "tooltip": "Whether newly placed takes enter the timeline muted.",
                 }),
-                "render_cache_enabled": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Whether timeline preview renders may read/write the project render cache.",
+                "render_cache_max_bytes": ("INT", {
+                    "default": 0, "min": -1, "max": 9007199254740991,
+                    "tooltip": "Project render-cache budget in bytes. 0 disables caching; -1 is unlimited.",
                 }),
                 "render_queue_active": ("BOOLEAN", {
                     "default": True,
@@ -579,11 +579,11 @@ class SonderEditor:
                 mask_pre_offset=0, mask_post_offset=0,
                 prompt=None, unique_id=None, take_placement_mode="trimmed",
                 take_placement_linked=True, take_placement_muted=False,
-                render_cache_enabled=False, render_queue_active=True,
+                render_cache_max_bytes=0, render_queue_active=True,
                 take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
-        render_cache_requested = render_cache_enabled
+        render_cache_requested = render_cache_max_bytes
         selection_start = max(0, _coerce_int(selection_start, 0))
         selection_end = max(0, _coerce_int(selection_end, 0))
         pre_context_frames = max(0, _coerce_int(pre_context_frames, 0))
@@ -599,7 +599,11 @@ class SonderEditor:
         take_crop_position = str(take_crop_position or DEFAULT_CROP_POSITION).strip().lower()
         if take_crop_position not in CROP_POSITIONS:
             take_crop_position = DEFAULT_CROP_POSITION
-        render_cache_enabled = self._coerce_bool(render_cache_enabled, False)
+        render_cache_max_bytes = _coerce_int(render_cache_max_bytes, 0)
+        if render_cache_max_bytes < -1 or render_cache_max_bytes > 9_007_199_254_740_991:
+            render_cache_max_bytes = 0
+        render_cache_active = render_cache_max_bytes != 0
+        render_cache_budget = None if render_cache_max_bytes == -1 else render_cache_max_bytes
         render_queue_active = self._coerce_bool(render_queue_active, True)
         proj = None
         queue_job = None
@@ -651,7 +655,8 @@ class SonderEditor:
                 mask_post_offset = max(0, _coerce_int(getattr(queue_job, "mask_post_offset", 0), 0))
             logger.info(
                 "execute begin: scene_id=%s selection=%d-%d terminal_save=%s unmarked_save=%s "
-                "render_cache_requested=%r render_cache_enabled=%s render_queue_active=%s "
+                "render_cache_requested=%r render_cache_max_bytes=%d render_cache_active=%s "
+                "render_queue_active=%s "
                 "queue_length=%d queue_job_mode=%s queue_job_id=%s snapshot_range=%s-%s",
                 scene_id or "",
                 selection_start,
@@ -659,7 +664,8 @@ class SonderEditor:
                 terminal_save_reached,
                 unmarked_save_reached,
                 render_cache_requested,
-                render_cache_enabled,
+                render_cache_max_bytes,
+                render_cache_active,
                 render_queue_active,
                 queue_length,
                 queue_job_mode,
@@ -801,7 +807,8 @@ class SonderEditor:
                 scene,
                 render_start,
                 render_end,
-                use_cache=render_cache_enabled,
+                use_cache=render_cache_active,
+                cache_max_bytes=render_cache_budget,
             )
             if frame_count_padding > 0:
                 rendered_frames = self._pad_image_batch_to_frame_count(rendered_frames, target_frame_count)
@@ -1129,7 +1136,8 @@ class SonderEditor:
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
                               render_start: int, render_end: int,
-                              *, use_cache: bool = True) -> torch.Tensor:
+                              *, use_cache: bool = True,
+                              cache_max_bytes: int | None = None) -> torch.Tensor:
         """Composite all visible video clips into frames for the given range.
 
         Returns (N, H, W, 3) float32 RGB tensor. Uses caching to skip
@@ -1141,6 +1149,7 @@ class SonderEditor:
             render_start,
             render_end,
             use_cache=use_cache,
+            cache_max_bytes=cache_max_bytes,
         )
 
     @staticmethod

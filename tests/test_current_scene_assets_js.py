@@ -283,7 +283,7 @@ console.log(JSON.stringify({
     playback: settings.playback,
     render: {
         defaultSavePreset: settings.render.defaultSavePreset,
-        maxRenderCacheEntries: settings.render.maxRenderCacheEntries,
+        maxRenderCacheSizeBytes: settings.render.maxRenderCacheSizeBytes,
         trashRetentionDays: settings.render.trashRetentionDays,
         trashMaxSizeMB: settings.render.trashMaxSizeMB,
     },
@@ -313,7 +313,7 @@ console.log(JSON.stringify({
     assert result["playback"]["decodeConcurrency"] == 8
     assert result["render"] == {
         "defaultSavePreset": "High Quality MP4",
-        "maxRenderCacheEntries": 0,
+        "maxRenderCacheSizeBytes": 0,
         "trashRetentionDays": 5,
         "trashMaxSizeMB": 5000,
     }

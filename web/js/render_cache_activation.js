@@ -1,14 +1,14 @@
-import { isRenderCacheEnabled } from "./editor_settings.js";
+import { renderCacheMaxBytes } from "./editor_settings.js";
 
 export function applyRenderCacheSettingToNode(node, settings) {
     if (!node || node.type !== "SonderEditor") return false;
-    const widget = node.widgets?.find?.((candidate) => candidate?.name === "render_cache_enabled");
+    const widget = node.widgets?.find?.((candidate) => candidate?.name === "render_cache_max_bytes");
     if (!widget) return false;
-    const enabled = isRenderCacheEnabled(settings);
-    if (widget.value === enabled) return false;
+    const maxBytes = renderCacheMaxBytes(settings);
+    if (widget.value === maxBytes) return false;
     // Browser-local retention policy is mirrored directly into the serialized
     // execution widget. It is deliberately not a mounted-session relay field.
-    widget.value = enabled;
+    widget.value = maxBytes;
     return true;
 }
 

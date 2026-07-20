@@ -1040,7 +1040,7 @@ app.registerExtension({
                     "take_placement_mode",
                     "take_placement_linked",
                     "take_placement_muted",
-                    "render_cache_enabled",
+                    "render_cache_max_bytes",
                     "render_queue_active",
                     "take_fit_mode",
                     "take_crop_position",

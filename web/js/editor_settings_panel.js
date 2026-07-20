@@ -30,13 +30,14 @@ import {
     previewConstraintValues,
 } from "./editor_settings.js";
 
-const RENDER_CACHE_ENTRY_PRESETS = [
+const DECIMAL_GB_BYTES = 1_000_000_000;
+const RENDER_CACHE_SIZE_PRESETS = [
     { value: "0", label: "Off" },
-    { value: "1", label: "Keep 1" },
-    { value: "3", label: "Keep 3" },
-    { value: "5", label: "Keep 5" },
-    { value: "10", label: "Keep 10" },
-    { value: "25", label: "Keep 25" },
+    { value: String(5 * DECIMAL_GB_BYTES), label: "5 GB" },
+    { value: String(10 * DECIMAL_GB_BYTES), label: "10 GB" },
+    { value: String(25 * DECIMAL_GB_BYTES), label: "25 GB" },
+    { value: String(50 * DECIMAL_GB_BYTES), label: "50 GB" },
+    { value: String(100 * DECIMAL_GB_BYTES), label: "100 GB" },
     { value: "unlimited", label: "Unlimited" },
 ];
 
@@ -48,6 +49,18 @@ const TRASH_SIZE_MB_PRESETS = [
     { value: "5000", label: "5 GB" },
     { value: "unlimited", label: "Unlimited" },
 ];
+
+function formatRenderCacheBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+    if (bytes >= DECIMAL_GB_BYTES) {
+        const gb = bytes / DECIMAL_GB_BYTES;
+        return `${gb >= 10 ? gb.toFixed(1) : gb.toFixed(2)} GB`;
+    }
+    if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(1)} MB`;
+    if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(1)} KB`;
+    return `${Math.round(bytes)} B`;
+}
 
 const BUTTON_VARIANTS = {
     muted: {
@@ -217,6 +230,25 @@ function syncSettingsPanelControls() {
     if (controls.defaultSavePreset) {
         controls.defaultSavePreset.value = this._settings.render?.defaultSavePreset ?? DEFAULT_SAVE_PRESET;
         controls.defaultSavePreset._sonderSyncTitle?.();
+    }
+    if (controls.renderCacheUsageLabel) {
+        const projectName = this._renderCacheProjectName;
+        const usage = this._renderCacheUsage;
+        if (!projectName) {
+            controls.renderCacheUsageLabel.textContent = "Open a project to view cache usage.";
+        } else if (!usage) {
+            controls.renderCacheUsageLabel.textContent = "Calculating…";
+        } else {
+            const count = Math.max(0, Number(usage.entry_count) || 0);
+            const stores = `${count} ${count === 1 ? "store" : "stores"}`;
+            const overage = Math.max(0, Number(usage.over_budget_bytes) || 0);
+            const pending = usage.pending === true ? " Cleanup will retry when execution is idle." : "";
+            const over = overage > 0 ? ` ${formatRenderCacheBytes(overage)} over budget.` : "";
+            controls.renderCacheUsageLabel.textContent = `${formatRenderCacheBytes(usage.size_bytes)} across ${stores}.${over}${pending}`;
+        }
+        if (controls.clearRenderCacheButton) {
+            controls.clearRenderCacheButton.disabled = !projectName || !usage || Number(usage.size_bytes) <= 0;
+        }
     }
     if (controls.guideSnapshotMaxLongEdge) controls.guideSnapshotMaxLongEdge.value = String(this._settings.guides?.guideSnapshotMaxLongEdge ?? 0);
     if (controls.hoverPreviewEnabled) controls.hoverPreviewEnabled.checked = this._settings.guides?.hoverPreviewEnabled ?? true;
@@ -406,9 +438,9 @@ function showSettingsPanel() {
         const controlWrap = createRow(section, label, description);
         const input = document.createElement("input");
         input.type = "number";
-        input.min = String(config.min);
-        input.max = String(config.max);
-        input.step = String(config.step ?? 1);
+        input.min = String(config.inputMin ?? config.min);
+        input.max = String(config.inputMax ?? config.max);
+        input.step = String(config.inputStep ?? config.step ?? 1);
         input.value = String(config.getter());
         input.style.cssText = `${chromeInputCss({ width: "86px", fontSize: "11px", padding: "4px 8px", textAlign: "right" })}`;
         input.addEventListener("change", () => {
@@ -458,6 +490,7 @@ function showSettingsPanel() {
         };
         const formatValue = (value) => {
             if (value === null || value === undefined) return String(config.customDefault ?? config.min);
+            if (typeof config.formatInput === "function") return String(config.formatInput(value));
             return config.integer ? String(Math.round(value)) : String(value);
         };
         const presetValueFor = (value) => {
@@ -510,12 +543,21 @@ function showSettingsPanel() {
             sync();
         });
         input.addEventListener("change", () => {
-            const nextValue = coerce(input.value);
+            const parsed = typeof config.parseInput === "function"
+                ? config.parseInput(input.value)
+                : input.value;
+            const nextValue = coerce(parsed);
             config.onChange(nextValue === undefined ? (currentValue() ?? coerce(config.customDefault)) : nextValue);
             sync();
         });
 
         inputRow.append(select, input);
+        if (config.inputSuffix) {
+            const suffix = document.createElement("span");
+            suffix.textContent = config.inputSuffix;
+            suffix.style.cssText = "font-size:10px;color:#8f98a3;";
+            inputRow.appendChild(suffix);
+        }
         controlWrap.appendChild(inputRow);
         controls[`${key}Preset`] = select;
         controls[`${key}Custom`] = input;
@@ -1205,23 +1247,59 @@ function showSettingsPanel() {
     );
     createPresetNumberInput(
         renderSection,
-        "maxRenderCacheEntries",
-        "Render Cache Entries",
-        "Off prevents new timeline preview render-cache writes. Higher keep counts retain more project-local block stores; cleanup runs when the editor opens or this cap changes.",
+        "maxRenderCacheSizeBytes",
+        "Render Cache Disk Budget",
+        "Stores rendered frames in reusable blocks to accelerate repeat renders. Localized edits rewrite only affected blocks, but widespread changes in long or high-resolution scenes may still write several GB per run. The limit controls retained cache size, not per-render writes.",
         {
-            options: RENDER_CACHE_ENTRY_PRESETS,
+            options: RENDER_CACHE_SIZE_PRESETS,
             min: 0,
-            max: 100000,
+            max: Number.MAX_SAFE_INTEGER,
             step: 1,
             integer: true,
             allowNull: true,
-            customDefault: DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries,
-            getter: () => this._settings.render?.maxRenderCacheEntries === null
+            customDefault: 5 * DECIMAL_GB_BYTES,
+            inputMin: 0.1,
+            inputMax: Number.MAX_SAFE_INTEGER / DECIMAL_GB_BYTES,
+            inputStep: 0.1,
+            inputSuffix: "GB",
+            formatInput: (value) => Number(value) / DECIMAL_GB_BYTES,
+            parseInput: (value) => Math.round(Number(value) * DECIMAL_GB_BYTES),
+            getter: () => this._settings.render?.maxRenderCacheSizeBytes === null
                 ? null
-                : (this._settings.render?.maxRenderCacheEntries ?? DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries),
-            onChange: (value) => updateCategory("render", "maxRenderCacheEntries", value),
+                : (this._settings.render?.maxRenderCacheSizeBytes ?? DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheSizeBytes),
+            onChange: (value) => updateCategory("render", "maxRenderCacheSizeBytes", value),
         }
     );
+    const cacheUsageControl = createRow(
+        renderSection,
+        "Current Project Cache",
+        "Shows retained render-cache storage for the open project. Clearing does not change the selected budget.",
+    );
+    cacheUsageControl.style.flexDirection = "column";
+    cacheUsageControl.style.alignItems = "flex-end";
+    const cacheUsageLabel = document.createElement("span");
+    cacheUsageLabel.style.cssText = "font-size:10px;color:#9aa4af;max-width:230px;text-align:right;";
+    cacheUsageLabel.textContent = "Calculating…";
+    const clearCacheButton = document.createElement("button");
+    clearCacheButton.type = "button";
+    clearCacheButton.textContent = "Clear Render Cache…";
+    clearCacheButton.style.cssText = chromeButtonCss({ variant: "danger", padding: "5px 10px", fontSize: "10px", radius: "6px" });
+    clearCacheButton.addEventListener("click", async () => {
+        const usage = this._renderCacheUsage;
+        const projectName = this._renderCacheProjectName;
+        if (!projectName || !usage || Number(usage.size_bytes) <= 0) return;
+        const size = formatRenderCacheBytes(usage.size_bytes);
+        if (!confirm(`Clear ${size} of render cache for "${projectName}"? This cannot be undone.`)) return;
+        clearCacheButton.disabled = true;
+        try {
+            await this._clearRenderCache?.();
+        } finally {
+            syncSettingsPanelControls.call(this);
+        }
+    });
+    cacheUsageControl.append(cacheUsageLabel, clearCacheButton);
+    controls.renderCacheUsageLabel = cacheUsageLabel;
+    controls.clearRenderCacheButton = clearCacheButton;
     createNumberInput(
         renderSection,
         "batchRenderMaxFramesPerChunk",
@@ -1245,7 +1323,7 @@ function showSettingsPanel() {
                 linkedTakePlacement: DEFAULT_EDITOR_SETTINGS.render.linkedTakePlacement,
                 takePlacementMuted: DEFAULT_EDITOR_SETTINGS.render.takePlacementMuted,
                 defaultSavePreset: DEFAULT_EDITOR_SETTINGS.render.defaultSavePreset,
-                maxRenderCacheEntries: DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheEntries,
+                maxRenderCacheSizeBytes: DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheSizeBytes,
             },
             batchRender: DEFAULT_EDITOR_SETTINGS.batchRender,
         })
@@ -1788,6 +1866,7 @@ function showSettingsPanel() {
     this._settingsPanelEl = backdrop;
     syncSettingsPanelControls.call(this);
     Promise.resolve(this._loadServerSettings?.()).catch(() => {});
+    Promise.resolve(this._refreshRenderCacheUsage?.()).catch(() => {});
 
     backdrop.addEventListener("click", (e) => {
         if (e.target === backdrop) this._hideSettingsPanel();
