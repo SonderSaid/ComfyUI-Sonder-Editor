@@ -1,0 +1,27 @@
+# ComfyUI-Sonder-Editor — Python dependencies
+#
+# IMPORTANT: torch and torchaudio are intentionally NOT listed here.
+# ComfyUI already ships a torch build matched to your GPU/CUDA. If a bare
+# `torch`/`torchaudio` is pip-installed (e.g. by ComfyUI-Manager resolving
+# requirements), it can overwrite that build with a mismatched, often
+# CPU-only wheel and break GPU acceleration. Audio features use torchaudio;
+# if it is missing, install the build that matches your existing torch/CUDA
+# version manually. See the "Troubleshooting" section of README.md.
+
+# Image / array — ships with ComfyUI; listed for standalone environments
+numpy
+Pillow
+
+# Video I/O
+# NOTE: opencv-python-headless is used deliberately (no GUI deps). Some other
+# custom nodes install full `opencv-python`; the two conflict. See README
+# "Troubleshooting" if cv2 imports break after installing another node pack.
+opencv-python-headless
+imageio
+imageio-ffmpeg
+
+# Numeric / signal helpers
+scipy
+
+# Server — ships with ComfyUI; listed for standalone environments
+aiohttp

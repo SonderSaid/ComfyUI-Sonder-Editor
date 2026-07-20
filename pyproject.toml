@@ -1,0 +1,43 @@
+# Packaging + ComfyUI Registry metadata for ComfyUI-Sonder-Editor.
+#
+# Before publishing to the ComfyUI Registry, set [tool.comfy].PublisherId to
+# the publisher id created at https://registry.comfy.org. Repository metadata
+# is already pointed at the intended public GitHub project.
+
+[project]
+name = "comfyui-sonder-editor"
+description = "Single-node, NLE-style video editor for ComfyUI: timeline, scenes, guides, prompt sections, project-scoped asset management, gallery, and a render-queue generation pipeline."
+version = "0.1.0"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "SonderSaid" }]
+keywords = ["comfyui", "video", "editor", "timeline", "ltx", "generation", "director", "scene", "project", "gallery"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+]
+
+# Runtime dependencies. torch/torchaudio are deliberately excluded — ComfyUI
+# provides a CUDA-matched torch and a bare install can clobber it. Keep this
+# list in sync with requirements.txt.
+dependencies = [
+    "numpy",
+    "Pillow",
+    "opencv-python-headless",
+    "imageio",
+    "imageio-ffmpeg",
+    "scipy",
+    "aiohttp",
+]
+
+[project.urls]
+Repository = "https://github.com/SonderSaid/ComfyUI-Sonder-Editor"
+
+[tool.comfy]
+PublisherId = "sondersaid"
+DisplayName = "Sonder Editor"
+# Optional: a public URL to a square icon shown on the Registry listing.
+Icon = ""

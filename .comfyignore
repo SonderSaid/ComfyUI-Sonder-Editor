@@ -1,0 +1,8 @@
+# Development-only files — excluded from the ComfyUI Registry archive.
+# Syntax matches .gitignore. Keep in sync when adding dev-only top-level files.
+tests/
+conftest.py
+pytest.ini
+.gitignore
+.comfyignore
+.github/
