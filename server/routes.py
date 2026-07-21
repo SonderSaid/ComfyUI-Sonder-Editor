@@ -159,6 +159,20 @@ def _attach_project_version_headers(
     return response
 
 
+def _sonder_route_path(path: str) -> str:
+    """Canonical Sonder route path for middleware prefix checks.
+
+    Standalone ComfyUI's frontend api.apiURL() prefixes requests with /api
+    (ComfyUI registers routes under both roots), so the same handler is
+    reachable at /sonder-editor/... and /api/sonder-editor/.... Strip a
+    single leading /api segment so every prefix check sees one spelling.
+    """
+    raw = str(path or "")
+    if raw.startswith("/api/"):
+        return raw[len("/api"):]
+    return raw
+
+
 def _request_host_candidates(request: web.Request) -> set[str]:
     candidates = set()
     headers = getattr(request, "headers", {}) or {}
@@ -184,7 +198,7 @@ def _same_origin_request(request: web.Request) -> bool:
 
 
 def _apply_sonder_security_headers(request: web.Request, response: web.StreamResponse) -> web.StreamResponse:
-    path = str(getattr(request, "path", "") or "")
+    path = _sonder_route_path(getattr(request, "path", "") or "")
     if not path.startswith("/sonder-editor/"):
         return response
     for key, value in _SONDER_SECURITY_HEADERS.items():
@@ -203,7 +217,7 @@ def _cross_origin_blocked_response(request: web.Request) -> web.StreamResponse:
 
 @web.middleware
 async def _sonder_security_middleware(request: web.Request, handler):
-    path = str(getattr(request, "path", "") or "")
+    path = _sonder_route_path(getattr(request, "path", "") or "")
     method = str(getattr(request, "method", "") or "").upper()
     if path.startswith("/sonder-editor/") and method in _SONDER_MUTATING_METHODS and not _same_origin_request(request):
         return _cross_origin_blocked_response(request)
@@ -313,7 +327,7 @@ except Exception:
 async def _project_version_header_middleware(request: web.Request, handler):
     response = await handler(request)
     try:
-        path = str(request.path or "")
+        path = _sonder_route_path(request.path or "")
         status = int(getattr(response, "status", 0) or 0)
         if path.startswith("/sonder-editor/project/") and 200 <= status < 400:
             project = _request_project(request)
@@ -364,7 +378,7 @@ async def _route_timing_middleware(request: web.Request, handler):
         if elapsed >= _ROUTE_TIMING_THRESHOLD_S:
             try:
                 path = request.path or ""
-                if path.startswith("/sonder-editor/"):
+                if _sonder_route_path(path).startswith("/sonder-editor/"):
                     project_id = ""
                     try:
                         project_id = str(request.match_info.get("project_id", "") or "")

@@ -187,6 +187,51 @@ export async function fetchProjectJson(input, init = {}, { projectId: fallbackPr
     return { response, payload };
 }
 
+// Versioned project write with immediate heal-and-retry from the 409 body.
+// Unlike the scenes/queue governor (blind timed backoff for GETs that only learn
+// staleness from a header), a versioned POST receives a 409 whose body already
+// carries `actual_modified_at` + the full project, so it can adopt the correct
+// version and retry at once. Returns fetchProjectJson's `{ response, payload }`
+// plus an `attempts` count so callers can emit reconcile diagnostics.
+export async function postProjectJsonWithReconcile(
+    url,
+    init = {},
+    { projectId = "", retryOnConflict = true, maxAttempts = 2 } = {},
+) {
+    let attempt = 0;
+    while (true) {
+        attempt += 1;
+        const explicitIfMatch = new Headers(init?.headers || {}).get("If-Match") || "";
+        const sentVersion = String(explicitIfMatch || getProjectVersion(projectId) || "")
+            .replace(/^W\//, "")
+            .replace(/^"|"$/g, "");
+        try {
+            const result = await fetchProjectJson(url, init, { projectId });
+            return { ...result, attempts: attempt };
+        } catch (error) {
+            if (
+                retryOnConflict
+                && error?.code === "project_version_conflict"
+                && attempt < maxAttempts
+            ) {
+                // fetchProjectJson already forward-adopted the 409's version
+                // (monotonic). A *lower* actual means the client map is poisoned
+                // ahead of the server, so force it back across both aliases. The
+                // fetch patch restamps If-Match from the healed map on the retry.
+                const actualVersion = String(error.actualModifiedAt || "");
+                if (actualVersion && sentVersion && actualVersion < sentVersion) {
+                    resetProjectVersion(projectId, actualVersion);
+                }
+                if (error.project) {
+                    rememberProjectVersionFromPayload(error.project, projectId);
+                }
+                continue;
+            }
+            throw error;
+        }
+    }
+}
+
 export function installProjectVersionFetchPatch() {
     if (fetchPatchInstalled || typeof window === "undefined" || typeof window.fetch !== "function") return;
     fetchPatchInstalled = true;

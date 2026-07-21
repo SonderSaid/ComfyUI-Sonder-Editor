@@ -144,10 +144,15 @@ class SonderLazySwitch(io.ComfyNode, _LazySelectionMixin):
     @classmethod
     def validate_inputs(
         cls,
-        select: int = 0,
+        select: int | None = 0,
         branches: io.Autogrow.Type | None = None,
         **kwargs,
     ) -> bool | str:
+        if select is None:
+            # 'select' is driven by a link (e.g. Sonder Selector); its value is
+            # not resolved at prompt-validation time on newer ComfyUI, which
+            # passes None. Defer index validation to check_lazy_status/execute.
+            return True
         idx = cls._selected_index(select=select)
         idx_ok = cls._validate_index_max(idx, MAX_BRANCHES)
         if idx_ok is not True:
@@ -296,9 +301,17 @@ class SonderLazyCluster(io.ComfyNode, _LazySelectionMixin):
 
     @classmethod
     def validate_inputs(cls, **kwargs) -> bool | str:
-        select = int(kwargs.get("select", 0))
-        branches = int(kwargs.get("branches", 2))
-        lanes = int(kwargs.get("lanes", 2))
+        select_raw = kwargs.get("select", 0)
+        branches_raw = kwargs.get("branches", 2)
+        lanes_raw = kwargs.get("lanes", 2)
+        if select_raw is None or branches_raw is None or lanes_raw is None:
+            # One or more control inputs (select/branches/lanes) are driven by a
+            # link and unresolved at prompt-validation time on newer ComfyUI,
+            # which passes None. Defer validation to check_lazy_status/execute.
+            return True
+        select = int(select_raw)
+        branches = int(branches_raw)
+        lanes = int(lanes_raw)
 
         idx = cls._selected_index(select=select)
         state_ok = cls._validate_cluster_state(idx, branches, lanes)

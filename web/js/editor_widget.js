@@ -273,9 +273,8 @@ import {
 } from "./editor_settings.js";
 import {
     createStaleReplayGovernor,
-    fetchProjectJson,
     getProjectVersion,
-    rememberProjectVersionFromPayload,
+    postProjectJsonWithReconcile,
     resetProjectVersion,
 } from "./api_client.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
@@ -553,6 +552,7 @@ export class EditorWidget {
         this._sceneFetchSeq = 0;
         this._sceneMutationInvalidationSeq = 0;
         this._queueFetchSeq = 0;
+        this._assetFetchSeq = 0;
         this._staleReplayGovernors = new Map();
         this._staleReplayTimers = new Map();
         this._projectMutationQueue = new ProjectMutationQueue({
@@ -1611,29 +1611,72 @@ export class EditorWidget {
             return;
         }
 
+        // Single-flight parity with _fetchScenes: a newer asset refresh
+        // supersedes this one (latest-wins). Incremented after the mutation gate
+        // so deferred no-op calls do not churn the counter.
+        const fetchSeq = ++this._assetFetchSeq;
+        const dirName = this.projectDir.split(/[/\\]/).pop();
+        // Capture the committed version BEFORE the POST for the exhausted-conflict
+        // governor comparison (the fetch patch records response versions into the
+        // shared map before this await resumes).
+        const knownVersion = getProjectVersion(dirName);
         try {
-            const dirName = this.projectDir.split(/[/\\]/).pop();
-            const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/sync?${this._assetListQueryString()}`), {
-                method: "POST",
-            });
-            if (resp.ok) {
-                const data = await resp.json();
-                this.assets = { video: [], image: [], audio: [], artifact: [] };
-                this._pathToAsset = {};
-                for (const asset of (data.assets || [])) {
-                    if (this.assets[asset.asset_type]) {
-                        this.assets[asset.asset_type].push(asset);
-                    }
-                    if (asset.path) this._pathToAsset[asset.path] = asset;
-                }
-                this._assetGallery?.setData({
-                    assets: data.assets || [],
-                    folders: data.folders || [],
-                    currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
-                });
-                this._clearPlaybackWarmOverlay("assets-refresh");
+            // /assets/sync is a version-gated POST (the fetch patch stamps
+            // If-Match); after a generation commit bumps the version it 409s.
+            // Reconcile from the 409 body and retry, instead of silently dropping
+            // it and stranding new takes as "Missing".
+            const { payload: data, attempts } = await postProjectJsonWithReconcile(
+                api.apiURL(`/sonder-editor/project/${dirName}/assets/sync?${this._assetListQueryString()}`),
+                { method: "POST" },
+                { projectId: dirName },
+            );
+            if (fetchSeq !== this._assetFetchSeq) {
+                // A newer asset refresh superseded this one: latest-wins.
+                return;
             }
+            if (attempts > 1) {
+                sessionDiagRecord("assets_refresh_stale_version", {
+                    reason,
+                    attempts,
+                    known_version: knownVersion,
+                });
+            }
+            this._markStaleReplayApplied("assets", dirName);
+            this.assets = { video: [], image: [], audio: [], artifact: [] };
+            this._pathToAsset = {};
+            for (const asset of (data?.assets || [])) {
+                if (this.assets[asset.asset_type]) {
+                    this.assets[asset.asset_type].push(asset);
+                }
+                if (asset.path) this._pathToAsset[asset.path] = asset;
+            }
+            this._assetGallery?.setData({
+                assets: data?.assets || [],
+                folders: data?.folders || [],
+                currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
+            });
+            this._clearPlaybackWarmOverlay("assets-refresh");
         } catch (e) {
+            if (e?.code === "project_version_conflict") {
+                // Immediate heal-and-retry was exhausted (a second commit raced in
+                // between heal and retry). Hand to the shared bounded-retry +
+                // stable-server breaker; it re-enters via
+                // _deferProjectBackedRefresh(["assets"]).
+                sessionDiagRecord("assets_refresh_stale_version", {
+                    reason,
+                    exhausted: true,
+                    header_version: String(e.actualModifiedAt || ""),
+                    known_version: knownVersion,
+                });
+                this._governStaleVersionReplay(
+                    "assets",
+                    dirName,
+                    String(e.actualModifiedAt || ""),
+                    knownVersion,
+                    "asset_refresh_stale_version_replay",
+                );
+                return;
+            }
             console.warn("[Sonder] Failed to fetch assets:", e);
         }
     }
@@ -2115,33 +2158,7 @@ export class EditorWidget {
     }
 
     async _runVersionedProjectMutation(path, init = {}, { projectId = "", retryOnConflict = true, maxAttempts = 2 } = {}) {
-        let attempt = 0;
-        while (true) {
-            attempt += 1;
-            const explicitIfMatch = new Headers(init?.headers || {}).get("If-Match") || "";
-            const sentVersion = String(explicitIfMatch || getProjectVersion(projectId) || "")
-                .replace(/^W\//, "")
-                .replace(/^"|"$/g, "");
-            try {
-                return await fetchProjectJson(api.apiURL(path), init, { projectId });
-            } catch (error) {
-                if (
-                    retryOnConflict
-                    && error?.code === "project_version_conflict"
-                    && attempt < maxAttempts
-                ) {
-                    const actualVersion = String(error.actualModifiedAt || "");
-                    if (actualVersion && sentVersion && actualVersion < sentVersion) {
-                        resetProjectVersion(projectId, actualVersion);
-                    }
-                    if (error.project) {
-                        rememberProjectVersionFromPayload(error.project, projectId);
-                    }
-                    continue;
-                }
-                throw error;
-            }
-        }
+        return postProjectJsonWithReconcile(api.apiURL(path), init, { projectId, retryOnConflict, maxAttempts });
     }
 
     _queueProjectMutation({
@@ -7556,19 +7573,43 @@ export class EditorWidget {
 
         this._pushUndo("add asset");
 
+        // Drop mutations go through the versioned mutation queue for
+        // serialization, fresh If-Match versions, and one-shot 409 retry.
+        // Each `run` resolves an {ok, payload|error} sentinel instead of
+        // rejecting: the queue's rejection handler would toast and defer its
+        // own scenes refresh, but this handler owns drop failure surfacing
+        // (incl. the lane PUT's deliberate silent revert) — do not "fix" the
+        // sentinel into a rejection or failures will double-toast.
+        // Per-drop key token + coalesce:false so rapid drops never coalesce.
+        const dropSeq = `${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+        const queueDropMutation = (keySuffix, label, path, init) => this._queueProjectMutation({
+            key: `scene:${this.activeSceneId}:drop:${dropSeq}:${keySuffix}`,
+            label,
+            coalesce: false,
+            refreshScenes: false,
+            run: async () => {
+                try {
+                    const result = await this._runVersionedProjectMutation(path, init, { projectId: dirName });
+                    return { ok: true, payload: result?.payload };
+                } catch (error) {
+                    return { ok: false, error };
+                }
+            },
+        });
+
         const persistSceneLaneCounts = async (fields, reason) => {
-            try {
-                const laneResp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`), {
+            const outcome = await queueDropMutation(
+                "lanes",
+                "drop lane counts",
+                `/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}`,
+                {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(fields),
-                });
-                if (laneResp.ok) return true;
-                const message = await laneResp.text();
-                console.warn("[Sonder] Auto-add lane failed:", laneResp.status, message);
-            } catch (error) {
-                console.warn("[Sonder] Auto-add lane failed:", error);
-            }
+                },
+            );
+            if (outcome?.ok) return true;
+            console.warn("[Sonder] Auto-add lane failed:", outcome?.error?.status, outcome?.error?.message || outcome?.error);
             this._discardLastUndo("add asset");
             await this._fetchScenes({ ignoreMutationGate: true, reason });
             return false;
@@ -7675,20 +7716,26 @@ export class EditorWidget {
                     fit_mode: this._defaultFitMode(),
                     crop_position: this._defaultCropPosition(),
                 };
-                resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(clipBody),
-                });
-                if (!resp.ok) {
-                    const message = await readResponseError(resp, `Clip creation failed: ${resp.status}`);
-                    console.warn("[Sonder] Clip creation failed:", resp.status, message);
+                const clipOutcome = await queueDropMutation(
+                    "clip",
+                    "drop clip",
+                    `/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/clips`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(clipBody),
+                    },
+                );
+                if (!clipOutcome?.ok) {
+                    const error = clipOutcome?.error;
+                    const message = error?.message || `Clip creation failed: ${error?.status || ""}`;
+                    console.warn("[Sonder] Clip creation failed:", error?.status, message);
                     notifyError(message, { source: "timeline-drop" });
                     this._discardLastUndo("add asset");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_clip_error" });
                     return;
                 }
-                const clipPayload = await resp.json();
+                const clipPayload = clipOutcome.payload;
                 const { audio_track: createdAudioTrack, ...createdClip } = clipPayload || {};
                 const clipIdx = (this.activeScene.clips || []).findIndex((clip) => clip.clip_id === optimisticClipId);
                 if (clipIdx >= 0) {
@@ -7739,24 +7786,30 @@ export class EditorWidget {
                 this.activeScene.audio_tracks = this.activeScene.audio_tracks || [];
                 this.activeScene.audio_tracks.push(optimisticAudio);
                 this._renderSceneAfterLocalMutation();
-                resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks`), {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        asset_id: asset.asset_id,
-                        timeline_start_frame: frame,
-                        lane_index: targetAudioLane,
-                    }),
-                });
-                if (!resp.ok) {
-                    const message = await readResponseError(resp, `Audio track creation failed: ${resp.status}`);
-                    console.warn("[Sonder] Audio track creation failed:", resp.status, message);
+                const audioOutcome = await queueDropMutation(
+                    "audio",
+                    "drop audio track",
+                    `/sonder-editor/project/${dirName}/scenes/${this.activeSceneId}/audio_tracks`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            asset_id: asset.asset_id,
+                            timeline_start_frame: frame,
+                            lane_index: targetAudioLane,
+                        }),
+                    },
+                );
+                if (!audioOutcome?.ok) {
+                    const error = audioOutcome?.error;
+                    const message = error?.message || `Audio track creation failed: ${error?.status || ""}`;
+                    console.warn("[Sonder] Audio track creation failed:", error?.status, message);
                     notifyError(message, { source: "timeline-drop" });
                     this._discardLastUndo("add asset");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_audio_error" });
                     return;
                 }
-                const audioPayload = await resp.json();
+                const audioPayload = audioOutcome.payload;
                 const audioIdx = (this.activeScene.audio_tracks || []).findIndex((track) => track.track_id === optimisticAudioId);
                 if (audioIdx >= 0) this.activeScene.audio_tracks[audioIdx] = audioPayload;
                 this._renderSceneAfterLocalMutation();

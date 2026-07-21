@@ -6,7 +6,7 @@ import {
     resolveFrameConstraintForTemplate,
     updateEditorSettings,
 } from "./editor_settings.js";
-import { installProjectVersionFetchPatch, getProjectVersion } from "./api_client.js";
+import { installProjectVersionFetchPatch, getProjectVersion, postProjectJsonWithReconcile } from "./api_client.js";
 import {
     claimEditorSession,
     createEditorHandoff,
@@ -2283,13 +2283,16 @@ export class EditorNodeController {
 
         try {
             if (syncAssets) {
-                const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/sync`), {
-                    method: "POST",
-                    signal: aborter.signal,
-                });
-                if (!resp.ok) {
-                    throw new Error(`Asset sync failed: ${resp.status}`);
-                }
+                // Version-gated POST: reconcile a post-commit 409 (heal + retry)
+                // instead of throwing, which would abort the whole summary refresh
+                // and strand new takes as "Missing". AbortError still propagates
+                // (it is not a version conflict) so latest-wins abort is preserved.
+                const projectId = projectIdFromDir(this.state.projectDir);
+                await postProjectJsonWithReconcile(
+                    api.apiURL(`/sonder-editor/project/${projectId}/assets/sync`),
+                    { method: "POST", signal: aborter.signal },
+                    { projectId },
+                );
             }
             this.syncStateFromWidgets();
             this.state.dormantSummary = await fetchJson(

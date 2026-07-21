@@ -60,3 +60,33 @@ def test_lazy_cluster_requests_only_selected_branch_lanes():
     )
 
     assert needed == ["b1_l0"]
+
+
+def test_lazy_switch_validate_defers_when_select_linked():
+    # A linked 'select' (e.g. driven by Sonder Selector) is None at
+    # prompt-validation time on newer ComfyUI. Validation must defer, not crash.
+    lazy = _import_lazy_switches()
+
+    assert lazy.SonderLazySwitch.validate_inputs(select=None) is True
+
+
+def test_lazy_switch_validate_still_checks_concrete_select():
+    lazy = _import_lazy_switches()
+
+    # Concrete, connected branch → valid.
+    assert lazy.SonderLazySwitch.validate_inputs(
+        select=1, branches={"item1": object()}
+    ) is True
+    # Concrete, unconnected selected branch → error string, not True.
+    result = lazy.SonderLazySwitch.validate_inputs(
+        select=0, branches={"item1": object()}
+    )
+    assert isinstance(result, str)
+
+
+def test_lazy_cluster_validate_defers_when_control_linked():
+    lazy = _import_lazy_switches()
+
+    assert lazy.SonderLazyCluster.validate_inputs(select=None) is True
+    assert lazy.SonderLazyCluster.validate_inputs(select=0, branches=None) is True
+    assert lazy.SonderLazyCluster.validate_inputs(select=0, lanes=None) is True

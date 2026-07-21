@@ -5,6 +5,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
 from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,7 +62,19 @@ def _apply_scene_operations(route_module, monkeypatch, project, scene_id, operat
     )))
 
 
-def test_project_version_header_middleware_attaches_loaded_project_version(monkeypatch):
+def test_sonder_route_path_strips_single_api_segment(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+
+    assert route_module._sonder_route_path("/api/sonder-editor/project/p") == "/sonder-editor/project/p"
+    assert route_module._sonder_route_path("/sonder-editor/project/p") == "/sonder-editor/project/p"
+    assert route_module._sonder_route_path("/apifoo/sonder-editor/x") == "/apifoo/sonder-editor/x"
+    assert route_module._sonder_route_path("/api") == "/api"
+    # Single strip only: a double /api prefix stays unmatched by design.
+    assert route_module._sonder_route_path("/api/api/sonder-editor/x") == "/api/sonder-editor/x"
+
+
+@pytest.mark.parametrize("prefix", ["", "/api"])
+def test_project_version_header_middleware_attaches_loaded_project_version(monkeypatch, prefix):
     route_module = _load_route_module(monkeypatch)
     project = TimelineProject(project_dir="", name="Project")
     project.project_id = "project-1"
@@ -74,7 +87,7 @@ def test_project_version_header_middleware_attaches_loaded_project_version(monke
     request = DummyRequest(
         match_info={"project_id": "project-1"},
         method="GET",
-        path="/sonder-editor/project/project-1/scenes/scene-1",
+        path=f"{prefix}/sonder-editor/project/project-1/scenes/scene-1",
     )
     response = asyncio.run(route_module._project_version_header_middleware(request, handler))
 
@@ -82,7 +95,8 @@ def test_project_version_header_middleware_attaches_loaded_project_version(monke
     assert response.headers["X-Sonder-Project-Modified-At"] == "version-1"
 
 
-def test_sonder_security_middleware_adds_security_headers(monkeypatch):
+@pytest.mark.parametrize("prefix", ["", "/api"])
+def test_sonder_security_middleware_adds_security_headers(monkeypatch, prefix):
     route_module = _load_route_module(monkeypatch)
 
     async def handler(_request):
@@ -90,7 +104,7 @@ def test_sonder_security_middleware_adds_security_headers(monkeypatch):
 
     request = DummyRequest(
         method="GET",
-        path="/sonder-editor/project/project-1/assets",
+        path=f"{prefix}/sonder-editor/project/project-1/assets",
         headers={"Host": "127.0.0.1:7822"},
     )
     response = asyncio.run(route_module._sonder_security_middleware(request, handler))
@@ -102,7 +116,8 @@ def test_sonder_security_middleware_adds_security_headers(monkeypatch):
     assert "frame-ancestors 'self'" in response.headers["Content-Security-Policy"]
 
 
-def test_sonder_security_middleware_blocks_cross_origin_mutation(monkeypatch):
+@pytest.mark.parametrize("prefix", ["", "/api"])
+def test_sonder_security_middleware_blocks_cross_origin_mutation(monkeypatch, prefix):
     route_module = _load_route_module(monkeypatch)
     called = []
 
@@ -112,7 +127,7 @@ def test_sonder_security_middleware_blocks_cross_origin_mutation(monkeypatch):
 
     request = DummyRequest(
         method="POST",
-        path="/sonder-editor/project/project-1/assets/sync",
+        path=f"{prefix}/sonder-editor/project/project-1/assets/sync",
         headers={"Host": "127.0.0.1:7822", "Origin": "https://example.invalid"},
     )
     response = asyncio.run(route_module._sonder_security_middleware(request, handler))
@@ -124,7 +139,8 @@ def test_sonder_security_middleware_blocks_cross_origin_mutation(monkeypatch):
     assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
-def test_sonder_security_middleware_allows_same_origin_mutation(monkeypatch):
+@pytest.mark.parametrize("prefix", ["", "/api"])
+def test_sonder_security_middleware_allows_same_origin_mutation(monkeypatch, prefix):
     route_module = _load_route_module(monkeypatch)
     called = []
 
@@ -134,7 +150,7 @@ def test_sonder_security_middleware_allows_same_origin_mutation(monkeypatch):
 
     request = DummyRequest(
         method="POST",
-        path="/sonder-editor/project/project-1/assets/sync",
+        path=f"{prefix}/sonder-editor/project/project-1/assets/sync",
         headers={"Host": "127.0.0.1:7822", "Origin": "http://127.0.0.1:7822"},
     )
     response = asyncio.run(route_module._sonder_security_middleware(request, handler))
@@ -143,7 +159,8 @@ def test_sonder_security_middleware_allows_same_origin_mutation(monkeypatch):
     assert called == [True]
 
 
-def test_sonder_security_middleware_allows_absent_origin_mutation(monkeypatch):
+@pytest.mark.parametrize("prefix", ["", "/api"])
+def test_sonder_security_middleware_allows_absent_origin_mutation(monkeypatch, prefix):
     route_module = _load_route_module(monkeypatch)
     called = []
 
@@ -153,13 +170,30 @@ def test_sonder_security_middleware_allows_absent_origin_mutation(monkeypatch):
 
     request = DummyRequest(
         method="POST",
-        path="/sonder-editor/project/project-1/assets/sync",
+        path=f"{prefix}/sonder-editor/project/project-1/assets/sync",
         headers={"Host": "127.0.0.1:7822"},
     )
     response = asyncio.run(route_module._sonder_security_middleware(request, handler))
 
     assert response.status == 200
     assert called == [True]
+
+
+def test_sonder_security_middleware_ignores_non_sonder_api_paths(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+
+    async def handler(_request):
+        return web.json_response({"status": "ok"})
+
+    request = DummyRequest(
+        method="GET",
+        path="/api/prompt",
+        headers={"Host": "127.0.0.1:7822"},
+    )
+    response = asyncio.run(route_module._sonder_security_middleware(request, handler))
+
+    assert response.status == 200
+    assert "Content-Security-Policy" not in response.headers
 
 
 def test_scene_mutation_remove_lane_is_single_save_and_reindexes(monkeypatch, tmp_path):
@@ -1199,6 +1233,43 @@ def test_queue_update_retries_stale_version_and_preserves_newer_jobs(monkeypatch
         "job-a": "completed",
         "job-b": "pending",
     }
+
+
+def test_asset_sync_stale_version_returns_409_conflict(monkeypatch, tmp_path):
+    # After a generation commit bumps the project version, the editor's asset
+    # refresh POSTs /assets/sync with a now-stale If-Match. The load-time
+    # precondition raises ProjectVersionConflict, which the shared conflict
+    # middleware renders as the 409 the client reconcile handler parses.
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    project = TimelineProject(project_dir=str(project_dir), name="Project")
+    project.project_id = "proj"
+    route_module.save_project(project)
+    monkeypatch.setattr(route_module, "_get_base_dir", lambda: str(tmp_path))
+    base_version = project.modified_at
+
+    # A later writer (mirrors a Save Video/Bridge generation commit) bumps the
+    # on-disk version past what the client still holds in its If-Match.
+    current = route_module.load_project(str(project_dir))
+    route_module.save_project(current)
+    assert current.modified_at != base_version
+
+    handler = _route_handler(route_module, "POST", "/sonder-editor/project/{project_id}/assets/sync")
+    request = DummyRequest(
+        match_info={"project_id": "proj"},
+        headers={"If-Match": base_version},
+        method="POST",
+        path="/sonder-editor/project/proj/assets/sync",
+    )
+    response = asyncio.run(route_module._project_conflict_middleware(request, handler))
+    payload = _response_json(response)
+
+    assert response.status == 409
+    assert payload["code"] == "project_version_conflict"
+    assert payload["expected_modified_at"] == base_version
+    assert payload["actual_modified_at"] == current.modified_at
+    assert payload["project"]["project_id"] == "proj"
 
 
 def test_scene_mutation_consolidates_video_and_removes_only_vacated_lanes(monkeypatch, tmp_path):
