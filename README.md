@@ -140,7 +140,37 @@ automatically.
 7. **Run the prompt.** The editor renders the selected window (or queued
    snapshots) into your workflow, and outputs return as project assets.
 
-<!-- TODO: link example workflow .json files here once published, e.g. an LTXV pipeline. -->
+## Example workflow
+
+Download the **[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)**
+workflow for a ready-wired generation graph covering prompt relay, multi-pass
+upscaling, image guides, and driver-controlled generation. It pairs with the
+sample project below.
+
+## Documentation
+
+- **[Getting Started](docs/getting-started.md)** — install to first
+  generated take, starting with pure text-to-video.
+- **[Editor Basics](docs/editor-basics.md)** — layout, timeline, item
+  types, gestures, and shortcuts.
+- **[Generating](docs/generating.md)** — the generation window, model
+  templates, prompts, guides, Drivers, the render queue, and what's frozen
+  vs. live in queued jobs.
+- **[Assets & Gallery](docs/assets-and-gallery.md)** — asset lifecycle,
+  tracked metadata, inspect/compare, and timeline export.
+
+## Sample project
+
+A ready-made showcase project — media, scenes, guides, prompts, generated
+takes, and cached thumbnails — is available from the
+[GitHub Releases page](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/releases).
+
+1. Download `Project-Sample.zip` from the **Sonder Editor Project Sample**
+   release.
+2. Extract it into `ComfyUI/output/sonder-projects/` so the sample sits in
+   its own folder there.
+3. Open the **Sonder Editor** node and select the project from the project
+   selector.
 
 ## Security & metadata
 

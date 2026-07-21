@@ -5,7 +5,7 @@
 # is already pointed at the intended public GitHub project.
 
 [project]
-name = "comfyui-sonder-editor"
+name = "sonder-editor"
 description = "Single-node, NLE-style video editor for ComfyUI: timeline, scenes, guides, prompt sections, project-scoped asset management, gallery, and a render-queue generation pipeline."
 version = "0.1.0"
 readme = "README.md"
@@ -35,9 +35,10 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/SonderSaid/ComfyUI-Sonder-Editor"
+Documentation = "https://github.com/SonderSaid/ComfyUI-Sonder-Editor#documentation"
 
 [tool.comfy]
 PublisherId = "sondersaid"
 DisplayName = "Sonder Editor"
-# Optional: a public URL to a square icon shown on the Registry listing.
-Icon = ""
+# Public square icon shown on the Registry listing and in ComfyUI-Manager.
+Icon = "https://raw.githubusercontent.com/SonderSaid/ComfyUI-Sonder-Editor/main/docs/images/sonder-editor-registry-icon.png"

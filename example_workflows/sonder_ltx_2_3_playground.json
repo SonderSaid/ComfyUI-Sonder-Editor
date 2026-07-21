@@ -1,0 +1,7215 @@
+{
+  "id": "43dab060-0f89-442d-93d1-fd7ddbafa6b0",
+  "revision": 0,
+  "last_node_id": 3061,
+  "last_link_id": 13669,
+  "nodes": [
+    {
+      "id": 502,
+      "type": "SetNode",
+      "pos": [
+        -3570,
+        4620
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 56,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "link": 1197
+        }
+      ],
+      "outputs": [
+        {
+          "name": "*",
+          "type": "*",
+          "links": null
+        }
+      ],
+      "title": "Set_AudioVae",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "AudioVae",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "AudioVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 1783,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        5837.261113524136
+      ],
+      "size": [
+        220,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            6893
+          ]
+        }
+      ],
+      "title": "Get_audio_latent_firstpass",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "audio_latent_firstpass"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 1785,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        5917.261113524136
+      ],
+      "size": [
+        210,
+        50
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            6898
+          ]
+        }
+      ],
+      "title": "Get_AudioVae",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "AudioVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 1784,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        5957.261113524136
+      ],
+      "size": [
+        210,
+        50
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            13631
+          ]
+        }
+      ],
+      "title": "Get_VideoVae",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "VideoVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 1782,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        5877.261113524136
+      ],
+      "size": [
+        220,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            13632
+          ]
+        }
+      ],
+      "title": "Get_video_latent_firstpass",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "video_latent_firstpass"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2374,
+      "type": "GetNode",
+      "pos": [
+        -4420,
+        5770
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            8081
+          ]
+        }
+      ],
+      "title": "Get_AudioVae",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "AudioVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2787,
+      "type": "SetNode",
+      "pos": [
+        -4310,
+        5820
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 84,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "link": 13120
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": null
+        }
+      ],
+      "title": "Set_audio_latent",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "audio_latent",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "audio_latent"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2788,
+      "type": "GetNode",
+      "pos": [
+        -3860,
+        5100
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            13122
+          ]
+        }
+      ],
+      "title": "Get_video_latent",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "video_latent"
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 2789,
+      "type": "GetNode",
+      "pos": [
+        -3860,
+        5140
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            13123
+          ]
+        }
+      ],
+      "title": "Get_audio_latent",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "audio_latent"
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 507,
+      "type": "SetNode",
+      "pos": [
+        -1840,
+        4480
+      ],
+      "size": [
+        230,
+        110
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 92,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "link": 13108
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": []
+        }
+      ],
+      "title": "Set_NEG",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "NEG",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "NEG"
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 503,
+      "type": "SetNode",
+      "pos": [
+        -3560,
+        4540
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 60,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "link": 1196
+        }
+      ],
+      "outputs": [
+        {
+          "name": "*",
+          "type": "*",
+          "links": []
+        }
+      ],
+      "title": "Set_VideoVae",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "VideoVae",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "VideoVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2395,
+      "type": "GetNode",
+      "pos": [
+        -4410,
+        5490
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            9172
+          ]
+        }
+      ],
+      "title": "Get_VideoVae",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "VideoVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2824,
+      "type": "SaveLatent",
+      "pos": [
+        -750,
+        5290
+      ],
+      "size": [
+        270,
+        60
+      ],
+      "flags": {},
+      "order": 114,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 13212
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": 13197
+        }
+      ],
+      "outputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.20.1",
+        "Node name for S&R": "SaveLatent",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "latents/ComfyUI"
+      ]
+    },
+    {
+      "id": 2387,
+      "type": "LTXVAudioVAEEncode",
+      "pos": [
+        -4410,
+        5870
+      ],
+      "size": [
+        210,
+        50
+      ],
+      "flags": {},
+      "order": 75,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 13262
+        },
+        {
+          "label": "Audio VAE",
+          "name": "audio_vae",
+          "type": "VAE",
+          "link": 8081
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Audio Latent",
+          "type": "LATENT",
+          "links": [
+            13120
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.19.3",
+        "Node name for S&R": "LTXVAudioVAEEncode",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2480,
+      "type": "VAEEncodeTiled",
+      "pos": [
+        -4420,
+        5580
+      ],
+      "size": [
+        270,
+        150
+      ],
+      "flags": {},
+      "order": 72,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pixels",
+          "type": "IMAGE",
+          "link": 13321
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 9172
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            13294
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.20.1",
+        "Node name for S&R": "VAEEncodeTiled",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        4096,
+        1024,
+        240,
+        64
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2206,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        -1010,
+        5150
+      ],
+      "size": [
+        230,
+        150
+      ],
+      "flags": {},
+      "order": 111,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise",
+          "type": "NOISE",
+          "link": 7688
+        },
+        {
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 13428
+        },
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 13427
+        },
+        {
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 13442
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 7974
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "LATENT",
+          "links": [
+            9702
+          ]
+        },
+        {
+          "name": "denoised_output",
+          "type": "LATENT",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.16.4",
+        "Node name for S&R": "SamplerCustomAdvanced",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 2192,
+      "type": "RandomNoise",
+      "pos": [
+        -1360,
+        4920
+      ],
+      "size": [
+        270,
+        90
+      ],
+      "flags": {},
+      "order": 57,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "noise_seed",
+          "type": "INT",
+          "widget": {
+            "name": "noise_seed"
+          },
+          "link": 7689
+        }
+      ],
+      "outputs": [
+        {
+          "name": "NOISE",
+          "type": "NOISE",
+          "links": [
+            7688
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.16.4",
+        "Node name for S&R": "RandomNoise",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0,
+        "fixed"
+      ]
+    },
+    {
+      "id": 2194,
+      "type": "LTXVCropGuides",
+      "pos": [
+        -750,
+        5000
+      ],
+      "size": [
+        240,
+        100
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 113,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 13153
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 13154
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 7678
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": []
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": []
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "slot_index": 2,
+          "links": [
+            7703
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.68",
+        "Node name for S&R": "LTXVCropGuides",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2187,
+      "type": "LTXVSeparateAVLatent",
+      "pos": [
+        -750,
+        5160
+      ],
+      "size": [
+        240,
+        50
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 112,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "av_latent",
+          "type": "LATENT",
+          "link": 9702
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_latent",
+          "type": "LATENT",
+          "links": [
+            7678,
+            13212
+          ]
+        },
+        {
+          "name": "audio_latent",
+          "type": "LATENT",
+          "links": [
+            7687
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.5.1",
+        "Node name for S&R": "LTXVSeparateAVLatent",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 2380,
+      "type": "GetNode",
+      "pos": [
+        -3860,
+        4950
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            10945
+          ]
+        }
+      ],
+      "title": "Get_NEG",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "NEG"
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 2861,
+      "type": "GetNode",
+      "pos": [
+        -3860,
+        4990
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "links": [
+            13276
+          ]
+        }
+      ],
+      "title": "Get_fps",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "fps"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 2382,
+      "type": "GetNode",
+      "pos": [
+        -3860,
+        5040
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            8060,
+            13640
+          ]
+        }
+      ],
+      "title": "Get_VideoVae",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "VideoVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2786,
+      "type": "SetNode",
+      "pos": [
+        -4310,
+        5530
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 83,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "link": 13294
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": null
+        }
+      ],
+      "title": "Set_video_latent",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "video_latent",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "video_latent"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 147,
+      "type": "VAELoaderKJ",
+      "pos": [
+        -3860,
+        4590
+      ],
+      "size": [
+        270,
+        180
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 11,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            1197
+          ]
+        }
+      ],
+      "title": "VAELoader KJ Audio",
+      "properties": {
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "1.2.5",
+        "Node name for S&R": "VAELoaderKJ",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "LTX\\LTX23_audio_vae_bf16.safetensors",
+        "main_device",
+        "bf16"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2893,
+      "type": "SetNode",
+      "pos": [
+        -3250,
+        4550
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 61,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "link": 13373
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": null
+        }
+      ],
+      "title": "Set_CLIP",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "CLIP",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "CLIP"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2892,
+      "type": "SetNode",
+      "pos": [
+        -3120,
+        4030
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 85,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "link": 13372
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": null
+        }
+      ],
+      "title": "Set_Power Lora",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "Power Lora",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Power Lora"
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 1908,
+      "type": "GetNode",
+      "pos": [
+        -1660,
+        4910
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 12,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": [
+            7689,
+            8672
+          ]
+        }
+      ],
+      "title": "Get_seed",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "seed"
+      ],
+      "color": "#1b4669",
+      "bgcolor": "#29699c"
+    },
+    {
+      "id": 2894,
+      "type": "SetNode",
+      "pos": [
+        -1080,
+        5060
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 109,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "link": 13374
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "links": null
+        }
+      ],
+      "title": "Set_CFG",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "CFG",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "CFG"
+      ],
+      "color": "#3c7878",
+      "bgcolor": "#1c453b"
+    },
+    {
+      "id": 1781,
+      "type": "SetNode",
+      "pos": [
+        -480,
+        5210
+      ],
+      "size": [
+        220,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 115,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "link": 7687
+        }
+      ],
+      "outputs": [
+        {
+          "name": "*",
+          "type": "*",
+          "links": []
+        }
+      ],
+      "title": "Set_audio_latent_firstpass",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "audio_latent_firstpass",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "audio_latent_firstpass"
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 1780,
+      "type": "SetNode",
+      "pos": [
+        -480,
+        5100
+      ],
+      "size": [
+        220,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 116,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "link": 7703
+        }
+      ],
+      "outputs": [
+        {
+          "name": "*",
+          "type": "*",
+          "links": []
+        }
+      ],
+      "title": "Set_video_latent_firstpass",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "video_latent_firstpass",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "video_latent_firstpass"
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 2904,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6537.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "links": [
+            13387
+          ]
+        }
+      ],
+      "title": "Get_CFG",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "CFG"
+      ],
+      "color": "#3c7878",
+      "bgcolor": "#1c453b"
+    },
+    {
+      "id": 2900,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6457.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 14,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            13383
+          ]
+        }
+      ],
+      "title": "Get_CLIP",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "CLIP"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2899,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6417.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 15,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            13382
+          ]
+        }
+      ],
+      "title": "Get_AudioVae",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "AudioVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2897,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6307.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 16,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            13379
+          ]
+        }
+      ],
+      "title": "Get_BaseModel",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "BaseModel"
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 2902,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6267.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 17,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": [
+            13378
+          ]
+        }
+      ],
+      "title": "Get_seed",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "seed"
+      ],
+      "color": "#1b4669",
+      "bgcolor": "#29699c"
+    },
+    {
+      "id": 2901,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6337.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 18,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            13380
+          ]
+        }
+      ],
+      "title": "Get_Power Lora",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Power Lora"
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 2898,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6387.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 19,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            13381
+          ]
+        }
+      ],
+      "title": "Get_VideoVae",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "VideoVae"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2784,
+      "type": "SetNode",
+      "pos": [
+        -4420,
+        5390
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 74,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "link": 13261
+        }
+      ],
+      "outputs": [
+        {
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "links": null
+        }
+      ],
+      "title": "Set_fps",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "fps",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "fps"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 2909,
+      "type": "MarkdownNote",
+      "pos": [
+        -420,
+        5330
+      ],
+      "size": [
+        380,
+        200
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### Sonder Save Bridge\n*Lets a third-party / native save node write into your project, then adopts its files as assets.*\n\n**Why it exists:** When you'd rather use someone else's encoder or save node but still want the results tracked in Sonder.\n\n**How to use it:** Wire `project` in. It hands you `output_dir` + `filename_prefix` — point your external save node at those. After the prompt finishes, the bridge automatically registers whatever was written into the project's asset system. Optionally set a `target_folder`, a filename `prefix`, and `mark_queue_complete`."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2895,
+      "type": "SetNode",
+      "pos": [
+        -1060,
+        5400
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 77,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "link": 13375
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "links": null
+        }
+      ],
+      "title": "Set_Sampler",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "Sampler",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Sampler"
+      ],
+      "color": "#614a4a",
+      "bgcolor": "#3b2c2c"
+    },
+    {
+      "id": 2437,
+      "type": "CFGGuider",
+      "pos": [
+        -1360,
+        5070
+      ],
+      "size": [
+        270,
+        100
+      ],
+      "flags": {},
+      "order": 107,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 13163
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 13151
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 13152
+        }
+      ],
+      "outputs": [
+        {
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "links": [
+            13374,
+            13428
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.20.1",
+        "Node name for S&R": "CFGGuider",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        1
+      ],
+      "color": "#233",
+      "bgcolor": "#355"
+    },
+    {
+      "id": 2497,
+      "type": "LTXVScheduler",
+      "pos": [
+        -1650,
+        5390
+      ],
+      "size": [
+        270,
+        160
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 108,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "latent",
+          "shape": 7,
+          "type": "LATENT",
+          "link": 9688
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            13440
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.20.1",
+        "Node name for S&R": "LTXVScheduler",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        8,
+        2.05,
+        0.95,
+        true,
+        0.1
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 2781,
+      "type": "ManualSigmas",
+      "pos": [
+        -1650,
+        5590
+      ],
+      "size": [
+        270,
+        60
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 21,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            13441
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.20.1",
+        "Node name for S&R": "ManualSigmas",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "0.85, 0.7250, 0.4219, 0.0"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 2903,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        6497.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 22,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "links": [
+            13446
+          ]
+        }
+      ],
+      "title": "Get_Sampler",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Sampler"
+      ],
+      "color": "#614a4a",
+      "bgcolor": "#3b2c2c"
+    },
+    {
+      "id": 2790,
+      "type": "GetNode",
+      "pos": [
+        -2670,
+        4110
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 23,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            13134
+          ]
+        }
+      ],
+      "title": "Get_video_latent",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "video_latent"
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 2378,
+      "type": "SonderGuidesBridgeEnd",
+      "pos": [
+        -2750,
+        5540
+      ],
+      "size": [
+        214.1412109375,
+        126
+      ],
+      "flags": {},
+      "order": 98,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13248
+        },
+        {
+          "name": "flow_control",
+          "type": "FLOW_CONTROL",
+          "link": 8033
+        },
+        {
+          "label": "COND",
+          "name": "value_0",
+          "shape": 7,
+          "type": "*",
+          "link": 8047
+        },
+        {
+          "label": "COND",
+          "name": "value_1",
+          "shape": 7,
+          "type": "*",
+          "link": 8048
+        },
+        {
+          "label": "LATENT",
+          "name": "value_2",
+          "shape": 7,
+          "type": "*",
+          "link": 10728
+        },
+        {
+          "label": "value_3",
+          "name": "value_3",
+          "shape": 7,
+          "type": "*",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "COND",
+          "name": "value_0",
+          "type": "*",
+          "links": [
+            13455,
+            13638
+          ]
+        },
+        {
+          "label": "COND",
+          "name": "value_1",
+          "type": "*",
+          "links": [
+            13456,
+            13639
+          ]
+        },
+        {
+          "label": "LATENT",
+          "name": "value_2",
+          "type": "*",
+          "links": [
+            13458,
+            13641
+          ]
+        },
+        {
+          "label": "value_3",
+          "name": "value_3",
+          "type": "*",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderGuidesBridgeEnd",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2379,
+      "type": "GetNode",
+      "pos": [
+        -3860,
+        4910
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 24,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            10943
+          ]
+        }
+      ],
+      "title": "Get_POS",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "POS"
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 2772,
+      "type": "SonderPromptRelayBridge",
+      "pos": [
+        -2730,
+        4160
+      ],
+      "size": [
+        230,
+        90
+      ],
+      "flags": {},
+      "order": 67,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13249
+        }
+      ],
+      "outputs": [
+        {
+          "name": "global_prompt",
+          "type": "STRING",
+          "links": [
+            13210
+          ]
+        },
+        {
+          "name": "smart_prompt",
+          "type": "STRING",
+          "links": [
+            13211
+          ]
+        },
+        {
+          "name": "local_prompts",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "segment_lengths",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderPromptRelayBridge",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2914,
+      "type": "MarkdownNote",
+      "pos": [
+        -2930,
+        4300
+      ],
+      "size": [
+        460,
+        260
+      ],
+      "flags": {},
+      "order": 25,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### Sonder Prompt Relay Bridge\n*Converts your timeline prompts into kijai ComfyUI-PromptRelay strings (Wan/LTX).*\n\n**How to use it:** Wire `project` in. It exports the render window's global + section prompts as relay-ready strings:\n- `global_prompt` + `smart_prompt` → **Prompt Relay Encode (Smart)**\n- `global_prompt` + `local_prompts` + `segment_lengths` → the manual **Prompt Relay Encode**\n\nPrompt sections hold until the next one starts, and frame tags are rebased to the window. No model patching happens here — PromptRelay itself owns the temporal routing and reads frame counts from the sampled latent.\n\n⚠️ *Note:* PromptRelay conflicts with other attention patchers — don't stack it with another one."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2912,
+      "type": "MarkdownNote",
+      "pos": [
+        -3610,
+        4910
+      ],
+      "size": [
+        400,
+        340
+      ],
+      "flags": {},
+      "order": 26,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### Sonder Driver Selector\nResolves a Driver lane cheaply — tells you if a driver is present without decoding any video.\n\nHow to use it: Wire project in and pick driver_lane_index. It returns a driver_ref handle plus a has_driver flag (1 = the lane has usable media, 0 = empty/hidden/muted). Use \"has_driver\" to drive a Sonder Switch/Cluster select, to cleanly bypass the driver workflow. This is useful in cases where your driver is only present on a specific section of your timeline and you are doing batch rendering.\n\nInputs: project, driver_lane_index → Outputs: driver_ref, has_driver.\n\n### Sonder Driver Bridge\nDecodes the driver frames from a resolved reference.\n\nHow to use it: Wire the driver_ref from a Sonder Driver Selector in. It decodes that lane's clip into driver_images rebased to the render window, plus the local start frame and strength. Feed these into your motion/driver conditioning.\n\nInputs: driver_ref → Outputs: driver_images, driver_idx, driver_strength.\n\n💡 Behavior: Missing lane/clip → black fallback; a decode failure on an active driver raises an error. Queued renders use the frozen driver snapshot. "
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2793,
+      "type": "Reroute",
+      "pos": [
+        -1920,
+        5320
+      ],
+      "size": [
+        75,
+        26
+      ],
+      "flags": {},
+      "order": 105,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "",
+          "type": "*",
+          "link": 13469
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "CONDITIONING",
+          "links": [
+            13152,
+            13154
+          ]
+        }
+      ],
+      "properties": {
+        "showOutputText": false,
+        "horizontal": false,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      }
+    },
+    {
+      "id": 2792,
+      "type": "Reroute",
+      "pos": [
+        -1920,
+        5280
+      ],
+      "size": [
+        75,
+        26
+      ],
+      "flags": {},
+      "order": 104,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "",
+          "type": "*",
+          "link": 13468
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "CONDITIONING",
+          "links": [
+            13151,
+            13153
+          ]
+        }
+      ],
+      "properties": {
+        "showOutputText": false,
+        "horizontal": false,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      }
+    },
+    {
+      "id": 152,
+      "type": "LTXVConcatAVLatent",
+      "pos": [
+        -2060,
+        5190
+      ],
+      "size": [
+        230,
+        80
+      ],
+      "flags": {},
+      "order": 106,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video_latent",
+          "type": "LATENT",
+          "link": 13470
+        },
+        {
+          "name": "audio_latent",
+          "type": "LATENT",
+          "link": 10736
+        }
+      ],
+      "outputs": [
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            7974,
+            9688
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "LTXVConcatAVLatent",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 2806,
+      "type": "SetNode",
+      "pos": [
+        -4600,
+        6060
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 64,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "link": 13439
+        }
+      ],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "title": "Set_Scheduler",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "Scheduler",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Scheduler"
+      ],
+      "color": "#1b4669",
+      "bgcolor": "#29699c"
+    },
+    {
+      "id": 2808,
+      "type": "SonderMetadataCollector",
+      "pos": [
+        -3691.251636208739,
+        6217.261113524136
+      ],
+      "size": [
+        217.3609375,
+        518
+      ],
+      "flags": {},
+      "order": 71,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13535
+        },
+        {
+          "label": "INT",
+          "name": "value_0",
+          "shape": 7,
+          "type": "*",
+          "link": 13378
+        },
+        {
+          "label": "MODEL",
+          "name": "value_1",
+          "type": "*",
+          "link": 13379
+        },
+        {
+          "label": "MODEL",
+          "name": "value_2",
+          "type": "*",
+          "link": 13380
+        },
+        {
+          "label": "VAE",
+          "name": "value_3",
+          "type": "*",
+          "link": 13381
+        },
+        {
+          "label": "VAE",
+          "name": "value_4",
+          "type": "*",
+          "link": 13382
+        },
+        {
+          "label": "CLIP",
+          "name": "value_5",
+          "type": "*",
+          "link": 13383
+        },
+        {
+          "label": "SAMPLER",
+          "name": "value_6",
+          "type": "*",
+          "link": 13446
+        },
+        {
+          "label": "GUIDER",
+          "name": "value_7",
+          "type": "*",
+          "link": 13387
+        },
+        {
+          "label": "TEXT",
+          "name": "value_8",
+          "type": "*",
+          "link": 13445
+        },
+        {
+          "label": "SIGMAS",
+          "name": "value_9",
+          "type": "*",
+          "link": 13627
+        },
+        {
+          "label": "value_10",
+          "name": "value_10",
+          "type": "*",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "links": [
+            13545
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderMetadataCollector",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "Scheduler Used",
+        "",
+        "",
+        ""
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2785,
+      "type": "GetNode",
+      "pos": [
+        -3861.251636208739,
+        5997.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 27,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "links": [
+            13546
+          ]
+        }
+      ],
+      "title": "Get_fps",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "fps"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 145,
+      "type": "LTXVAudioVAEDecode",
+      "pos": [
+        -3471.251636208739,
+        5827.261113524136
+      ],
+      "size": [
+        240,
+        50
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 54,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 6893
+        },
+        {
+          "label": "Audio VAE",
+          "name": "audio_vae",
+          "type": "VAE",
+          "link": 6898
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Audio",
+          "type": "AUDIO",
+          "links": [
+            13403,
+            13548
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.7.0",
+        "Node name for S&R": "LTXVAudioVAEDecode",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 2823,
+      "type": "SonderSaveBridge",
+      "pos": [
+        -760,
+        5400
+      ],
+      "size": [
+        300,
+        200
+      ],
+      "flags": {},
+      "order": 68,
+      "mode": 4,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13251
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output_dir",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "links": [
+            13197
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderSaveBridge",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "Latents",
+        "VideoLatent",
+        false,
+        ""
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2796,
+      "type": "GetNode",
+      "pos": [
+        -1660,
+        4950
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 28,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            13163,
+            13552
+          ]
+        }
+      ],
+      "title": "Get_Model",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Model"
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 2908,
+      "type": "MarkdownNote",
+      "pos": [
+        -3081.251636208739,
+        5827.261113524136
+      ],
+      "size": [
+        380,
+        510
+      ],
+      "flags": {},
+      "order": 29,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "## 💾 Outputs\n\n### Sonder Save Video\n*Encodes your frames into a real project video asset — optionally a \"Take\" placed back on the timeline.*\n\n**How to use it:** Connect `project` and `frames` (and `audio` to mux a soundtrack). Set **mode**:\n- **Video** — a normal saved file in the project's media folder.\n- **Take** — saves *and* drops the result onto the timeline as a new lane for review/comparison or driving the next segment of the timeline in batch rendering.\n\nPick a **save_preset**, or switch to **Custom** to control container, codec, CRF, pixel format, etc. The card shows an inline player (toggle `autoplay_preview`). Enable **mark_queue_complete** when you want to advance the render queue. Do not use if you want to iterate on the same queued item.\n\n\n### Sonder Preview Video\n*Quick in-UI playback — no asset is saved.*\n\n**How to use it:** Connect a batch of `frames` (and `audio`). It encodes a temporary video and plays it right on the node card. Use this for fast iteration when you don't want to commit a file to the project.\n\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2935,
+      "type": "GetNode",
+      "pos": [
+        -3871.251636208739,
+        6577.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 30,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            13445
+          ]
+        }
+      ],
+      "title": "Get_SchedulerS",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "SchedulerS"
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2911,
+      "type": "MarkdownNote",
+      "pos": [
+        -2360,
+        5470
+      ],
+      "size": [
+        500,
+        250
+      ],
+      "flags": {},
+      "order": 31,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### Sonder Guides Bridge Start / End\n*A for-each loop over your scene's guide frames — injects them one at a time into a generation body.*\n\n**Why it exists:** The Editor's `guide_images` output is a single batch. When a guider/sampler needs guides handled **one per iteration** instead, wrap that part of your graph between these two nodes.\n\n**How to use it:**\n1. **Start** takes `project` + `iteration_index` and emits one `(image, frame_index, strength)` per loop pass, plus `flow_control` and dynamic `value_i` passthrough sockets to carry state through the loop.\n2. Build your per-guide body off those outputs. Everything in the middle of the guides bridge will loop and apply to all guides.\n3. **End** takes `project` + `flow_control` back; it recurses automatically until every guide is consumed, then returns the final `value_i` passthroughs.\n\n💡 *Tip:* Per-guide mute overrides the project's guide set up\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2913,
+      "type": "MarkdownNote",
+      "pos": [
+        -4430,
+        5980
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {},
+      "order": 32,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### Sonder Masks Bridge\n*Splits the editor's single generation-mask window into independent video + audio mask times, each with a Freeze switch.*\n\n**How to use it:** Wire `project` in. It emits four FLOAT seconds — `video_mask_start/end_time` and `audio_mask_start/end_time` — to feed a downstream temporal-mask node. Toggle each channel **Edit** (generate over the window) or **Freeze** (zero-width window → keep that channel from source).\n\n💡 *Use case:* Freeze **audio** so it stays fixed and drives new video, or freeze **video** so it drives new audio."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 146,
+      "type": "VAELoaderKJ",
+      "pos": [
+        -3860,
+        4360
+      ],
+      "size": [
+        270,
+        180
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 33,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            1196
+          ]
+        }
+      ],
+      "title": "VAELoader KJ Video",
+      "properties": {
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "1.2.5",
+        "Node name for S&R": "VAELoaderKJ",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "LTX\\LTX23_video_vae_bf16.safetensors",
+        "main_device",
+        "bf16"
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 3022,
+      "type": "MarkdownNote",
+      "pos": [
+        -5590,
+        3980
+      ],
+      "size": [
+        750,
+        820
+      ],
+      "flags": {},
+      "order": 34,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Model Links",
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "\n- Hugging Face: [Lightricks/LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3/)\n- ComfyUI model files: [Kijai/LTX2.3_comfy](https://huggingface.co/Kijai/LTX2.3_comfy/tree/main)\n- GitHub: [Lightricks/LTX-2](https://github.com/Lightricks/LTX-2)\n\n## LTX 2.3 Prompting Tips\n\n1. **Core actions:** Describe events and actions in the order they happen.\n2. **Visual details:** Describe the subjects, environment, lighting, camera work, and other details you want to see.\n3. **Audio:** Describe the required sounds, music, voices, and dialogue.\n\n## Model Files for Local Users\n\nMost of the LTX 2.3-specific files come from [Kijai’s separated ComfyUI repository](https://huggingface.co/Kijai/LTX2.3_comfy/tree/main).\n\n### Diffusion Model\n\nPlace this file in `ComfyUI/models/diffusion_models/`:\n\n- [ltx-2-3-22b-dev_transformer_only_fp8_input_scaled.safetensors](https://huggingface.co/Kijai/LTX2.3_comfy/blob/main/diffusion_models/ltx-2-3-22b-dev_transformer_only_fp8_input_scaled.safetensors)\n\n### VAEs\n\nPlace these files in `ComfyUI/models/vae/`:\n\n- [LTX23_video_vae_bf16.safetensors](https://huggingface.co/Kijai/LTX2.3_comfy/blob/main/vae/LTX23_video_vae_bf16.safetensors)\n- [LTX23_audio_vae_bf16.safetensors](https://huggingface.co/Kijai/LTX2.3_comfy/blob/main/vae/LTX23_audio_vae_bf16.safetensors)\n\nThe video and audio pipelines use separate VAEs. Install both if you want the workflow to generate and process audio as well as video.\n### Text Encoders\n\nPlace these files in `ComfyUI/models/text_encoders/`:\n\n- [gemma_3_12B_it_fp8_scaled.safetensors](https://huggingface.co/Comfy-Org/ltx-2/blob/main/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors)\n- [ltx-2.3_text_projection_bf16.safetensors](https://huggingface.co/Kijai/LTX2.3_comfy/blob/main/text_encoders/ltx-2.3_text_projection_bf16.safetensors)\n\n## Model Storage Layout\n\n```text\n📂 ComfyUI/\n└── 📂 models/\n    ├── 📂 diffusion_models/\n    │   └── ltx-2-3-22b-dev_transformer_only_fp8_input_scaled.safetensors\n    │\n    ├── 📂 vae/\n    │   ├── LTX23_video_vae_bf16.safetensors\n    │   ├── LTX23_audio_vae_bf16.safetensors\n    │   \n    │\n    ├── 📂 text_encoders/\n    │   ├── gemma_3_12B_it_fp8_scaled.safetensors\n    │   └── ltx-2.3_text_projection_bf16.safetensors\n    │\n    ├── 📂 loras/\n   \n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2385,
+      "type": "LTXVAudioVideoMask",
+      "pos": [
+        -3860,
+        5290
+      ],
+      "size": [
+        230,
+        240
+      ],
+      "flags": {},
+      "order": 80,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video_latent",
+          "shape": 7,
+          "type": "LATENT",
+          "link": 13122
+        },
+        {
+          "name": "audio_latent",
+          "shape": 7,
+          "type": "LATENT",
+          "link": 13123
+        },
+        {
+          "name": "video_fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "video_fps"
+          },
+          "link": 13276
+        },
+        {
+          "name": "video_start_time",
+          "type": "FLOAT",
+          "widget": {
+            "name": "video_start_time"
+          },
+          "link": 13272
+        },
+        {
+          "name": "video_end_time",
+          "type": "FLOAT",
+          "widget": {
+            "name": "video_end_time"
+          },
+          "link": 13273
+        },
+        {
+          "name": "audio_start_time",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_start_time"
+          },
+          "link": 13624
+        },
+        {
+          "name": "audio_end_time",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_end_time"
+          },
+          "link": 13625
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_latent",
+          "type": "LATENT",
+          "links": [
+            10947
+          ]
+        },
+        {
+          "name": "audio_latent",
+          "type": "LATENT",
+          "links": [
+            10736
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-kjnodes",
+        "ver": "1.3.5",
+        "Node name for S&R": "LTXVAudioVideoMask",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        25,
+        2,
+        6,
+        0,
+        1.05,
+        "partial",
+        "overwrite"
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 2889,
+      "type": "SonderPreviewVideo",
+      "pos": [
+        -3091.251636208739,
+        6387.261113524136
+      ],
+      "size": [
+        410,
+        405
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 76,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "frames",
+          "type": "IMAGE",
+          "link": 13633
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 13403
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderPreviewVideo",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        24,
+        true,
+        ""
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 3020,
+      "type": "MarkdownNote",
+      "pos": [
+        -6160,
+        5440
+      ],
+      "size": [
+        890,
+        310
+      ],
+      "flags": {},
+      "order": 35,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### ⚡ TL;DR — One Workflow, Four Ways to Make Video\n\nThe project sample uses one preconfigured **Sonder LTX 2.3** workflow to create four kinds of video:\n\n- **T2V Prompt Relay:** animate a scene with global and timed local prompts.\n- **Upscale / Detail:** refine a finished clip through 720p and 1080p passes.\n- **I2V:** guide the video with images placed at key moments on the timeline.\n- **IC LoRA Driver:** use a motion or pose clip to drive the generation without rendering that clip itself.\n\nYou do not need to reconnect, mute, or bypass nodes. Set the editor template to **LTX 2.3**, click **Open Editor**, and choose the scene or generation method you want.\n\nFor long videos, use the editor’s **Batch** system: set a frame limit your GPU can handle, add context frames for continuity, enable the queue, and render each section. Generated takes can be placed directly into the timeline, refined individually, or rendered across the entire queue.\n\nThe graph remains the same throughout. The main controls are:\n\n- **Sonder Selector** — choose the sampling or scheduler mode.\n- **Sonder Masks Bridge** — choose whether video and/or audio is regenerated.\n- **Sonder Save Video** — place takes into the timeline and control queue progression.\n- **Sonder Guides / Driver Bridges** — automatically provide only the image guides or driver footage needed for the active part of the timeline.\n\nStart with the scene closest to your goal, then read its full section for the recommended settings and workflow.\n\n \n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2807,
+      "type": "GetNode",
+      "pos": [
+        -1340,
+        5670
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 36,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": [
+            13443
+          ]
+        }
+      ],
+      "title": "Get_Scheduler",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Scheduler"
+      ],
+      "color": "#1b4669",
+      "bgcolor": "#29699c"
+    },
+    {
+      "id": 2438,
+      "type": "ClownSampler_Beta",
+      "pos": [
+        -1360,
+        5220
+      ],
+      "size": [
+        270,
+        194
+      ],
+      "flags": {},
+      "order": 58,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "guides",
+          "shape": 7,
+          "type": "GUIDES",
+          "link": null
+        },
+        {
+          "label": "options0",
+          "name": "options_group.options0",
+          "shape": 7,
+          "type": "OPTIONS",
+          "link": null
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": 8672
+        },
+        {
+          "name": "options",
+          "shape": 7,
+          "type": "OPTIONS",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sampler",
+          "type": "SAMPLER",
+          "links": [
+            13375,
+            13427
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "RES4LYF",
+        "ver": "7750bf7800b6ad9d670308a09989fc0c04c40cec",
+        "Node name for S&R": "ClownSampler_Beta",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0.5,
+        "exponential/res_2s",
+        820105671097761,
+        "randomize",
+        true
+      ],
+      "color": "#323",
+      "bgcolor": "#535"
+    },
+    {
+      "id": 3030,
+      "type": "SetNode",
+      "pos": [
+        -1340,
+        5750
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 78,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "link": 13626
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": null
+        }
+      ],
+      "title": "Set_Basic Scheduler",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "Basic Scheduler",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Basic Scheduler"
+      ],
+      "color": "#485248",
+      "bgcolor": "#272e27"
+    },
+    {
+      "id": 3032,
+      "type": "GetNode",
+      "pos": [
+        -3881.251636208739,
+        6627.261113524136
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 37,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            13627
+          ]
+        }
+      ],
+      "title": "Get_Basic Scheduler",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Basic Scheduler"
+      ],
+      "color": "#485248",
+      "bgcolor": "#272e27"
+    },
+    {
+      "id": 2910,
+      "type": "MarkdownNote",
+      "pos": [
+        -3851.251636208739,
+        6817.261113524136
+      ],
+      "size": [
+        390,
+        210
+      ],
+      "flags": {},
+      "order": 38,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### Sonder Metadata Collector\n*A pass-through that stamps upstream settings onto your generated asset's provenance.*\n\n**How to use it:** Insert it in the `project` save line (Sonder Editor → Metadata Collector → Sonder Save Video/Sonder Save Bridge). Wire any upstream widget value into a `value_i` socket and give it a matching `label_i` (e.g. `value_0` = sampler steps, `label_0` = \"Steps\") or leave it blank and it will get the widget's name.\nThose pairs are recorded into the saved asset's **Tracked Metadata** and show up in the gallery inspector. It changes nothing about the render — it just remembers how it was made.\n💡 *Tip:* You can \"chain\" multiple metadata collectors in case you want to track First/Second passes in one workflow."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2977,
+      "type": "BasicScheduler",
+      "pos": [
+        -1650,
+        5700
+      ],
+      "size": [
+        270,
+        110
+      ],
+      "flags": {},
+      "order": 59,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 13552
+        }
+      ],
+      "outputs": [
+        {
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            13551,
+            13626
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.20.1",
+        "Node name for S&R": "BasicScheduler",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "bong_tangent",
+        4,
+        0.75
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 2795,
+      "type": "SetNode",
+      "pos": [
+        -5060,
+        6000
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 65,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "link": 13155
+        }
+      ],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "title": "Set_seed",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "seed",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "seed"
+      ],
+      "color": "#1b4669",
+      "bgcolor": "#29699c"
+    },
+    {
+      "id": 2934,
+      "type": "SetNode",
+      "pos": [
+        -4600,
+        6020
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 63,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "link": 13444
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "Set_SchedulerS",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "SchedulerS",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "SchedulerS"
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 1313,
+      "type": "DualCLIPLoader",
+      "pos": [
+        -3400,
+        4590
+      ],
+      "size": [
+        270,
+        190
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 39,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            13241,
+            13373
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.16.4",
+        "Node name for S&R": "DualCLIPLoader",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "gemma_3_12B_it_fp8_scaled.safetensors",
+        "ltx-2.3_text_projection_bf16.safetensors",
+        "ltxv",
+        "default"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 3021,
+      "type": "MarkdownNote",
+      "pos": [
+        -4820,
+        3980
+      ],
+      "size": [
+        930,
+        830
+      ],
+      "flags": {},
+      "order": 40,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "## Some LoRAs Used in the Sample Workflow\n\nThe sample workflow contains several LoRAs for faster sampling, motion quality, prompt understanding, cinematic styling, and detail enhancement.\n\n#### LTX 2.3 Distilled 1.1 LoRA\n\n**File:** `ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors`\n\nThis is the distilled sampling adapter used by the workflow. It is primarily a speed and sampling component rather than a visual style LoRA. It is especially relevant when using the LTX 2.3 development checkpoint with reduced-step sampling.\n\n[Download from Kijai’s LTX 2.3 repository](https://huggingface.co/Kijai/LTX2.3_comfy/blob/main/loras/ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors)\n\n#### LTX IC LORA UNION CONTROL\n\n**The lora that gives the model \"driver\" capabilities.**\n\n[Download from LTX-2.3 22B IC-LoRA Union Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/tree/main)\n\n\n#### OmniNFT RL LoRA\n\n**File:** `LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors`\n\nOmniNFT is a reinforcement-learning LoRA for joint audio and video generation. It is intended to improve how the model coordinates the visual and audio portions of a generation.\n\n[Download the ComfyUI BF16 file](https://huggingface.co/Kijai/LTX2.3_comfy/blob/main/loras/LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors)\n\n#### Licon VBVR Video Reasoning LoRA\n\n**File:** `Ltx2.3-Licon-VBVR-I2V-390K-R32.safetensors`\n\nThis LoRA improves video reasoning and complex prompt interpretation. Its model page describes improvements to motion dynamics, temporal consistency, action timing, multi-object interaction, and framing stability.\n\n[Download from LiconStudio](https://huggingface.co/LiconStudio/Ltx2.3-VBVR-lora-I2V)\n\n#### Singularity OmniCine Preview\n\n**File:** `Singularity LTX-2.3 OmniCine Preview v0.1.safetensors`\n\nThe preview version of Singularity OmniCine is used for cinematic motion, physical coherence, and more expressive image-to-video behavior.\n\n[Download from the Singularity OmniCine repository](https://huggingface.co/WarmBloodAban/Singularity-LTX-2.3_OmniCine_V1/tree/main)\n\nChoose `Singularity LTX-2.3 OmniCine Preview v0.1.safetensors` from the file list.\n\n#### Soft Enhance\n\nSoft Enhance adds subtle detail and clarity while reducing some of LTX 2.3’s harsher contrast. It aims for a smoother, more natural finish without making the result look overly sharpened.\n\n[Download Soft Enhance](https://huggingface.co/vrgamedevgirl84/LTX_2.3_Soft_Enhance_Style_LoRa)\n\n#### LTX-2 IC-LoRA Detailer\n\n[Download the official IC-LoRA Detailer](https://huggingface.co/Lightricks/LTX-2-19b-IC-LoRA-Detailer)\n\n#### Singularity OmniCine V1 — `0.40`\n\nThis is the newer V1 release of OmniCine. The sample combines it at a lower strength with the earlier preview version.\n\n[Download from the Singularity OmniCine repository](https://huggingface.co/WarmBloodAban/Singularity-LTX-2.3_OmniCine_V1/tree/main)\n\n#### Crisp Enhance\n\n**File:** `LTX2.3_Crisp_Enhance.safetensors`\n\nCrisp Enhance is the sharper counterpart to Soft Enhance. It increases edge definition, micro-detail, contrast, and perceived clarity.\n\nEnable it when you want a more polished, high-definition appearance. Soft and Crisp Enhance can also be balanced together, but strong values may make some scenes look oversharpened.\n\n[Download Crisp Enhance](https://huggingface.co/vrgamedevgirl84/LTX_2.3_Crisp_Enhance_Style_LoRa)\n\n#### LTX 2.3 Dance V2\n\nThis optional motion LoRA is designed to improve dancing movement in LTX 2.3 generations. It is included in the loader as an additional option but is disabled in the showcase configuration because the Dance scene uses an Open Pose driver and IC LoRA for motion control.\n\n[Download LTX 2.3 Dance from Civitai](https://civitai.com/models/2487939/ltx-23-dance?modelVersionId=2799941)\n\n### Inspecting LoRA Results\n\nThe **Metadata Collector** records the settings used for each generation, making it easier to understand and reproduce your results.\n\nIn the asset gallery, double-click a generated clip to inspect it and review the values used during that generation, including the active LoRAs and their strengths.\n\nYou can also activate **Compare Mode** to compare multiple clips directly. This is especially useful when testing different LoRAs, strengths, seeds, or scheduler settings—you can see how each change influenced the result without relying on memory or filenames.\n\n💡 Tip: When testing LoRAs, change one setting at a time and compare the new clip against your original. This makes each LoRA’s effect much easier to identify.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2936,
+      "type": "SonderDriverBridge",
+      "pos": [
+        -3090,
+        5180
+      ],
+      "size": [
+        190,
+        70
+      ],
+      "flags": {},
+      "order": 81,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "driver_ref",
+          "type": "SONDER_DRIVER_REF",
+          "link": 13448
+        }
+      ],
+      "outputs": [
+        {
+          "name": "driver_images",
+          "type": "IMAGE",
+          "links": [
+            13642
+          ]
+        },
+        {
+          "name": "driver_idx",
+          "type": "INT",
+          "links": [
+            13646
+          ]
+        },
+        {
+          "name": "driver_strength",
+          "type": "FLOAT",
+          "links": [
+            13647
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderDriverBridge",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 3039,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        -3068.7171118949623,
+        4620.179407681054
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 86,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 13635
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            13636,
+            13637
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.28.0",
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "LTX\\ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+        1
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 3035,
+      "type": "GetICLoRAParameters",
+      "pos": [
+        -3005.86318339799,
+        4750.248002137662
+      ],
+      "size": [
+        218.572265625,
+        26
+      ],
+      "flags": {},
+      "order": 91,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "iclora_model",
+          "type": "MODEL",
+          "link": 13637
+        }
+      ],
+      "outputs": [
+        {
+          "name": "iclora_parameters",
+          "type": "IC_LORA_PARAMETERS",
+          "links": [
+            13648
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.28.0",
+        "Node name for S&R": "GetICLoRAParameters"
+      },
+      "widgets_values": [],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 2890,
+      "type": "SetNode",
+      "pos": [
+        -3778.05270041506,
+        4191.359662780771
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 62,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "link": 13649
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            13628
+          ]
+        }
+      ],
+      "title": "Set_BaseModel",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "BaseModel",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "BaseModel"
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 3033,
+      "type": "UNETLoader",
+      "pos": [
+        -3844.9473618652314,
+        4066.9297535400215
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 41,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            13649
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.20.1",
+        "Node name for S&R": "UNETLoader",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "ltx-2.3-22b-dev_transformer_only_int8_convrot.safetensors",
+        "default"
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 2961,
+      "type": "MarkdownNote",
+      "pos": [
+        -5080,
+        6200
+      ],
+      "size": [
+        450,
+        190
+      ],
+      "flags": {},
+      "order": 42,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### Sonder Selector\nTurns a readable list of labels into a select index (and the label text).\n\nHow to use it: Type one option per line into choice_list, then pick one in the choice dropdown. It outputs the chosen selection text and its zero-based index. Wire index into a Sonder Switch / Cluster select so your branch picker reads as human-friendly names instead of bare numbers.\n\nInputs: choice, choice_list → Outputs: selection, index.\n\n⚠️ Note: Labels must be unique and the selected label must exist in the list, or the node errors."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 3019,
+      "type": "MarkdownNote",
+      "pos": [
+        -6160,
+        5800
+      ],
+      "size": [
+        890,
+        910
+      ],
+      "flags": {},
+      "order": 43,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "# About the Workflow & Project Sample Scenes\n\n## Getting the Project Sample\n\nDownload `Project-Sample.zip` from the **Sonder Editor Project Sample** release on the [ComfyUI-Sonder-Editor GitHub Releases page](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/releases). It is listed under **Assets**.\n\nThe sample contains four scenes built with the same **Sonder LTX 2.3** workflow:\n\n- Interrogation — T2V Prompt Relay\n- Interrogation — Upscale / Detail\n- Pretty People — I2V\n- Dance — T2V IC LoRA (Driver)\n\nTo explore any scene, click **Open Editor** in the Sonder Editor node.\n\n## How the Workflow Works\n\nAll four scenes use the same graph. You do not need to reconnect, bypass, or mute nodes—select the desired options in the editor and the supporting Sonder nodes.\n\nBefore starting, make sure the template is set to **LTX 2.3**. The editor automatically handles the model’s frame-count and pixel constraints.\n\nThe workflow is designed to cover several generation methods in one place:\n\n- Text-to-video with timed prompts formatted for Prompt Relay compatibility.\n- Multi-pass upscaling and detail work\n- Image-guided video with multiple keyframes\n- Driver-controlled video using IC LoRAs\n\n*You can mix and match multiple concepts together, like using Prompt Relay, guides, and a motion driver in one go.*\n\n## Rendering in Batches\n\nLong timelines may exceed available VRAM if rendered in one pass. Use the editor’s batching controls to split the timeline into manageable sections. \n\n1. Open the editor’s **Settings** menu with the gear icon.\n2. Set **Batch Max Frames** to a length your computer can render reliably.\n3. Set **Precontext Frames** to carry visual context from one batch into the next.\n4. Enable **Queue** on the left side of the editor, above the toolbar.\n5. Click **Batch** to segment the timeline and queue the sections.\n\nFor example, the T2V scene used a maximum of **241 frames** per batch with **48 precontext frames**. Render the graph once per queued chunk, or set ComfyUI’s batch count to the number of chunks.\n\nUse **Mark Queue Complete** in Sonder Save Video to control iteration:\n\n- **On:** advances to the next queued section after each render.\n- **Off:** keeps rendering the current section so you can iterate until you are satisfied.\n\nFor consistent color and high-quality intermediates, use the **Editing Master** save preset and enable **Color Drift Correction**. Export the final video as **High Quality** for broad device compatibility.\n\n## Interrogation — T2V Prompt Relay\n\nThis scene is a text-to-video example driven entirely by prompts through Kijai’s **Prompt Relay**. It was generated at **480p**.\n\nThe timeline contains:\n\n- One global prompt, active across the whole scene.\n- Multiple local prompts, active only at specific moments.\n\nThese timed prompts control motion, expression, and scene changes without needing image guides or drivers.\n\n### First-pass settings\n\nUse these graph settings for the initial generation:\n\n- Set the **Sonder Selector** to the **LTXV Scheduler** for full-denoise sampling.\n- In **Sonder Masks Bridge**, set both video and audio to **Edit**.\n- In **Sonder Save Video**, set the mode to **Take** so generated video is placed directly into the timeline.\n- Enable audio placement if you want generated audio added to the timeline.\n\nGenerating audio separately can sometimes improve results. Try the smallest supported resolution and audio segments of roughly **20–30 seconds**.\n\nAfter all batches are rendered, export the completed 480p timeline as one clip before moving to the upscale scene.\n\n## Interrogation — Upscale / Detail\n\nThis scene demonstrates detail enhancement in separate passes. Starting from the completed 480p export keeps the original generation intact and makes it easier to refine individual sections.\n\nYou can duplicate the original scene and remove unneeded prompts, or save the prompt setup as a template. Right-click the prompt lane to access prompt options.\n\n1. Drag the completed 480p clip into a new scene.\n2. Right-click the clip and extend the scene duration to match it.\n3. Upscale to **720p**, then use the resulting clip as the source for a **1080p** pass.\n\nThe sample used:\n\n| Pass | Batch Max Frames | Context Frames |\n| --- | ---: | --- |\n| 720p | 185 | 48 precontext |\n| 1080p | 121 | 25 precontext, 24 postcontext |\n\nThese values depend heavily on your GPU and available VRAM—experiment to find a stable combination of resolution and total frames.\n\n### 720p pass\n\n- Set the **Sonder Selector** to the basic scheduler with a **Bong Tangent** schedule.\n- Use approximately **0.6 denoise**.\n- In **Sonder Masks Bridge**, set audio to **Freeze** so the existing audio drives the video without being regenerated.\n- Disable audio placement in **Sonder Save Video**.\n\nHigher denoise can add more detail but may drift further from the original clip. Lower denoise preserves composition more closely while adding subtler detail.\n\nIf you are iterating on a single section, enable **New Takes Start Muted** in the editor settings. This keeps each attempt based on the original source clip rather than the previous take. Remember to change the seed between attempts.\n\n### 1080p pass and retakes\n\nThe 1080p pass follows the same process, but uses a lower denoise value—around **0.4** in this sample—to preserve the 720p result.\n\nFor problem areas such as lip-sync issues or seams between batches, select only the affected range and create a retake. The sample used **Manual Sigmas** in the Sonder Selector, with precontext and postcontext frames, to preserve detail density while allowing small composition corrections.\n\nOnce the retakes are complete, export the full timeline as one final clip.\n\n## Pretty People — I2V\n\nThis scene demonstrates **Any Frame to Video**: a more flexible version of a first-frame / last-frame workflow.\n\nInstead of using several timed prompts, it uses one continuous prompt and image guides placed at key moments in the timeline.\n\n1. Drag images from the asset gallery into the timeline.\n2. Place each image at the frame where it should influence the video.\n3. Set its guide strength.\n4. Optionally enter an exact frame number instead of positioning it manually.\n\nThe **Sonder Guides Bridge Start** and **End** nodes handle guide staging automatically. They provide only the guides needed for the current section of the timeline, and avoid influencing generation when no guide is present.\n\nFor LTX 2.3, the sample uses **LTXV Add Guide** to inject references into the latents. You may replace it with another compatible processing node: place it between the two Guides Bridge nodes and the editor will apply it to every relevant guide automatically.\n\nNo additional graph setup is required.\n\n## Dance — T2V IC LoRA (Driver)\n\nThis scene demonstrates driver-controlled generation using an LTX 2.3 **IC LoRA** in addition with the concepts from previous scenes.\n\nA driver is a clip that influences the generated video—through motion, pose, style, or another supported control signal—without appearing as rendered footage itself.\n\nThe sample uses a dance clip converted to **NLF Pose** (Open Pose that resizes to your reference character) with a NLF Pose workflow usually used for SCAIL animations. The generation interprets that pose data through the **IC LoRA Union Control** LoRA for LTX 2.3.\n\n#### Using a driver the same length of the generation size doubles the latent frames, it is very heavy and you will need to setup smaller batch sizes.\n\nThe editor uses two nodes to stage the driver:\n\n- **Sonder Driver Selector** relays the needed portion of a driver lane from the timeline.\n- **Sonder Driver Bridge** prepares that selected driver section for the workflow.\n\nLike image guides, the editor supplies a driver only where it exists on the timeline. The important difference is that an active LoRA can still affect sections with no driver clip.\n\nUse **Sonder Cluster** to solve this: it switches the full driver pipeline together, including the LoRA path, so sections without a driver skip the entire driver-conditioning branch.\n\nThis lets one workflow cleanly switch between normal generation and driver-controlled generation without rewiring the graph.\n\n \n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 3046,
+      "type": "SetNode",
+      "pos": [
+        -4434.584688283885,
+        5088.737926482622
+      ],
+      "size": [
+        210,
+        60.94037280896919
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 73,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "link": 13651
+        }
+      ],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "title": "Set_Prompt",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "Prompt"
+      },
+      "widgets_values": [
+        "Prompt"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 3036,
+      "type": "LTXVAddGuide",
+      "pos": [
+        -2798.1519817848443,
+        4946.405521750945
+      ],
+      "size": [
+        270,
+        202
+      ],
+      "flags": {},
+      "order": 102,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 13638
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 13639
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 13640
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 13641
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 13642
+        },
+        {
+          "name": "attention_mask",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        },
+        {
+          "name": "iclora_parameters",
+          "shape": 7,
+          "type": "IC_LORA_PARAMETERS",
+          "link": 13648
+        },
+        {
+          "name": "frame_idx",
+          "type": "INT",
+          "widget": {
+            "name": "frame_idx"
+          },
+          "link": 13646
+        },
+        {
+          "name": "strength",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength"
+          },
+          "link": 13647
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            13643
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            13644
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            13645
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.28.0",
+        "Node name for S&R": "LTXVAddGuide"
+      },
+      "widgets_values": [
+        0,
+        1
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2938,
+      "type": "SonderLazyCluster",
+      "pos": [
+        -2430,
+        4910
+      ],
+      "size": [
+        210,
+        206
+      ],
+      "flags": {},
+      "order": 103,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "select",
+          "type": "INT",
+          "widget": {
+            "name": "select"
+          },
+          "link": 13508
+        },
+        {
+          "label": "0: VALUE 0",
+          "name": "b0_l0",
+          "shape": 7,
+          "type": "CONDITIONING",
+          "link": 13455
+        },
+        {
+          "label": "   VALUE 1",
+          "name": "b0_l1",
+          "shape": 7,
+          "type": "CONDITIONING",
+          "link": 13456
+        },
+        {
+          "label": "   VALUE 2",
+          "name": "b0_l2",
+          "shape": 7,
+          "type": "LATENT",
+          "link": 13458
+        },
+        {
+          "label": "1: VALUE 0",
+          "name": "b1_l0",
+          "shape": 7,
+          "type": "*",
+          "link": 13643
+        },
+        {
+          "label": "   VALUE 1",
+          "name": "b1_l1",
+          "shape": 7,
+          "type": "*",
+          "link": 13644
+        },
+        {
+          "label": "   VALUE 2",
+          "name": "b1_l2",
+          "shape": 7,
+          "type": "*",
+          "link": 13645
+        }
+      ],
+      "outputs": [
+        {
+          "label": "VALUE 0",
+          "name": "A",
+          "type": "CONDITIONING",
+          "links": [
+            13468
+          ]
+        },
+        {
+          "label": "VALUE 1",
+          "name": "B",
+          "type": "CONDITIONING",
+          "links": [
+            13469
+          ]
+        },
+        {
+          "label": "VALUE 2",
+          "name": "C",
+          "type": "LATENT",
+          "links": [
+            13470
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderLazyCluster",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0,
+        2,
+        3
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2933,
+      "type": "SonderLazySwitch",
+      "pos": [
+        -1340,
+        5490
+      ],
+      "size": [
+        270,
+        140
+      ],
+      "flags": {},
+      "order": 110,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "item0",
+          "name": "branches.item0",
+          "shape": 7,
+          "type": "SIGMAS",
+          "link": 13440
+        },
+        {
+          "label": "item1",
+          "name": "branches.item1",
+          "shape": 7,
+          "type": "SIGMAS",
+          "link": 13441
+        },
+        {
+          "label": "item2",
+          "name": "branches.item2",
+          "shape": 7,
+          "type": "SIGMAS",
+          "link": 13551
+        },
+        {
+          "label": "item3",
+          "name": "branches.item3",
+          "shape": 7,
+          "type": "SIGMAS",
+          "link": null
+        },
+        {
+          "name": "select",
+          "type": "INT",
+          "widget": {
+            "name": "select"
+          },
+          "link": 13443
+        }
+      ],
+      "outputs": [
+        {
+          "name": "item",
+          "type": "SIGMAS",
+          "links": [
+            13442
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderLazySwitch",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2931,
+      "type": "SonderSelector",
+      "pos": [
+        -4910,
+        6009.416102471286
+      ],
+      "size": [
+        280,
+        140
+      ],
+      "flags": {},
+      "order": 44,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "selection",
+          "type": "STRING",
+          "links": [
+            13444
+          ]
+        },
+        {
+          "name": "index",
+          "type": "INT",
+          "links": [
+            13439
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderSelector",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "LTXV Scheduler - First Pass",
+        "LTXV Scheduler - First Pass\nManual Sigmas - Detail/Upscale Pass\nBasic Scheduler - Detail/Upscale Pass"
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2794,
+      "type": "SeedGenerator",
+      "pos": [
+        -5220,
+        6040
+      ],
+      "size": [
+        270,
+        110
+      ],
+      "flags": {},
+      "order": 45,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "seed",
+          "type": "INT",
+          "links": [
+            13155
+          ]
+        },
+        {
+          "name": "seed+1",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "RES4LYF",
+        "ver": "7750bf7800b6ad9d670308a09989fc0c04c40cec",
+        "Node name for S&R": "SeedGenerator",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0,
+        "fixed"
+      ]
+    },
+    {
+      "id": 2856,
+      "type": "SonderMasksBridge",
+      "pos": [
+        -4430,
+        6240
+      ],
+      "size": [
+        280,
+        150
+      ],
+      "flags": {},
+      "order": 69,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13285
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video_mask_start_time",
+          "type": "FLOAT",
+          "links": [
+            13272
+          ]
+        },
+        {
+          "name": "video_mask_end_time",
+          "type": "FLOAT",
+          "links": [
+            13273
+          ]
+        },
+        {
+          "name": "audio_mask_start_time",
+          "type": "FLOAT",
+          "links": [
+            13624
+          ]
+        },
+        {
+          "name": "audio_mask_end_time",
+          "type": "FLOAT",
+          "links": [
+            13625
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderMasksBridge",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        true,
+        true
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 506,
+      "type": "SetNode",
+      "pos": [
+        -1645.5071993184501,
+        4393.258363707492
+      ],
+      "size": [
+        230,
+        110
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 101,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "link": 13661
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": []
+        }
+      ],
+      "title": "Set_POS",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "POS",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "POS"
+      ],
+      "color": "#332922",
+      "bgcolor": "#593930"
+    },
+    {
+      "id": 505,
+      "type": "SetNode",
+      "pos": [
+        -1644.1303994888376,
+        4350.504764048267
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 100,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "link": 13660
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": null
+        }
+      ],
+      "title": "Set_Model",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "Model",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "Model"
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 2954,
+      "type": "SonderLazySwitch",
+      "pos": [
+        -2580,
+        4660
+      ],
+      "size": [
+        270,
+        98
+      ],
+      "flags": {},
+      "order": 90,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "item0",
+          "name": "branches.item0",
+          "shape": 7,
+          "type": "MODEL",
+          "link": 13504
+        },
+        {
+          "label": "item1",
+          "name": "branches.item1",
+          "shape": 7,
+          "type": "MODEL",
+          "link": 13636
+        },
+        {
+          "label": "item2",
+          "name": "branches.item2",
+          "shape": 7,
+          "type": "MODEL",
+          "link": null
+        },
+        {
+          "name": "select",
+          "type": "INT",
+          "widget": {
+            "name": "select"
+          },
+          "link": 13656
+        }
+      ],
+      "outputs": [
+        {
+          "name": "item",
+          "type": "MODEL",
+          "links": [
+            13506,
+            13662
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderLazySwitch",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 3055,
+      "type": "GetNode",
+      "pos": [
+        -1656.0493828980843,
+        4043.6984029202636
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 46,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": [
+            13664
+          ]
+        }
+      ],
+      "title": "Get_Conditioning",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes"
+      },
+      "widgets_values": [
+        "Conditioning"
+      ],
+      "color": "#1b4669",
+      "bgcolor": "#29699c"
+    },
+    {
+      "id": 120,
+      "type": "CLIPTextEncode",
+      "pos": [
+        -2284.1303994888385,
+        4434.130399488838
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 87,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 13243
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            13108
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.56",
+        "Node name for S&R": "CLIPTextEncode",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles,singing."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2960,
+      "type": "MarkdownNote",
+      "pos": [
+        -2200,
+        4680
+      ],
+      "size": [
+        510,
+        430
+      ],
+      "flags": {},
+      "order": 47,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "### 🔀 Logic & Routing\n### Sonder Switch\n\nA lazy A/B/C… switch for any data type — only the branch you pick actually runs.\n\nWhat it does: Feed several branches into one switch and set select to choose which one passes through. Because the inputs are lazy, the branches you didn't select are never evaluated — so you can wire up many expensive paths and only pay for one per run.\n\nHow to use it:\n\nDrag a connection into item1; a new empty item2, item3… slot grows automatically (up to 32).\nWire each branch (all must resolve to the same type — all IMAGE, all MODEL, etc.).\nSet select (0-based) — or drive it from a Sonder Selector or a has_driver flag.\nInputs: select, autogrowing item1…itemN → Output: item.\n\n\n### Sonder Cluster\n\nLike Sonder Switch, but routes one shared choice across several lanes at once.\n\nWhat it does: One select value picks the same branch across multiple parallel lanes — so you can switch a whole set of related outputs together (e.g. model + latent + VAE for \"preset A\" vs \"preset B\") in a single node. Only the selected branch's lanes are evaluated.\n\nHow to use it:\n\nSet branches (how many options, 2–32) and lanes (how many outputs per option, up to 8).\nFill the grid: branch 0 → lanes A/B/C…, branch 1 → lanes A/B/C…, etc. Each lane can be its own type; within a lane every branch must match.\nSet select to choose the active branch — every lane output (A, B, C…) switches together.\nInputs: select, branches, lanes, branch/lane grid → Outputs: A, B, C… (one per lane).\n\n💡 Tip: Pair them with a Sonder Driver Selector's has_driver output to skip an entire driver-conditioning branch when no driver is present."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2377,
+      "type": "SonderGuidesBridgeStart",
+      "pos": [
+        -3510,
+        5360
+      ],
+      "size": [
+        230,
+        350
+      ],
+      "flags": {},
+      "order": 89,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13247
+        },
+        {
+          "label": "COND",
+          "name": "value_0",
+          "shape": 7,
+          "type": "*",
+          "link": 10943
+        },
+        {
+          "label": "COND",
+          "name": "value_1",
+          "shape": 7,
+          "type": "*",
+          "link": 10945
+        },
+        {
+          "label": "LATENT",
+          "name": "value_2",
+          "shape": 7,
+          "type": "*",
+          "link": 10947
+        },
+        {
+          "label": "value_3",
+          "name": "value_3",
+          "shape": 7,
+          "type": "*",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "flow_control",
+          "type": "FLOW_CONTROL",
+          "links": [
+            8033
+          ]
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            13367
+          ]
+        },
+        {
+          "name": "frame_index",
+          "type": "INT",
+          "links": [
+            13132
+          ]
+        },
+        {
+          "name": "strength",
+          "type": "FLOAT",
+          "links": [
+            13133
+          ]
+        },
+        {
+          "label": "COND",
+          "name": "value_0",
+          "type": "*",
+          "links": [
+            8044
+          ]
+        },
+        {
+          "label": "COND",
+          "name": "value_1",
+          "type": "*",
+          "links": [
+            8045
+          ]
+        },
+        {
+          "label": "LATENT",
+          "name": "value_2",
+          "type": "*",
+          "links": [
+            8046
+          ]
+        },
+        {
+          "label": "value_3",
+          "name": "value_3",
+          "type": "*",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderGuidesBridgeStart",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0,
+        "{}",
+        ""
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2937,
+      "type": "SonderDriverSelector",
+      "pos": [
+        -3200,
+        4910
+      ],
+      "size": [
+        300,
+        230
+      ],
+      "flags": {},
+      "order": 70,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13447
+        }
+      ],
+      "outputs": [
+        {
+          "name": "driver_ref",
+          "type": "SONDER_DRIVER_REF",
+          "links": [
+            13448
+          ]
+        },
+        {
+          "name": "has_driver",
+          "type": "INT",
+          "links": [
+            13508,
+            13656
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderDriverSelector",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        0,
+        "{}",
+        ""
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2367,
+      "type": "LTXVAddGuide",
+      "pos": [
+        -3170,
+        5530
+      ],
+      "size": [
+        270,
+        202
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 95,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 8044
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 8045
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 8060
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 8046
+        },
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 10518
+        },
+        {
+          "name": "attention_mask",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        },
+        {
+          "name": "iclora_parameters",
+          "shape": 7,
+          "type": "IC_LORA_PARAMETERS",
+          "link": null
+        },
+        {
+          "name": "frame_idx",
+          "type": "INT",
+          "widget": {
+            "name": "frame_idx"
+          },
+          "link": 13132
+        },
+        {
+          "name": "strength",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength"
+          },
+          "link": 13133
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            8047
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            8048
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            10728
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.19.3",
+        "Node name for S&R": "LTXVAddGuide",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        50,
+        0
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2384,
+      "type": "LTXVPreprocess",
+      "pos": [
+        -3170,
+        5430
+      ],
+      "size": [
+        270,
+        60
+      ],
+      "flags": {},
+      "order": 93,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 13367
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output_image",
+          "type": "IMAGE",
+          "links": [
+            10518
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.19.3",
+        "Node name for S&R": "LTXVPreprocess",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        36
+      ],
+      "color": "#2a363b",
+      "bgcolor": "#3f5159"
+    },
+    {
+      "id": 3050,
+      "type": "SonderLazyCluster",
+      "pos": [
+        -1658.5720570797603,
+        4087.449398762548
+      ],
+      "size": [
+        210,
+        166
+      ],
+      "flags": {},
+      "order": 97,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "select",
+          "type": "INT",
+          "widget": {
+            "name": "select"
+          },
+          "link": 13664
+        },
+        {
+          "label": "0: MODEL",
+          "name": "b0_l0",
+          "shape": 7,
+          "type": "MODEL",
+          "link": 13658
+        },
+        {
+          "label": "   COND",
+          "name": "b0_l1",
+          "shape": 7,
+          "type": "CONDITIONING",
+          "link": 13659
+        },
+        {
+          "label": "1: MODEL",
+          "name": "b1_l0",
+          "shape": 7,
+          "type": "MODEL",
+          "link": 13662
+        },
+        {
+          "label": "   COND",
+          "name": "b1_l1",
+          "shape": 7,
+          "type": "CONDITIONING",
+          "link": 13663
+        }
+      ],
+      "outputs": [
+        {
+          "label": "MODEL",
+          "name": "A",
+          "type": "MODEL",
+          "links": [
+            13660
+          ]
+        },
+        {
+          "label": "COND",
+          "name": "B",
+          "type": "CONDITIONING",
+          "links": [
+            13661
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderLazyCluster"
+      },
+      "widgets_values": [
+        0,
+        2,
+        2
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 3037,
+      "type": "VAEDecodeTiled",
+      "pos": [
+        -3482.6154150089037,
+        5940.633978909049
+      ],
+      "size": [
+        270,
+        150
+      ],
+      "flags": {},
+      "order": 55,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 13632
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 13631
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            13633,
+            13634
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.28.0",
+        "Node name for S&R": "VAEDecodeTiled"
+      },
+      "widgets_values": [
+        4096,
+        1024,
+        128,
+        64
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 3049,
+      "type": "GetNode",
+      "pos": [
+        -2546.4091668610895,
+        4029.887222830476
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {},
+      "order": 48,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            13653
+          ]
+        }
+      ],
+      "title": "Get_Prompt",
+      "properties": {
+        "Node name for S&R": "GetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes"
+      },
+      "widgets_values": [
+        "Prompt"
+      ],
+      "color": "#232",
+      "bgcolor": "#353"
+    },
+    {
+      "id": 3047,
+      "type": "CLIPTextEncode",
+      "pos": [
+        -2110.2139481156264,
+        3989.7097005299615
+      ],
+      "size": [
+        400,
+        200
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 88,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 13652
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "widget": {
+            "name": "text"
+          },
+          "link": 13653
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            13663
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.3.56",
+        "Node name for S&R": "CLIPTextEncode",
+        "enableTabs": false,
+        "tabWidth": 65,
+        "tabXOffset": 10,
+        "hasSecondTab": false,
+        "secondTabText": "Send Back",
+        "secondTabOffset": 80,
+        "secondTabWidth": 65,
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        ""
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 3040,
+      "type": "MarkdownNote",
+      "pos": [
+        -1363.3096904858478,
+        4001.458606846271
+      ],
+      "size": [
+        645.9910051491322,
+        513.2857422502407
+      ],
+      "flags": {},
+      "order": 49,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## Installing ComfyUI-PromptRelay (kijai)\n\nThe Prompt Relay scenes use kijai's **ComfyUI-PromptRelay** to route timed\ntimeline prompts into the sampler. It is not on the ComfyUI Registry, so it must\nbe installed manually. If you flip the workflow switch to standard CLIP instead,\nthis node is not needed.\n\nRepo: https://github.com/kijai/ComfyUI-PromptRelay\n\n### Steps\n\n1. **Enable the legacy Manager UI.** Add this to your ComfyUI launch arguments\n   (where you set command-line args depends on how you run ComfyUI - your\n   launcher's args field, or your startup `.bat` / command line):\n   ```\n   --enable-manager-legacy-ui\n   ```\n\n2. **Find your Manager config file.** In the ComfyUI startup console, look for a\n   line like:\n   ```\n   ** ComfyUI-Manager config path: <...>\\user\\__manager\\config.ini\n   ```\n\n3. **Allow Git-URL and pip installs.** Open that `config.ini` and, in the\n   `[default]` section, set both of these to `True` (add the lines if they are\n   not already there):\n   ```\n   allow_git_url_install = True\n   allow_pip_install = True\n   ```\n\n4. **Restart ComfyUI.**\n\n5. **Install the node.** Open the Manager (Extensions > ComfyUI-Manager) and\n   choose **Install via Git URL**. Paste:\n   ```\n   https://github.com/kijai/ComfyUI-PromptRelay\n   ```\n\n6. **Restart ComfyUI** once the install finishes. Check the startup log for any\n   import errors, then refresh the browser.\n\n### Alternative: terminal install (no Manager flags needed)\n\nIf you are comfortable with a terminal, you can skip all the Manager settings\nabove and clone it directly:\n```\ncd ComfyUI/custom_nodes\ngit clone https://github.com/kijai/ComfyUI-PromptRelay.git\n```\nThen restart ComfyUI.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2975,
+      "type": "SonderSaveVideo",
+      "pos": [
+        -3431.251636208739,
+        6207.261113524136
+      ],
+      "size": [
+        320,
+        586
+      ],
+      "flags": {},
+      "order": 82,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "link": 13545
+        },
+        {
+          "name": "frames",
+          "type": "IMAGE",
+          "link": 13634
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 13548
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": 13546
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output_path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderSaveVideo",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "Output",
+        24,
+        "Take",
+        true,
+        true,
+        false,
+        "High Quality MP4",
+        "",
+        "Video File",
+        "mp4",
+        "libx264",
+        "yuv420p",
+        18,
+        "slow",
+        "aac",
+        192,
+        0,
+        false,
+        true,
+        ""
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 654,
+      "type": "Power Lora Loader (rgthree)",
+      "pos": [
+        -3400,
+        4070
+      ],
+      "size": [
+        420,
+        440
+      ],
+      "flags": {},
+      "order": 79,
+      "mode": 0,
+      "inputs": [
+        {
+          "dir": 3,
+          "name": "model",
+          "type": "MODEL",
+          "link": 13628
+        },
+        {
+          "dir": 3,
+          "name": "clip",
+          "type": "CLIP",
+          "link": 13241
+        }
+      ],
+      "outputs": [
+        {
+          "dir": 4,
+          "name": "MODEL",
+          "shape": 3,
+          "type": "MODEL",
+          "links": [
+            13372,
+            13504,
+            13635
+          ]
+        },
+        {
+          "dir": 4,
+          "name": "CLIP",
+          "shape": 3,
+          "type": "CLIP",
+          "links": [
+            13242,
+            13243,
+            13652
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "rgthree-comfy",
+        "ver": "0fb1e239a903e93ef626a8c20589b38f46e39dff",
+        "Show Strengths": "Single Strength",
+        "Match": "",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        {},
+        {
+          "type": "PowerLoraLoaderHeaderWidget"
+        },
+        {
+          "on": true,
+          "lora": "LTX\\ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors",
+          "strength": 0.6,
+          "strengthTwo": null
+        },
+        {
+          "on": true,
+          "lora": "LTX\\LTX-2.3-OmniNFT-RL-Lora_bf16.safetensors",
+          "strength": 1,
+          "strengthTwo": null
+        },
+        {
+          "on": true,
+          "lora": "LTX\\VBVR-official-comfyui.safetensors",
+          "strength": 1,
+          "strengthTwo": null
+        },
+        {
+          "on": false,
+          "lora": "LTX\\Singularity LTX-2.3  OmniCine Preview v0.1.safetensors",
+          "strength": 1,
+          "strengthTwo": null
+        },
+        {
+          "on": true,
+          "lora": "LTX\\LTX2.3_Soft_Enhance.safetensors",
+          "strength": 0.75,
+          "strengthTwo": null
+        },
+        {
+          "on": false,
+          "lora": "LTX\\LTX2.3_Crisp_Enhance.safetensors",
+          "strength": 0.75,
+          "strengthTwo": null
+        },
+        {
+          "on": false,
+          "lora": "LTX\\ltx-2-19b-ic-lora-detailer.safetensors",
+          "strength": 0.5,
+          "strengthTwo": null
+        },
+        {
+          "on": false,
+          "lora": "LTX\\Singularity-LTX-2.3_OmniCine_V1.safetensors",
+          "strength": 0.4,
+          "strengthTwo": null
+        },
+        {
+          "on": false,
+          "lora": "LTX\\LTX-2.3-danceV2.comfy.safetensors",
+          "strength": 1,
+          "strengthTwo": null
+        },
+        {
+          "on": false,
+          "lora": "LTX\\ltx23__demoposeturnaround_d3m0p0s3.safetensors",
+          "strength": 1,
+          "strengthTwo": null
+        },
+        {},
+        ""
+      ],
+      "color": "#223",
+      "bgcolor": "#335"
+    },
+    {
+      "id": 2752,
+      "type": "PromptRelaySmartEncode",
+      "pos": [
+        -2290,
+        4030
+      ],
+      "size": [
+        600,
+        360
+      ],
+      "flags": {},
+      "order": 94,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 13506
+        },
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 13242
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "link": 13134
+        },
+        {
+          "name": "global_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "global_prompt"
+          },
+          "link": 13210
+        },
+        {
+          "name": "smart_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "smart_prompt"
+          },
+          "link": 13211
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            13658
+          ]
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            13659
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "kijai/ComfyUI-PromptRelay",
+        "ver": "5cae3c00186ff2eb79771070f05a2c4e02f329bb",
+        "Node name for S&R": "PromptRelaySmartEncode",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "",
+        "",
+        false,
+        0.001
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 3059,
+      "type": "Mute / Bypass Repeater (rgthree)",
+      "pos": [
+        -1873.4666132313826,
+        3990.592570508585
+      ],
+      "size": [
+        260.0787109375,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 96,
+      "mode": 0,
+      "inputs": [
+        {
+          "dir": 3,
+          "name": "",
+          "type": "*",
+          "link": 13668
+        },
+        {
+          "dir": 3,
+          "name": "",
+          "type": "*",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "color_off": "#a80",
+          "color_on": "#Fc0",
+          "dir": 4,
+          "name": "OPT_CONNECTION",
+          "type": "*",
+          "links": [
+            13669
+          ]
+        }
+      ],
+      "title": "Prompt Relay Installed",
+      "properties": {}
+    },
+    {
+      "id": 3045,
+      "type": "SetNode",
+      "pos": [
+        -4979.090125450236,
+        6423.2470465063
+      ],
+      "size": [
+        210,
+        60
+      ],
+      "flags": {
+        "collapsed": true
+      },
+      "order": 66,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "link": 13650
+        }
+      ],
+      "outputs": [
+        {
+          "name": "INT",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "title": "Set_Conditioning",
+      "properties": {
+        "Node name for S&R": "SetNode",
+        "aux_id": "kijai/ComfyUI-KJNodes",
+        "previousName": "Conditioning"
+      },
+      "widgets_values": [
+        "Conditioning"
+      ],
+      "color": "#1b4669",
+      "bgcolor": "#29699c"
+    },
+    {
+      "id": 3044,
+      "type": "MarkdownNote",
+      "pos": [
+        -5123.370220260827,
+        6641.985492523038
+      ],
+      "size": [
+        596.8191215805191,
+        100.6950329210922
+      ],
+      "flags": {},
+      "order": 50,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## *If you dont want or need to use Prompt Relay functionality, select Clip Text Encode instead. And Bypass the Prompt Relay node if it is not installed to avoid the workflow being blocked\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 3061,
+      "type": "Fast Bypasser (rgthree)",
+      "pos": [
+        -4814.127697027468,
+        6467.455449613872
+      ],
+      "size": [
+        281.0859375,
+        119.00025447108192
+      ],
+      "flags": {},
+      "order": 99,
+      "mode": 0,
+      "inputs": [
+        {
+          "dir": 3,
+          "name": "Prompt Relay Installed",
+          "type": "*",
+          "link": 13669
+        },
+        {
+          "dir": 3,
+          "name": "",
+          "type": "*",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "dir": 4,
+          "name": "OPT_CONNECTION",
+          "type": "*",
+          "links": null
+        }
+      ],
+      "properties": {
+        "toggleRestriction": "default"
+      }
+    },
+    {
+      "id": 3041,
+      "type": "SonderSelector",
+      "pos": [
+        -5131.631932129294,
+        6461.714286820605
+      ],
+      "size": [
+        303.2744963375462,
+        132
+      ],
+      "flags": {},
+      "order": 51,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "selection",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "index",
+          "type": "INT",
+          "links": [
+            13650
+          ]
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderSelector"
+      },
+      "widgets_values": [
+        "Prompt Relay - Conditioning",
+        "Prompt Relay - Conditioning\nClip Text Encode - Conditioning\n"
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 2906,
+      "type": "MarkdownNote",
+      "pos": [
+        -6160,
+        4970.289596251476
+      ],
+      "size": [
+        891.6659277938315,
+        416.6814441233737
+      ],
+      "flags": {},
+      "order": 52,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.1",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "## 🎬 The Hub\n\n### Sonder Editor\n*The whole editor in one node — projects, scenes, timeline, assets, guides, prompts, and takes.*\n\n**What it does:** This is the heart of Sonder. Click \"Open Editor\" to open it fullscreen, where you arrange clips, audio, guide frames, and prompt sections on a timeline, then mark an In/Out range to generate. Everything else in the graph feeds off what you select here.\n\n**How to use it:**\n1. Pick an existing project, or choose **+ Create New** (then `project_name / fps / width / height` apply).\n2. Open fullscreen and build your scene — the node's outputs always reflect the **selected timeline range** unless a queue job is active.\n3. Wire `project` → **Sonder Save Video**, and feed `rendered_frames`, `guide_images`/`guide_idx`/`guide_strengths`, `prompt`, `audio`, and `mask_start_time`/`mask_end_time` into your workflow of choice.\n\n**Outputs:** `project`, `rendered_frames`, `guide_images`, `guide_idx`, `guide_strengths`, `prompt`, `frame_count`, `fps`, `width`, `height`, `audio`, `mask_start_time`, `mask_end_time`.\n\n💡 *Tip:* The widgets on the node card are just the project picker — all real editing happens in the fullscreen view.\n\n### Works Across Different Models\nThe editor works with regular images, videos, and audio, then handles the technical setup behind the scenes.\nThis means the same timeline tools and ideas can work with different video models—past, present, or future—as long as the chosen model supports the feature you want to use, such as audio. This specific workflow is for ltx 2.3\n\n⚠️ *Note:* \n### The \"project\" wire output does not play nice with Get/Set, Anything Everywhere, nor reroutes. Direct wiring is recommended for best results.\n\n### Node 2.0 is not compatible at the current time.\n\n \n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2849,
+      "type": "SonderEditor",
+      "pos": [
+        -5240,
+        4960
+      ],
+      "size": [
+        755.8696005111624,
+        992.1016022150361
+      ],
+      "flags": {
+        "resizable": true,
+        "collapsed": false
+      },
+      "order": 53,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "project",
+          "type": "SONDER_PROJECT",
+          "links": [
+            13247,
+            13248,
+            13249,
+            13251,
+            13285,
+            13447,
+            13535
+          ]
+        },
+        {
+          "name": "rendered_frames",
+          "type": "IMAGE",
+          "links": [
+            13321
+          ]
+        },
+        {
+          "name": "guide_images",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "guide_idx",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "guide_strengths",
+          "type": "STRING",
+          "links": null
+        },
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "links": [
+            13651
+          ]
+        },
+        {
+          "name": "frame_count",
+          "type": "INT",
+          "links": []
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": [
+            13261
+          ]
+        },
+        {
+          "name": "width",
+          "type": "INT",
+          "links": []
+        },
+        {
+          "name": "height",
+          "type": "INT",
+          "links": []
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            13262
+          ]
+        },
+        {
+          "name": "mask_start_time",
+          "type": "FLOAT",
+          "links": []
+        },
+        {
+          "name": "mask_end_time",
+          "type": "FLOAT",
+          "links": []
+        }
+      ],
+      "properties": {
+        "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+        "ver": "8434cbdeb905e449c457adca64ec208542305e63",
+        "Node name for S&R": "SonderEditor",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.1"
+        }
+      },
+      "widgets_values": [
+        "Project-Sample",
+        "Test",
+        24,
+        1280,
+        720,
+        "6342ea4f",
+        314,
+        554,
+        25,
+        24,
+        0,
+        0,
+        "trimmed",
+        true,
+        false,
+        0,
+        true,
+        "cover",
+        "center",
+        ""
+      ],
+      "color": "#222",
+      "bgcolor": "#000"
+    }
+  ],
+  "links": [
+    [
+      1196,
+      146,
+      0,
+      503,
+      0,
+      "VAE"
+    ],
+    [
+      1197,
+      147,
+      0,
+      502,
+      0,
+      "VAE"
+    ],
+    [
+      6893,
+      1783,
+      0,
+      145,
+      0,
+      "LATENT"
+    ],
+    [
+      6898,
+      1785,
+      0,
+      145,
+      1,
+      "VAE"
+    ],
+    [
+      7678,
+      2187,
+      0,
+      2194,
+      2,
+      "LATENT"
+    ],
+    [
+      7687,
+      2187,
+      1,
+      1781,
+      0,
+      "LATENT"
+    ],
+    [
+      7688,
+      2192,
+      0,
+      2206,
+      0,
+      "NOISE"
+    ],
+    [
+      7689,
+      1908,
+      0,
+      2192,
+      0,
+      "INT"
+    ],
+    [
+      7703,
+      2194,
+      2,
+      1780,
+      0,
+      "LATENT"
+    ],
+    [
+      7974,
+      152,
+      0,
+      2206,
+      4,
+      "LATENT"
+    ],
+    [
+      8033,
+      2377,
+      0,
+      2378,
+      1,
+      "FLOW_CONTROL"
+    ],
+    [
+      8044,
+      2377,
+      4,
+      2367,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      8045,
+      2377,
+      5,
+      2367,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      8046,
+      2377,
+      6,
+      2367,
+      3,
+      "LATENT"
+    ],
+    [
+      8047,
+      2367,
+      0,
+      2378,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      8048,
+      2367,
+      1,
+      2378,
+      3,
+      "CONDITIONING"
+    ],
+    [
+      8060,
+      2382,
+      0,
+      2367,
+      2,
+      "VAE"
+    ],
+    [
+      8081,
+      2374,
+      0,
+      2387,
+      1,
+      "VAE"
+    ],
+    [
+      8672,
+      1908,
+      0,
+      2438,
+      2,
+      "INT"
+    ],
+    [
+      9172,
+      2395,
+      0,
+      2480,
+      1,
+      "VAE"
+    ],
+    [
+      9688,
+      152,
+      0,
+      2497,
+      0,
+      "LATENT"
+    ],
+    [
+      9702,
+      2206,
+      0,
+      2187,
+      0,
+      "LATENT"
+    ],
+    [
+      10518,
+      2384,
+      0,
+      2367,
+      4,
+      "IMAGE"
+    ],
+    [
+      10728,
+      2367,
+      2,
+      2378,
+      4,
+      "LATENT"
+    ],
+    [
+      10736,
+      2385,
+      1,
+      152,
+      1,
+      "LATENT"
+    ],
+    [
+      10943,
+      2379,
+      0,
+      2377,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      10945,
+      2380,
+      0,
+      2377,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      10947,
+      2385,
+      0,
+      2377,
+      3,
+      "LATENT"
+    ],
+    [
+      13108,
+      120,
+      0,
+      507,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      13120,
+      2387,
+      0,
+      2787,
+      0,
+      "LATENT"
+    ],
+    [
+      13122,
+      2788,
+      0,
+      2385,
+      0,
+      "LATENT"
+    ],
+    [
+      13123,
+      2789,
+      0,
+      2385,
+      1,
+      "LATENT"
+    ],
+    [
+      13132,
+      2377,
+      2,
+      2367,
+      7,
+      "INT"
+    ],
+    [
+      13133,
+      2377,
+      3,
+      2367,
+      8,
+      "FLOAT"
+    ],
+    [
+      13134,
+      2790,
+      0,
+      2752,
+      2,
+      "LATENT"
+    ],
+    [
+      13151,
+      2792,
+      0,
+      2437,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      13152,
+      2793,
+      0,
+      2437,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      13153,
+      2792,
+      0,
+      2194,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      13154,
+      2793,
+      0,
+      2194,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      13155,
+      2794,
+      0,
+      2795,
+      0,
+      "INT"
+    ],
+    [
+      13163,
+      2796,
+      0,
+      2437,
+      0,
+      "MODEL"
+    ],
+    [
+      13197,
+      2823,
+      1,
+      2824,
+      1,
+      "STRING"
+    ],
+    [
+      13210,
+      2772,
+      0,
+      2752,
+      3,
+      "STRING"
+    ],
+    [
+      13211,
+      2772,
+      1,
+      2752,
+      4,
+      "STRING"
+    ],
+    [
+      13212,
+      2187,
+      0,
+      2824,
+      0,
+      "LATENT"
+    ],
+    [
+      13241,
+      1313,
+      0,
+      654,
+      1,
+      "CLIP"
+    ],
+    [
+      13242,
+      654,
+      1,
+      2752,
+      1,
+      "CLIP"
+    ],
+    [
+      13243,
+      654,
+      1,
+      120,
+      0,
+      "CLIP"
+    ],
+    [
+      13247,
+      2849,
+      0,
+      2377,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13248,
+      2849,
+      0,
+      2378,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13249,
+      2849,
+      0,
+      2772,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13251,
+      2849,
+      0,
+      2823,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13261,
+      2849,
+      7,
+      2784,
+      0,
+      "FLOAT"
+    ],
+    [
+      13262,
+      2849,
+      10,
+      2387,
+      0,
+      "AUDIO"
+    ],
+    [
+      13272,
+      2856,
+      0,
+      2385,
+      3,
+      "FLOAT"
+    ],
+    [
+      13273,
+      2856,
+      1,
+      2385,
+      4,
+      "FLOAT"
+    ],
+    [
+      13276,
+      2861,
+      0,
+      2385,
+      2,
+      "FLOAT"
+    ],
+    [
+      13285,
+      2849,
+      0,
+      2856,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13294,
+      2480,
+      0,
+      2786,
+      0,
+      "LATENT"
+    ],
+    [
+      13321,
+      2849,
+      1,
+      2480,
+      0,
+      "IMAGE"
+    ],
+    [
+      13367,
+      2377,
+      1,
+      2384,
+      0,
+      "IMAGE"
+    ],
+    [
+      13372,
+      654,
+      0,
+      2892,
+      0,
+      "MODEL"
+    ],
+    [
+      13373,
+      1313,
+      0,
+      2893,
+      0,
+      "CLIP"
+    ],
+    [
+      13374,
+      2437,
+      0,
+      2894,
+      0,
+      "GUIDER"
+    ],
+    [
+      13375,
+      2438,
+      0,
+      2895,
+      0,
+      "SAMPLER"
+    ],
+    [
+      13378,
+      2902,
+      0,
+      2808,
+      1,
+      "INT"
+    ],
+    [
+      13379,
+      2897,
+      0,
+      2808,
+      2,
+      "MODEL"
+    ],
+    [
+      13380,
+      2901,
+      0,
+      2808,
+      3,
+      "MODEL"
+    ],
+    [
+      13381,
+      2898,
+      0,
+      2808,
+      4,
+      "VAE"
+    ],
+    [
+      13382,
+      2899,
+      0,
+      2808,
+      5,
+      "VAE"
+    ],
+    [
+      13383,
+      2900,
+      0,
+      2808,
+      6,
+      "CLIP"
+    ],
+    [
+      13387,
+      2904,
+      0,
+      2808,
+      8,
+      "GUIDER"
+    ],
+    [
+      13403,
+      145,
+      0,
+      2889,
+      1,
+      "AUDIO"
+    ],
+    [
+      13427,
+      2438,
+      0,
+      2206,
+      2,
+      "SAMPLER"
+    ],
+    [
+      13428,
+      2437,
+      0,
+      2206,
+      1,
+      "GUIDER"
+    ],
+    [
+      13439,
+      2931,
+      1,
+      2806,
+      0,
+      "INT"
+    ],
+    [
+      13440,
+      2497,
+      0,
+      2933,
+      0,
+      "SIGMAS"
+    ],
+    [
+      13441,
+      2781,
+      0,
+      2933,
+      1,
+      "SIGMAS"
+    ],
+    [
+      13442,
+      2933,
+      0,
+      2206,
+      3,
+      "SIGMAS"
+    ],
+    [
+      13443,
+      2807,
+      0,
+      2933,
+      4,
+      "INT"
+    ],
+    [
+      13444,
+      2931,
+      0,
+      2934,
+      0,
+      "STRING"
+    ],
+    [
+      13445,
+      2935,
+      0,
+      2808,
+      9,
+      "STRING"
+    ],
+    [
+      13446,
+      2903,
+      0,
+      2808,
+      7,
+      "SAMPLER"
+    ],
+    [
+      13447,
+      2849,
+      0,
+      2937,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13448,
+      2937,
+      0,
+      2936,
+      0,
+      "SONDER_DRIVER_REF"
+    ],
+    [
+      13455,
+      2378,
+      0,
+      2938,
+      1,
+      "*"
+    ],
+    [
+      13456,
+      2378,
+      1,
+      2938,
+      2,
+      "*"
+    ],
+    [
+      13458,
+      2378,
+      2,
+      2938,
+      3,
+      "*"
+    ],
+    [
+      13468,
+      2938,
+      0,
+      2792,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      13469,
+      2938,
+      1,
+      2793,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      13470,
+      2938,
+      2,
+      152,
+      0,
+      "LATENT"
+    ],
+    [
+      13504,
+      654,
+      0,
+      2954,
+      0,
+      "MODEL"
+    ],
+    [
+      13506,
+      2954,
+      0,
+      2752,
+      0,
+      "MODEL"
+    ],
+    [
+      13508,
+      2937,
+      1,
+      2938,
+      0,
+      "INT"
+    ],
+    [
+      13535,
+      2849,
+      0,
+      2808,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13545,
+      2808,
+      0,
+      2975,
+      0,
+      "SONDER_PROJECT"
+    ],
+    [
+      13546,
+      2785,
+      0,
+      2975,
+      3,
+      "FLOAT"
+    ],
+    [
+      13548,
+      145,
+      0,
+      2975,
+      2,
+      "AUDIO"
+    ],
+    [
+      13551,
+      2977,
+      0,
+      2933,
+      2,
+      "SIGMAS"
+    ],
+    [
+      13552,
+      2796,
+      0,
+      2977,
+      0,
+      "MODEL"
+    ],
+    [
+      13624,
+      2856,
+      2,
+      2385,
+      5,
+      "FLOAT"
+    ],
+    [
+      13625,
+      2856,
+      3,
+      2385,
+      6,
+      "FLOAT"
+    ],
+    [
+      13626,
+      2977,
+      0,
+      3030,
+      0,
+      "SIGMAS"
+    ],
+    [
+      13627,
+      3032,
+      0,
+      2808,
+      10,
+      "SIGMAS"
+    ],
+    [
+      13628,
+      2890,
+      0,
+      654,
+      0,
+      "MODEL"
+    ],
+    [
+      13631,
+      1784,
+      0,
+      3037,
+      1,
+      "VAE"
+    ],
+    [
+      13632,
+      1782,
+      0,
+      3037,
+      0,
+      "LATENT"
+    ],
+    [
+      13633,
+      3037,
+      0,
+      2889,
+      0,
+      "IMAGE"
+    ],
+    [
+      13634,
+      3037,
+      0,
+      2975,
+      1,
+      "IMAGE"
+    ],
+    [
+      13635,
+      654,
+      0,
+      3039,
+      0,
+      "MODEL"
+    ],
+    [
+      13636,
+      3039,
+      0,
+      2954,
+      1,
+      "MODEL"
+    ],
+    [
+      13637,
+      3039,
+      0,
+      3035,
+      0,
+      "MODEL"
+    ],
+    [
+      13638,
+      2378,
+      0,
+      3036,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      13639,
+      2378,
+      1,
+      3036,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      13640,
+      2382,
+      0,
+      3036,
+      2,
+      "VAE"
+    ],
+    [
+      13641,
+      2378,
+      2,
+      3036,
+      3,
+      "LATENT"
+    ],
+    [
+      13642,
+      2936,
+      0,
+      3036,
+      4,
+      "IMAGE"
+    ],
+    [
+      13643,
+      3036,
+      0,
+      2938,
+      4,
+      "CONDITIONING"
+    ],
+    [
+      13644,
+      3036,
+      1,
+      2938,
+      5,
+      "CONDITIONING"
+    ],
+    [
+      13645,
+      3036,
+      2,
+      2938,
+      6,
+      "LATENT"
+    ],
+    [
+      13646,
+      2936,
+      1,
+      3036,
+      7,
+      "INT"
+    ],
+    [
+      13647,
+      2936,
+      2,
+      3036,
+      8,
+      "FLOAT"
+    ],
+    [
+      13648,
+      3035,
+      0,
+      3036,
+      6,
+      "IC_LORA_PARAMETERS"
+    ],
+    [
+      13649,
+      3033,
+      0,
+      2890,
+      0,
+      "MODEL"
+    ],
+    [
+      13650,
+      3041,
+      1,
+      3045,
+      0,
+      "INT"
+    ],
+    [
+      13651,
+      2849,
+      5,
+      3046,
+      0,
+      "STRING"
+    ],
+    [
+      13652,
+      654,
+      1,
+      3047,
+      0,
+      "CLIP"
+    ],
+    [
+      13653,
+      3049,
+      0,
+      3047,
+      1,
+      "STRING"
+    ],
+    [
+      13656,
+      2937,
+      1,
+      2954,
+      3,
+      "INT"
+    ],
+    [
+      13658,
+      2752,
+      0,
+      3050,
+      1,
+      "MODEL"
+    ],
+    [
+      13659,
+      2752,
+      1,
+      3050,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      13660,
+      3050,
+      0,
+      505,
+      0,
+      "MODEL"
+    ],
+    [
+      13661,
+      3050,
+      1,
+      506,
+      0,
+      "CONDITIONING"
+    ],
+    [
+      13662,
+      2954,
+      0,
+      3050,
+      3,
+      "MODEL"
+    ],
+    [
+      13663,
+      3047,
+      0,
+      3050,
+      4,
+      "CONDITIONING"
+    ],
+    [
+      13664,
+      3055,
+      0,
+      3050,
+      0,
+      "INT"
+    ],
+    [
+      13668,
+      2752,
+      0,
+      3059,
+      0,
+      "MODEL"
+    ],
+    [
+      13669,
+      3059,
+      0,
+      3061,
+      0,
+      "*"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Loaders and Conditioning",
+      "bounding": [
+        -3880,
+        3960,
+        2480,
+        840
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 12,
+      "title": "Latent Frames and Guides Setup",
+      "bounding": [
+        -3880,
+        4830,
+        2060,
+        900
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 23,
+      "title": "Decode and Save",
+      "bounding": [
+        -3881.251636208739,
+        5757.261113524136,
+        1290,
+        1550
+      ],
+      "color": "#A88",
+      "flags": {}
+    },
+    {
+      "id": 45,
+      "title": "Sampler",
+      "bounding": [
+        -1670,
+        4830,
+        1720,
+        990
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 46,
+      "title": "Encode",
+      "bounding": [
+        -4430,
+        5410,
+        290,
+        523.6
+      ],
+      "color": "#A88",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true,
+    "ue_links": [],
+    "links_added_by_ue": [],
+    "ds": {
+      "scale": 0.6602927234140404,
+      "offset": [
+        6249.150449775018,
+        -4869.129935507321
+      ]
+    },
+    "linearData": {
+      "inputs": [
+        [
+          "634",
+          "value"
+        ],
+        [
+          "2182",
+          "Gallery"
+        ]
+      ],
+      "outputs": [
+        "2323"
+      ]
+    },
+    "frontendVersion": "1.45.21"
+  },
+  "version": 0.4
+}
