@@ -11,15 +11,12 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
-### Added
-- Missing Asset Gallery thumbnails now heal quietly as they become visible, with a confirmed one-shot bulk regeneration action and cancellable progress in Settings.
-
-## [0.1.0] - TBD
-
-_Initial public release. Replace `TBD` with the date when you tag and publish 0.1.0._
+## [0.1.0] - 2026-07-22
 
 ### Added
-- **Sonder Editor Released**
+- Initial public release of **Sonder Editor**.
+- Project documentation, an example LTX 2.3 workflow, and a downloadable
+  showcase project.
 
 ### Notes
 - Requires ComfyUI and `ffmpeg` (see README). `torch`/`torchaudio` are provided
