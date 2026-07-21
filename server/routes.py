@@ -3527,11 +3527,6 @@ def _sync_media_folder(
             apply_color_metadata(asset, metadata)
         project.add_asset(asset)
 
-        if asset_type in {"video", "image", "audio"}:
-            thumb_path = _asset_thumbnail_path(project, asset)
-            if thumb_path:
-                ensure_thumbnail(asset_type, filepath, thumb_path)
-
         changed = True
         logger.info("Auto-registered asset: %s (%s)", filename, asset_type)
 
@@ -5108,6 +5103,8 @@ def _regenerate_thumbnail_if_current(project_dir: str, asset_id: str, expected_s
         thumb_path = _asset_thumbnail_path(project, asset)
         if not thumb_path:
             return
+        if os.path.isfile(thumb_path):
+            return
         os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
         temp_path = f"{thumb_path}.{uuid.uuid4().hex}.tmp.png"
         try:
@@ -6102,7 +6099,7 @@ if routes is not None:
         if asset_type in {"video", "image", "audio"}:
             thumb_path = _asset_thumbnail_path(project, asset)
             if thumb_path:
-                ensure_thumbnail(asset_type, dest_path, thumb_path)
+                await asyncio.to_thread(ensure_thumbnail, asset_type, dest_path, thumb_path)
 
         return web.json_response(_asset_payload(project, asset), status=201)
 
@@ -6284,7 +6281,7 @@ if routes is not None:
 
             thumb_path = _asset_thumbnail_path(project, asset)
             if thumb_path:
-                ensure_thumbnail("image", out_path, thumb_path)
+                await asyncio.to_thread(ensure_thumbnail, "image", out_path, thumb_path)
             return web.json_response(_asset_payload(project, asset), status=201)
         except Exception as e:
             logger.warning("Failed to register viewport snapshot: %s", e)
@@ -6373,7 +6370,7 @@ if routes is not None:
             # Generate thumbnail
             thumb_path = _asset_thumbnail_path(project, asset)
             if thumb_path:
-                ensure_thumbnail("image", out_path, thumb_path)
+                await asyncio.to_thread(ensure_thumbnail, "image", out_path, thumb_path)
 
             return web.json_response(_asset_payload(project, asset), status=201)
 
@@ -6850,7 +6847,12 @@ if routes is not None:
         if not _asset_missing(project, asset):
             thumb_path = _asset_thumbnail_path(project, asset)
             if thumb_path:
-                ensure_thumbnail(asset.asset_type, _asset_abspath(project, asset), thumb_path)
+                await asyncio.to_thread(
+                    ensure_thumbnail,
+                    asset.asset_type,
+                    _asset_abspath(project, asset),
+                    thumb_path,
+                )
 
         save_project(project)
         return web.json_response({

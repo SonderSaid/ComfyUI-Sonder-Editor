@@ -15,6 +15,12 @@ import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "
 import { resolveEffectiveStreamingMode } from "./media_streaming.js";
 import { notifyError, notifyInfo, notifySuccess } from "./editor_notifications.js";
 import {
+    cancelAutomaticThumbnailRepairs,
+    enqueueAutomaticThumbnailRepair,
+    isThumbnailRepairCandidate,
+    subscribeThumbnailRepairs,
+} from "./thumbnail_repair_manager.js";
+import {
     renderTrackedSectionBody,
     trackedFieldMatchForEntry,
     TRACKED_RENDERERS,
@@ -709,6 +715,9 @@ export function mountSharedAssetGallery(container, options = {}) {
         ? options.ownerId
         : `sonder-gallery-${Math.random().toString(36).slice(2, 8)}`;
     const consumerId = (suffix) => `${ownerId}:${suffix}`;
+    const thumbnailRepairOwnerBase = `${ownerId}:thumbnail-repair`;
+    const thumbnailRepairOwners = new Set();
+    let thumbnailRepairObserver = null;
     const state = {
         type: normalizeGalleryTab(initialSettings.gallery.activeTab),
         scopeMode: normalizeGalleryScope(initialSettings.gallery.scopeMode),
@@ -933,6 +942,88 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function currentProjectId() {
         return projectIdFromDir(currentProjectDir()) || "default";
+    }
+
+    function thumbnailRepairOwner(assetId, kind = "row") {
+        return `${thumbnailRepairOwnerBase}:${kind}:${assetId}`;
+    }
+
+    function cancelThumbnailRepairOwners() {
+        for (const repairOwner of thumbnailRepairOwners) {
+            cancelAutomaticThumbnailRepairs(repairOwner);
+        }
+        thumbnailRepairOwners.clear();
+    }
+
+    function enqueueThumbnailRepair(asset, kind = "row") {
+        if (!isThumbnailRepairCandidate(asset)) return;
+        const repairOwner = thumbnailRepairOwner(asset.asset_id, kind);
+        thumbnailRepairOwners.add(repairOwner);
+        enqueueAutomaticThumbnailRepair({
+            ownerId: repairOwner,
+            projectDir: currentProjectDir(),
+            asset,
+        });
+    }
+
+    function makeThumbnailImage(asset) {
+        const img = style(document.createElement("img"), `width:100%;height:100%;object-fit:contain;display:block;`);
+        img.loading = "lazy";
+        img.decoding = "async";
+        img.src = buildThumbnailUrl(currentProjectDir(), asset.asset_id);
+        img.alt = assetDisplayName(asset);
+        img.draggable = false;
+        return img;
+    }
+
+    function revealRepairedThumbnail(assetId) {
+        const asset = data.assets.find((entry) => entry.asset_id === assetId);
+        if (!asset) return;
+        asset.has_thumbnail = true;
+        for (const host of listScroller.querySelectorAll?.("[data-thumbnail-host]") || []) {
+            if (host.dataset.thumbnailHost !== assetId) continue;
+            host.innerHTML = "";
+            host.appendChild(makeThumbnailImage(asset));
+        }
+    }
+
+    const unsubscribeThumbnailRepairs = subscribeThumbnailRepairs(({ projectId, assetId }) => {
+        if (projectId !== currentProjectId()) return;
+        revealRepairedThumbnail(assetId);
+    });
+
+    function refreshThumbnailRepairObservation(selectedAsset = null) {
+        thumbnailRepairObserver?.disconnect?.();
+        thumbnailRepairObserver = null;
+        cancelThumbnailRepairOwners();
+
+        if (typeof IntersectionObserver === "function") {
+            thumbnailRepairObserver = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    const assetId = entry.target?.dataset?.assetRow || "";
+                    const asset = data.assets.find((item) => item.asset_id === assetId);
+                    const repairOwner = thumbnailRepairOwner(assetId, "row");
+                    if (entry.isIntersecting && asset) {
+                        enqueueThumbnailRepair(asset, "row");
+                    } else {
+                        cancelAutomaticThumbnailRepairs(repairOwner);
+                        thumbnailRepairOwners.delete(repairOwner);
+                    }
+                }
+            }, { root: listScroller, threshold: 0.01 });
+            for (const row of listScroller.querySelectorAll?.("[data-asset-row]") || []) {
+                const asset = data.assets.find((item) => item.asset_id === row.dataset.assetRow);
+                if (isThumbnailRepairCandidate(asset)) thumbnailRepairObserver.observe(row);
+            }
+        }
+
+        const inspectAssets = [
+            selectedAsset,
+            data.assets.find((asset) => asset.asset_id === state.overlayState.assetId),
+            data.assets.find((asset) => asset.asset_id === state.overlayState.compareLeftAssetId),
+            data.assets.find((asset) => asset.asset_id === state.overlayState.compareRightAssetId),
+        ];
+        for (const asset of inspectAssets) enqueueThumbnailRepair(asset, "inspect");
     }
 
     function assetMediaCacheKey(asset) {
@@ -6272,6 +6363,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
 
         const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${isMissing ? THEME.bg2 : THEME.bg0};border:1px solid ${isMissing ? `${THEME.statusFailed}66` : THEME.line2};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? THEME.statusFailed : THEME.fg2};font-size:${thumbConfig.metaFont}px;`);
+        thumb.dataset.thumbnailHost = asset.asset_id;
         if (isMissing) {
             thumb.textContent = "Missing";
         } else if (asset.has_thumbnail) {
@@ -6486,6 +6578,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
 
                 const thumb = style(document.createElement("div"), `height:${thumbConfig.thumbHeight}px;border-radius:5px;background:${isMissing ? THEME.bg2 : THEME.bg0};border:1px solid ${isMissing ? `${THEME.statusFailed}66` : THEME.line2};display:flex;align-items:center;justify-content:center;overflow:hidden;color:${isMissing ? THEME.statusFailed : THEME.fg2};font-size:${thumbConfig.metaFont}px;`);
+                thumb.dataset.thumbnailHost = asset.asset_id;
                 if (isMissing) {
                     thumb.textContent = "Missing";
                 } else if (asset.has_thumbnail) {
@@ -6607,6 +6700,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         } else {
             renderDetail(selected);
         }
+        refreshThumbnailRepairObservation(state.inspectorCollapsed ? null : selected);
         queueResize();
     }
 
@@ -7012,6 +7106,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.allowAutoFocus = true;
         if (!tryRenderAdditiveData(additiveAssets, previousAssets)) {
             render();
+        } else {
+            refreshThumbnailRepairObservation(selectedAsset());
         }
     }
 
@@ -7021,6 +7117,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         galleryKeyOff();
         document.removeEventListener("mousedown", documentMouseDownClear, true);
         unsubscribeSettings();
+        unsubscribeThumbnailRepairs();
+        thumbnailRepairObserver?.disconnect?.();
+        thumbnailRepairObserver = null;
+        cancelThumbnailRepairOwners();
         resizeObserver?.disconnect();
         closeInspectOverlay();
         clearOverlayMediaCache();
@@ -7033,6 +7133,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         root,
         setData,
         destroy,
+        cancelThumbnailRepairs: () => {
+            thumbnailRepairObserver?.disconnect?.();
+            cancelThumbnailRepairOwners();
+        },
         isInspectOverlayOpen: () => !!state.overlayState.open,
         hasSelectionOwnership,
         refreshCurrentScene: () => {

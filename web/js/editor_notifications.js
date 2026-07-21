@@ -190,6 +190,8 @@ function _applyOpts(notif, opts) {
 // ── Core API ───────────────────────────────────────────────────────────────────
 
 // notify({ tier, verb, message, detail, progress, foreground, source, onRetry, actions, durationMs })
+// Action descriptors are { label, variant, fn, dismiss? }; dismiss defaults to
+// true in presenters, while false keeps a progress notification mounted.
 // Returns a handle: { id, update, progress, resolve, dismiss }.
 export function notify(opts = {}) {
     const s = _ensure();

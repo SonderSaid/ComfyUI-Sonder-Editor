@@ -2,6 +2,7 @@
 
 import logging
 import os
+import threading
 
 import cv2
 import numpy as np
@@ -12,6 +13,8 @@ from .media_helpers import MediaProbeError, decode_audio_samples
 logger = logging.getLogger("sonder_editor")
 
 THUMB_SIZE = (192, 128)  # width, height
+THUMBNAIL_GENERATION_CONCURRENCY = 2
+_THUMBNAIL_GENERATION_SLOTS = threading.BoundedSemaphore(THUMBNAIL_GENERATION_CONCURRENCY)
 
 
 def generate_video_thumbnail(video_path: str, output_path: str,
@@ -231,10 +234,15 @@ def ensure_thumbnail(asset_type: str, source_path: str, output_path: str) -> boo
     if os.path.isfile(output_path):
         return True
 
-    if asset_type == "video":
-        return generate_video_thumbnail(source_path, output_path)
-    elif asset_type == "image":
-        return generate_image_thumbnail(source_path, output_path)
-    elif asset_type == "audio":
-        return generate_audio_waveform(source_path, output_path)
-    return False
+    with _THUMBNAIL_GENERATION_SLOTS:
+        # Another request may have filled this cache entry while this caller
+        # waited for one of the process-wide generation slots.
+        if os.path.isfile(output_path):
+            return True
+        if asset_type == "video":
+            return generate_video_thumbnail(source_path, output_path)
+        if asset_type == "image":
+            return generate_image_thumbnail(source_path, output_path)
+        if asset_type == "audio":
+            return generate_audio_waveform(source_path, output_path)
+        return False

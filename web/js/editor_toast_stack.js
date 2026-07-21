@@ -319,7 +319,15 @@ export function mountToastStack(target = document.body) {
         if (Array.isArray(n.actions)) {
             for (const a of n.actions) {
                 if (a && typeof a.fn === "function" && a.label) {
-                    actions.push({ label: a.label, variant: a.variant || "muted", fn: () => { try { a.fn(); } finally { dismiss(n.id); } } });
+                    actions.push({
+                        label: a.label,
+                        variant: a.variant || "muted",
+                        fn: () => {
+                            try { a.fn(); } finally {
+                                if (a.dismiss !== false) dismiss(n.id);
+                            }
+                        },
+                    });
                 }
             }
         }

@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Missing Asset Gallery thumbnails now heal quietly as they become visible, with a confirmed one-shot bulk regeneration action and cancellable progress in Settings.
 
 ## [0.1.0] - TBD
 

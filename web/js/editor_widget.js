@@ -214,6 +214,14 @@ import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress }
 import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
 import { mountSharedRenderQueue, queueBatchIds, formatQueueTime } from "./shared_render_queue.js";
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
+import {
+    cancelBulkThumbnailRepair,
+    cancelThumbnailRepairOwner,
+    fetchMissingThumbnailAssets,
+    getBulkThumbnailRepairState,
+    startBulkThumbnailRepair,
+    subscribeThumbnailRepairState,
+} from "./thumbnail_repair_manager.js";
 import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
 import { mountPromptManagementPanel } from "./editor_prompt_panel.js";
 import { evalNumericExpression } from "./editor_numeric_input.js";
@@ -520,6 +528,9 @@ export class EditorWidget {
         this._renderCacheSweepPending = false;
         this._renderCacheSweepSeq = 0;
         this._renderCacheStatusHandler = null;
+        this._thumbnailRepairOwnerId = this._keyboardConsumerId("thumbnail-bulk");
+        this._thumbnailRepairPreflight = false;
+        this._thumbnailRepairUnsubscribe = subscribeThumbnailRepairState(() => this._syncSettingsPanelControls());
 
         // Scene state
         this.scenes = [];
@@ -5246,6 +5257,11 @@ export class EditorWidget {
             get _renderCacheProjectName() { return editor._projectDirName(); },
             _refreshRenderCacheUsage: () => editor._refreshRenderCacheUsage(),
             _clearRenderCache: () => editor._clearRenderCache(),
+            get _thumbnailRepairOwnerId() { return editor._thumbnailRepairOwnerId; },
+            get _thumbnailRepairPreflight() { return editor._thumbnailRepairPreflight; },
+            get _thumbnailRepairProjectName() { return editor._projectDirName(); },
+            _thumbnailBulkRepairState: () => editor._thumbnailBulkRepairState(),
+            _toggleThumbnailBulkRepair: () => editor._toggleThumbnailBulkRepair(),
             _guideHoverPreviewSize: () => editor._guideHoverPreviewSize(),
             _hideGuideHoverPreview: () => editor._hideGuideHoverPreview(),
             _hidePromptHoverPreview: () => editor._hidePromptHoverPreview(),
@@ -5296,6 +5312,54 @@ export class EditorWidget {
             this._applyTemplateConstraintMetadata();
             this._syncSceneResolutionControls({ detectSelections: false });
             this._updateViewportHeader();
+        }
+    }
+
+    _thumbnailBulkRepairState() {
+        return getBulkThumbnailRepairState();
+    }
+
+    async _toggleThumbnailBulkRepair() {
+        const active = getBulkThumbnailRepairState();
+        if (active) {
+            if (active.ownerId === this._thumbnailRepairOwnerId) {
+                cancelBulkThumbnailRepair({ ownerId: this._thumbnailRepairOwnerId });
+            } else {
+                notifyWarning(`Thumbnail regeneration is already running for ${active.projectId}.`, {
+                    source: "thumbnail-repair",
+                });
+            }
+            return;
+        }
+        if (!this.projectDir || this._thumbnailRepairPreflight) return;
+
+        const projectDir = this.projectDir;
+        const projectName = this._projectDirName();
+        this._thumbnailRepairPreflight = true;
+        this._syncSettingsPanelControls();
+        try {
+            const candidates = await fetchMissingThumbnailAssets(projectDir);
+            if (this._destroyed || this.projectDir !== projectDir) return;
+            if (!candidates.length) {
+                notifyInfo("No missing thumbnails need regeneration.", { source: "thumbnail-repair" });
+                return;
+            }
+            const noun = candidates.length === 1 ? "thumbnail" : "thumbnails";
+            if (!window.confirm(`Regenerate ${candidates.length} missing ${noun} for "${projectName}"? Existing thumbnails, Trash, filmstrips, and waveforms will not be changed.`)) {
+                return;
+            }
+            this._thumbnailRepairPreflight = false;
+            this._syncSettingsPanelControls();
+            await startBulkThumbnailRepair({
+                ownerId: this._thumbnailRepairOwnerId,
+                projectDir,
+                assets: candidates,
+            });
+        } catch (error) {
+            notifyError(error?.message || "Thumbnail regeneration failed.", { source: "thumbnail-repair" });
+        } finally {
+            this._thumbnailRepairPreflight = false;
+            this._syncSettingsPanelControls();
         }
     }
 
@@ -14505,6 +14569,8 @@ export class EditorWidget {
     updateProject(projectDir) {
         if (projectDir === this.projectDir) return;
         this._clearStaleReplayState();
+        this._assetGallery?.cancelThumbnailRepairs?.();
+        cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
         this.projectDir = projectDir;
         this._frameConstraintHealedFor = "";
         this.activeSceneId = "";
@@ -15772,6 +15838,11 @@ export class EditorWidget {
         if (this._settingsUnsubscribe) {
             this._settingsUnsubscribe();
             this._settingsUnsubscribe = null;
+        }
+        cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
+        if (this._thumbnailRepairUnsubscribe) {
+            this._thumbnailRepairUnsubscribe();
+            this._thumbnailRepairUnsubscribe = null;
         }
         if (this._renderCacheStatusHandler && typeof api.removeEventListener === "function") {
             api.removeEventListener("status", this._renderCacheStatusHandler);

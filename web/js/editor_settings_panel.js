@@ -273,6 +273,33 @@ function syncSettingsPanelControls() {
     if (controls.galleryInspectorCollapsed) controls.galleryInspectorCollapsed.checked = !!this._settings.gallery.inspectorCollapsed;
     if (controls.galleryThumbnailSize) controls.galleryThumbnailSize.value = this._settings.gallery.thumbnailSize;
     if (controls.galleryArtifactInspectorExpanded) controls.galleryArtifactInspectorExpanded.checked = !!this._settings.gallery.artifactInspectorExpanded;
+    if (controls.thumbnailRepairButton) {
+        const projectName = this._thumbnailRepairProjectName || "";
+        const repairState = this._thumbnailBulkRepairState?.() || null;
+        const ownsRepair = !!repairState && repairState.ownerId === this._thumbnailRepairOwnerId;
+        const preflighting = this._thumbnailRepairPreflight === true;
+        if (controls.thumbnailRepairStatus) {
+            if (!projectName) {
+                controls.thumbnailRepairStatus.textContent = "Open a project to inspect its thumbnail cache.";
+            } else if (preflighting) {
+                controls.thumbnailRepairStatus.textContent = `Inspecting ${projectName}…`;
+            } else if (repairState) {
+                controls.thumbnailRepairStatus.textContent = `${repairState.completed}/${repairState.total} complete for ${repairState.projectId}.`;
+            } else {
+                controls.thumbnailRepairStatus.textContent = `Current project: ${projectName}`;
+            }
+        }
+        controls.thumbnailRepairButton.textContent = preflighting
+            ? "Inspecting…"
+            : (ownsRepair ? "Cancel Regeneration" : (repairState ? "Regeneration Running…" : "Regenerate Missing Thumbnails…"));
+        controls.thumbnailRepairButton.disabled = preflighting || !projectName || (!!repairState && !ownsRepair);
+        controls.thumbnailRepairButton.style.cssText = chromeButtonCss({
+            variant: ownsRepair ? "warning" : "primary",
+            padding: "5px 10px",
+            fontSize: "10px",
+            radius: "6px",
+        });
+    }
     if (controls.promptChannelLabels) controls.promptChannelLabels.checked = this._promptChannelLabels === true;
     if (controls.promptSectionDelimiter) controls.promptSectionDelimiter.value = String(this._promptSectionDelimiter ?? ".");
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
@@ -1848,6 +1875,23 @@ function showSettingsPanel() {
             onChange: (value) => updateCategory("render", "trashMaxSizeMB", value),
         }
     );
+    const thumbnailRepairControl = createRow(
+        gallerySection,
+        "Current Project Thumbnails",
+        "Regenerate only missing thumbnails for active video, image, and audio assets. Existing thumbnails, Trash, filmstrips, and waveforms are left unchanged.",
+    );
+    thumbnailRepairControl.style.flexDirection = "column";
+    thumbnailRepairControl.style.alignItems = "flex-end";
+    const thumbnailRepairStatus = document.createElement("span");
+    thumbnailRepairStatus.style.cssText = "font-size:10px;color:#9aa4af;max-width:230px;text-align:right;";
+    const thumbnailRepairButton = document.createElement("button");
+    thumbnailRepairButton.type = "button";
+    thumbnailRepairButton.addEventListener("click", () => {
+        Promise.resolve(this._toggleThumbnailBulkRepair?.()).catch(() => {});
+    });
+    thumbnailRepairControl.append(thumbnailRepairStatus, thumbnailRepairButton);
+    controls.thumbnailRepairStatus = thumbnailRepairStatus;
+    controls.thumbnailRepairButton = thumbnailRepairButton;
     addSectionReset(
         gallerySection,
         "Reset Gallery Section",
