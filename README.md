@@ -106,7 +106,7 @@ ComfyUI.
 
 ## Installation
 
-### Option A — ComfyUI-Manager (recommended, once published)
+### Option A — ComfyUI-Manager (recommended)
 
 Search for **Sonder Editor** in ComfyUI-Manager and install, then restart
 ComfyUI.
