@@ -162,11 +162,9 @@ sample project below.
 ## Sample project
 
 A ready-made showcase project — media, scenes, guides, prompts, generated
-takes, and cached thumbnails — is available from the
-[GitHub Releases page](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/releases).
+takes, and cached thumbnails — is available as a direct download.
 
-1. Download `Project-Sample.zip` from the **Sonder Editor Project Sample**
-   release.
+1. [Download `Project-Sample.zip`](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/releases/download/project_sample/Project-Sample.zip).
 2. Extract it into `ComfyUI/output/sonder-projects/` so the sample sits in
    its own folder there.
 3. Open the **Sonder Editor** node and select the project from the project

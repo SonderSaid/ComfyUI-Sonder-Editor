@@ -21,9 +21,8 @@ Click **Open Editor** to enter the fullscreen editing surface.
 
 ![The Sonder Editor node card with a project loaded and its Preview module expanded](images/node-card.webp)
 
-> **Prefer to explore a finished project first?** Download the sample
-> project from the
-> [Releases page](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/releases),
+> **Prefer to explore a finished project first?**
+> [Download `Project-Sample.zip`](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/releases/download/project_sample/Project-Sample.zip),
 > extract it into `ComfyUI/output/sonder-projects/`, and select it from the
 > node's project selector — it comes with media, scenes, guides, prompts,
 > and generated takes to poke at.
