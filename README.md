@@ -1,13 +1,13 @@
 # ComfyUI-Sonder-Editor
 
-A single-node, NLE-style **video editor for ComfyUI** — timeline, scenes, guide
-frames, prompt sections, project-scoped asset management, and a render-queue
-generation pipeline, all inside one node.
+Sonder Editor is a timeline-based video editor for ComfyUI, built for iterative
+long-form generation. Arrange scenes, clips, audio, guide frames, and prompts;
+then select the range you want to process.
 
-The editor is for **arranging, previewing, and selecting**. Generation and
-processing stay where they belong: in ComfyUI nodes. Sonder Editor gives you a
-timeline to compose long-form work and a clean handoff into your generation
-graph.
+Generation stays in ComfyUI; Sonder is where each iteration starts and ends —
+send the selection through the connected graph, then review or place the result
+back on the timeline. Sonder's generation capabilities and constraints depend
+on the diffusion model, nodes, and workflow connected to it.
 
 ![Sonder Editor](docs/images/editor.webp)
 
