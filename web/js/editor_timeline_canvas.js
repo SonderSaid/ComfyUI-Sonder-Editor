@@ -435,9 +435,12 @@ export function _drawTracks(host, ctx, width) {
 
                     // 3. Hide/Mute icon
                     const visibilityState = host._trackVisibilityState(entry);
+                    const visibilityDisabled = host._isLaneVisibilityControlDisabled?.(entry) || false;
                     const isAudioLike = entry.type === TRACK_TYPE.AUDIO || entry.type === TRACK_TYPE.PROMPT
                         || entry.type === TRACK_TYPE.PROMPT_GLOBAL;
-                    ctx.fillStyle = visibilityState === "hidden"
+                    ctx.fillStyle = visibilityDisabled
+                        ? COLORS.textMuted
+                        : visibilityState === "hidden"
                         ? COLORS.dangerText
                         : visibilityState === "partial"
                             ? COLORS.accentHi
@@ -769,7 +772,7 @@ export function _drawClips(host, ctx, width) {
             if (_vlEntry.collapsed) continue;
             const videoY = host._trackY(_vli);
             const videoH = host._trackH(_vli);
-            const laneHidden = _vlEntry.hidden;
+            const laneHidden = host._isLaneHidden(_vlEntry.type, _vlEntry.laneIndex);
             const isMotionDriverLane = _vlEntry.type === TRACK_TYPE.MOTION_DRIVER;
             const clips = allClips.filter(c => host._clipMatchesTrackEntry(c, _vlEntry));
             for (const clip of clips) {

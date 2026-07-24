@@ -29,6 +29,17 @@ def test_text_fields_shortcuts_and_steppers_share_manual_commit_path():
     assert "_snapSelectionFrame" not in chrome
 
 
+def test_guide_endpoint_actions_share_manual_commit_path():
+    widget = _source("web/js/editor_widget.js")
+    set_start = _method(widget, "_setSelectionStartFrame", "_setSelectionEndFrame")
+    set_end = _method(widget, "_setSelectionEndFrame", "_clearTimelineSelection")
+
+    assert 'this._commitManualSelectionEndpoint("start", frame);' in set_start
+    assert 'this._commitManualSelectionEndpoint("end", frame);' in set_end
+    assert "_setTimelineSelection" not in set_start
+    assert "_setTimelineSelection" not in set_end
+
+
 def test_draft_is_ephemeral_and_crossing_restarts_it():
     widget = _source("web/js/editor_widget.js")
     draft = _method(widget, "_setSelectionDraft", "_commitManualSelectionEndpoint")

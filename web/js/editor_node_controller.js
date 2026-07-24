@@ -557,6 +557,21 @@ async function fetchJson(url, signal) {
     return await resp.json();
 }
 
+function assetIdsFromPayload(payload) {
+    const assets = Array.isArray(payload)
+        ? payload
+        : (Array.isArray(payload?.assets) ? payload.assets : null);
+    if (!assets) return null;
+    return new Set(assets
+        .map((asset) => String(asset?.asset_id || "").trim())
+        .filter(Boolean));
+}
+
+function newAssetIdsSince(baselineIds, currentIds) {
+    if (!(baselineIds instanceof Set) || !(currentIds instanceof Set)) return [];
+    return [...currentIds].filter((assetId) => !baselineIds.has(assetId));
+}
+
 function isVideoLaneHidden(scene, trackIndex) {
     return !!scene?.video_lane_configs?.[trackIndex || 0]?.hidden;
 }
@@ -1290,6 +1305,9 @@ export class EditorNodeController {
         this._destroyed = false;
         this._queueSaveCompletionCounter = 0;
         this._lastQueueSettledSaveCompletionCounter = 0;
+        this._knownAssetIds = null;
+        this._knownAssetIdsProjectDir = "";
+        this._bridgeAssetSettleSession = null;
         this._frameConstraintHealedFor = "";
         this._editorSessionId = newEditorSessionId("fullscreen");
         this._sessionHeartbeatTimer = null;
@@ -1454,6 +1472,7 @@ export class EditorNodeController {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        this._resetBridgeAssetTracking({ clearKnown: true });
         this._releaseGraphPreviewSuppression();
 
         if (this._diagHotkeyUnregister) {
@@ -2208,6 +2227,7 @@ export class EditorNodeController {
             }
             this._queueSaveCompletionCounter = 0;
             this._lastQueueSettledSaveCompletionCounter = 0;
+            this._resetBridgeAssetTracking({ clearKnown: true });
             this._frameConstraintHealedFor = "";
             this.state.projectDir = "";
             this.state.dormantSummary = null;
@@ -2233,6 +2253,7 @@ export class EditorNodeController {
             }
             this._queueSaveCompletionCounter = 0;
             this._lastQueueSettledSaveCompletionCounter = 0;
+            this._resetBridgeAssetTracking({ clearKnown: true });
             this._frameConstraintHealedFor = "";
             this.state.projectDir = projectDir;
             this.state.dormantSummary = null;
@@ -2273,6 +2294,7 @@ export class EditorNodeController {
     async refreshSummary(options = {}) {
         const { syncAssets = false } = options;
         if (this._destroyed || !this.state.projectDir) return false;
+        const projectDir = this.state.projectDir;
 
         if (this._summaryAborter) {
             this._summaryAborter.abort();
@@ -2280,6 +2302,7 @@ export class EditorNodeController {
         const aborter = new AbortController();
         this._summaryAborter = aborter;
         let refreshed = false;
+        let syncedAssetPayload = null;
 
         try {
             if (syncAssets) {
@@ -2288,17 +2311,21 @@ export class EditorNodeController {
                 // and strand new takes as "Missing". AbortError still propagates
                 // (it is not a version conflict) so latest-wins abort is preserved.
                 const projectId = projectIdFromDir(this.state.projectDir);
-                await postProjectJsonWithReconcile(
+                const syncResult = await postProjectJsonWithReconcile(
                     api.apiURL(`/sonder-editor/project/${projectId}/assets/sync`),
                     { method: "POST", signal: aborter.signal },
                     { projectId },
                 );
+                syncedAssetPayload = syncResult?.payload ?? null;
             }
             this.syncStateFromWidgets();
             this.state.dormantSummary = await fetchJson(
                 buildDormantSummaryUrl(this.state),
                 aborter.signal,
             );
+            if (!aborter.signal.aborted && this.state.projectDir === projectDir) {
+                this._rememberAssetIds(syncedAssetPayload, projectDir);
+            }
             refreshed = true;
             const activeScene = this.state.dormantSummary?.active_scene;
             const widgetValue = this._getWidgetValue("scene_id", "") || "";
@@ -2677,6 +2704,96 @@ export class EditorNodeController {
         }
     }
 
+    _rememberAssetIds(payload, projectDir = this.state.projectDir) {
+        if (this._destroyed || !projectDir || projectDir !== this.state.projectDir) return null;
+        const assetIds = assetIdsFromPayload(payload);
+        if (!(assetIds instanceof Set)) return null;
+        this._knownAssetIds = new Set(assetIds);
+        this._knownAssetIdsProjectDir = projectDir;
+        return new Set(assetIds);
+    }
+
+    _cachedAssetIds(projectDir = this.state.projectDir) {
+        if (
+            projectDir
+            && this._knownAssetIdsProjectDir === projectDir
+            && this._knownAssetIds instanceof Set
+        ) {
+            return new Set(this._knownAssetIds);
+        }
+        const moduleAssetIds = assetIdsFromPayload(this.moduleCache.assets);
+        return moduleAssetIds instanceof Set ? moduleAssetIds : null;
+    }
+
+    _resetBridgeAssetTracking({ clearKnown = false } = {}) {
+        const session = this._bridgeAssetSettleSession;
+        this._bridgeAssetSettleSession = null;
+        session?.baselineAborter?.abort?.();
+        if (clearKnown) {
+            this._knownAssetIds = null;
+            this._knownAssetIdsProjectDir = "";
+        }
+    }
+
+    beginBridgeExecutionTracking() {
+        if (this._destroyed || !this.state.projectDir) return false;
+        const projectDir = this.state.projectDir;
+        const activeSession = this._bridgeAssetSettleSession;
+        if (
+            activeSession?.projectDir === projectDir
+            && !activeSession.arrivalAnnounced
+        ) {
+            // More than one Save Bridge can target the same editor in one
+            // execution. They intentionally share one baseline and one toast.
+            return true;
+        }
+
+        this._resetBridgeAssetTracking();
+        const cachedIds = this._cachedAssetIds(projectDir);
+        const session = {
+            projectDir,
+            baselineIds: cachedIds instanceof Set ? new Set(cachedIds) : null,
+            baselinePromise: null,
+            baselineAborter: null,
+            arrivalAnnounced: false,
+        };
+        this._bridgeAssetSettleSession = session;
+
+        if (!(session.baselineIds instanceof Set)) {
+            const aborter = new AbortController();
+            session.baselineAborter = aborter;
+            session.baselinePromise = fetchJson(
+                buildDormantAssetsUrl(projectDir),
+                aborter.signal,
+            ).then((payload) => {
+                const assetIds = assetIdsFromPayload(payload);
+                if (
+                    assetIds instanceof Set
+                    && this._bridgeAssetSettleSession === session
+                    && !this._destroyed
+                    && this.state.projectDir === projectDir
+                ) {
+                    session.baselineIds = new Set(assetIds);
+                    this._rememberAssetIds(payload, projectDir);
+                }
+                return assetIds instanceof Set ? assetIds : null;
+            }).catch((error) => {
+                if (
+                    error?.name !== "AbortError"
+                    && this._bridgeAssetSettleSession === session
+                ) {
+                    console.warn("[Sonder] Failed to capture bridge asset baseline:", error);
+                }
+                return null;
+            });
+        }
+        return true;
+    }
+
+    completeBridgeExecutionTracking() {
+        this._resetBridgeAssetTracking();
+    }
+
     handleNodeExecuted() {
         if (this._destroyed || !this.state.projectDir) return;
         this.syncStateFromWidgets();
@@ -2698,23 +2815,48 @@ export class EditorNodeController {
         }
         this.syncStateFromWidgets();
         // Bridge-asset-arrival info toast (observe-only — does NOT touch the
-        // rollback ladder logic). Baseline the asset total at the first rung of
-        // the settle session, then announce once when a new asset registers.
-        if (attemptIndex === 0) {
-            this._bridgeSettleBaselineTotal = this.state.dormantSummary?.asset_counts?.total ?? 0;
-            this._bridgeArrivalAnnounced = false;
+        // settlement ladder logic). Compare durable asset identities so an
+        // equal-count replacement is still observable.
+        if (
+            !this._bridgeAssetSettleSession
+            || this._bridgeAssetSettleSession.projectDir !== this.state.projectDir
+        ) {
+            // Normal canvas execution starts this at onExecuted, before the
+            // settlement ladder. Keep a defensive fallback for direct callers.
+            this.beginBridgeExecutionTracking();
+        }
+        const settleSession = this._bridgeAssetSettleSession;
+        const baselineIds = settleSession?.baselineIds instanceof Set
+            ? new Set(settleSession.baselineIds)
+            : await settleSession?.baselinePromise;
+        if (
+            this._destroyed
+            || !settleSession
+            || this._bridgeAssetSettleSession !== settleSession
+            || settleSession.projectDir !== this.state.projectDir
+        ) {
+            return this.state.dormantSummary?.queue_counts || {};
         }
         const refreshed = await this.refreshSummary({ syncAssets: true });
         if (refreshed) {
             this._invalidateModules(["assets", "scene", "queue", "preview"]);
             this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue", "preview"]);
         }
-        if (!this._bridgeArrivalAnnounced && typeof this._bridgeSettleBaselineTotal === "number") {
-            const newTotal = this.state.dormantSummary?.asset_counts?.total ?? 0;
-            const added = newTotal - this._bridgeSettleBaselineTotal;
-            if (added > 0) {
-                notifyInfo(added > 1 ? `${added} bridge assets saved` : "Bridge asset saved");
-                this._bridgeArrivalAnnounced = true;
+        if (
+            refreshed
+            && this._bridgeAssetSettleSession === settleSession
+            && !settleSession.arrivalAnnounced
+            && baselineIds instanceof Set
+        ) {
+            const currentIds = this._cachedAssetIds(settleSession.projectDir);
+            const addedAssetIds = newAssetIdsSince(baselineIds, currentIds);
+            if (addedAssetIds.length > 0) {
+                notifyInfo(
+                    addedAssetIds.length > 1
+                        ? `${addedAssetIds.length} bridge assets saved`
+                        : "Bridge asset saved"
+                );
+                settleSession.arrivalAnnounced = true;
             }
         }
         const counts = this.state.dormantSummary?.queue_counts || {};
@@ -3123,10 +3265,11 @@ export class EditorNodeController {
     }
 
     async _loadDormantAssets(signal) {
+        const projectDir = this.state.projectDir;
         const sceneId = this.state.sceneId || "";
-        const assetsPromise = fetchJson(buildDormantAssetsUrl(this.state.projectDir), signal);
+        const assetsPromise = fetchJson(buildDormantAssetsUrl(projectDir), signal);
         const scenePromise = sceneId
-            ? fetchJson(buildSceneUrl(this.state.projectDir, sceneId), signal).catch((error) => {
+            ? fetchJson(buildSceneUrl(projectDir, sceneId), signal).catch((error) => {
                 if (error?.name === "AbortError") throw error;
                 console.warn("[Sonder] Failed to load scene for asset gallery scope:", error);
                 return null;
@@ -3136,6 +3279,7 @@ export class EditorNodeController {
         const normalized = Array.isArray(payload)
             ? { assets: payload, folders: [] }
             : { assets: payload.assets || [], folders: payload.folders || [] };
+        this._rememberAssetIds(normalized, projectDir);
         return {
             ...normalized,
             currentSceneAssetIds: deriveCurrentSceneAssetIds(scene, normalized.assets),

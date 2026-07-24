@@ -11,6 +11,20 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Added shared frontend project-source resolution for direct wires, typed
+  pass-through/reroute chains, and current KJNodes Set/Get scopes.
+
+### Fixed
+- Guide **Set Selection In/Out** actions now use the same two-stage manual
+  endpoint workflow as toolbar and shortcut entry.
+- Animatic video suppression is now ephemeral and no longer overwrites durable
+  lane visibility when the mode is toggled or a scene changes.
+- Save Bridge restores its serialized target-folder field after workflow load
+  without invoking the widget callback or dirtying the graph.
+- Bridge asset-arrival notices now compare asset identities per execution
+  settlement instead of relying on total counts.
+
 ## [0.1.0] - 2026-07-22
 
 ### Added

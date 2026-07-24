@@ -27,6 +27,10 @@ import { mountToastStack } from "./editor_toast_stack.js";
 import { notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
 import { mountNodeVideoPreview, unmountNodeVideoPreview } from "./node_video_preview.js";
 import { applyRenderCacheSettingToNode, applyRenderCacheSettingToNodes } from "./render_cache_activation.js";
+import {
+    logProjectResolutionDiagnostic,
+    resolveProjectSource,
+} from "./project_source_resolver.js";
 
 injectSonderFontFaces();
 
@@ -707,44 +711,12 @@ function installComfyGraphUndoGuard() {
     });
 }
 
-function getGraphLinks() {
-    return app.graph?.links || app.graph?._links || {};
-}
-
 function getNodeById(nodeId) {
     if (nodeId == null) return null;
     if (typeof app.graph?.getNodeById === "function") {
         return app.graph.getNodeById(nodeId) || null;
     }
     return (app.graph?._nodes || app.graph?.nodes || []).find((node) => node.id === nodeId) || null;
-}
-
-function getLinkedNodeFromInput(node, inputName) {
-    const input = node?.inputs?.find?.((entry) => entry?.name === inputName);
-    const linkId = input?.link;
-    if (linkId == null) return null;
-    const link = getGraphLinks()?.[linkId];
-    if (link?.origin_id == null) return null;
-    return getNodeById(link.origin_id);
-}
-
-function collectUpstreamEditorNodes(startNode, collected = new Set(), visited = new Set()) {
-    if (!startNode || visited.has(startNode.id)) return collected;
-    visited.add(startNode.id);
-    if (startNode.type === "SonderEditor") {
-        collected.add(startNode);
-        return collected;
-    }
-    for (const input of startNode.inputs || []) {
-        if (input?.link == null) continue;
-        const link = getGraphLinks()?.[input.link];
-        if (link?.origin_id == null) continue;
-        const upstreamNode = getNodeById(link.origin_id);
-        if (upstreamNode) {
-            collectUpstreamEditorNodes(upstreamNode, collected, visited);
-        }
-    }
-    return collected;
 }
 
 function editorNodeHasQueuedWork(node) {
@@ -758,18 +730,26 @@ function refreshEditorNodes(editorNodes) {
     }
 }
 
-function getSaveVideoEditorNodes(saveNode) {
-    const projectSourceNode = getLinkedNodeFromInput(saveNode, "project");
-    if (!projectSourceNode) return [];
-    return Array.from(collectUpstreamEditorNodes(projectSourceNode)).filter(
-        (node) => node._sonderController?.state?.projectDir
-    );
+function resolvedEditorNodes(node, context, { requireProjectDir = false } = {}) {
+    const resolution = resolveProjectSource(node);
+    if (resolution.status !== "resolved") {
+        logProjectResolutionDiagnostic(resolution, { context, node });
+        return [];
+    }
+    if (requireProjectDir && !resolution.editor?._sonderController?.state?.projectDir) {
+        return [];
+    }
+    return [resolution.editor];
 }
 
-function getSaveBridgeEditorNodes(bridgeNode) {
-    const projectSourceNode = getLinkedNodeFromInput(bridgeNode, "project");
-    if (!projectSourceNode) return [];
-    return Array.from(collectUpstreamEditorNodes(projectSourceNode));
+function getSaveVideoEditorNodes(saveNode) {
+    return resolvedEditorNodes(saveNode, "Save Video editor refresh", {
+        requireProjectDir: true,
+    });
+}
+
+function getSaveBridgeEditorNodes(bridgeNode, context = "Save Bridge editor lookup") {
+    return resolvedEditorNodes(bridgeNode, context);
 }
 
 function getEditorProjectId(editorNode) {
@@ -780,7 +760,7 @@ function getEditorProjectId(editorNode) {
 }
 
 function getSaveBridgeProjectId(bridgeNode) {
-    for (const editorNode of getSaveBridgeEditorNodes(bridgeNode)) {
+    for (const editorNode of getSaveBridgeEditorNodes(bridgeNode, "Save Bridge folder lookup")) {
         const projectId = getEditorProjectId(editorNode);
         if (projectId) return projectId;
     }
@@ -846,6 +826,27 @@ async function syncBridgeTargetFolderWidget(node) {
         : "Connect a Sonder project to load folder suggestions";
     input.value = currentValue;
     return values;
+}
+
+function scheduleBridgeTargetFolderRestore(node, folderWidget, input) {
+    // onConfigure restores the serialized workflow widgets after onNodeCreated
+    // has already mounted the DOM picker. Supersede any suggestion request that
+    // started against the pre-configuration value immediately, then mirror the
+    // authoritative widget on the next task without callbacks or graph dirties.
+    const restoreToken = (Number(node._sonderBridgeFolderSyncToken) || 0) + 1;
+    node._sonderBridgeFolderSyncToken = restoreToken;
+    globalThis.setTimeout(() => {
+        if (
+            restoreToken !== node._sonderBridgeFolderSyncToken
+            || node._sonderBridgeFolderInput !== input
+        ) {
+            return;
+        }
+        const restoredValue = normalizeFolderValue(folderWidget.value || "");
+        input.value = restoredValue;
+        setBridgeFolderWidgetChoices(folderWidget, [], restoredValue);
+        void syncBridgeTargetFolderWidget(node);
+    }, 0);
 }
 
 function installBridgeFolderPicker(node) {
@@ -928,6 +929,13 @@ function installBridgeFolderPicker(node) {
     node._sonderBridgeFolderInput = input;
     node._sonderBridgeFolderDatalist = datalist;
 
+    const origOnConfigure = node.onConfigure;
+    node.onConfigure = function () {
+        const result = origOnConfigure?.apply(this, arguments);
+        scheduleBridgeTargetFolderRestore(this, folderWidget, input);
+        return result;
+    };
+
     const origOnConnectionsChange = node.onConnectionsChange;
     node.onConnectionsChange = function () {
         const result = origOnConnectionsChange?.apply(this, arguments);
@@ -938,21 +946,23 @@ function installBridgeFolderPicker(node) {
     void syncBridgeTargetFolderWidget(node);
 }
 
-const pendingBridgeEditorNodeIds = new Set();
+const pendingBridgeEditorNodeIds = new Map();
 let queuedExecutionRefreshToken = 0;
 
 function trackBridgeExecution(bridgeNode) {
-    for (const editorNode of getSaveBridgeEditorNodes(bridgeNode)) {
-        if (!editorNode?._sonderController?.state?.projectDir) continue;
-        pendingBridgeEditorNodeIds.add(editorNode.id);
+    for (const editorNode of getSaveBridgeEditorNodes(bridgeNode, "Save Bridge execution tracking")) {
+        const projectDir = editorNode?._sonderController?.state?.projectDir || "";
+        if (!projectDir) continue;
+        editorNode._sonderController.beginBridgeExecutionTracking?.();
+        pendingBridgeEditorNodeIds.set(editorNode.id, projectDir);
     }
 }
 
 function getTrackedBridgeEditorNodes() {
     const tracked = [];
-    for (const nodeId of [...pendingBridgeEditorNodeIds]) {
+    for (const [nodeId, projectDir] of [...pendingBridgeEditorNodeIds.entries()]) {
         const node = getNodeById(nodeId);
-        if (!node?._sonderController?.state?.projectDir) {
+        if (node?._sonderController?.state?.projectDir !== projectDir) {
             pendingBridgeEditorNodeIds.delete(nodeId);
             continue;
         }
@@ -1004,6 +1014,9 @@ function schedulePostPromptRefresh() {
             if (token !== queuedExecutionRefreshToken) return;
             const hasRunning = counts.some((value) => (value?.running || 0) > 0);
             if (index === delays.length - 1) {
+                for (const editorNode of bridgeNodes) {
+                    editorNode._sonderController?.completeBridgeExecutionTracking?.();
+                }
                 pendingBridgeEditorNodeIds.clear();
             }
             if (!hasRunning && !pendingBridgeEditorNodeIds.size) {

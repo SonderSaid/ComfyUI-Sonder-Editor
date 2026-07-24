@@ -631,7 +631,6 @@ export class EditorWidget {
 
         // Animatic toggle state
         this._animaticMode = false;
-        this._preAnimaticHidden = null;
 
         // Project template state
         this._templateId = this._settings.projectDefaults.defaultTemplateId || "free";
@@ -1235,11 +1234,7 @@ export class EditorWidget {
 
         if (!isSameScene) {
             this._selectionDraftAnchor = null;
-            if (this._animaticMode && this._restoreAnimaticState()) {
-                this._saveLaneConfig(this._trackLayout.filter((e) => e.type === TRACK_TYPE.VIDEO));
-            }
             this._animaticMode = false;
-            this._preAnimaticHidden = null;
             this._stopPlayback();
             // Clear undo/redo on scene switch (snapshots are scene-specific)
             this._undoStack = [];
@@ -4140,11 +4135,11 @@ export class EditorWidget {
     }
 
     _setSelectionStartFrame(frame) {
-        this._setTimelineSelection(frame, Math.max(frame, this.selectionEnd));
+        this._commitManualSelectionEndpoint("start", frame);
     }
 
     _setSelectionEndFrame(frame) {
-        this._setTimelineSelection(Math.min(frame, this.selectionStart), frame);
+        this._commitManualSelectionEndpoint("end", frame);
     }
 
     _clearTimelineSelection() {
@@ -4204,18 +4199,6 @@ export class EditorWidget {
         const start = Math.min(...ranges.map((range) => range.start));
         const end = Math.max(...ranges.map((range) => range.end));
         this._setSelectionToFrameRange(start, end);
-        return true;
-    }
-
-    _restoreAnimaticState() {
-        if (!this._preAnimaticHidden) return false;
-        for (const entry of this._trackLayout) {
-            if (entry.type === TRACK_TYPE.VIDEO) {
-                entry.hidden = !!this._preAnimaticHidden[entry.laneIndex];
-            }
-        }
-        this._preAnimaticHidden = null;
-        this._animaticMode = false;
         return true;
     }
 
@@ -4292,6 +4275,7 @@ export class EditorWidget {
 
     _trackVisibilityState(entry) {
         if (!entry) return "visible";
+        if (this._isLaneVisibilityControlDisabled(entry)) return "hidden";
         const items = this._trackItemsForEntry(entry);
         if (entry.type === TRACK_TYPE.PROMPT || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
             return entry.hidden ? "hidden" : "visible";
@@ -4619,23 +4603,9 @@ export class EditorWidget {
         return fields;
     }
 
-    async _toggleAnimatic() {
+    _toggleAnimatic() {
         if (!this.activeScene || !this.projectDir) return;
-
-        if (this._animaticMode) {
-            if (!this._restoreAnimaticState()) return;
-        } else {
-            const hiddenByLane = {};
-            for (const entry of this._trackLayout) {
-                if (entry.type !== TRACK_TYPE.VIDEO) continue;
-                hiddenByLane[entry.laneIndex] = !!entry.hidden;
-                entry.hidden = true;
-            }
-            this._preAnimaticHidden = hiddenByLane;
-            this._animaticMode = true;
-        }
-
-        await this._saveLaneConfig(this._trackLayout.filter((e) => e.type === TRACK_TYPE.VIDEO));
+        this._animaticMode = !this._animaticMode;
         this._clearPlaybackWarmOverlay("animatic-toggle", { render: false });
         this._renderTimeline();
         this._renderViewportFrame();
@@ -6286,8 +6256,18 @@ export class EditorWidget {
                         break;
                     }
                     case "hide":
-                        this._pushUndo("toggle track visibility");
-                        void this._applyHeaderVisibilityBulk(bulkEntries, this._trackVisibilityState(entry) === "visible");
+                        if (this._isLaneVisibilityControlDisabled(entry)) break;
+                        {
+                            const visibilityEntries = bulkEntries.filter(
+                                (target) => !this._isLaneVisibilityControlDisabled(target)
+                            );
+                            if (!visibilityEntries.length) break;
+                            this._pushUndo("toggle track visibility");
+                            void this._applyHeaderVisibilityBulk(
+                                visibilityEntries,
+                                this._trackVisibilityState(entry) === "visible"
+                            );
+                        }
                         break;
                     case "manage":
                         if (entry.type === TRACK_TYPE.GUIDES) {
@@ -8042,6 +8022,7 @@ export class EditorWidget {
 
     /** Check if a lane is hidden */
     _isLaneHidden(type, laneIndex) {
+        if (this._animaticMode && type === TRACK_TYPE.VIDEO) return true;
         const idx = type === TRACK_TYPE.VIDEO
             ? this._videoLaneLayoutIdx(laneIndex)
             : type === TRACK_TYPE.MOTION_DRIVER
@@ -8110,13 +8091,20 @@ export class EditorWidget {
 
     async _toggleHeaderVisibility(entry) {
         if (!entry) return;
+        if (this._isLaneVisibilityControlDisabled(entry)) return;
         await this._applyHeaderVisibilityBulk([entry], this._trackVisibilityState(entry) === "visible");
+    }
+
+    _isLaneVisibilityControlDisabled(entry) {
+        return !!this._animaticMode && entry?.type === TRACK_TYPE.VIDEO;
     }
 
     /** Apply one uniform header visibility command. Actual lane-hidden state is
      *  lane-local; an inferred muted/partial state performs linked-aware unmute. */
     async _applyHeaderVisibilityBulk(entries, nextHidden) {
-        const targets = (entries || []).filter(Boolean);
+        const targets = (entries || []).filter(
+            (entry) => entry && !this._isLaneVisibilityControlDisabled(entry)
+        );
         if (!targets.length) return;
         const visibilitySeq = (this._headerVisibilitySeq || 0) + 1;
         this._headerVisibilitySeq = visibilitySeq;

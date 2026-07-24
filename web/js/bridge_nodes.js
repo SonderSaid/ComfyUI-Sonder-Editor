@@ -10,6 +10,10 @@
 
 import { app } from "/scripts/app.js";
 import { refreshAutogrowShape } from "./autogrow_passthrough.js";
+import {
+    projectResolutionStatusText,
+    resolveProjectSource,
+} from "./project_source_resolver.js";
 const { api } = window.comfyAPI.api;
 
 const EXT_NAME = "sonder.bridge";
@@ -122,13 +126,6 @@ const writeGuideOverrides = (node, overrides) => {
     widget.value = serialized;
     widget.callback?.call(widget, serialized);
     app.graph.setDirtyCanvas?.(true, true);
-};
-
-const linkedNodeFromInput = (node, inputName) => {
-    const input = findInputByName(node, inputName);
-    if (!input || input.link == null) return null;
-    const link = getLink(node, input.link);
-    return getGraph(node)?.getNodeById?.(link?.origin_id) || null;
 };
 
 const guideKey = (assetId, frameIndex) => `${assetId || ""}:${frameIndex}`;
@@ -445,7 +442,15 @@ const mirrorProjectWire = (start) => {
 };
 
 async function loadLinkedEditorGuides(node) {
-    const editorNode = linkedNodeFromInput(node, "project");
+    const resolution = resolveProjectSource(node);
+    if (resolution.status !== "resolved") {
+        return {
+            status: projectResolutionStatusText(resolution),
+            guides: [],
+            linked: false,
+        };
+    }
+    const editorNode = resolution.editor;
     const controllerState = editorNode?._sonderController?.state || null;
     const projectDir = controllerState?.projectDir || "";
     const projectId = projectIdFromDir(projectDir);
@@ -584,7 +589,8 @@ function refreshBridgeGuidePanel(node) {
     // `updateProject()` has not populated `state.projectDir` yet, schedule a
     // one-shot retry so the panel auto-refreshes once the project resolves.
     // The current load still runs (and will show "Connect..." until the retry).
-    const editorNode = linkedNodeFromInput(node, "project");
+    const resolution = resolveProjectSource(node);
+    const editorNode = resolution.status === "resolved" ? resolution.editor : null;
     const controller = editorNode?._sonderController || null;
     if (controller && !controller.state?.projectDir && typeof controller.whenProjectReady === "function") {
         controller.whenProjectReady(() => refreshBridgeGuidePanel(node));
@@ -702,7 +708,15 @@ const setDriverLaneWidgetValue = (node, value) => {
 };
 
 async function loadLinkedEditorDrivers(node) {
-    const editorNode = linkedNodeFromInput(node, "project");
+    const resolution = resolveProjectSource(node);
+    if (resolution.status !== "resolved") {
+        return {
+            status: projectResolutionStatusText(resolution),
+            drivers: [],
+            linked: false,
+        };
+    }
+    const editorNode = resolution.editor;
     const controllerState = editorNode?._sonderController?.state || null;
     const projectDir = controllerState?.projectDir || "";
     const projectId = projectIdFromDir(projectDir);
@@ -855,7 +869,8 @@ function refreshBridgeDriverPanel(node) {
     const state = ensureNodeState(node);
     if (!state.driverPanel) return;
 
-    const editorNode = linkedNodeFromInput(node, "project");
+    const resolution = resolveProjectSource(node);
+    const editorNode = resolution.status === "resolved" ? resolution.editor : null;
     const controller = editorNode?._sonderController || null;
     if (controller && !controller.state?.projectDir && typeof controller.whenProjectReady === "function") {
         controller.whenProjectReady(() => refreshBridgeDriverPanel(node));
