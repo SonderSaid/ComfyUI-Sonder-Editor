@@ -1,4 +1,4 @@
-"""ComfyUI-Sonder-Editor: NLE-style video editing and AI generation pipeline."""
+"""ComfyUI-Sonder-Editor: timeline video editing and AI generation pipeline."""
 
 # Guard all ComfyUI-specific imports — this file is loaded by pytest
 # during test discovery, where folder_paths etc. are unavailable.

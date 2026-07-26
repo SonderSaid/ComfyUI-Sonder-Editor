@@ -15,6 +15,10 @@ a fresh `[Unreleased]` block.
 - Added shared frontend project-source resolution for direct wires, typed
   pass-through/reroute chains, and current KJNodes Set/Get scopes.
 
+### Changed
+- Rewrote the Registry and Manager listing description in plain language that
+  names what the editor does, replacing the "NLE-style" framing.
+
 ### Fixed
 - Guide **Set Selection In/Out** actions now use the same two-stage manual
   endpoint workflow as toolbar and shortcut entry.

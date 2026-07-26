@@ -6,7 +6,9 @@
 
 [project]
 name = "sonder-editor"
-description = "Single-node, NLE-style video editor for ComfyUI: timeline, scenes, guides, prompt sections, project-scoped asset management, gallery, and a render-queue generation pipeline."
+# Registry/Manager listing text. Kept identical to the description edited in the
+# Registry web UI — a version publish overwrites the web value from this field.
+description = "Timeline video editor for ComfyUI in a single node. Arrange video, images, and audio on tracks, set first and last frames, schedule prompts over time, transfer motion from a pose video, and regenerate any section in place. Work is organized into projects, and every result lands in a searchable asset gallery."
 version = "0.1.0"
 readme = "README.md"
 license = { file = "LICENSE" }
