@@ -32,8 +32,9 @@ project card and viewport preview.</em></p>
 ## See it work
 
 Three techniques from the same project, run through the same workflow. Each clip
-shows the timeline alongside the result it produced. All three scenes are in the
-[sample project](#sample-project) if you want to open them yourself.
+shows the timeline alongside the result it produced — and both halves are yours
+to open: the scenes are in the [sample project](#sample-project), and the
+[example workflow](#example-workflow) is the one that generated them.
 
 ### Prompt Relay
 

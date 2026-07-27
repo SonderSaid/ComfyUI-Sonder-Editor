@@ -11,9 +11,13 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-27
+
 ### Added
 - Added shared frontend project-source resolution for direct wires, typed
   pass-through/reroute chains, and current KJNodes Set/Get scopes.
+- README now carries a 90-second overview video and three technique clips —
+  Prompt Relay, Guides, and IC-LoRA motion transfer — from the sample project.
 
 ### Changed
 - Rewrote the Registry and Manager listing description in plain language that
