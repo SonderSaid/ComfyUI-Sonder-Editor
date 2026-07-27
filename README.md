@@ -11,6 +11,8 @@ on the diffusion model, nodes, and workflow connected to it.
 
 ![Sonder Editor](docs/images/editor.webp)
 
+**[▶ Watch the 90-second overview](https://youtu.be/lixgY2G80xE)**
+
 ## What it is
 
 Sonder Editor adds a timeline-based editing surface to ComfyUI without taking
@@ -26,6 +28,38 @@ compare, and place back on the timeline.
 <p align="center"><em>One native node in your graph — sockets in, sockets out.
 The fullscreen editor opens from it, and the dormant node keeps a live
 project card and viewport preview.</em></p>
+
+## See it work
+
+Three techniques from the same project, run through the same workflow. Each clip
+shows the timeline alongside the result it produced. All three scenes are in the
+[sample project](#sample-project) if you want to open them yourself.
+
+### Prompt Relay
+
+Prompt sections are cut along the timeline, each applying to its own range, so a
+single clip moves through a whole beat instead of holding one prompt for its
+entire length. **Sonder Prompt Relay Bridge** exports the render window's prompt
+lanes as ComfyUI-PromptRelay payload strings.
+
+https://github.com/user-attachments/assets/3c1643f7-3944-4949-b7da-a47ad9c5fa5b
+
+### Guides
+
+Guide frames sit on the timeline where you place them — first and last, or any
+frame in between — and the model fills what falls between them. Guides have their
+own lane and an animatic preview mode; **Sonder Guides Bridge Start / End** wrap
+the generation body to inject them per frame.
+
+https://github.com/user-attachments/assets/31e013a7-7e34-4f8d-8dc2-9114fe157165
+
+### IC-LoRA motion transfer
+
+An OpenPose clip on a Driver lane drives the generation frame for frame. **Sonder
+Driver Selector** and **Sonder Driver Bridge** resolve and decode that lane for
+the render window, so driver and result stay in lockstep on the timeline.
+
+https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
 
 ## Highlights
 
