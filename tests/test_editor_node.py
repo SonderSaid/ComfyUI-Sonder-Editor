@@ -880,6 +880,535 @@ def test_empty_execute_result_matches_output_contract(tmp_path, monkeypatch):
     assert result[12] == 0.0
 
 
+def _make_output_demand_project(tmp_path, *, duration_frames=12, with_guide=False):
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project_dir = tmp_path / "demand-project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    scene = timeline_state.Scene(
+        scene_id="scene-1",
+        name="Scene 1",
+        duration_frames=duration_frames,
+    )
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        name="Demand",
+        resolution=(64, 48),
+        scenes=[scene],
+    )
+    if with_guide:
+        (project_dir / "media" / "guide.png").write_bytes(b"guide")
+        scene.guide_frames = [
+            timeline_state.GuideFrame(
+                frame_index=2,
+                asset_id="guide-1",
+                strength=0.75,
+            ),
+        ]
+        project.assets = [
+            timeline_state.Asset(
+                asset_id="guide-1",
+                asset_type="image",
+                path=os.path.join("media", "guide.png"),
+            ),
+        ]
+    return project, scene
+
+
+def test_referenced_output_slots_are_strict_scoped_and_zero_based(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    node = editor_node.SonderEditor()
+    prompt = _prompt_graph({
+        7: _prompt_node("SonderEditor"),
+        "8": _prompt_node("SonderEditor"),
+        "consumer-a": _prompt_node("Consumer", {
+            "project": ["7", 0],
+            "frames": [7, 1],
+            "other_editor": ["8", 10],
+            "ordinary_list": ["not-an-editor", "value"],
+        }),
+        "consumer-b": _prompt_node("Consumer", {
+            "guide_idx": ["7", 3],
+            "audio": ["7", 10],
+        }),
+    })
+
+    assert node.OUTPUT_SLOTS == {
+        name: index for index, name in enumerate(node.RETURN_NAMES)
+    }
+    assert node._referenced_output_slots(prompt, "7") == frozenset({0, 1, 3, 10})
+    assert node._referenced_output_slots(prompt, 8) == frozenset({10})
+
+
+@pytest.mark.parametrize(
+    "prompt,unique_id",
+    [
+        (None, "1"),
+        (_prompt_graph({"1": _prompt_node("SonderEditor")}), None),
+        (_prompt_graph({"1": _prompt_node("SonderEditor")}), "1"),
+        (_prompt_graph({"1": _prompt_node("Other"), "2": _prompt_node("Use", {"x": ["1", 0]})}), "1"),
+        (_prompt_graph({"1": _prompt_node("SonderEditor"), "2": _prompt_node("Use", {"x": ["1", True]})}), "1"),
+        (_prompt_graph({"1": _prompt_node("SonderEditor"), "2": _prompt_node("Use", {"x": ["1", -1]})}), "1"),
+        (_prompt_graph({"1": _prompt_node("SonderEditor"), "2": _prompt_node("Use", {"x": ["1", 13]})}), "1"),
+        (_prompt_graph({"1": _prompt_node("SonderEditor"), "2": _prompt_node("Use", {"x": ["1", 0, "extra"]})}), "1"),
+    ],
+)
+def test_referenced_output_slots_fail_open_on_unknown_or_malformed_demand(
+    tmp_path, monkeypatch, prompt, unique_id
+):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    assert editor_node.SonderEditor._referenced_output_slots(prompt, unique_id) is None
+
+
+def test_known_unused_empty_media_outputs_are_bounded(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project = timeline_state.TimelineProject(
+        project_dir=str(tmp_path),
+        resolution=(4096, 4096),
+    )
+
+    result = editor_node.SonderEditor._empty_execute_result(
+        project,
+        24.0,
+        4096,
+        4096,
+        demanded_output_slots=frozenset({0}),
+    )
+
+    assert tuple(result[1].shape) == (1, 1, 1, 3)
+    assert tuple(result[2].shape) == (1, 1, 1, 3)
+    assert tuple(result[10]["waveform"].shape) == (1, 2, 1)
+
+
+@pytest.mark.parametrize("with_zero_duration_scene", [False, True])
+def test_project_only_no_scene_or_zero_duration_uses_bounded_empty_outputs(
+    tmp_path, monkeypatch, with_zero_duration_scene
+):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    scenes = []
+    scene_id = ""
+    if with_zero_duration_scene:
+        scene_id = "scene-1"
+        scenes.append(
+            timeline_state.Scene(
+                scene_id=scene_id,
+                name="Empty",
+                duration_frames=0,
+            )
+        )
+    project = timeline_state.TimelineProject(
+        project_dir=str(tmp_path),
+        resolution=(4096, 4096),
+        scenes=scenes,
+    )
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=4096,
+        height=4096,
+        scene_id=scene_id,
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+            "consumer": _prompt_node("Consumer", {"project": ["editor-1", 0]}),
+        }),
+        unique_id="editor-1",
+    )
+
+    assert tuple(result[1].shape) == (1, 1, 1, 3)
+    assert tuple(result[2].shape) == (1, 1, 1, 3)
+    assert tuple(result[10]["waveform"].shape) == (1, 2, 1)
+
+
+def test_project_only_execution_skips_media_and_preserves_context(
+    tmp_path, monkeypatch, caplog
+):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project, _scene = _make_output_demand_project(tmp_path, with_guide=True)
+    calls = {"render": 0, "guide": 0, "audio": 0, "stash": 0}
+
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda *args, **kwargs: calls.__setitem__("render", calls["render"] + 1),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_guide_image",
+        lambda *args, **kwargs: calls.__setitem__("guide", calls["guide"] + 1),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda *args, **kwargs: calls.__setitem__("audio", calls["audio"] + 1),
+    )
+    monkeypatch.setattr(
+        editor_node,
+        "build_context_reference_stash",
+        lambda *args, **kwargs: calls.__setitem__("stash", calls["stash"] + 1),
+    )
+    caplog.set_level("INFO", logger="sonder_editor")
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=64,
+        height=48,
+        scene_id="scene-1",
+        selection_start=2,
+        selection_end=8,
+        pre_context_frames=2,
+        post_context_frames=2,
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+            "collector-1": _prompt_node("SonderMetadataCollector", {
+                "project": ["editor-1", 0],
+            }),
+            "bridge-1": _prompt_node("SonderSaveBridge", {
+                "project": ["collector-1", 0],
+                "mark_queue_complete": False,
+            }),
+            "writer-1": _prompt_node("ExternalWriter", {
+                "output_dir": ["bridge-1", 0],
+            }),
+        }),
+        unique_id="editor-1",
+    )
+
+    assert calls == {"render": 0, "guide": 0, "audio": 0, "stash": 0}
+    assert tuple(result[1].shape) == (1, 1, 1, 3)
+    assert tuple(result[2].shape) == (1, 1, 1, 3)
+    assert tuple(result[10]["waveform"].shape) == (1, 2, 1)
+    assert result[6] == 10
+    assert project._execution_context["scene_id"] == "scene-1"
+    assert project._execution_context["frame_count"] == 10
+    assert project._execution_context["guide_injection"]["entries"][0]["guide_id"]
+    assert project._execution_context[editor_node.DRIFT_STASH_CONTEXT_KEY] is None
+    assert "outputs=project" in caplog.text
+    assert "skipped=rendered_frames,guide_bundle,audio" in caplog.text
+
+
+def test_project_only_context_feeds_in_pack_prompt_mask_and_guide_bridges(
+    tmp_path, monkeypatch
+):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    prompt_bridge = importlib.import_module(f"{TEST_PACKAGE}.nodes.prompt_bridge")
+    masks_bridge = importlib.import_module(f"{TEST_PACKAGE}.nodes.masks_bridge")
+    guides_bridge = importlib.import_module(f"{TEST_PACKAGE}.nodes.bridge_nodes")
+    driver_bridge = importlib.import_module(f"{TEST_PACKAGE}.nodes.driver_bridge")
+    pytest.importorskip("PIL")
+    from PIL import Image
+
+    project, scene = _make_output_demand_project(tmp_path, with_guide=True)
+    Image.new("RGB", (8, 8), color=(64, 128, 192)).save(
+        Path(project.project_dir) / "media" / "guide.png"
+    )
+    scene.prompt = "global"
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda *args, **kwargs: pytest.fail("project bridge context rendered frames"),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_guide_image",
+        lambda *args, **kwargs: pytest.fail("editor decoded direct guide outputs"),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda *args, **kwargs: pytest.fail("project bridge context mixed audio"),
+    )
+
+    prompt = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "prompt-bridge": _prompt_node("SonderPromptRelayBridge", {
+            "project": ["editor-1", 0],
+        }),
+        "mask-bridge": _prompt_node("SonderMasksBridge", {
+            "project": ["editor-1", 0],
+        }),
+        "guides-start": _prompt_node("SonderGuidesBridgeStart", {
+            "project": ["editor-1", 0],
+        }),
+        "driver-selector": _prompt_node("SonderDriverSelector", {
+            "project": ["editor-1", 0],
+        }),
+    })
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=64,
+        height=48,
+        scene_id="scene-1",
+        selection_start=2,
+        selection_end=6,
+        pre_context_frames=2,
+        post_context_frames=2,
+        prompt=prompt,
+        unique_id="editor-1",
+    )
+
+    relay = prompt_bridge.build_window_relay_payload(project)
+    masks = masks_bridge.resolve_mask_times(project)
+    guide_result = guides_bridge.SonderGuidesBridgeStart().execute(
+        project,
+        iteration_index=0,
+    )
+    driver_ref, has_driver = driver_bridge.SonderDriverSelector().execute(project)
+    driver_result = driver_bridge.SonderDriverBridge().execute(driver_ref)
+
+    assert tuple(result[1].shape) == (1, 1, 1, 3)
+    assert relay["window_start"] == 0
+    assert relay["window_end"] == 8
+    assert masks["video_mask_start_time"] == pytest.approx(result[11])
+    assert masks["video_mask_end_time"] == pytest.approx(result[12])
+    assert tuple(guide_result[1].shape) == (1, 48, 64, 3)
+    assert guide_result[2] == 2
+    assert guide_result[3] == pytest.approx(0.75)
+    assert has_driver == 0
+    assert tuple(driver_result[0].shape) == (1, 48, 64, 3)
+    assert driver_result[2] == 0.0
+
+
+def test_project_only_queue_peek_preserves_snapshot_context_without_media(
+    tmp_path, monkeypatch
+):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project, _scene = _make_output_demand_project(tmp_path)
+    job = timeline_state.GenerationJob(
+        job_id="job-peek",
+        scene_id="scene-1",
+        selection_start=3,
+        selection_end=7,
+        pre_context_frames=1,
+        post_context_frames=1,
+        prompt="frozen prompt",
+        status="pending",
+        params={"snapshot_version": 1},
+    )
+    project.generation_queue = [job]
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda *args, **kwargs: pytest.fail("project-only queue peek rendered frames"),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda *args, **kwargs: pytest.fail("project-only queue peek mixed audio"),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=64,
+        height=48,
+        scene_id="scene-1",
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+            "bridge-1": _prompt_node("SonderSaveBridge", {
+                "project": ["editor-1", 0],
+                "mark_queue_complete": False,
+            }),
+        }),
+        unique_id="editor-1",
+    )
+
+    assert job.status == "pending"
+    assert result[5] == "frozen prompt"
+    assert result[6] == 6
+    assert tuple(result[1].shape) == (1, 1, 1, 3)
+    assert project._execution_context["queue_job_id"] == ""
+    assert project._execution_context["queue_job_ref_id"] == "job-peek"
+    assert project._execution_context["context_start"] == 2
+    assert project._execution_context["context_end"] == 8
+
+
+def test_guide_and_audio_demand_materialize_without_rendering(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    project, _scene = _make_output_demand_project(tmp_path, with_guide=True)
+    calls = {"render": 0, "guide": 0, "audio": 0}
+
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda *args, **kwargs: calls.__setitem__("render", calls["render"] + 1),
+    )
+
+    def load_guide(*_args, **_kwargs):
+        calls["guide"] += 1
+        return torch.ones(48, 64, 3, dtype=torch.float32)
+
+    def load_audio(*_args, **_kwargs):
+        calls["audio"] += 1
+        return editor_node._make_silent_audio(0.5)
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_load_guide_image", load_guide)
+    monkeypatch.setattr(editor_node.SonderEditor, "_load_scene_audio", load_audio)
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=64,
+        height=48,
+        scene_id="scene-1",
+        selection_start=0,
+        selection_end=8,
+        prompt=_prompt_graph({
+            "editor-1": _prompt_node("SonderEditor"),
+            "consumer-1": _prompt_node("Consumer", {
+                "project": ["editor-1", 0],
+                "guide_idx": ["editor-1", 3],
+                "audio": ["editor-1", 10],
+            }),
+        }),
+        unique_id="editor-1",
+    )
+
+    assert calls == {"render": 0, "guide": 1, "audio": 1}
+    assert tuple(result[1].shape) == (1, 1, 1, 3)
+    assert tuple(result[2].shape) == (1, 48, 64, 3)
+    assert result[3] == "2"
+    assert result[4] == "0.7500"
+    assert result[10]["waveform"].shape[-1] > 1
+
+
+@pytest.mark.parametrize(
+    "correction_value,pre_context_frames,expected_render",
+    [
+        ("__missing__", 4, True),
+        (False, 4, False),
+        (["toggle-1", 0], 4, True),
+        ("__missing__", 0, False),
+    ],
+)
+def test_color_drift_requirement_is_an_implicit_render_demand(
+    tmp_path,
+    monkeypatch,
+    correction_value,
+    pre_context_frames,
+    expected_render,
+):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    project, _scene = _make_output_demand_project(tmp_path)
+    calls = {"render": 0, "stash": 0}
+
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+
+    def render(_self, _project, _scene, start, end, **_kwargs):
+        calls["render"] += 1
+        return torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
+
+    def stash(*_args, **_kwargs):
+        calls["stash"] += 1
+        return {"reference": True}
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames", render)
+    monkeypatch.setattr(editor_node, "build_context_reference_stash", stash)
+
+    save_inputs = {
+        "project": ["collector-1", 0],
+        "frames": ["external-frames", 0],
+        "mark_queue_complete": False,
+    }
+    if correction_value != "__missing__":
+        save_inputs["color_drift_correction"] = correction_value
+    prompt = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "collector-1": _prompt_node("SonderMetadataCollector", {
+            "project": ["editor-1", 0],
+        }),
+        "external-frames": _prompt_node("ExternalFrames"),
+        "toggle-1": _prompt_node("Boolean"),
+        "save-1": _prompt_node("SonderSaveVideo", save_inputs),
+    })
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=64,
+        height=48,
+        scene_id="scene-1",
+        selection_start=4,
+        selection_end=8,
+        pre_context_frames=pre_context_frames,
+        prompt=prompt,
+        unique_id="editor-1",
+    )
+
+    assert calls["render"] == int(expected_render)
+    assert calls["stash"] == int(expected_render)
+    if expected_render:
+        assert tuple(result[1].shape) == (4 + pre_context_frames, 2, 2, 3)
+        assert project._execution_context[editor_node.DRIFT_STASH_CONTEXT_KEY] == {
+            "reference": True,
+        }
+    else:
+        assert tuple(result[1].shape) == (1, 1, 1, 3)
+        assert project._execution_context[editor_node.DRIFT_STASH_CONTEXT_KEY] is None
+
+
+def test_output_demand_transitions_do_not_reuse_placeholders(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    project, _scene = _make_output_demand_project(tmp_path)
+    render_calls = []
+
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+
+    def render(_self, _project, _scene, start, end, **_kwargs):
+        render_calls.append((start, end))
+        return torch.ones(max(1, end - start), 2, 2, 3, dtype=torch.float32)
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames", render)
+    node = editor_node.SonderEditor()
+    base_kwargs = {
+        "project": "Existing Project",
+        "project_name": "Ignored",
+        "fps": 24.0,
+        "width": 64,
+        "height": 48,
+        "scene_id": "scene-1",
+        "selection_start": 0,
+        "selection_end": 4,
+        "unique_id": "editor-1",
+    }
+    project_only = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "consumer": _prompt_node("Consumer", {"project": ["editor-1", 0]}),
+    })
+    frames_used = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "consumer": _prompt_node("Consumer", {"frames": ["editor-1", 1]}),
+    })
+
+    first = node.execute(prompt=project_only, **base_kwargs)
+    second = node.execute(prompt=frames_used, **base_kwargs)
+    third = node.execute(prompt=project_only, **base_kwargs)
+
+    assert tuple(first[1].shape) == (1, 1, 1, 3)
+    assert tuple(second[1].shape) == (4, 2, 2, 3)
+    assert torch.all(second[1] == 1)
+    assert tuple(third[1].shape) == (1, 1, 1, 3)
+    assert render_calls == [(0, 4)]
+
+
 def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
@@ -1315,6 +1844,11 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
         prompt=_prompt_graph({
             "editor-1": _prompt_node("SonderEditor"),
             "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+            "guide-use": _prompt_node("TestGuideConsumer", {
+                "images": ["editor-1", 2],
+                "indices": ["editor-1", 3],
+                "strengths": ["editor-1", 4],
+            }),
         }),
         unique_id="editor-1",
         scene_id="widget-scene",
@@ -1425,7 +1959,11 @@ def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
         height=512,
         prompt=_prompt_graph({
             "editor-1": _prompt_node("SonderEditor"),
-            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+            "save-1": _prompt_node("SonderSaveVideo", {
+                "project": ["editor-1", 0],
+                "frames": ["editor-1", 1],
+                "mark_queue_complete": True,
+            }),
         }),
         unique_id="editor-1",
         scene_id="scene-1",
@@ -1516,7 +2054,11 @@ def test_unmarked_save_with_active_queue_peeks_without_completion(tmp_path, monk
         height=512,
         prompt=_prompt_graph({
             "editor-1": _prompt_node("SonderEditor"),
-            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": False}),
+            "save-1": _prompt_node("SonderSaveVideo", {
+                "project": ["editor-1", 0],
+                "frames": ["editor-1", 1],
+                "mark_queue_complete": False,
+            }),
         }),
         unique_id="editor-1",
         scene_id="scene-1",
@@ -1614,7 +2156,11 @@ def test_render_queue_inactive_ignores_terminal_save_queue(tmp_path, monkeypatch
         height=512,
         prompt=_prompt_graph({
             "editor-1": _prompt_node("SonderEditor"),
-            "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+            "save-1": _prompt_node("SonderSaveVideo", {
+                "project": ["editor-1", 0],
+                "frames": ["editor-1", 1],
+                "mark_queue_complete": True,
+            }),
         }),
         unique_id="editor-1",
         scene_id="scene-1",
@@ -1896,12 +2442,12 @@ def test_editor_to_bridge_marks_queue_complete_round_trip(tmp_path, monkeypatch)
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_render_scene_frames",
-        lambda self, proj, scene, start, end, **_kwargs: torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32),
+        lambda *args, **kwargs: pytest.fail("Save Bridge project-only execution rendered frames"),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda *args, **kwargs: pytest.fail("Save Bridge project-only execution mixed audio"),
     )
 
     with io_nodes._BRIDGE_REGISTRY_LOCK:
@@ -1927,6 +2473,8 @@ def test_editor_to_bridge_marks_queue_complete_round_trip(tmp_path, monkeypatch)
         unique_id="editor-1",
     )
     proj_after_editor = editor_result[0]
+    assert tuple(editor_result[1].shape) == (1, 1, 1, 3)
+    assert tuple(editor_result[10]["waveform"].shape) == (1, 2, 1)
     assert proj_after_editor._execution_context["queue_job_id"] == "job-1"
 
     bridge = io_nodes.SonderSaveBridge()

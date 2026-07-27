@@ -32,8 +32,10 @@ from ..server.media_helpers import (
     resolve_source_color_interpretation,
 )
 from ..server.color_correction import (
+    DRIFT_MIN_REFERENCE_FRAMES,
     DRIFT_STASH_CONTEXT_KEY,
     build_context_reference_stash,
+    select_context_reference_indices,
 )
 from ..server.path_security import (
     PathSecurityError,
@@ -118,6 +120,7 @@ class SonderEditor:
         "prompt", "frame_count", "fps", "width", "height", "audio",
         "mask_start_time", "mask_end_time",
     )
+    OUTPUT_SLOTS = {name: index for index, name in enumerate(RETURN_NAMES)}
     OUTPUT_TOOLTIPS = (
         "The project object. Connect to Sonder Save Video.",
         "Composited video frames from the timeline (all visible clips layered with opacity).",
@@ -234,13 +237,51 @@ class SonderEditor:
         return float("nan")
 
     @staticmethod
-    def _empty_execute_result(proj: TimelineProject, proj_fps: float, proj_w: int, proj_h: int):
-        empty_image = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
-        silent_audio = _make_silent_audio(1.0, 44100)
+    def _minimal_image_output():
+        return torch.zeros(1, 1, 1, 3, dtype=torch.float32)
+
+    @staticmethod
+    def _minimal_audio_output(sample_rate: int = 44100):
+        return {
+            "waveform": torch.zeros(1, 2, 1, dtype=torch.float32),
+            "sample_rate": sample_rate,
+        }
+
+    @classmethod
+    def _empty_execute_result(
+        cls,
+        proj: TimelineProject,
+        proj_fps: float,
+        proj_w: int,
+        proj_h: int,
+        demanded_output_slots=None,
+    ):
+        demand_unknown = demanded_output_slots is None
+        frames_needed = demand_unknown or cls.OUTPUT_SLOTS["rendered_frames"] in demanded_output_slots
+        guides_needed = demand_unknown or bool(
+            {
+                cls.OUTPUT_SLOTS["guide_images"],
+                cls.OUTPUT_SLOTS["guide_idx"],
+                cls.OUTPUT_SLOTS["guide_strengths"],
+            }
+            & set(demanded_output_slots)
+        )
+        audio_needed = demand_unknown or cls.OUTPUT_SLOTS["audio"] in demanded_output_slots
+        rendered_image = (
+            torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+            if frames_needed
+            else cls._minimal_image_output()
+        )
+        guide_image = (
+            torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+            if guides_needed
+            else cls._minimal_image_output()
+        )
+        silent_audio = _make_silent_audio(1.0, 44100) if audio_needed else cls._minimal_audio_output()
         return (
             proj,
-            empty_image,
-            empty_image,
+            rendered_image,
+            guide_image,
             "",
             "",
             "",
@@ -428,6 +469,135 @@ class SonderEditor:
         return inputs if isinstance(inputs, dict) else {}
 
     @classmethod
+    def _referenced_output_slots(cls, prompt, unique_id):
+        """Return directly referenced zero-based output slots, or None when unsafe.
+
+        Comfy prompt links are exact ``[upstream_node_id, output_slot]`` pairs.
+        Unknown or malformed demand deliberately fails open so legacy execution
+        remains the compatibility fallback.
+        """
+        if not isinstance(prompt, dict) or unique_id in {None, ""}:
+            return None
+        target_id = str(unique_id)
+        matching_entries = [
+            node
+            for node_id, node in prompt.items()
+            if str(node_id) == target_id and isinstance(node, dict)
+        ]
+        if len(matching_entries) != 1:
+            return None
+        if str(matching_entries[0].get("class_type") or "") != "SonderEditor":
+            return None
+
+        referenced = set()
+        output_count = len(cls.RETURN_NAMES)
+        for node in prompt.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs", {})
+            if not isinstance(inputs, dict):
+                continue
+            for value in inputs.values():
+                if not isinstance(value, (list, tuple)) or not value:
+                    continue
+                source_id = value[0]
+                if isinstance(source_id, bool) or not isinstance(source_id, (str, int)):
+                    continue
+                if str(source_id) != target_id:
+                    continue
+                if len(value) != 2:
+                    return None
+                output_slot = value[1]
+                if (
+                    isinstance(output_slot, bool)
+                    or not isinstance(output_slot, int)
+                    or output_slot < 0
+                    or output_slot >= output_count
+                ):
+                    return None
+                referenced.add(output_slot)
+
+        return frozenset(referenced) if referenced else None
+
+    @classmethod
+    def _upstream_reaches_editor(cls, prompt, source_id, editor_id) -> bool:
+        if source_id is None:
+            return False
+        target_id = str(editor_id)
+        stack = [str(source_id)]
+        seen = set()
+        while stack:
+            current_id = stack.pop()
+            if current_id == target_id:
+                return True
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            for upstream in cls._prompt_node_inputs(prompt, current_id).values():
+                upstream_id = cls._prompt_linked_node_id(upstream)
+                if upstream_id and upstream_id not in seen:
+                    stack.append(upstream_id)
+        return False
+
+    @classmethod
+    def _execution_reaches_color_correcting_save_video(cls, prompt, unique_id) -> bool:
+        """Whether this editor feeds a Save Video that may use its drift stash."""
+        if not isinstance(prompt, dict) or unique_id in {None, ""}:
+            return False
+        for node in prompt.values():
+            if not isinstance(node, dict) or node.get("class_type") != "SonderSaveVideo":
+                continue
+            inputs = node.get("inputs", {})
+            if not isinstance(inputs, dict):
+                continue
+            correction_value = inputs.get("color_drift_correction", True)
+            correction_enabled = (
+                True
+                if isinstance(correction_value, (list, tuple))
+                else cls._coerce_bool(correction_value, True)
+            )
+            if not correction_enabled:
+                continue
+            project_source = cls._prompt_linked_node_id(inputs.get("project"))
+            if cls._upstream_reaches_editor(prompt, project_source, unique_id):
+                return True
+        return False
+
+    @classmethod
+    def _log_output_demand(
+        cls,
+        demanded_output_slots,
+        *,
+        render_needed: bool,
+        guide_bundle_needed: bool,
+        audio_needed: bool,
+        implicit_render_reason: str = "",
+    ):
+        if demanded_output_slots is None:
+            demand_label = "unknown"
+        else:
+            demand_label = ",".join(
+                cls.RETURN_NAMES[index] for index in sorted(demanded_output_slots)
+            )
+        skipped = []
+        if not render_needed:
+            skipped.append("rendered_frames")
+        if not guide_bundle_needed:
+            skipped.append("guide_bundle")
+        if not audio_needed:
+            skipped.append("audio")
+        logger.info(
+            "output demand: outputs=%s render=%s guides=%s audio=%s "
+            "implicit_render=%s skipped=%s",
+            demand_label,
+            render_needed,
+            guide_bundle_needed,
+            audio_needed,
+            implicit_render_reason or "none",
+            ",".join(skipped) if skipped else "none",
+        )
+
+    @classmethod
     def _execution_reaches_save_with_mark(cls, prompt, unique_id, expected_mark_queue_complete: bool) -> bool:
         if not isinstance(prompt, dict) or unique_id in {None, ""}:
             return False
@@ -443,21 +613,8 @@ class SonderEditor:
             if cls._prompt_bool(inputs.get("mark_queue_complete")) is not expected_mark_queue_complete:
                 continue
             project_source = cls._prompt_linked_node_id(inputs.get("project"))
-            if project_source is None:
-                continue
-            stack = [project_source]
-            seen = set()
-            while stack:
-                current_id = stack.pop()
-                if current_id == target_id:
-                    return True
-                if current_id in seen:
-                    continue
-                seen.add(current_id)
-                for upstream in cls._prompt_node_inputs(prompt, current_id).values():
-                    upstream_id = cls._prompt_linked_node_id(upstream)
-                    if upstream_id and upstream_id not in seen:
-                        stack.append(upstream_id)
+            if cls._upstream_reaches_editor(prompt, project_source, target_id):
+                return True
         return False
 
     @classmethod
@@ -605,6 +762,24 @@ class SonderEditor:
         render_cache_active = render_cache_max_bytes != 0
         render_cache_budget = None if render_cache_max_bytes == -1 else render_cache_max_bytes
         render_queue_active = self._coerce_bool(render_queue_active, True)
+        demanded_output_slots = self._referenced_output_slots(prompt, unique_id)
+        demand_unknown = demanded_output_slots is None
+        render_explicitly_needed = (
+            demand_unknown
+            or self.OUTPUT_SLOTS["rendered_frames"] in demanded_output_slots
+        )
+        guide_bundle_needed = demand_unknown or bool(
+            {
+                self.OUTPUT_SLOTS["guide_images"],
+                self.OUTPUT_SLOTS["guide_idx"],
+                self.OUTPUT_SLOTS["guide_strengths"],
+            }
+            & set(demanded_output_slots)
+        )
+        audio_needed = demand_unknown or self.OUTPUT_SLOTS["audio"] in demanded_output_slots
+        color_correcting_save_reached = self._execution_reaches_color_correcting_save_video(
+            prompt, unique_id
+        )
         proj = None
         queue_job = None
         queue_job_consumed = False
@@ -702,13 +877,26 @@ class SonderEditor:
 
             # --- If no scene, return defaults ---
             if not scene:
+                self._log_output_demand(
+                    demanded_output_slots,
+                    render_needed=False,
+                    guide_bundle_needed=False,
+                    audio_needed=False,
+                    implicit_render_reason="no_scene",
+                )
                 logger.info(
                     "execute end: scene_id=%s frames=%d duration=%.2fs",
                     scene_id or "",
                     0,
                     time.perf_counter() - execute_started_at,
                 )
-                return self._empty_execute_result(proj, proj_fps, proj_w, proj_h)
+                return self._empty_execute_result(
+                    proj,
+                    proj_fps,
+                    proj_w,
+                    proj_h,
+                    demanded_output_slots=demanded_output_slots,
+                )
 
             # --- Determine render range ---
             # If selection is set, use it; otherwise render the full scene
@@ -729,7 +917,20 @@ class SonderEditor:
                 render_start = 0
                 render_end = scene.duration_frames
                 if render_end <= 0:
-                    return self._empty_execute_result(proj, proj_fps, proj_w, proj_h)
+                    self._log_output_demand(
+                        demanded_output_slots,
+                        render_needed=False,
+                        guide_bundle_needed=False,
+                        audio_needed=False,
+                        implicit_render_reason="zero_duration",
+                    )
+                    return self._empty_execute_result(
+                        proj,
+                        proj_fps,
+                        proj_w,
+                        proj_h,
+                        demanded_output_slots=demanded_output_slots,
+                    )
 
             # --- Context frame expansion (asymmetric pre/post) ---
             # generation_start/end = the actual new frames to generate (original selection)
@@ -772,8 +973,8 @@ class SonderEditor:
             context_start = render_start
             context_end = render_end
             source_frame_count = execution_window["source_frame_count"]
-            frame_count = source_frame_count
             target_frame_count = execution_window["frame_count"]
+            frame_count = target_frame_count
             frame_count_padding = execution_window["frame_count_padding"]
             logger.info(
                 "render frame plan: scene_id=%s template=%s constraint=%s source_frames=%d padded_frames=%d padding=%d",
@@ -799,26 +1000,52 @@ class SonderEditor:
             mask_start_time = mask_start_pixel / proj_fps if proj_fps > 0 else 0.0
             mask_end_time = mask_end_pixel / proj_fps if proj_fps > 0 else 0.0
 
+            drift_step = 1
+            if isinstance(frame_constraint, dict):
+                drift_step = max(1, _coerce_int(frame_constraint.get("step"), 1))
+            implicit_drift_render = False
+            if color_correcting_save_reached and not render_explicitly_needed:
+                reference_indices = select_context_reference_indices(
+                    frame_count=target_frame_count,
+                    source_frame_count=source_frame_count,
+                    mask_start_frame=mask_start_pixel,
+                    mask_end_frame=mask_end_pixel,
+                    step=drift_step,
+                )
+                implicit_drift_render = len(reference_indices) >= DRIFT_MIN_REFERENCE_FRAMES
+            render_needed = render_explicitly_needed or implicit_drift_render
+            self._log_output_demand(
+                demanded_output_slots,
+                render_needed=render_needed,
+                guide_bundle_needed=guide_bundle_needed,
+                audio_needed=audio_needed,
+                implicit_render_reason="color_drift_reference" if implicit_drift_render else "",
+            )
+
             # --- Render composited frames ---
-            render_started_at = time.perf_counter()
-            logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
-            rendered_frames = self._render_scene_frames(
-                proj,
-                scene,
-                render_start,
-                render_end,
-                use_cache=render_cache_active,
-                cache_max_bytes=render_cache_budget,
-            )
-            if frame_count_padding > 0:
-                rendered_frames = self._pad_image_batch_to_frame_count(rendered_frames, target_frame_count)
-                frame_count = target_frame_count
-            logger.info(
-                "render end: scene_id=%s frames=%d duration=%.2fs",
-                scene.scene_id,
-                frame_count,
-                time.perf_counter() - render_started_at,
-            )
+            if render_needed:
+                render_started_at = time.perf_counter()
+                logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
+                rendered_frames = self._render_scene_frames(
+                    proj,
+                    scene,
+                    render_start,
+                    render_end,
+                    use_cache=render_cache_active,
+                    cache_max_bytes=render_cache_budget,
+                )
+                if frame_count_padding > 0:
+                    rendered_frames = self._pad_image_batch_to_frame_count(
+                        rendered_frames, target_frame_count
+                    )
+                logger.info(
+                    "render end: scene_id=%s frames=%d duration=%.2fs",
+                    scene.scene_id,
+                    frame_count,
+                    time.perf_counter() - render_started_at,
+                )
+            else:
+                rendered_frames = self._minimal_image_output()
 
             # --- Gather guide frames within render range ---
             guide_images = []
@@ -967,43 +1194,48 @@ class SonderEditor:
                         "these are alternative injection paths and duplicate guide injection is unsupported."
                     )
 
-            for guide in guide_frames:
-                if guide_track_hidden or getattr(guide, "muted", False):
-                    continue
-                idx = guide.frame_index
-                if idx == -1:
-                    idx = scene.duration_frames - 1
+            if guide_bundle_needed:
+                for guide in guide_frames:
+                    if guide_track_hidden or getattr(guide, "muted", False):
+                        continue
+                    idx = guide.frame_index
+                    if idx == -1:
+                        idx = scene.duration_frames - 1
 
-                if render_start <= idx < render_end:
-                    asset = proj.get_asset(guide.asset_id)
-                    if asset:
-                        asset_path = resolve_existing_project_path(
-                            proj,
-                            asset.path,
-                            purpose=f"guide asset {getattr(asset, 'asset_id', '') or '(unknown)'}",
-                        )
-                        if os.path.isfile(asset_path):
-                            img = self._load_guide_image(
-                                asset_path, asset.asset_type, proj_w, proj_h,
-                                fit_mode=getattr(guide, "fit_mode", "pad_edge"),
-                                crop_position=getattr(guide, "crop_position", "center"),
-                                asset=asset,
+                    if render_start <= idx < render_end:
+                        asset = proj.get_asset(guide.asset_id)
+                        if asset:
+                            asset_path = resolve_existing_project_path(
+                                proj,
+                                asset.path,
+                                purpose=f"guide asset {getattr(asset, 'asset_id', '') or '(unknown)'}",
                             )
-                            if img is not None:
-                                guide_images.append(img)
-                                local_idx = idx - render_start
-                                entry = guide_entry_by_id.get(guide_identity_by_object.get(id(guide), ""))
-                                if entry and auto_offset_enabled:
-                                    local_idx = _coerce_int(entry.get("effective_local_idx"), local_idx)
-                                guide_indices.append(str(local_idx))
-                                guide_strengths.append(f"{getattr(guide, 'strength', 1.0):.4f}")
+                            if os.path.isfile(asset_path):
+                                img = self._load_guide_image(
+                                    asset_path, asset.asset_type, proj_w, proj_h,
+                                    fit_mode=getattr(guide, "fit_mode", "pad_edge"),
+                                    crop_position=getattr(guide, "crop_position", "center"),
+                                    asset=asset,
+                                )
+                                if img is not None:
+                                    guide_images.append(img)
+                                    local_idx = idx - render_start
+                                    entry = guide_entry_by_id.get(guide_identity_by_object.get(id(guide), ""))
+                                    if entry and auto_offset_enabled:
+                                        local_idx = _coerce_int(entry.get("effective_local_idx"), local_idx)
+                                    guide_indices.append(str(local_idx))
+                                    guide_strengths.append(f"{getattr(guide, 'strength', 1.0):.4f}")
 
-            if guide_images:
-                guide_tensor = torch.stack(guide_images, dim=0)
-                indices_str = ",".join(guide_indices)
-                strengths_str = ",".join(guide_strengths)
+                if guide_images:
+                    guide_tensor = torch.stack(guide_images, dim=0)
+                    indices_str = ",".join(guide_indices)
+                    strengths_str = ",".join(guide_strengths)
+                else:
+                    guide_tensor = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+                    indices_str = ""
+                    strengths_str = ""
             else:
-                guide_tensor = torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
+                guide_tensor = self._minimal_image_output()
                 indices_str = ""
                 strengths_str = ""
 
@@ -1035,9 +1267,12 @@ class SonderEditor:
                     boundary_threshold_pct=prompt_threshold)
 
             # --- Load audio from scene's audio tracks for the render range ---
-            audio = self._load_scene_audio(proj, scene, render_start, render_end)
-            if frame_count_padding > 0:
-                audio = self._pad_audio_to_frame_count(audio, frame_count, proj_fps)
+            if audio_needed:
+                audio = self._load_scene_audio(proj, scene, render_start, render_end)
+                if frame_count_padding > 0:
+                    audio = self._pad_audio_to_frame_count(audio, frame_count, proj_fps)
+            else:
+                audio = self._minimal_audio_output()
 
             # --- Queue snapshots freeze take placement MODE only; linked/muted are
             # live editing preferences resolved from the hidden widgets at execution
@@ -1051,17 +1286,18 @@ class SonderEditor:
             # context frames, paired by index at save time (never persisted — the
             # `_` prefix is stripped by _public_execution_context).
             drift_stash = None
-            try:
-                drift_stash = build_context_reference_stash(
-                    rendered_frames,
-                    frame_count=frame_count,
-                    source_frame_count=source_frame_count,
-                    mask_start_frame=mask_start_pixel,
-                    mask_end_frame=mask_end_pixel,
-                    frame_constraint=frame_constraint,
-                )
-            except Exception as e:
-                logger.warning("color drift stash failed: scene_id=%s error=%s", scene.scene_id, e)
+            if render_needed:
+                try:
+                    drift_stash = build_context_reference_stash(
+                        rendered_frames,
+                        frame_count=frame_count,
+                        source_frame_count=source_frame_count,
+                        mask_start_frame=mask_start_pixel,
+                        mask_end_frame=mask_end_pixel,
+                        frame_constraint=frame_constraint,
+                    )
+                except Exception as e:
+                    logger.warning("color drift stash failed: scene_id=%s error=%s", scene.scene_id, e)
 
             # --- Attach execution context for downstream nodes (e.g., SonderSaveVideo Take mode) ---
             proj._execution_context = {

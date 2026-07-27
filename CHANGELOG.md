@@ -20,6 +20,9 @@ a fresh `[Unreleased]` block.
   names what the editor does, replacing the "NLE-style" framing.
 
 ### Fixed
+- Sonder Editor now skips unused timeline-frame, direct-guide, and audio
+  materialization while preserving project, queue, bridge, and metadata
+  context.
 - Guide **Set Selection In/Out** actions now use the same two-stage manual
   endpoint workflow as toolbar and shortcut entry.
 - Animatic video suppression is now ephemeral and no longer overwrites durable
