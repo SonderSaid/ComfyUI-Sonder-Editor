@@ -11,6 +11,11 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Changed
+- Prompt text now saves when a field loses focus, so clicking away from a
+  timeline prompt bar keeps the edit instead of requiring Enter. Esc, Cancel,
+  and Delete remain the ways to throw an edit away.
+
 ### Fixed
 - Post-save asset refreshes now coalesce per browser window and use read-only
   registry reads, avoiding duplicate synchronization scans and summary-request

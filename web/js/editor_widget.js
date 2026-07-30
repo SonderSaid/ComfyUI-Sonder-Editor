@@ -8860,8 +8860,8 @@ export class EditorWidget {
         this._showPromptCreator(startFrame, endFrame);
     }
 
-    /** Auto-growing prompt textarea for inline bars: Enter commits,
-     *  Shift+Enter inserts a newline, Esc cancels. */
+    /** Auto-growing prompt textarea for inline bars: Enter and focus loss
+     *  commit, Shift+Enter inserts a newline, Esc cancels. */
     _makePromptTextarea({ value = "", placeholder = "", title = "", flex = 1 }, onEnter, onEscape) {
         const area = document.createElement("textarea");
         // Marks every prompt-editing field so the global key consumer leaves
@@ -8871,7 +8871,9 @@ export class EditorWidget {
         area.dataset.sonderPromptBox = "1";
         area.rows = 2;
         area.placeholder = placeholder;
-        area.title = title ? `${title} — Enter commits, Shift+Enter inserts a newline` : "Enter commits, Shift+Enter inserts a newline";
+        area.title = title
+            ? `${title} — Enter or clicking away commits, Shift+Enter inserts a newline, Esc discards`
+            : "Enter or clicking away commits, Shift+Enter inserts a newline, Esc discards";
         area.value = value;
         area.style.cssText = `flex: ${flex}; min-width: 40px; resize: none; overflow-y: auto; line-height: 1.35; ${chromeInputCss({ fontSize: "11px", padding: "3px 6px", textAlign: "left" })}`;
         const grow = () => {
@@ -8933,13 +8935,20 @@ export class EditorWidget {
         label.style.cssText = `font-size: 10px; color: ${COLORS.promptBorder}; white-space: nowrap;`;
         label.textContent = `New [${startFrame}-${endFrame}]:`;
 
+        // Focus loss creates the section rather than dropping the typed text;
+        // Esc and Cancel remain the explicit discard. `created` keeps the
+        // save-then-hide flush from creating a second copy.
+        let created = false;
+        let discard = false;
         const commit = () => {
+            if (created || discard) return;
             const channels = channelInputs.read();
             if (channels.visual || channels.speech || channels.sounds) {
+                created = true;
                 this._saveNewPromptSection(startFrame, endFrame, channels);
             }
         };
-        const channelInputs = this._buildChannelInputs(null, commit, () => this._hidePromptEditor());
+        const channelInputs = this._buildChannelInputs(null, commit, () => this._hidePromptEditor({ commit: false }));
 
         const createBtn = this._makeBtn("Create", "Create prompt section");
         setButtonVariant(createBtn, "primary");
@@ -8949,11 +8958,23 @@ export class EditorWidget {
         const cancelBtn = this._makeBtn("Cancel", "Cancel");
         setButtonVariant(cancelBtn, "subtle");
         cancelBtn.dataset.sonderHoverVariant = "subtle";
-        cancelBtn.addEventListener("click", () => this._hidePromptEditor());
+        // Arm before the textarea's focusout so pressing Cancel cannot be
+        // turned into a create by the blur it causes (browsers disagree on
+        // whether a mouse press focuses a button, so `relatedTarget` alone
+        // is not enough).
+        cancelBtn.addEventListener("mousedown", () => { discard = true; });
+        cancelBtn.addEventListener("click", () => this._hidePromptEditor({ commit: false }));
+
+        editor.addEventListener("focusin", () => { discard = false; });
+        editor.addEventListener("focusout", (e) => {
+            if (e.relatedTarget && editor.contains(e.relatedTarget)) return;
+            commit();
+        });
 
         editor.append(label, channelInputs.wrap, createBtn, cancelBtn);
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
+        this._promptEditorCommit = commit;
         this._refreshTimelineLayout();
 
         setTimeout(() => channelInputs.inputs.visual.focus(), 50);
@@ -9007,15 +9028,32 @@ export class EditorWidget {
         label.style.cssText = `font-size: 10px; color: ${COLORS.promptBorder}; white-space: nowrap;`;
         label.textContent = `Prompt [${section.start_frame}-${section.end_frame}]:`;
 
-        const commit = () => {
-            this._updatePromptSection(idx, { channels: channelInputs.read() });
-            this._hidePromptEditor();
+        // Last durably-written channels. Focus loss and every close path commit
+        // through here, so the comparison is what keeps repeated focus changes
+        // from stacking no-op mutations and undo entries.
+        let committed = normalizeChannels(section.channels, section.prompt);
+        let discard = false;
+        const commit = ({ close = true } = {}) => {
+            const next = channelInputs.read();
+            if (next.visual !== committed.visual
+                || next.speech !== committed.speech
+                || next.sounds !== committed.sounds) {
+                committed = next;
+                this._updatePromptSection(idx, { channels: next });
+                // The mutation clears the lane highlight; an open bar should
+                // keep pointing at the section its Save/Delete still target.
+                if (!close) {
+                    this._selectedPromptIdx = idx;
+                    this._renderTimeline();
+                }
+            }
+            if (close) this._hidePromptEditor();
         };
         const channelInputs = this._buildChannelInputs(
-            normalizeChannels(section.channels, section.prompt),
+            committed,
             commit,
             () => {
-                this._hidePromptEditor();
+                this._hidePromptEditor({ commit: false });
                 this._selectedPromptIdx = null;
                 this._renderTimeline();
             }
@@ -9024,21 +9062,36 @@ export class EditorWidget {
         const saveBtn = this._makeBtn("Save", "Save prompt");
         setButtonVariant(saveBtn, "primary");
         saveBtn.dataset.sonderHoverVariant = "primary";
-        saveBtn.addEventListener("click", commit);
+        saveBtn.addEventListener("click", () => commit());
 
         const deleteBtn = this._makeBtn("Delete", "Delete this prompt section");
         setButtonVariant(deleteBtn, "danger");
         deleteBtn.dataset.sonderHoverVariant = "danger";
+        // Arm before the textarea's focusout: deleting must not first write
+        // the edit it is about to discard (see the Cancel note in the creator).
+        deleteBtn.addEventListener("mousedown", () => { discard = true; });
         deleteBtn.addEventListener("click", () => {
             if (confirm(`Delete this prompt section?`)) {
                 this._deletePromptSection(idx);
+            } else {
+                discard = false;
             }
+        });
+
+        editor.addEventListener("focusin", () => { discard = false; });
+        editor.addEventListener("focusout", (e) => {
+            if (discard) return;
+            if (e.relatedTarget && editor.contains(e.relatedTarget)) return;
+            // Keep the bar open: it still owns Save/Delete, and the close paths
+            // (clicking the timeline, switching scenes) flush through the hook.
+            commit({ close: false });
         });
 
         editor.append(label, channelInputs.wrap, saveBtn, deleteBtn);
         // Insert after timeline canvas
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
+        this._promptEditorCommit = () => commit({ close: false });
         this._refreshTimelineLayout();
 
         // Focus input
@@ -9078,7 +9131,7 @@ export class EditorWidget {
             this._hidePromptEditor();
         }, () => {
             suppressBlurCommit = true;
-            this._hidePromptEditor();
+            this._hidePromptEditor({ commit: false });
         });
         input.addEventListener("blur", () => {
             commit();
@@ -9090,6 +9143,10 @@ export class EditorWidget {
         editor.append(label, input);
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
+        // Close paths flush too: browsers disagree on whether removing a
+        // focused element fires blur, and `_updateScenePrompt` already
+        // no-ops on an unchanged value, so a double call is harmless.
+        this._promptEditorCommit = commit;
         this._refreshTimelineLayout();
 
         setTimeout(() => input.focus(), 50);
@@ -9613,7 +9670,17 @@ export class EditorWidget {
         });
     }
 
-    _hidePromptEditor() {
+    /** Closes the inline prompt bar, flushing its pending edit first so text
+     *  survives every close path (click elsewhere, scene switch, drag-select,
+     *  opening another bar) without an explicit Enter. Pass `{commit:false}`
+     *  for the discard paths — Esc, Cancel, and section deletion, where the
+     *  pending edit is either refused by the user or aimed at a stale index.
+     *  The hook is cleared before it runs, so a flush that closes cannot
+     *  re-enter here. */
+    _hidePromptEditor({ commit = true } = {}) {
+        const pendingCommit = this._promptEditorCommit;
+        this._promptEditorCommit = null;
+        if (commit && pendingCommit) pendingCommit();
         if (this._promptEditorEl) {
             this._promptEditorEl.remove();
             this._promptEditorEl = null;
@@ -9678,7 +9745,9 @@ export class EditorWidget {
         const section = (this.activeScene.prompt_sections || [])[idx];
         this._applyLocalPromptDelete(idx);
         this._selectedPromptIdx = null;
-        this._hidePromptEditor();
+        // Discard any pending inline edit: it targets a section that is gone,
+        // and the indices behind it have already shifted.
+        this._hidePromptEditor({ commit: false });
         this._renderSceneAfterLocalMutation({ viewport: false });
 
         try {
@@ -12783,6 +12852,9 @@ export class EditorWidget {
         }
         this._projectMutationCloseInProgress = (async () => {
             this._stopPlayback();
+            // Flush an open prompt bar before the drain so a pending edit is
+            // part of it rather than dying with the fullscreen DOM.
+            this._hidePromptEditor();
             await this._drainProjectMutations(`fullscreen_exit:${reason}`);
             if (!this._destroyed && this.isFullscreen) {
                 this._exitFullscreen();

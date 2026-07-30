@@ -105,8 +105,8 @@ function smallInput({ value = "", placeholder = "", width = "", numeric = false 
 }
 
 // Paragraph-size prompt textarea with a browser-local persisted height
-// (one shared height per kind via prompts.panel*BoxHeight). Enter commits,
-// Shift+Enter inserts a newline — Esc is handled by the panel's focus-aware
+// (one shared height per kind via prompts.panel*BoxHeight). Enter and focus
+// loss commit, Shift+Enter inserts a newline — Esc is handled by the panel's focus-aware
 // OVERLAY consumer, not here. Native `resize` is OFF — the corner grip
 // disappears under the scrollbar once content overflows, so each box kind
 // gets an explicit drag grip (makeHeightGrip) below it instead.
@@ -114,7 +114,9 @@ function promptBox(host, { value = "", placeholder = "", heightKey = "", title =
     const area = document.createElement("textarea");
     area.value = value;
     area.placeholder = placeholder;
-    area.title = title ? `${title} — Enter commits, Shift+Enter inserts a newline` : "Enter commits, Shift+Enter inserts a newline";
+    area.title = title
+        ? `${title} — Enter or clicking away commits, Shift+Enter inserts a newline, Esc discards`
+        : "Enter or clicking away commits, Shift+Enter inserts a newline, Esc discards";
     const persisted = heightKey ? (host._settings?.prompts?.[heightKey] || 0) : 0;
     area.style.cssText = `${chromeInputCss({ padding: "4px 6px" })}; flex:1; min-width:40px; resize: none; line-height: 1.4; min-height: 28px; height: ${persisted > 0 ? `${persisted}px` : `${defaultHeight}px`}; overflow-y: auto;`;
     area.dataset.sonderPromptBox = "1";
