@@ -285,6 +285,13 @@ import {
     postProjectJsonWithReconcile,
     resetProjectVersion,
 } from "./api_client.js";
+import {
+    allocateAssetRefreshWave,
+    buildAssetRefreshPolicy,
+    getProjectAssetMutationEpoch,
+    markProjectAssetMutation,
+    requestProjectAssetRefresh,
+} from "./asset_refresh_coordinator.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
 import {
     findConstrainedSelectionEndpoint,
@@ -343,6 +350,7 @@ export function buildProjectAssetViewURL(projectDir, sourcePath) {
 export async function importFileIntoProject(projectDir, file, folder = "") {
     if (!projectDir || !file) return false;
     const dirName = projectDir.split(/[/\\]/).pop();
+    markProjectAssetMutation(dirName, "asset_import");
     const formData = new FormData();
     formData.append("file", file, file.name);
     if (folder) formData.append("folder", folder);
@@ -362,6 +370,7 @@ export async function importFileIntoProject(projectDir, file, folder = "") {
 export async function replaceAssetInProject(projectDir, assetId, file) {
     if (!projectDir || !assetId || !file) return null;
     const dirName = projectDir.split(/[/\\]/).pop();
+    markProjectAssetMutation(dirName, "asset_replace");
     const formData = new FormData();
     formData.append("file", file, file.name);
     const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}/replace`), {
@@ -563,7 +572,6 @@ export class EditorWidget {
         this._sceneFetchSeq = 0;
         this._sceneMutationInvalidationSeq = 0;
         this._queueFetchSeq = 0;
-        this._assetFetchSeq = 0;
         this._staleReplayGovernors = new Map();
         this._staleReplayTimers = new Map();
         this._projectMutationQueue = new ProjectMutationQueue({
@@ -1031,7 +1039,11 @@ export class EditorWidget {
                     handle = notifyProgress({ verb: "Refreshing", message: "Refreshing assets…", progress: null, source: "refresh" });
                 }, 500);
                 try {
-                    await this._fetchAssets();
+                    await this._fetchAssets({
+                        mode: "sync",
+                        manual: true,
+                        reason: "gallery_manual_refresh",
+                    });
                 } finally {
                     window.clearTimeout(timer);
                     if (handle) handle.resolve({ tier: "info", message: "Assets refreshed" });
@@ -1610,86 +1622,86 @@ export class EditorWidget {
         return deriveCurrentSceneAssetIds(this.activeScene, this._allProjectAssetsForGallery());
     }
 
-    async _fetchAssets({ ignoreMutationGate = false, reason = "assets" } = {}) {
+    _applyAssetPayload(data, {
+        projectDir = this.projectDir,
+        epoch = getProjectAssetMutationEpoch(this._projectDirName()),
+        requestId = "",
+    } = {}) {
+        const liveEpoch = getProjectAssetMutationEpoch(this._projectDirName());
+        if (!projectDir || projectDir !== this.projectDir || epoch !== liveEpoch) {
+            sessionDiagRecord("asset_refresh_supersede", {
+                request_id: requestId,
+                response_epoch: epoch,
+                live_epoch: liveEpoch,
+            });
+            return false;
+        }
+        this.assets = { video: [], image: [], audio: [], artifact: [] };
+        this._pathToAsset = {};
+        for (const asset of (data?.assets || [])) {
+            if (this.assets[asset.asset_type]) {
+                this.assets[asset.asset_type].push(asset);
+            }
+            if (asset.path) this._pathToAsset[asset.path] = asset;
+        }
+        this._assetGallery?.setData({
+            assets: data?.assets || [],
+            folders: data?.folders || [],
+            currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
+        });
+        this._clearPlaybackWarmOverlay("assets-refresh");
+        sessionDiagRecord("asset_refresh_apply", {
+            request_id: requestId,
+            mutation_epoch: epoch,
+            asset_count: Array.isArray(data?.assets) ? data.assets.length : 0,
+        });
+        return true;
+    }
+
+    async _fetchAssets({
+        ignoreMutationGate = false,
+        reason = "assets",
+        mode = "read",
+        waveId = "",
+        requiredVersion = "",
+        manual = false,
+    } = {}) {
         if (!this.projectDir) return;
         if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
             this._deferProjectBackedRefresh(["assets"], reason);
             return;
         }
 
-        // Single-flight parity with _fetchScenes: a newer asset refresh
-        // supersedes this one (latest-wins). Incremented after the mutation gate
-        // so deferred no-op calls do not churn the counter.
-        const fetchSeq = ++this._assetFetchSeq;
+        const projectDir = this.projectDir;
         const dirName = this.projectDir.split(/[/\\]/).pop();
-        // Capture the committed version BEFORE the POST for the exhausted-conflict
-        // governor comparison (the fetch patch records response versions into the
-        // shared map before this await resumes).
-        const knownVersion = getProjectVersion(dirName);
         try {
-            // /assets/sync is a version-gated POST (the fetch patch stamps
-            // If-Match); after a generation commit bumps the version it 409s.
-            // Reconcile from the 409 body and retry, instead of silently dropping
-            // it and stranding new takes as "Missing".
-            const { payload: data, attempts } = await postProjectJsonWithReconcile(
-                api.apiURL(`/sonder-editor/project/${dirName}/assets/sync?${this._assetListQueryString()}`),
-                { method: "POST" },
-                { projectId: dirName },
-            );
-            if (fetchSeq !== this._assetFetchSeq) {
-                // A newer asset refresh superseded this one: latest-wins.
-                return;
-            }
-            if (attempts > 1) {
-                sessionDiagRecord("assets_refresh_stale_version", {
-                    reason,
-                    attempts,
-                    known_version: knownVersion,
-                });
-            }
-            this._markStaleReplayApplied("assets", dirName);
-            this.assets = { video: [], image: [], audio: [], artifact: [] };
-            this._pathToAsset = {};
-            for (const asset of (data?.assets || [])) {
-                if (this.assets[asset.asset_type]) {
-                    this.assets[asset.asset_type].push(asset);
-                }
-                if (asset.path) this._pathToAsset[asset.path] = asset;
-            }
-            this._assetGallery?.setData({
-                assets: data?.assets || [],
-                folders: data?.folders || [],
-                currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
+            const result = await requestProjectAssetRefresh({
+                projectId: dirName,
+                mode,
+                waveId: waveId || allocateAssetRefreshWave(reason),
+                requiredVersion,
+                policy: buildAssetRefreshPolicy(this._settings),
+                reason,
+                manual,
+                diagnosticRecorder: (event) => sessionDiagRecord(event.kind, event),
             });
-            this._clearPlaybackWarmOverlay("assets-refresh");
+            if (!result || projectDir !== this.projectDir) return null;
+            this._markStaleReplayApplied("assets", dirName);
+            return this._applyAssetPayload(result.payload, {
+                projectDir,
+                epoch: result.epoch,
+                requestId: result.requestId,
+            }) ? result : null;
         } catch (e) {
-            if (e?.code === "project_version_conflict") {
-                // Immediate heal-and-retry was exhausted (a second commit raced in
-                // between heal and retry). Hand to the shared bounded-retry +
-                // stable-server breaker; it re-enters via
-                // _deferProjectBackedRefresh(["assets"]).
-                sessionDiagRecord("assets_refresh_stale_version", {
-                    reason,
-                    exhausted: true,
-                    header_version: String(e.actualModifiedAt || ""),
-                    known_version: knownVersion,
-                });
-                this._governStaleVersionReplay(
-                    "assets",
-                    dirName,
-                    String(e.actualModifiedAt || ""),
-                    knownVersion,
-                    "asset_refresh_stale_version_replay",
-                );
-                return;
-            }
             console.warn("[Sonder] Failed to fetch assets:", e);
+            return null;
         }
     }
 
     async _updateAssetMetadata(assetId, updates) {
         if (!this.projectDir || !assetId) return null;
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_metadata");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -1730,6 +1742,7 @@ export class EditorWidget {
     async _bulkMoveAssets(assetIds, folder = "") {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { updated: 0 };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_folder_move");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-move`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -1738,12 +1751,15 @@ export class EditorWidget {
         if (!resp.ok) {
             throw new Error(`Bulk asset move failed: ${resp.status}`);
         }
-        return await resp.json();
+        const payload = await resp.json();
+        await this._fetchAssets({ reason: "asset_folder_move_complete" });
+        return payload;
     }
 
     async _deleteAsset(assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_trash");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/${assetId}`), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
@@ -1767,6 +1783,7 @@ export class EditorWidget {
     async _bulkDeleteAssets(assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_bulk_trash");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1790,6 +1807,7 @@ export class EditorWidget {
     async _restoreAsset(assetId) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_restore");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/restore`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1809,6 +1827,7 @@ export class EditorWidget {
     async _bulkRestoreAssets(assetIds) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_bulk_restore");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-restore`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1828,6 +1847,7 @@ export class EditorWidget {
     async _permanentDeleteAsset(assetId, force = false) {
         if (!this.projectDir || !assetId) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_permanent_delete");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/permanent`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1851,6 +1871,7 @@ export class EditorWidget {
     async _bulkPermanentDeleteAssets(assetIds, force = false) {
         if (!this.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_bulk_permanent_delete");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/bulk-permanent-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1874,6 +1895,7 @@ export class EditorWidget {
     async _emptyTrash() {
         if (!this.projectDir) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_empty_trash");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/empty-trash`), {
             method: "POST",
         });
@@ -1891,6 +1913,7 @@ export class EditorWidget {
     async _createAssetFolder(folderName) {
         if (!this.projectDir || !folderName) return [];
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_folder_create");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1907,6 +1930,7 @@ export class EditorWidget {
     async _renameAssetFolder(folderName, newFolderName) {
         if (!this.projectDir || !folderName || !newFolderName) return [];
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_folder_rename");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -1923,6 +1947,7 @@ export class EditorWidget {
     async _deleteAssetFolder(folderName, force = false) {
         if (!this.projectDir || !folderName) return { status: "noop" };
         const dirName = this.projectDir.split(/[/\\]/).pop();
+        markProjectAssetMutation(dirName, "asset_folder_delete");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${dirName}/assets/folders`), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
@@ -14579,15 +14604,18 @@ export class EditorWidget {
         this._renderQueue = [];
         this._renderQueuePanel();
 
-        // Fetch assets first (triggers audio duration repair), then scenes
-        this._fetchAssets().then(() => this._fetchScenes());
+        // Entering a full editor surface explicitly owns discovery/repair.
+        this._fetchAssets({
+            mode: "sync",
+            reason: "editor_surface_entry",
+        }).then(() => this._fetchScenes());
         if (this._queueExpanded) {
             this._fetchRenderQueue({ reason: "load_project" });
         }
         this._renderTimeline();
     }
 
-    refresh(keys = []) {
+    refresh(keys = [], options = {}) {
         const wanted = new Set(keys);
         const wantsAssets = !wanted.size || wanted.has("assets");
         const wantsScenes = !wanted.size || wanted.has("scenes");
@@ -14605,10 +14633,10 @@ export class EditorWidget {
                 this._fetchProjectSettings();
             }
             if (wantsAssets && wantsScenes) {
-                this._fetchAssets().then(() => this._fetchScenes());
+                this._fetchAssets(options.assetRefresh || {}).then(() => this._fetchScenes());
             } else {
                 if (wantsAssets) {
-                    this._fetchAssets();
+                    this._fetchAssets(options.assetRefresh || {});
                 }
                 if (wantsScenes) {
                     this._fetchScenes();

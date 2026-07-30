@@ -6,7 +6,14 @@ import {
     resolveFrameConstraintForTemplate,
     updateEditorSettings,
 } from "./editor_settings.js";
-import { installProjectVersionFetchPatch, getProjectVersion, postProjectJsonWithReconcile } from "./api_client.js";
+import { installProjectVersionFetchPatch, getProjectVersion } from "./api_client.js";
+import {
+    allocateAssetRefreshWave,
+    buildAssetRefreshPolicy,
+    getProjectAssetMutationEpoch,
+    markProjectAssetMutation,
+    requestProjectAssetRefresh,
+} from "./asset_refresh_coordinator.js";
 import {
     claimEditorSession,
     createEditorHandoff,
@@ -557,6 +564,14 @@ async function fetchJson(url, signal) {
     return await resp.json();
 }
 
+function createDeferred() {
+    let resolve;
+    const promise = new Promise((onResolve) => {
+        resolve = onResolve;
+    });
+    return { promise, resolve };
+}
+
 function assetIdsFromPayload(payload) {
     const assets = Array.isArray(payload)
         ? payload
@@ -786,8 +801,8 @@ class FullscreenEditorSession {
         editor._enterFullscreen();
     }
 
-    refresh(keys = []) {
-        this.editor?.refresh(keys);
+    refresh(keys = [], options = {}) {
+        this.editor?.refresh(keys, options);
     }
 
     _handleEditorClosed() {
@@ -1289,10 +1304,13 @@ export class EditorNodeController {
             queue: { loading: false, error: "" },
         };
         this._moduleLoadAborters = {};
-        this._summaryAborter = null;
+        this._summaryRefreshActive = null;
+        this._summaryRefreshPending = null;
+        this._summaryRefreshSeq = 0;
+        this._projectGeneration = 0;
+        this._activeDormantAssetGallery = null;
         this._previewStateRefreshTimer = null;
         this._pendingPreviewRefreshKeys = new Set();
-        this._pendingPreviewRefreshSyncAssets = false;
         this.fullscreenSession = null;
         this._releaseGraphPreviewOwnership = null;
         this._preFullscreenModuleId = "";
@@ -1484,15 +1502,9 @@ export class EditorNodeController {
         }
         this._diagEvents.length = 0;
 
-        if (this._summaryAborter) {
-            this._summaryAborter.abort();
-            this._summaryAborter = null;
-        }
-
         clearTimeout(this._previewStateRefreshTimer);
         this._previewStateRefreshTimer = null;
         this._pendingPreviewRefreshKeys.clear();
-        this._pendingPreviewRefreshSyncAssets = false;
 
         for (const moduleId of Object.keys(this._moduleLoadAborters)) {
             this._abortModuleLoad(moduleId);
@@ -1710,20 +1722,17 @@ export class EditorNodeController {
         return ["preview"];
     }
 
-    _schedulePreviewStateRefresh(keys = ["preview"], { syncAssets = false } = {}) {
+    _schedulePreviewStateRefresh(keys = ["preview"]) {
         if (this._destroyed || !this.state.projectDir) return;
         for (const key of keys || []) {
             this._pendingPreviewRefreshKeys.add(key);
         }
-        this._pendingPreviewRefreshSyncAssets = this._pendingPreviewRefreshSyncAssets || !!syncAssets;
         clearTimeout(this._previewStateRefreshTimer);
         this._previewStateRefreshTimer = setTimeout(() => {
             this._previewStateRefreshTimer = null;
             const pendingKeys = Array.from(this._pendingPreviewRefreshKeys);
-            const pendingSyncAssets = this._pendingPreviewRefreshSyncAssets;
             this._pendingPreviewRefreshKeys.clear();
-            this._pendingPreviewRefreshSyncAssets = false;
-            this._refreshSummaryThenReloadModules(pendingKeys, { syncAssets: pendingSyncAssets });
+            this._refreshSummaryThenReloadModules(pendingKeys);
         }, PREVIEW_STATE_REFRESH_DEBOUNCE_MS);
     }
 
@@ -1999,8 +2008,20 @@ export class EditorNodeController {
                 refresh: shouldRefresh,
             });
             if (!shouldRefresh) return;
-            this._refreshSummaryThenReloadModules(["project", "assets", "scene", "queue", "preview"], { syncAssets: true });
-            this.fullscreenSession?.refresh(["project", "assets", "scenes", "queue"]);
+            const assetRefresh = {
+                mode: "read",
+                waveId: `project_updated:${pending.modified_at}`,
+                requiredVersion: pending.modified_at || "",
+                reason: "project_updated",
+            };
+            this._refreshSummaryThenReloadModules(
+                ["project", "assets", "scene", "queue", "preview"],
+                { assetRefresh },
+            );
+            this.fullscreenSession?.refresh(
+                ["project", "assets", "scenes", "queue"],
+                { assetRefresh },
+            );
         }, 250);
     }
 
@@ -2214,6 +2235,10 @@ export class EditorNodeController {
 
     async updateProject(projectDir, projectName = "") {
         if (this._destroyed) return;
+        const previousProjectDir = this.state.projectDir || "";
+        if (projectDir !== previousProjectDir) {
+            this._projectGeneration += 1;
+        }
 
         this.projectName = projectName || "";
         this.state.projectName = projectName || "";
@@ -2243,7 +2268,6 @@ export class EditorNodeController {
             return;
         }
 
-        const previousProjectDir = this.state.projectDir || "";
         if (projectDir !== previousProjectDir) {
             const switchingExistingProject = !!previousProjectDir && previousProjectDir !== projectDir;
             if (this.fullscreenSession) {
@@ -2291,68 +2315,206 @@ export class EditorNodeController {
         this._drainProjectReadyQueue();
     }
 
-    async refreshSummary(options = {}) {
-        const { syncAssets = false } = options;
-        if (this._destroyed || !this.state.projectDir) return false;
+    _currentSummarySignature() {
+        this.syncStateFromWidgets();
+        const url = buildDormantSummaryUrl(this.state);
+        return {
+            url,
+            signature: `${this._projectGeneration}:${url}`,
+        };
+    }
+
+    _summaryRequestDescriptor(invalidationKeys = [], skipModuleIds = []) {
+        const current = this._currentSummarySignature();
         const projectDir = this.state.projectDir;
+        return {
+            projectDir,
+            projectGeneration: this._projectGeneration,
+            url: current.url,
+            signature: current.signature,
+            invalidationKeys: new Set(invalidationKeys || []),
+            skipModuleIds: new Set(skipModuleIds || []),
+            deferred: createDeferred(),
+            requestId: `summary-${++this._summaryRefreshSeq}`,
+        };
+    }
 
-        if (this._summaryAborter) {
-            this._summaryAborter.abort();
-        }
-        const aborter = new AbortController();
-        this._summaryAborter = aborter;
-        let refreshed = false;
-        let syncedAssetPayload = null;
-
-        try {
-            if (syncAssets) {
-                // Version-gated POST: reconcile a post-commit 409 (heal + retry)
-                // instead of throwing, which would abort the whole summary refresh
-                // and strand new takes as "Missing". AbortError still propagates
-                // (it is not a version conflict) so latest-wins abort is preserved.
-                const projectId = projectIdFromDir(this.state.projectDir);
-                const syncResult = await postProjectJsonWithReconcile(
-                    api.apiURL(`/sonder-editor/project/${projectId}/assets/sync`),
-                    { method: "POST", signal: aborter.signal },
-                    { projectId },
-                );
-                syncedAssetPayload = syncResult?.payload ?? null;
+    _startSummaryRefresh(entry) {
+        this._summaryRefreshActive = entry;
+        fetchJson(entry.url).then((payload) => {
+            if (
+                this._destroyed
+                || this.state.projectDir !== entry.projectDir
+                || this._projectGeneration !== entry.projectGeneration
+                || this._currentSummarySignature().signature !== entry.signature
+            ) {
+                this._recordDiagEvent("summary_refresh_supersede", {
+                    request_id: entry.requestId,
+                    signature: entry.signature,
+                });
+                return false;
             }
-            this.syncStateFromWidgets();
-            this.state.dormantSummary = await fetchJson(
-                buildDormantSummaryUrl(this.state),
-                aborter.signal,
-            );
-            if (!aborter.signal.aborted && this.state.projectDir === projectDir) {
-                this._rememberAssetIds(syncedAssetPayload, projectDir);
-            }
-            refreshed = true;
-            const activeScene = this.state.dormantSummary?.active_scene;
+            this.state.dormantSummary = payload;
+            const activeScene = payload?.active_scene;
             const widgetValue = this._getWidgetValue("scene_id", "") || "";
             if (activeScene?.scene_id && !this.state.sceneId && !widgetValue) {
                 this.state.sceneId = activeScene.scene_id;
                 this._setWidgetValue("scene_id", activeScene.scene_id);
             }
-        } catch (e) {
-            if (e.name !== "AbortError") {
-                console.warn("[Sonder] Failed to fetch dormant summary:", e);
-            }
-        } finally {
-            if (this._summaryAborter === aborter) {
-                this._summaryAborter = null;
+            if (entry.invalidationKeys.size) {
+                const keys = [...entry.invalidationKeys];
+                this._invalidateModules(keys);
+                this._reloadExpandedModuleIfNeeded(keys, {
+                    skipModuleIds: [...entry.skipModuleIds],
+                });
             }
             this.render();
+            return true;
+        }).catch((error) => {
+            console.warn("[Sonder] Failed to fetch dormant summary:", error);
+            return false;
+        }).then((refreshed) => {
+            entry.deferred.resolve(refreshed);
+            if (this._summaryRefreshActive === entry) {
+                this._summaryRefreshActive = null;
+            }
+            if (this._summaryRefreshPending) {
+                const pending = this._summaryRefreshPending;
+                this._summaryRefreshPending = null;
+                this._startSummaryRefresh(pending);
+            }
+        });
+        return entry.deferred.promise;
+    }
+
+    refreshSummary(options = {}) {
+        const invalidationKeys = options.invalidationKeys || [];
+        const skipModuleIds = options.skipModuleIds || [];
+        if (this._destroyed || !this.state.projectDir) return Promise.resolve(false);
+        const incoming = this._summaryRequestDescriptor(invalidationKeys, skipModuleIds);
+        const active = this._summaryRefreshActive;
+        if (!active) return this._startSummaryRefresh(incoming);
+        if (active.signature === incoming.signature) {
+            for (const key of incoming.invalidationKeys) active.invalidationKeys.add(key);
+            for (const moduleId of incoming.skipModuleIds) active.skipModuleIds.add(moduleId);
+            this._recordDiagEvent("summary_refresh_join", {
+                request_id: active.requestId,
+                signature: active.signature,
+            });
+            return active.deferred.promise;
         }
-        return refreshed;
+        if (!this._summaryRefreshPending) {
+            this._summaryRefreshPending = incoming;
+        } else {
+            const pending = this._summaryRefreshPending;
+            pending.projectDir = incoming.projectDir;
+            pending.projectGeneration = incoming.projectGeneration;
+            pending.url = incoming.url;
+            pending.signature = incoming.signature;
+            for (const key of incoming.invalidationKeys) pending.invalidationKeys.add(key);
+            for (const moduleId of incoming.skipModuleIds) pending.skipModuleIds.add(moduleId);
+        }
+        this._recordDiagEvent("summary_refresh_followup_queued", {
+            active_request_id: active.requestId,
+            signature: incoming.signature,
+        });
+        return this._summaryRefreshPending.deferred.promise;
+    }
+
+    async _refreshAssets({
+        mode = "read",
+        waveId = "",
+        requiredVersion = "",
+        reason = "assets",
+        manual = false,
+    } = {}) {
+        if (this._destroyed || !this.state.projectDir) return null;
+        const projectDir = this.state.projectDir;
+        const projectId = projectIdFromDir(projectDir);
+        try {
+            const result = await requestProjectAssetRefresh({
+                projectId,
+                mode,
+                waveId: waveId || allocateAssetRefreshWave(reason),
+                requiredVersion,
+                policy: buildAssetRefreshPolicy(getEditorSettings()),
+                reason,
+                manual,
+                diagnosticRecorder: (event) => this._recordDiagEvent(event.kind, event),
+            });
+            if (
+                !result
+                || this._destroyed
+                || this.state.projectDir !== projectDir
+                || result.epoch !== getProjectAssetMutationEpoch(projectId)
+            ) {
+                return null;
+            }
+            this._seedAssetRefreshResult(result, projectDir);
+            return result;
+        } catch (error) {
+            console.warn("[Sonder] Failed to refresh assets:", error);
+            return null;
+        }
+    }
+
+    _seedAssetRefreshResult(result, projectDir = this.state.projectDir) {
+        const projectId = projectIdFromDir(projectDir);
+        if (
+            !result
+            || this._destroyed
+            || this.state.projectDir !== projectDir
+            || result.epoch !== getProjectAssetMutationEpoch(projectId)
+        ) {
+            return false;
+        }
+        const normalized = Array.isArray(result.payload)
+            ? { assets: result.payload, folders: [] }
+            : {
+                assets: result.payload?.assets || [],
+                folders: result.payload?.folders || [],
+            };
+        this.moduleCache.assets = {
+            ...normalized,
+            currentSceneAssetIds: deriveCurrentSceneAssetIds(
+                this.state.dormantSummary?.active_scene,
+                normalized.assets,
+            ),
+        };
+        this._rememberAssetIds(normalized, projectDir);
+        this._activeDormantAssetGallery?.setData(this.moduleCache.assets);
+        this._recordDiagEvent("asset_refresh_apply", {
+            request_id: result.requestId,
+            mutation_epoch: result.epoch,
+            asset_count: normalized.assets.length,
+        });
+        return true;
     }
 
     async _refreshSummaryThenReloadModules(keys = [], options = {}) {
-        const refreshed = await this.refreshSummary(options);
-        if (this._destroyed || !refreshed) return false;
-        this._invalidateModules(keys);
-        this._reloadExpandedModuleIfNeeded(keys);
-        this.render();
-        return true;
+        const summaryPromise = this.refreshSummary({
+            invalidationKeys: keys,
+            skipModuleIds: options.assetRefresh ? ["assets"] : [],
+        });
+        const assetPromise = options.assetRefresh
+            ? this._refreshAssets(options.assetRefresh)
+            : Promise.resolve(null);
+        const [refreshed, assetResult] = await Promise.all([summaryPromise, assetPromise]);
+        if (assetResult) this._seedAssetRefreshResult(assetResult);
+        return { refreshed, assetResult };
+    }
+
+    async _refreshAfterAssetMutation(reason, fullscreenKeys = ["assets", "scenes", "queue"]) {
+        const assetRefresh = {
+            mode: "read",
+            waveId: allocateAssetRefreshWave(reason),
+            reason,
+        };
+        this.fullscreenSession?.refresh(fullscreenKeys, { assetRefresh });
+        return await Promise.all([
+            this.refreshSummary(),
+            this._refreshAssets(assetRefresh),
+        ]);
     }
 
     toggleModule(moduleId) {
@@ -2428,9 +2590,10 @@ export class EditorNodeController {
         }
     }
 
-    _reloadExpandedModuleIfNeeded(keys) {
+    _reloadExpandedModuleIfNeeded(keys, { skipModuleIds = [] } = {}) {
         const expandedModuleId = this.state.expandedModuleId;
         if (!expandedModuleId) return;
+        if (new Set(skipModuleIds || []).has(expandedModuleId)) return;
         if (this.modules[expandedModuleId]?.invalidate(keys)) {
             this._loadModule(expandedModuleId);
         }
@@ -2751,6 +2914,7 @@ export class EditorNodeController {
         this._resetBridgeAssetTracking();
         const cachedIds = this._cachedAssetIds(projectDir);
         const session = {
+            sessionId: allocateAssetRefreshWave("bridge_session"),
             projectDir,
             baselineIds: cachedIds instanceof Set ? new Set(cachedIds) : null,
             baselinePromise: null,
@@ -2774,7 +2938,6 @@ export class EditorNodeController {
                     && this.state.projectDir === projectDir
                 ) {
                     session.baselineIds = new Set(assetIds);
-                    this._rememberAssetIds(payload, projectDir);
                 }
                 return assetIds instanceof Set ? assetIds : null;
             }).catch((error) => {
@@ -2797,16 +2960,27 @@ export class EditorNodeController {
     handleNodeExecuted() {
         if (this._destroyed || !this.state.projectDir) return;
         this.syncStateFromWidgets();
-        this._refreshSummaryThenReloadModules(["assets", "scene", "queue", "preview"], { syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._refreshSummaryThenReloadModules(["scene", "queue", "preview"]);
+        this.fullscreenSession?.refresh(["scenes", "queue"]);
     }
 
     handleSaveVideoExecuted() {
         if (this._destroyed || !this.state.projectDir) return;
         this._queueSaveCompletionCounter += 1;
         this.syncStateFromWidgets();
-        this._refreshSummaryThenReloadModules(["assets", "scene", "queue", "preview"], { syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        const assetRefresh = {
+            mode: "read",
+            waveId: allocateAssetRefreshWave("save_video"),
+            reason: "save_video_complete",
+        };
+        this._refreshSummaryThenReloadModules(
+            ["assets", "scene", "queue", "preview"],
+            { assetRefresh },
+        );
+        this.fullscreenSession?.refresh(
+            ["assets", "scenes", "queue"],
+            { assetRefresh },
+        );
     }
 
     async handleBridgeExecutionSettled({ allowRollback = false, attemptIndex = 0 } = {}) {
@@ -2826,6 +3000,19 @@ export class EditorNodeController {
             this.beginBridgeExecutionTracking();
         }
         const settleSession = this._bridgeAssetSettleSession;
+        const assetRefresh = {
+            mode: "read",
+            waveId: `${settleSession?.sessionId || "bridge"}:${attemptIndex}`,
+            reason: "bridge_settlement",
+        };
+        const refreshPromise = this._refreshSummaryThenReloadModules(
+            ["assets", "scene", "queue", "preview"],
+            { assetRefresh },
+        );
+        this.fullscreenSession?.refresh(
+            ["assets", "scenes", "queue"],
+            { assetRefresh },
+        );
         const baselineIds = settleSession?.baselineIds instanceof Set
             ? new Set(settleSession.baselineIds)
             : await settleSession?.baselinePromise;
@@ -2837,13 +3024,9 @@ export class EditorNodeController {
         ) {
             return this.state.dormantSummary?.queue_counts || {};
         }
-        const refreshed = await this.refreshSummary({ syncAssets: true });
-        if (refreshed) {
-            this._invalidateModules(["assets", "scene", "queue", "preview"]);
-            this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue", "preview"]);
-        }
+        const { assetResult } = await refreshPromise;
         if (
-            refreshed
+            assetResult
             && this._bridgeAssetSettleSession === settleSession
             && !settleSession.arrivalAnnounced
             && baselineIds instanceof Set
@@ -2860,7 +3043,6 @@ export class EditorNodeController {
             }
         }
         const counts = this.state.dormantSummary?.queue_counts || {};
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
         this.render();
         return counts;
     }
@@ -2954,8 +3136,8 @@ export class EditorNodeController {
 
             if (importedAny) {
                 this._invalidateModules(["assets", "scene"]);
-                this._reloadExpandedModuleIfNeeded(["assets", "scene"]);
-                await this.refreshSummary({ syncAssets: true });
+                this._reloadExpandedModuleIfNeeded(["assets", "scene"], { skipModuleIds: ["assets"] });
+                await this._refreshAfterAssetMutation("asset_import_complete", ["assets", "scenes"]);
             }
             if (!failures.length && imported === total) {
                 handle.resolve({ message: `Imported ${imported} file${imported === 1 ? "" : "s"}` });
@@ -2976,6 +3158,7 @@ export class EditorNodeController {
 
     async _updateAssetMetadata(assetId, updates) {
         if (!this.state.projectDir || !assetId) return null;
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_metadata");
 
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}`), {
             method: "PUT",
@@ -3002,7 +3185,7 @@ export class EditorNodeController {
                 this.moduleCache.assets.folders = Array.from(folders).sort((a, b) => a.localeCompare(b));
             }
         }
-        this.fullscreenSession?.refresh(["assets"]);
+        await this._refreshAfterAssetMutation("asset_metadata_complete", ["assets"]);
         return updatedAsset;
     }
 
@@ -3030,6 +3213,7 @@ export class EditorNodeController {
 
     async _bulkMoveAssets(assetIds, folder = "") {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { updated: 0 };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_folder_move");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-move`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -3039,12 +3223,13 @@ export class EditorNodeController {
             throw new Error(`Bulk asset move failed: ${resp.status}`);
         }
         const payload = await resp.json();
-        this.fullscreenSession?.refresh(["assets"]);
+        await this._refreshAfterAssetMutation("asset_folder_move_complete", ["assets"]);
         return payload;
     }
 
     async _deleteAsset(assetId, force = false) {
         if (!this.state.projectDir || !assetId) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_trash");
 
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/${assetId}`), {
             method: "DELETE",
@@ -3061,14 +3246,14 @@ export class EditorNodeController {
 
         const payload = await resp.json();
         this._invalidateModules(["assets"]);
-        this._reloadExpandedModuleIfNeeded(["assets"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_trash_complete");
         return { status: "trashed", ...(payload || {}) };
     }
 
     async _restoreAsset(assetId) {
         if (!this.state.projectDir || !assetId) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_restore");
 
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/restore`), {
             method: "POST",
@@ -3081,14 +3266,14 @@ export class EditorNodeController {
 
         const payload = await resp.json();
         this._invalidateModules(["assets"]);
-        this._reloadExpandedModuleIfNeeded(["assets"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_restore_complete");
         return { status: "restored", ...(payload || {}) };
     }
 
     async _bulkRestoreAssets(assetIds) {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_bulk_restore");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-restore`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -3100,14 +3285,14 @@ export class EditorNodeController {
 
         const payload = await resp.json();
         this._invalidateModules(["assets"]);
-        this._reloadExpandedModuleIfNeeded(["assets"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_bulk_restore_complete");
         return { status: "restored", ...(payload || {}) };
     }
 
     async _bulkDeleteAssets(assetIds, force = false) {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_bulk_trash");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -3123,14 +3308,14 @@ export class EditorNodeController {
 
         const payload = await resp.json();
         this._invalidateModules(["assets"]);
-        this._reloadExpandedModuleIfNeeded(["assets"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_bulk_trash_complete");
         return { status: "trashed", ...(payload || {}) };
     }
 
     async _permanentDeleteAsset(assetId, force = false) {
         if (!this.state.projectDir || !assetId) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_permanent_delete");
 
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/permanent`), {
             method: "POST",
@@ -3147,14 +3332,14 @@ export class EditorNodeController {
 
         const payload = await resp.json();
         this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_permanent_delete_complete");
         return { status: "deleted", ...(payload || {}) };
     }
 
     async _bulkPermanentDeleteAssets(assetIds, force = false) {
         if (!this.state.projectDir || !Array.isArray(assetIds) || !assetIds.length) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_bulk_permanent_delete");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/bulk-permanent-delete`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -3170,14 +3355,14 @@ export class EditorNodeController {
 
         const payload = await resp.json();
         this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_bulk_permanent_delete_complete");
         return { status: "deleted", ...(payload || {}) };
     }
 
     async _emptyTrash() {
         if (!this.state.projectDir) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_empty_trash");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/empty-trash`), {
             method: "POST",
         });
@@ -3187,14 +3372,14 @@ export class EditorNodeController {
 
         const payload = await resp.json();
         this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_empty_trash_complete");
         return { status: "deleted", ...(payload || {}) };
     }
 
     async _createAssetFolder(folderName) {
         if (!this.state.projectDir || !folderName) return [];
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_folder_create");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -3210,12 +3395,13 @@ export class EditorNodeController {
                 folders: Array.isArray(payload.folders) ? payload.folders : (this.moduleCache.assets.folders || []),
             };
         }
-        this.fullscreenSession?.refresh(["assets"]);
+        await this._refreshAfterAssetMutation("asset_folder_create_complete", ["assets"]);
         return Array.isArray(payload.folders) ? payload.folders : [];
     }
 
     async _renameAssetFolder(folderName, newFolderName) {
         if (!this.state.projectDir || !folderName || !newFolderName) return [];
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_folder_rename");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -3226,14 +3412,14 @@ export class EditorNodeController {
         }
         const payload = await resp.json();
         this._invalidateModules(["assets"]);
-        this._reloadExpandedModuleIfNeeded(["assets"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets"]);
+        this._reloadExpandedModuleIfNeeded(["assets"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_folder_rename_complete", ["assets"]);
         return payload || { folders: [] };
     }
 
     async _deleteAssetFolder(folderName, force = false) {
         if (!this.state.projectDir || !folderName) return { status: "noop" };
+        markProjectAssetMutation(projectIdFromDir(this.state.projectDir), "asset_folder_delete");
         const resp = await fetch(api.apiURL(`/sonder-editor/project/${projectIdFromDir(this.state.projectDir)}/assets/folders`), {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
@@ -3248,9 +3434,8 @@ export class EditorNodeController {
         }
         const payload = await resp.json();
         this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_folder_delete_complete");
         return { status: "deleted", ...(payload || {}) };
     }
 
@@ -3258,9 +3443,8 @@ export class EditorNodeController {
         if (!this.state.projectDir || !assetId || !file) return null;
         const payload = await replaceAssetInProject(this.state.projectDir, assetId, file);
         this._invalidateModules(["assets", "scene", "queue"]);
-        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"]);
-        await this.refreshSummary({ syncAssets: true });
-        this.fullscreenSession?.refresh(["assets", "scenes", "queue"]);
+        this._reloadExpandedModuleIfNeeded(["assets", "scene", "queue"], { skipModuleIds: ["assets"] });
+        await this._refreshAfterAssetMutation("asset_replace_complete");
         return payload?.asset || null;
     }
 
@@ -3451,14 +3635,23 @@ export class EditorNodeController {
                 await window.__SONDER_OPEN_SOURCE_WORKFLOW__?.(this.state.projectDir, asset);
             },
             onRefresh: async () => {
-                const payload = await this._loadDormantAssets();
-                this.moduleCache.assets = payload;
-                gallery.setData(payload);
+                await this._refreshAssets({
+                    mode: "sync",
+                    waveId: allocateAssetRefreshWave("dormant_manual_refresh"),
+                    reason: "dormant_manual_refresh",
+                    manual: true,
+                });
                 this.card.syncModuleContainerHeight?.();
             },
             onRequestResize: () => this.card.syncModuleContainerHeight?.(),
         });
-        return () => gallery.destroy();
+        this._activeDormantAssetGallery = gallery;
+        return () => {
+            if (this._activeDormantAssetGallery === gallery) {
+                this._activeDormantAssetGallery = null;
+            }
+            gallery.destroy();
+        };
     }
 
     _mountPreviewModule(container, data) {

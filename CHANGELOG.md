@@ -11,6 +11,11 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- Post-save asset refreshes now coalesce per browser window and use read-only
+  registry reads, avoiding duplicate synchronization scans and summary-request
+  abort churn while preserving explicit discovery and repair.
+
 ## [0.1.1] - 2026-07-27
 
 ### Added

@@ -172,6 +172,8 @@ function fetchJson(_url, _signal) {{
     snapshotCalls += 1;
     return new Promise((resolve) => {{ resolveSnapshot = resolve; }});
 }}
+let wave = 0;
+function allocateAssetRefreshWave() {{ wave += 1; return `wave-${{wave}}`; }}
 
 class Harness {{
     constructor(moduleCache = {{}}) {{
@@ -207,6 +209,7 @@ console.log(JSON.stringify({{
     pendingAggregated,
     snapshotCalls,
     capturedIds,
+    knownIdsAfterBaseline: uncached._knownAssetIds,
     reset: uncached._bridgeAssetSettleSession === null,
     abortedOnReset: pendingSession.baselineAborter.signal.aborted,
 }}));
@@ -218,6 +221,7 @@ console.log(JSON.stringify({{
         "pendingAggregated": True,
         "snapshotCalls": 1,
         "capturedIds": ["before"],
+        "knownIdsAfterBaseline": None,
         "reset": True,
         "abortedOnReset": True,
     }
@@ -256,9 +260,10 @@ class Harness {{
     }}
     syncStateFromWidgets() {{}}
     beginBridgeExecutionTracking() {{ throw new Error("session should already exist"); }}
-    async refreshSummary() {{ return this.refreshResults.shift() ?? true; }}
-    _invalidateModules() {{}}
-    _reloadExpandedModuleIfNeeded() {{}}
+    async _refreshSummaryThenReloadModules() {{
+        const success = this.refreshResults.shift() ?? true;
+        return {{ refreshed: true, assetResult: success ? {{ payload: {{}} }} : null }};
+    }}
     _cachedAssetIds() {{ return new Set(this.current); }}
     render() {{}}
 {method}
@@ -325,13 +330,100 @@ def test_bridge_tracking_lifecycle_is_wired_to_extension_and_controller():
     destroy_end = controller.index("    getElement()", destroy_start)
     assert '_resetBridgeAssetTracking({ clearKnown: true })' in controller[destroy_start:destroy_end]
     assert controller.count('_resetBridgeAssetTracking({ clearKnown: true })') == 3
-    refresh_start = controller.index("    async refreshSummary(")
-    refresh_end = controller.index("    async _refreshSummaryThenReloadModules(", refresh_start)
-    refresh_source = controller[refresh_start:refresh_end]
-    assert "syncedAssetPayload = syncResult?.payload ?? null;" in refresh_source
-    assert refresh_source.index("this._rememberAssetIds(syncedAssetPayload, projectDir);") > (
-        refresh_source.index("this.state.dormantSummary = await fetchJson(")
+
+
+def test_queue_only_settlement_refreshes_summary_without_assets():
+    source = CONTROLLER.read_text(encoding="utf-8")
+    method = _between(
+        source,
+        "    async handleQueueExecutionSettled(",
+        "    async _rollbackStaleRunningQueueJobs(",
     )
-    assert refresh_source.index("this._rememberAssetIds(syncedAssetPayload, projectDir);") < (
-        refresh_source.index("refreshed = true;")
+    script = f"""
+class Harness {{
+    constructor() {{
+        this._destroyed = false;
+        this.state = {{ projectDir: "project-1", dormantSummary: {{ queue_counts: {{ pending: 0, running: 0 }} }} }};
+        this._queueSaveCompletionCounter = 0;
+        this._lastQueueSettledSaveCompletionCounter = 0;
+        this.summaryCalls = 0;
+        this.assetCalls = 0;
+        this.fullscreenSession = {{ refresh: (keys) => {{ this.fullscreenKeys = keys; }} }};
+    }}
+    syncStateFromWidgets() {{}}
+    async refreshSummary() {{ this.summaryCalls += 1; return true; }}
+    _invalidateModules() {{}}
+    _reloadExpandedModuleIfNeeded() {{}}
+    async _rollbackStaleRunningQueueJobs() {{ return false; }}
+    async _refreshAssets() {{ this.assetCalls += 1; }}
+    render() {{}}
+{method}
+}}
+const harness = new Harness();
+const counts = await harness.handleQueueExecutionSettled({{ allowRollback: true }});
+console.log(JSON.stringify({{
+    counts,
+    summaryCalls: harness.summaryCalls,
+    assetCalls: harness.assetCalls,
+    fullscreenKeys: harness.fullscreenKeys,
+}}));
+"""
+    assert _run_node(script) == {
+        "counts": {"pending": 0, "running": 0},
+        "summaryCalls": 1,
+        "assetCalls": 0,
+        "fullscreenKeys": ["queue"],
+    }
+
+
+def test_editor_execution_skips_assets_and_save_video_shares_one_read_wave():
+    source = CONTROLLER.read_text(encoding="utf-8")
+    methods = _between(
+        source,
+        "    handleNodeExecuted()",
+        "    async handleBridgeExecutionSettled(",
     )
+    script = f"""
+let wave = 0;
+function allocateAssetRefreshWave(reason) {{ wave += 1; return `${{reason}}:${{wave}}`; }}
+class Harness {{
+    constructor() {{
+        this._destroyed = false;
+        this.state = {{ projectDir: "p" }};
+        this._queueSaveCompletionCounter = 0;
+        this.controllerCalls = [];
+        this.fullscreenCalls = [];
+        this.fullscreenSession = {{
+            refresh: (keys, options = {{}}) => this.fullscreenCalls.push({{ keys, options }}),
+        }};
+    }}
+    syncStateFromWidgets() {{}}
+    _refreshSummaryThenReloadModules(keys, options = {{}}) {{
+        this.controllerCalls.push({{ keys, options }});
+    }}
+{methods}
+}}
+const harness = new Harness();
+harness.handleNodeExecuted();
+harness.handleSaveVideoExecuted();
+console.log(JSON.stringify({{
+    controllerCalls: harness.controllerCalls,
+    fullscreenCalls: harness.fullscreenCalls,
+    saveCounter: harness._queueSaveCompletionCounter,
+}}));
+"""
+    result = _run_node(script)
+    assert result["controllerCalls"][0] == {
+        "keys": ["scene", "queue", "preview"],
+        "options": {},
+    }
+    assert result["fullscreenCalls"][0] == {
+        "keys": ["scenes", "queue"],
+        "options": {},
+    }
+    controller_asset = result["controllerCalls"][1]["options"]["assetRefresh"]
+    fullscreen_asset = result["fullscreenCalls"][1]["options"]["assetRefresh"]
+    assert controller_asset == fullscreen_asset
+    assert controller_asset["mode"] == "read"
+    assert controller_asset["reason"] == "save_video_complete"
+    assert result["saveCounter"] == 1
