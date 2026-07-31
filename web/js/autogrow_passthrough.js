@@ -230,7 +230,17 @@ const applyTypeLabels = (node, peer, count) => {
     }
 };
 
-export function refreshAutogrowShape(node, { maxCount, peer = null, inputs = true, outputs = true } = {}) {
+export function refreshAutogrowShape(
+    node,
+    {
+        maxCount,
+        peer = null,
+        inputs = true,
+        outputs = true,
+        resize = true,
+        dirty = true,
+    } = {},
+) {
     if (!node || !maxCount) return;
     ensureState(node);
     const local = maxConnectedValueIndex(node);
@@ -238,8 +248,9 @@ export function refreshAutogrowShape(node, { maxCount, peer = null, inputs = tru
     const desired = Math.min(maxCount, Math.max(1, Math.max(local, peerMax) + 2));
     const mutated = applyShape(node, desired, maxCount, { inputs, outputs });
     applyTypeLabels(node, peer, desired);
-    if (mutated && typeof node.computeSize === "function" && typeof node.setSize === "function") {
+    if (mutated && resize && typeof node.computeSize === "function" && typeof node.setSize === "function") {
         node.setSize(node.computeSize());
     }
-    node.setDirtyCanvas?.(true, true);
+    if (dirty) node.setDirtyCanvas?.(true, true);
+    return mutated;
 }

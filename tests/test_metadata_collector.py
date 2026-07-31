@@ -424,3 +424,76 @@ def test_power_lora_large_stack_preserves_list_shape(tmp_path):
     assert first["name"].startswith("FluxKlein\\")
     assert section["fields"]["enabled_lora_count"] == 25
     assert section["fields"]["total_lora_count"] == 50
+
+
+def test_shared_collector_core_accepts_v3_dotted_autogrow_inputs(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    prompt = {
+        "10": _origin("ImageNode", {"seed": 10}),
+        "11": _origin("ModelNode", {"name": "model.safetensors"}),
+        "20": {
+            "class_type": "SonderMetadataCollectorV3",
+            "inputs": {
+                "project": ["1", 0],
+                "values.value_7": ["11", 0],
+                "values.value_0": ["10", 0],
+            },
+        },
+    }
+
+    result = module.collect_metadata(
+        project,
+        prompt=prompt,
+        extra_pnginfo={"workflow": {}},
+        unique_id="20",
+        values={"value_7": object(), "value_0": "text"},
+        labels={"label_7": "Model", "label_0": "Image"},
+        capacity=module.MAX_V3_COLLECTOR_INPUTS,
+    )
+
+    assert result is project
+    chain = _chain(project, module)
+    assert [section["label"] for section in chain] == ["Image", "Model"]
+    assert [section["source_node_id"] for section in chain] == ["10", "11"]
+
+
+def test_shared_collector_core_supports_full_v3_capacity(tmp_path):
+    module = _import_collector()
+    project = _project(tmp_path)
+    prompt = {
+        "99": _origin("LastNode", {"value": 99}),
+        "20": {
+            "class_type": "SonderMetadataCollectorV3",
+            "inputs": {"values.value_31": ["99", 0]},
+        },
+    }
+
+    module.collect_metadata(
+        project,
+        prompt=prompt,
+        extra_pnginfo={"workflow": {}},
+        unique_id="20",
+        values={"values.value_31": object()},
+        labels={"label_31": "Last"},
+        capacity=module.MAX_V3_COLLECTOR_INPUTS,
+    )
+
+    assert module.MAX_V3_COLLECTOR_INPUTS == 32
+    assert _chain(project, module)[0]["label"] == "Last"
+
+
+def test_collector_fingerprint_shared_contract_and_nan_fallback():
+    module = _import_collector()
+    prompt = {"20": {"class_type": "SonderMetadataCollector", "inputs": {}}}
+    extra = {"workflow": {"nodes": []}}
+
+    first = module.collector_fingerprint(prompt, extra, {"label_0": "A"})
+    second = module.collector_fingerprint(prompt, extra, {"label_0": "A"})
+    changed = module.collector_fingerprint(prompt, extra, {"label_0": "B"})
+    missing = module.collector_fingerprint(prompt, {}, {"label_0": "A"})
+
+    assert first == second
+    assert first != changed
+    assert isinstance(missing, float)
+    assert missing != missing

@@ -35,6 +35,7 @@ def _resolve_max_collector_inputs() -> int:
 
 
 MAX_COLLECTOR_INPUTS = _resolve_max_collector_inputs()
+MAX_V3_COLLECTOR_INPUTS = 32
 
 
 def _as_id(value: Any) -> str:
@@ -313,6 +314,113 @@ def collector_chain_for_consumer(context: dict | None, prompt: dict | None, cons
     return [section for section in chain if isinstance(section, dict)]
 
 
+def collector_fingerprint(
+    prompt: dict | None,
+    extra_pnginfo: dict | None,
+    labels: dict[str, Any] | None,
+):
+    workflow = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
+    if prompt is None or workflow is None:
+        return float("NaN")
+    try:
+        payload = json.dumps(
+            {
+                "prompt": prompt,
+                "workflow": workflow,
+                "labels": labels if isinstance(labels, dict) else {},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    except Exception:
+        return float("NaN")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalized_value_names(values: Any) -> set[str]:
+    if not isinstance(values, dict):
+        return set()
+    normalized = set()
+    for key in values:
+        name = str(key)
+        if name.startswith("values."):
+            name = name.split(".", 1)[1]
+        if re.fullmatch(r"value_\d+", name):
+            normalized.add(name)
+    return normalized
+
+
+def _collector_origin_ref(inputs: dict, value_name: str):
+    direct = inputs.get(value_name)
+    if direct is not None:
+        return direct
+    dotted = inputs.get(f"values.{value_name}")
+    if dotted is not None:
+        return dotted
+    nested = inputs.get("values")
+    if isinstance(nested, dict):
+        return nested.get(value_name)
+    return None
+
+
+def collect_metadata(
+    project,
+    *,
+    prompt: dict | None,
+    extra_pnginfo: dict | None,
+    unique_id: Any,
+    values: dict[str, Any] | None,
+    labels: dict[str, Any] | None,
+    capacity: int,
+):
+    context = getattr(project, "_execution_context", None)
+    if not isinstance(context, dict):
+        context = {}
+        project._execution_context = context
+
+    workflow = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
+    chains = context.setdefault(TRACKED_METADATA_CONTEXT_KEY, {})
+    if not isinstance(chains, dict):
+        chains = {}
+        context[TRACKED_METADATA_CONTEXT_KEY] = chains
+
+    # Resolve this collector's own inputs from the executed prompt. V1 uses
+    # value_N while V3 Autogrow flattens them to values.value_N.
+    owner_key, my_entry = _prompt_node(prompt, _as_id(unique_id))
+    my_inputs = my_entry.get("inputs") if isinstance(my_entry, dict) else None
+    my_inputs = my_inputs if isinstance(my_inputs, dict) else {}
+
+    # Overwriting our own chain makes repeated execution idempotent.
+    parent_key, _parent_entry = _prompt_node(prompt, _project_input_origin_id(my_inputs))
+    own_chain = list(chains.get(parent_key, [])) if parent_key else []
+    value_names = _normalized_value_names(values)
+    label_values = labels if isinstance(labels, dict) else {}
+
+    for index in range(max(0, int(capacity))):
+        value_name = f"value_{index}"
+        if value_name not in value_names:
+            continue
+        origin_ref = _collector_origin_ref(my_inputs, value_name)
+        if not (isinstance(origin_ref, list) and origin_ref):
+            continue
+        resolved_key, prompt_entry = _prompt_node(prompt, _as_id(origin_ref[0]))
+        if not prompt_entry:
+            continue
+        origin_workflow_node = _find_collector_workflow_node(workflow, resolved_key)
+        own_chain.append(
+            _section_from_origin(
+                resolved_key,
+                prompt_entry,
+                origin_workflow_node,
+                label_values.get(f"label_{index}", ""),
+            )
+        )
+
+    chains[owner_key] = own_chain
+    return project
+
+
 class SonderMetadataCollector:
     CATEGORY = "Sonder/IO"
     FUNCTION = "collect"
@@ -344,70 +452,35 @@ class SonderMetadataCollector:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        prompt = kwargs.get("prompt")
-        extra_pnginfo = kwargs.get("extra_pnginfo")
-        workflow = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
-        if prompt is None or workflow is None:
-            return float("NaN")
         labels = {
             key: value
             for key, value in kwargs.items()
             if isinstance(key, str) and key.startswith("label_")
         }
-        try:
-            payload = json.dumps(
-                {"prompt": prompt, "workflow": workflow, "labels": labels},
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            )
-        except Exception:
-            return float("NaN")
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return collector_fingerprint(
+            kwargs.get("prompt"),
+            kwargs.get("extra_pnginfo"),
+            labels,
+        )
 
     def collect(self, project, prompt=None, extra_pnginfo=None, unique_id=None, **kwargs):
-        context = getattr(project, "_execution_context", None)
-        if not isinstance(context, dict):
-            context = {}
-            project._execution_context = context
-
-        workflow = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
-        chains = context.setdefault(TRACKED_METADATA_CONTEXT_KEY, {})
-        if not isinstance(chains, dict):
-            chains = {}
-            context[TRACKED_METADATA_CONTEXT_KEY] = chains
-
-        # Resolve THIS collector's own inputs from the executed prompt. ComfyUI has already
-        # collapsed Set/Get/Reroute indirection into prompt links, so a wired value_N is
-        # [origin_id, slot] pointing at the real upstream node -- unlike the workflow link
-        # graph, which still contains the virtual indirection node.
-        owner_key, my_entry = _prompt_node(prompt, _as_id(unique_id))
-        my_inputs = my_entry.get("inputs") if isinstance(my_entry, dict) else None
-        my_inputs = my_inputs if isinstance(my_inputs, dict) else {}
-
-        # Inherit the upstream branch chain so each consumer sees only its own lineage;
-        # overwriting our own entry keeps re-runs idempotent (no duplicate sections).
-        parent_key, _parent_entry = _prompt_node(prompt, _project_input_origin_id(my_inputs))
-        own_chain = list(chains.get(parent_key, [])) if parent_key else []
-
-        for index in range(MAX_COLLECTOR_INPUTS):
-            value_name = f"value_{index}"
-            if value_name not in kwargs:
-                continue
-            origin_ref = my_inputs.get(value_name)
-            if not (isinstance(origin_ref, list) and origin_ref):
-                continue
-            resolved_key, prompt_entry = _prompt_node(prompt, _as_id(origin_ref[0]))
-            if not prompt_entry:
-                continue
-            origin_workflow_node = _find_collector_workflow_node(workflow, resolved_key)
-            section = _section_from_origin(
-                resolved_key,
-                prompt_entry,
-                origin_workflow_node,
-                kwargs.get(f"label_{index}", ""),
-            )
-            own_chain.append(section)
-
-        chains[owner_key] = own_chain
-        return (project,)
+        values = {
+            key: value
+            for key, value in kwargs.items()
+            if isinstance(key, str) and key.startswith("value_")
+        }
+        labels = {
+            key: value
+            for key, value in kwargs.items()
+            if isinstance(key, str) and key.startswith("label_")
+        }
+        result = collect_metadata(
+            project,
+            prompt=prompt,
+            extra_pnginfo=extra_pnginfo,
+            unique_id=unique_id,
+            values=values,
+            labels=labels,
+            capacity=MAX_COLLECTOR_INPUTS,
+        )
+        return (result,)

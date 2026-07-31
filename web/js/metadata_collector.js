@@ -1,60 +1,54 @@
 import { app } from "/scripts/app.js";
-import { refreshAutogrowShape, slotValueIndex } from "./autogrow_passthrough.js";
+import { refreshAutogrowShape } from "./autogrow_passthrough.js";
+import {
+    collectorCapacity,
+    collectorLabelIndex,
+    visibleCollectorValueCount,
+} from "./metadata_collector_shape.js";
+import {
+    commitWidgetVisibility,
+    setWidgetHidden,
+} from "./widget_visibility.js";
 
 const EXT_NAME = "sonder.metadata_collector";
-const TARGET = "SonderMetadataCollector";
-const MAX_COLLECTOR_INPUTS = 12;
+const LEGACY_TARGET = "SonderMetadataCollector";
+const V3_TARGET = "SonderMetadataCollectorV3";
+const TARGETS = new Set([LEGACY_TARGET, V3_TARGET]);
 
-function hideWidget(widget) {
-    if (!widget || widget.hidden) return;
-    widget.hidden = true;
-    widget._sonderCollectorOrigComputeSize = widget.computeSize;
-    widget.computeSize = () => [0, -4];
-}
-
-function showWidget(widget) {
-    if (!widget || !widget.hidden) return;
-    widget.hidden = false;
-    if (widget._sonderCollectorOrigComputeSize) {
-        widget.computeSize = widget._sonderCollectorOrigComputeSize;
-        delete widget._sonderCollectorOrigComputeSize;
-    } else {
-        delete widget.computeSize;
-    }
-}
-
-function visibleValueCount(node) {
-    let max = -1;
-    for (const slot of node?.inputs || []) {
-        const index = slotValueIndex(slot);
-        if (index >= 0) max = Math.max(max, index);
-    }
-    return Math.max(1, max + 1);
-}
+const isLegacyCollector = (node) =>
+    node?.comfyClass === LEGACY_TARGET || node?.type === LEGACY_TARGET;
 
 function refreshCollector(node) {
-    refreshAutogrowShape(node, {
-        maxCount: MAX_COLLECTOR_INPUTS,
-        inputs: true,
-        outputs: false,
-    });
-    const visible = visibleValueCount(node);
-    for (const widget of node.widgets || []) {
-        const match = /^label_(\d+)$/.exec(widget?.name || "");
-        if (!match) continue;
-        const index = parseInt(match[1], 10);
-        if (index < visible) showWidget(widget);
-        else hideWidget(widget);
+    const capacity = collectorCapacity(node);
+    if (isLegacyCollector(node)) {
+        refreshAutogrowShape(node, {
+            maxCount: capacity,
+            inputs: true,
+            outputs: false,
+            resize: false,
+            dirty: false,
+        });
     }
+
+    const visible = visibleCollectorValueCount(node, capacity);
+    let visibilityChanged = false;
+    for (const widget of node.widgets || []) {
+        const index = collectorLabelIndex(widget);
+        if (index < 0) continue;
+        visibilityChanged = setWidgetHidden(widget, index >= visible) || visibilityChanged;
+    }
+
+    if (visibilityChanged) commitWidgetVisibility(node, { resize: false, dirty: false });
     if (typeof node.computeSize === "function" && typeof node.setSize === "function") {
         node.setSize(node.computeSize());
     }
+    node.setDirtyCanvas?.(true, true);
 }
 
 app.registerExtension({
     name: EXT_NAME,
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== TARGET) return;
+        if (!TARGETS.has(nodeData.name)) return;
 
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

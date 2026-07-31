@@ -14,6 +14,10 @@ import {
     projectResolutionStatusText,
     resolveProjectSource,
 } from "./project_source_resolver.js";
+import {
+    commitWidgetVisibility,
+    setWidgetHidden,
+} from "./widget_visibility.js";
 const { api } = window.comfyAPI.api;
 
 const EXT_NAME = "sonder.bridge";
@@ -49,13 +53,6 @@ const TYPE_ALIASES = new Map([
 ]);
 
 // ── Widget hide helper (mirrors extension.js) ─────────────────────────
-function hideWidget(widget) {
-    if (!widget || widget.hidden) return;
-    widget.hidden = true;
-    widget._sonderBridgeOrigComputeSize = widget.computeSize;
-    widget.computeSize = () => [0, -4];
-}
-
 // ── Slot helpers ──────────────────────────────────────────────────────
 const slotValueIndex = (slot) => {
     if (!slot || typeof slot.name !== "string") return -1;
@@ -967,22 +964,25 @@ const installNode = (node) => {
     const state = ensureNodeState(node);
     if (state.initialized) return;
     state.initialized = true;
+    let visibilityChanged = false;
 
     if (isStart(node)) {
         const widget = (node.widgets || []).find((w) => w?.name === "iteration_index");
-        if (widget) hideWidget(widget);
+        visibilityChanged = setWidgetHidden(widget, true) || visibilityChanged;
         const overridesWidget = (node.widgets || []).find((w) => w?.name === OVERRIDES_WIDGET);
-        if (overridesWidget) hideWidget(overridesWidget);
+        visibilityChanged = setWidgetHidden(overridesWidget, true) || visibilityChanged;
         installGuidePanel(node);
     }
 
     if (isDriverSelector(node)) {
         const laneWidget = (node.widgets || []).find((w) => w?.name === DRIVER_LANE_WIDGET);
-        if (laneWidget) hideWidget(laneWidget);
+        visibilityChanged = setWidgetHidden(laneWidget, true) || visibilityChanged;
         const overridesWidget = (node.widgets || []).find((w) => w?.name === DRIVER_OVERRIDES_WIDGET);
-        if (overridesWidget) hideWidget(overridesWidget);
+        visibilityChanged = setWidgetHidden(overridesWidget, true) || visibilityChanged;
         installDriverPanel(node);
     }
+
+    if (visibilityChanged) commitWidgetVisibility(node, { resize: false });
 
     const original = node.onConnectionsChange;
     node.onConnectionsChange = function (...args) {

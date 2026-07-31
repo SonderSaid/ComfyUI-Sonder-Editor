@@ -11,12 +11,30 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Recent ComfyUI builds now expose the native V3 Metadata Collector with
+  heterogeneous Autogrow inputs while retaining the established executable V1
+  node.
+
 ### Changed
+- Metadata Collector naming now keeps the established V1 node as **Sonder
+  Metadata Collector** and labels the native V3 Autogrow entry **Sonder
+  Metadata Collector Nodes 2.0**.
 - Prompt text now saves when a field loses focus, so clicking away from a
   timeline prompt bar keeps the edit instead of requiring Enter. Esc, Cancel,
   and Delete remain the ways to throw an edit away.
 
 ### Fixed
+- Sonder Editor now uses one renderer-stable DOM surface for both project
+  creation and the dormant UI, so Nodes 2.0 can show the Create action and
+  shrink scrollable Assets, Preview, and Queue modules to the saved node size.
+- Save Video and Preview Video graph players now follow their live host-node
+  width in both renderers instead of retaining their creation width.
+- Sonder Editor now cold-loads its saved project UI under Nodes 2.0 by waiting
+  for workflow widget restoration before committing visibility and node size.
+- Gallery-to-canvas drops now register nested input paths with ComfyUI's loader
+  combo so Nodes 2.0 displays them as imported assets, and videos fall back to
+  the core Load Video node when Video Helper Suite is unavailable.
 - Post-save asset refreshes now coalesce per browser window and use read-only
   registry reads, avoiding duplicate synchronization scans and summary-request
   abort churn while preserving explicit discovery and repair.

@@ -114,7 +114,7 @@ ComfyUI.
 | **Sonder Save Video** | Encodes an IMAGE tensor to a project video asset, optionally muxing audio; previews the first frame. Auto-corrects accumulated VAE color drift against the render's protected context frames (`color_drift_correction`, on by default). |
 | **Sonder Save Bridge** | Creates a prompt-isolated output target in the project cache — external save nodes write there, then the bridge registers the results into the Sonder asset system after the prompt settles. |
 | **Sonder Preview Video** | Encodes frames to a temporary video for in-UI preview playback. |
-| **Sonder Metadata Collector** | Collects explicitly wired upstream widget values into a generated asset's tracked metadata. |
+| **Sonder Metadata Collector** / **Sonder Metadata Collector Nodes 2.0** | Both collect explicitly wired upstream widget values into a generated asset's tracked metadata. The established collector keeps manually shaped workflow sockets; the Nodes 2.0 entry uses native heterogeneous V3 Autogrow sockets when the installed ComfyUI supports them. |
 
 ### Routing & logic — `Sonder/Logic`
 
@@ -124,13 +124,22 @@ ComfyUI.
 | **Sonder Switch** | Routes any one data type across N branches and evaluates only the selected branch (lazy). |
 | **Sonder Cluster** | Routes a shared branch selection across multiple lanes, each lane carrying its own type (lazy). |
 
-> **Sonder Switch** and **Sonder Cluster** use ComfyUI's newer (V3) node API and
-> load only on recent ComfyUI builds; on older builds they're skipped and the
-> rest of the pack is unaffected.
+> **Sonder Switch**, **Sonder Cluster**, and **Sonder Metadata Collector Nodes
+> 2.0** use ComfyUI's newer V3 node API and load only on recent ComfyUI builds.
+> V3 registration is schema-validated before it changes discovery:
+> older or incompatible builds keep the complete V1 node set under the
+> normal **Sonder Metadata Collector** name. When V3 is available, it appears
+> separately as **Sonder Metadata Collector Nodes 2.0**. Automatic migration
+> is not enabled: frontend v1.45.21
+> only offers replacements for missing node types and does not transfer links
+> into dotted Autogrow inputs. Use V3 for new collectors until ComfyUI can
+> preserve those links.
 
 ## Requirements
 
-- **ComfyUI** (recent version).
+- **ComfyUI** (recent version). Nodes 2.0 widget hiding requires a frontend that
+  processes `widget.options.hidden` (including frontend v1.45.21 and current
+  stable builds); earlier frontend builds retain the legacy LiteGraph fallback.
 - **Python 3.10+** (matching your ComfyUI environment).
 - **ffmpeg** — required for video/audio decode, encode, and export. The
   `imageio-ffmpeg` dependency bundles a usable ffmpeg automatically, but a

@@ -1,5 +1,7 @@
 """ComfyUI-Sonder-Editor: timeline video editing and AI generation pipeline."""
 
+import logging
+
 # Guard all ComfyUI-specific imports — this file is loaded by pytest
 # during test discovery, where folder_paths etc. are unavailable.
 try:
@@ -47,8 +49,46 @@ try:
         NODE_CLASS_MAPPINGS.update(LAZY_NODE_CLASS_MAPPINGS)
         NODE_DISPLAY_NAME_MAPPINGS.update(LAZY_NODE_DISPLAY_NAME_MAPPINGS)
     except Exception as exc:
-        import logging
         logging.getLogger(__name__).warning("Sonder lazy nodes unavailable: %s", exc)
+
+    try:
+        from .nodes.metadata_collector_v3 import (
+            V3_NODE_ID,
+            SonderMetadataCollectorV3,
+        )
+        _v3_collector_schema = SonderMetadataCollectorV3.GET_SCHEMA()
+        if getattr(_v3_collector_schema, "node_id", None) != V3_NODE_ID:
+            raise RuntimeError(
+                "Sonder Metadata Collector V3 schema returned an unexpected node id"
+            )
+        if (
+            getattr(_v3_collector_schema, "display_name", None)
+            != "Sonder Metadata Collector Nodes 2.0"
+        ):
+            raise RuntimeError(
+                "Sonder Metadata Collector V3 schema returned an unexpected display name"
+            )
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("comfy_api"):
+            logging.getLogger(__name__).warning(
+                "Sonder Metadata Collector V3 import failed: %s",
+                exc,
+                exc_info=True,
+            )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Sonder Metadata Collector V3 unavailable: %s",
+            exc,
+            exc_info=True,
+        )
+    else:
+        NODE_CLASS_MAPPINGS.update({
+            V3_NODE_ID: SonderMetadataCollectorV3,
+        })
+        NODE_DISPLAY_NAME_MAPPINGS.update({
+            V3_NODE_ID: "Sonder Metadata Collector Nodes 2.0",
+            "SonderMetadataCollector": "Sonder Metadata Collector",
+        })
 
     WEB_DIRECTORY = "./web"
 

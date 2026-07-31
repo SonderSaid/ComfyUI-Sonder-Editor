@@ -31,6 +31,20 @@ import {
     logProjectResolutionDiagnostic,
     resolveProjectSource,
 } from "./project_source_resolver.js";
+import {
+    commitWidgetVisibility,
+    setWidgetHidden,
+} from "./widget_visibility.js";
+import {
+    assignUploadedAsset,
+    resolveAssetLoader,
+} from "./gallery_canvas_drop.js";
+import {
+    chainAfterGraphConfigured,
+    chainWidgetCallback,
+    createGraphAwareReconciler,
+} from "./editor_graph_lifecycle.js";
+import { createEditorNodeSurface } from "./editor_node_surface.js";
 
 injectSonderFontFaces();
 
@@ -108,24 +122,6 @@ function snapFpsToTemplate(fps, template) {
 }
 
 // ── Widget hide/show helpers ───────────────────────────────────────────
-function hideWidget(node, widget) {
-    if (widget.hidden) return;
-    widget.hidden = true;
-    widget._sonder_origComputeSize = widget.computeSize;
-    widget.computeSize = () => [0, -4];
-}
-
-function showWidget(node, widget) {
-    if (!widget.hidden) return;
-    widget.hidden = false;
-    if (widget._sonder_origComputeSize) {
-        widget.computeSize = widget._sonder_origComputeSize;
-        delete widget._sonder_origComputeSize;
-    } else {
-        delete widget.computeSize;
-    }
-}
-
 // ── Utility: get project directory from project dropdown value ─────────
 async function getProjectDir(projectValue) {
     if (!projectValue || projectValue === "+ Create New") return "";
@@ -259,7 +255,7 @@ if (typeof window !== "undefined") {
     window.__SONDER_OPEN_SOURCE_WORKFLOW__ = openSourceWorkflowForAsset;
 }
 
-async function createProjectFromNode(node, projectWidget) {
+async function createProjectFromNode(node, projectWidget, { isCurrent = () => true } = {}) {
     const projectNameWidget = node.widgets.find((widget) => widget.name === "project_name");
     const fpsWidget = node.widgets.find((widget) => widget.name === "fps");
     const widthWidget = node.widgets.find((widget) => widget.name === "width");
@@ -325,9 +321,12 @@ async function createProjectFromNode(node, projectWidget) {
         }
     }
 
+    if (!isCurrent()) return false;
+
     projectWidget.value = nextValue;
     projectWidget.callback?.(nextValue);
     app.graph.setDirtyCanvas?.(true, true);
+    return true;
 }
 
 function applyProjectCreationDefaults(node) {
@@ -405,15 +404,8 @@ function setComboValues(widget, values) {
     return coerceWidgetValue(widget, values, values[0]) || changed;
 }
 
-function setWidgetVisible(node, widget, visible) {
-    if (!widget) return false;
-    const wasHidden = !!widget.hidden;
-    if (visible) {
-        showWidget(node, widget);
-    } else {
-        hideWidget(node, widget);
-    }
-    return wasHidden === !!visible;
+function setWidgetVisible(widget, visible) {
+    return setWidgetHidden(widget, !visible);
 }
 
 function savePresetOption(value) {
@@ -503,6 +495,7 @@ function installSaveVideoPresetUi(node) {
 
     const sync = () => {
         let changed = false;
+        let visibilityChanged = false;
         const presetWidget = findWidget(node, "save_preset");
         const modeWidget = findWidget(node, "mode");
         const outputKindWidget = findWidget(node, "custom_output_kind");
@@ -545,10 +538,12 @@ function installSaveVideoPresetUi(node) {
         }
 
         for (const name of SAVE_VIDEO_CUSTOM_WIDGET_NAMES) {
-            changed = setWidgetVisible(node, findWidget(node, name), visibleNames.has(name)) || changed;
+            visibilityChanged = setWidgetVisible(findWidget(node, name), visibleNames.has(name)) || visibilityChanged;
         }
-        changed = setWidgetVisible(node, findWidget(node, "place_audio_on_timeline"), isTake) || changed;
+        visibilityChanged = setWidgetVisible(findWidget(node, "place_audio_on_timeline"), isTake) || visibilityChanged;
+        changed = visibilityChanged || changed;
         updateSavePresetHelp(node, helpEl);
+        if (visibilityChanged) commitWidgetVisibility(node, { dirty: false });
         if (changed) resizeSaveVideoNode(node);
     };
 
@@ -854,7 +849,9 @@ function installBridgeFolderPicker(node) {
     const folderWidget = node.widgets.find((widget) => widget.name === "target_folder");
     if (!folderWidget) return;
 
-    hideWidget(node, folderWidget);
+    if (setWidgetHidden(folderWidget, true)) {
+        commitWidgetVisibility(node);
+    }
     setBridgeFolderWidgetChoices(folderWidget, [], folderWidget.value || "");
 
     const wrapper = style(document.createElement("div"), `
@@ -1084,90 +1081,53 @@ app.registerExtension({
                     }
                     const result = origNodeOnConfigure?.apply(this, arguments);
                     applyRenderCacheSettingToNode(node, getEditorSettings());
-                    window.setTimeout?.(() => node._sonderRunUpdateVisibility?.(), 0);
                     return result;
                 };
 
-                const editorDOMWidget = node.addDOMWidget("sonder_editor_ui", "SonderEditorWidget", controller.getElement(), {
+                const editorSurface = createEditorNodeSurface({
+                    controllerElement: controller.getElement(),
+                    onCreate: (isCurrent) => createProjectFromNode(
+                        node,
+                        projectWidget,
+                        { isCurrent },
+                    ),
+                    onError: (error) => {
+                        console.warn("[Sonder] Failed to create project:", error);
+                    },
+                });
+                node._sonderEditorSurface = editorSurface;
+
+                node.addDOMWidget("sonder_editor_ui", "SonderEditorWidget", editorSurface.element, {
                     serialize: false,
                     hideOnZoom: false,
-                    getMinHeight: () => 150,
-                    getMaxHeight: () => controller.getHeight(),
-                    getHeight: () => controller.getHeight(),
+                    getMinHeight: () => editorSurface.getMinHeight(),
                 });
-                editorDOMWidget.computeSize = (width) => [width, controller.getHeight()];
 
-                // Override node.computeSize to allow shrinking during interactive resize.
-                // Widget computeSize returns _height (correct for layout), but node.computeSize
-                // replaces the widget's contribution with a fixed 150px floor so LiteGraph
-                // doesn't clamp the node at _height + overhead.
-                const origNodeComputeSize = node.computeSize.bind(node);
-                node.computeSize = function () {
-                    const result = origNodeComputeSize();
-                    const widgetHeight = controller.getHeight();
-                    const overhead = result[1] - widgetHeight;
-                    result[1] = 150 + overhead;
-                    return result;
-                };
-
-                const createButtonWidget = node.addWidget("button", "Create", null, async () => {
-                    try {
-                        await createProjectFromNode(node, projectWidget);
-                    } catch (e) {
-                        console.warn("[Sonder] Failed to create project:", e);
-                    }
-                });
-                createButtonWidget.serialize = false;
-
-                let visibilityRunId = 0;
-                const updateVisibility = async () => {
-                    const runId = ++visibilityRunId;
-                    const projectValue = projectWidget?.value || "";
+                const applyVisibilityAndSize = (projectValue) => {
                     const isCreateNew = projectValue === "+ Create New";
-                    const isCurrentRun = () => (
-                        runId === visibilityRunId
-                        && (projectWidget?.value || "") === projectValue
-                    );
-                    let layoutChanged = false;
+                    let layoutChanged = editorSurface.setCreateMode(isCreateNew);
+                    let widgetVisibilityChanged = false;
                     for (const widget of node.widgets) {
                         if (creationWidgetNames.includes(widget.name)) {
-                            layoutChanged = setWidgetVisible(node, widget, isCreateNew) || layoutChanged;
+                            widgetVisibilityChanged = setWidgetVisible(widget, isCreateNew) || widgetVisibilityChanged;
                         }
                         if (hiddenWidgetNames.includes(widget.name)) {
-                            layoutChanged = setWidgetVisible(node, widget, false) || layoutChanged;
+                            widgetVisibilityChanged = setWidgetVisible(widget, false) || widgetVisibilityChanged;
                         }
                     }
                     if (isCreateNew) {
                         applyProjectCreationDefaults(node);
-                        layoutChanged = setWidgetVisible(node, createButtonWidget, true) || layoutChanged;
-                    } else {
-                        layoutChanged = setWidgetVisible(node, createButtonWidget, false) || layoutChanged;
                     }
 
-                    if (isCreateNew) {
-                        layoutChanged = setWidgetVisible(node, editorDOMWidget, false) || layoutChanged;
-                        if (controller.getElement().style.display !== "none") {
-                            controller.getElement().style.display = "none";
-                            layoutChanged = true;
-                        }
-                        await controller.updateProject("", projectValue);
-                        if (!isCurrentRun()) return;
-                    } else {
-                        layoutChanged = setWidgetVisible(node, editorDOMWidget, true) || layoutChanged;
-                        if (controller.getElement().style.display !== "") {
-                            controller.getElement().style.display = "";
-                            layoutChanged = true;
-                        }
-                        const dir = await getProjectDir(projectValue);
-                        if (!isCurrentRun()) return;
-                        await controller.updateProject(dir, projectValue);
-                        if (!isCurrentRun()) return;
+                    if (widgetVisibilityChanged) {
+                        commitWidgetVisibility(node, { dirty: false });
+                        layoutChanged = true;
                     }
 
                     const preferredWidth = isCreateNew ? 340 : 440;
                     const modeKey = isCreateNew ? "create" : "existing";
-                    const minComputedHeight = controller.getMinimumNodeHeight?.()
-                        || node.computeSize?.()?.[1]
+                    const minComputedHeight = node.computeSize?.()?.[1]
+                        || controller.getMinimumNodeHeight?.()
                         || 0;
                     let sizeChanged = false;
                     if (!node._sonderInitializedSize) {
@@ -1192,41 +1152,60 @@ app.registerExtension({
                                 Math.max(minComputedHeight, node.size?.[1] || 0),
                             ) || sizeChanged;
                         }
-                    } else if (node._sonderPreferredWidthMode !== modeKey && (node.size?.[0] || 0) < preferredWidth) {
+                    } else if (node._sonderPreferredWidthMode !== modeKey) {
                         // Mode switch (create ↔ existing) grows a too-narrow node to the
-                        // preferred width for the new mode. Height is preserved.
+                        // Apply the new mode's width and height safety floors once.
                         node._sonderPreferredWidthMode = modeKey;
                         sizeChanged = controller.setNodeSizeProgrammatic(
-                            preferredWidth,
-                            node.size?.[1] || minComputedHeight || controller.getHeight(),
+                            Math.max(node.size?.[0] || 0, preferredWidth),
+                            Math.max(node.size?.[1] || 0, minComputedHeight),
                         ) || sizeChanged;
                     }
 
                     if (layoutChanged || sizeChanged) {
                         app.graph.setDirtyCanvas?.(true, true);
                     }
+                };
 
-                    if (!isCreateNew) {
+                const visibilityReconciler = createGraphAwareReconciler({
+                    isConfiguringGraph: () => !!app.configuringGraph,
+                    getCurrentValue: () => projectWidget?.value || "",
+                    applySynchronousState: applyVisibilityAndSize,
+                    hydrate: async (projectValue, isCurrentRun) => {
+                        if (projectValue === "+ Create New") {
+                            await controller.updateProject("", projectValue);
+                            return;
+                        }
+                        const dir = await getProjectDir(projectValue);
+                        if (!isCurrentRun()) return;
+                        await controller.updateProject(dir, projectValue);
+                        if (!isCurrentRun()) return;
                         controller.queueResize();
+                    },
+                    onError: (error) => {
+                        console.warn("[Sonder] Failed to update node visibility:", error);
+                    },
+                });
+
+                const runUpdateVisibility = ({ force = false } = {}) => {
+                    const promise = visibilityReconciler.request({ force });
+                    if (promise) {
+                        node._sonderVisibilityPromise = promise;
                     }
+                    return promise;
                 };
 
-                const runUpdateVisibility = () => {
-                    Promise.resolve(updateVisibility()).catch((e) => {
-                        console.warn("[Sonder] Failed to update node visibility:", e);
-                    });
-                };
                 node._sonderRunUpdateVisibility = runUpdateVisibility;
+                chainAfterGraphConfigured(node, () => {
+                    runUpdateVisibility({ force: true });
+                });
 
                 // Hook dropdown changes
                 if (projectWidget) {
-                    const origCallback = projectWidget.callback;
-                    projectWidget.callback = (value) => {
-                        origCallback?.call(projectWidget, value);
+                    chainWidgetCallback(projectWidget, () => {
                         runUpdateVisibility();
-                    };
+                    });
                     syncProjectWidgetChoices(projectWidget)
-                        .then(() => runUpdateVisibility())
                         .catch((e) => {
                             console.warn("[Sonder] Failed to sync project choices:", e);
                         });
@@ -1244,6 +1223,8 @@ app.registerExtension({
 
                 const origOnRemoved = node.onRemoved;
                 node.onRemoved = function () {
+                    visibilityReconciler.cancel();
+                    editorSurface.destroy();
                     node._sonderController?.destroy();
                     origOnRemoved?.apply(this, arguments);
                 };
@@ -1456,24 +1437,15 @@ app.registerExtension({
                     ? `${uploadResult.subfolder}/${uploadResult.name}`
                     : uploadResult.name;
 
-                // Pick node type based on asset type
+                // Pick an installed loader that preserves the asset's media type.
                 const regTypes = LiteGraph.registered_node_types || {};
-                let nodeType, widgetName;
-                if (asset.asset_type === "image") {
-                    nodeType = "LoadImage";
-                    widgetName = "image";
-                } else if (asset.asset_type === "video") {
-                    nodeType = regTypes["VHS_LoadVideo"] ? "VHS_LoadVideo" : "LoadImage";
-                    widgetName = nodeType === "VHS_LoadVideo" ? "video" : "image";
-                } else if (asset.asset_type === "audio") {
-                    nodeType = regTypes["LoadAudio"] ? "LoadAudio" : null;
-                    widgetName = "audio";
-                }
+                const loader = resolveAssetLoader(asset.asset_type, regTypes);
 
-                if (!nodeType) {
+                if (!loader) {
                     console.warn("[Sonder] No suitable node type for:", asset.asset_type);
                     return;
                 }
+                const { nodeType, widgetName } = loader;
 
                 // Create node at drop position on the graph
                 const graphCanvas = app.canvas;
@@ -1486,11 +1458,11 @@ app.registerExtension({
                 node.pos = [pos[0], pos[1]];
                 app.graph.add(node);
 
-                // Set the file widget value
-                const widget = node.widgets?.find(w => w.name === widgetName);
-                if (widget) {
-                    widget.value = uploadedName;
-                    widget.callback?.(uploadedName);
+                // Mirror ComfyUI's native upload path: add the nested input path
+                // to the combo before assigning it so Nodes 2.0 accepts and
+                // displays it as an imported asset.
+                if (!assignUploadedAsset(node, widgetName, uploadedName)) {
+                    console.warn("[Sonder] Loader is missing its file widget:", nodeType, widgetName);
                 }
             } catch (err) {
                 console.warn("[Sonder] ComfyUI graph drop failed:", err);

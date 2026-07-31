@@ -70,6 +70,150 @@ console.log(JSON.stringify({{ transitions, initial, owned, afterOneRelease, hibe
     assert result["cleaned"]["total"] == 0
 
 
+def test_node_video_width_contract_is_live_finite_and_chains_resize_callbacks():
+    module_url = (ROOT / "web" / "js" / "node_video_preview.js").as_uri()
+    script = f"""
+globalThis.window = {{
+    comfyAPI: {{
+        api: {{ api: {{}} }},
+        app: {{ app: {{ graph: {{ setDirtyCanvas() {{}} }} }} }},
+    }},
+    SONDER_DEBUG_SESSION: false,
+}};
+globalThis.requestAnimationFrame = (callback) => {{ callback(); return 1; }};
+globalThis.cancelAnimationFrame = () => {{}};
+
+const preview = await import({json.dumps(module_url)});
+const events = [];
+const node = {{
+    id: 4,
+    type: "SonderPreviewVideo",
+    width: 180,
+    size: [180, 240],
+    graph: {{
+        setDirtyCanvas(foreground, background) {{
+            events.push(["dirty", foreground, background]);
+        }},
+    }},
+}};
+const wrapper = {{
+    getBoundingClientRect: () => ({{ width: 160 }}),
+}};
+const container = {{
+    parentElement: wrapper,
+    getBoundingClientRect: () => ({{ width: 160 }}),
+}};
+const video = {{
+    getBoundingClientRect: () => ({{ width: 160 }}),
+}};
+const callbackThis = {{ marker: "callback-this" }};
+const widget = {{
+    width: 270,
+    options: {{
+        afterResize(...args) {{
+            events.push(["original", this === callbackThis, args[0] === node, args[1]]);
+            return "resize-result";
+        }},
+    }},
+    _sonderContainerEl: container,
+    _sonderVideoEl: video,
+}};
+
+preview.chainNodeVideoPreviewResize(widget, node);
+const chained = widget.options.afterResize.call(callbackThis, node, "extra");
+const narrow = preview.measureNodeVideoPreviewLayout(node, widget);
+const omittedSize = preview.computeNodeVideoWidgetSize(node);
+
+node.width = 520;
+node.size[0] = 520;
+widget.options.afterResize.call(callbackThis, node, "wide");
+const wide = preview.measureNodeVideoPreviewLayout(node, widget);
+const explicitSize = preview.computeNodeVideoWidgetSize(node, 400);
+
+console.log(JSON.stringify({{
+    chained,
+    narrow,
+    wide,
+    omittedSize,
+    explicitSize,
+    events,
+}}));
+"""
+    result = _run_node(script)
+
+    assert result["chained"] == "resize-result"
+    assert result["narrow"] == {
+        "nodeWidth": 180,
+        "widgetWidth": 180,
+        "wrapperWidth": 160,
+        "containerWidth": 160,
+        "mediaWidth": 160,
+    }
+    assert result["wide"] == {
+        "nodeWidth": 520,
+        "widgetWidth": 520,
+        "wrapperWidth": 160,
+        "containerWidth": 160,
+        "mediaWidth": 160,
+    }
+    assert result["omittedSize"][0] == 180
+    assert result["explicitSize"][0] == 400
+    assert all(isinstance(value, int) and value > 0 for value in result["omittedSize"])
+    assert all(isinstance(value, int) and value > 0 for value in result["explicitSize"])
+    assert result["events"] == [
+        ["original", True, True, "extra"],
+        ["dirty", False, True],
+        ["original", True, True, "wide"],
+        ["dirty", False, True],
+    ]
+
+
+def test_node_video_resize_chaining_preserves_original_error_and_does_not_resize_node():
+    module_url = (ROOT / "web" / "js" / "node_video_preview.js").as_uri()
+    script = f"""
+globalThis.window = {{
+    comfyAPI: {{
+        api: {{ api: {{}} }},
+        app: {{ app: {{ graph: {{ setDirtyCanvas() {{}} }} }} }},
+    }},
+    SONDER_DEBUG_SESSION: false,
+}};
+const preview = await import({json.dumps(module_url)});
+const failure = new Error("resize failure");
+let setSizeCalls = 0;
+const node = {{
+    width: 320,
+    size: [320, 240],
+    setSize() {{ setSizeCalls += 1; }},
+}};
+const widget = {{
+    width: 270,
+    options: {{
+        afterResize() {{ throw failure; }},
+    }},
+}};
+preview.chainNodeVideoPreviewResize(widget, node);
+let sameError = false;
+try {{
+    widget.options.afterResize.call(widget, node);
+}} catch (error) {{
+    sameError = error === failure;
+}}
+console.log(JSON.stringify({{
+    sameError,
+    width: widget.width,
+    setSizeCalls,
+}}));
+"""
+    result = _run_node(script)
+
+    assert result == {
+        "sameError": True,
+        "width": 270,
+        "setSizeCalls": 0,
+    }
+
+
 def test_blob_loader_cleanup_aborts_fetch_without_direct_url_fallback():
     module_url = (ROOT / "web" / "js" / "shared_asset_gallery.js").as_uri()
     script = f"""
@@ -409,3 +553,14 @@ def test_production_preview_and_playback_paths_use_the_new_lifecycle_seams():
     assert 'viewportDiagRecord("playback_slow_viewport_render"' in viewport_source
     assert "const gapThresholdMs = 50;" in viewport_source
     assert "playingHidden" in viewport_source
+
+
+def test_inline_preview_css_and_size_callbacks_enforce_live_width_bounds():
+    source = (ROOT / "web" / "js" / "node_video_preview.js").read_text(encoding="utf-8")
+
+    assert "resolveNodeVideoWidgetWidth(node, requestedWidth)" in source
+    assert "computeNodeVideoWidgetSize(node, requestedWidth)" in source
+    assert "chainNodeVideoPreviewResize(widget, node)" in source
+    assert "synchronizeNodeVideoPreviewWidth(node, widget" in source
+    assert source.count("min-width: 0;") >= 4
+    assert source.count("max-width: 100%;") >= 4

@@ -69,13 +69,107 @@ function videoAspect(node) {
     return a && isFinite(a) && a > 0 ? a : DEFAULT_ASPECT;
 }
 
+export function resolveNodeVideoWidgetWidth(node, requestedWidth) {
+    const requested = Number(requestedWidth);
+    if (Number.isFinite(requested) && requested > 0) return requested;
+
+    const liveWidth = Number(node?.width);
+    if (Number.isFinite(liveWidth) && liveWidth > 0) return liveWidth;
+
+    const sizeWidth = Number(node?.size?.[0]);
+    if (Number.isFinite(sizeWidth) && sizeWidth > 0) return sizeWidth;
+    return 240;
+}
+
+function measuredWidth(element) {
+    if (!element) return 0;
+    const rectWidth = Number(element.getBoundingClientRect?.()?.width);
+    if (Number.isFinite(rectWidth) && rectWidth >= 0) return rectWidth;
+    const clientWidth = Number(element.clientWidth);
+    return Number.isFinite(clientWidth) && clientWidth >= 0 ? clientWidth : 0;
+}
+
+export function measureNodeVideoPreviewLayout(node, widget) {
+    const container = widget?._sonderContainerEl || widget?.element || null;
+    const wrapper = container?.parentElement || container?.parentNode || null;
+    const video = widget?._sonderVideoEl || null;
+    return {
+        nodeWidth: resolveNodeVideoWidgetWidth(node),
+        widgetWidth: Number.isFinite(Number(widget?.width)) ? Number(widget.width) : null,
+        wrapperWidth: measuredWidth(wrapper),
+        containerWidth: measuredWidth(container),
+        mediaWidth: measuredWidth(video),
+    };
+}
+
+function recordNodeVideoPreviewLayout(node, widget) {
+    const layout = measureNodeVideoPreviewLayout(node, widget);
+    widget._sonderLayoutDiagnostics = layout;
+    if (window?.SONDER_DEBUG_SESSION) {
+        try {
+            window.__SONDER_CANVAS_DIAG?.record?.("graph_video_preview_layout", {
+                node_id: node?.id ?? null,
+                node_type: node?.type || node?.comfyClass || "",
+                ...layout,
+            });
+        } catch {
+            // Layout diagnostics are best-effort.
+        }
+    }
+    return layout;
+}
+
+export function synchronizeNodeVideoPreviewWidth(node, widget, { dirty = true } = {}) {
+    if (!node || !widget || widget._sonderVideoCleaned) return null;
+    const width = resolveNodeVideoWidgetWidth(node);
+
+    // DomWidgets.vue prefers a widget-level width when one exists. Keep it
+    // explicitly live so legacy overlays cannot retain their creation width.
+    widget.width = width;
+
+    if (widget._sonderLayoutRaf != null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(widget._sonderLayoutRaf);
+    }
+    const measure = () => {
+        widget._sonderLayoutRaf = null;
+        if (!widget._sonderVideoCleaned) recordNodeVideoPreviewLayout(node, widget);
+    };
+    if (typeof requestAnimationFrame === "function") {
+        widget._sonderLayoutRaf = requestAnimationFrame(measure);
+    } else {
+        measure();
+    }
+
+    if (dirty) {
+        const graph = node.graph || comfyApp()?.graph;
+        graph?.setDirtyCanvas?.(false, true);
+    }
+    return width;
+}
+
+export function chainNodeVideoPreviewResize(widget, node) {
+    if (!widget?.options || widget._sonderResizeWidthChained) return;
+    const original = widget.options.afterResize;
+    widget.options.afterResize = function (...args) {
+        const result = original?.apply(this, args);
+        synchronizeNodeVideoPreviewWidth(args[0] || node, widget);
+        return result;
+    };
+    widget._sonderResizeWidthChained = true;
+}
+
 // Widget height tracks the node WIDTH by the video's aspect ratio (plus the control bar),
 // so the media scales proportionally when the node is resized. computeSize(width) drives
 // the DOM widget's height in this frontend.
 function widgetHeightForWidth(node, width) {
-    const w = Math.max(80, Number(width) || Number(node.size?.[0]) || 240);
+    const w = Math.max(80, resolveNodeVideoWidgetWidth(node, width));
     const h = w / videoAspect(node) + CONTROL_CHROME_PX;
     return Math.round(Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, h)));
+}
+
+export function computeNodeVideoWidgetSize(node, requestedWidth) {
+    const width = resolveNodeVideoWidgetWidth(node, requestedWidth);
+    return [width, widgetHeightForWidth(node, width)];
 }
 
 function sizeNodeToVideo(node) {
@@ -150,6 +244,9 @@ function cleanupWidget(widget) {
         /* media teardown is best-effort */
     }
     try { widget._sonderContainerEl?.remove?.(); } catch (_) { /* detach is best-effort */ }
+    if (widget._sonderLayoutRaf != null && typeof cancelAnimationFrame === "function") {
+        try { cancelAnimationFrame(widget._sonderLayoutRaf); } catch (_) {}
+    }
 
     widget._sonderMediaCleanup = null;
     widget._sonderLifecycleCleanup = null;
@@ -160,6 +257,8 @@ function cleanupWidget(widget) {
     widget._sonderSetSource = null;
     widget._sonderVideoEl = null;
     widget._sonderContainerEl = null;
+    widget._sonderLayoutDiagnostics = null;
+    widget._sonderLayoutRaf = null;
     widget._sonderLoadedUrl = "";
 }
 
@@ -202,6 +301,8 @@ function createWidget(node) {
     container.style.cssText = `
         box-sizing: border-box;
         width: 100%;
+        min-width: 0;
+        max-width: 100%;
         height: 100%;
         margin: 4px 0;
         border: 1px solid ${THEME.line2};
@@ -224,6 +325,8 @@ function createWidget(node) {
     video.style.cssText = `
         flex: 1 1 auto;
         min-height: 0;
+        min-width: 0;
+        max-width: 100%;
         width: 100%;
         display: block;
         background: ${THEME.bg0};
@@ -236,6 +339,10 @@ function createWidget(node) {
     const controlsRow = document.createElement("div");
     controlsRow.style.cssText = `
         flex: 0 0 auto;
+        box-sizing: border-box;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
         display: flex;
         align-items: center;
         gap: 6px;
@@ -245,6 +352,10 @@ function createWidget(node) {
     const scrubRow = document.createElement("div");
     scrubRow.style.cssText = `
         flex: 0 0 auto;
+        box-sizing: border-box;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
         display: flex;
         align-items: center;
         padding: 4px 6px;
@@ -432,7 +543,7 @@ function createWidget(node) {
         getMaxHeight: () => widgetHeightForWidth(node, node.size?.[0]),
         getHeight: () => widgetHeightForWidth(node, node.size?.[0]),
     });
-    widget.computeSize = (width) => [width, widgetHeightForWidth(node, width)];
+    widget.computeSize = (requestedWidth) => computeNodeVideoWidgetSize(node, requestedWidth);
     widget._sonderVideoEl = video;
     widget._sonderContainerEl = container;
     widget._sonderScrubCleanup = scrub.cleanup;
@@ -520,6 +631,8 @@ function createWidget(node) {
         unregisterDiagnostic = null;
     };
     node._sonderVideoWidget = widget;
+    chainNodeVideoPreviewResize(widget, node);
+    synchronizeNodeVideoPreviewWidth(node, widget, { dirty: false });
 
     // Lock the aspect once the real dimensions are known, then grow the node to fit.
     listen(video, "loadedmetadata", () => {
@@ -549,6 +662,7 @@ export function mountNodeVideoPreview(node, descriptor) {
         widget = createWidget(node);
         changed = true;
     }
+    synchronizeNodeVideoPreviewWidth(node, widget, { dirty: false });
     if (changed) {
         refreshNodeLayout(node);
     }
