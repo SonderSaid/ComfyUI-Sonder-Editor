@@ -2,6 +2,7 @@ import json
 import os
 import logging
 import hashlib
+import math
 import random
 import re
 import shutil
@@ -20,6 +21,7 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server import external_links
+from ..server.atomic_io import atomic_replace
 from ..server.project_manager import load_project, save_project
 from ..server.path_security import (
     PathSecurityError,
@@ -91,6 +93,7 @@ SAVE_PRESET_TOOLTIP = "Preset choices: " + " | ".join(
     for preset in SAVE_VIDEO_PRESET_ORDER
 )
 BRIDGE_STALE_DIR_TTL_SEC = 24 * 60 * 60
+BRIDGE_PREVIEW_GRACE_SEC = 60.0
 BRIDGE_POLL_INTERVAL_SEC = 0.25
 BRIDGE_IDLE_SETTLE_SEC = 1.0
 BRIDGE_FALLBACK_MIN_WAIT_SEC = 5.0
@@ -99,6 +102,7 @@ BRIDGE_MAX_WAIT_SEC = 60 * 60
 _BRIDGE_REGISTRY_LOCK = threading.Lock()
 _BRIDGE_REGISTRY = {}
 _BRIDGE_PROMPT_WATCHERS = {}
+_BRIDGE_PREVIEW_CLEANUP_TIMERS = {}
 _BRIDGE_PROMPT_KEY_BY_OBJECT_ID = {}
 _BRIDGE_PROMPT_OBJECT_IDS_BY_KEY = {}
 _BRIDGE_PROMPT_QUEUE_HOOK_LOCK = threading.Lock()
@@ -507,7 +511,12 @@ def _strict_realpath_within(parent: str, child: str) -> bool:
         return False
 
 
-def _write_bridge_sidecar(bridge_dir: str, existed: list[str]) -> None:
+def _write_bridge_sidecar(
+    bridge_dir: str,
+    existed: list[str],
+    *,
+    preview_expires_at: float | None = None,
+) -> None:
     sidecar_path = resolve_under_root(
         bridge_dir,
         BRIDGE_SCAN_SIDECAR,
@@ -515,11 +524,38 @@ def _write_bridge_sidecar(bridge_dir: str, existed: list[str]) -> None:
     )
     if not sidecar_path:
         raise ValueError("Invalid bridge sidecar path")
-    with open(sidecar_path, "w", encoding="utf-8") as handle:
-        json.dump({"existed": sorted(set(existed))}, handle, indent=2)
+
+    payload = {"existed": sorted(set(existed))}
+    if preview_expires_at is not None:
+        expires_at = float(preview_expires_at)
+        if not math.isfinite(expires_at) or expires_at <= 0:
+            raise ValueError("Invalid bridge preview expiry")
+        payload["preview_expires_at"] = expires_at
+
+    temp_name = f".{BRIDGE_SCAN_SIDECAR}.{uuid.uuid4().hex}.tmp"
+    temp_path = resolve_under_root(
+        bridge_dir,
+        temp_name,
+        purpose="bridge scan sidecar temp",
+    )
+    if not temp_path:
+        raise ValueError("Invalid bridge sidecar temp path")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(temp_path, sidecar_path)
+    except Exception:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
 
-def _read_bridge_sidecar(bridge_dir: str) -> set[str]:
+def _read_bridge_sidecar_payload(bridge_dir: str) -> dict:
     sidecar_path = resolve_under_root(
         bridge_dir,
         BRIDGE_SCAN_SIDECAR,
@@ -528,18 +564,33 @@ def _read_bridge_sidecar(bridge_dir: str) -> set[str]:
         log=False,
     )
     if not os.path.isfile(sidecar_path):
-        return set()
+        return {}
     try:
         with open(sidecar_path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except Exception:
-        return set()
-    existed = payload.get("existed", []) if isinstance(payload, dict) else []
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_bridge_sidecar(bridge_dir: str) -> set[str]:
+    existed = _read_bridge_sidecar_payload(bridge_dir).get("existed", [])
     return {
         str(entry).replace("\\", "/").strip("/")
         for entry in existed
         if str(entry or "").strip()
     }
+
+
+def _bridge_preview_expires_at(bridge_dir: str) -> float | None:
+    raw_value = _read_bridge_sidecar_payload(bridge_dir).get("preview_expires_at")
+    try:
+        expires_at = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(expires_at) or expires_at <= 0:
+        return None
+    return expires_at
 
 
 def _list_bridge_files(bridge_dir: str) -> list[str]:
@@ -600,7 +651,9 @@ def _list_bridge_files(bridge_dir: str) -> list[str]:
                     reason=str(exc),
                 )
                 continue
-            if rel_path == BRIDGE_SCAN_SIDECAR:
+            if rel_path == BRIDGE_SCAN_SIDECAR or (
+                rel_path.startswith(f".{BRIDGE_SCAN_SIDECAR}.") and rel_path.endswith(".tmp")
+            ):
                 continue
             results.append(rel_path)
     return sorted(results)
@@ -638,7 +691,8 @@ def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
     bridge_root = project_bridge_root(project_dir, must_exist=True)
     if not os.path.isdir(bridge_root):
         return
-    cutoff = time.time() - BRIDGE_STALE_DIR_TTL_SEC
+    now = time.time()
+    cutoff = now - BRIDGE_STALE_DIR_TTL_SEC
     for entry in os.scandir(bridge_root):
         if not entry.is_dir(follow_symlinks=False):
             continue
@@ -650,11 +704,6 @@ def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
                 reason="reparse directory skipped",
             )
             continue
-        try:
-            if entry.stat().st_mtime >= cutoff:
-                continue
-        except OSError:
-            continue
         target = os.path.abspath(entry.path) if external_links.is_enabled() else os.path.realpath(entry.path)
         if not path_within(bridge_root, target):
             log_path_quarantine(
@@ -663,6 +712,18 @@ def _cleanup_stale_bridge_dirs(project_dir: str) -> None:
                 root=bridge_root,
                 reason="entry escapes bridge root",
             )
+            continue
+        preview_expires_at = _bridge_preview_expires_at(target)
+        if preview_expires_at is not None:
+            if preview_expires_at <= now:
+                _cleanup_bridge_output_dir(project_dir, target)
+            else:
+                _schedule_bridge_preview_cleanup(project_dir, target, preview_expires_at)
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+        except OSError:
             continue
         recovered_stem = f"bridge_recovered_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         orphan_entry = {
@@ -1082,10 +1143,70 @@ def _validated_bridge_dir(project, bridge_dir: str, *, must_exist: bool = True) 
     return target
 
 
-def _cleanup_bridge_output_dir(project, bridge_dir: str) -> None:
+def _cleanup_bridge_output_dir(project, bridge_dir: str) -> bool:
     target = _validated_bridge_dir(project, bridge_dir, must_exist=True)
-    if target and os.path.isdir(target):
-        shutil.rmtree(target, ignore_errors=True)
+    if not target or not os.path.isdir(target):
+        return True
+
+    preview_expires_at = _bridge_preview_expires_at(target)
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        logger.warning("Failed to clean bridge output directory %s: %s", target, exc)
+        if os.path.isdir(target) and preview_expires_at is not None:
+            try:
+                _write_bridge_sidecar(
+                    target,
+                    _list_bridge_files(target),
+                    preview_expires_at=preview_expires_at,
+                )
+            except Exception:
+                logger.warning("Failed to restore bridge preview cleanup marker for %s", target, exc_info=True)
+        return False
+    return not os.path.exists(target)
+
+
+def _schedule_bridge_preview_cleanup(project, bridge_dir: str, expires_at: float):
+    project_dir = project if isinstance(project, str) else getattr(project, "project_dir", "")
+    normalized_dir = os.path.abspath(bridge_dir) if external_links.is_enabled() else os.path.realpath(bridge_dir)
+    timer_key = os.path.normcase(normalized_dir)
+    expiry = float(expires_at)
+    delay = max(0.0, expiry - time.time())
+
+    def _cleanup_when_expired() -> None:
+        reschedule = False
+        try:
+            if expiry - time.time() > 0:
+                reschedule = True
+            else:
+                _cleanup_bridge_output_dir(project_dir, normalized_dir)
+        finally:
+            with _BRIDGE_REGISTRY_LOCK:
+                current = _BRIDGE_PREVIEW_CLEANUP_TIMERS.get(timer_key)
+                if current and current[0] is timer:
+                    _BRIDGE_PREVIEW_CLEANUP_TIMERS.pop(timer_key, None)
+        if reschedule:
+            _schedule_bridge_preview_cleanup(project_dir, normalized_dir, expiry)
+
+    with _BRIDGE_REGISTRY_LOCK:
+        existing = _BRIDGE_PREVIEW_CLEANUP_TIMERS.get(timer_key)
+        if existing:
+            existing_timer, existing_expiry = existing
+            try:
+                existing_alive = existing_timer.is_alive()
+            except AttributeError:
+                existing_alive = True
+            if existing_alive and abs(float(existing_expiry) - expiry) < 0.001:
+                return existing_timer
+            try:
+                existing_timer.cancel()
+            except AttributeError:
+                pass
+        timer = threading.Timer(delay, _cleanup_when_expired)
+        timer.daemon = True
+        _BRIDGE_PREVIEW_CLEANUP_TIMERS[timer_key] = (timer, expiry)
+    timer.start()
+    return timer
 
 
 def _normalize_asset_path_for_compare(path: str) -> str:
@@ -1145,7 +1266,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
                 return final_name
             suffix += 1
 
-    def _move_bridge_output_file(pending: dict) -> str:
+    def _publish_bridge_output_file(pending: dict) -> str:
         source_path = resolve_under_root(
             bridge_dir,
             pending["rel_path"],
@@ -1162,28 +1283,52 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
             or os.path.lexists(final_path)
         ):
             log_path_quarantine(
-                purpose="bridge finalized move",
+                purpose="bridge finalized publication",
                 path=str(pending.get("source_path") or ""),
                 root=bridge_dir,
                 reason="source or destination failed final containment check",
             )
             return ""
+        temp_path = ""
         try:
-            shutil.move(source_path, final_path)
-        except OSError as exc:
+            try:
+                os.link(source_path, final_path, follow_symlinks=False)
+            except FileExistsError:
+                raise
+            except (OSError, TypeError, NotImplementedError):
+                temp_name = f".{uuid.uuid4().hex}.bridge-publish.tmp"
+                temp_path = resolve_under_root(
+                    media_dir,
+                    temp_name,
+                    purpose="bridge finalized copy temp",
+                )
+                if not temp_path:
+                    raise ValueError("Invalid bridge finalized copy temp path")
+                shutil.copy2(source_path, temp_path)
+                if os.path.lexists(final_path):
+                    raise FileExistsError(final_path)
+                atomic_replace(temp_path, final_path)
+                temp_path = ""
+        except (OSError, TypeError, NotImplementedError, ValueError) as exc:
+            if temp_path:
+                try:
+                    if path_within(media_dir, temp_path) and os.path.isfile(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    logger.warning("Failed to remove bridge publication temp %s", temp_path)
             log_path_quarantine(
-                purpose="bridge finalized move",
+                purpose="bridge finalized publication",
                 path=str(source_path or ""),
                 root=bridge_dir,
-                reason=f"move failed: {exc}",
+                reason=f"publication failed: {exc}",
             )
             return ""
         if os.path.islink(final_path) or not os.path.isfile(final_path) or not path_within(media_dir, final_path):
             log_path_quarantine(
-                purpose="bridge finalized move",
+                purpose="bridge finalized publication",
                 path=str(final_path or ""),
                 root=media_dir,
-                reason="moved output failed media containment check",
+                reason="published output failed media containment check",
             )
             try:
                 if path_within(media_dir, os.path.dirname(final_path)) and os.path.lexists(final_path):
@@ -1221,7 +1366,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
 
     completed_moves = []
     for pending in pending_moves:
-        moved_path = _move_bridge_output_file(pending)
+        moved_path = _publish_bridge_output_file(pending)
         if not moved_path:
             continue
         pending["final_path"] = moved_path
@@ -1295,28 +1440,62 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
             entry.get("bridge_node_id"),
         )
 
-    if changed:
-        committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
-        asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) if committed_project is not None else {}
-        for pending in completed_moves:
-            if pending["asset_type"] in {"video", "image", "audio"}:
-                from ..server.thumbnail_service import ensure_thumbnail
-                asset = pending["asset"]
-                committed_asset_id = asset_id_remap.get(asset.asset_id, asset.asset_id)
-                thumb_path = _project_thumbnail_path(project, committed_asset_id, purpose="bridge asset thumbnail path")
-                if thumb_path:
-                    ensure_thumbnail(pending["asset_type"], pending["final_path"], thumb_path)
+    preview_expires_at = None
+    retain_native_preview = bool(registered_assets) and entry.get("prompt_key_source") != "recovered"
+    if retain_native_preview:
+        preview_expires_at = time.time() + BRIDGE_PREVIEW_GRACE_SEC
+        try:
+            _write_bridge_sidecar(
+                bridge_dir,
+                _list_bridge_files(bridge_dir),
+                preview_expires_at=preview_expires_at,
+            )
+        except Exception:
+            _cleanup_bridge_output_dir(project, bridge_dir)
+            raise
 
-    logger.info(
-        "Bridge finalize: prompt=%s node=%s moved=%d target_folder=%s stem=%s",
-        entry.get("prompt_key"),
-        entry.get("bridge_node_id"),
-        len(registered_assets),
-        target_folder or "(root)",
-        naming_stem,
-    )
+    try:
+        if changed:
+            committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
+            asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) if committed_project is not None else {}
+            for pending in completed_moves:
+                if pending["asset_type"] in {"video", "image", "audio"}:
+                    from ..server.thumbnail_service import ensure_thumbnail
+                    asset = pending["asset"]
+                    committed_asset_id = asset_id_remap.get(asset.asset_id, asset.asset_id)
+                    thumb_path = _project_thumbnail_path(project, committed_asset_id, purpose="bridge asset thumbnail path")
+                    if thumb_path:
+                        ensure_thumbnail(pending["asset_type"], pending["final_path"], thumb_path)
 
-    _cleanup_bridge_output_dir(project, bridge_dir)
+        if retain_native_preview:
+            refreshed_expires_at = time.time() + BRIDGE_PREVIEW_GRACE_SEC
+            try:
+                _write_bridge_sidecar(
+                    bridge_dir,
+                    _list_bridge_files(bridge_dir),
+                    preview_expires_at=refreshed_expires_at,
+                )
+                preview_expires_at = refreshed_expires_at
+            except Exception:
+                logger.warning(
+                    "Failed to refresh bridge preview grace after durable registration for %s",
+                    bridge_dir,
+                    exc_info=True,
+                )
+
+        logger.info(
+            "Bridge finalize: prompt=%s node=%s published=%d target_folder=%s stem=%s",
+            entry.get("prompt_key"),
+            entry.get("bridge_node_id"),
+            len(registered_assets),
+            target_folder or "(root)",
+            naming_stem,
+        )
+    finally:
+        if preview_expires_at is not None:
+            _schedule_bridge_preview_cleanup(project, bridge_dir, preview_expires_at)
+        else:
+            _cleanup_bridge_output_dir(project, bridge_dir)
     return [asset for _rel_path, asset in registered_assets]
 
 

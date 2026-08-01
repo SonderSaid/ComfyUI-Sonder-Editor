@@ -25,6 +25,9 @@ a fresh `[Unreleased]` block.
   and Delete remain the ways to throw an edit away.
 
 ### Fixed
+- Save Bridge now publishes generated files durably while retaining native Save
+  Image staging previews for a bounded 60-second grace period, preventing
+  finalization-time `/api/view` 404s without delaying asset registration.
 - Sonder Editor now uses one renderer-stable DOM surface for both project
   creation and the dormant UI, so Nodes 2.0 can show the Create action and
   shrink scrollable Assets, Preview, and Queue modules to the saved node size.

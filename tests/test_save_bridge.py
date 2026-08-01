@@ -44,8 +44,11 @@ def _import_io_nodes(tmp_path, monkeypatch):
 
 def _clear_bridge_state(io_nodes):
     with io_nodes._BRIDGE_REGISTRY_LOCK:
+        for timer, _expires_at in io_nodes._BRIDGE_PREVIEW_CLEANUP_TIMERS.values():
+            timer.cancel()
         io_nodes._BRIDGE_REGISTRY.clear()
         io_nodes._BRIDGE_PROMPT_WATCHERS.clear()
+        io_nodes._BRIDGE_PREVIEW_CLEANUP_TIMERS.clear()
         io_nodes._BRIDGE_PROMPT_KEY_BY_OBJECT_ID.clear()
         io_nodes._BRIDGE_PROMPT_OBJECT_IDS_BY_KEY.clear()
     io_nodes._BRIDGE_HOOKED_PROMPT_QUEUE_ID = None
@@ -149,6 +152,64 @@ def test_bridge_registers_image_output(tmp_path, monkeypatch):
     assert asset.folder == "FreshTake"
     assert asset.path.startswith(os.path.join("media", "Bridge_Test_"))
     assert asset.path.endswith("_0001.png")
+
+
+def test_bridge_retains_native_preview_source_until_scheduled_cleanup(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    scheduled = []
+    monkeypatch.setattr(
+        io_nodes,
+        "_schedule_bridge_preview_cleanup",
+        lambda project_arg, bridge_dir, expires_at: scheduled.append((project_arg, bridge_dir, expires_at)),
+    )
+
+    output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(
+        project,
+        prompt={},
+        unique_id="bridge-1",
+    )
+    preview_path = Path(output_dir) / "native_00001_.png"
+    _write_png(preview_path)
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    durable_path = Path(project.project_dir) / restored.assets[0].path
+    assert preview_path.is_file()
+    assert durable_path.is_file()
+    assert preview_path.read_bytes() == durable_path.read_bytes()
+    payload = io_nodes._read_bridge_sidecar_payload(output_dir)
+    assert payload["existed"] == ["native_00001_.png"]
+    assert payload["preview_expires_at"] > time.time()
+    assert len(scheduled) == 1
+    assert Path(scheduled[0][1]) == Path(output_dir)
+    assert scheduled[0][2] == payload["preview_expires_at"]
+
+
+def test_bridge_publication_falls_back_to_atomic_copy(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "_schedule_bridge_preview_cleanup", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes.os, "link", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("no hardlinks")))
+
+    output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(project, prompt={}, unique_id="bridge-1")
+    preview_path = Path(output_dir) / "fallback.png"
+    _write_png(preview_path)
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    durable_path = Path(project.project_dir) / restored.assets[0].path
+    assert preview_path.is_file()
+    assert durable_path.is_file()
+    assert preview_path.read_bytes() == durable_path.read_bytes()
+    assert not os.path.samefile(preview_path, durable_path)
+    assert list(durable_path.parent.glob(".*.bridge-publish.tmp")) == []
 
 
 def test_bridge_upgrades_blank_same_path_placeholder(tmp_path, monkeypatch):
@@ -263,7 +324,7 @@ def test_bridge_no_output_fails_terminal_queue_job(tmp_path, monkeypatch):
     project_manager.save_project(project)
 
     bridge = io_nodes.SonderSaveBridge()
-    bridge.prepare_output(project, mark_queue_complete=True, prompt={}, unique_id="bridge-1")
+    output_dir, _ = bridge.prepare_output(project, mark_queue_complete=True, prompt={}, unique_id="bridge-1")
 
     prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
     io_nodes._finalize_prompt_bridges(prompt_key)
@@ -272,6 +333,23 @@ def test_bridge_no_output_fails_terminal_queue_job(tmp_path, monkeypatch):
     assert restored.generation_queue[0].status == "failed"
     assert restored.generation_queue[0].error == "Bridge terminal produced no files"
     assert restored.generation_queue[0].result_asset_id == ""
+    assert not Path(output_dir).exists()
+
+
+def test_bridge_unprobeable_output_cleans_staging_without_registration(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(project, prompt={}, unique_id="bridge-1")
+    (Path(output_dir) / "broken.png").write_bytes(b"not an image")
+
+    prompt_key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    io_nodes._finalize_prompt_bridges(prompt_key)
+
+    restored = _load_saved_project(project_manager, project)
+    assert restored.assets == []
+    assert not Path(output_dir).exists()
 
 
 def test_bridge_multi_in_one_prompt_isolation(tmp_path, monkeypatch):
@@ -377,6 +455,129 @@ def test_bridge_cleanup_adopts_stale_dirs(tmp_path, monkeypatch):
     assert adopted.asset_type == "image"
     assert adopted.name.startswith("bridge_recovered_")
     assert adopted.name.endswith("_0001.png")
+
+
+def test_bridge_finalized_preview_marker_skips_adoption_and_expires(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    bridge_root = Path(project.project_dir) / "cache" / "bridge_out"
+    preview_dir = bridge_root / "finalized-preview"
+    preview_dir.mkdir()
+    _write_png(preview_dir / "preview.png")
+    io_nodes._write_bridge_sidecar(
+        str(preview_dir),
+        ["preview.png"],
+        preview_expires_at=time.time() - 1,
+    )
+    monkeypatch.setattr(
+        io_nodes,
+        "_finalize_bridge_entry",
+        lambda *_args, **_kwargs: pytest.fail("Finalized preview aliases must not be re-adopted"),
+    )
+
+    io_nodes._cleanup_stale_bridge_dirs(project.project_dir)
+
+    assert not preview_dir.exists()
+    assert _load_saved_project(project_manager, project).assets == []
+
+
+def test_bridge_future_preview_marker_is_preserved_and_rescheduled(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    bridge_root = Path(project.project_dir) / "cache" / "bridge_out"
+    preview_dir = bridge_root / "future-preview"
+    preview_dir.mkdir()
+    _write_png(preview_dir / "preview.png")
+    expires_at = time.time() + 30
+    io_nodes._write_bridge_sidecar(
+        str(preview_dir),
+        ["preview.png"],
+        preview_expires_at=expires_at,
+    )
+    scheduled = []
+    monkeypatch.setattr(
+        io_nodes,
+        "_schedule_bridge_preview_cleanup",
+        lambda project_arg, bridge_dir, expiry: scheduled.append((project_arg, bridge_dir, expiry)),
+    )
+
+    io_nodes._cleanup_stale_bridge_dirs(project.project_dir)
+
+    assert preview_dir.is_dir()
+    assert scheduled == [(project.project_dir, str(preview_dir.resolve()), expires_at)]
+    assert _load_saved_project(project_manager, project).assets == []
+
+
+def test_bridge_preview_cleanup_timer_is_daemon_and_deletes_at_expiry(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    bridge_root = Path(project.project_dir) / "cache" / "bridge_out"
+    preview_dir = bridge_root / "scheduled-preview"
+    preview_dir.mkdir()
+    _write_png(preview_dir / "preview.png")
+    io_nodes._write_bridge_sidecar(
+        str(preview_dir),
+        ["preview.png"],
+        preview_expires_at=160.0,
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(io_nodes.time, "time", lambda: now["value"])
+    created = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.daemon = False
+            self.started = False
+            created.append(self)
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+        def cancel(self):
+            self.started = False
+
+    monkeypatch.setattr(io_nodes.threading, "Timer", FakeTimer)
+
+    timer = io_nodes._schedule_bridge_preview_cleanup(project, str(preview_dir), 160.0)
+
+    assert timer is created[0]
+    assert timer.delay == 60.0
+    assert timer.daemon is True
+    assert timer.started is True
+    assert io_nodes._schedule_bridge_preview_cleanup(project, str(preview_dir), 160.0) is timer
+    assert len(created) == 1
+    now["value"] = 161.0
+    timer.callback()
+    assert not preview_dir.exists()
+    timer_key = os.path.normcase(os.path.realpath(preview_dir))
+    assert timer_key not in io_nodes._BRIDGE_PREVIEW_CLEANUP_TIMERS
+
+
+def test_bridge_cleanup_failure_restores_preview_marker(tmp_path, monkeypatch):
+    io_nodes, _timeline_state, _project_manager, project = _make_project(tmp_path, monkeypatch)
+    bridge_root = Path(project.project_dir) / "cache" / "bridge_out"
+    preview_dir = bridge_root / "locked-preview"
+    preview_dir.mkdir()
+    _write_png(preview_dir / "preview.png")
+    expires_at = time.time() - 1
+    io_nodes._write_bridge_sidecar(
+        str(preview_dir),
+        ["preview.png"],
+        preview_expires_at=expires_at,
+    )
+
+    def fail_after_marker_removal(path):
+        (Path(path) / io_nodes.BRIDGE_SCAN_SIDECAR).unlink()
+        raise PermissionError("preview file is locked")
+
+    monkeypatch.setattr(io_nodes.shutil, "rmtree", fail_after_marker_removal)
+
+    assert io_nodes._cleanup_bridge_output_dir(project, str(preview_dir)) is False
+    restored_payload = io_nodes._read_bridge_sidecar_payload(str(preview_dir))
+    assert restored_payload["preview_expires_at"] == expires_at
+    assert restored_payload["existed"] == ["preview.png"]
 
 
 def test_bridge_terminal_marks_queue_complete_after_registration(tmp_path, monkeypatch):
