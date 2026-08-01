@@ -84,7 +84,8 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
 - **Asset gallery** — project-scoped assets and artifacts, folders, inspector,
   compare mode, trash/restore, favorites, reference-aware deletes, and tracked
   generation metadata.
-- **Timeline export** — export video/audio with a streaming CPU compositing path.
+- **Timeline export** — export video/audio with a frame-streaming CPU
+  compositing path; practical duration is bounded by disk space rather than RAM.
 - **Color-managed exports** — video presets encode and tag BT.709, and timeline
   decoding honors source color tags, so exports match the browser preview.
 - **Playback** — fullscreen/dormant viewport preview with adaptive
