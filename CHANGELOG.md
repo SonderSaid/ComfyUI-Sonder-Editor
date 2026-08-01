@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-01
+
 ### Added
 - Recent ComfyUI builds now expose the native V3 Metadata Collector with
   heterogeneous Autogrow inputs while retaining the established executable V1
