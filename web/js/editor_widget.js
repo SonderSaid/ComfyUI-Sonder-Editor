@@ -8941,6 +8941,9 @@ export class EditorWidget {
         let created = false;
         let discard = false;
         const commit = () => {
+            // Teardown fires a final focusout; only the mounted bar may write,
+            // so Cancel and Esc cannot be reversed by their own removal.
+            if (this._promptEditorEl !== editor) return;
             if (created || discard) return;
             const channels = channelInputs.read();
             if (channels.visual || channels.speech || channels.sounds) {
@@ -9034,6 +9037,9 @@ export class EditorWidget {
         let committed = normalizeChannels(section.channels, section.prompt);
         let discard = false;
         const commit = ({ close = true } = {}) => {
+            // Teardown fires a final focusout; only the mounted bar may write,
+            // so Esc and Delete cannot be reversed by their own removal.
+            if (this._promptEditorEl !== editor) return;
             const next = channelInputs.read();
             if (next.visual !== committed.visual
                 || next.speech !== committed.speech
@@ -9676,14 +9682,18 @@ export class EditorWidget {
      *  for the discard paths — Esc, Cancel, and section deletion, where the
      *  pending edit is either refused by the user or aimed at a stale index.
      *  The hook is cleared before it runs, so a flush that closes cannot
-     *  re-enter here. */
+     *  re-enter here. `_promptEditorEl` is cleared BEFORE the removal: taking
+     *  a focused field out of the DOM fires one last focusout, and each bar
+     *  refuses to commit once it is no longer the mounted bar — otherwise Esc
+     *  and Cancel would be undone by their own teardown. */
     _hidePromptEditor({ commit = true } = {}) {
         const pendingCommit = this._promptEditorCommit;
         this._promptEditorCommit = null;
         if (commit && pendingCommit) pendingCommit();
-        if (this._promptEditorEl) {
-            this._promptEditorEl.remove();
-            this._promptEditorEl = null;
+        const editorEl = this._promptEditorEl;
+        this._promptEditorEl = null;
+        if (editorEl) {
+            editorEl.remove();
             this._refreshTimelineLayout();
         }
     }

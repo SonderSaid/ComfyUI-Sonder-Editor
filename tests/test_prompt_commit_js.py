@@ -33,17 +33,23 @@ def test_hide_flushes_pending_edit_and_clears_the_hook_first():
 
     assert "_hidePromptEditor({ commit = true } = {})" in hide
     # The hook is read and cleared before it runs, so a flush whose commit
-    # closes the bar cannot re-enter and double-write.
+    # closes the bar cannot re-enter and double-write. `_promptEditorEl` is
+    # dropped before the removal, so the focusout that removal fires finds no
+    # mounted bar and cannot resurrect a discarded edit.
     clear_at = hide.index("this._promptEditorCommit = null")
     run_at = hide.index("if (commit && pendingCommit) pendingCommit()")
-    remove_at = hide.index("this._promptEditorEl.remove()")
-    assert clear_at < run_at < remove_at
+    unmount_at = hide.index("this._promptEditorEl = null")
+    remove_at = hide.index("editorEl.remove()")
+    assert clear_at < run_at < unmount_at < remove_at
 
 
 def test_section_bar_commits_on_focus_loss_and_dedupes_unchanged_channels():
     editor = _method(_source("web/js/editor_widget.js"), "_showPromptEditor", "_showGlobalPromptEditor")
 
     assert 'editor.addEventListener("focusout"' in editor
+    # A bar that is no longer mounted never writes, so the focusout its own
+    # teardown fires cannot undo an Esc or a Delete.
+    assert "if (this._promptEditorEl !== editor) return;" in editor
     # Moving focus inside the bar (Save/Delete) is not a commit trigger.
     assert "if (e.relatedTarget && editor.contains(e.relatedTarget)) return;" in editor
     assert "commit({ close: false })" in editor
@@ -61,6 +67,9 @@ def test_creator_bar_creates_on_focus_loss_but_never_twice():
     creator = _method(_source("web/js/editor_widget.js"), "_showPromptCreator", "_saveNewPromptSection")
 
     assert 'editor.addEventListener("focusout"' in creator
+    # A bar that is no longer mounted never creates, so Cancel and Esc cannot
+    # be turned into a create by their own teardown.
+    assert "if (this._promptEditorEl !== editor) return;" in creator
     assert "this._promptEditorCommit = commit;" in creator
     # The save path hides, and hiding flushes — `created` stops the second run.
     assert "if (created || discard) return;" in creator
