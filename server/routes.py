@@ -98,6 +98,18 @@ from .timeline_state import (
     effective_scene_fps, media_timeline_frames, normalize_reference_tags,
     retime_scene_geometry,
 )
+from .lane_registry import (
+    LANE_DESCRIPTORS,
+    VARIABLE_LANE_DESCRIPTORS,
+    clip_lane_type as registry_clip_lane_type,
+    descriptor_for_lane_type,
+    is_render_clip as registry_is_render_clip,
+    item_matches_descriptor,
+    lane_items as registry_lane_items,
+    pad_config_list,
+    pad_lane_configs,
+    variable_descriptor,
+)
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 from . import external_links
@@ -559,7 +571,7 @@ def _clip_source_asset_type(project: TimelineProject, clip: ClipReference) -> st
 
 
 def _is_render_clip(clip: ClipReference) -> bool:
-    return getattr(clip, "role", "render") in ("", "render")
+    return registry_is_render_clip(clip)
 
 
 def _trim_lane_configs(configs: list, removed_index: int, target_count: int) -> None:
@@ -580,33 +592,27 @@ def _compact_empty_media_lane(scene: Scene, lane_type: str, lane_index: int) -> 
     if lane_index < 0:
         return False
 
-    if lane_type == "video":
-        lane_count = max(1, int(scene.video_lane_count or 1))
-        if lane_count <= 1 or lane_index >= lane_count:
-            return False
-        if any(_is_render_clip(clip) and (clip.track_index or 0) == lane_index for clip in scene.clips):
-            return False
-        for clip in scene.clips:
-            if _is_render_clip(clip) and (clip.track_index or 0) > lane_index:
-                clip.track_index = max(0, (clip.track_index or 0) - 1)
-        scene.video_lane_count = lane_count - 1
-        _trim_lane_configs(scene.video_lane_configs, lane_index, scene.video_lane_count)
-        return True
-
-    if lane_type == "audio":
-        lane_count = max(1, int(scene.audio_lane_count or 1))
-        if lane_count <= 1 or lane_index >= lane_count:
-            return False
-        if any((track.lane_index or 0) == lane_index for track in scene.audio_tracks):
-            return False
-        for track in scene.audio_tracks:
-            if (track.lane_index or 0) > lane_index:
-                track.lane_index = max(0, (track.lane_index or 0) - 1)
-        scene.audio_lane_count = lane_count - 1
-        _trim_lane_configs(scene.audio_lane_configs, lane_index, scene.audio_lane_count)
-        return True
-
-    return False
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is None or not descriptor.supports_compaction:
+        return False
+    lane_count = max(1, int(getattr(scene, descriptor.count_attr) or 1))
+    if lane_count <= 1 or lane_index >= lane_count:
+        return False
+    if registry_lane_items(scene, lane_type, lane_index):
+        return False
+    for item in getattr(scene, descriptor.items_attr):
+        if item_matches_descriptor(item, descriptor) and (
+            getattr(item, descriptor.item_index_attr, 0) or 0
+        ) > lane_index:
+            setattr(
+                item,
+                descriptor.item_index_attr,
+                max(0, (getattr(item, descriptor.item_index_attr, 0) or 0) - 1),
+            )
+    next_count = lane_count - 1
+    setattr(scene, descriptor.count_attr, next_count)
+    _trim_lane_configs(getattr(scene, descriptor.configs_attr), lane_index, next_count)
+    return True
 
 
 class ProjectMutationRequestError(Exception):
@@ -657,38 +663,26 @@ def _mutation_float(value, field_name: str, default: float | None = None) -> flo
 
 
 def _scene_lane_configs(scene: Scene, lane_type: str) -> list[LaneConfig]:
-    if lane_type == "video":
-        return scene.video_lane_configs
-    if lane_type == "motion_driver":
-        return scene.motion_driver_lane_configs
-    if lane_type == "audio":
-        return scene.audio_lane_configs
-    _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is None:
+        _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    return getattr(scene, descriptor.configs_attr)
 
 
 def _scene_lane_count(scene: Scene, lane_type: str) -> int:
-    if lane_type == "video":
-        return max(1, int(scene.video_lane_count or 1))
-    if lane_type == "motion_driver":
-        return max(1, int(scene.motion_driver_lane_count or 1))
-    if lane_type == "audio":
-        return max(1, int(scene.audio_lane_count or 1))
-    _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is None:
+        _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    return max(1, int(getattr(scene, descriptor.count_attr) or 1))
 
 
 def _set_scene_lane_count(scene: Scene, lane_type: str, count: int) -> None:
     count = max(1, int(count))
-    if lane_type == "video":
-        scene.video_lane_count = count
-        configs = scene.video_lane_configs
-    elif lane_type == "motion_driver":
-        scene.motion_driver_lane_count = count
-        configs = scene.motion_driver_lane_configs
-    elif lane_type == "audio":
-        scene.audio_lane_count = count
-        configs = scene.audio_lane_configs
-    else:
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is None:
         _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    setattr(scene, descriptor.count_attr, count)
+    configs = getattr(scene, descriptor.configs_attr)
     while len(configs) < count:
         configs.append(LaneConfig())
     while len(configs) > count:
@@ -729,7 +723,7 @@ def _require_lane_unlocked(scene: Scene, lane_type: str, lane_index: int | None 
 
 
 def _clip_lane_type(clip: ClipReference) -> str:
-    return "video" if _is_render_clip(clip) else "motion_driver"
+    return registry_clip_lane_type(clip)
 
 
 def _require_clip_unlocked(scene: Scene, clip: ClipReference) -> None:
@@ -741,9 +735,8 @@ def _require_audio_unlocked(scene: Scene, track: AudioTrack) -> None:
 
 
 def _ensure_scene_lane_config_lengths(scene: Scene) -> None:
-    _set_scene_lane_count(scene, "video", _scene_lane_count(scene, "video"))
-    _set_scene_lane_count(scene, "motion_driver", _scene_lane_count(scene, "motion_driver"))
-    _set_scene_lane_count(scene, "audio", _scene_lane_count(scene, "audio"))
+    for descriptor in VARIABLE_LANE_DESCRIPTORS:
+        _set_scene_lane_count(scene, descriptor.lane_type, _scene_lane_count(scene, descriptor.lane_type))
 
 
 def _validate_single_driver_per_lane(scene: Scene) -> None:
@@ -1444,38 +1437,28 @@ def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) ->
             _require_scene_queue_idle(project, scene.scene_id)
             retime_scene_geometry(scene, old_fps, new_fps)
         scene.fps = new_scene_fps
-    if "video_lane_count" in fields:
-        _set_scene_lane_count(scene, "video", max(1, int(fields["video_lane_count"])))
-    if "motion_driver_lane_count" in fields:
-        _set_scene_lane_count(scene, "motion_driver", max(1, int(fields["motion_driver_lane_count"])))
-    if "audio_lane_count" in fields:
-        _set_scene_lane_count(scene, "audio", max(1, int(fields["audio_lane_count"])))
+    for descriptor in VARIABLE_LANE_DESCRIPTORS:
+        if descriptor.count_attr in fields:
+            _set_scene_lane_count(
+                scene,
+                descriptor.lane_type,
+                max(1, int(fields[descriptor.count_attr])),
+            )
     _ensure_scene_lane_config_lengths(scene)
 
 
 def _apply_lane_configs(scene: Scene, fields: dict) -> None:
     if not isinstance(fields, dict):
         _mutation_error("update_lane_configs requires fields", 400)
-    if "video_lane_configs" in fields:
-        scene.video_lane_configs = [LaneConfig.from_dict(c) for c in fields["video_lane_configs"]]
-    if "motion_driver_lane_configs" in fields:
-        scene.motion_driver_lane_configs = [LaneConfig.from_dict(c) for c in fields["motion_driver_lane_configs"]]
-    if "audio_lane_configs" in fields:
-        scene.audio_lane_configs = [LaneConfig.from_dict(c) for c in fields["audio_lane_configs"]]
-    if "guide_track_config" in fields:
-        scene.guide_track_config = LaneConfig.from_dict(fields["guide_track_config"])
-    if "prompt_track_config" in fields:
-        scene.prompt_track_config = LaneConfig.from_dict(fields["prompt_track_config"])
-    if "global_prompt_track_config" in fields:
-        scene.global_prompt_track_config = LaneConfig.from_dict(fields["global_prompt_track_config"])
+    for descriptor in LANE_DESCRIPTORS:
+        attr = descriptor.configs_attr if descriptor.variable else descriptor.fixed_config_attr
+        if not attr or attr not in fields:
+            continue
+        if descriptor.variable:
+            setattr(scene, attr, [LaneConfig.from_dict(config) for config in fields[attr]])
+        else:
+            setattr(scene, attr, LaneConfig.from_dict(fields[attr]))
     _ensure_scene_lane_config_lengths(scene)
-
-
-_FIXED_TRACK_CONFIG_ATTRS = {
-    "guide": "guide_track_config",
-    "prompt": "prompt_track_config",
-    "prompt_global": "global_prompt_track_config",
-}
 
 
 def _apply_lane_config(scene: Scene, op: dict) -> dict:
@@ -1490,14 +1473,15 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
     if not isinstance(fields, dict):
         _mutation_error("update_lane_config requires fields", 400)
     lane_type = str(op.get("lane_type", ""))
-    if lane_type in _FIXED_TRACK_CONFIG_ATTRS:
-        attr = _FIXED_TRACK_CONFIG_ATTRS[lane_type]
+    descriptor = descriptor_for_lane_type(lane_type)
+    if descriptor is not None and descriptor.fixed_config_attr:
+        attr = descriptor.fixed_config_attr
         config = getattr(scene, attr, None)
         if config is None:
             config = LaneConfig()
             setattr(scene, attr, config)
         lane_index = 0
-    elif lane_type in {"video", "motion_driver", "audio"}:
+    elif descriptor is not None and descriptor.variable:
         lane_index = _mutation_int(op.get("lane_index", 0), "lane_index", 0)
         if lane_index < 0 or lane_index >= _scene_lane_count(scene, lane_type):
             _mutation_error(f"Lane index out of range: {lane_index}", 404, "item_not_found")
@@ -1516,23 +1500,10 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
 
 
 def _media_lane_items(scene: Scene, lane_type: str, lane_index: int) -> list:
-    if lane_type == "video":
-        return [
-            clip for clip in scene.clips
-            if _is_render_clip(clip) and int(clip.track_index or 0) == lane_index
-        ]
-    if lane_type == "motion_driver":
-        return [
-            clip for clip in scene.clips
-            if getattr(clip, "role", "render") == "motion_driver"
-            and int(clip.track_index or 0) == lane_index
-        ]
-    if lane_type == "audio":
-        return [
-            track for track in scene.audio_tracks
-            if int(track.lane_index or 0) == lane_index
-        ]
-    _mutation_error(f"Unknown lane type: {lane_type}", 400)
+    try:
+        return registry_lane_items(scene, lane_type, lane_index)
+    except KeyError:
+        _mutation_error(f"Unknown lane type: {lane_type}", 400)
 
 
 def _media_item_id(item) -> str:
@@ -1600,7 +1571,8 @@ def _require_media_items_fit_lane(moving_items: list, destination_items: list) -
 
 def _consolidate_media_items(scene: Scene, op: dict) -> dict:
     lane_type = str(op.get("lane_type", ""))
-    if lane_type not in {"video", "audio"}:
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is None or not descriptor.supports_multi_lane_delete:
         _mutation_error("Consolidation supports render-video or audio items only", 400, "invalid_consolidation")
 
     raw_ids = op.get("item_ids", [])
@@ -1617,14 +1589,22 @@ def _consolidate_media_items(scene: Scene, op: dict) -> dict:
     if target_lane < 0 or target_lane >= lane_count:
         _mutation_error("Consolidation target lane is out of range", 400, "invalid_consolidation")
 
-    if lane_type == "video":
-        selected_items = [_find_clip(scene, item_id) for item_id in item_ids]
-        if any(not _is_render_clip(item) for item in selected_items):
-            _mutation_error("Driver clips cannot be consolidated", 400, "invalid_consolidation")
-        item_lane = lambda item: int(item.track_index or 0)
-    else:
-        selected_items = [_find_audio_track(scene, item_id) for item_id in item_ids]
-        item_lane = lambda item: int(item.lane_index or 0)
+    selected_items = []
+    for item_id in item_ids:
+        item = next(
+            (
+                candidate for candidate in getattr(scene, descriptor.items_attr)
+                if getattr(candidate, descriptor.item_id_attr) == item_id
+            ),
+            None,
+        )
+        if item is None:
+            item_label = "Clip" if descriptor.items_attr == "clips" else "Audio track"
+            _mutation_error(f"{item_label} not found: {item_id}", 404, "item_not_found")
+        selected_items.append(item)
+    if descriptor.item_predicate == "render" and any(not _is_render_clip(item) for item in selected_items):
+        _mutation_error("Driver clips cannot be consolidated", 400, "invalid_consolidation")
+    item_lane = lambda item: int(getattr(item, descriptor.item_index_attr) or 0)
 
     source_lanes = {item_lane(item) for item in selected_items}
     if source_lanes == {target_lane}:
@@ -1642,10 +1622,7 @@ def _consolidate_media_items(scene: Scene, op: dict) -> dict:
     _require_media_items_fit_lane(selected_items, destination_items)
 
     for item in selected_items:
-        if lane_type == "video":
-            item.track_index = target_lane
-        else:
-            item.lane_index = target_lane
+        setattr(item, descriptor.item_index_attr, target_lane)
 
     removed_lanes: list[int] = []
     if bool(op.get("remove_vacated_lanes", False)):
@@ -1666,7 +1643,8 @@ def _consolidate_media_items(scene: Scene, op: dict) -> dict:
 
 
 def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_policy: str, target_lane: int | None = None) -> None:
-    if lane_type not in {"video", "motion_driver", "audio"}:
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is None or not descriptor.lane_removable:
         _mutation_error(f"Cannot remove lane type: {lane_type}", 400)
     lane_index = _mutation_int(lane_index, "lane_index")
     current_count = _scene_lane_count(scene, lane_type)
@@ -1694,39 +1672,31 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
             _media_lane_items(scene, lane_type, target_lane),
         )
         for item in lane_items:
-            if lane_type in {"video", "motion_driver"}:
-                item.track_index = target_lane
-            else:
-                item.lane_index = target_lane
+            setattr(item, descriptor.item_index_attr, target_lane)
     elif lane_items and item_policy == "delete_items":
-        if lane_type in {"video", "motion_driver"}:
-            deleting = {item.clip_id for item in lane_items}
-            scene.clips = [clip for clip in scene.clips if clip.clip_id not in deleting]
-        else:
-            deleting = {item.track_id for item in lane_items}
-            scene.audio_tracks = [track for track in scene.audio_tracks if track.track_id not in deleting]
+        deleting = {getattr(item, descriptor.item_id_attr) for item in lane_items}
+        setattr(
+            scene,
+            descriptor.items_attr,
+            [
+                item for item in getattr(scene, descriptor.items_attr)
+                if getattr(item, descriptor.item_id_attr) not in deleting
+            ],
+        )
     elif lane_items:
         _mutation_error(f"Unknown lane item policy: {item_policy}", 400)
 
-    if lane_type == "video":
-        for clip in scene.clips:
-            if _is_render_clip(clip) and int(clip.track_index or 0) > lane_index:
-                clip.track_index = max(0, int(clip.track_index or 0) - 1)
-        scene.video_lane_count = current_count - 1
-        _trim_lane_configs(scene.video_lane_configs, lane_index, scene.video_lane_count)
-    elif lane_type == "motion_driver":
-        for clip in scene.clips:
-            if getattr(clip, "role", "render") == "motion_driver" and int(clip.track_index or 0) > lane_index:
-                clip.track_index = max(0, int(clip.track_index or 0) - 1)
-        scene.motion_driver_lane_count = current_count - 1
-        _trim_lane_configs(scene.motion_driver_lane_configs, lane_index, scene.motion_driver_lane_count)
+    for item in getattr(scene, descriptor.items_attr):
+        if not item_matches_descriptor(item, descriptor):
+            continue
+        current_index = int(getattr(item, descriptor.item_index_attr, 0) or 0)
+        if current_index > lane_index:
+            setattr(item, descriptor.item_index_attr, max(0, current_index - 1))
+    next_count = current_count - 1
+    setattr(scene, descriptor.count_attr, next_count)
+    _trim_lane_configs(getattr(scene, descriptor.configs_attr), lane_index, next_count)
+    if descriptor.max_items_per_lane == 1:
         _validate_single_driver_per_lane(scene)
-    else:
-        for track in scene.audio_tracks:
-            if int(track.lane_index or 0) > lane_index:
-                track.lane_index = max(0, int(track.lane_index or 0) - 1)
-        scene.audio_lane_count = current_count - 1
-        _trim_lane_configs(scene.audio_lane_configs, lane_index, scene.audio_lane_count)
 
 
 def _validated_fit_mode(value) -> str:
@@ -7610,24 +7580,15 @@ if routes is not None:
             ]
         if "generation_params" in body:
             scene.generation_params = body["generation_params"]
-        if "video_lane_count" in body:
-            scene.video_lane_count = max(1, int(body["video_lane_count"]))
-        if "motion_driver_lane_count" in body:
-            scene.motion_driver_lane_count = max(1, int(body["motion_driver_lane_count"]))
-        if "audio_lane_count" in body:
-            scene.audio_lane_count = max(1, int(body["audio_lane_count"]))
-        if "video_lane_configs" in body:
-            scene.video_lane_configs = [
-                LaneConfig.from_dict(c) for c in body["video_lane_configs"]
-            ]
-        if "motion_driver_lane_configs" in body:
-            scene.motion_driver_lane_configs = [
-                LaneConfig.from_dict(c) for c in body["motion_driver_lane_configs"]
-            ]
-        if "audio_lane_configs" in body:
-            scene.audio_lane_configs = [
-                LaneConfig.from_dict(c) for c in body["audio_lane_configs"]
-            ]
+        for descriptor in VARIABLE_LANE_DESCRIPTORS:
+            if descriptor.count_attr in body:
+                setattr(scene, descriptor.count_attr, max(1, int(body[descriptor.count_attr])))
+            if descriptor.configs_attr in body:
+                setattr(
+                    scene,
+                    descriptor.configs_attr,
+                    [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
+                )
         if "guide_track_config" in body:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
         if "prompt_track_config" in body:
@@ -7651,13 +7612,8 @@ if routes is not None:
             except ProjectMutationRequestError as e:
                 return _mutation_json_error(e)
             scene.fps = new_scene_fps
-        # Auto-pad configs to match lane counts
-        while len(scene.video_lane_configs) < scene.video_lane_count:
-            scene.video_lane_configs.append(LaneConfig())
-        while len(scene.motion_driver_lane_configs) < scene.motion_driver_lane_count:
-            scene.motion_driver_lane_configs.append(LaneConfig())
-        while len(scene.audio_lane_configs) < scene.audio_lane_count:
-            scene.audio_lane_configs.append(LaneConfig())
+        # Auto-pad configs to match lane counts.
+        pad_lane_configs(scene, LaneConfig)
 
         try:
             _validate_single_driver_per_lane(scene)
@@ -7750,34 +7706,20 @@ if routes is not None:
             scene.audio_tracks = [
                 AudioTrack.from_dict(a) for a in body["audio_tracks"]
             ]
-        if "video_lane_count" in body:
-            scene.video_lane_count = max(1, int(body["video_lane_count"]))
-        if "motion_driver_lane_count" in body:
-            scene.motion_driver_lane_count = max(1, int(body["motion_driver_lane_count"]))
-        if "audio_lane_count" in body:
-            scene.audio_lane_count = max(1, int(body["audio_lane_count"]))
-        if "video_lane_configs" in body:
-            scene.video_lane_configs = [
-                LaneConfig.from_dict(c) for c in body["video_lane_configs"]
-            ]
-        if "motion_driver_lane_configs" in body:
-            scene.motion_driver_lane_configs = [
-                LaneConfig.from_dict(c) for c in body["motion_driver_lane_configs"]
-            ]
-        if "audio_lane_configs" in body:
-            scene.audio_lane_configs = [
-                LaneConfig.from_dict(c) for c in body["audio_lane_configs"]
-            ]
+        for descriptor in VARIABLE_LANE_DESCRIPTORS:
+            if descriptor.count_attr in body:
+                setattr(scene, descriptor.count_attr, max(1, int(body[descriptor.count_attr])))
+            if descriptor.configs_attr in body:
+                setattr(
+                    scene,
+                    descriptor.configs_attr,
+                    [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
+                )
         if "guide_track_config" in body:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
         if "prompt_track_config" in body:
             scene.prompt_track_config = LaneConfig.from_dict(body["prompt_track_config"])
-        while len(scene.video_lane_configs) < scene.video_lane_count:
-            scene.video_lane_configs.append(LaneConfig())
-        while len(scene.motion_driver_lane_configs) < scene.motion_driver_lane_count:
-            scene.motion_driver_lane_configs.append(LaneConfig())
-        while len(scene.audio_lane_configs) < scene.audio_lane_count:
-            scene.audio_lane_configs.append(LaneConfig())
+        pad_lane_configs(scene, LaneConfig)
 
         try:
             _validate_single_driver_per_lane(scene)
@@ -7946,11 +7888,12 @@ if routes is not None:
                 active_job = job
                 break
 
+        driver_descriptor = descriptor_for_lane_type("motion_driver")
         if active_job is not None:
-            lane_count = max(1, int(getattr(active_job, "driver_lane_count", 1) or 1))
+            lane_count = max(1, int(getattr(active_job, driver_descriptor.snapshot_count_attr, 1) or 1))
             lane_configs = [
                 LaneConfig.from_dict(item) if isinstance(item, dict) else item
-                for item in (getattr(active_job, "driver_lane_configs", []) or [])
+                for item in (getattr(active_job, driver_descriptor.snapshot_configs_attr, []) or [])
             ]
             clips = [
                 ClipReference.from_dict(item)
@@ -7959,13 +7902,12 @@ if routes is not None:
             ]
             source_label = "snapshot"
         else:
-            lane_count = max(1, int(getattr(scene, "motion_driver_lane_count", 1) or 1))
-            lane_configs = list(getattr(scene, "motion_driver_lane_configs", []) or [])
+            lane_count = max(1, int(getattr(scene, driver_descriptor.count_attr, 1) or 1))
+            lane_configs = list(getattr(scene, driver_descriptor.configs_attr, []) or [])
             clips = list(getattr(scene, "clips", []) or [])
             source_label = "live"
 
-        while len(lane_configs) < lane_count:
-            lane_configs.append(LaneConfig())
+        pad_config_list(lane_configs, lane_count, LaneConfig)
 
         def _asset_name_for_source(source_path: str) -> str:
             norm = str(source_path or "").replace("\\", "/")

@@ -38,6 +38,7 @@ import { register as registerKeyboardConsumer, PRIORITY as KEYBOARD_PRIORITY } f
 import { acquireGraphPreviewSuppression } from "./graph_preview_ownership.js";
 import { notifyProgress, notifyInfo } from "./editor_notifications.js";
 import { EDITOR_CHROME as CHROME, FONT, THEME, statusPillCss } from "./editor_theme.js";
+import { TRACK_TYPE, laneHiddenInScene } from "./lane_registry.js";
 import {
     DORMANT_NODE_MIN_WIDTH,
     DORMANT_WIDGET_FLOOR,
@@ -588,15 +589,15 @@ function newAssetIdsSince(baselineIds, currentIds) {
 }
 
 function isVideoLaneHidden(scene, trackIndex) {
-    return !!scene?.video_lane_configs?.[trackIndex || 0]?.hidden;
+    return laneHiddenInScene(scene, TRACK_TYPE.VIDEO, trackIndex || 0);
 }
 
 function isAudioLaneHidden(scene, laneIndex) {
-    return !!scene?.audio_lane_configs?.[laneIndex || 0]?.hidden;
+    return laneHiddenInScene(scene, TRACK_TYPE.AUDIO, laneIndex || 0);
 }
 
 function isGuideTrackHidden(scene) {
-    return !!scene?.guide_track_config?.hidden;
+    return laneHiddenInScene(scene, TRACK_TYPE.GUIDES, 0);
 }
 
 function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDimensions = {}) {

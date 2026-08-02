@@ -3297,7 +3297,10 @@ def test_save_video_take_mode_creates_audio_track_when_audio_present(tmp_path, m
     assert scene.clips[-1].muted is True
     assert scene.audio_tracks[-1].lane_index == 1
     assert scene.audio_tracks[-1].muted is True
+    assert scene.video_lane_count == 2
+    assert len(scene.video_lane_configs) == 2
     assert scene.audio_lane_count == 2
+    assert len(scene.audio_lane_configs) == 2
     assert scene.audio_tracks[-1].timeline_start_frame == 8
     assert scene.audio_tracks[-1].timeline_end_frame == 12
     assert scene.audio_tracks[-1].source_in_frame == 1

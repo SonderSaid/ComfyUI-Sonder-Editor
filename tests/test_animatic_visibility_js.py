@@ -39,7 +39,8 @@ def test_animatic_visibility_is_derived_for_video_only():
     is_hidden = _method(widget, "_isLaneHidden", "_muteOperationForItem")
     visibility_state = _method(widget, "_trackVisibilityState", "_isGuideTrackLocked")
 
-    assert "this._animaticMode && type === TRACK_TYPE.VIDEO" in is_hidden
+    assert "animaticMode: this._animaticMode" in is_hidden
+    assert "if (idx === null) return true;" in is_hidden
     assert "this._isLaneVisibilityControlDisabled(entry)" in visibility_state
 
 

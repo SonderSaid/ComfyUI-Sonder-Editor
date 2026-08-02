@@ -20,6 +20,7 @@ import folder_paths
 from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
+from ..server.lane_registry import ensure_lane_index
 from ..server import external_links
 from ..server.atomic_io import atomic_replace
 from ..server.project_manager import load_project, save_project
@@ -1914,10 +1915,7 @@ class SonderSaveVideo:
                 new_lane = max(existing_lanes) + 1
 
                 # Ensure scene has enough lanes
-                if scene.video_lane_count <= new_lane:
-                    scene.video_lane_count = new_lane + 1
-                while len(scene.video_lane_configs) < scene.video_lane_count:
-                    scene.video_lane_configs.append(LaneConfig())
+                ensure_lane_index(scene, "video", new_lane, LaneConfig)
 
                 # Determine clip placement — at original selection, not context-expanded range
                 def context_int(key, default=0):
@@ -2030,10 +2028,7 @@ class SonderSaveVideo:
 
                         existing_audio_lanes = [track.lane_index for track in scene.audio_tracks] if scene.audio_tracks else [-1]
                         new_audio_lane = max(existing_audio_lanes) + 1
-                        if scene.audio_lane_count <= new_audio_lane:
-                            scene.audio_lane_count = new_audio_lane + 1
-                        while len(scene.audio_lane_configs) < scene.audio_lane_count:
-                            scene.audio_lane_configs.append(LaneConfig())
+                        ensure_lane_index(scene, "audio", new_audio_lane, LaneConfig)
 
                         visible_len = source_out_frame - source_in_frame
                         assert (timeline_end_frame - timeline_start_frame) == visible_len, (

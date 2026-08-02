@@ -35,6 +35,7 @@ from .render_cache import (
     stage_block,
 )
 from .timeline_state import Scene, TimelineProject, effective_scene_fps
+from .lane_registry import hidden_lane_indexes
 
 def _default_video_capture(path: str):
     # Pin the FFmpeg backend: the color-correction constants (fixed BT.601
@@ -75,11 +76,7 @@ def _scene_resolution(project: TimelineProject, scene: Scene) -> tuple[int, int]
 
 
 def _visible_render_clips(scene: Scene) -> list:
-    hidden_lanes = {
-        idx
-        for idx, cfg in enumerate(getattr(scene, "video_lane_configs", []) or [])
-        if getattr(cfg, "hidden", False)
-    }
+    hidden_lanes = hidden_lane_indexes(scene, "video")
     return [
         clip
         for clip in getattr(scene, "clips", []) or []
@@ -765,11 +762,7 @@ def _audio_contributors(
     end_frame: int,
 ) -> list[dict]:
     fps = effective_scene_fps(project, scene)
-    hidden_lanes = {
-        idx
-        for idx, cfg in enumerate(getattr(scene, "audio_lane_configs", []) or [])
-        if getattr(cfg, "hidden", False)
-    }
+    hidden_lanes = hidden_lane_indexes(scene, "audio")
     contributors = []
     for track in getattr(scene, "audio_tracks", []) or []:
         if getattr(track, "muted", False):

@@ -1,6 +1,7 @@
 import logging
 
 from .project_manager import ProjectVersionConflict, load_project, save_project
+from .lane_registry import VARIABLE_LANE_DESCRIPTORS
 from .timeline_state import LaneConfig, TimelineProject
 
 logger = logging.getLogger("sonder_editor")
@@ -282,22 +283,27 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
         # lanes — never by copying produced's base configs by absolute position,
         # which duplicated/resurrected lanes when the user deleted a non-tail
         # lane mid-generation (current's indices shifted relative to produced).
-        role_specs = (
-            ("video_lane_count", "video_lane_configs", "track_index", new_render, "clips"),
-            ("motion_driver_lane_count", "motion_driver_lane_configs", "track_index", new_driver, "clips"),
-            ("audio_lane_count", "audio_lane_configs", "lane_index", new_audio, "audio_tracks"),
-        )
-        for count_attr, configs_attr, idx_attr, items, list_attr in role_specs:
+        items_by_lane_type = {
+            "video": new_render,
+            "motion_driver": new_driver,
+            "audio": new_audio,
+        }
+        for descriptor in VARIABLE_LANE_DESCRIPTORS:
+            # Generated-output producers opt lane families into reconciliation
+            # by supplying an item list above.  Registry-only families (for
+            # example the future Reference lane) must remain harmless until a
+            # producer exists for them.
+            items = items_by_lane_type.get(descriptor.lane_type)
             if not items:
                 continue
-            current_count = int(getattr(current_scene, count_attr, 0) or 0)
-            current_configs = list(getattr(current_scene, configs_attr, []) or [])
+            current_count = int(getattr(current_scene, descriptor.count_attr, 0) or 0)
+            current_configs = list(getattr(current_scene, descriptor.configs_attr, []) or [])
             new_count = _append_generated_lanes(
-                items, idx_attr, current_count, current_configs
+                items, descriptor.item_index_attr, current_count, current_configs
             )
-            getattr(current_scene, list_attr).extend(items)
-            setattr(current_scene, configs_attr, current_configs)
-            setattr(current_scene, count_attr, new_count)
+            getattr(current_scene, descriptor.items_attr).extend(items)
+            setattr(current_scene, descriptor.configs_attr, current_configs)
+            setattr(current_scene, descriptor.count_attr, new_count)
             changed = True
 
         current_link_ids = {

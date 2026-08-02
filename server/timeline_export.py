@@ -53,6 +53,7 @@ from .timeline_state import (
     Asset, AudioTrack, ClipReference, LaneConfig, Scene, TimelineProject,
     effective_scene_fps,
 )
+from .lane_registry import ensure_lane_index, hidden_lane_indexes
 
 
 def _transient_temp_dir() -> str:
@@ -281,7 +282,7 @@ def _hidden_lane_indexes(configs: list) -> set[int]:
 
 
 def _video_sources(project: TimelineProject, scene: Scene, start: int, end: int) -> list[dict]:
-    hidden = _hidden_lane_indexes(getattr(scene, "video_lane_configs", []))
+    hidden = hidden_lane_indexes(scene, "video")
     sources = []
     for clip in getattr(scene, "clips", []) or []:
         if getattr(clip, "track_index", 0) in hidden:
@@ -306,7 +307,7 @@ def _video_sources(project: TimelineProject, scene: Scene, start: int, end: int)
 
 
 def _audio_sources(project: TimelineProject, scene: Scene, start: int, end: int) -> list[dict]:
-    hidden = _hidden_lane_indexes(getattr(scene, "audio_lane_configs", []))
+    hidden = hidden_lane_indexes(scene, "audio")
     sources = []
     for track in getattr(scene, "audio_tracks", []) or []:
         if getattr(track, "lane_index", 0) in hidden or getattr(track, "muted", False):
@@ -414,10 +415,7 @@ def _place_video_take(
     total_frames = max(1, int(asset.frame_count or (end - start) or 1))
     existing_lanes = [int(getattr(clip, "track_index", 0) or 0) for clip in getattr(scene, "clips", [])]
     new_lane = (max(existing_lanes) if existing_lanes else -1) + 1
-    if scene.video_lane_count <= new_lane:
-        scene.video_lane_count = new_lane + 1
-    while len(scene.video_lane_configs) < scene.video_lane_count:
-        scene.video_lane_configs.append(LaneConfig())
+    ensure_lane_index(scene, "video", new_lane, LaneConfig)
 
     clip = ClipReference(
         source_path=asset.path,
@@ -529,10 +527,7 @@ def _place_embedded_audio_take(
 
     existing_lanes = [int(getattr(track, "lane_index", 0) or 0) for track in getattr(scene, "audio_tracks", [])]
     new_lane = (max(existing_lanes) if existing_lanes else -1) + 1
-    if scene.audio_lane_count <= new_lane:
-        scene.audio_lane_count = new_lane + 1
-    while len(scene.audio_lane_configs) < scene.audio_lane_count:
-        scene.audio_lane_configs.append(LaneConfig())
+    ensure_lane_index(scene, "audio", new_lane, LaneConfig)
 
     track = AudioTrack(
         source_path=audio_asset.path,

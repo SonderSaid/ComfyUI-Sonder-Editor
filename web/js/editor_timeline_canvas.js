@@ -7,6 +7,7 @@ import {
     TRACK_HEIGHT,
     TRACK_TYPE,
 } from "./editor_timeline_constants.js";
+import { descriptorFor } from "./lane_registry.js";
 export {
     LABEL_WIDTH,
     LABEL_WIDTH_FS,
@@ -436,8 +437,8 @@ export function _drawTracks(host, ctx, width) {
                     // 3. Hide/Mute icon
                     const visibilityState = host._trackVisibilityState(entry);
                     const visibilityDisabled = host._isLaneVisibilityControlDisabled?.(entry) || false;
-                    const isAudioLike = entry.type === TRACK_TYPE.AUDIO || entry.type === TRACK_TYPE.PROMPT
-                        || entry.type === TRACK_TYPE.PROMPT_GLOBAL;
+                    const visibilityIcons = descriptorFor(entry.type)?.visibilityIcons
+                        || { visible: "👁", hidden: "🚫" };
                     ctx.fillStyle = visibilityDisabled
                         ? COLORS.textMuted
                         : visibilityState === "hidden"
@@ -445,8 +446,8 @@ export function _drawTracks(host, ctx, width) {
                         : visibilityState === "partial"
                             ? COLORS.accentHi
                             : COLORS.textMuted;
-                    const visibleIcon = isAudioLike ? "🔊" : "👁";
-                    const hiddenIcon = isAudioLike ? "🔇" : "🚫";
+                    const visibleIcon = visibilityIcons.visible;
+                    const hiddenIcon = visibilityIcons.hidden;
                     ctx.fillText(
                         visibilityState === "partial" ? "◐" : (visibilityState === "hidden" ? hiddenIcon : visibleIcon),
                         curX,
@@ -457,7 +458,7 @@ export function _drawTracks(host, ctx, width) {
                     // 3b. Manage icon (☰) — fixed tracks only; opens the
                     // guide/prompt management panel. Advance matches the
                     // hit-test zone width exactly so glyph and zone align.
-                    if (!isLane) {
+                    if (descriptorFor(entry.type)?.hasManageIcon) {
                         ctx.fillStyle = COLORS.textMuted;
                         ctx.font = host._canvasSansFont(iconSize - Math.round(2 * hs), 500);
                         ctx.fillText("☰", curX, y + h / 2 + Math.round((fs ? 4 : 3) * hs));
@@ -768,7 +769,7 @@ export function _drawClips(host, ctx, width) {
         const allClips = host.activeScene.clips || [];
         for (let _vli = 0; _vli < host._trackLayout.length; _vli++) {
             const _vlEntry = host._trackLayout[_vli];
-            if (_vlEntry.type !== TRACK_TYPE.VIDEO && _vlEntry.type !== TRACK_TYPE.MOTION_DRIVER) continue;
+            if (descriptorFor(_vlEntry.type)?.itemsSource?.listField !== "clips") continue;
             if (_vlEntry.collapsed) continue;
             const videoY = host._trackY(_vli);
             const videoH = host._trackH(_vli);
@@ -958,7 +959,7 @@ export function _drawClips(host, ctx, width) {
         const allAudioTracks = host.activeScene.audio_tracks || [];
         for (let _ali = 0; _ali < host._trackLayout.length; _ali++) {
             const _alEntry = host._trackLayout[_ali];
-            if (_alEntry.type !== TRACK_TYPE.AUDIO || _alEntry.collapsed) continue;
+            if (descriptorFor(_alEntry.type)?.itemsSource?.listField !== "audio_tracks" || _alEntry.collapsed) continue;
             const audioY = host._trackY(_ali);
             const audioH = host._trackH(_ali);
             const audioLaneHidden = _alEntry.hidden;
@@ -1322,8 +1323,7 @@ export function _hitTestTrackHeader(host, x, rawY) {
         if (x < zoneEnd) return { layoutIdx, zone: "hide" };
         // Fixed tracks carry a 4th "manage" icon (☰) opening the respective
         // management panel — discoverability for the guide/prompt tooling
-        if (entry.type === TRACK_TYPE.GUIDES || entry.type === TRACK_TYPE.PROMPT
-            || entry.type === TRACK_TYPE.PROMPT_GLOBAL) {
+        if (descriptorFor(entry.type)?.hasManageIcon) {
             zoneEnd += iconSize + Math.round(1 * hs);
             if (x < zoneEnd) return { layoutIdx, zone: "manage" };
         }
@@ -1342,7 +1342,7 @@ export function _hitTestClip(host, x, rawY) {
         const layoutIdx = host._layoutIndexFromRawY(rawY);
         if (layoutIdx < 0) return null;
         const entry = host._trackLayout[layoutIdx];
-        if ((entry.type !== TRACK_TYPE.VIDEO && entry.type !== TRACK_TYPE.MOTION_DRIVER) || entry.collapsed) return null;
+        if (descriptorFor(entry.type)?.itemsSource?.listField !== "clips" || entry.collapsed) return null;
         const clips = host.activeScene.clips || [];
         for (const clip of clips) {
             if (!host._clipMatchesTrackEntry(clip, entry)) continue;
@@ -1360,7 +1360,7 @@ export function _hitTestAudio(host, x, rawY) {
         const layoutIdx = host._layoutIndexFromRawY(rawY);
         if (layoutIdx < 0) return null;
         const entry = host._trackLayout[layoutIdx];
-        if (entry.type !== TRACK_TYPE.AUDIO || entry.collapsed) return null;
+        if (descriptorFor(entry.type)?.itemsSource?.listField !== "audio_tracks" || entry.collapsed) return null;
         const tracks = host.activeScene.audio_tracks || [];
         for (const track of tracks) {
             if ((track.lane_index || 0) !== entry.laneIndex) continue;
@@ -1445,7 +1445,7 @@ export function _hitTestEdge(host, x, rawY) {
             });
         };
 
-        if ((entry.type === TRACK_TYPE.VIDEO || entry.type === TRACK_TYPE.MOTION_DRIVER) && !entry.collapsed) {
+        if (descriptorFor(entry.type)?.itemsSource?.listField === "clips" && !entry.collapsed) {
             for (const clip of (host.activeScene.clips || [])) {
                 if (!host._clipMatchesTrackEntry(clip, entry)) continue;
                 const x1 = host._frameToX(clip.timeline_start_frame);
@@ -1455,7 +1455,7 @@ export function _hitTestEdge(host, x, rawY) {
             }
         }
 
-        if (entry.type === TRACK_TYPE.AUDIO && !entry.collapsed) {
+        if (descriptorFor(entry.type)?.itemsSource?.listField === "audio_tracks" && !entry.collapsed) {
             for (const track of (host.activeScene.audio_tracks || [])) {
                 if ((track.lane_index || 0) !== entry.laneIndex) continue;
                 const x1 = host._frameToX(track.timeline_start_frame);

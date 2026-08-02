@@ -29,6 +29,7 @@ import {
     isBuiltinModelTemplate,
     previewConstraintValues,
 } from "./editor_settings.js";
+import { VARIABLE_TRACK_TYPES, descriptorFor } from "./lane_registry.js";
 
 const DECIMAL_GB_BYTES = 1_000_000_000;
 const RENDER_CACHE_SIZE_PRESETS = [
@@ -213,7 +214,7 @@ function syncSettingsPanelControls() {
     if (controls.clipLabelVerticalAlign) controls.clipLabelVerticalAlign.value = this._settings.appearance.clipLabelVerticalAlign;
     if (controls.clipLabelHorizontalAlign) controls.clipLabelHorizontalAlign.value = this._settings.appearance.clipLabelHorizontalAlign;
     if (controls.sceneOutline) controls.sceneOutline.checked = this._settings.appearance.sceneOutline !== false;
-    for (const tintKey of ["video", "audio", "motion_driver"]) {
+    for (const tintKey of VARIABLE_TRACK_TYPES) {
         const tintInput = controls[`laneTintOverride_${tintKey}`];
         if (tintInput) {
             const stored = this._settings.appearance.laneTintOverrides?.[tintKey] || "";
@@ -1598,11 +1599,14 @@ function showSettingsPanel() {
         (checked) => updateCategory("appearance", "sceneOutline", checked)
     );
 
-    const laneTintSpecs = [
-        { key: "video", label: "Video Lane Tint", description: "Optional subtle color overlay on all video lane backgrounds." },
-        { key: "audio", label: "Audio Lane Tint", description: "Optional subtle color overlay on all audio lane backgrounds." },
-        { key: "motion_driver", label: "Driver Lane Tint", description: "Optional subtle color overlay on all driver lane backgrounds." },
-    ];
+    const laneTintSpecs = VARIABLE_TRACK_TYPES.map((trackType) => {
+        const descriptor = descriptorFor(trackType);
+        return {
+            key: trackType,
+            label: `${descriptor.menuLabel} Lane Tint`,
+            description: `Optional subtle color overlay on all ${descriptor.logLabel} lane backgrounds.`,
+        };
+    });
     for (const spec of laneTintSpecs) {
         const row = createRow(appearanceSection, spec.label, spec.description);
         const input = document.createElement("input");

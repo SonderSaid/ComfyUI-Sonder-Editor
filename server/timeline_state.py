@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from . import prompt_payload
+from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs
 
 logger = logging.getLogger("sonder_editor")
 
@@ -886,21 +887,16 @@ class Scene:
             data.get("linked_item_groups", [])
         )
         # Lane configs — deserialize + auto-pad to match lane counts
-        scene.video_lane_configs = [
-            LaneConfig.from_dict(c) for c in data.get("video_lane_configs", [])
-        ]
-        while len(scene.video_lane_configs) < scene.video_lane_count:
-            scene.video_lane_configs.append(LaneConfig())
-        scene.motion_driver_lane_configs = [
-            LaneConfig.from_dict(c) for c in data.get("motion_driver_lane_configs", [])
-        ]
-        while len(scene.motion_driver_lane_configs) < scene.motion_driver_lane_count:
-            scene.motion_driver_lane_configs.append(LaneConfig())
-        scene.audio_lane_configs = [
-            LaneConfig.from_dict(c) for c in data.get("audio_lane_configs", [])
-        ]
-        while len(scene.audio_lane_configs) < scene.audio_lane_count:
-            scene.audio_lane_configs.append(LaneConfig())
+        for descriptor in VARIABLE_LANE_DESCRIPTORS:
+            setattr(
+                scene,
+                descriptor.configs_attr,
+                [
+                    LaneConfig.from_dict(config)
+                    for config in data.get(descriptor.configs_attr, [])
+                ],
+            )
+        pad_lane_configs(scene, LaneConfig)
         scene.guide_track_config = LaneConfig.from_dict(data.get("guide_track_config", {}))
         scene.prompt_track_config = LaneConfig.from_dict(data.get("prompt_track_config", {}))
         raw_global_config = data.get("global_prompt_track_config")
