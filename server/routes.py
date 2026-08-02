@@ -92,8 +92,11 @@ from .session_registry import (
 )
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
-    ClipReference, LaneConfig, GenerationJob, apply_color_metadata, classify_asset_path,
-    effective_scene_fps, media_timeline_frames, retime_scene_geometry,
+    ClipReference, LaneConfig, GenerationJob, ReferenceEntity, ReferenceMember,
+    REFERENCE_CLASSES, REFERENCE_KINDS, REFERENCE_TAG_NAMESPACE, REFERENCE_TAG_PRESETS,
+    apply_color_metadata, classify_asset_path, default_reference_class,
+    effective_scene_fps, media_timeline_frames, normalize_reference_tags,
+    retime_scene_geometry,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
@@ -2853,6 +2856,428 @@ def _apply_queue_mutation_operations(project: TimelineProject, operations: list)
     }
 
 
+# ---------------------------------------------------------------------------
+# Reference Library mutations
+# ---------------------------------------------------------------------------
+
+_REFERENCE_PRESET_BY_ID = {
+    str(preset["id"]).casefold(): preset
+    for preset in REFERENCE_TAG_PRESETS
+}
+_REFERENCE_ENTITY_FIELDS = {"name", "kind", "reference_class", "notes"}
+_REFERENCE_MEMBER_FIELDS = {
+    "asset_id", "tags", "prompt", "crop", "source_start_sec", "source_end_sec",
+}
+
+
+def _reference_catalog_payload() -> list[dict]:
+    return [
+        {
+            "id": str(preset["id"]),
+            "label": str(preset["label"]),
+            "asset_types": list(preset.get("asset_types", [])),
+            "suggested_kinds": list(preset.get("suggested_kinds", [])),
+            "requires_audio": bool(preset.get("requires_audio", False)),
+        }
+        for preset in REFERENCE_TAG_PRESETS
+    ]
+
+
+def _references_payload(project: TimelineProject) -> dict:
+    return {
+        "project_id": project.project_id,
+        "modified_at": project.modified_at,
+        "references": [reference.to_dict() for reference in project.references],
+        "tag_presets": _reference_catalog_payload(),
+    }
+
+
+def _find_reference(project: TimelineProject, reference_id: str) -> ReferenceEntity:
+    reference = next(
+        (candidate for candidate in project.references if candidate.reference_id == reference_id),
+        None,
+    )
+    if reference is None:
+        _mutation_error(f"Reference not found: {reference_id}", 404, "item_not_found")
+    return reference
+
+
+def _find_reference_member(reference: ReferenceEntity, member_id: str) -> ReferenceMember:
+    member = next(
+        (candidate for candidate in reference.members if candidate.member_id == member_id),
+        None,
+    )
+    if member is None:
+        _mutation_error(f"Reference member not found: {member_id}", 404, "item_not_found")
+    return member
+
+
+def _require_expected(expected, required_keys: set[str], label: str) -> dict:
+    if not isinstance(expected, dict) or not required_keys.issubset(expected.keys()):
+        _mutation_error(
+            f"{label} requires expected prior values",
+            400,
+            "missing_expected_identity",
+        )
+    return expected
+
+
+def _validate_reference_expected(reference: ReferenceEntity, expected: dict, keys) -> None:
+    current = reference.to_dict()
+    for key in keys:
+        if key == "member_ids":
+            value = [member.member_id for member in reference.members]
+        else:
+            value = current.get(key)
+        if not _expected_matches(value, expected.get(key)):
+            _mutation_error("Reference identity mismatch", 409, "identity_mismatch")
+
+
+def _validate_reference_member_expected(member: ReferenceMember, expected: dict, keys) -> None:
+    current = member.to_dict()
+    for key in keys:
+        if not _expected_matches(current.get(key), expected.get(key)):
+            _mutation_error("Reference member identity mismatch", 409, "identity_mismatch")
+
+
+def _validated_reference_name(value) -> str:
+    name = str(value or "").strip()
+    if not name:
+        _mutation_error("Reference name is required", 400, "invalid_reference")
+    return name
+
+
+def _validated_reference_kind(value) -> str:
+    kind = str(value or "")
+    if kind not in REFERENCE_KINDS:
+        _mutation_error("Invalid reference kind", 400, "invalid_reference")
+    return kind
+
+
+def _validated_reference_class(value) -> str:
+    reference_class = str(value or "")
+    if reference_class not in REFERENCE_CLASSES:
+        _mutation_error("Invalid reference class", 400, "invalid_reference")
+    return reference_class
+
+
+def _validated_reference_tags(raw_tags, asset: Asset) -> list[str]:
+    if raw_tags is None:
+        raw_tags = []
+    if not isinstance(raw_tags, list) or any(not isinstance(tag, str) for tag in raw_tags):
+        _mutation_error("Reference tags must be a list of strings", 400, "invalid_reference_member")
+    tags = normalize_reference_tags(raw_tags)
+    validated = []
+    for tag in tags:
+        key = tag.casefold()
+        preset = _REFERENCE_PRESET_BY_ID.get(key)
+        if preset is not None:
+            asset_type = str(asset.asset_type or "")
+            has_required_audio = (
+                not preset.get("requires_audio", False)
+                or asset_type == "audio"
+                or (asset_type == "video" and bool(asset.has_audio))
+            )
+            if asset_type not in set(preset.get("asset_types", [])) or not has_required_audio:
+                _mutation_error(
+                    f"Tag {preset['id']} is not compatible with {asset_type} assets",
+                    400,
+                    "reference_tag_asset_mismatch",
+                )
+            validated.append(str(preset["id"]))
+        elif key.startswith(REFERENCE_TAG_NAMESPACE):
+            _mutation_error(
+                f"Unknown reserved reference tag: {tag}",
+                400,
+                "invalid_reference_tag",
+            )
+        else:
+            validated.append(tag)
+    return validated
+
+
+def _validated_reference_crop(raw_crop, asset_type: str) -> dict | None:
+    if raw_crop is None:
+        return None
+    if asset_type not in {"image", "video"}:
+        _mutation_error("Reference crop is available only for image and video members", 400, "invalid_reference_crop")
+    if not isinstance(raw_crop, dict):
+        _mutation_error("Reference crop must be an object or null", 400, "invalid_reference_crop")
+    try:
+        crop = {key: float(raw_crop[key]) for key in ("x", "y", "w", "h")}
+    except (KeyError, TypeError, ValueError, OverflowError):
+        _mutation_error("Reference crop requires finite x, y, w, and h", 400, "invalid_reference_crop")
+    if not all(math.isfinite(value) for value in crop.values()):
+        _mutation_error("Reference crop requires finite x, y, w, and h", 400, "invalid_reference_crop")
+    if crop["x"] < 0 or crop["y"] < 0 or crop["w"] <= 0 or crop["h"] <= 0:
+        _mutation_error("Reference crop is outside normalized source bounds", 400, "invalid_reference_crop")
+    if crop["x"] + crop["w"] > 1.0 + 1e-9 or crop["y"] + crop["h"] > 1.0 + 1e-9:
+        _mutation_error("Reference crop is outside normalized source bounds", 400, "invalid_reference_crop")
+    return crop
+
+
+def _validated_reference_source_range(raw_start, raw_end, _asset_type: str) -> tuple[float, float | None]:
+    try:
+        start = float(0.0 if raw_start is None else raw_start)
+    except (TypeError, ValueError, OverflowError):
+        _mutation_error("Reference source start must be finite", 400, "invalid_reference_range")
+    if not math.isfinite(start) or start < 0:
+        _mutation_error("Reference source start must be non-negative", 400, "invalid_reference_range")
+    if raw_end is None or raw_end == "":
+        end = None
+    else:
+        try:
+            end = float(raw_end)
+        except (TypeError, ValueError, OverflowError):
+            _mutation_error("Reference source end must be finite", 400, "invalid_reference_range")
+        if not math.isfinite(end) or end <= start:
+            _mutation_error("Reference source end must be greater than start", 400, "invalid_reference_range")
+    return start, end
+
+
+def _reference_asset(project: TimelineProject, asset_id: str) -> Asset:
+    asset = project.get_asset(str(asset_id or ""))
+    if asset is None:
+        _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
+    if asset.asset_type not in {"image", "audio", "video"}:
+        _mutation_error("Reference members accept image, audio, or video assets", 400, "invalid_reference_asset")
+    return asset
+
+
+def _new_reference_id(project: TimelineProject, *, member: bool = False) -> str:
+    existing = {
+        candidate.member_id
+        for reference in project.references
+        for candidate in reference.members
+    } if member else {reference.reference_id for reference in project.references}
+    while True:
+        candidate = uuid.uuid4().hex
+        if candidate not in existing:
+            return candidate
+
+
+def _member_from_fields(project: TimelineProject, fields: dict, *, member_id: str = "", order: int = 0) -> ReferenceMember:
+    if not isinstance(fields, dict):
+        _mutation_error("Reference member fields must be an object", 400, "invalid_reference_member")
+    unknown = set(fields).difference(_REFERENCE_MEMBER_FIELDS)
+    if unknown:
+        _mutation_error(f"Unsupported member fields: {', '.join(sorted(unknown))}", 400, "invalid_reference_mutation")
+    asset = _reference_asset(project, str(fields.get("asset_id", "") or ""))
+    tags = _validated_reference_tags(fields.get("tags", []), asset)
+    crop = _validated_reference_crop(fields.get("crop"), asset.asset_type)
+    start, end = _validated_reference_source_range(
+        fields.get("source_start_sec", 0.0),
+        fields.get("source_end_sec"),
+        asset.asset_type,
+    )
+    return ReferenceMember(
+        member_id=member_id or _new_reference_id(project, member=True),
+        asset_id=asset.asset_id,
+        tags=tags,
+        prompt=str(fields.get("prompt", "") or ""),
+        crop=crop,
+        order=order,
+        source_start_sec=start,
+        source_end_sec=end,
+    )
+
+
+def _apply_create_reference(project: TimelineProject, fields: dict) -> ReferenceEntity:
+    if not isinstance(fields, dict):
+        _mutation_error("Reference fields must be an object", 400, "invalid_reference")
+    unknown = set(fields).difference(_REFERENCE_ENTITY_FIELDS)
+    if unknown:
+        _mutation_error(f"Unsupported reference fields: {', '.join(sorted(unknown))}", 400, "invalid_reference_mutation")
+    kind = _validated_reference_kind(fields.get("kind", "character"))
+    reference = ReferenceEntity(
+        reference_id=_new_reference_id(project),
+        name=_validated_reference_name(fields.get("name")),
+        kind=kind,
+        reference_class=_validated_reference_class(
+            fields.get("reference_class", default_reference_class(kind))
+        ),
+        notes=str(fields.get("notes", "") or ""),
+        members=[],
+    )
+    project.references.append(reference)
+    return reference
+
+
+def _apply_update_reference(project: TimelineProject, operation: dict) -> ReferenceEntity:
+    reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
+    fields = operation.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        _mutation_error("update_reference requires fields", 400, "invalid_reference_mutation")
+    unknown = set(fields).difference(_REFERENCE_ENTITY_FIELDS)
+    if unknown:
+        _mutation_error(f"Unsupported reference fields: {', '.join(sorted(unknown))}", 400, "invalid_reference_mutation")
+    expected = _require_expected(operation.get("expected"), set(fields), "update_reference")
+    _validate_reference_expected(reference, expected, fields.keys())
+    if "name" in fields:
+        reference.name = _validated_reference_name(fields["name"])
+    if "kind" in fields:
+        reference.kind = _validated_reference_kind(fields["kind"])
+    if "reference_class" in fields:
+        reference.reference_class = _validated_reference_class(fields["reference_class"])
+    if "notes" in fields:
+        reference.notes = str(fields["notes"] or "")
+    return reference
+
+
+def _apply_delete_reference(project: TimelineProject, operation: dict) -> ReferenceEntity:
+    reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
+    required = {"name", "kind", "reference_class", "notes", "member_ids"}
+    expected = _require_expected(operation.get("expected"), required, "delete_reference")
+    _validate_reference_expected(reference, expected, required)
+    project.references = [candidate for candidate in project.references if candidate is not reference]
+    return reference
+
+
+def _apply_create_reference_member(project: TimelineProject, operation: dict) -> ReferenceMember:
+    reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
+    member = _member_from_fields(project, operation.get("fields"), order=len(reference.members))
+    reference.members.append(member)
+    return member
+
+
+def _apply_update_reference_member(project: TimelineProject, operation: dict) -> ReferenceMember:
+    reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
+    member = _find_reference_member(reference, str(operation.get("member_id", "") or ""))
+    fields = operation.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        _mutation_error("update_member requires fields", 400, "invalid_reference_mutation")
+    unknown = set(fields).difference(_REFERENCE_MEMBER_FIELDS)
+    if unknown:
+        _mutation_error(f"Unsupported member fields: {', '.join(sorted(unknown))}", 400, "invalid_reference_mutation")
+    expected = _require_expected(operation.get("expected"), set(fields), "update_member")
+    _validate_reference_member_expected(member, expected, fields.keys())
+    prospective = member.to_dict()
+    prospective.pop("member_id", None)
+    prospective.pop("order", None)
+    prospective.update(fields)
+    replacement = _member_from_fields(
+        project,
+        prospective,
+        member_id=member.member_id,
+        order=member.order,
+    )
+    member.asset_id = replacement.asset_id
+    member.tags = replacement.tags
+    member.prompt = replacement.prompt
+    member.crop = replacement.crop
+    member.source_start_sec = replacement.source_start_sec
+    member.source_end_sec = replacement.source_end_sec
+    return member
+
+
+def _apply_delete_reference_member(project: TimelineProject, operation: dict) -> ReferenceMember:
+    reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
+    member = _find_reference_member(reference, str(operation.get("member_id", "") or ""))
+    required = set(member.to_dict())
+    expected = _require_expected(operation.get("expected"), required, "delete_member")
+    _validate_reference_member_expected(member, expected, required)
+    reference.members = [candidate for candidate in reference.members if candidate is not member]
+    for order, candidate in enumerate(reference.members):
+        candidate.order = order
+    return member
+
+
+def _apply_reorder_reference_members(project: TimelineProject, operation: dict) -> ReferenceEntity:
+    reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
+    expected_ids = operation.get("expected_member_ids")
+    desired_ids = operation.get("member_ids")
+    if not isinstance(expected_ids, list) or not isinstance(desired_ids, list):
+        _mutation_error("reorder_members requires expected_member_ids and member_ids", 400, "invalid_reference_mutation")
+    current_ids = [member.member_id for member in reference.members]
+    if current_ids != [str(member_id) for member_id in expected_ids]:
+        _mutation_error("Reference member order changed", 409, "identity_mismatch")
+    desired_ids = [str(member_id) for member_id in desired_ids]
+    if len(desired_ids) != len(set(desired_ids)) or set(desired_ids) != set(current_ids):
+        _mutation_error("Member order must be an exact permutation", 409, "reference_member_set_changed")
+    by_id = {member.member_id: member for member in reference.members}
+    reference.members = [by_id[member_id] for member_id in desired_ids]
+    for order, member in enumerate(reference.members):
+        member.order = order
+    return reference
+
+
+def _apply_reference_mutation_operations(project: TimelineProject, operations: list) -> dict:
+    results = []
+    for operation in operations:
+        if not isinstance(operation, dict):
+            _mutation_error("Reference operation must be an object", 400, "invalid_reference_mutation")
+        op_type = str(operation.get("type", "") or "")
+        if op_type == "create_reference":
+            reference = _apply_create_reference(project, operation.get("fields"))
+            results.append({"type": op_type, "reference_id": reference.reference_id})
+        elif op_type == "update_reference":
+            reference = _apply_update_reference(project, operation)
+            results.append({"type": op_type, "reference_id": reference.reference_id})
+        elif op_type == "delete_reference":
+            reference = _apply_delete_reference(project, operation)
+            results.append({"type": op_type, "reference_id": reference.reference_id})
+        elif op_type == "create_member":
+            member = _apply_create_reference_member(project, operation)
+            results.append({
+                "type": op_type,
+                "reference_id": str(operation.get("reference_id", "") or ""),
+                "member_id": member.member_id,
+            })
+        elif op_type == "update_member":
+            member = _apply_update_reference_member(project, operation)
+            results.append({"type": op_type, "member_id": member.member_id})
+        elif op_type == "delete_member":
+            member = _apply_delete_reference_member(project, operation)
+            results.append({"type": op_type, "member_id": member.member_id})
+        elif op_type == "reorder_members":
+            reference = _apply_reorder_reference_members(project, operation)
+            results.append({"type": op_type, "reference_id": reference.reference_id})
+        else:
+            _mutation_error(f"Unsupported reference operation: {op_type}", 400, "unsupported_reference_mutation")
+    return {
+        "status": "ok",
+        "operation_count": len(operations),
+        "results": results,
+        **_references_payload(project),
+    }
+
+
+def _apply_reference_mutations_sync(request: web.Request, operations: list) -> tuple[TimelineProject, dict]:
+    project = _load_project_from_request(request)
+    payload = _apply_reference_mutation_operations(project, operations)
+    save_project(project)
+    payload.update(_references_payload(project))
+    return project, payload
+
+
+def _remove_reference_members_for_assets(project: TimelineProject, asset_ids: set[str]) -> dict:
+    removed = []
+    affected_reference_ids = []
+    for reference in project.references:
+        kept = []
+        reference_removed = []
+        for member in reference.members:
+            if member.asset_id in asset_ids:
+                reference_removed.append(member)
+            else:
+                kept.append(member)
+        if reference_removed:
+            reference.members = kept
+            for order, member in enumerate(reference.members):
+                member.order = order
+            affected_reference_ids.append(reference.reference_id)
+            removed.extend({
+                "reference_id": reference.reference_id,
+                "member_id": member.member_id,
+                "asset_id": member.asset_id,
+            } for member in reference_removed)
+    return {
+        "reference_members_removed": len(removed),
+        "affected_reference_ids": affected_reference_ids,
+        "removed_reference_members": removed,
+    }
+
+
 def _asset_abspath(project: TimelineProject, asset: Asset) -> str:
     asset_path = getattr(asset, "path", "") or ""
     if not asset_path:
@@ -4419,6 +4844,7 @@ def _usage_sort_key(project: TimelineProject, usage: dict) -> tuple:
         usage.get("clip_id")
         or usage.get("track_id")
         or usage.get("job_id")
+        or usage.get("member_id")
         or ""
     )
     return (
@@ -4467,6 +4893,21 @@ def _find_asset_usages(project: TimelineProject, asset: Asset) -> dict:
                     "scene_name": scene.name,
                     "frame_index": guide.frame_index,
                     "strength": guide.strength,
+                })
+
+    for reference in project.references:
+        for member in reference.members:
+            if member.asset_id == asset.asset_id:
+                usages.append({
+                    "asset_id": asset.asset_id,
+                    "type": "reference_member",
+                    "scene_id": "",
+                    "scene_name": "Reference Library",
+                    "reference_id": reference.reference_id,
+                    "reference_name": reference.name,
+                    "member_id": member.member_id,
+                    "tags": list(member.tags),
+                    "order": member.order,
                 })
 
     for job in project.generation_queue:
@@ -5624,6 +6065,42 @@ if routes is not None:
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
+    @routes.get("/sonder-editor/project/{project_id}/references")
+    async def api_get_references(request: web.Request) -> web.Response:
+        try:
+            project = await asyncio.to_thread(
+                _load_project_from_request,
+                request,
+                repair_missing_frames=False,
+            )
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        return web.json_response(_references_payload(project))
+
+    @routes.post("/sonder-editor/project/{project_id}/references/mutations")
+    async def api_apply_reference_mutations(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("Reference mutation body must be an object", 400)
+        operations = body.get("operations", [])
+        if not isinstance(operations, list) or not operations:
+            return _json_error("operations must be a non-empty list", 400)
+        try:
+            project, payload = await asyncio.to_thread(
+                _apply_reference_mutations_sync,
+                request,
+                operations,
+            )
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+        _remember_request_project(request, project)
+        return web.json_response(payload)
+
     @routes.get("/sonder-editor/project/{project_id}/dormant_summary")
     async def api_get_dormant_summary(request: web.Request) -> web.Response:
         try:
@@ -6555,6 +7032,7 @@ if routes is not None:
             }, status=409)
 
         try:
+            reference_cleanup = _remove_reference_members_for_assets(project, {asset.asset_id})
             payload = _delete_project_asset(project, asset, usage["usage_count"])
         except ValueError as e:
             return _json_error(str(e), 400)
@@ -6562,6 +7040,7 @@ if routes is not None:
             return _json_error(str(e), 500)
 
         save_project(project)
+        payload.update(reference_cleanup)
         return web.json_response(payload)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-permanent-delete")
@@ -6595,6 +7074,10 @@ if routes is not None:
         deleted_ids = []
         try:
             _require_asset_media_sources(project, assets, operation="Asset bulk delete")
+            reference_cleanup = _remove_reference_members_for_assets(
+                project,
+                {asset.asset_id for asset in assets},
+            )
             for asset in assets:
                 _delete_project_asset(project, asset)
                 deleted_ids.append(asset.asset_id)
@@ -6607,6 +7090,7 @@ if routes is not None:
         return web.json_response({
             "deleted": deleted_ids,
             "usages_orphaned": usage["usage_count"],
+            **reference_cleanup,
         })
 
     @routes.post("/sonder-editor/project/{project_id}/assets/empty-trash")
@@ -6620,6 +7104,10 @@ if routes is not None:
         try:
             trashed_assets = list(_project_trashed_assets(project))
             _require_asset_media_sources(project, trashed_assets, operation="Asset empty trash")
+            reference_cleanup = _remove_reference_members_for_assets(
+                project,
+                {asset.asset_id for asset in trashed_assets},
+            )
             for asset in trashed_assets:
                 _delete_project_asset(project, asset)
                 deleted_ids.append(asset.asset_id)
@@ -6632,6 +7120,7 @@ if routes is not None:
         return web.json_response({
             "deleted": deleted_ids,
             "emptied": len(deleted_ids),
+            **reference_cleanup,
         })
 
     @routes.put("/sonder-editor/project/{project_id}/assets/{asset_id}")

@@ -84,6 +84,9 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
 - **Asset gallery** — project-scoped assets and artifacts, folders, inspector,
   compare mode, trash/restore, favorites, reference-aware deletes, and tracked
   generation metadata.
+- **Reference Library** — project-durable character, location, prop, and outfit
+  collections with image/audio/video members, hybrid tags, prompts, visual
+  crop/trim editing, and conflict-safe authoring in fullscreen or mounted mode.
 - **Timeline export** — export video/audio with a frame-streaming CPU
   compositing path; practical duration is bounded by disk space rather than RAM.
 - **Color-managed exports** — video presets encode and tag BT.709, and timeline

@@ -27,8 +27,8 @@ From top to bottom:
 
 1. **Header bar** — project pill, scene switcher (‹ › and the scene pill),
    **+ Scene**, and **Mount in Tab** / **✕ Exit**.
-2. **Top row** — the **Assets sidebar** on the left (with the **Render Queue**
-   panel docked at its bottom) and the **Viewport** in the center with its
+2. **Top row** — the **Assets | References sidebar** on the left (Assets keeps
+   the **Render Queue** panel docked at its bottom) and the **Viewport** in the center with its
    transport bar (Play, frame counter, clickable progress bar).
 3. **Toolbar** — grouped controls: undo/redo, the generation-window block,
    timeline tools, view tools, queue & export, scene geometry, and the
@@ -39,6 +39,11 @@ From top to bottom:
 The sidebar width and timeline height are drag-resizable and remembered
 between sessions (**Settings ▸ Layout & UI Scale ▸ Reset Editor Layout**
 clears them).
+
+**References** is the project-level authoring Library for reusable character,
+location, prop, outfit, voice, and video media. It stays beside the viewport but does
+not place anything on the timeline in this phase. See
+[Assets & Gallery › Reference Library](assets-and-gallery.md#reference-library).
 
 ## The timeline
 
@@ -250,5 +255,5 @@ you're typing in a text field.
 | ? | Shortcut overlay |
 | Esc | Exit fullscreen / dismiss overlay / clear selection |
 
-Gallery and inspect-overlay shortcuts are listed in
+Gallery, inspect-overlay, and focused Reference-media shortcuts are listed in
 [Assets & Gallery](assets-and-gallery.md).

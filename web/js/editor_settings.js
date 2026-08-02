@@ -294,6 +294,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         labelWidth: 0,
         labelWidthFullscreen: 0,
         fullscreenSidebarWidth: 0,
+        fullscreenSidebarContent: "assets",
         fullscreenTimelineHeight: 0,
     },
     timelineBehavior: {
@@ -412,6 +413,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         audioCompareWaveformLayout: "stacked",
         audioCompareMonitor: "a",
         compareCycleSide: "B",
+        referenceMediaViewMode: "source",
     },
 };
 
@@ -426,6 +428,7 @@ const VALID_CLIP_LABEL_MODES = new Set(CLIP_LABEL_MODE_OPTIONS.map((entry) => en
 const VALID_CLIP_LABEL_VERTICAL_ALIGNS = new Set(CLIP_LABEL_VERTICAL_ALIGN_OPTIONS.map((entry) => entry.value));
 const VALID_CLIP_LABEL_HORIZONTAL_ALIGNS = new Set(CLIP_LABEL_HORIZONTAL_ALIGN_OPTIONS.map((entry) => entry.value));
 const VALID_TIMECODE_MODES = new Set(TIMECODE_MODE_OPTIONS.map((entry) => entry.value));
+const VALID_FULLSCREEN_SIDEBAR_CONTENT = new Set(["assets", "references"]);
 const VALID_SAVE_PRESETS = new Set(SAVE_PRESET_OPTIONS.map((entry) => entry.value));
 const VALID_SNAP_TARGETS = new Set(SNAP_TARGET_OPTIONS.map((entry) => entry.key));
 const BUILTIN_MODEL_TEMPLATE_IDS = new Set(BUILTIN_MODEL_TEMPLATES.map((entry) => entry.id));
@@ -448,6 +451,7 @@ const VALID_COMPARE_LAYOUTS = new Set(["divider", "sideBySide"]);
 const VALID_AUDIO_COMPARE_WAVEFORM_LAYOUTS = new Set(["stacked", "overlay"]);
 const VALID_AUDIO_COMPARE_MONITORS = new Set(["a", "b", "both", "mute"]);
 const VALID_COMPARE_CYCLE_SIDES = new Set(["A", "B"]);
+const VALID_REFERENCE_MEDIA_VIEW_MODES = new Set(["source", "result"]);
 export const VALID_TAKE_PLACEMENT_MODES = new Set(TAKE_PLACEMENT_MODE_OPTIONS.map((entry) => entry.value));
 
 // Per-item fit modes (mirror server/media_helpers.py FIT_MODES / CROP_POSITIONS).
@@ -1012,6 +1016,9 @@ function normalizeEditorSettings(source = null) {
                 defaults.layout.fullscreenSidebarWidth,
                 true,
             ),
+            fullscreenSidebarContent: VALID_FULLSCREEN_SIDEBAR_CONTENT.has(stored?.layout?.fullscreenSidebarContent)
+                ? stored.layout.fullscreenSidebarContent
+                : defaults.layout.fullscreenSidebarContent,
             fullscreenTimelineHeight: clampNumber(
                 pickDefined(stored?.layout?.fullscreenTimelineHeight, legacyLayout.fullscreenTimelineHeight),
                 0,
@@ -1290,6 +1297,9 @@ function normalizeEditorSettings(source = null) {
             compareCycleSide: VALID_COMPARE_CYCLE_SIDES.has(stored?.inspector?.compareCycleSide)
                 ? stored.inspector.compareCycleSide
                 : defaults.inspector.compareCycleSide,
+            referenceMediaViewMode: VALID_REFERENCE_MEDIA_VIEW_MODES.has(stored?.inspector?.referenceMediaViewMode)
+                ? stored.inspector.referenceMediaViewMode
+                : defaults.inspector.referenceMediaViewMode,
         },
     };
 }

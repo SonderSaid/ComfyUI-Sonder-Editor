@@ -34,6 +34,8 @@ import {
     installChromeScrollbarStyles,
     statusPillCss,
 } from "./editor_theme.js";
+import { resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
+import { mountMediaScrubBar } from "./media_scrub_bar.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
@@ -762,6 +764,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         overlayState: {
             open: false,
             assetId: "",
+            origin: "gallery",
             zoomLevel: 1,
             panX: 0,
             panY: 0,
@@ -2197,13 +2200,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             audio_track: 0,
             guide_frame: 0,
             generation_job: 0,
+            reference_member: 0,
         };
         for (const usage of usages || []) {
             if (Object.prototype.hasOwnProperty.call(counts, usage?.type)) {
                 counts[usage.type] += 1;
             }
         }
-        counts.total = counts.clip + counts.audio_track + counts.guide_frame + counts.generation_job;
+        counts.total = counts.clip + counts.audio_track + counts.guide_frame + counts.generation_job + counts.reference_member;
         return counts;
     }
 
@@ -2212,6 +2216,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (type === "audio_track") return "Audio Track";
         if (type === "guide_frame") return "Guide Frame";
         if (type === "generation_job") return "Generation Job";
+        if (type === "reference_member") return "Reference Member";
         return "Usage";
     }
 
@@ -2228,6 +2233,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
         if (usage.type === "generation_job") {
             return `${usage.status || "pending"} | ${usage.job_id || "job"}`;
+        }
+        if (usage.type === "reference_member") {
+            const tags = Array.isArray(usage.tags) && usage.tags.length ? ` | ${usage.tags.join(", ")}` : "";
+            return `${usage.reference_name || "Untitled Reference"}${tags}`;
         }
         return "";
     }
@@ -2491,6 +2500,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 `Audio: ${counts.audio_track}`,
                 `Guides: ${counts.guide_frame}`,
                 `Queue: ${counts.generation_job}`,
+                `References: ${counts.reference_member}`,
             );
         }
         if (favoriteCount > 0) {
@@ -2533,8 +2543,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                     `Audio: ${counts.audio_track}`,
                     `Guides: ${counts.guide_frame}`,
                     `Queue: ${counts.generation_job}`,
+                    `Library memberships: ${counts.reference_member} (will be removed)`,
                     "",
-                    "Existing references will stay in place and become missing placeholders.",
+                    "Timeline and queue references will stay in place as missing placeholders.",
                 ].join("\n")
                 : `Permanently delete "${assetDisplayName(asset)}"? This cannot be undone.`;
             if (!confirm(message)) return;
@@ -2573,8 +2584,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                     `Audio: ${counts.audio_track}`,
                     `Guides: ${counts.guide_frame}`,
                     `Queue: ${counts.generation_job}`,
+                    `Library memberships: ${counts.reference_member} (will be removed)`,
                     "",
-                    "Existing references will stay in place and become missing placeholders.",
+                    "Timeline and queue references will stay in place as missing placeholders.",
                 ].join("\n")
                 : `Permanently delete ${ids.length} selected asset(s)? This cannot be undone.`;
             if (!confirm(message)) return;
@@ -3089,82 +3101,6 @@ export function mountSharedAssetGallery(container, options = {}) {
         return panel;
     }
 
-    function renderMediaScrubBar(mediaEl, opts = {}) {
-        const fps = Number(opts.fps) || 0;
-        const wrap = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.03);border:1px solid ${CHROME.borderSoft};`);
-        const track = style(document.createElement("div"), `position:relative;flex:1 1 auto;height:10px;border-radius:999px;background:#1a2631;cursor:pointer;overflow:hidden;`);
-        const fill = style(document.createElement("div"), `position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#6fa7d8,#8fc0f0);`);
-        const thumb = style(document.createElement("div"), `position:absolute;top:50%;width:12px;height:12px;border-radius:50%;background:#d9ebfb;border:1px solid rgba(0,0,0,0.35);transform:translate(-50%,-50%);left:100%;pointer-events:none;box-shadow:0 1px 3px rgba(0,0,0,0.35);`);
-        fill.appendChild(thumb);
-        track.appendChild(fill);
-        const label = style(document.createElement("div"), `color:#a9bccb;font-size:10px;white-space:nowrap;min-width:72px;text-align:right;`);
-        wrap.append(track, label);
-
-        let dragging = false;
-
-        const duration = () => {
-            const value = Number(mediaEl?.duration);
-            return Number.isFinite(value) && value > 0 ? value : 0;
-        };
-
-        const updateUI = () => {
-            const total = duration();
-            const current = clamp(Number(mediaEl?.currentTime) || 0, 0, total || Number.MAX_SAFE_INTEGER);
-            const ratio = total > 0 ? current / total : 0;
-            fill.style.width = `${ratio * 100}%`;
-            label.textContent = formatScrubLabel(current, total, fps);
-        };
-
-        const seekFromClientX = (clientX) => {
-            const total = duration();
-            if (!total) return;
-            const rect = track.getBoundingClientRect();
-            const ratio = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-            mediaEl.currentTime = ratio * total;
-            updateUI();
-        };
-
-        const handlePointerMove = (event) => {
-            if (!dragging) return;
-            seekFromClientX(event.clientX);
-        };
-        const handlePointerUp = (event) => {
-            if (!dragging) return;
-            dragging = false;
-            seekFromClientX(event.clientX);
-            window.removeEventListener("mousemove", handlePointerMove);
-            window.removeEventListener("mouseup", handlePointerUp);
-        };
-        const handlePointerDown = (event) => {
-            event.preventDefault();
-            dragging = true;
-            seekFromClientX(event.clientX);
-            window.addEventListener("mousemove", handlePointerMove);
-            window.addEventListener("mouseup", handlePointerUp);
-        };
-
-        track.addEventListener("mousedown", handlePointerDown);
-        mediaEl?.addEventListener?.("timeupdate", updateUI);
-        mediaEl?.addEventListener?.("loadedmetadata", updateUI);
-        mediaEl?.addEventListener?.("durationchange", updateUI);
-        mediaEl?.addEventListener?.("ended", updateUI);
-        updateUI();
-
-        return {
-            el: wrap,
-            cleanup() {
-                dragging = false;
-                window.removeEventListener("mousemove", handlePointerMove);
-                window.removeEventListener("mouseup", handlePointerUp);
-                track.removeEventListener("mousedown", handlePointerDown);
-                mediaEl?.removeEventListener?.("timeupdate", updateUI);
-                mediaEl?.removeEventListener?.("loadedmetadata", updateUI);
-                mediaEl?.removeEventListener?.("durationchange", updateUI);
-                mediaEl?.removeEventListener?.("ended", updateUI);
-            },
-        };
-    }
-
     function renderSynchronizedScrubBar(mediaEls, opts = {}) {
         const mediaList = (mediaEls || []).filter(Boolean);
         const { transport = null } = opts;
@@ -3650,15 +3586,23 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function overlayAssets() {
-        return activeNavigableAssets();
+        return resolveInspectOverlayScope({
+            origin: state.overlayState.origin,
+            requestedAssetId: state.overlayState.assetId,
+            visibleAssets: activeNavigableAssets(),
+            sortedProjectAssets: sortAssets(data.assets),
+        }).assets;
     }
 
     function currentOverlayAsset() {
         const assetId = state.overlayState.assetId;
         if (!assetId) return null;
-        const fromVisible = overlayAssets().find((asset) => asset.asset_id === assetId);
-        if (fromVisible) return fromVisible;
-        return filteredAssets().find((asset) => asset.asset_id === assetId) || null;
+        return resolveInspectOverlayScope({
+            origin: state.overlayState.origin,
+            requestedAssetId: assetId,
+            visibleAssets: activeNavigableAssets(),
+            sortedProjectAssets: sortAssets(data.assets),
+        }).asset;
     }
 
     function sameTypeOverlayAssets(asset) {
@@ -3680,6 +3624,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         clearOverlayRuntime();
         state.overlayState.open = false;
         state.overlayState.assetId = "";
+        state.overlayState.origin = "gallery";
         state.overlayState.compareMode = false;
         state.overlayState.showMetadata = false;
         state.overlayState.compareLeftAssetId = "";
@@ -4289,10 +4234,16 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
     }
 
-    function openInspectOverlay(asset) {
+    function openInspectOverlay(asset, { origin = "gallery" } = {}) {
         if (!asset || isTrashed(asset)) return;
+        if (state.overlayState.open && state.overlayState.assetId !== asset.asset_id) {
+            clearOverlayRuntime();
+            state.overlayState.carriedMediaState = null;
+            state.overlayState.mediaSignature = "";
+        }
         state.overlayState.open = true;
         state.overlayState.assetId = asset.asset_id;
+        state.overlayState.origin = origin === "direct" ? "direct" : "gallery";
         state.overlayState.compareMode = false;
         state.overlayState.showMetadata = false;
         state.overlayState.compareLeftAssetId = asset.asset_id;
@@ -4306,6 +4257,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.showWaveform = false;
         resetOverlayTransform();
         renderInspectOverlay();
+    }
+
+    function inspectAsset(assetId) {
+        const asset = (data.assets || []).find((entry) => entry?.asset_id === assetId);
+        if (!asset || !["image", "audio", "video"].includes(asset.asset_type) || !asset.path || isTrashed(asset) || assetIsMissing(asset)) return false;
+        openInspectOverlay(asset, { origin: "direct" });
+        return true;
     }
 
     function renderSingleOverlay(asset, host) {
@@ -4364,7 +4322,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             video.addEventListener("pause", syncPlayPauseLabel);
             video.addEventListener("ended", syncPlayPauseLabel);
             playbackRow.append(playPauseBtn, playbackHint);
-            const scrub = renderMediaScrubBar(video, { fps: assetFps(asset) });
+            const scrub = mountMediaScrubBar(video, { fps: assetFps(asset) });
             stage.appendChild(video);
             content.append(stage, playbackRow, scrub.el);
             state.overlayState.captureMediaState = () => ({ time: Number(video.currentTime) || 0, playing: !video.paused });
@@ -5301,6 +5259,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             ["Audio", counts.audio_track],
             ["Guides", counts.guide_frame],
             ["Queue", counts.generation_job],
+            ["References", counts.reference_member],
         ]) {
             summary.appendChild(makeMetaCell(label, String(value)));
         }
@@ -5308,7 +5267,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         if (!(usage.usage_count > 0)) {
             const empty = style(document.createElement("div"), `color:#7f8b96;font-size:10px;line-height:1.45;`);
-            empty.textContent = "No clip, guide, audio, or generation job references were found for this asset.";
+            empty.textContent = "No clip, guide, audio, generation job, or Reference Library memberships were found for this asset.";
             detailPane.appendChild(empty);
             queueResize();
             return;
@@ -5502,7 +5461,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const blobHandle = loadGalleryMediaAsBlob(asset, video);
             previewSurface.appendChild(video);
             state.liveMedia = video;
-            const scrubBar = renderMediaScrubBar(video);
+        const scrubBar = mountMediaScrubBar(video);
             const scrubCleanup = scrubBar.cleanup;
             state.liveMediaCleanup = () => { scrubCleanup(); blobHandle.cleanup(); };
             previewExtras.push(scrubBar.el);
@@ -5517,7 +5476,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             audioWrap.append(audioLabel, audio);
             previewSurface.appendChild(audioWrap);
             state.liveMedia = audio;
-            const scrubBar = renderMediaScrubBar(audio);
+        const scrubBar = mountMediaScrubBar(audio);
             const scrubCleanup = scrubBar.cleanup;
             state.liveMediaCleanup = () => { scrubCleanup(); blobHandle.cleanup(); };
             previewExtras.push(scrubBar.el);
@@ -7143,6 +7102,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             refreshCurrentSceneAssetIdsFromHost();
             render();
         },
+        inspectAsset,
         revealAsset,
     };
 }

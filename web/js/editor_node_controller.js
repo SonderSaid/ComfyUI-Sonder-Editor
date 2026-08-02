@@ -2019,7 +2019,7 @@ export class EditorNodeController {
                 { assetRefresh },
             );
             this.fullscreenSession?.refresh(
-                ["project", "assets", "scenes", "queue"],
+                ["project", "assets", "scenes", "queue", "references"],
                 { assetRefresh },
             );
         }, 250);

@@ -28,6 +28,82 @@ ARTIFACT_KIND_BY_EXT = {
     ".txt": "text",
 }
 
+REFERENCE_KINDS = {"character", "location", "prop", "outfit"}
+REFERENCE_CLASSES = {"subject", "context"}
+REFERENCE_TAG_NAMESPACE = "sonder:"
+REFERENCE_TAG_PRESETS = (
+    {"id": "sonder:subject_still", "label": "Subject Still", "asset_types": ["image"], "suggested_kinds": ["character", "prop", "outfit"]},
+    {"id": "sonder:subject_clip", "label": "Subject Clip", "asset_types": ["video"], "suggested_kinds": ["character", "prop", "outfit"]},
+    {"id": "sonder:context_clip", "label": "Context Clip", "asset_types": ["video"], "suggested_kinds": ["location"]},
+    {"id": "sonder:motion_reference", "label": "Motion Reference", "asset_types": ["video"], "suggested_kinds": ["character", "prop", "outfit"]},
+    {"id": "sonder:portrait", "label": "Portrait", "asset_types": ["image", "video"], "suggested_kinds": ["character"]},
+    {"id": "sonder:face_closeup", "label": "Face Close-up", "asset_types": ["image", "video"], "suggested_kinds": ["character"]},
+    {"id": "sonder:full_body", "label": "Full Body", "asset_types": ["image", "video"], "suggested_kinds": ["character", "outfit"]},
+    {"id": "sonder:turnaround", "label": "Turnaround", "asset_types": ["image", "video"], "suggested_kinds": ["character", "prop", "outfit"]},
+    {"id": "sonder:character_sheet", "label": "Character Sheet", "asset_types": ["image"], "suggested_kinds": ["character", "outfit"]},
+    {"id": "sonder:additional_view", "label": "Additional View", "asset_types": ["image", "video"], "suggested_kinds": ["character", "location", "prop", "outfit"]},
+    {"id": "sonder:prop_angle", "label": "Prop Angle", "asset_types": ["image", "video"], "suggested_kinds": ["prop"]},
+    {"id": "sonder:location", "label": "Location", "asset_types": ["image", "video"], "suggested_kinds": ["location"]},
+    {"id": "sonder:first_frame", "label": "First Frame", "asset_types": ["image"], "suggested_kinds": ["location"]},
+    {"id": "sonder:voice_identity", "label": "Voice Identity", "asset_types": ["audio", "video"], "suggested_kinds": ["character"], "requires_audio": True},
+)
+
+
+def default_reference_class(kind: str) -> str:
+    return "context" if str(kind or "") == "location" else "subject"
+
+
+def normalize_reference_tags(raw_tags) -> list[str]:
+    """Tolerantly normalize stored tags without interpreting unknown presets."""
+    if not isinstance(raw_tags, list) or any(not isinstance(raw_tag, str) for raw_tag in raw_tags):
+        return []
+    result = []
+    seen = set()
+    for raw_tag in raw_tags:
+        tag = " ".join(raw_tag.split())
+        key = tag.casefold()
+        if not tag or key in seen:
+            continue
+        result.append(tag)
+        seen.add(key)
+    return result
+
+
+def normalize_reference_crop(raw_crop) -> dict | None:
+    if raw_crop is None:
+        return None
+    if not isinstance(raw_crop, dict):
+        return None
+    try:
+        crop = {key: float(raw_crop.get(key)) for key in ("x", "y", "w", "h")}
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) for value in crop.values()):
+        return None
+    if crop["x"] < 0 or crop["y"] < 0 or crop["w"] <= 0 or crop["h"] <= 0:
+        return None
+    if crop["x"] + crop["w"] > 1.0 + 1e-9 or crop["y"] + crop["h"] > 1.0 + 1e-9:
+        return None
+    return crop
+
+
+def normalize_reference_source_range(raw_start, raw_end) -> tuple[float, float | None]:
+    try:
+        start = float(raw_start if raw_start is not None else 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, None
+    if not math.isfinite(start) or start < 0:
+        return 0.0, None
+    if raw_end is None or raw_end == "":
+        return start, None
+    try:
+        end = float(raw_end)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0, None
+    if not math.isfinite(end) or end <= start:
+        return 0.0, None
+    return start, end
+
 
 def classify_asset_path(path: str) -> tuple[str, str]:
     """Classify a path into an asset_type plus artifact_kind (if applicable)."""
@@ -139,6 +215,163 @@ class Asset:
             trashed_at=data.get("trashed_at", ""),
             trash_previous_folder=data.get("trash_previous_folder", ""),
         )
+
+
+# ---------------------------------------------------------------------------
+# Reference Library — project-durable entities and asset membership
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReferenceMember:
+    member_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    asset_id: str = ""
+    tags: list[str] = field(default_factory=list)
+    prompt: str = ""
+    crop: dict | None = None
+    order: int = 0
+    source_start_sec: float = 0.0
+    source_end_sec: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "member_id": self.member_id,
+            "asset_id": self.asset_id,
+            "tags": list(self.tags),
+            "prompt": self.prompt,
+            "crop": dict(self.crop) if isinstance(self.crop, dict) else None,
+            "order": int(self.order),
+            "source_start_sec": float(self.source_start_sec),
+            "source_end_sec": None if self.source_end_sec is None else float(self.source_end_sec),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReferenceMember":
+        if not isinstance(data, dict):
+            data = {}
+        start, end = normalize_reference_source_range(
+            data.get("source_start_sec", 0.0),
+            data.get("source_end_sec"),
+        )
+        try:
+            order = int(data.get("order", 0))
+        except (TypeError, ValueError, OverflowError):
+            order = 0
+        return cls(
+            member_id=str(data.get("member_id", "") or ""),
+            asset_id=str(data.get("asset_id", "") or ""),
+            tags=normalize_reference_tags(data.get("tags")),
+            prompt=str(data.get("prompt", "") or ""),
+            crop=normalize_reference_crop(data.get("crop")),
+            order=max(0, order),
+            source_start_sec=start,
+            source_end_sec=end,
+        )
+
+
+@dataclass
+class ReferenceEntity:
+    reference_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    name: str = "Untitled Reference"
+    kind: str = "character"
+    reference_class: str = "subject"
+    notes: str = ""
+    members: list[ReferenceMember] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "reference_id": self.reference_id,
+            "name": self.name,
+            "kind": self.kind,
+            "reference_class": self.reference_class,
+            "notes": self.notes,
+            "members": [member.to_dict() for member in self.members],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReferenceEntity":
+        if not isinstance(data, dict):
+            data = {}
+        kind = str(data.get("kind", "character") or "character")
+        if kind not in REFERENCE_KINDS:
+            kind = "character"
+        reference_class = str(data.get("reference_class", "") or "")
+        if reference_class not in REFERENCE_CLASSES:
+            reference_class = default_reference_class(kind)
+        name = str(data.get("name", "") or "").strip() or "Untitled Reference"
+
+        raw_members = data.get("members", [])
+        if not isinstance(raw_members, list):
+            raw_members = []
+        sortable_members = []
+        for serialized_index, raw_member in enumerate(raw_members):
+            member = ReferenceMember.from_dict(raw_member)
+            # Ephemeral load metadata used only for deterministic identity
+            # repair. Canonical serialization remains schema-clean.
+            setattr(member, "_serialized_position", serialized_index)
+            raw_order = raw_member.get("order") if isinstance(raw_member, dict) else None
+            valid_order = isinstance(raw_order, int) and not isinstance(raw_order, bool) and raw_order >= 0
+            order = raw_order if valid_order else 0
+            sortable_members.append(((0, order, serialized_index) if valid_order else (1, 0, serialized_index), member))
+        sortable_members.sort(key=lambda item: item[0])
+        members = [member for _, member in sortable_members]
+        for order, member in enumerate(members):
+            member.order = order
+
+        return cls(
+            reference_id=str(data.get("reference_id", "") or ""),
+            name=name,
+            kind=kind,
+            reference_class=reference_class,
+            notes=str(data.get("notes", "") or ""),
+            members=members,
+        )
+
+
+def _deterministic_reference_id(project_id: str, identity: str, seen: set[str]) -> str:
+    attempt = 0
+    while True:
+        suffix = f"/{attempt}" if attempt else ""
+        candidate = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"sonder-editor/{project_id}/{identity}{suffix}",
+        ).hex
+        if candidate not in seen:
+            return candidate
+        attempt += 1
+
+
+def repair_reference_ids(project: "TimelineProject") -> None:
+    """Repair blank/duplicate ids deterministically without performing a save."""
+    seen_references: set[str] = set()
+    seen_members: set[str] = set()
+    project_id = str(getattr(project, "project_id", "") or "")
+    for reference_index, reference in enumerate(getattr(project, "references", []) or []):
+        raw_reference_id = str(getattr(reference, "reference_id", "") or "")
+        reference_id = raw_reference_id if raw_reference_id.strip() else ""
+        if not reference_id or reference_id in seen_references:
+            reference_id = _deterministic_reference_id(
+                project_id,
+                f"reference/{reference_index}",
+                seen_references,
+            )
+            reference.reference_id = reference_id
+        seen_references.add(reference_id)
+        serialized_members = sorted(
+            enumerate(getattr(reference, "members", []) or []),
+            key=lambda item: int(getattr(item[1], "_serialized_position", item[0])),
+        )
+        for member_index, member in serialized_members:
+            serialized_position = int(getattr(member, "_serialized_position", member_index))
+            raw_member_id = str(getattr(member, "member_id", "") or "")
+            member_id = raw_member_id if raw_member_id.strip() else ""
+            if not member_id or member_id in seen_members:
+                member_id = _deterministic_reference_id(
+                    project_id,
+                    f"reference/{reference_index}/member/{serialized_position}",
+                    seen_members,
+                )
+                member.member_id = member_id
+            seen_members.add(member_id)
 
 
 def effective_scene_fps(project, scene) -> float:
@@ -1107,6 +1340,7 @@ class TimelineProject:
     frame_constraint: dict | None = None
     scenes: list = field(default_factory=list)           # list[Scene] — ordered compositions
     assets: list = field(default_factory=list)           # list[Asset] — project media registry
+    references: list = field(default_factory=list)       # list[ReferenceEntity] — project Reference Library
     generation_queue: list = field(default_factory=list)  # list[GenerationJob]
     metadata: dict = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -1242,6 +1476,7 @@ class TimelineProject:
             "frame_constraint": self.frame_constraint,
             "scenes": [s.to_dict() for s in self.scenes],
             "assets": [a.to_dict() for a in self.assets],
+            "references": [reference.to_dict() for reference in self.references],
             "generation_queue": [j.to_dict() for j in self.generation_queue],
             "metadata": self.metadata,
             "created_at": self.created_at,
@@ -1268,6 +1503,13 @@ class TimelineProject:
         project.assets = [
             Asset.from_dict(a) for a in data.get("assets", [])
         ]
+        raw_references = data.get("references", [])
+        if not isinstance(raw_references, list):
+            raw_references = []
+        project.references = [
+            ReferenceEntity.from_dict(reference) for reference in raw_references
+        ]
+        repair_reference_ids(project)
         project.generation_queue = [
             GenerationJob.from_dict(j) for j in data.get("generation_queue", [])
         ]

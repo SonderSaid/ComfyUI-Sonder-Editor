@@ -23,8 +23,32 @@ a fresh `[Unreleased]` block.
 ## [0.2.1] - 2026-08-03
 
 ### Added
+- Added a project-durable Reference Library with conflict-safe atomic editing,
+  hybrid built-in/custom member tags, image/video crops, audio/video source trims, and an
+  **Assets | References** authoring switch in fullscreen and mounted editors.
+- Reference authoring now includes media-aware preset filtering, video members,
+  non-committing picker inspection, richer cards and Manage mode, plus a focused
+  visual crop/trim editor with full-source and applied-result preview.
+- Asset **Where Used**, Trash warnings, and permanent-deletion results now
+  include Reference Library memberships and identify which edges are removed.
 - Added a **MiniMax H3** model template: 24 fps, multiple-of-32 dimensions, and
   `17k+5` frame counts.
+
+### Changed
+- Reference crop/trim preview now remembers Full Source versus Applied Result,
+  uses the shared gallery seek bar for audio and video, and makes audio
+  waveform-first with movable trim ranges and visible playback lines.
+- Reference image/video cropping now supports the timeline aspect presets plus
+  Free and user-entered Custom ratio locking.
+
+### Fixed
+- Reference source inspection now resolves the requested image, audio, or video
+  independently of the Asset Gallery's active filters and last media type.
+- Focused Reference overlays now own Space, Escape, and geometry shortcuts
+  through the editor keyboard registry, open on a neutral focus target, restore
+  crop/trim focus on pointer interaction, suppress the neutral shell's visual
+  focus ring, and suppress the browser context menu.
+- Reference field help no longer displays a duplicate browser-native tooltip.
 
 ## [0.2.0] - 2026-08-01
 

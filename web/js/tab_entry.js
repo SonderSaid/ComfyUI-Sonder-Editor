@@ -568,7 +568,7 @@ async function main() {
                     refresh: shouldRefresh,
                 });
                 if (shouldRefresh) {
-                    editor.refresh(["project", "assets", "scenes", "queue"]);
+                    editor.refresh(["project", "assets", "scenes", "queue", "references"]);
                 }
             }, 250);
         },

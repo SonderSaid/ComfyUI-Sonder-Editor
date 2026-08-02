@@ -209,6 +209,9 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 }
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
+import { mountReferenceLibrary } from "./editor_reference_library.js";
+import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
+import { shouldApplyReferenceResponse } from "./reference_library_model.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
@@ -281,6 +284,7 @@ import {
 } from "./editor_settings.js";
 import {
     createStaleReplayGovernor,
+    fetchProjectJson,
     getProjectVersion,
     postProjectJsonWithReconcile,
     resetProjectVersion,
@@ -581,6 +585,17 @@ export class EditorWidget {
 
         // Asset state
         this.assets = { video: [], image: [], audio: [], artifact: [] };
+        this._references = [];
+        this._referenceTagPresets = [];
+        this._referencesLoaded = false;
+        this._referencesDirty = false;
+        this._referencesLoading = false;
+        this._referencesError = "";
+        this._referenceFetchSeq = 0;
+        this._referenceMutationSeq = 0;
+        this._referenceLibraryEl = null;
+        this._referenceLibraryHandle = null;
+        this._referenceMediaEditorHandle = null;
         this.selectedAssetType = "video";
         this._collapsedFolders = {};
         this._renderQueue = [];
@@ -1649,6 +1664,9 @@ export class EditorWidget {
             folders: data?.folders || [],
             currentSceneAssetIds: this._currentSceneAssetIdsForGallery(),
         });
+        // Reference entities are unchanged by an asset-only refresh, but their
+        // names, thumbnails, Trash, and Missing presentation are asset-backed.
+        this._referenceLibraryHandle?.render?.();
         this._clearPlaybackWarmOverlay("assets-refresh");
         sessionDiagRecord("asset_refresh_apply", {
             request_id: requestId,
@@ -1695,6 +1713,229 @@ export class EditorWidget {
         } catch (e) {
             console.warn("[Sonder] Failed to fetch assets:", e);
             return null;
+        }
+    }
+
+    _referenceLibraryData() {
+        return {
+            references: this._references,
+            catalog: this._referenceTagPresets,
+            assets: this._allProjectAssetsForGallery(),
+            loading: this._referencesLoading,
+            error: this._referencesError,
+        };
+    }
+
+    _applyReferencePayload(payload, { projectDir = this.projectDir, requestSeq = this._referenceFetchSeq } = {}) {
+        if (!shouldApplyReferenceResponse({
+            requestedProject: projectDir,
+            currentProject: this.projectDir,
+            requestGeneration: requestSeq,
+            currentGeneration: this._referenceFetchSeq,
+        })) return false;
+        this._references = Array.isArray(payload?.references) ? payload.references : [];
+        this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
+        this._referencesLoaded = true;
+        this._referencesDirty = false;
+        this._referencesLoading = false;
+        this._referencesError = "";
+        this._referenceLibraryHandle?.render?.();
+        return true;
+    }
+
+    async _fetchReferences({ ignoreMutationGate = false, reason = "references", force = false } = {}) {
+        if (!this.projectDir) return null;
+        if (!force && !this._referencesLoaded && this._settings?.layout?.fullscreenSidebarContent !== "references") {
+            this._referencesDirty = true;
+            return null;
+        }
+        if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
+            this._deferProjectBackedRefresh(["references"], reason);
+            return null;
+        }
+        const projectDir = this.projectDir;
+        const dirName = this._projectDirName();
+        const requestSeq = ++this._referenceFetchSeq;
+        this._referencesLoading = true;
+        this._referencesError = "";
+        this._referenceLibraryHandle?.render?.();
+        try {
+            const result = await fetchProjectJson(
+                api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/references`),
+                {},
+                { projectId: dirName },
+            );
+            const payload = result?.payload || {};
+            if (!this._applyReferencePayload(payload, { projectDir, requestSeq })) return null;
+            this._markStaleReplayApplied("references", dirName);
+            return payload;
+        } catch (error) {
+            if (projectDir === this.projectDir && requestSeq === this._referenceFetchSeq) {
+                this._referencesLoading = false;
+                this._referencesError = error?.message || "Failed to load references.";
+                this._referenceLibraryHandle?.render?.();
+            }
+            return null;
+        }
+    }
+
+    _mutateReferences(operations) {
+        if (!this.projectDir || !Array.isArray(operations) || !operations.length) return Promise.resolve(null);
+        const projectDir = this.projectDir;
+        const dirName = this._projectDirName();
+        const requestSeq = ++this._referenceFetchSeq;
+        return this._queueProjectMutation({
+            key: `references:${++this._referenceMutationSeq}`,
+            label: "Reference Library change",
+            coalesce: false,
+            intent: operations,
+            refreshScenes: false,
+            refreshKeysOnError: ["references"],
+            failureMessage: (error) => error?.code === "identity_mismatch"
+                ? "Reference changed elsewhere — Library refreshed."
+                : "Reference Library change failed.",
+            run: async (queuedOperations) => {
+                const result = await this._runVersionedProjectMutation(
+                    `/sonder-editor/project/${encodeURIComponent(dirName)}/references/mutations`,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ operations: queuedOperations }),
+                    },
+                    { projectId: dirName, retryOnConflict: true, maxAttempts: 2 },
+                );
+                if (projectDir === this.projectDir) {
+                    this._applyReferencePayload(result?.payload || {}, { projectDir, requestSeq });
+                }
+                return result;
+            },
+        });
+    }
+
+    _reconcileReferencesAfterAssetDeletion(payload) {
+        if (!Array.isArray(payload?.affected_reference_ids) || !payload.affected_reference_ids.length) return;
+        if (this.isFullscreen && this._settings?.layout?.fullscreenSidebarContent === "references") {
+            void this._fetchReferences({ reason: "asset_delete_reference_prune", force: true });
+        } else {
+            this._referencesDirty = true;
+        }
+    }
+
+    _inspectReferenceAsset(asset) {
+        if (!asset) {
+            notifyWarning("This Reference member's asset is unresolved.", { source: "reference-inspect-unresolved" });
+            return false;
+        }
+        if (asset.trashed || asset.trashed_at) {
+            notifyWarning("Restore this asset from Trash before inspecting it.", { source: "reference-inspect-trashed" });
+            return false;
+        }
+        if (asset.missing) {
+            notifyWarning("The source file is missing and cannot be inspected.", { source: "reference-inspect-missing" });
+            return false;
+        }
+        if (!this._assetGallery?.inspectAsset?.(asset.asset_id)) {
+            notifyWarning("Asset preview is unavailable.", { source: "reference-inspect-unavailable" });
+            return false;
+        }
+        return true;
+    }
+
+    _openReferenceMediaEditor({ asset, draft, readOnly = false, onApply = () => {} } = {}) {
+        if (!asset) {
+            notifyWarning("This Reference member's asset is unresolved.", { source: "reference-preview-unresolved" });
+            return;
+        }
+        if (asset.trashed || asset.trashed_at) {
+            notifyWarning("Restore this asset from Trash before previewing it.", { source: "reference-preview-trashed" });
+            return;
+        }
+        if (asset.missing || !asset.path) {
+            notifyWarning("The source file is missing and cannot be previewed.", { source: "reference-preview-missing" });
+            return;
+        }
+        this._referenceMediaEditorHandle?.destroy?.();
+        const projectDir = this._projectDirName();
+        let handle = null;
+        handle = openReferenceMediaEditor({
+            asset,
+            crop: draft?.crop || null,
+            sourceStartSec: draft?.source_start_sec ?? 0,
+            sourceEndSec: draft?.source_end_sec ?? null,
+            mediaUrl: this._buildViewURL(asset.path),
+            waveformUrl: projectDir && ["audio", "video"].includes(asset.asset_type)
+                ? api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectDir)}/waveform/${encodeURIComponent(asset.asset_id)}`)
+                : "",
+            readOnly,
+            initialViewMode: this._settings?.inspector?.referenceMediaViewMode || "source",
+            onViewModeChange: (referenceMediaViewMode) => {
+                this._updateSettings({ inspector: { referenceMediaViewMode } });
+            },
+            keyboardConsumerId: this._keyboardConsumerId("reference-media"),
+            onApply,
+            onClose: () => {
+                if (this._referenceMediaEditorHandle === handle) this._referenceMediaEditorHandle = null;
+            },
+        });
+        this._referenceMediaEditorHandle = handle;
+    }
+
+    _ensureReferenceLibraryMounted() {
+        if (!this._fsSidebar || this._referenceLibraryHandle) return;
+        this._referenceLibraryEl = document.createElement("div");
+        this._referenceLibraryEl.style.cssText = "display:none;flex:1;min-height:0;overflow:hidden;";
+        this._fsSidebar.appendChild(this._referenceLibraryEl);
+        this._referenceLibraryHandle = mountReferenceLibrary(this._referenceLibraryEl, {
+            getData: () => this._referenceLibraryData(),
+            mutate: (operations) => this._mutateReferences(operations),
+            confirm: (message) => window.confirm(message),
+            pickAsset: ({ assetType, currentAssetId, onPick }) => this._showImagePicker({
+                title: `Choose ${assetType} reference`,
+                currentAssetId,
+                assetType,
+                onInspect: (assetId) => {
+                    const asset = (this.assets?.[assetType] || []).find((entry) => entry.asset_id === assetId);
+                    this._inspectReferenceAsset(asset);
+                },
+                onPick: (assetId) => {
+                    const asset = (this.assets?.[assetType] || []).find((entry) => entry.asset_id === assetId);
+                    if (asset) onPick(asset);
+                },
+            }),
+            inspectAsset: (asset) => this._inspectReferenceAsset(asset),
+            editMemberMedia: ({ asset, draft, readOnly, onApply }) => this._openReferenceMediaEditor({ asset, draft, readOnly, onApply }),
+            previewMemberMedia: ({ asset, draft, readOnly }) => this._openReferenceMediaEditor({ asset, draft, readOnly }),
+            assetPreviewUrl: (asset) => {
+                if (!asset || !["image", "video"].includes(asset.asset_type)) return null;
+                if (asset.has_thumbnail && this._projectDirName()) {
+                    return api.apiURL(`/sonder-editor/project/${encodeURIComponent(this._projectDirName())}/thumbnail/${encodeURIComponent(asset.asset_id)}`);
+                }
+                return asset.asset_type === "image" ? this._buildViewURL(asset.path) : null;
+            },
+        });
+    }
+
+    _showFullscreenSidebarContent(value, { persist = true } = {}) {
+        const mode = value === "references" ? "references" : "assets";
+        this._ensureReferenceLibraryMounted();
+        if (this.galleryEl) this.galleryEl.style.display = mode === "assets" ? "flex" : "none";
+        if (this._referenceLibraryEl) this._referenceLibraryEl.style.display = mode === "references" ? "flex" : "none";
+        if (this._fsAssetsTab) this._fsAssetsTab.dataset.active = mode === "assets" ? "true" : "false";
+        if (this._fsReferencesTab) this._fsReferencesTab.dataset.active = mode === "references" ? "true" : "false";
+        for (const button of [this._fsAssetsTab, this._fsReferencesTab]) {
+            if (!button) continue;
+            const active = button.dataset.active === "true";
+            button.style.color = active ? COLORS.text : COLORS.textMuted;
+            button.style.borderBottomColor = active ? COLORS.accent : "transparent";
+        }
+        if (persist && this._settings?.layout?.fullscreenSidebarContent !== mode) {
+            this._updateSettings({ layout: { fullscreenSidebarContent: mode } });
+            // The settings subscription re-enters this method with the
+            // normalized value and owns the one lazy fetch.
+            return;
+        }
+        if (mode === "references" && (!this._referencesLoaded || this._referencesDirty)) {
+            void this._fetchReferences({ reason: "references_tab_open", force: true });
         }
     }
 
@@ -1865,6 +2106,7 @@ export class EditorWidget {
             this._fetchAssets(),
             this._fetchRenderQueue(),
         ]);
+        this._reconcileReferencesAfterAssetDeletion(payload);
         return { status: "deleted", ...(payload || {}) };
     }
 
@@ -1889,6 +2131,7 @@ export class EditorWidget {
             this._fetchAssets(),
             this._fetchRenderQueue(),
         ]);
+        this._reconcileReferencesAfterAssetDeletion(payload);
         return { status: "deleted", ...(payload || {}) };
     }
 
@@ -1907,6 +2150,7 @@ export class EditorWidget {
             this._fetchAssets(),
             this._fetchRenderQueue(),
         ]);
+        this._reconcileReferencesAfterAssetDeletion(payload);
         return { status: "deleted", ...(payload || {}) };
     }
 
@@ -2155,6 +2399,7 @@ export class EditorWidget {
         const wantsAssets = keys.has("assets");
         const wantsScenes = keys.has("scenes");
         const wantsQueue = keys.has("queue");
+        const wantsReferences = keys.has("references");
         if (wantsAssets && wantsScenes) {
             this._fetchAssets({ ignoreMutationGate: true }).then(() => {
                 if (!this._destroyed) {
@@ -2171,6 +2416,13 @@ export class EditorWidget {
         }
         if (wantsQueue) {
             this._fetchRenderQueue({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay" });
+        }
+        if (wantsReferences) {
+            if (this.isFullscreen && this._settings?.layout?.fullscreenSidebarContent === "references") {
+                this._fetchReferences({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay", force: true });
+            } else {
+                this._referencesDirty = true;
+            }
         }
     }
 
@@ -5104,6 +5356,8 @@ export class EditorWidget {
         const prevTimecodeMode = this._timecodeMode;
         const prevStreamingMode = this._settings?.playback?.streamingMode ?? "auto";
         const nextStreamingMode = nextSettings?.playback?.streamingMode ?? "auto";
+        const prevSidebarContent = this._settings?.layout?.fullscreenSidebarContent ?? "assets";
+        const nextSidebarContent = nextSettings?.layout?.fullscreenSidebarContent ?? "assets";
         const prevLaneTintSignature = JSON.stringify(this._settings?.appearance?.laneTintOverrides || {});
         const nextLaneTintSignature = JSON.stringify(nextSettings?.appearance?.laneTintOverrides || {});
         const prevClipLabelSignature = JSON.stringify({
@@ -5198,6 +5452,9 @@ export class EditorWidget {
             this._applyEditorMargins(nextSettings);
         }
         if (this.isFullscreen) {
+            if (prevSidebarContent !== nextSidebarContent) {
+                this._showFullscreenSidebarContent(nextSidebarContent, { persist: false });
+            }
             if (this._fsSidebar && nextSettings.layout.fullscreenSidebarWidth > 0) {
                 const sidebarMax = this._computeFullscreenSidebarMaxWidth();
                 this._fsSidebar.style.width = `${Math.max(FULLSCREEN_SIDEBAR_MIN_WIDTH, Math.min(sidebarMax, nextSettings.layout.fullscreenSidebarWidth))}px`;
@@ -5536,6 +5793,7 @@ export class EditorWidget {
                 labelWidth: 0,
                 labelWidthFullscreen: 0,
                 fullscreenSidebarWidth: 0,
+                fullscreenSidebarContent: "assets",
                 fullscreenTimelineHeight: 0,
             },
         });
@@ -11777,6 +12035,7 @@ export class EditorWidget {
                 ["Esc", "Clear or reduce gallery selection"],
             ]) +
             this._shortcutSection("Inspect Overlay", INSPECT_OVERLAY_SHORTCUTS) +
+            this._shortcutSection("Reference Media Editor", REFERENCE_MEDIA_EDITOR_SHORTCUTS) +
             this._shortcutSection("View", [
                 ["Wheel", "Vertical lane scroll"],
                 ["Ctrl+Wheel", "Horizontal timeline pan"],
@@ -11828,6 +12087,7 @@ export class EditorWidget {
         title = "Choose an image",
         currentAssetId = "",
         onPick = () => {},
+        onInspect = null,
         assetType = "image",
         assetTypeLabel = "",
     } = {}) {
@@ -11916,10 +12176,33 @@ export class EditorWidget {
                 }
                 card.addEventListener("mouseenter", () => { card.style.borderColor = COLORS.accent; });
                 card.addEventListener("mouseleave", () => { card.style.borderColor = isCurrent ? COLORS.accent : COLORS.borderSoft; });
-                card.addEventListener("click", () => {
-                    this._hideImagePicker();
-                    onPick(asset.asset_id);
-                });
+                if (typeof onInspect === "function") {
+                    card.style.cursor = "default";
+                    const actions = document.createElement("div");
+                    actions.style.cssText = "display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:auto;";
+                    const inspect = document.createElement("button");
+                    inspect.textContent = "Inspect";
+                    inspect.style.cssText = chromeButtonCss({ variant: "subtle", padding: "4px 6px", fontSize: "10px", radius: "6px" });
+                    inspect.addEventListener("click", (event) => {
+                        event.stopPropagation();
+                        onInspect(asset.asset_id);
+                    });
+                    const select = document.createElement("button");
+                    select.textContent = "Select";
+                    select.style.cssText = chromeButtonCss({ variant: "primary", padding: "4px 6px", fontSize: "10px", radius: "6px" });
+                    select.addEventListener("click", (event) => {
+                        event.stopPropagation();
+                        this._hideImagePicker();
+                        onPick(asset.asset_id);
+                    });
+                    actions.append(inspect, select);
+                    card.appendChild(actions);
+                } else {
+                    card.addEventListener("click", () => {
+                        this._hideImagePicker();
+                        onPick(asset.asset_id);
+                    });
+                }
                 grid.appendChild(card);
             }
         };
@@ -12541,14 +12824,26 @@ export class EditorWidget {
             flex-shrink: 0; position: relative;
         `;
 
-        // Sidebar header with project name
+        // Sidebar content switch; project identity lives in the breadcrumb.
         this._fsSidebarHeader = document.createElement("div");
         this._fsSidebarHeader.style.cssText = `
-            padding: 8px 12px; background: ${COLORS.panel}; border-bottom: 1px solid ${COLORS.border};
-            font-size: 12px; color: ${COLORS.text}; font-weight: 600;
-            flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            padding: 0 8px; background: ${COLORS.panel}; border-bottom: 1px solid ${COLORS.border};
+            display: flex; align-items: stretch; gap: 4px; flex-shrink: 0;
         `;
-        this._fsSidebarHeader.textContent = "Assets";
+        const makeSidebarTab = (label, mode) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.style.cssText = `
+                border: 0; border-bottom: 2px solid transparent; background: transparent;
+                padding: 8px 5px 6px; color: ${COLORS.textMuted}; font: 600 11px ${FONT.sans}; cursor: pointer;
+            `;
+            button.addEventListener("click", () => this._showFullscreenSidebarContent(mode));
+            return button;
+        };
+        this._fsAssetsTab = makeSidebarTab("Assets", "assets");
+        this._fsReferencesTab = makeSidebarTab("References", "references");
+        this._fsSidebarHeader.append(this._fsAssetsTab, this._fsReferencesTab);
         this._fsSidebar.appendChild(this._fsSidebarHeader);
 
         // Sidebar resize handle
@@ -12788,9 +13083,6 @@ export class EditorWidget {
         // Save gallery's position in container for restoration
         this._galleryNextSibling = this.galleryEl.nextSibling;
 
-        // Sidebar keeps a stable panel title; project identity lives in the breadcrumb pill.
-        if (this._fsSidebarHeader) this._fsSidebarHeader.textContent = "Assets";
-
         // Move gallery to sidebar (keep gallery zoom for scale)
         this._fsSidebar.appendChild(this.galleryEl);
         const sg = this._scaleGallery;
@@ -12805,6 +13097,7 @@ export class EditorWidget {
         this.assetGrid.style.overflow = "hidden";
         this.assetGrid.style.minHeight = "0";
         this.assetGrid.style.gridTemplateColumns = "";
+        this._showFullscreenSidebarContent(this._settings?.layout?.fullscreenSidebarContent, { persist: false });
 
         // Move timeline container (without gallery) to bottom row
         this._fsBottomRow.appendChild(this.container);
@@ -14666,11 +14959,21 @@ export class EditorWidget {
         this._clearStaleReplayState();
         this._assetGallery?.cancelThumbnailRepairs?.();
         cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
+        this._referenceFetchSeq += 1;
         this.projectDir = projectDir;
         this._frameConstraintHealedFor = "";
         this.activeSceneId = "";
         this.activeScene = null;
         this.scenes = [];
+        this._references = [];
+        this._referenceTagPresets = [];
+        this._referencesLoaded = false;
+        this._referencesDirty = false;
+        this._referencesLoading = false;
+        this._referencesError = "";
+        this._referenceMediaEditorHandle?.destroy?.();
+        this._referenceMediaEditorHandle = null;
+        this._referenceLibraryHandle?.reset?.();
         this._queueBatchExpanded = {};
         this._updateSceneIdentity("Loading…");
         this._updateProjectIdentity();
@@ -14691,6 +14994,9 @@ export class EditorWidget {
             mode: "sync",
             reason: "editor_surface_entry",
         }).then(() => this._fetchScenes());
+        if (this.isFullscreen && this._settings?.layout?.fullscreenSidebarContent === "references") {
+            void this._fetchReferences({ reason: "load_project", force: true });
+        }
         if (this._queueExpanded) {
             this._fetchRenderQueue({ reason: "load_project" });
         }
@@ -14703,12 +15009,14 @@ export class EditorWidget {
         const wantsScenes = !wanted.size || wanted.has("scenes");
         const wantsProject = !wanted.size || wanted.has("project");
         const wantsQueue = !wanted.size || wanted.has("queue");
-        if (this._hasPendingProjectMutations() && (wantsProject || wantsAssets || wantsScenes || wantsQueue)) {
+        const wantsReferences = !wanted.size || wanted.has("references");
+        if (this._hasPendingProjectMutations() && (wantsProject || wantsAssets || wantsScenes || wantsQueue || wantsReferences)) {
             const deferred = [];
             if (wantsProject) deferred.push("project");
             if (wantsAssets) deferred.push("assets");
             if (wantsScenes) deferred.push("scenes");
             if (wantsQueue) deferred.push("queue");
+            if (wantsReferences) deferred.push("references");
             this._deferProjectBackedRefresh(deferred, "external_refresh");
         } else {
             if (wantsProject) {
@@ -14726,6 +15034,13 @@ export class EditorWidget {
             }
             if (wantsQueue) {
                 this._fetchRenderQueue({ reason: "external_refresh" });
+            }
+            if (wantsReferences) {
+                if (this.isFullscreen && this._settings?.layout?.fullscreenSidebarContent === "references") {
+                    this._fetchReferences({ reason: "external_refresh", force: true });
+                } else {
+                    this._referencesDirty = true;
+                }
             }
         }
     }
@@ -15982,6 +16297,15 @@ export class EditorWidget {
         if (this._assetGallery) {
             this._assetGallery.destroy();
             this._assetGallery = null;
+        }
+        if (this._referenceLibraryHandle) {
+            this._referenceLibraryHandle.destroy();
+            this._referenceLibraryHandle = null;
+            this._referenceLibraryEl = null;
+        }
+        if (this._referenceMediaEditorHandle) {
+            this._referenceMediaEditorHandle.destroy();
+            this._referenceMediaEditorHandle = null;
         }
         if (this._playbackWarmRenderRAF !== null) {
             cancelAnimationFrame(this._playbackWarmRenderRAF);
