@@ -87,6 +87,9 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
 - **Reference Library** — project-durable character, location, prop, and outfit
   collections with image/audio/video members, hybrid tags, prompts, visual
   crop/trim editing, and conflict-safe authoring in fullscreen or mounted mode.
+- **Reference lanes** — scope ordered Library members over scene ranges, choose
+  durable model-specific assembly recipes, and freeze the effective sets into
+  queued generations.
 - **Timeline export** — export video/audio with a frame-streaming CPU
   compositing path; practical duration is bounded by disk space rather than RAM.
 - **Color-managed exports** — video presets encode and tag BT.709, and timeline
@@ -108,6 +111,8 @@ ComfyUI.
 | **Sonder Guides Bridge Start / End** | Paired loop nodes that wrap a generation body to inject per-frame guide images. |
 | **Sonder Driver Selector** | Resolves a selected Driver lane *without* decoding media and exposes a `has_driver` presence flag for lazy routing; pass its reference to the Driver Bridge. |
 | **Sonder Driver Bridge** | Decodes the selected Driver lane's frames from a Driver Selector reference, emitting driver images, local start index, and conditioning strength for the render window. |
+| **Sonder Reference Selector** | Resolves one Reference lane for the active editor window without decoding media and exposes `has_reference` for lazy branch routing. |
+| **Sonder Reference Bridge** | Decodes and assembles the selected set according to its durable recipe, with image/audio, prompt/name, context, and `r01`–`r16` outputs; absent sets emit type-correct fallbacks and unreadable staged media fails loudly. |
 | **Sonder Masks Bridge** | Exposes the editor's generation-mask window as separate video/audio mask-time pairs, each gated by an Edit/Freeze toggle (a frozen channel emits a zero-width window, so nothing is generated for it). Feed a downstream temporal mask node. |
 | **Sonder Prompt Relay Bridge** | Exports the render window's prompt lanes as ComfyUI-PromptRelay payload strings (no model patching). |
 
@@ -128,8 +133,9 @@ ComfyUI.
 | **Sonder Switch** | Routes any one data type across N branches and evaluates only the selected branch (lazy). |
 | **Sonder Cluster** | Routes a shared branch selection across multiple lanes, each lane carrying its own type (lazy). |
 
-> **Sonder Switch**, **Sonder Cluster**, and **Sonder Metadata Collector Nodes
-> 2.0** use ComfyUI's newer V3 node API and load only on recent ComfyUI builds.
+> **Sonder Switch**, **Sonder Cluster**, **Sonder Reference Selector**, **Sonder
+> Reference Bridge**, and **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
+> newer V3 node API and load only on recent ComfyUI builds.
 > V3 registration is schema-validated before it changes discovery:
 > older or incompatible builds keep the complete V1 node set under the
 > normal **Sonder Metadata Collector** name. When V3 is available, it appears

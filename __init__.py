@@ -90,6 +90,38 @@ try:
             "SonderMetadataCollector": "Sonder Metadata Collector",
         })
 
+    try:
+        from .nodes.reference_bridge_v3 import (
+            BRIDGE_NODE_ID,
+            SELECTOR_NODE_ID,
+            SonderReferenceBridge,
+            SonderReferenceSelector,
+        )
+        _reference_selector_schema = SonderReferenceSelector.GET_SCHEMA()
+        _reference_bridge_schema = SonderReferenceBridge.GET_SCHEMA()
+        if getattr(_reference_selector_schema, "node_id", None) != SELECTOR_NODE_ID:
+            raise RuntimeError("Sonder Reference Selector schema returned an unexpected node id")
+        if getattr(_reference_bridge_schema, "node_id", None) != BRIDGE_NODE_ID:
+            raise RuntimeError("Sonder Reference Bridge schema returned an unexpected node id")
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("comfy_api"):
+            logging.getLogger(__name__).warning(
+                "Sonder Reference V3 import failed: %s", exc, exc_info=True
+            )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Sonder Reference V3 nodes unavailable: %s", exc, exc_info=True
+        )
+    else:
+        NODE_CLASS_MAPPINGS.update({
+            SELECTOR_NODE_ID: SonderReferenceSelector,
+            BRIDGE_NODE_ID: SonderReferenceBridge,
+        })
+        NODE_DISPLAY_NAME_MAPPINGS.update({
+            SELECTOR_NODE_ID: "Sonder Reference Selector",
+            BRIDGE_NODE_ID: "Sonder Reference Bridge",
+        })
+
     WEB_DIRECTORY = "./web"
 
     # Import server module to register API routes with PromptServer

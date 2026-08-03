@@ -50,6 +50,7 @@ const flattened = mod.LANE_DESCRIPTORS.map((descriptor) => ({{
   headerControllable: descriptor.headerControllable,
   countField: descriptor.countField,
   configsField: descriptor.configsField,
+  recipeAttr: descriptor.recipeAttr,
   fixedConfigField: descriptor.fixedConfigField,
   itemsField: descriptor.itemsSource?.listField || "",
   itemIndexField: descriptor.itemsSource?.indexField || "",
@@ -74,6 +75,7 @@ console.log(JSON.stringify({{
         "headerControllable": "header_controllable",
         "countField": "count_attr",
         "configsField": "configs_attr",
+        "recipeAttr": "recipe_attr",
         "fixedConfigField": "fixed_config_attr",
         "itemsField": "items_attr",
         "itemIndexField": "item_index_attr",
@@ -94,7 +96,7 @@ console.log(JSON.stringify({{
 
     shared_top_level = {
         "trackType", "laneType", "variable", "headerControllable", "countField",
-        "configsField", "fixedConfigField", "maxItemsPerLane",
+        "configsField", "recipeAttr", "fixedConfigField", "maxItemsPerLane",
         "supportsMultiLaneDelete", "supportsCompaction", "laneRemovable",
     }
     js_only = {
@@ -106,8 +108,8 @@ console.log(JSON.stringify({{
     assert set(lane_registry.LaneDescriptor.__dataclass_fields__) - set(field_map.values()) == {
         "snapshot_count_attr", "snapshot_configs_attr"
     }
-    assert tuple(lane_registry.VARIABLE_LANE_TYPES) == ("video", "motion_driver", "audio")
-    assert js["variableTrackTypes"] == ["video", "audio", "motion_driver"]
+    assert tuple(lane_registry.VARIABLE_LANE_TYPES) == ("video", "motion_driver", "audio", "reference")
+    assert js["variableTrackTypes"] == ["video", "audio", "motion_driver", "reference"]
 
 
 def test_descriptor_scene_attributes_and_unknown_role_divergence_are_pinned():

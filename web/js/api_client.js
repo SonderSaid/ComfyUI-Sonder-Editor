@@ -1,5 +1,6 @@
 const projectVersions = new Map();
 const projectAliases = new Map();
+const projectVersionListeners = new Set();
 let fetchPatchInstalled = false;
 
 const STALE_REPLAY_DELAYS_MS = [250, 1000, 4000];
@@ -32,6 +33,29 @@ export function projectIdFromUrl(url) {
     return match ? decodeURIComponent(match[1]) : "";
 }
 
+/**
+ * Observe durable project-version movement. Every mutation response passes
+ * through the version map, so this is the one page-level signal that catches
+ * same-tab and cross-tab project writes alike — graph-side surfaces that cache
+ * project-derived shape subscribe here instead of opening their own socket.
+ * Returns an unsubscribe function. Listener errors never reach the caller.
+ */
+export function onProjectVersionChanged(callback) {
+    if (typeof callback !== "function") return () => {};
+    projectVersionListeners.add(callback);
+    return () => projectVersionListeners.delete(callback);
+}
+
+function emitProjectVersionChanged(projectId, modifiedAt) {
+    for (const listener of [...projectVersionListeners]) {
+        try {
+            listener(projectId, modifiedAt);
+        } catch (error) {
+            console.warn("[Sonder] project version listener failed:", error);
+        }
+    }
+}
+
 export function rememberProjectVersion(projectId, modifiedAt) {
     const normalizedProjectId = normalizeProjectId(projectId);
     if (!normalizedProjectId || !modifiedAt) return;
@@ -46,6 +70,7 @@ export function rememberProjectVersion(projectId, modifiedAt) {
     const current = projectVersions.get(normalizedProjectId) || "";
     if (current && next < current) return;
     projectVersions.set(normalizedProjectId, next);
+    if (next !== current) emitProjectVersionChanged(normalizedProjectId, next);
 }
 
 export function resetProjectVersion(projectId, modifiedAt) {
@@ -53,9 +78,12 @@ export function resetProjectVersion(projectId, modifiedAt) {
     if (!normalizedProjectId || !modifiedAt) return;
     const next = String(modifiedAt);
     const aliases = projectAliases.get(normalizedProjectId) || new Set([normalizedProjectId]);
+    let changed = false;
     for (const alias of aliases) {
+        changed = changed || (projectVersions.get(alias) || "") !== next;
         projectVersions.set(alias, next);
     }
+    if (changed) emitProjectVersionChanged(normalizedProjectId, next);
 }
 
 export function createStaleReplayGovernor() {

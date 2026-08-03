@@ -47,6 +47,7 @@ from .path_security import (
     sanitize_filename_component,
 )
 from .atomic_io import atomic_replace
+from .reference_resolution import reference_live_outputs
 from .render_cache import (
     RenderCacheActiveError,
     RenderCacheError,
@@ -93,7 +94,10 @@ from .session_registry import (
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
     ClipReference, LaneConfig, GenerationJob, ReferenceEntity, ReferenceMember,
+    ReferenceItem, ReferenceLaneRecipe,
     REFERENCE_CLASSES, REFERENCE_KINDS, REFERENCE_TAG_NAMESPACE, REFERENCE_TAG_PRESETS,
+    REFERENCE_RECIPE_FIELDS,
+    REFERENCE_RECIPE_PRESETS,
     apply_color_metadata, classify_asset_path, default_reference_class,
     effective_scene_fps, media_timeline_frames, normalize_reference_tags,
     retime_scene_geometry,
@@ -108,6 +112,8 @@ from .lane_registry import (
     lane_items as registry_lane_items,
     pad_config_list,
     pad_lane_configs,
+    pad_lane_recipes,
+    trim_lane_recipes,
     variable_descriptor,
 )
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
@@ -574,13 +580,21 @@ def _is_render_clip(clip: ClipReference) -> bool:
     return registry_is_render_clip(clip)
 
 
-def _trim_lane_configs(configs: list, removed_index: int, target_count: int) -> None:
+def _trim_lane_configs(scene: Scene, descriptor, removed_index: int, target_count: int) -> None:
+    configs = getattr(scene, descriptor.configs_attr)
     if 0 <= removed_index < len(configs):
         configs.pop(removed_index)
     while len(configs) > target_count:
         configs.pop()
     while len(configs) < target_count:
         configs.append(LaneConfig())
+    if descriptor.recipe_attr:
+        trim_lane_recipes(
+            getattr(scene, descriptor.recipe_attr),
+            removed_index,
+            target_count,
+            ReferenceLaneRecipe,
+        )
 
 
 def _compact_empty_media_lane(scene: Scene, lane_type: str, lane_index: int) -> bool:
@@ -611,7 +625,7 @@ def _compact_empty_media_lane(scene: Scene, lane_type: str, lane_index: int) -> 
             )
     next_count = lane_count - 1
     setattr(scene, descriptor.count_attr, next_count)
-    _trim_lane_configs(getattr(scene, descriptor.configs_attr), lane_index, next_count)
+    _trim_lane_configs(scene, descriptor, lane_index, next_count)
     return True
 
 
@@ -687,6 +701,11 @@ def _set_scene_lane_count(scene: Scene, lane_type: str, count: int) -> None:
         configs.append(LaneConfig())
     while len(configs) > count:
         configs.pop()
+    if descriptor.recipe_attr:
+        recipes = getattr(scene, descriptor.recipe_attr)
+        while len(recipes) > count:
+            recipes.pop()
+        pad_lane_recipes(scene, ReferenceLaneRecipe)
 
 
 def _lane_config(scene: Scene, lane_type: str, lane_index: int) -> LaneConfig:
@@ -696,6 +715,11 @@ def _lane_config(scene: Scene, lane_type: str, lane_index: int) -> LaneConfig:
     configs = _scene_lane_configs(scene, lane_type)
     while len(configs) <= lane_index:
         configs.append(LaneConfig())
+    descriptor = variable_descriptor(lane_type)
+    if descriptor is not None and descriptor.recipe_attr:
+        recipes = getattr(scene, descriptor.recipe_attr)
+        while len(recipes) < len(configs):
+            recipes.append(ReferenceLaneRecipe())
     return configs[lane_index]
 
 
@@ -1417,6 +1441,7 @@ def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) ->
         scene.name = str(fields["name"])
     if "duration_frames" in fields:
         scene.duration_frames = max(0, int(fields["duration_frames"]))
+        _clamp_reference_items_to_scene(scene)
     if "prompt" in fields:
         _require_lane_unlocked(scene, "prompt_global")
         scene.prompt = str(fields["prompt"])
@@ -1452,12 +1477,17 @@ def _apply_lane_configs(scene: Scene, fields: dict) -> None:
         _mutation_error("update_lane_configs requires fields", 400)
     for descriptor in LANE_DESCRIPTORS:
         attr = descriptor.configs_attr if descriptor.variable else descriptor.fixed_config_attr
-        if not attr or attr not in fields:
-            continue
-        if descriptor.variable:
-            setattr(scene, attr, [LaneConfig.from_dict(config) for config in fields[attr]])
-        else:
-            setattr(scene, attr, LaneConfig.from_dict(fields[attr]))
+        if attr and attr in fields:
+            if descriptor.variable:
+                setattr(scene, attr, [LaneConfig.from_dict(config) for config in fields[attr]])
+            else:
+                setattr(scene, attr, LaneConfig.from_dict(fields[attr]))
+        if descriptor.variable and descriptor.recipe_attr and descriptor.recipe_attr in fields:
+            setattr(
+                scene,
+                descriptor.recipe_attr,
+                [ReferenceLaneRecipe.from_dict(recipe) for recipe in fields[descriptor.recipe_attr]],
+            )
     _ensure_scene_lane_config_lengths(scene)
 
 
@@ -1496,6 +1526,21 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
         config.locked = bool(fields["locked"])
     if "hidden" in fields:
         config.hidden = bool(fields["hidden"])
+    if descriptor.recipe_attr and "reference_recipe" in fields:
+        recipes = getattr(scene, descriptor.recipe_attr)
+        while len(recipes) <= lane_index:
+            recipes.append(ReferenceLaneRecipe())
+        next_recipe = ReferenceLaneRecipe.from_dict(fields["reference_recipe"])
+        if (
+            next_recipe.media_kind != recipes[lane_index].media_kind
+            and _media_lane_items(scene, lane_type, lane_index)
+        ):
+            _mutation_error(
+                "Clear the Reference lane before changing between image and audio recipes",
+                409,
+                "reference_media_kind_mismatch",
+            )
+        recipes[lane_index] = next_recipe
     return {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
 
 
@@ -1507,16 +1552,29 @@ def _media_lane_items(scene: Scene, lane_type: str, lane_index: int) -> list:
 
 
 def _media_item_id(item) -> str:
-    return str(getattr(item, "clip_id", "") or getattr(item, "track_id", "") or "")
+    return str(
+        getattr(item, "clip_id", "")
+        or getattr(item, "track_id", "")
+        or getattr(item, "reference_item_id", "")
+        or ""
+    )
+
+
+def _media_item_bounds(item) -> tuple[int, int]:
+    if isinstance(item, ReferenceItem):
+        start = int(getattr(item, "start_frame", 0) or 0)
+        end = int(getattr(item, "end_frame", -1))
+        return start, (2**31 - 1 if end < 0 else end)
+    return (
+        int(getattr(item, "timeline_start_frame", 0) or 0),
+        int(getattr(item, "timeline_end_frame", 0) or 0),
+    )
 
 
 def _media_items_overlap(left, right) -> bool:
-    return _media_bounds_overlap(
-        int(getattr(left, "timeline_start_frame", 0) or 0),
-        int(getattr(left, "timeline_end_frame", 0) or 0),
-        int(getattr(right, "timeline_start_frame", 0) or 0),
-        int(getattr(right, "timeline_end_frame", 0) or 0),
-    )
+    left_start, left_end = _media_item_bounds(left)
+    right_start, right_end = _media_item_bounds(right)
+    return _media_bounds_overlap(left_start, left_end, right_start, right_end)
 
 
 def _media_bounds_overlap(left_start: int, left_end: int, right_start: int, right_end: int) -> bool:
@@ -1526,6 +1584,8 @@ def _media_bounds_overlap(left_start: int, left_end: int, right_start: int, righ
 def _media_item_lane(item) -> tuple[str, int]:
     if isinstance(item, ClipReference):
         return _clip_lane_type(item), int(getattr(item, "track_index", 0) or 0)
+    if isinstance(item, ReferenceItem):
+        return "reference", int(getattr(item, "lane_index", 0) or 0)
     return "audio", int(getattr(item, "lane_index", 0) or 0)
 
 
@@ -1542,12 +1602,8 @@ def _require_media_target_bounds_fit(scene: Scene, targets: list[tuple[object, i
         for other in _media_lane_items(scene, lane_type, lane_index):
             if _media_item_id(other) in target_ids:
                 continue
-            if _media_bounds_overlap(
-                start,
-                end,
-                int(getattr(other, "timeline_start_frame", 0) or 0),
-                int(getattr(other, "timeline_end_frame", 0) or 0),
-            ):
+            other_start, other_end = _media_item_bounds(other)
+            if _media_bounds_overlap(start, end, other_start, other_end):
                 _mutation_error("Timeline item overlaps another item on the lane", 409, "lane_collision")
 
 
@@ -1667,6 +1723,15 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
         if target_lane < 0 or target_lane >= current_count or target_lane == lane_index:
             _mutation_error("Invalid target lane", 400)
         _require_lane_unlocked(scene, lane_type, target_lane)
+        if lane_type == "reference":
+            source_kind = _reference_lane_recipe(scene, lane_index).media_kind
+            target_kind = _reference_lane_recipe(scene, target_lane).media_kind
+            if source_kind != target_kind:
+                _mutation_error(
+                    "Reference items cannot move between image and audio lanes",
+                    409,
+                    "reference_media_kind_mismatch",
+                )
         _require_media_items_fit_lane(
             lane_items,
             _media_lane_items(scene, lane_type, target_lane),
@@ -1694,7 +1759,7 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
             setattr(item, descriptor.item_index_attr, max(0, current_index - 1))
     next_count = current_count - 1
     setattr(scene, descriptor.count_attr, next_count)
-    _trim_lane_configs(getattr(scene, descriptor.configs_attr), lane_index, next_count)
+    _trim_lane_configs(scene, descriptor, lane_index, next_count)
     if descriptor.max_items_per_lane == 1:
         _validate_single_driver_per_lane(scene)
 
@@ -1930,9 +1995,13 @@ def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = F
     if not isinstance(items, list):
         _mutation_error("bulk_delete_items requires items", 400)
     if apply_linked:
-        refs = [_item_ref_from_selection(scene, item) for item in items]
-        _apply_delete_link_refs(scene, refs, preserve_lanes)
-        return
+        linked_items = [item for item in items if str(item.get("type", "")) != "reference"]
+        if linked_items:
+            refs = [_item_ref_from_selection(scene, item) for item in linked_items]
+            _apply_delete_link_refs(scene, refs, preserve_lanes)
+        items = [item for item in items if str(item.get("type", "")) == "reference"]
+        if not items:
+            return
     resolved = []
     for item in items:
         if not isinstance(item, dict):
@@ -1960,6 +2029,11 @@ def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = F
             section = _find_prompt_section(scene, index)
             _validate_prompt_identity(section, expected)
             resolved.append((item_type, index, True))
+        elif item_type == "reference":
+            reference_item = _find_reference_item(scene, str(item_id))
+            _require_lane_unlocked(scene, "reference", int(reference_item.lane_index))
+            _reference_item_expected(reference_item, expected, set(reference_item.to_dict()))
+            resolved.append((item_type, reference_item, True))
         else:
             _mutation_error(f"Unsupported bulk delete item type: {item_type}", 400)
 
@@ -1967,6 +2041,7 @@ def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = F
     audio_lanes = []
     prompt_indexes = []
     guide_frames = set()
+    reference_item_ids = set()
     for item_type, item, preserve_lane in resolved:
         if item_type == "clip":
             video_lanes.append(int(item.track_index or 0))
@@ -1978,6 +2053,8 @@ def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = F
             guide_frames.add(int(item.frame_index))
         elif item_type == "prompt":
             prompt_indexes.append(int(item))
+        elif item_type == "reference":
+            reference_item_ids.add(item.reference_item_id)
         if preserve_lane:
             if item_type == "clip" and video_lanes:
                 video_lanes.pop()
@@ -1986,6 +2063,11 @@ def _apply_bulk_delete_items(scene: Scene, items: list, preserve_lanes: bool = F
 
     if guide_frames:
         scene.guide_frames = [guide for guide in scene.guide_frames if int(guide.frame_index) not in guide_frames]
+    if reference_item_ids:
+        scene.reference_items = [
+            item for item in scene.reference_items
+            if item.reference_item_id not in reference_item_ids
+        ]
     for idx in sorted(set(prompt_indexes), reverse=True):
         if 0 <= idx < len(scene.prompt_sections):
             scene.prompt_sections.pop(idx)
@@ -2180,6 +2262,205 @@ def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
     return section
 
 
+_REFERENCE_ITEM_FIELDS = {
+    "lane_index", "start_frame", "end_frame", "members", "prompt_override", "muted",
+}
+
+
+def _find_reference_item(scene: Scene, reference_item_id: str) -> ReferenceItem:
+    item = next(
+        (
+            candidate for candidate in getattr(scene, "reference_items", []) or []
+            if str(getattr(candidate, "reference_item_id", "") or "") == str(reference_item_id or "")
+        ),
+        None,
+    )
+    if item is None:
+        _mutation_error(f"Reference item not found: {reference_item_id}", 404, "item_not_found")
+    return item
+
+
+def _reference_item_expected(item: ReferenceItem, expected, keys) -> None:
+    expected = _require_expected(expected, set(keys), "reference item mutation")
+    current = item.to_dict()
+    for key in keys:
+        if not _expected_matches(current.get(key), expected.get(key)):
+            _mutation_error("Reference item identity mismatch", 409, "identity_mismatch")
+
+
+def _canonical_reference_member_refs(project: TimelineProject, raw_members, media_kind: str) -> list[dict]:
+    if not isinstance(raw_members, list) or not raw_members:
+        _mutation_error("Reference items require at least one Library member", 400, "invalid_reference_item")
+    by_member_id = {
+        member.member_id: (reference, member)
+        for reference in project.references
+        for member in reference.members
+    }
+    result = []
+    seen = set()
+    for raw in raw_members:
+        if not isinstance(raw, dict):
+            _mutation_error("Reference item members must be objects", 400, "invalid_reference_item")
+        member_id = str(raw.get("member_id", "") or "")
+        resolved = by_member_id.get(member_id)
+        if resolved is None:
+            _mutation_error(f"Reference member not found: {member_id}", 404, "item_not_found")
+        reference, member = resolved
+        if member_id in seen:
+            _mutation_error("Reference item members must be unique", 400, "invalid_reference_item")
+        asset = project.get_asset(member.asset_id)
+        if asset is None:
+            _mutation_error(f"Reference member asset not found: {member.asset_id}", 404, "asset_not_found")
+        asset_type = str(getattr(asset, "asset_type", "") or "")
+        compatible = (
+            asset_type in {"image", "video"}
+            if media_kind == "image"
+            else asset_type == "audio" or (asset_type == "video" and bool(getattr(asset, "has_audio", False)))
+        )
+        if not compatible:
+            _mutation_error(
+                f"Reference member {member_id} is incompatible with the {media_kind} lane",
+                409,
+                "reference_media_kind_mismatch",
+            )
+        result.append({"entity_id": reference.reference_id, "member_id": member_id})
+        seen.add(member_id)
+    return result
+
+
+def _reference_item_bounds(scene: Scene, start, end) -> tuple[int, int]:
+    start_frame = max(0, _mutation_int(start, "start_frame", 0))
+    duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+    if duration > 0:
+        start_frame = min(start_frame, duration - 1)
+    end_frame = _mutation_int(end, "end_frame", -1)
+    if end_frame < 0:
+        end_frame = -1
+    elif end_frame <= start_frame:
+        _mutation_error("Reference item range must be at least one frame", 409, "invalid_range")
+    elif duration > 0:
+        end_frame = min(end_frame, duration)
+        if end_frame <= start_frame:
+            _mutation_error("Reference item range is outside the scene", 409, "invalid_range")
+    return start_frame, end_frame
+
+
+def _clamp_reference_items_to_scene(scene: Scene) -> None:
+    duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+    if duration <= 0:
+        return
+    for item in getattr(scene, "reference_items", []) or []:
+        item.start_frame = min(max(0, int(getattr(item, "start_frame", 0) or 0)), duration - 1)
+        end_frame = int(getattr(item, "end_frame", -1))
+        if end_frame >= 0:
+            item.end_frame = min(duration, max(item.start_frame + 1, end_frame))
+
+
+def _require_no_reference_overlap(
+    scene: Scene,
+    lane_index: int,
+    start_frame: int,
+    end_frame: int,
+    *,
+    ignore: ReferenceItem | None = None,
+) -> None:
+    resolved_end = max(0, int(getattr(scene, "duration_frames", 0) or 0)) if end_frame < 0 else end_frame
+    if resolved_end <= start_frame:
+        resolved_end = start_frame + 1
+    for other in getattr(scene, "reference_items", []) or []:
+        if other is ignore or int(getattr(other, "lane_index", 0) or 0) != lane_index:
+            continue
+        other_start = int(getattr(other, "start_frame", 0) or 0)
+        other_end = int(getattr(other, "end_frame", -1))
+        if other_end < 0:
+            other_end = max(other_start + 1, int(getattr(scene, "duration_frames", 0) or 0))
+        if _media_bounds_overlap(start_frame, resolved_end, other_start, other_end):
+            _mutation_error("Reference items cannot overlap on one lane", 409, "lane_collision")
+
+
+def _reference_lane_recipe(scene: Scene, lane_index: int) -> ReferenceLaneRecipe:
+    _lane_config(scene, "reference", lane_index)
+    while len(scene.reference_lane_recipes) <= lane_index:
+        scene.reference_lane_recipes.append(ReferenceLaneRecipe())
+    return scene.reference_lane_recipes[lane_index]
+
+
+def _apply_create_reference_item(project: TimelineProject, scene: Scene, fields: dict) -> ReferenceItem:
+    if not isinstance(fields, dict):
+        _mutation_error("create_reference_item requires fields", 400)
+    unknown = set(fields).difference(_REFERENCE_ITEM_FIELDS | {"reference_item_id"})
+    if unknown:
+        _mutation_error(f"Unsupported reference item fields: {', '.join(sorted(unknown))}", 400)
+    lane_index = _mutation_int(fields.get("lane_index", 0), "lane_index", 0)
+    if lane_index < 0 or lane_index >= _scene_lane_count(scene, "reference"):
+        _mutation_error("Reference lane index is out of range", 404, "item_not_found")
+    _require_lane_unlocked(scene, "reference", lane_index)
+    recipe = _reference_lane_recipe(scene, lane_index)
+    start_frame, end_frame = _reference_item_bounds(scene, fields.get("start_frame", 0), fields.get("end_frame", -1))
+    members = _canonical_reference_member_refs(project, fields.get("members"), recipe.media_kind)
+    _require_no_reference_overlap(scene, lane_index, start_frame, end_frame)
+    item = ReferenceItem(
+        reference_item_id=str(fields.get("reference_item_id", "") or uuid.uuid4().hex),
+        lane_index=lane_index,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        members=members,
+        prompt_override=str(fields.get("prompt_override", "") or ""),
+        muted=bool(fields.get("muted", False)),
+    )
+    if any(existing.reference_item_id == item.reference_item_id for existing in scene.reference_items):
+        item.reference_item_id = uuid.uuid4().hex
+    scene.reference_items.append(item)
+    return item
+
+
+def _apply_update_reference_item(project: TimelineProject, scene: Scene, operation: dict) -> ReferenceItem:
+    item = _find_reference_item(scene, str(operation.get("reference_item_id", "") or ""))
+    fields = operation.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        _mutation_error("update_reference_item requires fields", 400)
+    unknown = set(fields).difference(_REFERENCE_ITEM_FIELDS)
+    if unknown:
+        _mutation_error(f"Unsupported reference item fields: {', '.join(sorted(unknown))}", 400)
+    _reference_item_expected(item, operation.get("expected"), fields.keys())
+    old_lane = int(item.lane_index)
+    lane_index = _mutation_int(fields.get("lane_index", item.lane_index), "lane_index", item.lane_index)
+    if lane_index < 0 or lane_index >= _scene_lane_count(scene, "reference"):
+        _mutation_error("Reference lane index is out of range", 404, "item_not_found")
+    _require_lane_unlocked(scene, "reference", old_lane)
+    if lane_index != old_lane:
+        _require_lane_unlocked(scene, "reference", lane_index)
+    recipe = _reference_lane_recipe(scene, lane_index)
+    start_frame, end_frame = _reference_item_bounds(
+        scene,
+        fields.get("start_frame", item.start_frame),
+        fields.get("end_frame", item.end_frame),
+    )
+    members = _canonical_reference_member_refs(
+        project,
+        fields.get("members", item.members),
+        recipe.media_kind,
+    )
+    _require_no_reference_overlap(scene, lane_index, start_frame, end_frame, ignore=item)
+    item.lane_index = lane_index
+    item.start_frame = start_frame
+    item.end_frame = end_frame
+    item.members = members
+    if "prompt_override" in fields:
+        item.prompt_override = str(fields["prompt_override"] or "")
+    if "muted" in fields:
+        item.muted = bool(fields["muted"])
+    return item
+
+
+def _apply_delete_reference_item(scene: Scene, operation: dict) -> ReferenceItem:
+    item = _find_reference_item(scene, str(operation.get("reference_item_id", "") or ""))
+    _require_lane_unlocked(scene, "reference", int(item.lane_index))
+    _reference_item_expected(item, operation.get("expected"), set(item.to_dict()))
+    scene.reference_items = [candidate for candidate in scene.reference_items if candidate is not item]
+    return item
+
+
 def _apply_swap_prompt_sections(scene: Scene, op: dict) -> tuple:
     """Atomically exchange two sections' ranges (threshold-swap commit).
 
@@ -2325,6 +2606,15 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
             return {"type": op_type, "track_id": str(op.get("track_id", "")), "linked": True}
         _delete_audio_track(scene, str(op.get("track_id", "")), bool(op.get("preserve_lane", False)))
         return {"type": op_type, "track_id": str(op.get("track_id", ""))}
+    if op_type == "create_reference_item":
+        item = _apply_create_reference_item(project, scene, op.get("fields", {}))
+        return {"type": op_type, "reference_item_id": item.reference_item_id}
+    if op_type == "update_reference_item":
+        item = _apply_update_reference_item(project, scene, op)
+        return {"type": op_type, "reference_item_id": item.reference_item_id}
+    if op_type == "delete_reference_item":
+        item = _apply_delete_reference_item(scene, op)
+        return {"type": op_type, "reference_item_id": item.reference_item_id}
     if op_type == "bulk_delete_items":
         _apply_bulk_delete_items(
             scene,
@@ -2467,6 +2757,10 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         "driver_clip_snapshots",
         "driver_lane_count",
         "driver_lane_configs",
+        "reference_item_snapshots",
+        "reference_lane_count",
+        "reference_lane_configs",
+        "reference_lane_recipes",
         "prompt_sections",
         "scene_prompt",
         "scene_width",
@@ -2506,6 +2800,10 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         driver_clip_snapshots=list(body.get("driver_clip_snapshots", []) or []),
         driver_lane_count=max(1, int(body.get("driver_lane_count", 1) or 1)),
         driver_lane_configs=list(body.get("driver_lane_configs", []) or []),
+        reference_item_snapshots=list(body.get("reference_item_snapshots", []) or []),
+        reference_lane_count=max(1, int(body.get("reference_lane_count", 1) or 1)),
+        reference_lane_configs=list(body.get("reference_lane_configs", []) or []),
+        reference_lane_recipes=list(body.get("reference_lane_recipes", []) or []),
         prompt_sections=list(body.get("prompt_sections", []) or []),
         scene_width=int(body.get("scene_width", 0)),
         scene_height=int(body.get("scene_height", 0)),
@@ -2853,12 +3151,29 @@ def _reference_catalog_payload() -> list[dict]:
     ]
 
 
+def _reference_recipe_catalog_payload() -> list[dict]:
+    return [
+        {
+            "id": str(preset["id"]),
+            "name": str(preset["name"]),
+            "builtIn": True,
+            "media_kind": str(preset.get("media_kind", "image")),
+            "hard": dict(preset.get("hard", {})),
+            "soft": dict(preset.get("soft", {})),
+        }
+        for preset in REFERENCE_RECIPE_PRESETS
+    ]
+
+
 def _references_payload(project: TimelineProject) -> dict:
     return {
         "project_id": project.project_id,
         "modified_at": project.modified_at,
         "references": [reference.to_dict() for reference in project.references],
         "tag_presets": _reference_catalog_payload(),
+        "recipe_presets": _reference_recipe_catalog_payload(),
+        "recipe_field_schema": [dict(field) for field in REFERENCE_RECIPE_FIELDS],
+        "reference_recipes": [dict(recipe) for recipe in project.reference_recipes if isinstance(recipe, dict)],
     }
 
 
@@ -3099,7 +3414,9 @@ def _apply_delete_reference(project: TimelineProject, operation: dict) -> Refere
     required = {"name", "kind", "reference_class", "notes", "member_ids"}
     expected = _require_expected(operation.get("expected"), required, "delete_reference")
     _validate_reference_expected(reference, expected, required)
+    removed_member_ids = {member.member_id for member in reference.members}
     project.references = [candidate for candidate in project.references if candidate is not reference]
+    _reconcile_staged_reference_members(project, removed_member_ids)
     return reference
 
 
@@ -3149,6 +3466,7 @@ def _apply_delete_reference_member(project: TimelineProject, operation: dict) ->
     reference.members = [candidate for candidate in reference.members if candidate is not member]
     for order, candidate in enumerate(reference.members):
         candidate.order = order
+    _reconcile_staged_reference_members(project, {member.member_id})
     return member
 
 
@@ -3169,6 +3487,151 @@ def _apply_reorder_reference_members(project: TimelineProject, operation: dict) 
     for order, member in enumerate(reference.members):
         member.order = order
     return reference
+
+
+def _reference_recipe_value(field: dict, value):
+    """Coerce one authored recipe value, or refuse it by name."""
+    key, kind = field["key"], field["type"]
+    label = f"Reference recipe field '{key}'"
+
+    def bounded(number):
+        low, high = field.get("min"), field.get("max")
+        if (low is not None and number < low) or (high is not None and number > high):
+            _mutation_error(f"{label} must be between {low} and {high}", 400, "invalid_reference_recipe")
+        return number
+
+    if kind == "enum":
+        if value not in field["values"]:
+            _mutation_error(f"{label} must be one of: {', '.join(field['values'])}", 400, "invalid_reference_recipe")
+        return value
+    if kind == "bool":
+        if not isinstance(value, bool):
+            _mutation_error(f"{label} must be true or false", 400, "invalid_reference_recipe")
+        return value
+    if kind == "string":
+        if not isinstance(value, str):
+            _mutation_error(f"{label} must be text", 400, "invalid_reference_recipe")
+        return value
+    if kind in {"int", "number"}:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            _mutation_error(f"{label} must be a number", 400, "invalid_reference_recipe")
+        if kind == "number" and not math.isfinite(float(value)):
+            _mutation_error(f"{label} must be a finite number", 400, "invalid_reference_recipe")
+        return bounded(int(value) if kind == "int" else float(value))
+    if kind in {"int_list", "int_pair"}:
+        if not isinstance(value, list) or any(isinstance(entry, bool) or not isinstance(entry, int) for entry in value):
+            _mutation_error(f"{label} must be a list of whole numbers", 400, "invalid_reference_recipe")
+        if kind == "int_pair" and len(value) not in {0, 2}:
+            _mutation_error(f"{label} must hold exactly two numbers", 400, "invalid_reference_recipe")
+        return [bounded(entry) for entry in value]
+    if kind in {"string_list", "output_list"}:
+        if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
+            _mutation_error(f"{label} must be a list of text values", 400, "invalid_reference_recipe")
+        allowed = field.get("values")
+        if allowed:
+            unknown = [entry for entry in value if entry not in allowed]
+            if unknown:
+                _mutation_error(
+                    f"{label} does not accept: {', '.join(sorted(unknown))}", 400, "invalid_reference_recipe",
+                )
+        return list(value)
+    _mutation_error(f"{label} has an unsupported type", 400, "invalid_reference_recipe")
+
+
+def _normalize_reference_recipe_section(values: dict, section: str) -> dict:
+    """Validate one authored `hard`/`soft` block against the recipe schema.
+
+    Unknown keys are refused rather than stored: a silently-kept typo reads as
+    the assembler's default and produces a wrong render with no error anywhere.
+    """
+    schema = {
+        field["key"]: field
+        for field in REFERENCE_RECIPE_FIELDS
+        if field["section"] == section
+    }
+    unknown = set(values).difference(schema)
+    if unknown:
+        _mutation_error(
+            f"Unsupported recipe {section} settings: {', '.join(sorted(unknown))}",
+            400,
+            "invalid_reference_recipe",
+        )
+    return {key: _reference_recipe_value(schema[key], value) for key, value in values.items()}
+
+
+def _normalize_custom_reference_recipe(fields: dict, *, recipe_id: str = "") -> dict:
+    if not isinstance(fields, dict):
+        _mutation_error("Reference recipe fields must be an object", 400, "invalid_reference_recipe")
+    unknown = set(fields).difference({"id", "name", "media_kind", "hard", "soft"})
+    if unknown:
+        _mutation_error(f"Unsupported recipe fields: {', '.join(sorted(unknown))}", 400, "invalid_reference_recipe")
+    name = str(fields.get("name", "") or "").strip()
+    if not name:
+        _mutation_error("Reference recipe name is required", 400, "invalid_reference_recipe")
+    media_kind = str(fields.get("media_kind", "image") or "image")
+    if media_kind not in {"image", "audio"}:
+        _mutation_error("Reference recipe media_kind must be image or audio", 400, "invalid_reference_recipe")
+    candidate_id = recipe_id or str(fields.get("id", "") or "").strip()
+    if not candidate_id:
+        candidate_id = f"custom:{uuid.uuid4().hex}"
+    if candidate_id.casefold().startswith(REFERENCE_TAG_NAMESPACE):
+        _mutation_error("Custom recipes cannot use the sonder: namespace", 400, "invalid_reference_recipe")
+    hard = fields.get("hard", {})
+    soft = fields.get("soft", {})
+    if not isinstance(hard, dict) or not isinstance(soft, dict):
+        _mutation_error("Reference recipe hard and soft settings must be objects", 400, "invalid_reference_recipe")
+    return {
+        "id": candidate_id,
+        "name": name,
+        "builtIn": False,
+        "media_kind": media_kind,
+        "hard": _normalize_reference_recipe_section(hard, "hard"),
+        "soft": _normalize_reference_recipe_section(soft, "soft"),
+    }
+
+
+def _find_custom_reference_recipe(project: TimelineProject, recipe_id: str) -> tuple[int, dict]:
+    for index, recipe in enumerate(project.reference_recipes):
+        if isinstance(recipe, dict) and str(recipe.get("id", "") or "") == recipe_id:
+            return index, recipe
+    _mutation_error(f"Reference recipe not found: {recipe_id}", 404, "item_not_found")
+
+
+def _validate_recipe_expected(recipe: dict, expected) -> None:
+    required = {"id", "name", "media_kind", "hard", "soft"}
+    expected = _require_expected(expected, required, "reference recipe mutation")
+    for key in required:
+        if not _expected_matches(recipe.get(key), expected.get(key)):
+            _mutation_error("Reference recipe identity mismatch", 409, "identity_mismatch")
+
+
+def _reconcile_staged_reference_members(project: TimelineProject, removed_member_ids: set[str]) -> dict:
+    affected_scene_ids = []
+    removed_item_ids = []
+    thinned_item_ids = []
+    for scene in project.scenes:
+        next_items = []
+        changed = False
+        for item in getattr(scene, "reference_items", []) or []:
+            kept = [member for member in item.members if member.get("member_id") not in removed_member_ids]
+            if len(kept) != len(item.members):
+                changed = True
+                if kept:
+                    item.members = kept
+                    thinned_item_ids.append(item.reference_item_id)
+                    next_items.append(item)
+                else:
+                    removed_item_ids.append(item.reference_item_id)
+            else:
+                next_items.append(item)
+        if changed:
+            scene.reference_items = next_items
+            affected_scene_ids.append(scene.scene_id)
+    return {
+        "affected_scene_ids": affected_scene_ids,
+        "removed_reference_item_ids": removed_item_ids,
+        "thinned_reference_item_ids": thinned_item_ids,
+    }
 
 
 def _apply_reference_mutation_operations(project: TimelineProject, operations: list) -> dict:
@@ -3202,6 +3665,34 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
         elif op_type == "reorder_members":
             reference = _apply_reorder_reference_members(project, operation)
             results.append({"type": op_type, "reference_id": reference.reference_id})
+        elif op_type == "create_recipe":
+            recipe = _normalize_custom_reference_recipe(operation.get("fields"))
+            existing_ids = {
+                str(candidate.get("id", "") or "")
+                for candidate in project.reference_recipes if isinstance(candidate, dict)
+            }
+            existing_ids.update(str(preset["id"]) for preset in REFERENCE_RECIPE_PRESETS)
+            if recipe["id"] in existing_ids:
+                recipe["id"] = f"custom:{uuid.uuid4().hex}"
+            project.reference_recipes.append(recipe)
+            results.append({"type": op_type, "recipe_id": recipe["id"]})
+        elif op_type == "update_recipe":
+            recipe_id = str(operation.get("recipe_id", "") or "")
+            index, current = _find_custom_reference_recipe(project, recipe_id)
+            _validate_recipe_expected(current, operation.get("expected"))
+            fields = dict(current)
+            fields.pop("builtIn", None)
+            fields.update(operation.get("fields") if isinstance(operation.get("fields"), dict) else {})
+            fields["id"] = recipe_id
+            recipe = _normalize_custom_reference_recipe(fields, recipe_id=recipe_id)
+            project.reference_recipes[index] = recipe
+            results.append({"type": op_type, "recipe_id": recipe_id})
+        elif op_type == "delete_recipe":
+            recipe_id = str(operation.get("recipe_id", "") or "")
+            index, current = _find_custom_reference_recipe(project, recipe_id)
+            _validate_recipe_expected(current, operation.get("expected"))
+            project.reference_recipes.pop(index)
+            results.append({"type": op_type, "recipe_id": recipe_id})
         else:
             _mutation_error(f"Unsupported reference operation: {op_type}", 400, "unsupported_reference_mutation")
     return {
@@ -3241,10 +3732,15 @@ def _remove_reference_members_for_assets(project: TimelineProject, asset_ids: se
                 "member_id": member.member_id,
                 "asset_id": member.asset_id,
             } for member in reference_removed)
+    reconciliation = _reconcile_staged_reference_members(
+        project,
+        {entry["member_id"] for entry in removed},
+    )
     return {
         "reference_members_removed": len(removed),
         "affected_reference_ids": affected_reference_ids,
         "removed_reference_members": removed,
+        **reconciliation,
     }
 
 
@@ -7517,6 +8013,9 @@ if routes is not None:
         for track_payload in payload.get("audio_tracks", []) or []:
             if isinstance(track_payload, dict):
                 track_payload.pop("track_id", None)
+        for item_payload in payload.get("reference_items", []) or []:
+            if isinstance(item_payload, dict):
+                item_payload.pop("reference_item_id", None)
 
         existing_names = {scene.name for scene in project.scenes}
         copy_base = f"{source_scene.name} (copy)"
@@ -7570,6 +8069,7 @@ if routes is not None:
             scene.name = body["name"]
         if "duration_frames" in body:
             scene.duration_frames = int(body["duration_frames"])
+            _clamp_reference_items_to_scene(scene)
         if "prompt" in body:
             if getattr(scene.global_prompt_track_config, "locked", False):
                 return _json_error("Global prompt track is locked", 409)
@@ -7588,6 +8088,12 @@ if routes is not None:
                     scene,
                     descriptor.configs_attr,
                     [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
+                )
+            if descriptor.recipe_attr and descriptor.recipe_attr in body:
+                setattr(
+                    scene,
+                    descriptor.recipe_attr,
+                    [ReferenceLaneRecipe.from_dict(recipe) for recipe in body[descriptor.recipe_attr]],
                 )
         if "guide_track_config" in body:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
@@ -7614,6 +8120,7 @@ if routes is not None:
             scene.fps = new_scene_fps
         # Auto-pad configs to match lane counts.
         pad_lane_configs(scene, LaneConfig)
+        pad_lane_recipes(scene, ReferenceLaneRecipe)
 
         try:
             _validate_single_driver_per_lane(scene)
@@ -7706,6 +8213,10 @@ if routes is not None:
             scene.audio_tracks = [
                 AudioTrack.from_dict(a) for a in body["audio_tracks"]
             ]
+        if "reference_items" in body:
+            scene.reference_items = [
+                ReferenceItem.from_dict(item) for item in body["reference_items"]
+            ]
         for descriptor in VARIABLE_LANE_DESCRIPTORS:
             if descriptor.count_attr in body:
                 setattr(scene, descriptor.count_attr, max(1, int(body[descriptor.count_attr])))
@@ -7715,11 +8226,18 @@ if routes is not None:
                     descriptor.configs_attr,
                     [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
                 )
+            if descriptor.recipe_attr and descriptor.recipe_attr in body:
+                setattr(
+                    scene,
+                    descriptor.recipe_attr,
+                    [ReferenceLaneRecipe.from_dict(recipe) for recipe in body[descriptor.recipe_attr]],
+                )
         if "guide_track_config" in body:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
         if "prompt_track_config" in body:
             scene.prompt_track_config = LaneConfig.from_dict(body["prompt_track_config"])
         pad_lane_configs(scene, LaneConfig)
+        pad_lane_recipes(scene, ReferenceLaneRecipe)
 
         try:
             _validate_single_driver_per_lane(scene)
@@ -7957,6 +8475,76 @@ if routes is not None:
             "driver_lane_count": lane_count,
             "drivers": rows,
             "all_driver_keys": all_driver_keys,
+        })
+
+    @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-references")
+    async def api_bridge_references(request: web.Request) -> web.Response:
+        """Return informational Reference lane shape for selector/bridge UI."""
+        try:
+            project = await asyncio.to_thread(_load_project_from_request, request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        scene_id = request.match_info["scene_id"]
+        scene = project.get_scene(scene_id)
+        if not scene:
+            return _json_error(f"Scene not found: {scene_id}", 404)
+
+        active_job = None
+        for job in getattr(project, "generation_queue", []) or []:
+            params = getattr(job, "params", {}) or {}
+            try:
+                snapshot_version = int(params.get("snapshot_version", 0) or 0) if isinstance(params, dict) else 0
+            except (TypeError, ValueError, OverflowError):
+                snapshot_version = 0
+            if (
+                getattr(job, "scene_id", "") == scene_id
+                and str(getattr(job, "status", "") or "").lower() == "running"
+                and snapshot_version > 0
+            ):
+                active_job = job
+                break
+        if active_job is not None:
+            lane_count = max(1, int(getattr(active_job, "reference_lane_count", 1) or 1))
+            configs = [LaneConfig.from_dict(value) if isinstance(value, dict) else value for value in (active_job.reference_lane_configs or [])]
+            recipes = [ReferenceLaneRecipe.from_dict(value) if isinstance(value, dict) else value for value in (active_job.reference_lane_recipes or [])]
+            reference_items = [ReferenceItem.from_dict(value) for value in (active_job.reference_item_snapshots or []) if isinstance(value, dict)]
+            source_label = "snapshot"
+        else:
+            lane_count = max(1, int(getattr(scene, "reference_lane_count", 1) or 1))
+            configs = list(getattr(scene, "reference_lane_configs", []) or [])
+            recipes = list(getattr(scene, "reference_lane_recipes", []) or [])
+            reference_items = list(getattr(scene, "reference_items", []) or [])
+            source_label = "live"
+        pad_config_list(configs, lane_count, LaneConfig)
+        while len(recipes) < lane_count:
+            recipes.append(ReferenceLaneRecipe())
+
+        rows = []
+        for lane_index in range(lane_count):
+            lane_items = [item for item in reference_items if int(getattr(item, "lane_index", 0) or 0) == lane_index]
+            member_count = max((len(getattr(item, "members", []) or []) for item in lane_items), default=0)
+            recipe = recipes[lane_index]
+            materialized = getattr(recipe, "recipe", {}) or {}
+            hard = materialized.get("hard") if isinstance(materialized.get("hard"), dict) else {}
+            live = reference_live_outputs(hard)
+            rows.append({
+                "lane_index": lane_index,
+                "lane_name": getattr(configs[lane_index], "name", "") or f"Reference {lane_index + 1}",
+                "hidden": bool(getattr(configs[lane_index], "hidden", False)),
+                "media_kind": getattr(recipe, "media_kind", "image"),
+                "recipe_id": getattr(recipe, "recipe_id", ""),
+                "recipe_name": str(materialized.get("name", "") or "Detached / Custom"),
+                "item_count": len(lane_items),
+                "member_count": min(16, member_count),
+                # Recipes that do not consume the r-block show no slots at all.
+                "slot_count": min(16, member_count) if "slots" in live else 0,
+                "live_outputs": sorted(live),
+            })
+        return web.json_response({
+            "scene_name": getattr(scene, "name", "") or scene_id,
+            "source": source_label,
+            "reference_lane_count": lane_count,
+            "references": rows,
         })
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-payload")

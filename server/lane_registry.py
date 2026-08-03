@@ -29,6 +29,7 @@ class LaneDescriptor:
     lane_removable: bool = False
     snapshot_count_attr: str = ""
     snapshot_configs_attr: str = ""
+    recipe_attr: str = ""
 
 
 LANE_DESCRIPTORS = (
@@ -107,6 +108,22 @@ LANE_DESCRIPTORS = (
         item_id_attr="prompt_id",
         item_predicate="all",
     ),
+    LaneDescriptor(
+        track_type="reference",
+        lane_type="reference",
+        variable=True,
+        header_controllable=True,
+        count_attr="reference_lane_count",
+        configs_attr="reference_lane_configs",
+        items_attr="reference_items",
+        item_index_attr="lane_index",
+        item_id_attr="reference_item_id",
+        item_predicate="all",
+        lane_removable=True,
+        snapshot_count_attr="reference_lane_count",
+        snapshot_configs_attr="reference_lane_configs",
+        recipe_attr="reference_lane_recipes",
+    ),
 )
 
 LANE_DESCRIPTORS_BY_TRACK_TYPE = MappingProxyType(
@@ -118,7 +135,7 @@ LANE_DESCRIPTORS_BY_LANE_TYPE = MappingProxyType(
 
 # This order is a backend reconciliation contract, not frontend presentation
 # order.  In particular Driver intentionally precedes audio here.
-VARIABLE_LANE_TYPES = ("video", "motion_driver", "audio")
+VARIABLE_LANE_TYPES = ("video", "motion_driver", "audio", "reference")
 VARIABLE_LANE_DESCRIPTORS = tuple(
     LANE_DESCRIPTORS_BY_LANE_TYPE[lane_type] for lane_type in VARIABLE_LANE_TYPES
 )
@@ -180,12 +197,38 @@ def pad_lane_configs(scene, factory: Callable[[], object]) -> None:
         pad_config_list(configs, count, factory)
 
 
+def pad_lane_recipes(scene, factory: Callable[[], object]) -> None:
+    """Pad recipe-bearing lane families without coupling this leaf module to models."""
+    for descriptor in VARIABLE_LANE_DESCRIPTORS:
+        if not descriptor.recipe_attr:
+            continue
+        recipes = getattr(scene, descriptor.recipe_attr)
+        count = getattr(scene, descriptor.count_attr)
+        pad_config_list(recipes, count, factory)
+
+
+def trim_lane_recipes(
+    recipes: list,
+    removed_index: int,
+    target_count: int,
+    factory: Callable[[], object],
+) -> None:
+    """Remove the recipe at the same index as its lane, then reconcile length."""
+    if 0 <= removed_index < len(recipes):
+        recipes.pop(removed_index)
+    while len(recipes) > target_count:
+        recipes.pop()
+    pad_config_list(recipes, target_count, factory)
+
+
 def ensure_lane_index(
     scene,
     lane_type: str,
     lane_index: int,
     factory: Callable[[], object],
 ) -> LaneDescriptor:
+    # Current callers create only video/audio lanes. A future caller for a
+    # recipe-bearing lane must also pad descriptor.recipe_attr explicitly.
     descriptor = variable_descriptor(lane_type)
     if descriptor is None:
         raise KeyError(lane_type)

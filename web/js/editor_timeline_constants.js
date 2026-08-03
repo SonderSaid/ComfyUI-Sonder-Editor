@@ -9,6 +9,7 @@ export const TRACK_TYPE = Object.freeze({
     VIDEO: "video",
     AUDIO: "audio",
     MOTION_DRIVER: "motion_driver",
+    REFERENCE: "reference",
     GUIDES: "guides",
     PROMPT_GLOBAL: "prompt_global",
     PROMPT: "prompt",

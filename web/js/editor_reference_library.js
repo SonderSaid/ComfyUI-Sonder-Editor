@@ -21,6 +21,12 @@ const css = {
 };
 
 let fieldId = 0;
+export const SONDER_REFERENCE_MIME = "application/x-sonder-reference";
+let activeReferenceDrag = null;
+
+export function getActiveReferenceDrag() {
+    return activeReferenceDrag;
+}
 
 function el(tag, text = "", style = "") {
     const node = document.createElement(tag);
@@ -85,6 +91,44 @@ export function mountReferenceLibrary(container, host) {
         destroyed: false,
     };
     container.style.cssText = "display:flex;flex-direction:column;min-height:0;overflow:hidden;height:100%;background:#11161b;color:#e6ebf0;";
+
+    const dragPayload = (reference, member = null) => ({
+        reference_id: reference.reference_id,
+        reference_name: reference.name,
+        members: (member ? [member] : (reference.members || [])).map((entry) => ({
+            entity_id: reference.reference_id,
+            member_id: entry.member_id,
+        })),
+    });
+
+    const beginReferenceDrag = (event, payload) => {
+        if (!payload.members.length) {
+            event.preventDefault();
+            return;
+        }
+        activeReferenceDrag = payload;
+        event.dataTransfer.effectAllowed = "copy";
+        event.dataTransfer.setData(SONDER_REFERENCE_MIME, JSON.stringify(payload));
+        event.dataTransfer.setData("text/plain", payload.reference_name || "Reference");
+    };
+
+    const endReferenceDrag = () => { activeReferenceDrag = null; };
+
+    const openTimelineMenu = (event, payload) => {
+        event.preventDefault();
+        event.stopPropagation();
+        document.querySelector('[data-reference-timeline-menu="true"]')?.remove();
+        const menu = el("div", "", "position:fixed;z-index:10020;padding:4px;border:1px solid #43505c;border-radius:6px;background:#182028;box-shadow:0 8px 22px rgba(0,0,0,.45);");
+        menu.dataset.referenceTimelineMenu = "true";
+        menu.style.left = `${event.clientX}px`;
+        menu.style.top = `${event.clientY}px`;
+        const add = el("button", "Add to timeline", `${css.button}border:0;background:transparent;display:block;width:100%;text-align:left;`);
+        add.disabled = !payload.members.length;
+        add.addEventListener("click", () => { menu.remove(); host.addToTimeline?.(payload); });
+        menu.appendChild(add);
+        document.body.appendChild(menu);
+        setTimeout(() => document.addEventListener("pointerdown", () => menu.remove(), { once: true }), 0);
+    };
 
     const reset = () => {
         state.query = "";
@@ -370,6 +414,10 @@ export function mountReferenceLibrary(container, host) {
         for (const reference of references) {
             const card = el("section", "", "border:1px solid #303841;border-radius:8px;background:#171d23;margin-bottom:8px;overflow:hidden;");
             const header = el("div", "", "display:flex;flex-direction:column;gap:5px;padding:8px;cursor:pointer;");
+            header.draggable = (reference.members || []).length > 0;
+            header.addEventListener("dragstart", (event) => beginReferenceDrag(event, dragPayload(reference)));
+            header.addEventListener("dragend", endReferenceDrag);
+            header.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference)));
             const memberAssets = (reference.members || []).map((member) => allAssets.find((asset) => asset.asset_id === member.asset_id));
             const unresolved = memberAssets.filter((asset) => !asset).length;
             const trashed = memberAssets.filter((asset) => asset && (asset.trashed || asset.trashed_at)).length;
@@ -408,7 +456,10 @@ export function mountReferenceLibrary(container, host) {
                 const actions = el("div", "", "display:flex;gap:5px;margin:7px 0;");
                 const addMember = el("button", "+ Member", css.button);
                 addMember.addEventListener("click", () => { state.memberDraft = createMemberDraft(); state.memberNotice = ""; state.memberMode = "create"; render(); });
-                actions.append(addMember);
+                const addTimeline = el("button", "Add to timeline", css.button);
+                addTimeline.disabled = !(reference.members || []).length;
+                addTimeline.addEventListener("click", () => host.addToTimeline?.(dragPayload(reference)));
+                actions.append(addMember, addTimeline);
                 detail.appendChild(actions);
                 if (state.memberDraft) {
                     const editing = (reference.members || []).find((member) => member.member_id === state.memberMode);
@@ -417,6 +468,10 @@ export function mountReferenceLibrary(container, host) {
                     for (const member of reference.members || []) {
                         const asset = allAssets.find((entry) => entry.asset_id === member.asset_id);
                         const row = el("div", "", "display:grid;grid-template-columns:40px minmax(0,1fr);gap:7px;padding:7px 0;border-top:1px solid #293039;");
+                        row.draggable = true;
+                        row.addEventListener("dragstart", (event) => beginReferenceDrag(event, dragPayload(reference, member)));
+                        row.addEventListener("dragend", endReferenceDrag);
+                        row.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference, member)));
                         const preview = el("button", asset?.asset_type === "audio" ? "Audio" : (asset?.asset_type === "video" ? "Video" : ""), "width:40px;height:34px;padding:0;background:#0b0e12;border:1px solid #333b44;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:8px;color:#8995a0;overflow:hidden;cursor:pointer;");
                         preview.type = "button";
                         preview.title = "Inspect Reference member";
@@ -466,6 +521,6 @@ export function mountReferenceLibrary(container, host) {
     return {
         render,
         reset,
-        destroy() { state.destroyed = true; container.innerHTML = ""; },
+        destroy() { state.destroyed = true; activeReferenceDrag = null; container.innerHTML = ""; },
     };
 }

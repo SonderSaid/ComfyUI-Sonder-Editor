@@ -6,7 +6,10 @@ import pytest
 from server import lane_registry
 from server import project_commit
 from server import routes
-from server.timeline_state import AudioTrack, ClipReference, LaneConfig, Scene, TimelineProject
+from server.timeline_state import (
+    AudioTrack, ClipReference, LaneConfig, ReferenceItem, ReferenceLaneRecipe,
+    Scene, TimelineProject,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,9 +20,12 @@ def _lane_surfaces(scene: Scene) -> dict:
         "video_lane_count": scene.video_lane_count,
         "motion_driver_lane_count": scene.motion_driver_lane_count,
         "audio_lane_count": scene.audio_lane_count,
+        "reference_lane_count": scene.reference_lane_count,
         "video_lane_configs": [asdict(config) for config in scene.video_lane_configs],
         "motion_driver_lane_configs": [asdict(config) for config in scene.motion_driver_lane_configs],
         "audio_lane_configs": [asdict(config) for config in scene.audio_lane_configs],
+        "reference_lane_configs": [asdict(config) for config in scene.reference_lane_configs],
+        "reference_lane_recipes": [asdict(recipe) for recipe in scene.reference_lane_recipes],
         "guide_track_config": asdict(scene.guide_track_config),
         "prompt_track_config": asdict(scene.prompt_track_config),
         "global_prompt_track_config": asdict(scene.global_prompt_track_config),
@@ -42,6 +48,7 @@ def test_scene_round_trip_preserves_lane_surface_shape_matrix(shape, configs, ex
         "video_lane_count": 3,
         "motion_driver_lane_count": 3,
         "audio_lane_count": 3,
+        "reference_lane_count": 3,
         "guide_track_config": {"name": "Guides", "locked": True},
         "prompt_track_config": {"name": "Prompt", "hidden": True},
         "global_prompt_track_config": {"name": "Global", "locked": True, "hidden": True},
@@ -51,6 +58,7 @@ def test_scene_round_trip_preserves_lane_surface_shape_matrix(shape, configs, ex
             "video_lane_configs",
             "motion_driver_lane_configs",
             "audio_lane_configs",
+            "reference_lane_configs",
         ):
             payload[field] = [dict(config) for config in configs]
 
@@ -62,6 +70,7 @@ def test_scene_round_trip_preserves_lane_surface_shape_matrix(shape, configs, ex
         "video_lane_configs",
         "motion_driver_lane_configs",
         "audio_lane_configs",
+        "reference_lane_configs",
     ):
         assert [config["name"] for config in before[field]] == expected_names
     assert before["guide_track_config"] == asdict(LaneConfig(name="Guides", locked=True))
@@ -159,6 +168,10 @@ def _scene_for_lane_removal(lane_type, state):
         if lane_type == "audio":
             scene.audio_tracks.append(
                 AudioTrack(track_id="occupied", lane_index=lane_index, timeline_end_frame=4)
+            )
+        elif lane_type == "reference":
+            scene.reference_items.append(
+                ReferenceItem(reference_item_id="occupied", lane_index=lane_index, end_frame=4)
             )
         else:
             scene.clips.append(

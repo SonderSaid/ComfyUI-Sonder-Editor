@@ -61,3 +61,50 @@ def test_gitignore_excludes_local_release_noise_and_secret_files():
         "build/",
     }
     assert required <= ignored
+
+
+# cp1252 with its five undefined slots passed through, which is how a tool that
+# wrote UTF-8 bytes through a Windows ANSI codec mangles a non-ASCII literal.
+_CP1252_TO_BYTE = {chr(code): code for code in range(0x20, 0x80)}
+for _byte in range(0x80, 0x100):
+    try:
+        _CP1252_TO_BYTE[bytes([_byte]).decode("cp1252")] = _byte
+    except UnicodeDecodeError:
+        pass
+_CP1252_TO_BYTE.update({chr(code): code for code in (0x81, 0x8D, 0x8F, 0x90, 0x9D)})
+_LEAD = "".join(map(chr, range(0xC2, 0xF5)))
+_CONT = "".join(char for char, byte in _CP1252_TO_BYTE.items() if 0x80 <= byte <= 0xBF)
+_MOJIBAKE = re.compile(f"[{re.escape(_LEAD)}][{re.escape(_CONT)}]{{1,3}}")
+
+
+def _recovered_utf8(text: str) -> str | None:
+    try:
+        return bytes(_CP1252_TO_BYTE[char] for char in text).decode("utf-8")
+    except (KeyError, UnicodeDecodeError):
+        return None
+
+
+def test_source_text_has_no_cp1252_round_trip_damage():
+    """A mangled emoji renders as literal garbage in the UI and reads as valid UTF-8.
+
+    The lane header icons hit this: the file stayed well-formed UTF-8, nothing
+    failed to load, and the only symptom was a nonsense glyph on the canvas.
+    """
+    findings = []
+    for path in sorted(ROOT.rglob("*")):
+        if path.is_dir() or any(part in {".git", "__pycache__", "node_modules"} for part in path.parts):
+            continue
+        if path.suffix not in {".js", ".py", ".md", ".json", ".toml", ".css", ".html"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            for match in _MOJIBAKE.finditer(line):
+                recovered = _recovered_utf8(match.group(0))
+                if recovered:
+                    findings.append(
+                        f"{path.relative_to(ROOT)}:{number}: {match.group(0)!r} should be {recovered!r}"
+                    )
+    assert not findings, "cp1252 round-trip damage in source text:\n" + "\n".join(findings)

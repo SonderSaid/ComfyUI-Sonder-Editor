@@ -344,6 +344,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
             video: "",
             audio: "",
             motion_driver: "",
+            reference: "",
         },
         editorMargins: { top: 16, bottom: 16, sides: 0 }, // px; `sides` = left & right
     },

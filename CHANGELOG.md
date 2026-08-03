@@ -11,18 +11,15 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
-## [0.2.2] - 2026-08-13
-
-### Fixed
-- Saved videos keep every rendered frame when the workflow also supplies audio.
-  Generated audio is often a fraction of a second shorter than the video, and
-  ffmpeg was ending the file at the audio instead — dropping the last frame or
-  two. Chained renders then read that missing frame as black at the start of
-  each new segment, which showed up as a hard seam between clips.
-
-## [0.2.1] - 2026-08-03
-
 ### Added
+- Added scene-durable Reference lanes and scoped Reference items with drag/drop,
+  range editing, hide/mute/lock, undoable exact mutations, hard media-kind
+  enforcement, built-in and project-custom assembly recipes, and queue freezes.
+- Added guarded Nodes 2.0 **Sonder Reference Selector** and **Sonder Reference
+  Bridge** nodes with lazy effective-window presence, per-recipe image/audio
+  assembly (segmented subject sequences, looped panel sheets, equal-width
+  strips), a per-recipe output liveness map, fixed `r01`–`r16` workflow sockets
+  that follow the staged member count, and loud staged-media failures.
 - Added a project-durable Reference Library with conflict-safe atomic editing,
   hybrid built-in/custom member tags, image/video crops, audio/video source trims, and an
   **Assets | References** authoring switch in fullscreen and mounted editors.
@@ -31,8 +28,23 @@ a fresh `[Unreleased]` block.
   visual crop/trim editor with full-source and applied-result preview.
 - Asset **Where Used**, Trash warnings, and permanent-deletion results now
   include Reference Library memberships and identify which edges are removed.
-- Added a **MiniMax H3** model template: 24 fps, multiple-of-32 dimensions, and
-  `17k+5` frame counts.
+- Reference lanes now open a full setup overlay from the ☰ icon: the recipe's
+  assembly, geometry, frame grid, member cap, prompt convention and live Bridge
+  outputs are all shown and explained, built-in templates fork into editable
+  project recipes, and each staged item lists its Library members with a
+  searchable picker and reorder controls.
+- The Reference lane overlay leads with the staged items, marks which one
+  actually reaches the model for the current window, shows the derived prompt so
+  it can be read and copied before overriding it, and completes suggested member
+  tags on Tab.
+- Reference recipe geometry is now Output size (scene, native or custom) plus a
+  snap-to multiple that can be copied from the scene's model template.
+- Sonder Reference Selector gained a lane dropdown with a status line in place
+  of a bare index, every Reference socket gained a hover description, and Sonder
+  Reference Bridge now hides the outputs a recipe does not drive — connected
+  slots always stay.
+- Reference lane headers show the recipe in use, and item bars show member tags
+  when there is room for them.
 
 ### Changed
 - Reference crop/trim preview now remembers Full Source versus Applied Result,
@@ -49,6 +61,23 @@ a fresh `[Unreleased]` block.
   crop/trim focus on pointer interaction, suppress the neutral shell's visual
   focus ring, and suppress the browser context menu.
 - Reference field help no longer displays a duplicate browser-native tooltip.
+- The external-links setting no longer shows a garbled ellipsis while its
+  server value loads.
+
+## [0.2.2] - 2026-08-13
+
+### Fixed
+- Saved videos keep every rendered frame when the workflow also supplies audio.
+  Generated audio is often a fraction of a second shorter than the video, and
+  ffmpeg was ending the file at the audio instead — dropping the last frame or
+  two. Chained renders then read that missing frame as black at the start of
+  each new segment, which showed up as a hard seam between clips.
+
+## [0.2.1] - 2026-08-03
+
+### Added
+- Added a **MiniMax H3** model template: 24 fps, multiple-of-32 dimensions, and
+  `17k+5` frame counts.
 
 ## [0.2.0] - 2026-08-01
 

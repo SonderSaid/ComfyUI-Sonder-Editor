@@ -7,7 +7,8 @@ import os
 from typing import Any
 
 from . import prompt_payload
-from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs
+from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs, pad_lane_recipes
+from .reference_resolution import REFERENCE_OUTPUT_NAMES
 
 logger = logging.getLogger("sonder_editor")
 
@@ -48,6 +49,221 @@ REFERENCE_TAG_PRESETS = (
     {"id": "sonder:first_frame", "label": "First Frame", "asset_types": ["image"], "suggested_kinds": ["location"]},
     {"id": "sonder:voice_identity", "label": "Voice Identity", "asset_types": ["audio", "video"], "suggested_kinds": ["character"], "requires_audio": True},
 )
+
+# Backend-owned recipe catalog. Lane state stores a materialized copy of the
+# selected recipe so projects remain reproducible if this catalog evolves.
+#
+# `live_outputs` is the per-recipe Bridge output liveness map: every output NOT
+# listed is dead for that mechanism and emits its documented type-correct
+# fallback (empty IMAGE / silent AUDIO / 0). "slots" covers the whole r01..r16
+# block. A recipe with no `live_outputs` (detached/custom) keeps every output
+# live. Values are read from the surveyed node sources, not from model cards —
+# see memory/Research Entries/reference_conditioning_mechanisms_2026-07.md.
+REFERENCE_RECIPE_PRESETS = (
+    {
+        "id": "sonder:ltx_msr",
+        # LiconMSR is an assembler, not an injector: refs occupy contiguous
+        # segments of a frame sequence on the 8x temporal VAE grid, the first
+        # ref starting at index 0, and `background` is a separate socket.
+        "name": "LTX Multiple Subject Reference",
+        "media_kind": "image",
+        "hard": {"assembly": "temporal", "max_members": 5, "frame_step": 8, "frame_offset": 1,
+                 "allowed_frame_counts": [17, 25, 33, 41, 49, 57, 65], "context_slot": True,
+                 "live_outputs": ["reference_frames", "reference_idx", "reference_strength",
+                                  "reference_prompt", "reference_names", "context", "slots"]},
+        "soft": {"suggested_tags": ["sonder:subject_still"], "context_tag": "sonder:location"},
+    },
+    {
+        "id": "sonder:ltx_ingredients",
+        # One panel sheet at exact output resolution, looped as a static video.
+        # 121 is the assembled reference-sequence length, never a render-window
+        # constraint — the editor's {step, offset} governs the render window.
+        "name": "LTX IC-LoRA Ingredients",
+        "media_kind": "image",
+        "hard": {"assembly": "sheet", "max_members": 16, "output_size": "scene", "background": "black",
+                 "loop_frames": 121, "frame_step": 8, "frame_offset": 1,
+                 "live_outputs": ["reference_frames", "reference_idx", "reference_strength",
+                                  "reference_prompt", "reference_names"]},
+        "soft": {"suggested_tags": ["sonder:face_closeup", "sonder:full_body", "sonder:turnaround"],
+                 "prompt_prefix": "Reference sheet:"},
+    },
+    {
+        "id": "sonder:ltx_best_face_id",
+        # A 4-panel sheet is exactly 1536x1024; a lone bust crop is ~460x406.
+        "name": "LTX Best Face ID",
+        "media_kind": "image",
+        "hard": {"assembly": "sheet", "max_members": 4, "output_size": "custom", "width": 1536, "height": 1024,
+                 "single_member_size": [460, 406], "background": "black",
+                 "live_outputs": ["reference_frames", "reference_strength",
+                                  "reference_prompt", "reference_names"]},
+        "soft": {"suggested_tags": ["sonder:face_closeup"], "prompt_prefix": "ref_t2v:"},
+    },
+    {
+        "id": "sonder:ltx_id_lora_audio",
+        "name": "LTX ID-LoRA Voice Identity",
+        "media_kind": "audio",
+        "hard": {"assembly": "audio", "max_members": 1,
+                 "live_outputs": ["reference_audio", "reference_prompt", "reference_names"]},
+        "soft": {"suggested_tags": ["sonder:voice_identity"], "recommended_duration_sec": 5.0},
+    },
+    {
+        "id": "sonder:wan_vace",
+        # Native VACE takes reference_image[:1], so multi-reference requires one
+        # composited sheet. The kijai wrapper is the reference implementation:
+        # an equal-width vertical strip, padded to output aspect with white and
+        # resized to width/height floored to /16.
+        "name": "Wan VACE Reference Sheet",
+        "media_kind": "image",
+        "hard": {"assembly": "sheet", "layout": "strip", "max_members": 16,
+                 "output_size": "scene", "size_multiple": 16, "background": "white",
+                 "live_outputs": ["reference_frames", "reference_prompt", "reference_names"]},
+        "soft": {"silent_single_input": True},
+    },
+    {
+        "id": "sonder:wan_phantom",
+        "name": "Wan Phantom Identities",
+        "media_kind": "image",
+        "hard": {"assembly": "batch", "max_members": 4, "output_size": "scene",
+                 "live_outputs": ["reference_frames", "reference_prompt", "reference_names"]},
+        "soft": {"suggested_tags": ["sonder:subject_still"]},
+    },
+    {
+        "id": "sonder:wan_scail",
+        "name": "Wan SCAIL Identities",
+        "media_kind": "image",
+        "hard": {"assembly": "batch", "max_members": 6, "output_size": "custom", "width": 512, "height": 896,
+                 "primary_model_position": "last",
+                 "live_outputs": ["reference_frames", "reference_prompt", "reference_names"]},
+        "soft": {"requires_identity_masks": True},
+    },
+    {
+        "id": "sonder:wan_bernini",
+        "name": "Wan Bernini-R References",
+        "media_kind": "image",
+        "hard": {"assembly": "slots", "max_members": 8, "output_size": "native",
+                 "long_edge_max": 848, "size_multiple": 16,
+                 "live_outputs": ["slots", "reference_prompt", "reference_names"]},
+        "soft": {"prompt_tokens": "image{index}"},
+    },
+)
+
+
+IMAGE_ASSEMBLIES = ("batch", "sheet", "temporal", "slots")
+
+# Authoring schema for the values a recipe carries. This is the single
+# declaration of what a recipe *has*: the Reference lane panel renders its form
+# straight from it, custom-recipe validation checks against it, and every key
+# here is read by the assembler in nodes/reference_core.py or drives a lane
+# advisory. `applies_to` is the set of assembly modes a field is meaningful for
+# (empty = all); `requires` names a sibling gate, matched against `requires_value`
+# when that is set and against truthiness when it is empty.
+REFERENCE_RECIPE_FIELDS = (
+    {"key": "assembly", "section": "hard", "group": "Assembly", "label": "Assembly",
+     "type": "enum", "values": ["batch", "sheet", "temporal", "slots", "audio"], "default": "batch",
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "How staged members become the reference_frames output."},
+    {"key": "layout", "section": "hard", "group": "Assembly", "label": "Sheet layout",
+     "type": "enum", "values": ["grid", "strip"], "default": "grid",
+     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "help": "Panel grid, or one equal-width vertical strip as the VACE wrapper builds it."},
+    {"key": "background", "section": "hard", "group": "Assembly", "label": "Sheet background",
+     "type": "enum", "values": ["black", "white"], "default": "black",
+     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "help": "Fill behind panels and padding. Ingredients documents black; the VACE wrapper pads white."},
+    {"key": "output_size", "section": "hard", "group": "Geometry", "label": "Output size",
+     "type": "enum", "values": ["scene", "native", "custom"], "default": "scene",
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
+     "help": "Follow the scene resolution, keep each member's own aspect, or pin an exact size."},
+    {"key": "width", "section": "hard", "group": "Geometry", "label": "Width",
+     "type": "int", "min": 0, "max": 8192, "default": 0,
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "output_size", "requires_value": "custom",
+     "help": "Exact output width this mechanism requires."},
+    {"key": "height", "section": "hard", "group": "Geometry", "label": "Height",
+     "type": "int", "min": 0, "max": 8192, "default": 0,
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "output_size", "requires_value": "custom",
+     "help": "Exact output height this mechanism requires."},
+    {"key": "long_edge_max", "section": "hard", "group": "Geometry", "label": "Long-edge maximum",
+     "type": "int", "min": 16, "max": 8192, "default": 848,
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "output_size", "requires_value": "native",
+     "help": "Upper bound on the longer side, so a large still is not passed through untouched."},
+    {"key": "single_member_size", "section": "hard", "group": "Geometry", "label": "Lone-member size",
+     "type": "int_pair", "min": 1, "max": 8192, "default": [],
+     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "help": "Size used when only one member is staged, where a lone crop differs from the full sheet."},
+    {"key": "size_multiple", "section": "hard", "group": "Geometry", "label": "Snap sides to",
+     "type": "int", "min": 1, "max": 64, "default": 1,
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
+     "help": "Both sides snap to this multiple. 1 leaves the size alone."},
+    {"key": "size_multiple_source", "section": "hard", "group": "Geometry", "label": "Multiple taken from",
+     "type": "enum", "values": ["custom", "template"], "default": "custom",
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
+     "help": "Provenance only. `template` records that the number was copied from the scene's model "
+             "template, so the panel can offer a re-sync when that template later disagrees."},
+    {"key": "frame_step", "section": "hard", "group": "Frame grid", "label": "Frame step",
+     "type": "int", "min": 1, "max": 64, "default": 8,
+     "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
+     "help": "Temporal VAE stride of the assembled reference sequence."},
+    {"key": "frame_offset", "section": "hard", "group": "Frame grid", "label": "Frame offset",
+     "type": "int", "min": 0, "max": 64, "default": 1,
+     "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
+     "help": "Grid offset, so valid lengths are step x k + offset."},
+    {"key": "allowed_frame_counts", "section": "hard", "group": "Frame grid", "label": "Allowed lengths",
+     "type": "int_list", "min": 1, "max": 4096, "default": [],
+     "applies_to": ["temporal"], "requires": "", "requires_value": "",
+     "help": "Trained sequence lengths. The shortest one that fits every member is used."},
+    {"key": "loop_frames", "section": "hard", "group": "Frame grid", "label": "Loop sheet to",
+     "type": "int", "min": 0, "max": 4096, "default": 0,
+     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "help": "Repeat the sheet to this many frames. Reference length only; it never limits the render window."},
+    {"key": "max_members", "section": "hard", "group": "Members", "label": "Maximum members",
+     "type": "int", "min": 1, "max": 16, "default": 16,
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Staging more than this refuses the render rather than dropping members silently."},
+    {"key": "context_slot", "section": "hard", "group": "Members", "label": "Separate background slot",
+     "type": "bool", "default": False,
+     "applies_to": ["temporal"], "requires": "", "requires_value": "",
+     "help": "A context-class member leaves the sequence and drives the context output instead."},
+    {"key": "primary_model_position", "section": "hard", "group": "Members", "label": "Primary arrives",
+     "type": "enum", "values": ["first", "last"], "default": "first",
+     "applies_to": ["batch"], "requires": "", "requires_value": "",
+     "help": "Some models silently move the primary reference to the end of the batch."},
+    {"key": "live_outputs", "section": "hard", "group": "Bridge outputs", "label": "Outputs this recipe drives",
+     "type": "output_list", "values": list(REFERENCE_OUTPUT_NAMES), "default": [],
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Unchecked outputs are dead for this mechanism and emit a type-correct fallback."},
+    {"key": "prompt_prefix", "section": "soft", "group": "Prompt", "label": "Prompt prefix",
+     "type": "string", "default": "",
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Prepended to the derived reference_prompt, for conventions like 'Reference sheet:'."},
+    {"key": "prompt_tokens", "section": "soft", "group": "Prompt", "label": "Per-member token",
+     "type": "string", "default": "",
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Positional token pattern, e.g. image{index}, for models that address slots by name."},
+    {"key": "suggested_tags", "section": "soft", "group": "Advisories", "label": "Suggested member tags",
+     "type": "string_list", "default": [],
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Staging without one of these raises a quality suggestion; it never blocks."},
+    {"key": "context_tag", "section": "soft", "group": "Advisories", "label": "Background tag",
+     "type": "string", "default": "",
+     "applies_to": ["temporal"], "requires": "", "requires_value": "",
+     "help": "Tag that marks the background member for the context slot."},
+    {"key": "recommended_duration_sec", "section": "soft", "group": "Advisories", "label": "Recommended seconds",
+     "type": "number", "min": 0, "max": 3600, "default": 0,
+     "applies_to": ["audio"], "requires": "", "requires_value": "",
+     "help": "Suggests a longer take when the staged audio is shorter than this."},
+    {"key": "silent_single_input", "section": "soft", "group": "Advisories", "label": "Model reads one image",
+     "type": "bool", "default": False,
+     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "help": "Warns that the model consumes a single image, which is why members are composited."},
+    {"key": "requires_identity_masks", "section": "soft", "group": "Advisories", "label": "Needs identity masks",
+     "type": "bool", "default": False,
+     "applies_to": ["batch"], "requires": "", "requires_value": "",
+     "help": "Warns that this mechanism also needs colour-matched masks supplied outside the Bridge."},
+)
+
+
+def reference_recipe_field(key: str) -> dict | None:
+    return next((field for field in REFERENCE_RECIPE_FIELDS if field["key"] == key), None)
 
 
 def default_reference_class(kind: str) -> str:
@@ -325,6 +541,89 @@ class ReferenceEntity:
             reference_class=reference_class,
             notes=str(data.get("notes", "") or ""),
             members=members,
+        )
+
+
+@dataclass
+class ReferenceLaneRecipe:
+    media_kind: str = "image"
+    recipe_id: str = ""
+    recipe: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "media_kind": "audio" if self.media_kind == "audio" else "image",
+            "recipe_id": str(self.recipe_id or ""),
+            "recipe": dict(self.recipe) if isinstance(self.recipe, dict) else {},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReferenceLaneRecipe":
+        if not isinstance(data, dict):
+            data = {}
+        media_kind = str(data.get("media_kind", "image") or "image")
+        if media_kind not in {"image", "audio"}:
+            media_kind = "image"
+        recipe = data.get("recipe", {})
+        return cls(
+            media_kind=media_kind,
+            recipe_id=str(data.get("recipe_id", "") or ""),
+            recipe=dict(recipe) if isinstance(recipe, dict) else {},
+        )
+
+
+@dataclass
+class ReferenceItem:
+    reference_item_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    lane_index: int = 0
+    start_frame: int = 0
+    end_frame: int = -1
+    members: list[dict] = field(default_factory=list)
+    prompt_override: str = ""
+    muted: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "reference_item_id": self.reference_item_id,
+            "lane_index": int(self.lane_index),
+            "start_frame": int(self.start_frame),
+            "end_frame": int(self.end_frame),
+            "members": [dict(member) for member in self.members if isinstance(member, dict)],
+            "prompt_override": str(self.prompt_override or ""),
+            "muted": bool(self.muted),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReferenceItem":
+        if not isinstance(data, dict):
+            data = {}
+        members = []
+        for raw_member in data.get("members", []) if isinstance(data.get("members", []), list) else []:
+            if not isinstance(raw_member, dict):
+                continue
+            member_id = str(raw_member.get("member_id", "") or "")
+            if not member_id:
+                continue
+            members.append({
+                "entity_id": str(raw_member.get("entity_id", "") or ""),
+                "member_id": member_id,
+            })
+        try:
+            lane_index = max(0, int(data.get("lane_index", 0) or 0))
+            start_frame = max(0, int(data.get("start_frame", 0) or 0))
+            end_frame = int(data.get("end_frame", -1))
+        except (TypeError, ValueError, OverflowError):
+            lane_index, start_frame, end_frame = 0, 0, -1
+        if end_frame != -1 and end_frame <= start_frame:
+            end_frame = start_frame + 1
+        return cls(
+            reference_item_id=str(data.get("reference_item_id", "") or ""),
+            lane_index=lane_index,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            members=members,
+            prompt_override=str(data.get("prompt_override", "") or ""),
+            muted=bool(data.get("muted", False)),
         )
 
 
@@ -715,15 +1014,19 @@ class Scene:
     guide_frames: list = field(default_factory=list)    # list[GuideFrame]
     clips: list = field(default_factory=list)            # list[ClipReference] — generated segments
     audio_tracks: list = field(default_factory=list)     # list[AudioTrack]
+    reference_items: list = field(default_factory=list)  # list[ReferenceItem]
     linked_item_groups: list = field(default_factory=list)  # list[{group_id, items:[{type,id}]}]
     asset_ids: list = field(default_factory=list)        # references to project-level Assets used
     is_bridge: bool = False                 # True if this is an auto-generated bridge between scenes
     video_lane_count: int = 1               # number of video lanes (multi-layer)
     motion_driver_lane_count: int = 1       # number of driver lanes
     audio_lane_count: int = 1               # number of audio lanes (multi-layer)
+    reference_lane_count: int = 1           # number of Reference lanes
     video_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     motion_driver_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
     audio_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
+    reference_lane_configs: list = field(default_factory=list)  # list[LaneConfig]
+    reference_lane_recipes: list = field(default_factory=list)  # list[ReferenceLaneRecipe]
     guide_track_config: LaneConfig = field(default_factory=LaneConfig)
     prompt_track_config: LaneConfig = field(default_factory=LaneConfig)
     global_prompt_track_config: LaneConfig = field(default_factory=LaneConfig)
@@ -813,15 +1116,19 @@ class Scene:
             "guide_frames": [g.to_dict() for g in self.guide_frames],
             "clips": [c.to_dict() for c in self.clips],
             "audio_tracks": [a.to_dict() for a in self.audio_tracks],
+            "reference_items": [item.to_dict() for item in self.reference_items],
             "linked_item_groups": list(self.linked_item_groups),
             "asset_ids": list(self.asset_ids),
             "is_bridge": self.is_bridge,
             "video_lane_count": self.video_lane_count,
             "motion_driver_lane_count": self.motion_driver_lane_count,
             "audio_lane_count": self.audio_lane_count,
+            "reference_lane_count": self.reference_lane_count,
             "video_lane_configs": [c.to_dict() for c in self.video_lane_configs],
             "motion_driver_lane_configs": [c.to_dict() for c in self.motion_driver_lane_configs],
             "audio_lane_configs": [c.to_dict() for c in self.audio_lane_configs],
+            "reference_lane_configs": [c.to_dict() for c in self.reference_lane_configs],
+            "reference_lane_recipes": [recipe.to_dict() for recipe in self.reference_lane_recipes],
             "guide_track_config": self.guide_track_config.to_dict(),
             "prompt_track_config": self.prompt_track_config.to_dict(),
             "global_prompt_track_config": self.global_prompt_track_config.to_dict(),
@@ -852,6 +1159,7 @@ class Scene:
             video_lane_count=data.get("video_lane_count", 1),
             motion_driver_lane_count=data.get("motion_driver_lane_count", 1),
             audio_lane_count=data.get("audio_lane_count", 1),
+            reference_lane_count=data.get("reference_lane_count", 1),
             width=data.get("width", 0),
             height=data.get("height", 0),
             fps=data.get("fps", 0.0),
@@ -882,6 +1190,9 @@ class Scene:
         scene.audio_tracks = [
             AudioTrack.from_dict(a) for a in data.get("audio_tracks", [])
         ]
+        scene.reference_items = [
+            ReferenceItem.from_dict(item) for item in data.get("reference_items", [])
+        ]
         scene._ensure_stable_link_item_ids()
         scene.linked_item_groups = scene._normalize_linked_item_groups(
             data.get("linked_item_groups", [])
@@ -896,7 +1207,12 @@ class Scene:
                     for config in data.get(descriptor.configs_attr, [])
                 ],
             )
+        scene.reference_lane_recipes = [
+            ReferenceLaneRecipe.from_dict(recipe)
+            for recipe in data.get("reference_lane_recipes", [])
+        ]
         pad_lane_configs(scene, LaneConfig)
+        pad_lane_recipes(scene, ReferenceLaneRecipe)
         scene.guide_track_config = LaneConfig.from_dict(data.get("guide_track_config", {}))
         scene.prompt_track_config = LaneConfig.from_dict(data.get("prompt_track_config", {}))
         raw_global_config = data.get("global_prompt_track_config")
@@ -928,6 +1244,14 @@ class Scene:
                 prompt_id = uuid.uuid4().hex[:8]
                 section.prompt_id = prompt_id
             seen_prompts.add(prompt_id)
+
+        seen_references = set()
+        for item in self.reference_items:
+            reference_item_id = str(getattr(item, "reference_item_id", "") or "")
+            if not reference_item_id or reference_item_id in seen_references:
+                reference_item_id = uuid.uuid4().hex
+                item.reference_item_id = reference_item_id
+            seen_references.add(reference_item_id)
 
     def _normalize_linked_item_groups(self, groups) -> list:
         if not isinstance(groups, list):
@@ -1143,6 +1467,15 @@ def retime_scene_geometry(scene: Scene, old_fps: float, new_fps: float) -> None:
             int(item.timeline_end_frame),
         )
 
+    max_reference_start = max(0, int(getattr(scene, "duration_frames", 0) or 0) - 1)
+    for item in getattr(scene, "reference_items", []) or []:
+        start = scaled(getattr(item, "start_frame", 0))
+        if int(getattr(scene, "duration_frames", 0) or 0) > 0:
+            start = min(max_reference_start, max(0, start))
+        old_end = int(getattr(item, "end_frame", -1))
+        item.start_frame = start
+        item.end_frame = -1 if old_end < 0 else max(start + 1, scaled(old_end))
+
     # Preserve the last-frame sentinel. For ordinary guides, process original
     # time order so the earlier guide keeps a rounded collision frame.
     guides = list(getattr(scene, "guide_frames", []) or [])
@@ -1218,6 +1551,10 @@ class GenerationJob:
     driver_clip_snapshots: list = field(default_factory=list)
     driver_lane_count: int = 1
     driver_lane_configs: list = field(default_factory=list)
+    reference_item_snapshots: list = field(default_factory=list)
+    reference_lane_count: int = 1
+    reference_lane_configs: list = field(default_factory=list)
+    reference_lane_recipes: list = field(default_factory=list)
     prompt_sections: list = field(default_factory=list)
     scene_width: int = 0
     scene_height: int = 0
@@ -1258,6 +1595,10 @@ class GenerationJob:
             "driver_clip_snapshots": list(self.driver_clip_snapshots),
             "driver_lane_count": self.driver_lane_count,
             "driver_lane_configs": list(self.driver_lane_configs),
+            "reference_item_snapshots": list(self.reference_item_snapshots),
+            "reference_lane_count": self.reference_lane_count,
+            "reference_lane_configs": list(self.reference_lane_configs),
+            "reference_lane_recipes": list(self.reference_lane_recipes),
             "prompt_sections": list(self.prompt_sections),
             "scene_width": self.scene_width,
             "scene_height": self.scene_height,
@@ -1305,6 +1646,10 @@ class GenerationJob:
             driver_clip_snapshots=list(data.get("driver_clip_snapshots", []) or []),
             driver_lane_count=max(1, int(data.get("driver_lane_count", 1) or 1)),
             driver_lane_configs=list(data.get("driver_lane_configs", []) or []),
+            reference_item_snapshots=list(data.get("reference_item_snapshots", []) or []),
+            reference_lane_count=max(1, int(data.get("reference_lane_count", 1) or 1)),
+            reference_lane_configs=list(data.get("reference_lane_configs", []) or []),
+            reference_lane_recipes=list(data.get("reference_lane_recipes", []) or []),
             prompt_sections=list(data.get("prompt_sections", []) or []),
             scene_width=data.get("scene_width", 0),
             scene_height=data.get("scene_height", 0),
@@ -1337,6 +1682,7 @@ class TimelineProject:
     scenes: list = field(default_factory=list)           # list[Scene] — ordered compositions
     assets: list = field(default_factory=list)           # list[Asset] — project media registry
     references: list = field(default_factory=list)       # list[ReferenceEntity] — project Reference Library
+    reference_recipes: list = field(default_factory=list)  # project-durable custom Reference recipes
     generation_queue: list = field(default_factory=list)  # list[GenerationJob]
     metadata: dict = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -1473,6 +1819,7 @@ class TimelineProject:
             "scenes": [s.to_dict() for s in self.scenes],
             "assets": [a.to_dict() for a in self.assets],
             "references": [reference.to_dict() for reference in self.references],
+            "reference_recipes": [dict(recipe) for recipe in self.reference_recipes if isinstance(recipe, dict)],
             "generation_queue": [j.to_dict() for j in self.generation_queue],
             "metadata": self.metadata,
             "created_at": self.created_at,
@@ -1504,6 +1851,12 @@ class TimelineProject:
             raw_references = []
         project.references = [
             ReferenceEntity.from_dict(reference) for reference in raw_references
+        ]
+        raw_reference_recipes = data.get("reference_recipes", [])
+        if not isinstance(raw_reference_recipes, list):
+            raw_reference_recipes = []
+        project.reference_recipes = [
+            dict(recipe) for recipe in raw_reference_recipes if isinstance(recipe, dict)
         ]
         repair_reference_ids(project)
         project.generation_queue = [

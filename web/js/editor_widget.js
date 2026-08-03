@@ -209,9 +209,10 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 }
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
-import { mountReferenceLibrary } from "./editor_reference_library.js";
+import { getActiveReferenceDrag, mountReferenceLibrary, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import { shouldApplyReferenceResponse } from "./reference_library_model.js";
+import { mountReferenceLanePanel } from "./editor_reference_panel.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
@@ -607,6 +608,9 @@ export class EditorWidget {
         this.assets = { video: [], image: [], audio: [], artifact: [] };
         this._references = [];
         this._referenceTagPresets = [];
+        this._referenceRecipePresets = [];
+        this._customReferenceRecipes = [];
+        this._referenceRecipeFieldSchema = [];
         this._referencesLoaded = false;
         this._referencesDirty = false;
         this._referencesLoading = false;
@@ -1740,6 +1744,8 @@ export class EditorWidget {
         return {
             references: this._references,
             catalog: this._referenceTagPresets,
+            recipePresets: this._referenceRecipePresets,
+            customRecipes: this._customReferenceRecipes,
             assets: this._allProjectAssetsForGallery(),
             loading: this._referencesLoading,
             error: this._referencesError,
@@ -1755,11 +1761,15 @@ export class EditorWidget {
         })) return false;
         this._references = Array.isArray(payload?.references) ? payload.references : [];
         this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
+        this._referenceRecipePresets = Array.isArray(payload?.recipe_presets) ? payload.recipe_presets : [];
+        this._customReferenceRecipes = Array.isArray(payload?.reference_recipes) ? payload.reference_recipes : [];
+        this._referenceRecipeFieldSchema = Array.isArray(payload?.recipe_field_schema) ? payload.recipe_field_schema : [];
         this._referencesLoaded = true;
         this._referencesDirty = false;
         this._referencesLoading = false;
         this._referencesError = "";
         this._referenceLibraryHandle?.render?.();
+        this._referencePanelHandle?.refresh?.();
         return true;
     }
 
@@ -1925,14 +1935,38 @@ export class EditorWidget {
             inspectAsset: (asset) => this._inspectReferenceAsset(asset),
             editMemberMedia: ({ asset, draft, readOnly, onApply }) => this._openReferenceMediaEditor({ asset, draft, readOnly, onApply }),
             previewMemberMedia: ({ asset, draft, readOnly }) => this._openReferenceMediaEditor({ asset, draft, readOnly }),
-            assetPreviewUrl: (asset) => {
-                if (!asset || !["image", "video"].includes(asset.asset_type)) return null;
-                if (asset.has_thumbnail && this._projectDirName()) {
-                    return api.apiURL(`/sonder-editor/project/${encodeURIComponent(this._projectDirName())}/thumbnail/${encodeURIComponent(asset.asset_id)}`);
-                }
-                return asset.asset_type === "image" ? this._buildViewURL(asset.path) : null;
-            },
+            addToTimeline: (payload) => void this._placeReferencePayload(payload, this.playhead, undefined),
+            assetPreviewUrl: (asset) => this._referenceAssetPreviewUrl(asset),
         });
+    }
+
+    /** Dimension grid of the scene's model template, for the Reference recipe
+     *  panel to materialize into `size_multiple`. Browser-local, so the panel
+     *  copies the number rather than looking it up at render time. */
+    /** Short recipe name for a Reference lane header, empty when detached. */
+    _referenceLaneRecipeLabel(laneIndex) {
+        const recipe = this.activeScene?.reference_lane_recipes?.[laneIndex || 0];
+        if (!recipe) return "";
+        const definition = [...(this._referenceRecipePresets || []), ...(this._customReferenceRecipes || [])]
+            .find((entry) => entry.id === recipe.recipe_id);
+        return definition?.name || String(recipe.recipe?.name || "");
+    }
+
+    _referenceTemplateDimensionStep() {
+        const constraint = getDimensionConstraint(getTemplateById(this._templateId, this._settings));
+        return Math.max(1, parseInt(constraint?.step, 10) || 1);
+    }
+
+    _referenceTemplateName() {
+        return getTemplateById(this._templateId, this._settings)?.name || "the scene template";
+    }
+
+    _referenceAssetPreviewUrl(asset) {
+        if (!asset || !["image", "video"].includes(asset.asset_type)) return null;
+        if (asset.has_thumbnail && this._projectDirName()) {
+            return api.apiURL(`/sonder-editor/project/${encodeURIComponent(this._projectDirName())}/thumbnail/${encodeURIComponent(asset.asset_id)}`);
+        }
+        return asset.asset_type === "image" ? this._buildViewURL(asset.path) : null;
     }
 
     _showFullscreenSidebarContent(value, { persist = true } = {}) {
@@ -2818,6 +2852,14 @@ export class EditorWidget {
         this.activeScene[descriptor.configsField] = this._trimLocalLaneConfigs(
             this.activeScene[descriptor.configsField] || [], -1, count,
         );
+        if (descriptor.recipeAttr) {
+            const recipes = Array.isArray(this.activeScene[descriptor.recipeAttr])
+                ? this.activeScene[descriptor.recipeAttr]
+                : [];
+            while (recipes.length > count) recipes.pop();
+            while (recipes.length < count) recipes.push(this._defaultReferenceLaneRecipe());
+            this.activeScene[descriptor.recipeAttr] = recipes;
+        }
     }
 
     _applyLocalRemoveLane(laneType, laneIndex, itemPolicy = "require_empty", targetLane = null) {
@@ -2855,6 +2897,15 @@ export class EditorWidget {
         this.activeScene[descriptor.configsField] = this._trimLocalLaneConfigs(
             this.activeScene[descriptor.configsField] || [], laneIndex, nextCount,
         );
+        if (descriptor.recipeAttr) {
+            const recipes = Array.isArray(this.activeScene[descriptor.recipeAttr])
+                ? this.activeScene[descriptor.recipeAttr]
+                : [];
+            if (laneIndex >= 0 && laneIndex < recipes.length) recipes.splice(laneIndex, 1);
+            while (recipes.length > nextCount) recipes.pop();
+            while (recipes.length < nextCount) recipes.push(this._defaultReferenceLaneRecipe());
+            this.activeScene[descriptor.recipeAttr] = recipes;
+        }
         return true;
     }
 
@@ -2968,6 +3019,7 @@ export class EditorWidget {
         const promptIndexes = [];
         const clipIds = new Set();
         const audioIds = new Set();
+        const referenceIds = new Set();
 
         for (const item of items) {
             if (!item || typeof item !== "object") continue;
@@ -2988,6 +3040,8 @@ export class EditorWidget {
             } else if (item.type === "prompt") {
                 const idx = parseInt(item.id, 10);
                 if (Number.isFinite(idx)) promptIndexes.push(idx);
+            } else if (item.type === "reference") {
+                referenceIds.add(String(item.id || ""));
             }
         }
 
@@ -3005,6 +3059,10 @@ export class EditorWidget {
             if (idx >= 0 && idx < (this.activeScene.prompt_sections || []).length) {
                 this.activeScene.prompt_sections.splice(idx, 1);
             }
+        }
+        if (referenceIds.size) {
+            this.activeScene.reference_items = (this.activeScene.reference_items || [])
+                .filter((item) => !referenceIds.has(String(item.reference_item_id || "")));
         }
         for (const lane of Array.from(new Set(videoLanes)).sort((a, b) => b - a)) {
             this._compactEmptyMediaLaneLocal("video", lane);
@@ -4412,6 +4470,11 @@ export class EditorWidget {
         } else if (item.type === "prompt") {
             start = data.start_frame;
             end = data.end_frame;
+        } else if (item.type === "reference") {
+            start = data.start_frame;
+            end = data.end_frame === -1
+                ? (this.totalFrames || this.activeScene?.duration_frames || 0)
+                : data.end_frame;
         } else if (item.type === "guide") {
             start = this._resolvedGuideFrame(data);
             end = start + 1;
@@ -4480,6 +4543,21 @@ export class EditorWidget {
         return { name: "", color: "", locked: false, hidden: false, ...overrides };
     }
 
+    _defaultReferenceLaneRecipe(overrides = {}) {
+        return { media_kind: "image", recipe_id: "", recipe: {}, ...overrides };
+    }
+
+    // media_kind is a hard lane property: a staging drop may adopt a kind only
+    // on a lane the user has never configured. Anything else — a chosen recipe,
+    // a detached custom recipe, or an explicit Media toggle — is authored lane
+    // state that a wrong-media drop must not silently repurpose.
+    _isUnconfiguredReferenceLaneRecipe(recipe) {
+        const value = recipe || {};
+        return (value.media_kind || "image") === "image"
+            && !String(value.recipe_id || "")
+            && !Object.keys(value.recipe || {}).length;
+    }
+
     _trackConfigForFixedType(type) {
         const field = descriptorFor(type)?.fixedConfigField;
         return (field && this.activeScene?.[field]) || this._defaultLaneConfig();
@@ -4543,6 +4621,7 @@ export class EditorWidget {
         if (item.type === "audio") return this._isLaneLocked(TRACK_TYPE.AUDIO, item.data.lane_index || 0);
         if (item.type === "guide") return this._isGuideTrackLocked();
         if (item.type === "prompt") return this._isPromptTrackLocked();
+        if (item.type === "reference") return this._isLaneLocked(TRACK_TYPE.REFERENCE, item.data.lane_index || 0);
         if (item.type === "prompt_global") return this._isGlobalPromptTrackLocked();
         return false;
     }
@@ -4706,6 +4785,22 @@ export class EditorWidget {
         }
         if (item.type === "clip" || item.type === "audio") {
             return { type: item.type, id: item.id };
+        }
+        if (item.type === "reference") {
+            const data = item.data || {};
+            return {
+                type: "reference",
+                id: item.id,
+                expected: {
+                    reference_item_id: data.reference_item_id || item.id,
+                    lane_index: data.lane_index || 0,
+                    start_frame: data.start_frame || 0,
+                    end_frame: data.end_frame ?? -1,
+                    members: Array.isArray(data.members) ? data.members : [],
+                    prompt_override: data.prompt_override || "",
+                    muted: !!data.muted,
+                },
+            };
         }
         return null;
     }
@@ -5777,6 +5872,10 @@ export class EditorWidget {
         return TimelineCanvas._hitTestAudio(this, x, rawY);
     }
 
+    _hitTestReference(x, rawY) {
+        return TimelineCanvas._hitTestReference(this, x, rawY);
+    }
+
     _hitTestGuide(x, rawY) {
         return TimelineCanvas._hitTestGuide(this, x, rawY);
     }
@@ -5815,6 +5914,12 @@ export class EditorWidget {
                 String(index) === String(id) || String(item.prompt_id || "") === String(id)
             );
             return idx >= 0 ? { type, id: idx, data: sections[idx] } : null;
+        }
+        if (type === "reference") {
+            const item = (this.activeScene.reference_items || []).find((candidate) =>
+                String(candidate.reference_item_id || "") === String(id)
+            );
+            return item ? { type, id: item.reference_item_id, data: item } : null;
         }
         return null;
     }
@@ -6057,6 +6162,15 @@ export class EditorWidget {
             const layoutIdx = this._audioLaneLayoutIdx(track.lane_index || 0);
             if (intersectsRow(layoutIdx) && intersectsFrames(track.timeline_start_frame || 0, track.timeline_end_frame || 0)) {
                 hits.push({ type: "audio", id: track.track_id, data: track });
+            }
+        }
+        for (const item of (this.activeScene.reference_items || [])) {
+            const layoutIdx = this._trackLayout.findIndex((entry) =>
+                entry.type === TRACK_TYPE.REFERENCE && entry.laneIndex === (item.lane_index || 0)
+            );
+            const end = item.end_frame === -1 ? Math.max(0, this.totalFrames) : item.end_frame;
+            if (intersectsRow(layoutIdx) && intersectsFrames(item.start_frame || 0, end || 0)) {
+                hits.push({ type: "reference", id: item.reference_item_id, data: item });
             }
         }
         const guideIdx = this._guidesLayoutIdx();
@@ -6396,6 +6510,8 @@ export class EditorWidget {
                             this._showGuideManagementPopup(e.clientX, e.clientY);
                         } else if (descriptorFor(entry.type)?.manageAction === "prompts") {
                             this._showPromptManagementPanel();
+                        } else if (descriptorFor(entry.type)?.manageAction === "references") {
+                            void this._showReferenceLanePanel(entry);
                         }
                         break;
                     case "label":
@@ -6421,10 +6537,12 @@ export class EditorWidget {
                         if (edgeHit.type === "clip" && this._isLaneLocked(this._clipTrackType(edgeHit.data), edgeHit.data.track_index || 0)) return;
                         if (edgeHit.type === "audio" && this._isLaneLocked(TRACK_TYPE.AUDIO, edgeHit.data.lane_index || 0)) return;
                         if (edgeHit.type === "prompt" && this._isPromptTrackLocked()) return;
+                        if (edgeHit.type === "reference" && this._isLaneLocked(TRACK_TYPE.REFERENCE, edgeHit.data.lane_index || 0)) return;
                         this._pushUndo("trim");
-                        const isPrompt = edgeHit.type === "prompt";
-                        const trimOrigStart = isPrompt ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame;
-                        const trimOrigEnd = isPrompt ? edgeHit.data.end_frame : edgeHit.data.timeline_end_frame;
+                        const isSourceLess = edgeHit.type === "prompt" || edgeHit.type === "reference";
+                        const trimOrigStart = isSourceLess ? edgeHit.data.start_frame : edgeHit.data.timeline_start_frame;
+                        const trimStoredEnd = isSourceLess ? edgeHit.data.end_frame : edgeHit.data.timeline_end_frame;
+                        const trimOrigEnd = edgeHit.type === "reference" && trimStoredEnd === -1 ? this.totalFrames : trimStoredEnd;
                         const trimOrigSourceIn = edgeHit.data.source_in_frame || 0;
                         const trimOrigSourceOut = edgeHit.data.source_out_frame || (trimOrigEnd - trimOrigStart);
                         // Read total_source_frames from item data (set by backend on placement/split).
@@ -6432,7 +6550,7 @@ export class EditorWidget {
                         const trimOrigTotalSource = (typeof edgeHit.data.total_source_frames === "number" && edgeHit.data.total_source_frames > 0)
                             ? edgeHit.data.total_source_frames
                             : (trimOrigSourceOut - trimOrigSourceIn) + (trimOrigEnd - trimOrigStart);
-                        const trimLimits = isPrompt ? {} : this._trimDeltaLimits(
+                        const trimLimits = isSourceLess ? {} : this._trimDeltaLimits(
                             edgeHit,
                             trimOrigStart,
                             trimOrigEnd,
@@ -6444,6 +6562,7 @@ export class EditorWidget {
                             ...edgeHit,
                             origStart: trimOrigStart,
                             origEnd: trimOrigEnd,
+                            origStoredEnd: trimStoredEnd,
                             origSourceIn: trimOrigSourceIn,
                             origSourceOut: trimOrigSourceOut,
                             origTotalSourceFrames: trimOrigTotalSource,
@@ -6500,21 +6619,28 @@ export class EditorWidget {
                         this._lastSnappedDelta = 0; // Track snapped delta for commit
                         this._dragLastValidDelta = 0; // Group hold delta (linked collision)
                         this._dragItemOrigStart = hit.data.timeline_start_frame ?? hit.data.start_frame ?? hit.data.frame_index ?? 0;
-                        this._dragItemOrigEnd = hit.data.timeline_end_frame ?? hit.data.end_frame ?? this._dragItemOrigStart;
+                        this._dragItemOrigEnd = hit.data.timeline_end_frame
+                            ?? (hit.data.end_frame === -1 ? this.totalFrames : hit.data.end_frame)
+                            ?? this._dragItemOrigStart;
                         // Anchor lane/type for per-item lane-delta calculation (#15)
                         this._dragAnchorType = hit.type;
                         this._dragAnchorId = hit.id;
                         this._dragAnchorOrigLane = hit.type === "clip" ? (hit.data.track_index || 0)
-                            : (hit.type === "audio" ? (hit.data.lane_index || 0) : 0);
+                            : ((hit.type === "audio" || hit.type === "reference") ? (hit.data.lane_index || 0) : 0);
                         this._dragAnchorTrackType = hit.type === "clip" ? this._clipTrackType(hit.data)
-                            : (hit.type === "audio" ? TRACK_TYPE.AUDIO : "");
+                            : (hit.type === "audio" ? TRACK_TYPE.AUDIO : (hit.type === "reference" ? TRACK_TYPE.REFERENCE : ""));
                         // Store original positions + lane info for all selected items (group move)
                         this._dragItemsOrig = this.selectedItems.map(s => ({
                             type: s.type, id: s.id, data: s.data,
                             origStart: s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0,
-                            origEnd: s.data.timeline_end_frame ?? s.data.end_frame ?? (s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0),
-                            origLane: s.type === "clip" ? (s.data.track_index || 0) : (s.type === "audio" ? (s.data.lane_index || 0) : 0),
-                            origTrackType: s.type === "clip" ? this._clipTrackType(s.data) : (s.type === "audio" ? TRACK_TYPE.AUDIO : ""),
+                            origEnd: s.data.timeline_end_frame
+                                ?? (s.data.end_frame === -1 ? this.totalFrames : s.data.end_frame)
+                                ?? (s.data.timeline_start_frame ?? s.data.start_frame ?? s.data.frame_index ?? 0),
+                            origStoredEnd: s.data.end_frame,
+                            origLane: s.type === "clip" ? (s.data.track_index || 0)
+                                : ((s.type === "audio" || s.type === "reference") ? (s.data.lane_index || 0) : 0),
+                            origTrackType: s.type === "clip" ? this._clipTrackType(s.data)
+                                : (s.type === "audio" ? TRACK_TYPE.AUDIO : (s.type === "reference" ? TRACK_TYPE.REFERENCE : "")),
                         }));
                         this._dragLaneChanged = false;
                         this._dragSwapTarget = null;
@@ -6546,6 +6672,14 @@ export class EditorWidget {
                         }));
                         this._dragPromptSwap = null;
                         this._dragPromptHold = null;
+                        this._origAllReferenceRanges = (this.activeScene?.reference_items || []).map((item) => ({
+                            data: item,
+                            start: item.start_frame || 0,
+                            end: item.end_frame === -1 ? this.totalFrames : (item.end_frame || 0),
+                            storedEnd: item.end_frame,
+                            lane: item.lane_index || 0,
+                        }));
+                        this._dragReferenceHold = null;
                     } else {
                         // Click on empty space — deselect all
                         this._startItemDragSelect(x, rawY, e);
@@ -6627,16 +6761,20 @@ export class EditorWidget {
                 const snappedFrame = this._snapFrame(frame, [this._trimItem.id]);
                 const item = this._trimItem;
 
-                if (item.type === "prompt") {
+                if (item.type === "prompt" || item.type === "reference") {
                     // Prompts have no source media — resize freely but clamp to
                     // neighbor boundaries (no-overlap invariant; backend 409 is
                     // the safety net for races)
-                    const otherSections = (this.activeScene?.prompt_sections || [])
-                        .filter((s) => s !== item.data);
+                    const otherSections = item.type === "prompt"
+                        ? (this.activeScene?.prompt_sections || []).filter((scope) => scope !== item.data)
+                        : (this.activeScene?.reference_items || []).filter((scope) =>
+                            scope !== item.data && (scope.lane_index || 0) === (item.data.lane_index || 0)
+                        );
+                    const resolvedEnd = (scope) => scope.end_frame === -1 ? this.totalFrames : (scope.end_frame || 0);
                     if (item.edge === "left") {
                         let leftBound = 0;
                         for (const s of otherSections) {
-                            if ((s.end_frame || 0) <= item.origStart) leftBound = Math.max(leftBound, s.end_frame || 0);
+                            if (resolvedEnd(s) <= item.origStart) leftBound = Math.max(leftBound, resolvedEnd(s));
                         }
                         item.data.start_frame = Math.max(leftBound, Math.min(item.origEnd - 1, snappedFrame));
                     } else {
@@ -6644,7 +6782,8 @@ export class EditorWidget {
                         for (const s of otherSections) {
                             if ((s.start_frame || 0) >= item.origEnd) rightBound = Math.min(rightBound, s.start_frame || 0);
                         }
-                        item.data.end_frame = Math.max(item.origStart + 1, Math.min(rightBound, snappedFrame));
+                        const nextEnd = Math.max(item.origStart + 1, Math.min(rightBound, snappedFrame));
+                        item.data.end_frame = item.type === "reference" && nextEnd >= this.totalFrames ? -1 : nextEnd;
                     }
                 } else {
                     // Clips and audio — clamp to source media bounds
@@ -6697,6 +6836,9 @@ export class EditorWidget {
                     } else if (orig.type === "prompt") {
                         frameDelta = Math.max(frameDelta, -orig.origStart);
                         frameDelta = Math.min(frameDelta, this.totalFrames - orig.origEnd);
+                    } else if (orig.type === "reference") {
+                        frameDelta = Math.max(frameDelta, -orig.origStart);
+                        frameDelta = Math.min(frameDelta, this.totalFrames - orig.origEnd);
                     }
                 }
                 this._lastSnappedDelta = frameDelta;
@@ -6737,6 +6879,11 @@ export class EditorWidget {
                 for (const snap of (this._origAllPromptRanges || [])) {
                     snap.data.start_frame = snap.start;
                     snap.data.end_frame = snap.end;
+                }
+                for (const snap of (this._origAllReferenceRanges || [])) {
+                    snap.data.start_frame = snap.start;
+                    snap.data.end_frame = snap.storedEnd;
+                    snap.data.lane_index = snap.lane;
                 }
 
                 const draggedClipIds = new Set((this._dragItemsOrig || []).filter(o => o.type === "clip").map(o => o.id));
@@ -6889,6 +7036,7 @@ export class EditorWidget {
                     }
                 }
                 this._previewPromptDrag(effectiveDelta, x, rawY);
+                this._previewReferenceDrag(effectiveDelta);
             }
 
             this._renderTimeline();
@@ -6960,6 +7108,8 @@ export class EditorWidget {
                 this._origAllAudioLanes = {};
                 this._origAllAudioStarts = {};
                 this._origAllAudioEnds = {};
+                this._origAllReferenceRanges = [];
+                this._dragReferenceHold = null;
                 this._lastSnappedDelta = 0;
                 this._dragLaneChanged = false;
                 this._dragSwapTarget = null;
@@ -7044,6 +7194,18 @@ export class EditorWidget {
             if (this._dropHoverTarget) {
                 this._dropHoverTarget = null;
                 this._renderTimeline();
+            }
+            const referenceData = e.dataTransfer.getData(SONDER_REFERENCE_MIME);
+            if (referenceData) {
+                try {
+                    const payload = JSON.parse(referenceData);
+                    const { x, rawY } = this._canvasMouseCoords(e);
+                    const frame = Math.max(0, this._xToFrame(x));
+                    void this._placeReferencePayload(payload, frame, rawY);
+                } catch (err) {
+                    console.warn("[Sonder] Reference drop failed:", err);
+                }
+                return;
             }
             const assetData = e.dataTransfer.getData("application/x-sonder-asset");
             if (!assetData) {
@@ -7167,6 +7329,12 @@ export class EditorWidget {
                     this._showContextMenu(e.clientX, e.clientY, menuItems);
                     return;
                 }
+                if (entry.type === TRACK_TYPE.REFERENCE) {
+                    // Setup joins the generic lane menu rather than replacing
+                    // it: a Reference lane still renames, adds and removes like
+                    // every other variable lane.
+                    menuItems.push({ label: "Reference Lane Setup…", action: () => void this._showReferenceLanePanel(entry) });
+                }
                 if (this._isLaneTrackType(entry.type)) {
                     const descriptor = descriptorFor(entry.type);
                     const laneCount = laneCountFor(this.activeScene, entry.type);
@@ -7251,7 +7419,7 @@ export class EditorWidget {
                 // Discoverable mirror of the M shortcut (linked-aware via
                 // _toggleSelectedMute's own expansion + lock refusal).
                 const muteCandidates = expandedMenuItems.filter((item) =>
-                    item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt");
+                    item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt" || item?.type === "reference");
                 if (muteCandidates.length > 0) {
                     const allMuted = muteCandidates.every((item) => !!item.data?.muted);
                     const muteLabel = `${allMuted ? "Unmute" : "Mute"} Selected (${muteCandidates.length})`;
@@ -7394,6 +7562,23 @@ export class EditorWidget {
                     });
                     const deleteLabel = hasLinkedSelection ? `Delete Linked Items (${expandedDeleteCount})` : "Delete Guide";
                     menuItems.push({ label: itemLocked ? `${deleteLabel} (locked)` : deleteLabel, action: itemLocked ? () => {} : () => this._deleteSelectedItems(), danger: true, disabled: itemLocked });
+                } else if (hit.type === "reference") {
+                    const endFrame = hit.data.end_frame === -1 ? this.totalFrames : (hit.data.end_frame || 0);
+                    menuItems.push({
+                        label: "Set Selection to Reference",
+                        action: () => this._setSelectionToFrameRange(hit.data.start_frame || 0, endFrame),
+                    });
+                    const laneEntry = (this._trackLayout || []).find((entry) =>
+                        entry.type === TRACK_TYPE.REFERENCE && (entry.laneIndex || 0) === (hit.data.lane_index || 0));
+                    if (laneEntry) {
+                        menuItems.push({ label: "Reference Lane Setup", action: () => void this._showReferenceLanePanel(laneEntry) });
+                    }
+                    menuItems.push({
+                        label: itemLocked ? "Delete Reference (locked)" : "Delete Reference",
+                        action: itemLocked ? () => {} : () => this._deleteSelectedItems(),
+                        danger: true,
+                        disabled: itemLocked,
+                    });
                 }
             }
 
@@ -7457,6 +7642,17 @@ export class EditorWidget {
      *  accept/refuse lives in _handleAssetDrop. */
     _resolveDropHoverTarget(rawY) {
         if (!this.activeScene || rawY === undefined) return null;
+        const referenceDrag = getActiveReferenceDrag?.() || null;
+        if (referenceDrag) {
+            if (rawY < this._timelineRulerHeight()) return { kind: "invalid" };
+            const layoutIdx = this._layoutIndexFromRawY(rawY);
+            const entry = layoutIdx >= 0 ? this._trackLayout[layoutIdx] : null;
+            return entry?.type === TRACK_TYPE.REFERENCE
+                && !entry.collapsed
+                && !this._isLaneLocked(entry.type, entry.laneIndex || 0)
+                ? { kind: "lane", layoutIdx }
+                : { kind: "invalid" };
+        }
         const dragAsset = getActiveDragAsset?.() || null;
         const assetType = dragAsset?.asset_type || "";
         if (assetType === "artifact") return { kind: "invalid" };
@@ -7489,6 +7685,107 @@ export class EditorWidget {
         return compatibility !== "reject" && laneValid()
             ? { kind: "lane", layoutIdx }
             : { kind: "invalid" };
+    }
+
+    _referencePayloadMediaKind(payload) {
+        const kinds = new Set();
+        for (const memberRef of payload?.members || []) {
+            const resolved = this._referenceMemberForRef(memberRef);
+            const asset = resolved ? this._findAssetById(resolved.member.asset_id) : null;
+            if (!resolved || !asset) return "";
+            const voiceTagged = (resolved.member.tags || []).includes("sonder:voice_identity");
+            kinds.add(asset.asset_type === "audio" || (asset.asset_type === "video" && voiceTagged) ? "audio" : "image");
+        }
+        return kinds.size === 1 ? [...kinds][0] : "";
+    }
+
+    async _placeReferencePayload(payload, frame, trackRawY) {
+        if (!this.activeScene || !this.projectDir || !Array.isArray(payload?.members) || !payload.members.length) return;
+        const mediaKind = this._referencePayloadMediaKind(payload);
+        if (!mediaKind) {
+            notifyWarning("Stage image/video references separately from voice-reference audio.", { source: "reference-stage-refused" });
+            return;
+        }
+        const scene = this.activeScene;
+        const duration = Math.max(1, parseInt(scene.duration_frames, 10) || this.totalFrames || 1);
+        const startFrame = Math.min(duration - 1, Math.max(0, Math.round(Number(frame) || 0)));
+        let explicitEntry = null;
+        if (trackRawY !== undefined) {
+            if (trackRawY < this._timelineRulerHeight()) return;
+            const layoutIdx = this._layoutIndexFromRawY(trackRawY);
+            explicitEntry = layoutIdx >= 0 ? this._trackLayout[layoutIdx] : null;
+            if (explicitEntry?.type !== TRACK_TYPE.REFERENCE || explicitEntry.collapsed) return;
+        }
+        const referenceEntries = (this._trackLayout || []).filter((entry) => entry.type === TRACK_TYPE.REFERENCE);
+        const overlapsFrame = (laneIndex) => (scene.reference_items || []).some((item) => {
+            if ((item.lane_index || 0) !== laneIndex) return false;
+            const end = item.end_frame === -1 ? duration : item.end_frame;
+            return (item.start_frame || 0) <= startFrame && end > startFrame;
+        });
+        const recipeFor = (laneIndex) => scene.reference_lane_recipes?.[laneIndex] || this._defaultReferenceLaneRecipe();
+        const canUse = (entry) => {
+            if (!entry || this._isLaneLocked(entry.type, entry.laneIndex || 0) || overlapsFrame(entry.laneIndex || 0)) return false;
+            const recipe = recipeFor(entry.laneIndex || 0);
+            if (recipe.media_kind === mediaKind) return true;
+            const occupied = (scene.reference_items || []).some((item) => (item.lane_index || 0) === (entry.laneIndex || 0));
+            return !occupied && this._isUnconfiguredReferenceLaneRecipe(recipe);
+        };
+        let entry = explicitEntry;
+        if (entry && !canUse(entry)) {
+            notifyWarning("That Reference lane is locked, occupied at this frame, or uses a different media kind.", { source: "reference-stage-refused" });
+            return;
+        }
+        if (!entry) entry = referenceEntries.find(canUse) || null;
+
+        const operations = [];
+        let laneIndex;
+        if (!entry) {
+            laneIndex = laneCountFor(scene, TRACK_TYPE.REFERENCE);
+            operations.push({ type: "set_lane_count", lane_type: "reference", count: laneIndex + 1 });
+        } else {
+            laneIndex = entry.laneIndex || 0;
+        }
+        const existingRecipe = recipeFor(laneIndex);
+        if (existingRecipe.media_kind !== mediaKind || !entry) {
+            operations.push({
+                type: "update_lane_config",
+                lane_type: "reference",
+                lane_index: laneIndex,
+                fields: { reference_recipe: this._defaultReferenceLaneRecipe({ media_kind: mediaKind }) },
+            });
+        }
+        const nextStart = (scene.reference_items || [])
+            .filter((item) => (item.lane_index || 0) === laneIndex && (item.start_frame || 0) > startFrame)
+            .map((item) => item.start_frame || 0)
+            .sort((left, right) => left - right)[0];
+        operations.push({
+            type: "create_reference_item",
+            fields: {
+                lane_index: laneIndex,
+                start_frame: startFrame,
+                end_frame: Number.isFinite(nextStart) ? nextStart : -1,
+                members: payload.members,
+                prompt_override: "",
+                muted: false,
+            },
+        });
+
+        this._pushUndo("add reference item");
+        try {
+            const result = await this._runSceneMutation(operations, {
+                key: `scene:${this.activeSceneId}:reference-stage:${Date.now()}`,
+                label: "stage reference",
+                coalesce: false,
+                refreshScenes: false,
+            });
+            this._reconcileActiveSceneFromMutation(result, { reason: "reference_stage", ignoreTimelineGate: true });
+            this._buildTrackLayout();
+            this._renderTimeline();
+        } catch (error) {
+            this._discardLastUndo("add reference item");
+            notifyWarning(error?.message || "Reference placement was refused.", { source: "reference-stage-refused" });
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_stage_error" });
+        }
     }
 
     async _handleAssetDrop(asset, frame, trackRawY) {
@@ -8156,12 +8453,20 @@ export class EditorWidget {
                 apply_linked: applyLinked,
             };
         }
+        if (item.type === "reference") {
+            return {
+                type: "update_reference_item",
+                reference_item_id: item.data.reference_item_id || item.id,
+                expected: { muted: !!item.data.muted },
+                fields: { muted: !!muted },
+            };
+        }
         return null;
     }
 
     _buildLinkedMuteOperations(items, muted) {
         const expanded = this._expandItemsWithLinked(items)
-            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt");
+            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt" || item?.type === "reference");
         if (expanded.some((item) => this._isItemLocked(item))) {
             return { operations: [], targets: expanded, locked: true };
         }
@@ -8211,13 +8516,14 @@ export class EditorWidget {
                     const listField = descriptorFor(target.type)?.itemsSource?.listField;
                     const type = listField === "audio_tracks" ? "audio"
                         : listField === "guide_frames" ? "guide"
-                            : listField === "prompt_sections" ? "prompt" : "clip";
+                            : listField === "prompt_sections" ? "prompt"
+                                : listField === "reference_items" ? "reference" : "clip";
                     for (const data of this._trackItemsForEntry(target)) {
                         if (!data?.muted) continue;
                         const id = type === "audio" ? data.track_id
                             : type === "guide" ? data.frame_index
                                 : type === "prompt" ? (this.activeScene?.prompt_sections || []).indexOf(data)
-                                    : data.clip_id;
+                                    : type === "reference" ? data.reference_item_id : data.clip_id;
                         if (id !== undefined && id !== null && id !== -1) unmuteSeeds.push({ type, id, data });
                     }
                 }
@@ -8253,7 +8559,7 @@ export class EditorWidget {
                 const listKey = descriptorFor(target.type)?.configsField;
                 const list = Array.isArray(sceneRef[listKey]) ? sceneRef[listKey] : [];
                 while (list.length <= laneIndex) list.push(this._defaultLaneConfig());
-                list[laneIndex] = cfg;
+                list[laneIndex] = { ...(list[laneIndex] || {}), ...cfg };
                 sceneRef[listKey] = list;
             }
         }
@@ -8364,12 +8670,19 @@ export class EditorWidget {
             if (!laneType) continue;
             const laneIndex = e.laneIndex || 0;
             const fields = { name: e.customName || "", color: e.color || "", locked: !!e.locked, hidden: !!e.hidden };
+            const descriptor = descriptorFor(e.type);
+            if (descriptor?.recipeAttr) {
+                fields.reference_recipe = e.referenceRecipe
+                    || sceneRef?.[descriptor.recipeAttr]?.[laneIndex]
+                    || this._defaultReferenceLaneRecipe();
+            }
             operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields });
             // Optimistic per-lane scene write (icon-flicker fix, now scoped):
             // _buildTrackLayout re-derives icon state from scene configs, so any
             // rebuild during the in-flight window must already see the new value.
             if (sceneRef) {
-                const cfg = { ...fields };
+                const { reference_recipe: _referenceRecipe, ...configFields } = fields;
+                const cfg = { ...configFields };
                 if (laneType === "guide") {
                     sceneRef.guide_track_config = cfg;
                 } else if (laneType === "prompt") {
@@ -8377,11 +8690,17 @@ export class EditorWidget {
                 } else if (laneType === "prompt_global") {
                     sceneRef.global_prompt_track_config = cfg;
                 } else {
-                    const listKey = descriptorFor(e.type)?.configsField;
+                    const listKey = descriptor?.configsField;
                     const list = Array.isArray(sceneRef[listKey]) ? sceneRef[listKey] : [];
                     while (list.length <= laneIndex) list.push(this._defaultLaneConfig());
-                    list[laneIndex] = cfg;
+                    list[laneIndex] = { ...(list[laneIndex] || {}), ...cfg };
                     sceneRef[listKey] = list;
+                    if (descriptor?.recipeAttr && fields.reference_recipe) {
+                        const recipes = Array.isArray(sceneRef[descriptor.recipeAttr]) ? sceneRef[descriptor.recipeAttr] : [];
+                        while (recipes.length <= laneIndex) recipes.push(this._defaultReferenceLaneRecipe());
+                        recipes[laneIndex] = { ...fields.reference_recipe };
+                        sceneRef[descriptor.recipeAttr] = recipes;
+                    }
                 }
             }
         }
@@ -8452,8 +8771,15 @@ export class EditorWidget {
     }
 
     _mediaItemsOverlap(left, right) {
-        return (left?.timeline_start_frame || 0) < (right?.timeline_end_frame || 0)
-            && (left?.timeline_end_frame || 0) > (right?.timeline_start_frame || 0);
+        const bounds = (item) => {
+            if (item?.reference_item_id) {
+                return [item.start_frame || 0, item.end_frame === -1 ? this.totalFrames : (item.end_frame || 0)];
+            }
+            return [item?.timeline_start_frame || 0, item?.timeline_end_frame || 0];
+        };
+        const [leftStart, leftEnd] = bounds(left);
+        const [rightStart, rightEnd] = bounds(right);
+        return leftStart < rightEnd && leftEnd > rightStart;
     }
 
     _laneMoveItemsRefusal(trackType, sourceLane, targetLane) {
@@ -8462,6 +8788,15 @@ export class EditorWidget {
         }
         const moving = this._laneItemsForTrackType(trackType, sourceLane);
         const destination = this._laneItemsForTrackType(trackType, targetLane);
+        if (trackType === TRACK_TYPE.REFERENCE) {
+            const descriptor = descriptorFor(trackType);
+            const recipes = this.activeScene?.[descriptor?.recipeAttr] || [];
+            const sourceKind = recipes[sourceLane]?.media_kind === "audio" ? "audio" : "image";
+            const targetKind = recipes[targetLane]?.media_kind === "audio" ? "audio" : "image";
+            if (sourceKind !== targetKind) {
+                return "Move refused because image and audio Reference lanes are not interchangeable.";
+            }
+        }
         for (let index = 0; index < moving.length; index++) {
             for (let otherIndex = index + 1; otherIndex < moving.length; otherIndex++) {
                 if (this._mediaItemsOverlap(moving[index], moving[otherIndex])) {
@@ -9801,7 +10136,9 @@ export class EditorWidget {
             ? (isMotionDriverClip ? COLORS.motionDriverSelected : COLORS.clipSelected)
             : type === "audio"
                 ? COLORS.audioClipSelected
-                : COLORS.guideSelected;
+                : type === "reference"
+                    ? COLORS.referenceItemSelected
+                    : COLORS.guideSelected;
 
         const editor = document.createElement("div");
         editor.style.cssText = `
@@ -9812,12 +10149,15 @@ export class EditorWidget {
 
         const typeLabel = document.createElement("span");
         typeLabel.style.cssText = `font-size: 10px; color: ${editorAccent}; white-space: nowrap; font-weight: bold;`;
-        typeLabel.textContent = type === "clip" ? (isMotionDriverClip ? "Driver" : "Video Clip") : type === "audio" ? "Audio Track" : "Guide Frame";
+        typeLabel.textContent = type === "clip"
+            ? (isMotionDriverClip ? "Driver" : "Video Clip")
+            : type === "audio" ? "Audio Track" : type === "reference" ? "Reference" : "Guide Frame";
         editor.appendChild(typeLabel);
 
-        if (type === "clip" || type === "audio") {
-            const startFrame = data.timeline_start_frame;
-            const endFrame = data.timeline_end_frame;
+        if (type === "clip" || type === "audio" || type === "reference") {
+            const startFrame = type === "reference" ? (data.start_frame || 0) : data.timeline_start_frame;
+            const storedEndFrame = type === "reference" ? (data.end_frame ?? -1) : data.timeline_end_frame;
+            const endFrame = storedEndFrame === -1 ? this.totalFrames : storedEndFrame;
             const duration = endFrame - startFrame;
 
             // Start frame input
@@ -9834,7 +10174,27 @@ export class EditorWidget {
             editor.appendChild(durLabel);
 
             // Opacity (clips) or Volume (audio)
-            if (type === "clip") {
+            if (type === "reference") {
+                // The prompt moved to the Reference lane panel, which can show the
+                // derived text this override replaces. A bare input here could only
+                // ever offer the override half of that contract.
+                const setupBtn = this._makeBtn("Lane Setup…", "Recipe, staged members and prompt for this Reference lane");
+                setupBtn.addEventListener("click", () => {
+                    const laneEntry = (this._trackLayout || []).find((entry) =>
+                        entry.type === TRACK_TYPE.REFERENCE && (entry.laneIndex || 0) === (data.lane_index || 0));
+                    if (laneEntry) void this._showReferenceLanePanel(laneEntry);
+                });
+                const muteBtn = this._makeBtn(data.muted ? "Muted" : "Active", "Toggle reference item");
+                muteBtn.addEventListener("click", () => {
+                    this._pushUndo("toggle reference mute");
+                    const nextMuted = !data.muted;
+                    this._updateItemProperty(type, id, { muted: nextMuted });
+                    data.muted = nextMuted;
+                    muteBtn.textContent = data.muted ? "Muted" : "Active";
+                    this._renderTimeline();
+                });
+                editor.append(setupBtn, muteBtn);
+            } else if (type === "clip") {
                 if (isMotionDriverClip) {
                     const strengthLabel = this._makeEditorLabel("Strength:");
                     const strengthInput = this._makeEditorInput((data.strength ?? 1.0).toFixed(2), 0, 1);
@@ -9915,7 +10275,7 @@ export class EditorWidget {
             }
 
             // Apply button
-            const applyBtn = this._makeBtn("Apply", "Apply guide changes");
+            const applyBtn = this._makeBtn("Apply", "Apply timeline position");
             applyBtn.addEventListener("click", () => {
                 const newStart = this._parsePositionInput(startInput.value);
                 if (!isNaN(newStart) && newStart >= 0) {
@@ -10118,9 +10478,28 @@ export class EditorWidget {
             return;
         }
         this._pushUndo("move item");
+        const referenceMove = (() => {
+            if (type !== "reference") return null;
+            const oldStart = Math.max(0, parseInt(data.start_frame, 10) || 0);
+            const oldEnd = data.end_frame === -1
+                ? Math.max(oldStart + 1, this.totalFrames)
+                : Math.max(oldStart + 1, parseInt(data.end_frame, 10) || 0);
+            const duration = Math.max(1, oldEnd - oldStart);
+            const maxStart = Math.max(0, this.totalFrames - duration);
+            const nextStart = Math.max(0, Math.min(maxStart, Math.round(Number(newStart) || 0)));
+            const nextEnd = nextStart + duration;
+            return {
+                type: "update_reference_item",
+                reference_item_id: data.reference_item_id || id,
+                expected: { start_frame: oldStart, end_frame: data.end_frame === -1 ? -1 : oldEnd },
+                fields: { start_frame: nextStart, end_frame: nextEnd >= this.totalFrames ? -1 : nextEnd },
+            };
+        })();
         const operation = type === "clip"
             ? { type: "update_clip", clip_id: id, fields: { timeline_start_frame: newStart }, apply_linked: applyLinked }
-            : { type: "update_audio_track", track_id: id, fields: { timeline_start_frame: newStart }, apply_linked: applyLinked };
+            : type === "reference"
+                ? referenceMove
+                : { type: "update_audio_track", track_id: id, fields: { timeline_start_frame: newStart }, apply_linked: applyLinked };
 
         try {
             await this._runSceneMutation([operation], {
@@ -10164,6 +10543,14 @@ export class EditorWidget {
         let operation;
         if (type === "clip") {
             operation = { type: "update_clip", clip_id: id, fields: { ...props }, apply_linked: applyLinked };
+        } else if (type === "reference") {
+            const item = this._findSceneItemBySelection(type, id)?.data;
+            operation = {
+                type: "update_reference_item",
+                reference_item_id: item?.reference_item_id || id,
+                expected: Object.fromEntries(Object.keys(props || {}).map((key) => [key, item?.[key]])),
+                fields: { ...props },
+            };
         } else if (type === "guide") {
             const frameIndex = parseInt(id, 10);
             const guide = (this.activeScene.guide_frames || []).find((g) => (g.frame_index || 0) === frameIndex);
@@ -10218,7 +10605,7 @@ export class EditorWidget {
 
     async _toggleSelectedMute() {
         const targets = this._expandItemsWithLinked(this.selectedItems)
-            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt");
+            .filter((item) => item?.type === "clip" || item?.type === "audio" || item?.type === "guide" || item?.type === "prompt" || item?.type === "reference");
         if (!targets.length) return;
         if (targets.some((item) => this._isItemLocked(item))) {
             notifyWarning("Linked mute refused because one or more selected items are locked.", { source: "timeline-mute-refused" });
@@ -10265,6 +10652,13 @@ export class EditorWidget {
                     },
                     fields: { muted: nextMuted },
                     apply_linked: applyLinked,
+                });
+            } else if (item.type === "reference") {
+                operations.push({
+                    type: "update_reference_item",
+                    reference_item_id: item.data?.reference_item_id || item.id,
+                    expected: { muted: !nextMuted },
+                    fields: { muted: nextMuted },
                 });
             }
         }
@@ -10788,6 +11182,47 @@ export class EditorWidget {
         }
     }
 
+    _previewReferenceDrag(frameDelta) {
+        const dragged = (this._dragItemsOrig || []).filter((item) => item.type === "reference");
+        if (!dragged.length) return;
+        const draggedSet = new Set(dragged.map((item) => item.data));
+        const proposals = dragged.map((orig) => {
+            const duration = Math.max(1, orig.origEnd - orig.origStart);
+            const start = Math.max(0, Math.min(this.totalFrames - duration, orig.origStart + frameDelta));
+            const end = start + duration;
+            return { orig, start, end };
+        });
+        const valid = proposals.every(({ orig, start, end }, index) => {
+            const overlaps = (otherStart, otherEnd) => start < otherEnd && end > otherStart;
+            for (const other of (this.activeScene?.reference_items || [])) {
+                if (draggedSet.has(other) || (other.lane_index || 0) !== orig.origLane) continue;
+                const otherEnd = other.end_frame === -1 ? this.totalFrames : (other.end_frame || 0);
+                if (overlaps(other.start_frame || 0, otherEnd)) return false;
+            }
+            for (let otherIndex = index + 1; otherIndex < proposals.length; otherIndex++) {
+                const other = proposals[otherIndex];
+                if (other.orig.origLane === orig.origLane && overlaps(other.start, other.end)) return false;
+            }
+            return true;
+        });
+        if (valid) {
+            for (const proposal of proposals) {
+                proposal.orig.data.start_frame = proposal.start;
+                proposal.orig.data.end_frame = proposal.end >= this.totalFrames ? -1 : proposal.end;
+            }
+            this._dragReferenceHold = proposals.map((proposal) => ({
+                data: proposal.orig.data,
+                start: proposal.start,
+                end: proposal.end,
+            }));
+        } else if (this._dragReferenceHold) {
+            for (const held of this._dragReferenceHold) {
+                held.data.start_frame = held.start;
+                held.data.end_frame = held.end >= this.totalFrames ? -1 : held.end;
+            }
+        }
+    }
+
     /** No-overlap prompt-lane drag preview: all-or-nothing linear move with
      *  hold-at-last-valid, plus a duration-preserving threshold swap on
      *  single-item drags. Assumes all section ranges were just restored from
@@ -10959,7 +11394,20 @@ export class EditorWidget {
                 for (const orig of dragItemsOrig) {
                     const { type, id, data } = orig;
                     if (type === "clip" || type === "audio") continue;
-                    if (type === "guide") {
+                    if (type === "reference") {
+                        operations.push({
+                            type: "update_reference_item",
+                            reference_item_id: data.reference_item_id || id,
+                            expected: {
+                                start_frame: orig.origStart,
+                                end_frame: orig.origStoredEnd,
+                            },
+                            fields: {
+                                start_frame: data.start_frame,
+                                end_frame: data.end_frame,
+                            },
+                        });
+                    } else if (type === "guide") {
                         if (this._isGuideTrackLocked()) continue;
                         const oldIdx = orig.origStart;
                         const previewIdx = Number.isFinite(data._previewFrameIndex) ? data._previewFrameIndex : null;
@@ -11100,6 +11548,19 @@ export class EditorWidget {
                             end_frame: data.end_frame,
                         },
                         apply_linked: applyLinked,
+                    });
+                } else if (type === "reference") {
+                    operations.push({
+                        type: "update_reference_item",
+                        reference_item_id: data.reference_item_id || id,
+                        expected: {
+                            start_frame: origStart,
+                            end_frame: trimInfo.origStoredEnd,
+                        },
+                        fields: {
+                            start_frame: data.start_frame,
+                            end_frame: data.end_frame,
+                        },
                     });
                 }
                 if (operations.length > 0) {
@@ -14013,6 +14474,44 @@ export class EditorWidget {
             }
         }
 
+        const referenceDescriptor = descriptorFor(TRACK_TYPE.REFERENCE);
+        const referenceLaneCount = Math.max(1, parseInt(laneCountFor(this.activeScene, TRACK_TYPE.REFERENCE), 10) || 1);
+        const referenceLaneConfigs = [];
+        const referenceLaneRecipes = [];
+        for (let laneIndex = 0; laneIndex < referenceLaneCount; laneIndex++) {
+            const cfg = (this.activeScene[referenceDescriptor.configsField] || [])[laneIndex] || {};
+            referenceLaneConfigs.push({
+                name: cfg.name || "",
+                color: cfg.color || "",
+                locked: !!cfg.locked,
+                hidden: !!cfg.hidden,
+            });
+            referenceLaneRecipes.push({
+                ...this._defaultReferenceLaneRecipe(),
+                ...((this.activeScene[referenceDescriptor.recipeAttr] || [])[laneIndex] || {}),
+            });
+        }
+        const referenceItemSnapshots = [];
+        for (const item of (this.activeScene.reference_items || [])) {
+            const itemStart = Math.max(0, parseInt(item.start_frame, 10) || 0);
+            const itemEnd = item.end_frame === -1
+                ? sceneDuration
+                : Math.max(itemStart + 1, parseInt(item.end_frame, 10) || 0);
+            if (itemStart < snapshotEnd && itemEnd > snapshotStart) {
+                referenceItemSnapshots.push({
+                    reference_item_id: item.reference_item_id || "",
+                    lane_index: Math.max(0, parseInt(item.lane_index, 10) || 0),
+                    start_frame: itemStart,
+                    // A queued job is immutable. Resolve the authored -1 sentinel
+                    // now so later scene-duration edits cannot change its scope.
+                    end_frame: itemEnd,
+                    members: Array.isArray(item.members) ? item.members.map((member) => ({ ...member })) : [],
+                    prompt_override: item.prompt_override || "",
+                    muted: !!item.muted,
+                });
+            }
+        }
+
         return {
             scene_id: range.sceneId,
             scene_name: range.sceneName,
@@ -14029,6 +14528,10 @@ export class EditorWidget {
             driver_clip_snapshots: driverClipSnapshots,
             driver_lane_count: driverLaneCount,
             driver_lane_configs: driverLaneConfigs,
+            reference_item_snapshots: referenceItemSnapshots,
+            reference_lane_count: referenceLaneCount,
+            reference_lane_configs: referenceLaneConfigs,
+            reference_lane_recipes: referenceLaneRecipes,
             prompt_sections: promptSections,
             scene_width: Math.max(0, parseInt(this.activeScene.width, 10) || 0),
             scene_height: Math.max(0, parseInt(this.activeScene.height, 10) || 0),
@@ -14716,6 +15219,9 @@ export class EditorWidget {
         this.scenes = [];
         this._references = [];
         this._referenceTagPresets = [];
+        this._referenceRecipePresets = [];
+        this._customReferenceRecipes = [];
+        this._referenceRecipeFieldSchema = [];
         this._referencesLoaded = false;
         this._referencesDirty = false;
         this._referencesLoading = false;
@@ -14723,6 +15229,7 @@ export class EditorWidget {
         this._referenceMediaEditorHandle?.destroy?.();
         this._referenceMediaEditorHandle = null;
         this._referenceLibraryHandle?.reset?.();
+        this._referencePanelHandle?.close?.();
         this._queueBatchExpanded = {};
         this._updateSceneIdentity("Loading…");
         this._updateProjectIdentity();
@@ -14792,6 +15299,68 @@ export class EditorWidget {
                 }
             }
         }
+    }
+
+    _referenceMemberForRef(memberRef) {
+        for (const reference of this._references || []) {
+            const member = (reference.members || []).find((candidate) => candidate.member_id === memberRef?.member_id);
+            if (member) return { reference, member };
+        }
+        return null;
+    }
+
+    _referenceLaneAdvisories(entry, recipeDefinition) {
+        const staged = (this.activeScene?.reference_items || [])
+            .filter((item) => (item.lane_index || 0) === (entry.laneIndex || 0))
+            .flatMap((item) => item.members || [])
+            .map((memberRef) => this._referenceMemberForRef(memberRef))
+            .filter(Boolean);
+        const hard = recipeDefinition?.hard || {};
+        const soft = recipeDefinition?.soft || {};
+        const advisories = [];
+        const cap = Number(hard.max_members);
+        if (Number.isFinite(cap) && cap >= 0 && staged.length > cap) {
+            advisories.push({ voice: "silent-loss", text: `${staged.length} staged members exceed the hard cap of ${cap}; render will be refused.` });
+        }
+        for (const tag of soft.suggested_tags || []) {
+            if (!staged.some(({ member }) => (member.tags || []).includes(tag))) {
+                advisories.push({ voice: "suggestion", text: `Consider staging a member tagged ${tag}.` });
+            }
+        }
+        if (soft.context_tag && !staged.some(({ reference, member }) =>
+            reference.reference_class === "context" || (member.tags || []).includes(soft.context_tag)
+        )) {
+            advisories.push({ voice: "suggestion", text: "Consider staging a background or context member." });
+        }
+        const recommendedSeconds = Number(soft.recommended_duration_sec);
+        if (Number.isFinite(recommendedSeconds) && recommendedSeconds > 0) {
+            const shortest = staged
+                .map(({ member }) => {
+                    const asset = this._findAssetById(member.asset_id);
+                    const end = Number(member.source_end_sec);
+                    const start = Number(member.source_start_sec) || 0;
+                    return Number.isFinite(end) && end > start ? end - start : Number(asset?.duration_sec) || 0;
+                })
+                .filter((seconds) => seconds > 0)
+                .sort((left, right) => left - right)[0];
+            if (shortest && shortest < recommendedSeconds) {
+                advisories.push({ voice: "suggestion", text: `This recipe works best with about ${recommendedSeconds}s of reference; the shortest staged member is ${shortest.toFixed(1)}s.` });
+            }
+        }
+        if (soft.silent_single_input && staged.length > 1) {
+            advisories.push({ voice: "suggestion", text: "The model reads a single image, which is why these members are composited into one sheet." });
+        }
+        if (soft.requires_identity_masks && staged.length) {
+            advisories.push({ voice: "suggestion", text: "This mechanism also needs colour-matched identity masks, supplied outside the Bridge." });
+        }
+        return advisories;
+    }
+
+    async _showReferenceLanePanel(entry) {
+        if (!entry || entry.type !== TRACK_TYPE.REFERENCE) return;
+        if (!this._referencesLoaded) await this._fetchReferences({ force: true, reason: "reference_lane_panel" });
+        this._referencePanelHandle?.close?.();
+        this._referencePanelHandle = mountReferenceLanePanel(this, { laneIndex: entry.laneIndex || 0 });
     }
 
     async _fetchProjectSettings({ ignoreMutationGate = false, reason = "project_settings" } = {}) {

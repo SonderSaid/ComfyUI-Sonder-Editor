@@ -14,6 +14,7 @@ export const LANE_DESCRIPTORS = freeze([
         laneOrder: "desc",
         countField: "video_lane_count",
         configsField: "video_lane_configs",
+        recipeAttr: "",
         fixedConfigField: "",
         labelPrefix: "V",
         labelSingular: "Video",
@@ -48,6 +49,7 @@ export const LANE_DESCRIPTORS = freeze([
         laneOrder: "asc",
         countField: "audio_lane_count",
         configsField: "audio_lane_configs",
+        recipeAttr: "",
         fixedConfigField: "",
         labelPrefix: "A",
         labelSingular: "Audio",
@@ -82,6 +84,7 @@ export const LANE_DESCRIPTORS = freeze([
         laneOrder: "asc",
         countField: "motion_driver_lane_count",
         configsField: "motion_driver_lane_configs",
+        recipeAttr: "",
         fixedConfigField: "",
         labelPrefix: "Driver ",
         labelSingular: "Driver",
@@ -108,6 +111,41 @@ export const LANE_DESCRIPTORS = freeze([
         laneRemovable: true,
     }),
     freeze({
+        trackType: TRACK_TYPE.REFERENCE,
+        laneType: "reference",
+        variable: true,
+        headerControllable: true,
+        layoutOrder: 40,
+        laneOrder: "asc",
+        countField: "reference_lane_count",
+        configsField: "reference_lane_configs",
+        recipeAttr: "reference_lane_recipes",
+        fixedConfigField: "",
+        labelPrefix: "R",
+        labelSingular: "Reference",
+        labelFixed: "",
+        menuLabel: "Reference",
+        logLabel: "reference",
+        color: freeze({ mode: "fixed", key: "laneReference" }),
+        accentColorKey: "laneReference",
+        itemsSource: freeze({
+            listField: "reference_items",
+            indexField: "lane_index",
+            idField: "reference_item_id",
+            drawPredicate: "all",
+            mutationPredicate: "all",
+        }),
+        visibilityIcons: freeze({ visible: "👁", hidden: "🚫" }),
+        visibilityMode: "items",
+        hasManageIcon: true,
+        manageAction: "references",
+        dropAccepts: freeze({}),
+        maxItemsPerLane: null,
+        supportsMultiLaneDelete: false,
+        supportsCompaction: false,
+        laneRemovable: true,
+    }),
+    freeze({
         trackType: TRACK_TYPE.GUIDES,
         laneType: "guide",
         variable: false,
@@ -116,6 +154,7 @@ export const LANE_DESCRIPTORS = freeze([
         laneOrder: "single",
         countField: "",
         configsField: "",
+        recipeAttr: "",
         fixedConfigField: "guide_track_config",
         labelPrefix: "",
         labelSingular: "",
@@ -150,6 +189,7 @@ export const LANE_DESCRIPTORS = freeze([
         laneOrder: "single",
         countField: "",
         configsField: "",
+        recipeAttr: "",
         fixedConfigField: "global_prompt_track_config",
         labelPrefix: "",
         labelSingular: "",
@@ -179,6 +219,7 @@ export const LANE_DESCRIPTORS = freeze([
         laneOrder: "single",
         countField: "",
         configsField: "",
+        recipeAttr: "",
         fixedConfigField: "prompt_track_config",
         labelPrefix: "",
         labelSingular: "",
@@ -343,6 +384,9 @@ export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {
                     color: config.color || fallbackColor(descriptor, laneIndex, theme),
                     locked: config.locked || false,
                     hidden: config.hidden || false,
+                    referenceRecipe: descriptor.recipeAttr
+                        ? (scene?.[descriptor.recipeAttr]?.[laneIndex] || { media_kind: "image", recipe_id: "", recipe: {} })
+                        : null,
                 });
             }
             continue;
@@ -358,28 +402,27 @@ export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {
             color: "",
             locked: !!config.locked,
             hidden: !!config.hidden,
+            referenceRecipe: null,
         });
     }
     return layout;
 }
 
 export function laneLayoutIndex(layout, trackType, laneIndex, { animaticMode = false } = {}) {
-    // Null is the explicit ephemeral animatic-video suppression sentinel.  For
-    // every other type preserve the legacy lane-state fallback: anything that
-    // is neither Video nor Driver resolves through the audio lane index.
+    // Null is the explicit ephemeral animatic-video suppression sentinel.
+    // Every registered track resolves through its own descriptor identity.
     if (animaticMode && trackType === TRACK_TYPE.VIDEO) return null;
-    const resolvedType = trackType === TRACK_TYPE.VIDEO
-        ? TRACK_TYPE.VIDEO
-        : trackType === TRACK_TYPE.MOTION_DRIVER
-            ? TRACK_TYPE.MOTION_DRIVER
-            : TRACK_TYPE.AUDIO;
+    const resolvedType = descriptorFor(trackType)?.trackType || trackType;
     return (layout || []).findIndex(
         (entry) => entry.type === resolvedType && entry.laneIndex === laneIndex
     );
 }
 
 export function laneAcceptsAssetType(trackType, assetType, { hasAudio = false } = {}) {
-    if (!assetType) return isVariableLane(trackType) ? "accept" : "reject";
+    if (!assetType) {
+        const accepts = descriptorFor(trackType)?.dropAccepts || {};
+        return isVariableLane(trackType) && Object.keys(accepts).length ? "accept" : "reject";
+    }
     const result = descriptorFor(trackType)?.dropAccepts?.[assetType] || "reject";
     return result === "accept_as_audio" && !hasAudio ? "reject" : result;
 }

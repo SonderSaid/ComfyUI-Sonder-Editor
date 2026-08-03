@@ -484,6 +484,19 @@ export function _drawTracks(host, ctx, width) {
                 ctx.rect(curX, y, maxLabelW, h);
                 ctx.clip();
                 ctx.fillText(labelText, curX, y + h / 2 + Math.round(3 * hs));
+                // A Reference lane's recipe governs render geometry for every
+                // item on it, so it belongs here rather than repeated on each
+                // bar. It yields to the lane name whenever space is short.
+                if (entry.type === TRACK_TYPE.REFERENCE) {
+                    const recipeText = host._referenceLaneRecipeLabel?.(entry.laneIndex) || "";
+                    const nameW = ctx.measureText(labelText).width;
+                    const room = maxLabelW - nameW - Math.round(6 * hs);
+                    if (recipeText && room > Math.round(28 * hs)) {
+                        ctx.fillStyle = COLORS.textMuted;
+                        ctx.font = host._canvasSansFont(Math.round((fs ? 9 : 7) * hs), 400);
+                        ctx.fillText(recipeText, curX + nameW + Math.round(6 * hs), y + h / 2 + Math.round(3 * hs));
+                    }
+                }
                 ctx.restore();
             }
 
@@ -748,9 +761,10 @@ export function _drawClips(host, ctx, width) {
         const drawTrimGhost = (trimItem, trackY, trackH, color) => {
             if (!host._trimItem || host._trimItem.data !== trimItem) return;
             const item = host._trimItem;
-            const isPrompt = item.type === "prompt";
-            const curStart = isPrompt ? item.data.start_frame : item.data.timeline_start_frame;
-            const curEnd = isPrompt ? item.data.end_frame : item.data.timeline_end_frame;
+            const isSourceLess = item.type === "prompt" || item.type === "reference";
+            const curStart = isSourceLess ? item.data.start_frame : item.data.timeline_start_frame;
+            const rawEnd = isSourceLess ? item.data.end_frame : item.data.timeline_end_frame;
+            const curEnd = item.type === "reference" && rawEnd === -1 ? host.totalFrames : rawEnd;
             ctx.globalAlpha = 0.25;
             ctx.fillStyle = color;
             if (item.edge === "left" && curStart > item.origStart) {
@@ -1221,6 +1235,67 @@ export function _drawClips(host, ctx, width) {
                 if (host.dragType === "trimEdge") drawTrimGhost(section, promptY, promptH, COLORS.motionDriver);
             }
         }
+
+        // Reference items are source-less timeline scopes; they deliberately
+        // never resolve or draw an asset thumbnail.
+        for (let layoutIdx = 0; layoutIdx < host._trackLayout.length; layoutIdx++) {
+            const entry = host._trackLayout[layoutIdx];
+            if (entry.type !== TRACK_TYPE.REFERENCE || entry.collapsed) continue;
+            const y = host._trackY(layoutIdx);
+            const h = host._trackH(layoutIdx);
+            const laneHidden = host._isLaneHidden(entry.type, entry.laneIndex);
+            for (const item of (host.activeScene.reference_items || [])) {
+                if ((item.lane_index || 0) !== entry.laneIndex) continue;
+                const endFrame = item.end_frame === -1 ? host.totalFrames : item.end_frame;
+                const x1 = host._frameToX(item.start_frame || 0);
+                const x2 = host._frameToX(endFrame || 0);
+                if (x2 < 0 || x1 > width) continue;
+                const selected = host._isSelected("reference", item.reference_item_id);
+                const hidden = laneHidden || !!item.muted;
+                ctx.globalAlpha = hidden ? 0.3 : 1;
+                ctx.fillStyle = selected ? COLORS.referenceItemSelected : COLORS.referenceItem;
+                ctx.fillRect(x1 + 1, y + 2, x2 - x1 - 2, h - 4);
+                host._drawTimelineItemRail(ctx, x1 + 1, y + 2, x2 - x1 - 2, h - 4, host._timelineLaneAccent(entry));
+                ctx.strokeStyle = selected ? COLORS.accent : COLORS.referenceBorder;
+                ctx.lineWidth = selected ? 1.5 : 1;
+                ctx.strokeRect(x1 + 1, y + 2, x2 - x1 - 2, h - 4);
+                const resolvedMembers = (item.members || []).map((memberRef) => host._referenceMemberForRef?.(memberRef)).filter(Boolean);
+                const label = item.prompt_override
+                    || resolvedMembers.map(({ reference }) => reference.name).filter((value, index, values) => values.indexOf(value) === index).join(" + ")
+                    || "Reference";
+                if (x2 - x1 > 20) {
+                    const scale = host._scaleTimeline;
+                    const textX = x1 + Math.round(9 * scale);
+                    const baseline = y + h / 2 + Math.round(3 * scale);
+                    ctx.textAlign = "left";
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.rect(x1 + 3, y + 2, x2 - x1 - 6, h - 4);
+                    ctx.clip();
+                    ctx.fillStyle = COLORS.text;
+                    ctx.font = host._canvasSansFont(Math.round(9 * scale), 600);
+                    ctx.fillText(label, textX, baseline);
+                    // Member tags are what tell you WHICH reference this is, but
+                    // they are strictly secondary: a short bar keeps the name and
+                    // drops them rather than truncating both into noise.
+                    const tags = [...new Set(resolvedMembers.flatMap(({ member }) => member.tags || []))];
+                    if (tags.length) {
+                        const nameW = ctx.measureText(label).width;
+                        const room = (x2 - x1 - 6) - nameW - Math.round(12 * scale);
+                        if (room > Math.round(30 * scale)) {
+                            ctx.fillStyle = COLORS.textMuted;
+                            ctx.font = host._canvasSansFont(Math.round(8 * scale), 400);
+                            const shortened = tags.map((tag) => tag.replace(/^sonder:/, ""));
+                            ctx.fillText(shortened.join(", "), textX + nameW + Math.round(8 * scale), baseline);
+                        }
+                    }
+                    ctx.restore();
+                }
+                if (hidden) host._drawMutedOverlay(ctx, x1 + 1, y + 2, x2 - x1 - 2, h - 4, item.muted ? "Muted" : "Hidden");
+                if (host.dragType === "trimEdge") drawTrimGhost(item, y, h, COLORS.referenceItem);
+            }
+            ctx.globalAlpha = 1;
+        }
     }
 
 export function _drawPlayheadTriangle(host, ctx, width) {
@@ -1373,6 +1448,22 @@ export function _hitTestAudio(host, x, rawY) {
         return null;
     }
 
+export function _hitTestReference(host, x, rawY) {
+        if (!host.activeScene) return null;
+        const layoutIdx = host._layoutIndexFromRawY(rawY);
+        if (layoutIdx < 0) return null;
+        const entry = host._trackLayout[layoutIdx];
+        if (entry.type !== TRACK_TYPE.REFERENCE || entry.collapsed) return null;
+        for (const item of (host.activeScene.reference_items || [])) {
+            if ((item.lane_index || 0) !== entry.laneIndex) continue;
+            const end = item.end_frame === -1 ? host.totalFrames : item.end_frame;
+            const x1 = host._frameToX(item.start_frame || 0);
+            const x2 = host._frameToX(end || 0);
+            if (x >= x1 && x <= x2) return { type: "reference", id: item.reference_item_id, data: item };
+        }
+        return null;
+    }
+
 export function _hitTestGuide(host, x, rawY) {
         if (!host.activeScene) return null;
         const gi = host._guidesLayoutIdx();
@@ -1420,7 +1511,7 @@ export function _hitTestGlobalPrompt(host, x, rawY) {
     }
 
 export function _hitTestItem(host, x, rawY) {
-        return host._hitTestClip(x, rawY) || host._hitTestAudio(x, rawY) || host._hitTestGuide(x, rawY) || host._hitTestPrompt(x, rawY) || host._hitTestGlobalPrompt(x, rawY);
+        return host._hitTestClip(x, rawY) || host._hitTestAudio(x, rawY) || host._hitTestReference(x, rawY) || host._hitTestGuide(x, rawY) || host._hitTestPrompt(x, rawY) || host._hitTestGlobalPrompt(x, rawY);
     }
 
 export function _hitTestEdge(host, x, rawY) {
@@ -1473,6 +1564,17 @@ export function _hitTestEdge(host, x, rawY) {
                 const x2 = host._frameToX(section.end_frame);
                 addCandidate("prompt", i, section, "left", x1, section.start_frame);
                 addCandidate("prompt", i, section, "right", x2, section.start_frame);
+            }
+        }
+
+        if (entry.type === TRACK_TYPE.REFERENCE && !entry.collapsed) {
+            for (const item of (host.activeScene.reference_items || [])) {
+                if ((item.lane_index || 0) !== entry.laneIndex) continue;
+                const end = item.end_frame === -1 ? host.totalFrames : item.end_frame;
+                const x1 = host._frameToX(item.start_frame || 0);
+                const x2 = host._frameToX(end || 0);
+                addCandidate("reference", item.reference_item_id, item, "left", x1, item.start_frame || 0);
+                addCandidate("reference", item.reference_item_id, item, "right", x2, item.start_frame || 0);
             }
         }
 

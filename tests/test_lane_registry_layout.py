@@ -45,7 +45,23 @@ console.log(JSON.stringify(cases));
     actual = json.loads(_run_node(script))
     golden = json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
     assert golden["case_count"] == 215
-    assert actual == golden["cases"]
+    migrated = []
+    for case in golden["cases"]:
+        rows = [{**row, "referenceRecipe": None} for row in case["rows"]]
+        guide_index = next(index for index, row in enumerate(rows) if row["type"] == "guides")
+        rows.insert(guide_index, {
+            "type": "reference",
+            "label": "Reference",
+            "customName": "",
+            "laneIndex": 0,
+            "collapsed": False,
+            "color": "",
+            "locked": False,
+            "hidden": False,
+            "referenceRecipe": {"media_kind": "image", "recipe_id": "", "recipe": {}},
+        })
+        migrated.append({**case, "rows": rows, "length": len(rows)})
+    assert actual == migrated
 
 
 def test_editor_host_binds_real_theme_and_assigns_layout_before_clamping():
@@ -66,7 +82,7 @@ const layout = mod.buildTrackLayout({{
   collapsedKeys: null,
   theme: {{ palette: ["p0", "p1"], fixed: {{ laneDriver: "driver" }} }},
 }});
-const trackTypes = ["video", "audio", "motion_driver", "guides", "prompt_global", "prompt"];
+const trackTypes = ["video", "audio", "motion_driver", "reference", "guides", "prompt_global", "prompt"];
 const assetTypes = ["", "video", "audio", "image", "artifact"];
 const cells = {{}};
 for (const trackType of trackTypes) {{
@@ -86,6 +102,7 @@ console.log(JSON.stringify({{
   ).length,
   guideFallbackIndex: mod.laneLayoutIndex(layout, mod.TRACK_TYPE.GUIDES, 0),
   audioIndex: mod.laneLayoutIndex(layout, mod.TRACK_TYPE.AUDIO, 0),
+  referenceIndex: mod.laneLayoutIndex(layout, mod.TRACK_TYPE.REFERENCE, 0),
   animaticVideoIndex: mod.laneLayoutIndex(
     layout, mod.TRACK_TYPE.VIDEO, 0, {{ animaticMode: true }}
   ),
@@ -102,7 +119,8 @@ console.log(JSON.stringify({{
     assert result["guideVariableLaneType"] == ""
     assert result["unknownRoleTrackType"] == "video"
     assert result["unknownRoleMutationItems"] == 0
-    assert result["guideFallbackIndex"] == result["audioIndex"]
+    assert result["guideFallbackIndex"] != result["audioIndex"]
+    assert result["audioIndex"] < result["referenceIndex"] < result["guideFallbackIndex"]
     assert result["animaticVideoIndex"] is None
     assert result["driverOrder"] < result["reservedOrder"] < result["guidesOrder"]
     assert result["reservedOrder"] == 40
@@ -120,6 +138,7 @@ console.log(JSON.stringify({{
             "artifact": reject,
         },
         "motion_driver": {"empty": accept, "video": accept, "audio": reject, "image": reject, "artifact": reject},
+        "reference": {"empty": reject, "video": reject, "audio": reject, "image": reject, "artifact": reject},
         "guides": {"empty": reject, "video": reject, "audio": reject, "image": accept, "artifact": reject},
         "prompt_global": {"empty": reject, "video": reject, "audio": reject, "image": reject, "artifact": reject},
         "prompt": {"empty": reject, "video": reject, "audio": reject, "image": reject, "artifact": reject},

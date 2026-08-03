@@ -310,7 +310,7 @@ function syncSettingsPanelControls() {
         controls.allowExternalProjectLinks.checked = this._serverSettings?.allow_external_project_links === true;
         controls.allowExternalProjectLinks.title = resolved
             ? ""
-            : "Loading server settingâ€¦";
+            : "Loading server setting…";
     }
     this._renderModelTemplateSettings?.();
 }
@@ -1430,7 +1430,7 @@ function showSettingsPanel() {
         }
     );
     externalLinksToggle.disabled = true;
-    externalLinksToggle.title = "Loading server settingâ€¦";
+    externalLinksToggle.title = "Loading server setting…";
 
     const promptsSection = createSection(
         "Prompts",
