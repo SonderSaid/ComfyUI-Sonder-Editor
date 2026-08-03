@@ -241,98 +241,6 @@ FIXED_OUTPUT_NAMES = [name for name in REFERENCE_OUTPUT_NAMES if name != "slots"
 SLOT_NAMES = [f"r{index:02d}" for index in range(1, 17)]
 
 
-def test_bridge_output_shape_hides_dead_outputs_but_never_a_connected_one():
-    """Slot hiding is display-only, so its safety lives entirely in these rules."""
-    node_bin = shutil.which("node")
-    if not node_bin:
-        pytest.skip("node is required for the bridge shape test")
-    module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
-    script = f"""
-const {{ resolveBridgeOutputs, canonicalOutputOrder, FIXED_OUTPUT_NAMES }} = await import({json.dumps(module_url)});
-const order = canonicalOutputOrder();
-const metadata = new Map(order.map((name) => [name, {{ type: name === 'reference_idx' ? 'INT' : 'IMAGE' }}]));
-const makeNode = (names) => ({{
-  outputs: names.map((name) => ({{ name, type: metadata.get(name).type, link: null, links: [] }})),
-  addOutput(name, type, opts) {{ this.outputs.push({{ name, type, link: null, links: [], ...opts }}); }},
-  removeOutput(index) {{ this.outputs.splice(index, 1); }},
-}});
-const names = (node) => node.outputs.map((slot) => slot.name);
-const shape = (node, s) => resolveBridgeOutputs(node, s, {{ metadata, order }});
-const results = {{}};
-
-// A recipe driving three outputs hides the rest.
-const lean = makeNode([...FIXED_OUTPUT_NAMES, 'r01', 'r02']);
-shape(lean, {{ slotCount: 0, liveOutputs: ['reference_frames', 'reference_prompt', 'reference_names'] }});
-results.lean = names(lean);
-
-// Rule 1: a dead output the user has WIRED stays, because removing it drops the link.
-const wired = makeNode([...FIXED_OUTPUT_NAMES]);
-wired.outputs.find((slot) => slot.name === 'reference_audio').links = [7];
-shape(wired, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
-results.wired = names(wired);
-
-// Rule 1 again, for the r-block: a connected slot above the member count stays,
-// and the block stays CONTIGUOUS up to it — a numbered list with a hole in it
-// would misrepresent which slot is which.
-const wiredSlot = makeNode([...FIXED_OUTPUT_NAMES, 'r01', 'r02', 'r03']);
-wiredSlot.outputs.find((slot) => slot.name === 'r03').links = [9];
-shape(wiredSlot, {{ slotCount: 1, liveOutputs: null }});
-results.wiredSlot = names(wiredSlot).filter((n) => /^r\\d\\d$/.test(n));
-
-// With nothing connected the block really does shrink to the member count.
-const looseSlot = makeNode([...FIXED_OUTPUT_NAMES, 'r01', 'r02', 'r03']);
-shape(looseSlot, {{ slotCount: 1, liveOutputs: null }});
-results.looseSlot = names(looseSlot).filter((n) => /^r\\d\\d$/.test(n));
-
-// Rule 2: no declaration shows everything.
-const unresolved = makeNode(['reference_frames']);
-shape(unresolved, {{ slotCount: 16, liveOutputs: null }});
-results.unresolved = names(unresolved);
-
-// A restored output returns to its canonical tuple position, not the end.
-const restored = makeNode(['reference_frames', 'reference_names']);
-shape(restored, {{ slotCount: 0, liveOutputs: null }});
-results.restoredOrder = names(restored);
-
-// Idempotent: an unchanged shape reports no change and touches nothing.
-const stable = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(stable, {{ slotCount: 2, liveOutputs: null }});
-const first = names(stable).join();
-results.secondRunChanged = shape(stable, {{ slotCount: 2, liveOutputs: null }});
-results.stableSame = first === names(stable).join();
-
-// An empty recipe with nothing wired collapses to nothing but never throws.
-const empty = makeNode([...FIXED_OUTPUT_NAMES, 'r01']);
-shape(empty, {{ slotCount: 0, liveOutputs: [] }});
-results.empty = names(empty);
-
-console.log(JSON.stringify(results));
-"""
-    out = json.loads(subprocess.run(
-        [node_bin, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True,
-    ).stdout)
-
-    assert out["lean"] == ["reference_frames", "reference_prompt", "reference_names"]
-    assert out["wired"] == ["reference_frames", "reference_audio"]
-    assert out["wiredSlot"] == ["r01", "r02", "r03"]
-    assert out["looseSlot"] == ["r01"]
-    assert out["unresolved"] == FIXED_OUTPUT_NAMES + SLOT_NAMES
-    assert out["restoredOrder"] == FIXED_OUTPUT_NAMES
-    assert out["secondRunChanged"] is False and out["stableSame"] is True
-    assert out["empty"] == []
-
-
-def test_bridge_shape_module_stays_free_of_browser_imports():
-    """It is a separate module so these rules are testable without a browser."""
-    source = (ROOT / "web" / "js" / "reference_bridge_shape.js").read_text(encoding="utf-8")
-    assert "/scripts/app.js" not in source and "/scripts/api.js" not in source
-    assert "document" not in source and "window" not in source
-    bridge = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
-    assert 'from "./reference_bridge_shape.js"' in bridge
-    # The unresolved/failed paths must reach for the full shape, never a subset.
-    assert bridge.count("FULL_SHAPE") >= 5
-
-
 def test_selector_panel_view_keeps_an_orphaned_lane_visible():
     """The dropdown must never read as a lane other than the INT actually holds."""
     node_bin = shutil.which("node")
@@ -408,3 +316,104 @@ def test_reference_item_editor_defers_the_prompt_to_the_lane_panel():
     assert "prompt_override" not in block
     assert 'this._makeBtn("Lane Setup…"' in block
     assert "_showReferenceLanePanel(laneEntry)" in block
+
+
+FIXED_OUTPUT_NAMES = [name for name in REFERENCE_OUTPUT_NAMES if name != "slots"]
+SLOT_NAMES = [f"r{index:02d}" for index in range(1, 17)]
+
+
+def test_bridge_never_removes_a_fixed_output_because_slot_index_is_the_contract():
+    """Regression: a dead MIDDLE output must not be removed.
+
+    ComfyUI validates a connection against the static /object_info definition by
+    slot index. Removing `reference_audio` (index 3) slid `r01` into index 3, so
+    dragging from a slot labelled r01 was refused as AUDIO. Dead fixed outputs
+    are relabelled instead; only the r-block, a contiguous tail, shrinks.
+    """
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for the bridge shape test")
+    module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    script = rf"""
+const {{ resolveBridgeOutputs, canonicalOutputOrder, FIXED_OUTPUT_NAMES, UNUSED_SUFFIX }} =
+  await import({json.dumps(module_url)});
+const order = canonicalOutputOrder();
+const types = new Map(order.map((name) => [name, name === 'reference_idx' ? 'INT'
+  : name === 'reference_strength' ? 'FLOAT'
+  : name === 'reference_audio' ? 'AUDIO'
+  : name.startsWith('reference_prompt') || name.startsWith('reference_names') ? 'STRING' : 'IMAGE']));
+const metadata = new Map(order.map((name) => [name, {{ type: types.get(name) }}]));
+const makeNode = (names) => ({{
+  outputs: names.map((name) => ({{ name, type: types.get(name), link: null, links: [] }})),
+  addOutput(name, type, opts) {{ this.outputs.push({{ name, type, link: null, links: [], ...opts }}); }},
+  removeOutput(index) {{ this.outputs.splice(index, 1); }},
+}});
+const shape = (node, s) => resolveBridgeOutputs(node, s, {{ metadata, order }});
+const describe = (node) => node.outputs.map((slot, i) => [i, slot.name, slot.type, slot.label ?? null]);
+const results = {{}};
+
+// The reported bug, exactly: a recipe driving only prompt/names/context/slots.
+const lean = makeNode([...FIXED_OUTPUT_NAMES, 'r01']);
+shape(lean, {{ slotCount: 1, liveOutputs: ['reference_prompt', 'reference_names', 'context', 'slots'] }});
+results.lean = describe(lean);
+
+// The r-block still trims, because it is a tail.
+const trimmed = makeNode([...FIXED_OUTPUT_NAMES, 'r01', 'r02', 'r03']);
+shape(trimmed, {{ slotCount: 1, liveOutputs: null }});
+results.trimmedSlots = trimmed.outputs.filter((s) => /^r\d\d$/.test(s.name)).map((s) => s.name);
+
+// A connected dead output is not even marked — it is in active use.
+const wired = makeNode([...FIXED_OUTPUT_NAMES]);
+wired.outputs.find((s) => s.name === 'reference_audio').links = [7];
+shape(wired, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
+results.wiredLabel = wired.outputs.find((s) => s.name === 'reference_audio').label;
+
+// No declaration: everything present and nothing marked.
+const unknown = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(unknown, {{ slotCount: 0, liveOutputs: null }});
+results.unknownLabels = unknown.outputs.map((s) => s.label);
+
+// Marks clear again when the recipe changes back.
+const revived = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(revived, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
+const markedCount = revived.outputs.filter((s) => String(s.label).endsWith(UNUSED_SUFFIX)).length;
+shape(revived, {{ slotCount: 0, liveOutputs: null }});
+results.markCycle = [markedCount, revived.outputs.filter((s) => String(s.label).endsWith(UNUSED_SUFFIX)).length];
+
+// Idempotent.
+const stable = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(stable, {{ slotCount: 2, liveOutputs: ['reference_frames'] }});
+results.secondRunChanged = shape(stable, {{ slotCount: 2, liveOutputs: ['reference_frames'] }});
+
+console.log(JSON.stringify(results));
+"""
+    out = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+    # Every fixed output keeps its canonical index and its declared type.
+    for index, name in enumerate(FIXED_OUTPUT_NAMES):
+        assert out["lean"][index][0] == index
+        assert out["lean"][index][1] == name
+    assert out["lean"][3][1:3] == ["reference_audio", "AUDIO"], "index 3 must stay AUDIO"
+    assert out["lean"][7][1:3] == ["r01", "IMAGE"], "r01 must sit at index 7, not 3"
+    # Dead ones read as unused; live ones read normally.
+    assert out["lean"][3][3] == "reference_audio (unused)"
+    assert out["lean"][0][3] == "reference_frames (unused)"
+    assert out["lean"][4][3] == "reference_prompt"
+
+    assert out["trimmedSlots"] == ["r01"]
+    assert out["wiredLabel"] == "reference_audio", "a wired output is in use, not unused"
+    assert out["unknownLabels"] == FIXED_OUTPUT_NAMES
+    assert out["markCycle"] == [6, 0], "marks must clear when liveness is unknown again"
+    assert out["secondRunChanged"] is False
+
+
+def test_bridge_shape_module_stays_free_of_browser_imports():
+    """It is a separate module so these rules are testable without a browser."""
+    source = (ROOT / "web" / "js" / "reference_bridge_shape.js").read_text(encoding="utf-8")
+    assert "/scripts/app.js" not in source and "/scripts/api.js" not in source
+    assert not re.search(r"\bdocument\.", source) and not re.search(r"\bwindow\.", source)
+    bridge = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
+    assert 'from "./reference_bridge_shape.js"' in bridge
+    assert bridge.count("FULL_SHAPE") >= 5

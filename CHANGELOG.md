@@ -41,8 +41,8 @@ a fresh `[Unreleased]` block.
   snap-to multiple that can be copied from the scene's model template.
 - Sonder Reference Selector gained a lane dropdown with a status line in place
   of a bare index, every Reference socket gained a hover description, and Sonder
-  Reference Bridge now hides the outputs a recipe does not drive — connected
-  slots always stay.
+  Reference Bridge now marks the outputs a recipe does not drive as unused and
+  shows only as many `r01`–`r16` slots as the lane stages.
 - Reference lane headers show the recipe in use, and item bars show member tags
   when there is room for them.
 
