@@ -9,7 +9,7 @@ name = "sonder-editor"
 # Registry/Manager listing text. Kept identical to the description edited in the
 # Registry web UI — a version publish overwrites the web value from this field.
 description = "Timeline video editor for ComfyUI in a single node. Arrange video, images, and audio on tracks, set first and last frames, schedule prompts over time, transfer motion from a pose video, and regenerate any section in place. Work is organized into projects, and every result lands in a searchable asset gallery."
-version = "0.2.0"
+version = "0.2.1"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
