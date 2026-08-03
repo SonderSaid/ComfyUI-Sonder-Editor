@@ -174,6 +174,34 @@ def test_batch_config_aligned_frame_count():
     assert bc.aligned_frame_count(100) == 97    # rounds to nearest
 
 
+def test_batch_config_frame_offset_defaults_to_one():
+    # Projects written before frame_offset existed must keep the Nk+1 behavior.
+    bc = BatchConfig.from_dict({"max_frames": 97, "context_overlap": 16, "frame_alignment": 8})
+    assert bc.frame_offset == 1
+    assert bc.aligned_frame_count(13) == 17
+    assert BatchConfig.from_dict(bc.to_dict()).frame_offset == 1
+
+
+def test_batch_config_aligned_frame_count_honors_offset():
+    # MiniMax H3: 17k+5 -> 5, 22, 39, 56, 73, ...
+    bc = BatchConfig(max_frames=362, context_overlap=17, frame_alignment=17, frame_offset=5)
+    assert bc.aligned_frame_count(5) == 5
+    assert bc.aligned_frame_count(3) == 5        # below offset floors to offset
+    assert bc.aligned_frame_count(22) == 22
+    assert bc.aligned_frame_count(25) == 22      # rounds to nearest
+    assert bc.aligned_frame_count(50) == 56      # rounds up
+    assert bc.aligned_frame_count(124) == 124
+    assert all((bc.aligned_frame_count(n) - 5) % 17 == 0 for n in range(6, 400))
+
+
+def test_batch_config_compute_batches_honors_offset():
+    bc = BatchConfig(max_frames=124, context_overlap=17, frame_alignment=17, frame_offset=5)
+    batches = bc.compute_batches(300)
+    assert len(batches) >= 2
+    for batch in batches:
+        assert (batch["frame_count"] - 5) % 17 == 0
+
+
 def test_batch_config_compute_batches_single():
     bc = BatchConfig(max_frames=97, context_overlap=16, frame_alignment=8)
     batches = bc.compute_batches(90)

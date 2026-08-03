@@ -269,7 +269,8 @@ class BatchConfig:
     """How to split a scene into GPU-sized generation batches."""
     max_frames: int = 97                    # max frames per batch (default: LTX 8k+1)
     context_overlap: int = 16               # overlap frames between batches for consistency
-    frame_alignment: int = 8                # frames must satisfy (N-1) % alignment == 0
+    frame_alignment: int = 8                # frames must satisfy (N - offset) % alignment == 0
+    frame_offset: int = 1                   # LTX/Wan/Hunyuan are Nk+1; MiniMax H3 is 17k+5
     # e.g. LTX requires 8k+1: 9, 17, 25, ..., 97, ..., 193, 257
 
     def to_dict(self) -> dict:
@@ -277,6 +278,7 @@ class BatchConfig:
             "max_frames": self.max_frames,
             "context_overlap": self.context_overlap,
             "frame_alignment": self.frame_alignment,
+            "frame_offset": self.frame_offset,
         }
 
     @classmethod
@@ -285,14 +287,16 @@ class BatchConfig:
             max_frames=data.get("max_frames", 97),
             context_overlap=data.get("context_overlap", 16),
             frame_alignment=data.get("frame_alignment", 8),
+            frame_offset=data.get("frame_offset", 1),
         )
 
     def aligned_frame_count(self, desired: int) -> int:
-        """Round desired frame count to nearest valid aligned value (8k+1)."""
-        if desired <= 1:
-            return 1
-        k = round((desired - 1) / self.frame_alignment)
-        return max(k, 1) * self.frame_alignment + 1
+        """Round desired frame count to the nearest valid value (alignment*k + offset)."""
+        offset = max(1, int(self.frame_offset))
+        if desired <= offset:
+            return offset
+        k = round((desired - offset) / self.frame_alignment)
+        return max(k, 1) * self.frame_alignment + offset
 
     def compute_batches(self, total_frames: int) -> list[dict]:
         """Split total_frames into batches respecting alignment and overlap.

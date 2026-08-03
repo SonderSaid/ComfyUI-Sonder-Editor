@@ -158,6 +158,24 @@ export const BUILTIN_MODEL_TEMPLATES = [
         },
     },
     {
+        // Fixed 24fps with a 17k+5 length grid; 768x1344 is the native canvas
+        // ceiling, so `maxRes` is the model's limit rather than an upscale target.
+        id: "minimax-h3",
+        name: "MiniMax H3",
+        builtIn: true,
+        hard: {
+            dimensionStep: 32, dimensionOffset: 0, evenLatentDimensions: false,
+            frameStep: 17, frameOffset: 5,
+            fps: [24],
+        },
+        soft: {
+            minDimension: 64,
+            recommendedRes: [[1344, 768], [768, 1344], [1024, 1024], [864, 480]],
+            maxRes: [1344, 768],
+            recommendedDuration: { minSec: 4, maxSec: 15 },
+        },
+    },
+    {
         id: "wan",
         name: "Wan 2.1 / 2.2 (14B)",
         builtIn: true,

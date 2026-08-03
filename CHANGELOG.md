@@ -11,6 +11,10 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Added a **MiniMax H3** model template: 24 fps, multiple-of-32 dimensions, and
+  `17k+5` frame counts.
+
 ## [0.2.0] - 2026-08-01
 
 ### Added
