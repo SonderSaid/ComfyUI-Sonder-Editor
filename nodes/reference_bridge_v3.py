@@ -121,6 +121,19 @@ class SonderReferenceBridge(io.ComfyNode):
             )
             for index in range(1, MAX_REFERENCE_SLOTS + 1)
         ]
+        # Appended AFTER the r-block: tail growth moves no existing slot index,
+        # which is the contract ComfyUI type-checks against.
+        slot_prompts = [
+            io.String.Output(
+                display_name=f"p{index:02d}",
+                tooltip=(
+                    f"Prompt text for staged member {index} alone, expanded from the recipe's per-member "
+                    "pattern. Lets a graph address references positionally instead of splitting "
+                    "reference_prompt."
+                ),
+            )
+            for index in range(1, MAX_REFERENCE_SLOTS + 1)
+        ]
         return io.Schema(
             node_id=BRIDGE_NODE_ID,
             display_name="Sonder Reference Bridge",
@@ -132,7 +145,7 @@ class SonderReferenceBridge(io.ComfyNode):
             inputs=[
                 ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector."),
             ],
-            outputs=[*fixed_outputs, *slots],
+            outputs=[*fixed_outputs, *slots, *slot_prompts],
         )
 
     @classmethod

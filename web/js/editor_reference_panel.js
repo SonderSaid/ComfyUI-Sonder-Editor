@@ -39,11 +39,32 @@ import {
 } from "./keyboard_ownership.js";
 import { TRACK_TYPE } from "./editor_timeline_constants.js";
 import { moveMember } from "./reference_library_model.js";
-import { deriveReferencePrompt, resolveEffectiveReferences } from "./reference_resolution.js";
+import {
+    REFERENCE_VERDICT,
+    REFERENCE_VERDICT_LABEL,
+    deriveReferencePrompt,
+    resolveReferenceVerdicts,
+} from "./reference_resolution.js";
 import { notifySuccess, notifyWarning } from "./editor_notifications.js";
 
 const DETACHED_LABEL = "Detached / Custom";
 const NEW_ITEM = "__new_reference_item__";
+// Value field -> the `*_source` field that decides whether it is pegged.
+const PEG_SOURCE_FIELD = {
+    size_multiple: "size_multiple_source",
+    frame_step: "frame_grid_source",
+    frame_offset: "frame_grid_source",
+    loop_frames: "loop_frames_source",
+};
+// Why each verdict happened, and what to do about it — the two failure modes
+// have different remedies, which is why they are separate states at all.
+const VERDICT_EXPLANATION = {
+    winner: "Most-specific-wins resolves this item for the current window; it is the one the model receives.",
+    superseded: "Another item on this lane covers this window more tightly, so that one is sent instead. Restage or rescope to change which wins.",
+    below_threshold: "The window covers too little of this item's own span for the Reference Threshold, so nothing is sent. Lower the threshold in Settings, or widen the item.",
+    outside: "This item does not overlap the current generation window.",
+    excluded: "Muted, or on a hidden lane, so it never participates.",
+};
 const GROUP_ORDER = ["Assembly", "Geometry", "Frame grid", "Members", "Bridge outputs", "Prompt", "Advisories"];
 
 /**
@@ -247,44 +268,72 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const materialized = recipe.recipe && typeof recipe.recipe === "object" ? recipe.recipe : {};
         const section = field.section === "soft" ? "soft" : "hard";
         const next = { ...(materialized[section] || {}), [field.key]: value };
-        // Typing a multiple by hand drops the template provenance; keeping it
-        // would offer a re-sync against a number the user deliberately chose.
-        if (field.key === "size_multiple") next.size_multiple_source = "custom";
+        // Typing a pegged value by hand un-pegs it: the number you just entered
+        // is the intent, not the source it used to follow.
+        const peg = PEG_SOURCE_FIELD[field.key];
+        if (peg) next[peg] = "custom";
         materialized[section] = next;
         recipe.recipe = materialized;
         void writeRecipe(recipe);
     };
 
     /**
-     * `size_multiple` may be copied from the scene's model template. The template
-     * is browser-local while the recipe rides the queue freeze, so the number is
-     * materialized and this only records where it came from — plus a re-sync when
-     * the template later disagrees.
+     * A pegged value is resolved at render time from a live source, so the
+     * stored number is only a fallback. This reports what the peg resolves to
+     * right now — it must never nag to "update" the stored value, because
+     * following the source is the whole point of pegging.
      */
-    const templateMultipleNote = (recipe, locked) => {
+    const pegNote = (recipe, field) => {
+        const peg = peggedFieldState(recipe, field);
+        if (!peg) return null;
+        const note = el("div", peg.resolved
+            ? `from ${peg.label}`
+            : `follows ${peg.label} — not set yet, so ${peg.fallback} is used`,
+            `font-size:10px;color:${COLORS.textMuted};white-space:nowrap;`);
+        note.title = `Pegged: resolved when the render runs, so it follows ${peg.label} instead of staying at a number typed once.`;
+        return note;
+    };
+
+    /**
+     * Peg state for a field, or null when it is authored directly.
+     * `resolved` is 0 when the source has nothing to give, in which case the
+     * authored `fallback` is what the assembler uses.
+     */
+    const peggedFieldState = (recipe, field) => {
+        const source = PEG_SOURCE_FIELD[field.key];
+        if (!source) return null;
         const hard = recipe.recipe?.hard || {};
-        const templateStep = Math.max(1, parseInt(host._referenceTemplateDimensionStep?.(), 10) || 1);
-        const current = Math.max(1, parseInt(hard.size_multiple, 10) || 1);
-        const fromTemplate = String(hard.size_multiple_source || "custom") === "template";
-        const wrap = el("div", "", `display:flex;align-items:center;gap:6px;font-size:10px;color:${COLORS.textMuted};`);
-        if (fromTemplate && current === templateStep) {
-            wrap.appendChild(el("span", `from ${host._referenceTemplateName?.() || "the scene template"}`));
-            return wrap;
+        const mode = String(hard[source] || "custom");
+        if (mode === "custom") return null;
+        return {
+            mode,
+            resolved: resolvedPegValue(field.key, mode),
+            fallback: hard[field.key] ?? field.default,
+            label: mode === "window"
+                ? "the render window"
+                : (host._referenceTemplateName?.() || "the scene template"),
+        };
+    };
+
+    /** What a peg resolves to right now, for display only. */
+    const resolvedPegValue = (key, mode) => {
+        if (mode === "template" && key === "size_multiple") {
+            return Math.max(1, parseInt(host._referenceTemplateDimensionStep?.(), 10) || 0) || 0;
         }
-        if (fromTemplate) {
-            wrap.appendChild(el("span", `was ${current}; ${host._referenceTemplateName?.() || "the scene template"} now uses ${templateStep}`, `color:${COLORS.warningText};`));
+        if (mode === "template" && (key === "frame_step" || key === "frame_offset")) {
+            const constraint = host._referenceTemplateFrameConstraint?.() || null;
+            const value = key === "frame_step" ? constraint?.step : constraint?.offset;
+            return Number.isFinite(Number(value)) ? Number(value) : 0;
         }
-        if (locked || templateStep === current) return fromTemplate ? wrap : null;
-        const adopt = button(`Use ${templateStep}`, "Copy the multiple from the scene's model template");
-        adopt.addEventListener("click", () => {
-            const next = laneRecipe();
-            const materialized = next.recipe && typeof next.recipe === "object" ? next.recipe : {};
-            materialized.hard = { ...(materialized.hard || {}), size_multiple: templateStep, size_multiple_source: "template" };
-            next.recipe = materialized;
-            void writeRecipe(next);
-        });
-        wrap.appendChild(adopt);
-        return wrap;
+        if (mode === "window" && key === "loop_frames") {
+            const scene = host.activeScene;
+            const hasSelection = Number.isFinite(host.selectionStart) && Number.isFinite(host.selectionEnd)
+                && host.selectionEnd > host.selectionStart;
+            return hasSelection
+                ? host.selectionEnd - host.selectionStart
+                : Math.max(0, parseInt(scene?.duration_frames, 10) || 0);
+        }
+        return 0;
     };
 
     /** Preset tag names, for Tab completion. */
@@ -361,16 +410,27 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             return box;
         }
         if (field.type === "enum") {
+            const wrap = el("div", "", "display:flex;flex-direction:column;gap:3px;flex:1;min-width:0;");
             const select = el("select", "", chromeSelectCss({ padding: "3px 6px", fontSize: "11px" }));
             for (const option of field.values || []) {
                 const node = el("option", option);
                 node.value = option;
+                node.title = field.value_help?.[option] || "";
                 select.appendChild(node);
             }
             select.value = String(value ?? field.default ?? "");
             select.disabled = locked;
-            select.addEventListener("change", () => applyField(field, select.value));
-            return select;
+            // The chosen option's meaning stays visible: which mode you picked is
+            // the decision, and the field label alone never explains it.
+            const chosenHelp = el("div", "", `font-size:10px;color:${COLORS.textMuted};line-height:1.3;`);
+            const syncHelp = () => { chosenHelp.textContent = field.value_help?.[select.value] || ""; };
+            syncHelp();
+            select.addEventListener("change", () => {
+                syncHelp();
+                applyField(field, select.value);
+            });
+            wrap.append(select, chosenHelp);
+            return wrap;
         }
         if (field.type === "output_list") {
             const wrap = el("div", "", "display:flex;flex-wrap:wrap;gap:4px 10px;");
@@ -383,6 +443,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 // detached escape hatch — so an unauthored recipe shows all on.
                 box.checked = declared ? declared.includes(name) : true;
                 box.disabled = locked;
+                // What this socket carries, and what it emits when unchecked.
+                label.title = field.value_help?.[name] || "";
                 box.addEventListener("change", () => {
                     const base = declared || [...(field.values || [])];
                     const next = box.checked
@@ -399,9 +461,21 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         input.disabled = locked;
         if (field.type === "int" || field.type === "number") {
             input.type = "number";
-            input.value = String(value ?? field.default ?? 0);
+            // A pegged field shows what the render will USE, not the number it
+            // replaced: displaying the authored fallback while the peg supplies
+            // something else is what made this read as broken. The fallback stays
+            // in the recipe for when the source is unset.
+            const peg = peggedFieldState(recipe, field);
+            input.value = String((peg?.resolved ?? value ?? field.default ?? 0));
             if (field.min !== undefined) input.min = String(field.min);
             if (field.max !== undefined) input.max = String(field.max);
+            if (peg) {
+                input.readOnly = true;
+                input.style.opacity = "0.6";
+                input.style.cursor = "not-allowed";
+                input.title = `Pegged to ${peg.label}. Change "${field.label} taken from" to edit this directly.`;
+                return input;
+            }
             input.addEventListener("change", () => {
                 const parsed = field.type === "int" ? parseInt(input.value, 10) : parseFloat(input.value);
                 applyField(field, Number.isFinite(parsed) ? parsed : (field.default ?? 0));
@@ -519,11 +593,14 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                     label.title = field.help;
                     row.title = field.help;
                 }
-                row.append(label, fieldControl(recipe, field, locked));
-                if (field.key === "size_multiple") {
-                    const provenance = templateMultipleNote(recipe, locked);
-                    if (provenance) row.appendChild(provenance);
-                }
+                // A pegged value is not authored here any more, so its own
+                // control is inert and the note says what it resolves to.
+                const pegSource = PEG_SOURCE_FIELD[field.key];
+                const pegged = pegSource
+                    && String((recipe.recipe?.hard || {})[pegSource] || "custom") !== "custom";
+                row.append(label, fieldControl(recipe, field, locked || !!pegged));
+                const provenance = pegNote(recipe, field);
+                if (provenance) row.appendChild(provenance);
                 block.appendChild(row);
             }
             body.appendChild(block);
@@ -773,25 +850,35 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     };
 
     /**
-     * Which staged item actually reaches the model for the current window.
-     * Most-specific-wins is the resolver's whole job and is otherwise invisible:
-     * two overlapping items look identical in this list.
+     * What happens to each staged item for the current window, keyed by
+     * reference_item_id. Most-specific-wins is the resolver's whole job and is
+     * otherwise invisible: two overlapping items look identical in this list.
+     *
+     * Same vocabulary and same window as the timeline marks, so one concept
+     * reads the same in both surfaces — including no verdict at all when there
+     * is no selection to resolve against.
      */
-    const effectiveItemId = () => {
+    const itemVerdicts = () => {
         const scene = host.activeScene;
-        if (!scene) return "";
-        const duration = Math.max(0, parseInt(scene.duration_frames, 10) || 0);
-        const hasSelection = Number.isFinite(host.selectionStart) && Number.isFinite(host.selectionEnd)
-            && host.selectionEnd > host.selectionStart;
-        const winners = resolveEffectiveReferences({
+        const range = host._selectionContextRange?.();
+        const byId = new Map();
+        if (!scene || !range) return byId;
+        const { verdicts } = resolveReferenceVerdicts({
             referenceItems: scene.reference_items || [],
             laneCount: Math.max(1, parseInt(scene.reference_lane_count, 10) || 1),
-            sceneDuration: duration,
-            windowStart: hasSelection ? host.selectionStart : 0,
-            windowEnd: hasSelection ? host.selectionEnd : duration,
+            sceneDuration: Math.max(0, parseInt(scene.duration_frames, 10) || 0),
+            windowStart: Math.max(0, Math.round(range.contextStart)),
+            windowEnd: Math.round(range.contextEnd),
             laneConfigs: scene.reference_lane_configs || [],
+            // Without this a chip would claim an item is in window that the
+            // threshold actually drops at render time.
+            frameThresholdPct: host._referenceFrameThreshold || 0,
         });
-        return winners[state.laneIndex]?.item?.reference_item_id || "";
+        for (const [index, verdict] of verdicts) {
+            const item = (scene.reference_items || [])[index];
+            if (item?.reference_item_id) byId.set(item.reference_item_id, verdict);
+        }
+        return byId;
     };
 
     const renderPromptRow = (item, locked) => {
@@ -857,7 +944,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const items = laneItems();
         const recipe = laneRecipe();
         const locked = laneLocked() || state.busy;
-        const effectiveId = effectiveItemId();
+        const verdicts = itemVerdicts();
 
         const header = el("div", "", "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px;");
         header.appendChild(sectionTitle(`Staged items (${items.length})`));
@@ -887,21 +974,24 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         }
 
         for (const item of items) {
-            const effective = item.reference_item_id === effectiveId;
+            const verdict = verdicts.get(item.reference_item_id) || null;
+            const effective = verdict === REFERENCE_VERDICT.WINNER;
             const card = el("div", "", `
                 border:1px solid ${effective ? COLORS.accent : COLORS.border}; border-radius:7px; padding:8px 10px;
                 display:flex; flex-direction:column; gap:6px;
             `);
             const top = el("div", "", "display:flex;align-items:center;gap:6px;flex-wrap:wrap;");
-            const marker = el("span", effective ? "In window" : "Not in window",
-                `font-size:9px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;padding:2px 5px;border-radius:4px;`
-                + (effective
-                    ? `color:${COLORS.bg};background:${COLORS.accent};`
-                    : `color:${COLORS.textMuted};border:1px solid ${COLORS.border};`));
-            marker.title = effective
-                ? "Most-specific-wins resolves this item for the current window; it is the one the model receives."
-                : "Another item on this lane wins the current window, so this one does not reach the model.";
-            top.appendChild(marker);
+            // Same wording the timeline draws, and nothing at all without a
+            // selection — there is no window to resolve against yet.
+            if (verdict) {
+                const marker = el("span", REFERENCE_VERDICT_LABEL[verdict],
+                    `font-size:9px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;padding:2px 5px;border-radius:4px;`
+                    + (effective
+                        ? `color:${COLORS.bg};background:${COLORS.accent};`
+                        : `color:${COLORS.textMuted};border:1px solid ${COLORS.border};`));
+                marker.title = VERDICT_EXPLANATION[verdict] || "";
+                top.appendChild(marker);
+            }
             const startInput = el("input", "", chromeInputCss({ padding: "3px 6px", fontSize: "11px" }) + "width:74px;");
             startInput.type = "number";
             startInput.min = "0";

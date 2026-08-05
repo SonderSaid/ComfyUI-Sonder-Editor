@@ -2780,6 +2780,8 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
 
     raw_frame_constraint = body.get("frame_constraint")
     frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
+    raw_dimension_constraint = body.get("dimension_constraint")
+    dimension_constraint = raw_dimension_constraint if isinstance(raw_dimension_constraint, dict) and raw_dimension_constraint else None
 
     return GenerationJob(
         scene_id=body.get("scene_id", ""),
@@ -2810,6 +2812,7 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         scene_fps=float(body.get("scene_fps", 0.0) or 0.0),
         template_id=str(body.get("template_id", "free") or "free"),
         frame_constraint=frame_constraint,
+        dimension_constraint=dimension_constraint,
         take_placement_mode=take_placement_mode,
         params=params,
     )
@@ -2854,6 +2857,12 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
     except (TypeError, ValueError):
         threshold = 10.0
     params["prompt_frame_threshold"] = threshold  # frozen for reproducibility
+    try:
+        reference_threshold = float(params.get("reference_frame_threshold",
+                                               metadata.get("reference_frame_threshold", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        reference_threshold = 0.0
+    params["reference_frame_threshold"] = reference_threshold  # frozen for reproducibility
     job.params = params
     window_start = max(0, int(getattr(job, "selection_start", 0) or 0)
                        - int(getattr(job, "pre_context_frames", 0) or 0))
@@ -6638,6 +6647,9 @@ if routes is not None:
         if "frame_constraint" in body:
             raw = body.get("frame_constraint")
             project.frame_constraint = raw if isinstance(raw, dict) and raw else None
+        if "dimension_constraint" in body:
+            raw = body.get("dimension_constraint")
+            project.dimension_constraint = raw if isinstance(raw, dict) and raw else None
         if "metadata" in body:
             project.metadata.update(body["metadata"])
 
@@ -8519,10 +8531,24 @@ if routes is not None:
         while len(recipes) < lane_count:
             recipes.append(ReferenceLaneRecipe())
 
+        members_by_id = {
+            member.member_id: member
+            for reference in project.references
+            for member in reference.members
+        }
         rows = []
         for lane_index in range(lane_count):
             lane_items = [item for item in reference_items if int(getattr(item, "lane_index", 0) or 0) == lane_index]
             member_count = max((len(getattr(item, "members", []) or []) for item in lane_items), default=0)
+            # Distinct tags across everything staged on the lane, so the selector
+            # panel can say WHICH references it is carrying, not just how many.
+            lane_tags: list[str] = []
+            for item in lane_items:
+                for ref in getattr(item, "members", []) or []:
+                    member = members_by_id.get(str((ref or {}).get("member_id", "") or ""))
+                    for tag in (getattr(member, "tags", []) or []):
+                        if tag not in lane_tags:
+                            lane_tags.append(str(tag))
             recipe = recipes[lane_index]
             materialized = getattr(recipe, "recipe", {}) or {}
             hard = materialized.get("hard") if isinstance(materialized.get("hard"), dict) else {}
@@ -8539,6 +8565,7 @@ if routes is not None:
                 # Recipes that do not consume the r-block show no slots at all.
                 "slot_count": min(16, member_count) if "slots" in live else 0,
                 "live_outputs": sorted(live),
+                "member_tags": lane_tags,
             })
         return web.json_response({
             "scene_name": getattr(scene, "name", "") or scene_id,

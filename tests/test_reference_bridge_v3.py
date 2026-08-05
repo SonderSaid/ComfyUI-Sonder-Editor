@@ -241,7 +241,11 @@ def test_dead_recipe_outputs_emit_documented_fallbacks(monkeypatch, tmp_path):
     assert result[3]["waveform"].abs().max() == 0.0         # silent AUDIO
     assert result[4] and result[5]
     assert float(result[6].abs().max()) == 0.0              # context
-    assert all(float(slot.abs().max()) == 0.0 for slot in result[7:])  # r01..r16
+    assert all(float(slot.abs().max()) == 0.0 for slot in result[7:23])  # r01..r16
+    # p01..p16 follow reference_prompt liveness: VACE drives it, so the two
+    # staged members carry text and the unstaged tail stays empty.
+    assert result[23] and result[24]
+    assert all(slot == "" for slot in result[25:])
 
     bernini = _multi_member_project(tmp_path / "b", _preset("sonder:wan_bernini"), [(255, 0, 0), (0, 255, 0)])
     slots = core.decode_reference_set(core.resolve_reference_set(bernini, 0))
@@ -314,13 +318,13 @@ def test_bridge_absent_fallback_and_present_slot_assembly(monkeypatch, tmp_path)
     ))
     monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
     absent = core.decode_reference_set({"has_reference": 0, "width": 64, "height": 48})
-    assert len(absent) == 23
+    assert len(absent) == 39  # 7 fixed + r01..r16 + p01..p16
     assert tuple(absent[0].shape) == (1, 48, 64, 3)
     assert absent[2] == 0.0
     assert absent[3]["waveform"].shape[1] == 2
 
     present = core.decode_reference_set(core.resolve_reference_set(project, 0))
-    assert len(present) == 23
+    assert len(present) == 39  # 7 fixed + r01..r16 + p01..p16
     assert present[2] == 1.0
     assert present[4] == "image0: red subject"
     assert present[5] == "Hero"
@@ -361,11 +365,23 @@ def test_v3_schema_freezes_selector_and_bridge_socket_names(monkeypatch):
     assert [value.id for value in selector.inputs] == ["project", "reference_lane_index"]
     assert [value.display_name for value in selector.outputs] == ["reference_set", "has_reference"]
     assert bridge.node_id == "SonderReferenceBridge"
-    assert [value.display_name for value in bridge.outputs] == [
+    names = [value.display_name for value in bridge.outputs]
+    fixed = [
         "reference_frames", "reference_idx", "reference_strength", "reference_audio",
         "reference_prompt", "reference_names", "context",
-        *[f"r{index:02d}" for index in range(1, 17)],
     ]
+    slots = [f"r{index:02d}" for index in range(1, 17)]
+    prompts = [f"p{index:02d}" for index in range(1, 17)]
+    assert names == [*fixed, *slots, *prompts]
+    # p01..p16 are TAIL growth. ComfyUI type-checks a connection by slot index
+    # against the static definition, so every pre-existing socket must keep the
+    # index it had before the block was appended.
+    for index, name in enumerate([*fixed, *slots]):
+        assert names[index] == name, f"slot {index} moved: expected {name}, got {names[index]}"
+    assert all(value.display_name.startswith("p") for value in bridge.outputs[len(fixed) + len(slots):])
+    # Every output carries a hover description.
+    assert all(getattr(value, "tooltip", "") for value in bridge.outputs)
+    assert all(getattr(value, "tooltip", "") for value in selector.outputs)
 
 
 # The pre-redesign `hard` geometry blocks, kept verbatim. The Output size
@@ -437,3 +453,58 @@ def test_output_size_modes_are_mutually_exclusive_in_the_assembler(monkeypatch):
     # `size_multiple` floors rather than rounds up, on every mode that uses it.
     assert core._member_geometry(frame, {"output_size": "scene", "size_multiple": 16}, 970, 580, 3) == (960, 576)
     assert core._member_geometry(frame, {"output_size": "scene", "size_multiple": 1}, 970, 580, 3) == (970, 580)
+
+
+def test_pegged_recipe_values_follow_their_source_and_fall_back_when_absent(monkeypatch):
+    """A pegged value tracks what the scene actually renders with.
+
+    The authored number stays as the fallback, so a project with no resolved
+    constraint degrades to what the user typed rather than to zero.
+    """
+    core = _import_module(monkeypatch, "reference_core")
+    authored = {"frame_step": 8, "frame_offset": 1, "size_multiple": 1, "loop_frames": 121}
+    pegged = {
+        **authored,
+        "frame_grid_source": "template",
+        "size_multiple_source": "template",
+        "loop_frames_source": "window",
+    }
+    sources = {
+        "frame_constraint": {"step": 4, "offset": 1},
+        "dimension_constraint": {"step": 32, "offset": 0},
+        "window_frames": 97,
+    }
+
+    # Nothing pegged: the authored values survive untouched.
+    assert core.resolve_pegged_hard(authored, sources) == authored
+
+    resolved = core.resolve_pegged_hard(pegged, sources)
+    assert resolved["frame_step"] == 4 and resolved["frame_offset"] == 1
+    assert resolved["size_multiple"] == 32
+    assert resolved["loop_frames"] == 97
+
+    # Every source missing: each peg keeps its authored fallback.
+    assert core.resolve_pegged_hard(pegged, {}) == pegged
+    # A constraint present but degenerate is not a usable peg either.
+    assert core.resolve_pegged_hard(pegged, {"frame_constraint": {"step": 0}})["frame_step"] == 8
+    assert core.resolve_pegged_hard(pegged, {"window_frames": 0})["loop_frames"] == 121
+
+
+def test_pegs_reach_the_bridge_and_the_selector_fingerprint(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
+    project = _multi_member_project(tmp_path, _preset("sonder:ltx_ingredients"), [(255, 0, 0), (0, 255, 0)])
+    project.dimension_constraint = {"step": 32, "offset": 0}
+    project.frame_constraint = {"step": 4, "offset": 1}
+
+    resolved = core.resolve_reference_set(project, 0)
+    assert resolved["pegs"]["dimension_constraint"] == {"step": 32, "offset": 0}
+    assert resolved["pegs"]["frame_constraint"] == {"step": 4, "offset": 1}
+    # The window peg needs the resolved render window, not the scene duration.
+    assert resolved["pegs"]["window_frames"] == resolved["render_end"] - resolved["render_start"]
+
+    # Cache identity must move when a peg source moves, or a pegged render would
+    # reuse a set assembled against the previous model.
+    before = core.reference_fingerprint(project, 0)
+    project.dimension_constraint = {"step": 16, "offset": 0}
+    assert core.reference_fingerprint(project, 0) != before

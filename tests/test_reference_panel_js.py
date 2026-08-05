@@ -48,7 +48,9 @@ def test_recipe_schema_declares_every_key_the_presets_and_assembler_use():
     core = (ROOT / "nodes" / "reference_core.py").read_text(encoding="utf-8")
     widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
     panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(encoding="utf-8")
-    read_keys = set(re.findall(r'hard(?:_wrapper)?\.get\("([a-z_]+)"', core))
+    # `resolved` is resolve_pegged_hard's working copy of the hard block, so a
+    # key read only while resolving a peg still counts as consumed.
+    read_keys = set(re.findall(r'(?:hard(?:_wrapper)?|resolved)\.get\("([a-z_]+)"', core))
     read_keys.update(re.findall(r'soft\.get\("([a-z_]+)"', core))
     read_keys.update(re.findall(r'\b(?:hard|soft)\.([a-z_]+)\b', widget))
     read_keys.update(re.findall(r'\bhard\.([a-z_]+)\b', panel))
@@ -74,6 +76,14 @@ def test_recipe_schema_entries_are_well_formed():
             assert field["default"] in field["values"], field["key"]
         if field["key"] == "live_outputs":
             assert field["values"] == list(REFERENCE_OUTPUT_NAMES)
+        # Which option you pick IS the decision, so no value may ship without an
+        # explanation. Only enums and the output list have values to describe.
+        if field["type"] in {"enum", "output_list"}:
+            undocumented = sorted(set(field["values"]) - set(field.get("value_help", {})))
+            assert not undocumented, f"{field['key']} values lack help: {undocumented}"
+            assert all(field["value_help"][value].strip() for value in field["values"]), field["key"]
+        else:
+            assert not field.get("value_help"), f"{field['key']} has no values to describe"
 
 
 def test_custom_recipes_round_trip_every_built_in_and_refuse_bad_authoring():
@@ -200,6 +210,14 @@ _PROMPT_FIXTURES = [
     # Repeated placeholder: Python replaces every occurrence, JS String.replace
     # with a string literal replaces only the first.
     {"promptOverride": "", "members": [{"name": "Hero", "prompt": "face"}], "soft": {"prompt_tokens": "{index}_of_{index}"}},
+    # {n} is 1-based where {index} is 0-based, so both must survive side by side.
+    {"promptOverride": "", "members": [{"name": "Hero", "prompt": "face"}, {"name": "Sofa", "prompt": "room"}], "soft": {"prompt_tokens": "n={n} i={index}"}},
+    # A pattern carrying {prompt}/{name} composes a whole sentence instead of
+    # prefixing a token, and the member text is NOT appended a second time.
+    {"promptOverride": "", "members": [{"name": "Chloe", "prompt": "a redhead woman"}, {"name": "Sofa", "prompt": "a couch"}],
+     "soft": {"prompt_tokens": "<Subject {n}> is {prompt}, from <Picture {n}>"}},
+    {"promptOverride": "", "members": [{"name": "Chloe", "prompt": ""}], "soft": {"prompt_tokens": "<{name} {n}>"}},
+    {"promptOverride": "", "members": [{"name": "", "prompt": ""}], "soft": {"prompt_tokens": "<Subject {n}> is {prompt}"}},
     {"promptOverride": "", "members": [{"name": "Hero", "prompt": "  padded  "}], "soft": {"prompt_prefix": "  spaced  ", "prompt_tokens": ""}},
 ]
 
@@ -239,6 +257,7 @@ console.log(JSON.stringify({json.dumps(_PROMPT_FIXTURES)}.map((f) => mod.deriveR
 
 FIXED_OUTPUT_NAMES = [name for name in REFERENCE_OUTPUT_NAMES if name != "slots"]
 SLOT_NAMES = [f"r{index:02d}" for index in range(1, 17)]
+PROMPT_SLOT_NAMES = [f"p{index:02d}" for index in range(1, 17)]
 
 
 def test_selector_panel_view_keeps_an_orphaned_lane_visible():
@@ -249,10 +268,11 @@ def test_selector_panel_view_keeps_an_orphaned_lane_visible():
     lanes = [
         {"lane_index": 0, "lane_name": "Reference 1", "recipe_name": "Wan VACE Reference Sheet",
          "media_kind": "image", "item_count": 2, "member_count": 3, "hidden": False,
-         "live_outputs": ["reference_frames", "reference_prompt", "slots"]},
+         "live_outputs": ["reference_frames", "reference_prompt", "slots"],
+         "member_tags": ["sonder:face_closeup", "sonder:location"]},
         {"lane_index": 1, "lane_name": "Voices", "recipe_name": "LTX ID-LoRA Voice Identity",
          "media_kind": "audio", "item_count": 1, "member_count": 1, "hidden": True,
-         "live_outputs": ["reference_audio"]},
+         "live_outputs": ["reference_audio"], "member_tags": []},
     ]
     module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
     script = f"""
@@ -273,6 +293,10 @@ console.log(JSON.stringify({{
     assert out["first"]["options"][0]["label"] == "Reference 1 — Wan VACE Reference Sheet"
     assert out["first"]["status"] == "image · 2 items · 3 members"
     assert out["first"]["outputs"] == ["reference_frames", "reference_prompt", "r01..r16"]
+    # Tags identify WHICH references the lane carries; the namespace is dropped.
+    assert out["first"]["tags"] == ["face_closeup", "location"]
+    assert out["hiddenAudio"]["tags"] == []
+    assert out["orphan"]["tags"] == []
     assert out["hiddenAudio"]["status"] == "audio · 1 item · 1 member · lane hidden"
     # The orphan option keeps the real INT value selectable and says why.
     assert out["orphan"]["options"][-1] == {"value": 7, "label": "Reference 8 — no such lane in this scene", "orphan": True}
@@ -320,6 +344,7 @@ def test_reference_item_editor_defers_the_prompt_to_the_lane_panel():
 
 FIXED_OUTPUT_NAMES = [name for name in REFERENCE_OUTPUT_NAMES if name != "slots"]
 SLOT_NAMES = [f"r{index:02d}" for index in range(1, 17)]
+PROMPT_SLOT_NAMES = [f"p{index:02d}" for index in range(1, 17)]
 
 
 def test_bridge_never_removes_a_fixed_output_because_slot_index_is_the_contract():
@@ -357,10 +382,15 @@ const lean = makeNode([...FIXED_OUTPUT_NAMES, 'r01']);
 shape(lean, {{ slotCount: 1, liveOutputs: ['reference_prompt', 'reference_names', 'context', 'slots'] }});
 results.lean = describe(lean);
 
-// The r-block still trims, because it is a tail.
-const trimmed = makeNode([...FIXED_OUTPUT_NAMES, 'r01', 'r02', 'r03']);
-shape(trimmed, {{ slotCount: 1, liveOutputs: null }});
-results.trimmedSlots = trimmed.outputs.filter((s) => /^r\d\d$/.test(s.name)).map((s) => s.name);
+// Numbered slots past the staged count are MARKED, never removed: the p-block
+// sits behind the r-block, so trimming an r-slot used to slide p01 into an
+// r-block position and deliver an image tensor from a STRING socket.
+const trimmed = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(trimmed, {{ slotCount: 1, liveOutputs: ['slots', 'reference_prompt'] }});
+results.slotNames = trimmed.outputs.map((s) => s.name);
+results.r02Label = trimmed.outputs.find((s) => s.name === 'r02').label;
+results.p01Label = trimmed.outputs.find((s) => s.name === 'p01').label;
+results.p02Label = trimmed.outputs.find((s) => s.name === 'p02').label;
 
 // A connected dead output is not even marked — it is in active use.
 const wired = makeNode([...FIXED_OUTPUT_NAMES]);
@@ -371,14 +401,27 @@ results.wiredLabel = wired.outputs.find((s) => s.name === 'reference_audio').lab
 // No declaration: everything present and nothing marked.
 const unknown = makeNode([...FIXED_OUTPUT_NAMES]);
 shape(unknown, {{ slotCount: 0, liveOutputs: null }});
-results.unknownLabels = unknown.outputs.map((s) => s.label);
+results.unknownLabels = unknown.outputs.slice(0, FIXED_OUTPUT_NAMES.length).map((s) => s.label);
+results.unknownSlotLabels = ['r01', 'r16', 'p01', 'p16']
+  .map((n) => unknown.outputs.find((s) => s.name === n).label);
+
+// The reported `slots` serve mode: reference_frames is dead and unwired, so it
+// must read as unused on BOTH renderers - label for legacy, localized_name for
+// Nodes 2.0. Setting only one leaves the other showing the bare name.
+const slotsMode = makeNode([...FIXED_OUTPUT_NAMES, 'r01']);
+shape(slotsMode, {{ slotCount: 1, liveOutputs: ['slots', 'reference_prompt', 'reference_names'] }});
+const frames = slotsMode.outputs.find((s) => s.name === 'reference_frames');
+results.slotsMode = [frames.label, frames.localized_name];
 
 // Marks clear again when the recipe changes back.
 const revived = makeNode([...FIXED_OUTPUT_NAMES]);
 shape(revived, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
-const markedCount = revived.outputs.filter((s) => String(s.label).endsWith(UNUSED_SUFFIX)).length;
+const markedFixed = () => revived.outputs
+  .slice(0, FIXED_OUTPUT_NAMES.length)
+  .filter((s) => String(s.label).endsWith(UNUSED_SUFFIX)).length;
+const markedCount = markedFixed();
 shape(revived, {{ slotCount: 0, liveOutputs: null }});
-results.markCycle = [markedCount, revived.outputs.filter((s) => String(s.label).endsWith(UNUSED_SUFFIX)).length];
+results.markCycle = [markedCount, markedFixed()];
 
 // Idempotent.
 const stable = makeNode([...FIXED_OUTPUT_NAMES]);
@@ -402,9 +445,17 @@ console.log(JSON.stringify(results));
     assert out["lean"][0][3] == "reference_frames (unused)"
     assert out["lean"][4][3] == "reference_prompt"
 
-    assert out["trimmedSlots"] == ["r01"]
+    # Every declared output is present, in canonical order, at every shape.
+    assert out["slotNames"] == FIXED_OUTPUT_NAMES + SLOT_NAMES + PROMPT_SLOT_NAMES
+    # One staged member: slot 1 is live, slot 2 reads unused on both blocks.
+    assert out["r02Label"] == "r02 (unused)" and out["p02Label"] == "p02 (unused)"
+    assert out["p01Label"] == "p01"
+    # Rule 2 still holds for the numbered blocks: with no liveness declaration
+    # every slot shows unmarked rather than looking broken during a slow load.
+    assert out["unknownSlotLabels"] == ["r01", "r16", "p01", "p16"]
     assert out["wiredLabel"] == "reference_audio", "a wired output is in use, not unused"
     assert out["unknownLabels"] == FIXED_OUTPUT_NAMES
+    assert out["slotsMode"] == ["reference_frames (unused)", "reference_frames (unused)"]
     assert out["markCycle"] == [6, 0], "marks must clear when liveness is unknown again"
     assert out["secondRunChanged"] is False
 
@@ -417,3 +468,209 @@ def test_bridge_shape_module_stays_free_of_browser_imports():
     bridge = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
     assert 'from "./reference_bridge_shape.js"' in bridge
     assert bridge.count("FULL_SHAPE") >= 5
+
+
+# One fixture set, resolved in Python and in node. A lane of two items where the
+# window clips one of them, swept across thresholds.
+_THRESHOLD_ITEMS = [
+    {"reference_item_id": "wide", "lane_index": 0, "start_frame": 0, "end_frame": 100, "members": [{"member_id": "m"}]},
+    {"reference_item_id": "narrow", "lane_index": 0, "start_frame": 40, "end_frame": 60, "members": [{"member_id": "m"}]},
+    {"reference_item_id": "other", "lane_index": 1, "start_frame": 0, "end_frame": 10, "members": [{"member_id": "m"}]},
+]
+_THRESHOLD_CASES = [
+    {"windowStart": 40, "windowEnd": 60, "frameThresholdPct": 0},
+    {"windowStart": 40, "windowEnd": 60, "frameThresholdPct": 50},
+    {"windowStart": 40, "windowEnd": 60, "frameThresholdPct": 100},
+    # The window clips only a sliver of both items on lane 0.
+    {"windowStart": 55, "windowEnd": 62, "frameThresholdPct": 0},
+    {"windowStart": 55, "windowEnd": 62, "frameThresholdPct": 30},
+    {"windowStart": 55, "windowEnd": 62, "frameThresholdPct": 90},
+    {"windowStart": 0, "windowEnd": 100, "frameThresholdPct": 25},
+]
+
+
+def test_reference_threshold_matches_between_python_and_javascript():
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for the threshold parity test")
+    from server.reference_resolution import resolve_effective_references
+
+    expected = []
+    for case in _THRESHOLD_CASES:
+        winners = resolve_effective_references(
+            reference_items=[dict(item) for item in _THRESHOLD_ITEMS],
+            lane_count=2, scene_duration=100,
+            window_start=case["windowStart"], window_end=case["windowEnd"],
+            lane_configs=[], frame_threshold_pct=case["frameThresholdPct"],
+        )
+        expected.append([
+            (winner or {}).get("item", {}).get("reference_item_id") if winner else None
+            for winner in winners
+        ])
+
+    module_url = (ROOT / "web" / "js" / "reference_resolution.js").as_uri()
+    script = f"""
+const {{ resolveEffectiveReferences }} = await import({json.dumps(module_url)});
+const items = {json.dumps(_THRESHOLD_ITEMS)};
+const rows = {json.dumps(_THRESHOLD_CASES)}.map((c) =>
+  resolveEffectiveReferences({{
+    referenceItems: items, laneCount: 2, sceneDuration: 100,
+    windowStart: c.windowStart, windowEnd: c.windowEnd,
+    laneConfigs: [], frameThresholdPct: c.frameThresholdPct,
+  }}).map((w) => (w ? w.item.reference_item_id : null)));
+console.log(JSON.stringify(rows));
+"""
+    actual = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+    assert actual == expected
+
+    # The fixtures must actually exercise the behaviour, not agree vacuously.
+    # Off: most-specific-wins picks the tightly-scoped item.
+    assert expected[0][0] == "narrow"
+    # A threshold above the clipped coverage empties the lane entirely — the
+    # deliberate difference from the prompt rule, which always keeps one.
+    assert expected[5][0] is None, "a high threshold must be able to leave a lane with nothing"
+    assert any(row[0] is None for row in expected), "expected at least one empty resolution"
+    assert any(row[0] is not None for row in expected), "expected at least one live resolution"
+
+
+def test_reference_threshold_is_project_durable_and_frozen_at_enqueue():
+    routes_source = (ROOT / "server" / "routes.py").read_text(encoding="utf-8")
+    core = (ROOT / "nodes" / "reference_core.py").read_text(encoding="utf-8")
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    panel = (ROOT / "web" / "js" / "editor_settings_panel.js").read_text(encoding="utf-8")
+
+    # Frozen into job params for reproducibility, exactly like the prompt one.
+    assert 'params["reference_frame_threshold"] = reference_threshold' in routes_source
+    # A queued job reads the frozen value; live resolution reads the project.
+    assert '(getattr(job, "params", {}) or {}).get("reference_frame_threshold"' in core
+    assert '(getattr(project, "metadata", {}) or {}).get("reference_frame_threshold"' in core
+    assert 'frame_threshold_pct=source["frame_threshold_pct"]' in core
+    # Authored in Settings as a project-wide value, not a browser preference.
+    assert 'metadata: { reference_frame_threshold: pct }' in widget
+    assert "Reference Threshold % (project-wide)" in panel
+    # A mid-batch has_reference flip is announced rather than silent.
+    assert "_warnOnReferenceFlipAcrossBatch(chunks)" in widget
+    assert 'source: "reference-batch-flip"' in widget
+    # A threshold above the per-chunk coverage drops the lane from EVERY chunk,
+    # so nothing flips and the flip check alone stayed silent.
+    assert 'source: "reference-batch-silenced"' in widget
+
+
+def test_reference_verdicts_report_why_each_item_did_or_did_not_resolve():
+    """The timeline needs the reason, not just the winner.
+
+    Superseded and below-threshold have different remedies — restage versus
+    lower the setting — so one label for both would send the user to the wrong
+    fix. `resolveEffectiveReferences` derives its winners from this core, so the
+    JS-vs-Python parity test above also guards the scoring here.
+    """
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for the verdict test")
+    items = [
+        # Lane 0: `narrow` sits inside `wide`, so a window over it wins on coverage.
+        {"reference_item_id": "wide", "lane_index": 0, "start_frame": 0, "end_frame": 100},
+        {"reference_item_id": "narrow", "lane_index": 0, "start_frame": 40, "end_frame": 60},
+        {"reference_item_id": "elsewhere", "lane_index": 0, "start_frame": 80, "end_frame": 100},
+        {"reference_item_id": "muted", "lane_index": 0, "start_frame": 40, "end_frame": 60, "muted": True},
+        # Lane 1 is hidden, so nothing on it participates.
+        {"reference_item_id": "on_hidden_lane", "lane_index": 1, "start_frame": 40, "end_frame": 60},
+    ]
+    module_url = (ROOT / "web" / "js" / "reference_resolution.js").as_uri()
+    script = f"""
+const {{ resolveReferenceVerdicts, resolveEffectiveReferences, REFERENCE_VERDICT_LABEL }} =
+  await import({json.dumps(module_url)});
+const items = {json.dumps(items)};
+const shared = {{ referenceItems: items, laneCount: 2, sceneDuration: 100, laneConfigs: [{{}}, {{ hidden: true }}] }};
+const named = (result) => Object.fromEntries(
+  [...result.verdicts].map(([index, verdict]) => [items[index].reference_item_id, verdict]));
+const plain = resolveReferenceVerdicts({{ ...shared, windowStart: 40, windowEnd: 60 }});
+console.log(JSON.stringify({{
+  plain: named(plain),
+  // Same window, threshold above `wide`'s 20% coverage but under `narrow`'s 100%.
+  thresholded: named(resolveReferenceVerdicts({{ ...shared, windowStart: 40, windowEnd: 60, frameThresholdPct: 50 }})),
+  // Threshold above every candidate: the lane resolves to nothing at all.
+  emptied: named(resolveReferenceVerdicts({{ ...shared, windowStart: 55, windowEnd: 62, frameThresholdPct: 90 }})),
+  labels: REFERENCE_VERDICT_LABEL,
+  // The wrapper must still publish exactly the winner shape callers expect.
+  wrapperShape: resolveEffectiveReferences({{ ...shared, windowStart: 40, windowEnd: 60 }})
+    .map((w) => (w ? Object.keys(w).sort().join(",") : null)),
+}}));
+"""
+    out = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+    # All five outcomes, from one window.
+    assert out["plain"] == {
+        "wide": "superseded",          # overlaps but loses most-specific-wins
+        "narrow": "winner",
+        "elsewhere": "outside",        # no overlap with the window
+        "muted": "excluded",
+        "on_hidden_lane": "excluded",  # hidden lane does not participate
+    }
+    # The threshold removes a candidate before scoring, so its reason changes
+    # from "another item won" to "the setting dropped it".
+    assert out["thresholded"]["wide"] == "below_threshold"
+    assert out["thresholded"]["narrow"] == "winner"
+    # Nothing survives: no winner is invented to fill the lane.
+    assert set(out["emptied"].values()) <= {"below_threshold", "outside", "excluded"}
+    assert "winner" not in out["emptied"].values()
+
+    assert out["labels"]["superseded"] == "Superseded"
+    assert out["labels"]["below_threshold"] == "Below threshold"
+    assert out["wrapperShape"] == ["item,laneIndex", None]
+
+
+def test_verdict_marks_share_one_vocabulary_and_need_no_selection_guard_of_their_own():
+    """Timeline and panel must read as one concept, resolved the same way."""
+    canvas = (ROOT / "web" / "js" / "editor_timeline_canvas.js").read_text(encoding="utf-8")
+    panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(encoding="utf-8")
+    resolution = (ROOT / "web" / "js" / "reference_resolution.js").read_text(encoding="utf-8")
+
+    # Labels live once, in the resolver, and both surfaces render from them
+    # rather than hard-coding their own strings.
+    assert '"Superseded"' in resolution and '"Below threshold"' in resolution
+    for surface in (canvas, panel):
+        assert "REFERENCE_VERDICT_LABEL" in surface
+        assert "Superseded" not in surface.replace("REFERENCE_VERDICT_LABEL", "")
+
+    # No selection means no marks, in both surfaces, via the same accessor the
+    # prompt-usage highlight uses.
+    assert "const range = host._selectionContextRange?.();\n    if (!range) return null;" in canvas
+    assert "const range = host._selectionContextRange?.();" in panel
+    assert "if (!scene || !range) return byId;" in panel
+
+    # The hatch reuses the shared muted overlay rather than a second bespoke one,
+    # and the winner accent mirrors the prompt lane's fillRect bar.
+    reference_block = canvas.split("Reference items are source-less timeline scopes", 1)[1]
+    assert "host._drawMutedOverlay(" in reference_block
+    assert "ctx.fillStyle = COLORS.accent;" in reference_block
+    # A muted/hidden item already carries its own overlay; stacking a second
+    # would double-darken it.
+    assert "} else if (!hidden" in reference_block
+
+
+def test_pegged_fields_display_what_the_render_will_use():
+    panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(encoding="utf-8")
+    numeric = panel.split('if (field.type === "int" || field.type === "number") {', 1)[1].split("return input;", 1)[0]
+    # The resolved value wins over the stored one, and the control is inert.
+    assert "peg?.resolved ?? value ?? field.default" in numeric
+    assert "input.readOnly = true;" in panel
+    # The authored number is still what the assembler falls back to, so it must
+    # remain in the recipe rather than being overwritten by the display.
+    assert "fallback: hard[field.key] ?? field.default" in panel
+
+
+def test_threshold_batch_warnings_name_the_lane_the_count_and_the_right_remedy():
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    block = widget.split("_warnOnReferenceFlipAcrossBatch(chunks) {", 1)[1].split("\n    async ", 1)[0]
+    assert "${dropped} of ${total}" in block
+    assert "dropped from all ${total} chunks" in block
+    # Naming a setting that is not involved sends the user to the wrong fix, so
+    # the remedy follows the actual cause.
+    assert "shared.frameThresholdPct > 0" in block
+    assert "does not overlap this batch" in block
+    assert "Lower it in Settings" in block

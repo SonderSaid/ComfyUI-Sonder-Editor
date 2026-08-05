@@ -161,19 +161,39 @@ REFERENCE_RECIPE_FIELDS = (
     {"key": "assembly", "section": "hard", "group": "Assembly", "label": "Assembly",
      "type": "enum", "values": ["batch", "sheet", "temporal", "slots", "audio"], "default": "batch",
      "applies_to": [], "requires": "", "requires_value": "",
-     "help": "How staged members become the reference_frames output."},
+     "help": "How staged members become the reference_frames output.",
+     "value_help": {
+         "batch": "Each member stays a separate image, stacked into one batch. The model receives them as a set of identities.",
+         "sheet": "Members are composited into ONE image - a panel grid or a vertical strip - because the model only reads a single reference image.",
+         "temporal": "Members are laid out along time, each holding a contiguous run of frames in the assembled sequence.",
+         "slots": "Each member is emitted on its own numbered socket (r01, r02, ...) for models that take separately wired reference inputs.",
+         "audio": "The staged member is trimmed audio rather than an image; only the audio outputs carry anything.",
+     }},
     {"key": "layout", "section": "hard", "group": "Assembly", "label": "Sheet layout",
      "type": "enum", "values": ["grid", "strip"], "default": "grid",
      "applies_to": ["sheet"], "requires": "", "requires_value": "",
-     "help": "Panel grid, or one equal-width vertical strip as the VACE wrapper builds it."},
+     "help": "Panel grid, or one equal-width vertical strip as the VACE wrapper builds it.",
+     "value_help": {
+         "grid": "Members are tiled into rows and columns, each panel the same size.",
+         "strip": "Members are stacked as equal-width bands down one column, which is what the VACE wrapper expects.",
+     }},
     {"key": "background", "section": "hard", "group": "Assembly", "label": "Sheet background",
      "type": "enum", "values": ["black", "white"], "default": "black",
      "applies_to": ["sheet"], "requires": "", "requires_value": "",
-     "help": "Fill behind panels and padding. Ingredients documents black; the VACE wrapper pads white."},
+     "help": "Fill behind panels and padding. Ingredients documents black; the VACE wrapper pads white.",
+     "value_help": {
+         "black": "Black fill, which Ingredients documents and most sheet mechanisms assume.",
+         "white": "White fill, which the kijai VACE wrapper pads with.",
+     }},
     {"key": "output_size", "section": "hard", "group": "Geometry", "label": "Output size",
      "type": "enum", "values": ["scene", "native", "custom"], "default": "scene",
      "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
-     "help": "Follow the scene resolution, keep each member's own aspect, or pin an exact size."},
+     "help": "Follow the scene resolution, keep each member's own aspect, or pin an exact size.",
+     "value_help": {
+         "scene": "Every member is fitted to the scene's render resolution.",
+         "native": "Each member keeps its own aspect ratio, bounded by the long-edge maximum.",
+         "custom": "Every member is fitted to an exact width and height this mechanism requires.",
+     }},
     {"key": "width", "section": "hard", "group": "Geometry", "label": "Width",
      "type": "int", "min": 0, "max": 8192, "default": 0,
      "applies_to": list(IMAGE_ASSEMBLIES), "requires": "output_size", "requires_value": "custom",
@@ -197,8 +217,11 @@ REFERENCE_RECIPE_FIELDS = (
     {"key": "size_multiple_source", "section": "hard", "group": "Geometry", "label": "Multiple taken from",
      "type": "enum", "values": ["custom", "template"], "default": "custom",
      "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
-     "help": "Provenance only. `template` records that the number was copied from the scene's model "
-             "template, so the panel can offer a re-sync when that template later disagrees."},
+     "help": "Where the snap multiple comes from.",
+     "value_help": {
+         "custom": "The number you typed. It stays put whatever model the scene uses.",
+         "template": "Pegged to the scene's model template, so it follows whenever you change model.",
+     }},
     {"key": "frame_step", "section": "hard", "group": "Frame grid", "label": "Frame step",
      "type": "int", "min": 1, "max": 64, "default": 8,
      "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
@@ -207,6 +230,15 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "int", "min": 0, "max": 64, "default": 1,
      "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
      "help": "Grid offset, so valid lengths are step x k + offset."},
+    {"key": "frame_grid_source", "section": "hard", "group": "Frame grid", "label": "Frame grid taken from",
+     "type": "enum", "values": ["custom", "template"], "default": "custom",
+     "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
+     "help": "Where the frame step and offset come from.",
+     "value_help": {
+         "custom": "The step and offset above. They stay put whatever model the scene uses.",
+         "template": "Pegged to the project's resolved frame constraint, so they follow whenever you change model. "
+                     "Resolved at render time; the values above are the fallback when no constraint is set.",
+     }},
     {"key": "allowed_frame_counts", "section": "hard", "group": "Frame grid", "label": "Allowed lengths",
      "type": "int_list", "min": 1, "max": 4096, "default": [],
      "applies_to": ["temporal"], "requires": "", "requires_value": "",
@@ -215,6 +247,14 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "int", "min": 0, "max": 4096, "default": 0,
      "applies_to": ["sheet"], "requires": "", "requires_value": "",
      "help": "Repeat the sheet to this many frames. Reference length only; it never limits the render window."},
+    {"key": "loop_frames_source", "section": "hard", "group": "Frame grid", "label": "Loop length taken from",
+     "type": "enum", "values": ["custom", "window"], "default": "custom",
+     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "help": "Where the sheet loop length comes from.",
+     "value_help": {
+         "custom": "The fixed number above.",
+         "window": "Pegged to the render window, so the sheet always spans the generation being produced.",
+     }},
     {"key": "max_members", "section": "hard", "group": "Members", "label": "Maximum members",
      "type": "int", "min": 1, "max": 16, "default": 16,
      "applies_to": [], "requires": "", "requires_value": "",
@@ -226,19 +266,37 @@ REFERENCE_RECIPE_FIELDS = (
     {"key": "primary_model_position", "section": "hard", "group": "Members", "label": "Primary arrives",
      "type": "enum", "values": ["first", "last"], "default": "first",
      "applies_to": ["batch"], "requires": "", "requires_value": "",
-     "help": "Some models silently move the primary reference to the end of the batch."},
+     "help": "Some models silently move the primary reference to the end of the batch.",
+     "value_help": {
+         "first": "The first staged member arrives first, matching the order shown on the lane.",
+         "last": "The primary reference is moved to the end of the batch, as SCAIL-2 does.",
+     }},
     {"key": "live_outputs", "section": "hard", "group": "Bridge outputs", "label": "Outputs this recipe drives",
      "type": "output_list", "values": list(REFERENCE_OUTPUT_NAMES), "default": [],
      "applies_to": [], "requires": "", "requires_value": "",
-     "help": "Unchecked outputs are dead for this mechanism and emit a type-correct fallback."},
+     "help": "Unchecked outputs read as unused on the Bridge and emit a type-correct fallback.",
+     "value_help": {
+         "reference_frames": "The assembled image or sequence. Unchecked emits a black frame at the output size.",
+         "reference_idx": "Frame index each member occupies in the assembled sequence. Only temporal layouts place references in time; unchecked emits 0.",
+         "reference_strength": "Conditioning strength for the set. Unchecked emits 0.0.",
+         "reference_audio": "Trimmed audio from an audio lane. Unchecked emits the required silent fallback, never None.",
+         "reference_prompt": "Text derived from the staged members, or the item's override. Unchecked emits an empty string.",
+         "reference_names": "Library names of the staged members in slot order. Unchecked emits an empty string.",
+         "context": "A background member routed out of the main set, for mechanisms with a dedicated background input. Unchecked emits a black frame.",
+         "slots": "The whole r01-r16 block. Unchecked collapses it to no slots at all.",
+     }},
     {"key": "prompt_prefix", "section": "soft", "group": "Prompt", "label": "Prompt prefix",
      "type": "string", "default": "",
      "applies_to": [], "requires": "", "requires_value": "",
-     "help": "Prepended to the derived reference_prompt, for conventions like 'Reference sheet:'."},
+     "help": "Static text placed once at the front of the whole derived prompt. It does not repeat "
+             "per member - that is what the per-member pattern is for."},
     {"key": "prompt_tokens", "section": "soft", "group": "Prompt", "label": "Per-member token",
      "type": "string", "default": "",
      "applies_to": [], "requires": "", "requires_value": "",
-     "help": "Positional token pattern, e.g. image{index}, for models that address slots by name."},
+     "help": "Repeated once per staged member. Placeholders: {n} member number from 1, {index} from 0, "
+             "{prompt} the member's own text, {name} its Library name. Use as many as you like, e.g. "
+             "'<Subject {n}> is {prompt}, from <Picture {n}>'. With no {prompt}/{name} the member text is "
+             "appended after the pattern. Each expansion is also emitted on its own p01-p16 output."},
     {"key": "suggested_tags", "section": "soft", "group": "Advisories", "label": "Suggested member tags",
      "type": "string_list", "default": [],
      "applies_to": [], "requires": "", "requires_value": "",
@@ -1561,6 +1619,7 @@ class GenerationJob:
     scene_fps: float = 0.0
     template_id: str = "free"
     frame_constraint: dict | None = None
+    dimension_constraint: dict | None = None
     take_placement_mode: str = "trimmed"
     take_placement_linked: bool = True
     take_placement_muted: bool = False
@@ -1605,6 +1664,7 @@ class GenerationJob:
             "scene_fps": self.scene_fps,
             "template_id": self.template_id,
             "frame_constraint": self.frame_constraint,
+            "dimension_constraint": self.dimension_constraint,
             "take_placement_mode": self.take_placement_mode,
             "take_placement_linked": self.take_placement_linked,
             "take_placement_muted": self.take_placement_muted,
@@ -1656,6 +1716,7 @@ class GenerationJob:
             scene_fps=data.get("scene_fps", 0.0),
             template_id=data.get("template_id", "free"),
             frame_constraint=data.get("frame_constraint"),
+            dimension_constraint=data.get("dimension_constraint"),
             take_placement_mode=take_placement_mode,
             take_placement_linked=bool(data.get("take_placement_linked", data.get("take_linked", True))),
             take_placement_muted=bool(data.get("take_placement_muted", data.get("take_muted", False))),
@@ -1679,6 +1740,7 @@ class TimelineProject:
     resolution: tuple = (1280, 720)
     template_id: str = "free"
     frame_constraint: dict | None = None
+    dimension_constraint: dict | None = None
     scenes: list = field(default_factory=list)           # list[Scene] — ordered compositions
     assets: list = field(default_factory=list)           # list[Asset] — project media registry
     references: list = field(default_factory=list)       # list[ReferenceEntity] — project Reference Library
@@ -1816,6 +1878,7 @@ class TimelineProject:
             "resolution": list(self.resolution),
             "template_id": self.template_id,
             "frame_constraint": self.frame_constraint,
+            "dimension_constraint": self.dimension_constraint,
             "scenes": [s.to_dict() for s in self.scenes],
             "assets": [a.to_dict() for a in self.assets],
             "references": [reference.to_dict() for reference in self.references],
@@ -1836,6 +1899,7 @@ class TimelineProject:
             resolution=tuple(data.get("resolution", [1280, 720])),
             template_id=data.get("template_id", "free"),
             frame_constraint=data.get("frame_constraint"),
+            dimension_constraint=data.get("dimension_constraint"),
             metadata=data.get("metadata", {}),
             created_at=data.get("created_at", datetime.now().isoformat()),
             modified_at=data.get("modified_at", datetime.now().isoformat()),

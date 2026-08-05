@@ -45,11 +45,19 @@ def resolve_effective_references(
     window_start,
     window_end,
     lane_configs=None,
+    frame_threshold_pct=0.0,
 ) -> list:
     """Return one most-specific overlapping item per Reference lane.
 
     Ranges are half-open. A negative item end resolves to scene end before
     scoring. Muted items and hidden lanes do not participate.
+
+    `frame_threshold_pct` drops an item whose in-window overlap is under that
+    percentage of its OWN span, before the survivors are scored. Unlike the
+    prompt boundary threshold there is no never-empty guard: References resolve
+    to a single winner per lane, so a lane may legitimately resolve to nothing
+    and report `has_reference = 0` for that window. That is the point of the
+    setting, and it is why enqueue warns when it flips across a batch.
     """
     count = max(1, _integer(lane_count, 1))
     duration = max(0, _integer(scene_duration, 0))
@@ -57,6 +65,10 @@ def resolve_effective_references(
     end = min(duration, max(start, _integer(window_end, duration)))
     configs = lane_configs if isinstance(lane_configs, list) else []
     items = reference_items if isinstance(reference_items, list) else []
+    try:
+        threshold = max(0.0, min(100.0, float(frame_threshold_pct or 0.0))) / 100.0
+    except (TypeError, ValueError):
+        threshold = 0.0
     winners = [None] * count
     scores = [None] * count
 
@@ -83,7 +95,10 @@ def resolve_effective_references(
         overlap = max(0, min(item_end, end) - max(item_start, start))
         if overlap <= 0:
             continue
-        score = (overlap / (item_end - item_start), item_start, item_index)
+        coverage = overlap / (item_end - item_start)
+        if threshold > 0 and coverage < threshold:
+            continue
+        score = (coverage, item_start, item_index)
         if scores[lane_index] is None or score > scores[lane_index]:
             scores[lane_index] = score
             winners[lane_index] = {"laneIndex": lane_index, "item": item}

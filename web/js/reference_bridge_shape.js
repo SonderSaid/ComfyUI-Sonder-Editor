@@ -8,10 +8,14 @@
 // and refused. That is a tuple reshape in everything but name, which
 // `durable_rules.md` forbids.
 //
-// So the fixed block is never removed. Outputs a recipe does not drive are
-// RELABELLED as unused, which changes nothing about index, name or type. Only
-// the r-block shrinks, because it is a contiguous TAIL: trimming r05..r16 moves
-// no surviving slot.
+// So NO output is ever removed. Outputs a recipe does not drive are RELABELLED
+// as unused, which changes nothing about index, name or type.
+//
+// The r-block used to shrink, because it was a contiguous TAIL and trimming
+// r05..r16 moved no surviving slot. Appending p01..p16 after it ended that:
+// removing an r-slot now slides every p-slot down into an r-block position, so
+// a socket labelled p01 delivered an image tensor. Nothing is a tail any more,
+// so nothing is removed.
 //
 // Two further rules:
 //   1. A connected slot is never removed, whatever the recipe says. Removing it
@@ -34,6 +38,7 @@ export const SLOT_NAME_RE = /^r(0[1-9]|1[0-6])$/;
 export const FIXED_OUTPUT_NAMES = REFERENCE_OUTPUT_NAMES.filter((name) => name !== "slots");
 
 export const slotName = (index) => `r${String(index).padStart(2, "0")}`;
+export const promptSlotName = (index) => `p${String(index).padStart(2, "0")}`;
 
 export function slotNumber(slot) {
     const match = SLOT_NAME_RE.exec(String(slot?.name || ""));
@@ -50,7 +55,11 @@ export function connectedSlotCeiling(node) {
 
 /** Canonical tuple order: the fixed block, then r01..r16. */
 export function canonicalOutputOrder() {
-    return [...FIXED_OUTPUT_NAMES, ...Array.from({ length: MAX_REFERENCE_SLOTS }, (_, i) => slotName(i + 1))];
+    return [
+        ...FIXED_OUTPUT_NAMES,
+        ...Array.from({ length: MAX_REFERENCE_SLOTS }, (_, i) => slotName(i + 1)),
+        ...Array.from({ length: MAX_REFERENCE_SLOTS }, (_, i) => promptSlotName(i + 1)),
+    ];
 }
 
 /**
@@ -99,6 +108,9 @@ export function selectorPanelView({ lanes = [], laneIndex = 0, status = "", scen
         disabled: !rows.length,
         status: statusText,
         outputs: (lane?.live_outputs || []).map((name) => (name === "slots" ? "r01..r16" : name)),
+        // The `sonder:` namespace is noise on a node this small; the tag name is
+        // what identifies the reference.
+        tags: (lane?.member_tags || []).map((tag) => String(tag).replace(/^sonder:/, "")),
     };
 }
 
@@ -112,24 +124,33 @@ function ensureOutput(node, name, metadata, order) {
 
 export const UNUSED_SUFFIX = " (unused)";
 
-/** Mark a dead output without touching its index, name or type. */
+/**
+ * Mark a dead output without touching its index, name or type.
+ *
+ * Writes BOTH `label` and `localized_name`: legacy LiteGraph draws `label`,
+ * Nodes 2.0 reads `localized_name`, so setting only one leaves the other
+ * renderer showing the bare name. Same pairing as `bridge_nodes.js` and
+ * `autogrow_passthrough.js`.
+ */
 function markOutput(slot, live, metadata) {
     if (!slot) return false;
-    const original = metadata?.get(slot.name)?.label ?? slot.name;
+    const meta = metadata?.get(slot.name);
+    const original = meta?.label ?? meta?.localized_name ?? slot.name;
     const dead = live && !live.has(slot.name) && !outputConnected(slot);
     const label = dead ? `${original}${UNUSED_SUFFIX}` : original;
-    if (slot.label === label) return false;
+    if (slot.label === label && slot.localized_name === label) return false;
     slot.label = label;
+    slot.localized_name = label;
     return true;
 }
 
 /**
  * Reshape a bridge node's displayed outputs.
  *
- * The fixed block is only ever relabelled, never removed — see the module
- * header. Only the r-block, a contiguous tail, actually shrinks.
+ * Every output stays present at its declared index; unused ones are relabelled.
+ * See the module header for why nothing may be removed.
  *
- * @param shape.slotCount   effective r-block size (0 when the recipe never uses it)
+ * @param shape.slotCount   staged member count — r/p slots above it read as unused
  * @param shape.liveOutputs fixed output names the recipe drives, or null for "show everything"
  * @param options.metadata  Map of name -> {type,label,tooltip} captured at node creation
  * @param options.order     canonical name order; defaults to the tuple order
@@ -138,30 +159,37 @@ function markOutput(slot, live, metadata) {
 export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order = null } = {}) {
     const { slotCount = 0, liveOutputs = null } = typeof shape === "number" ? { slotCount: shape } : (shape || {});
     const canonical = order || canonicalOutputOrder();
-    const signature = () => (node.outputs || []).map((slot) => `${slot?.name}:${slot?.label ?? ""}`).join("|");
+    const signature = () => (node.outputs || [])
+        .map((slot) => `${slot?.name}:${slot?.label ?? ""}:${slot?.localized_name ?? ""}`).join("|");
     const before = signature();
-    const desired = Math.max(
+    const staged = Math.max(
         0,
         Math.min(MAX_REFERENCE_SLOTS, parseInt(slotCount, 10) || 0),
         connectedSlotCeiling(node),
     );
     const live = Array.isArray(liveOutputs) ? new Set(liveOutputs) : null;
 
-    // Fixed outputs: always present, relabelled when the recipe does not drive
-    // them. Removing one would shift every later slot into a position whose
-    // declared type belongs to a different output.
     for (const name of FIXED_OUTPUT_NAMES) {
         ensureOutput(node, name, metadata, canonical);
         markOutput(node.outputs[outputIndex(node, name)], live, metadata);
     }
-    // The r-block is a tail, so it can genuinely shrink. `slots` liveness is
-    // already folded into slotCount by the caller.
-    for (let index = 1; index <= desired; index++) {
+    // Numbered slots past the staged member count carry a fallback rather than a
+    // member, so they read as unused — but they keep their index, because the
+    // p-block sits behind them and would otherwise slide into r-block positions.
+    // Two passes, not one interleaved pass: ensureOutput appends, so creating
+    // r01,p01,r02,p02… would build the wrong canonical order on a node that is
+    // missing slots.
+    for (let index = 1; index <= MAX_REFERENCE_SLOTS; index++) {
         ensureOutput(node, slotName(index), metadata, canonical);
     }
-    for (let index = (node.outputs || []).length - 1; index >= 0; index--) {
-        const slot = node.outputs[index];
-        if (slotNumber(slot) > desired && !outputConnected(slot)) node.removeOutput?.(index);
+    for (let index = 1; index <= MAX_REFERENCE_SLOTS; index++) {
+        ensureOutput(node, promptSlotName(index), metadata, canonical);
+    }
+    for (let index = 1; index <= MAX_REFERENCE_SLOTS; index++) {
+        const imageLive = live ? (live.has("slots") && index <= staged) : true;
+        const textLive = live ? (live.has("reference_prompt") && index <= staged) : true;
+        markOutput(node.outputs[outputIndex(node, slotName(index))], imageLive ? null : new Set(), metadata);
+        markOutput(node.outputs[outputIndex(node, promptSlotName(index))], textLive ? null : new Set(), metadata);
     }
     return signature() !== before;
 }

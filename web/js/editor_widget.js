@@ -213,6 +213,7 @@ import { getActiveReferenceDrag, mountReferenceLibrary, SONDER_REFERENCE_MIME } 
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import { shouldApplyReferenceResponse } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
+import { resolveEffectiveReferences } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
@@ -672,6 +673,7 @@ export class EditorWidget {
         this._guideCollisionAutoOffset = true;
         this._promptSectionDelimiter = ".";
         this._promptFrameThreshold = 10;
+        this._referenceFrameThreshold = 0;
         this._serverSettings = null;
         this._serverSettingsLoaded = false;
         this._activeProjectLinked = false;
@@ -1955,6 +1957,11 @@ export class EditorWidget {
     _referenceTemplateDimensionStep() {
         const constraint = getDimensionConstraint(getTemplateById(this._templateId, this._settings));
         return Math.max(1, parseInt(constraint?.step, 10) || 1);
+    }
+
+    /** Resolved frame grid of the scene's model template, for a pegged recipe. */
+    _referenceTemplateFrameConstraint() {
+        return this._resolveFrameConstraintForTemplate(this._templateId) || null;
     }
 
     _referenceTemplateName() {
@@ -3925,13 +3932,20 @@ export class EditorWidget {
         if (!this.projectDir) return true;
         const dirName = this._projectDirName();
         const frameConstraint = this._resolveFrameConstraintForTemplate(templateId);
+        // Persisted beside the frame grid so a Reference recipe pegged to the
+        // template resolves the same way on any machine and inside a frozen job.
+        const dimensionConstraint = getDimensionConstraint(getTemplateById(templateId, this._settings));
         try {
             await this._runVersionedProjectMutation(
                 `/sonder-editor/project/${encodeURIComponent(dirName)}`,
                 {
                     method: "PUT",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ template_id: templateId, frame_constraint: frameConstraint }),
+                    body: JSON.stringify({
+                        template_id: templateId,
+                        frame_constraint: frameConstraint,
+                        dimension_constraint: dimensionConstraint,
+                    }),
                 },
                 { projectId: dirName }
             );
@@ -5461,6 +5475,7 @@ export class EditorWidget {
             get _promptChannelLabels() { return editor._promptChannelLabels; },
             get _promptSectionDelimiter() { return editor._promptSectionDelimiter; },
             get _promptFrameThreshold() { return editor._promptFrameThreshold; },
+            get _referenceFrameThreshold() { return editor._referenceFrameThreshold; },
             get _guideCollisionAutoOffset() { return editor._guideCollisionAutoOffset; },
             get _serverSettings() { return editor._serverSettings; },
             get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
@@ -5470,6 +5485,7 @@ export class EditorWidget {
             _toggleGuideCollisionAutoOffset: (on) => editor._toggleGuideCollisionAutoOffset(on),
             _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
             _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
+            _setReferenceFrameThreshold: (value) => editor._setReferenceFrameThreshold(value),
             _keyboardConsumerId: (suffix) => editor._keyboardConsumerId(suffix),
             _hideSettingsPanel: () => editor._hideSettingsPanel(),
         };
@@ -9615,6 +9631,97 @@ export class EditorWidget {
             this._refreshPromptUsageHighlight();
         } catch (e) {
             notifyWarning(e?.message || "Failed to update prompt threshold.", { source: "prompt-threshold-refused" });
+            throw e;
+        }
+    }
+
+    /**
+     * Warn when a Reference lane resolves for some chunks of a batch but not
+     * others. A `has_reference` 1→0 flip mid-batch changes the inferred task
+     * mode of connectivity-driven mechanisms (Bernini-R infers t2v/r2v from
+     * which sockets are wired), so one continuous shot can render under two
+     * different modes with nothing on screen explaining why.
+     */
+    _warnOnReferenceFlipAcrossBatch(chunks) {
+        const scene = this.activeScene;
+        if (!scene || !Array.isArray(chunks) || chunks.length < 2) return;
+        const laneCount = Math.max(1, parseInt(scene.reference_lane_count, 10) || 1);
+        const duration = Math.max(0, parseInt(scene.duration_frames, 10) || 0);
+        const shared = {
+            referenceItems: scene.reference_items || [],
+            laneCount,
+            sceneDuration: duration,
+            laneConfigs: scene.reference_lane_configs || [],
+            frameThresholdPct: this._referenceFrameThreshold || 0,
+        };
+        const total = chunks.length;
+        const flipped = [];
+        const silenced = [];
+        for (let lane = 0; lane < laneCount; lane++) {
+            const staged = (scene.reference_items || []).some((item) => (item.lane_index || 0) === lane);
+            if (!staged) continue;
+            const present = chunks.map((chunk) => !!resolveEffectiveReferences({
+                ...shared, windowStart: chunk.start, windowEnd: chunk.end,
+            })[lane]);
+            const dropped = present.filter((value) => !value).length;
+            const label = laneLabel(scene, TRACK_TYPE.REFERENCE, lane);
+            if (dropped && dropped < total) {
+                flipped.push(`${label} (${dropped} of ${total})`);
+            } else if (dropped === total) {
+                // A threshold set above the per-chunk coverage drops the lane in
+                // EVERY chunk, so nothing flips and the flip check stayed quiet —
+                // but the reference silently never reaches the model at all.
+                silenced.push(label);
+            }
+        }
+        if (flipped.length) {
+            notifyWarning(
+                `${flipped.join(", ")} — dropped from some chunks of this batch but not others. `
+                + "Mechanisms that infer their task from which sockets are connected will run those chunks "
+                + "in a different mode. Widen the staged range to cover the whole batch, or lower the "
+                + "Reference Threshold in Settings.",
+                { source: "reference-batch-flip", duration: 0 },
+            );
+        }
+        if (silenced.length) {
+            // Name the actual cause: with the threshold off, a lane that never
+            // resolves simply does not overlap the batch, and pointing at a
+            // setting that is not involved sends the user to the wrong fix.
+            const remedy = shared.frameThresholdPct > 0
+                ? "Each chunk covers too little of the item's own span for the current Reference Threshold. "
+                  + "Lower it in Settings, or widen the staged item."
+                : "The staged range does not overlap this batch. Move or extend the item to cover it.";
+            notifyWarning(
+                `${silenced.join(", ")} — dropped from all ${total} chunks, so the staged reference reaches `
+                + `nothing in this batch. ${remedy}`,
+                { source: "reference-batch-silenced", duration: 0 },
+            );
+        }
+    }
+
+    async _setReferenceFrameThreshold(value) {
+        const dirName = this._projectDirName();
+        if (!dirName) return;
+        let pct = parseFloat(value);
+        if (!Number.isFinite(pct)) pct = 0;
+        pct = Math.max(0, Math.min(100, pct));
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ metadata: { reference_frame_threshold: pct } }),
+                },
+                { projectId: dirName }
+            );
+            this._referenceFrameThreshold = pct;
+            // Changes which staged item wins the live window, and whether a lane
+            // resolves at all — both are visible in the lane panel.
+            this._referencePanelHandle?.refresh?.();
+            this._renderTimeline();
+        } catch (e) {
+            notifyWarning(e?.message || "Failed to update Reference threshold.", { source: "reference-threshold-refused" });
             throw e;
         }
     }
@@ -14734,6 +14841,7 @@ export class EditorWidget {
                     batch_index: index,
                 };
             });
+            this._warnOnReferenceFlipAcrossBatch(chunks);
             tempJobs = snapshots.map((snapshot, index) => ({
                 ...snapshot,
                 job_id: `temp-batch-${Date.now().toString(36)}-${index}-${Math.random().toString(16).slice(2, 8)}`,
@@ -15387,6 +15495,7 @@ export class EditorWidget {
                 this._promptSectionDelimiter = String(data.metadata?.prompt_section_delimiter ?? ".");
                 // Project-durable boundary-spill threshold % (render-affecting; default 10)
                 this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold ?? 10) || 0;
+                this._referenceFrameThreshold = Number(data.metadata?.reference_frame_threshold ?? 0) || 0;
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 this._syncSceneResolutionControls({ detectSelections: false });
                 this._updateViewportHeader();

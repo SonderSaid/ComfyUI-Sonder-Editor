@@ -38,7 +38,12 @@ function ensureState(node) {
         const name = String(slot?.name || "");
         if (!name) continue;
         order.push(name);
-        metadata.set(name, { type: slot.type || "IMAGE", label: slot.label, tooltip: slot.tooltip });
+        metadata.set(name, {
+            type: slot.type || "IMAGE",
+            label: slot.label,
+            localized_name: slot.localized_name,
+            tooltip: slot.tooltip,
+        });
     }
     node[STATE] = { metadata, order: order.length ? order : canonicalOutputOrder(), initialized: false, refreshToken: 0 };
     return node[STATE];
@@ -230,12 +235,22 @@ function renderSelectorPanel(node, payload) {
     state.status.textContent = view.status;
 
     state.list.replaceChildren();
+    for (const tag of view.tags) {
+        const chip = style(document.createElement("span"), `
+            display:inline-block; font-size:9px; padding:1px 5px; margin:1px;
+            border:1px solid rgba(190,125,157,0.42); border-radius:8px; color:#d9bcca;
+        `);
+        chip.textContent = tag;
+        chip.title = "Tag on a member staged in this lane";
+        state.list.appendChild(chip);
+    }
     for (const name of view.outputs) {
         const chip = style(document.createElement("span"), `
             display:inline-block; font-size:9px; padding:1px 5px; margin:1px;
             border:1px solid rgba(126,168,201,0.3); border-radius:8px; color:#a8b6c4;
         `);
         chip.textContent = name;
+        chip.title = "Output this recipe drives";
         state.list.appendChild(chip);
     }
 }

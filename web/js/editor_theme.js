@@ -117,6 +117,10 @@ export const EDITOR_COLORS = Object.freeze({
     referenceItem: "rgba(104, 67, 86, 0.82)",
     referenceItemSelected: "rgba(145, 91, 118, 0.94)",
     referenceBorder: "rgba(190, 125, 157, 0.68)",
+    // Secondary text drawn ON a timeline item, not on panel chrome. The
+    // textMuted/textDim greys are tuned against dark chrome and disappear on a
+    // saturated item fill, so on-item detail needs its own token.
+    itemSubText: "rgba(233, 224, 229, 0.72)",
     laneVideo: "#5d8aa0",
     laneAudio: "#7a8e8e",
     laneDriver: "#8a7fa0",

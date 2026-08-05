@@ -103,12 +103,24 @@ def _source(project, scene) -> dict[str, Any]:
             for value in (getattr(job, "reference_item_snapshots", []) or [])
             if isinstance(value, dict)
         ]
+        # Frozen at enqueue so a queued job resolves the same set it was
+        # queued with, mirroring how the prompt threshold rides job params.
+        threshold = _float((getattr(job, "params", {}) or {}).get("reference_frame_threshold", 0.0))
+        pegs = {
+            "frame_constraint": getattr(job, "frame_constraint", None),
+            "dimension_constraint": getattr(job, "dimension_constraint", None),
+        }
         source_name = "snapshot"
     else:
         lane_count = max(1, _int(getattr(scene, "reference_lane_count", 1), 1)) if scene else 1
         configs = list(getattr(scene, "reference_lane_configs", []) or []) if scene else []
         recipes = list(getattr(scene, "reference_lane_recipes", []) or []) if scene else []
         items = list(getattr(scene, "reference_items", []) or []) if scene else []
+        threshold = _float((getattr(project, "metadata", {}) or {}).get("reference_frame_threshold", 0.0))
+        pegs = {
+            "frame_constraint": getattr(project, "frame_constraint", None),
+            "dimension_constraint": getattr(project, "dimension_constraint", None),
+        }
         source_name = "live"
     while len(configs) < lane_count:
         configs.append(LaneConfig())
@@ -120,6 +132,8 @@ def _source(project, scene) -> dict[str, Any]:
         "configs": configs[:lane_count],
         "recipes": recipes[:lane_count],
         "items": items,
+        "frame_threshold_pct": threshold,
+        "pegs": pegs,
     }
 
 
@@ -148,6 +162,7 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
             scene_duration=duration,
             lane_configs=source["configs"],
             lane_count=source["lane_count"],
+            frame_threshold_pct=source["frame_threshold_pct"],
         )
         lane_value = resolved[lane_index] if lane_index < len(resolved) else None
         selected = lane_value.get("item") if isinstance(lane_value, dict) else None
@@ -165,6 +180,10 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
         "render_end": render_end,
         "width": width,
         "height": height,
+        # Peg sources travel with the resolved set so the bridge resolves them
+        # the same way whether it runs live or from a frozen job, and so they
+        # land in the selector fingerprint.
+        "pegs": {**source["pegs"], "window_frames": max(0, render_end - render_start)},
     }
 
 
@@ -250,6 +269,36 @@ def _load_member_image(record: dict[str, Any]) -> np.ndarray:
     if frame is None or frame.size == 0:
         raise RuntimeError(f"Reference member {getattr(member, 'member_id', '')} could not be decoded.")
     return _apply_member_crop(frame, getattr(member, "crop", None))
+
+
+def resolve_pegged_hard(hard: dict, pegs: dict) -> dict:
+    """Resolve `*_source` pegs against live constraints, once per assembly.
+
+    A pegged value tracks whatever the scene is actually rendering with instead
+    of the number that was authored. `pegs` supplies the resolved sources; a peg
+    whose source is missing keeps the authored value, so a project with no
+    resolved constraint degrades to what the user typed rather than to zero.
+    """
+    if not isinstance(hard, dict):
+        return {}
+    resolved = dict(hard)
+    frame_constraint = pegs.get("frame_constraint") if isinstance(pegs.get("frame_constraint"), dict) else None
+    if str(resolved.get("frame_grid_source", "custom")) == "template" and frame_constraint:
+        step = _int(frame_constraint.get("step"), 0)
+        if step > 0:
+            resolved["frame_step"] = step
+            resolved["frame_offset"] = max(0, _int(frame_constraint.get("offset"), 0))
+    dimension_constraint = pegs.get("dimension_constraint") if isinstance(pegs.get("dimension_constraint"), dict) else None
+    if str(resolved.get("size_multiple_source", "custom")) == "template" and dimension_constraint:
+        step = _int(dimension_constraint.get("step"), 0)
+        if step > 0:
+            resolved["size_multiple"] = step
+    if str(resolved.get("loop_frames_source", "custom")) == "custom":
+        return resolved
+    window = max(0, _int(pegs.get("window_frames"), 0))
+    if window > 0:
+        resolved["loop_frames"] = window
+    return resolved
 
 
 def _snap_dimension(value: int, multiple: int, *, ceiling=None, floor=False) -> int:
@@ -358,6 +407,32 @@ def _grid_frame_count(hard: dict, minimum: int) -> int:
     return span if remainder == 0 else span + (step - remainder)
 
 
+def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str) -> str:
+    """Expand one member's slice of the derived prompt.
+
+    A pattern may use `{n}` (1-based), `{index}` (0-based), `{prompt}` and
+    `{name}` as many times as it likes, so a recipe can compose a sentence like
+    `<Subject {n}> is {prompt}, from <Picture {n}>` rather than only prefixing a
+    token. With no `{prompt}`/`{name}` placeholder the member text is appended
+    after the expanded pattern, which is what the original `token: label` form
+    did and is why existing recipes keep composing identically.
+    """
+    member_prompt = str(prompt or "").strip()
+    entity_name = str(name or "").strip()
+    label = member_prompt or entity_name
+    if not pattern:
+        return label
+    expanded = (
+        pattern.replace("{n}", str(index + 1))
+        .replace("{index}", str(index))
+        .replace("{prompt}", member_prompt)
+        .replace("{name}", entity_name)
+    )
+    if "{prompt}" in pattern or "{name}" in pattern:
+        return expanded.strip()
+    return f"{expanded}: {label}" if label else expanded
+
+
 def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict) -> str:
     override = str(item.get("prompt_override", "") or "").strip()
     if override:
@@ -366,17 +441,31 @@ def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict) ->
     token_pattern = str(soft.get("prompt_tokens", "") or "")
     values = []
     for index, record in enumerate(records):
-        member_prompt = str(getattr(record["member"], "prompt", "") or "").strip()
-        name = str(getattr(record["reference"], "name", "") or "").strip()
-        label = member_prompt or name
-        if token_pattern:
-            token = token_pattern.replace("{index}", str(index))
-            label = f"{token}: {label}" if label else token
-        if label:
-            values.append(label)
+        fragment = member_prompt_fragment(
+            token_pattern,
+            index,
+            getattr(record["member"], "prompt", ""),
+            getattr(record["reference"], "name", ""),
+        )
+        if fragment:
+            values.append(fragment)
     prefix = str(soft.get("prompt_prefix", "") or "").strip()
     joined = ", ".join(values)
     return " ".join(value for value in (prefix, joined) if value)
+
+
+def _member_prompts(records: list[dict[str, Any]], recipe: dict) -> list[str]:
+    """Per-slot prompt text, one entry per staged member, for p01..p16."""
+    soft = recipe.get("soft", {}) if isinstance(recipe.get("soft"), dict) else {}
+    pattern = str(soft.get("prompt_tokens", "") or "")
+    return [
+        member_prompt_fragment(
+            pattern, index,
+            getattr(record["member"], "prompt", ""),
+            getattr(record["reference"], "name", ""),
+        )
+        for index, record in enumerate(records)
+    ]
 
 
 def _audio_output(record: dict[str, Any]) -> dict:
@@ -404,11 +493,15 @@ def _bridge_tuple(
     names: str = "",
     context=None,
     slots=None,
+    slot_prompts=None,
 ) -> tuple:
     """Emit the frozen tuple, replacing every dead output with its fallback."""
 
     empty = _empty_image(width, height)
     slot_values = list(slots or []) if "slots" in live else []
+    # p01..p16 follow the same liveness as reference_prompt: they are the same
+    # composition, split per slot.
+    prompt_values = list(slot_prompts or []) if "reference_prompt" in live else []
     return (
         frames if frames is not None and "reference_frames" in live else empty,
         int(reference_index) if "reference_idx" in live else 0,
@@ -419,6 +512,10 @@ def _bridge_tuple(
         context if context is not None and "context" in live else empty,
         *[
             slot_values[index] if index < len(slot_values) else empty
+            for index in range(MAX_REFERENCE_SLOTS)
+        ],
+        *[
+            prompt_values[index] if index < len(prompt_values) else ""
             for index in range(MAX_REFERENCE_SLOTS)
         ],
     )
@@ -436,7 +533,10 @@ def decode_reference_set(reference_set) -> tuple:
     item = ref.get("item") if isinstance(ref.get("item"), dict) else {}
     recipe_wrapper = ref.get("recipe") if isinstance(ref.get("recipe"), dict) else {}
     recipe = recipe_wrapper.get("recipe") if isinstance(recipe_wrapper.get("recipe"), dict) else {}
-    hard = recipe.get("hard") if isinstance(recipe.get("hard"), dict) else {}
+    hard = resolve_pegged_hard(
+        recipe.get("hard") if isinstance(recipe.get("hard"), dict) else {},
+        ref.get("pegs") if isinstance(ref.get("pegs"), dict) else {},
+    )
     records = _member_records(project, item)
     cap = max(1, _int(hard.get("max_members"), MAX_REFERENCE_SLOTS))
     if len(records) > min(cap, MAX_REFERENCE_SLOTS):
@@ -523,4 +623,5 @@ def decode_reference_set(reference_set) -> tuple:
         frames=frames, reference_index=reference_index, strength=1.0,
         prompt=prompt, names=names, context=context,
         slots=member_tensors[:MAX_REFERENCE_SLOTS],
+        slot_prompts=_member_prompts(records, recipe)[:MAX_REFERENCE_SLOTS],
     )

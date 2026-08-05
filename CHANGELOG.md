@@ -41,10 +41,42 @@ a fresh `[Unreleased]` block.
   snap-to multiple that can be copied from the scene's model template.
 - Sonder Reference Selector gained a lane dropdown with a status line in place
   of a bare index, every Reference socket gained a hover description, and Sonder
-  Reference Bridge now marks the outputs a recipe does not drive as unused and
-  shows only as many `r01`–`r16` slots as the lane stages.
+  Reference Bridge marks every output a recipe does not drive — and every
+  numbered slot past the staged member count — as unused.
 - Reference lane headers show the recipe in use, and item bars show member tags
   when there is room for them.
+- Reference recipe options now explain themselves: choosing an Assembly or a
+  Bridge output says what that choice does and what an unchecked output emits.
+- Reference recipe frame grid, snap multiple and sheet loop length can be pegged
+  to the scene's model template or to the render window instead of being typed
+  once, so they follow whatever model the scene uses.
+- Reference prompts take a per-member pattern with `{n}`, `{index}`, `{prompt}`
+  and `{name}` placeholders, usable more than once, so a recipe can compose
+  `<Subject 1> is a redhead woman, from <Picture 1>`. Each member's expansion is
+  also emitted on its own `p01`–`p16` Bridge output.
+- Added a project-wide Reference Threshold: a staged Reference is ignored for a
+  render window that covers too little of its own span. Queueing a batch warns
+  when this changes whether a lane resolves between chunks.
+- Sonder Reference Selector lists the tags of the references staged on the
+  selected lane.
+- Reference items now show what a render will do with them: the item the current
+  window sends to the model takes an accent bar, while one another item
+  supersedes, or one the Reference Threshold drops, is hatched with the reason.
+  The lane panel uses the same wording, and nothing is marked without a
+  selection.
+
+### Fixed
+
+- Reference item-bar tags are legible again.
+- A pegged Reference recipe value now displays what the render will use instead
+  of the number it replaced, read-only, with its source beside it.
+- Reference batch warnings now name the lane, how many chunks were affected, and
+  the remedy that actually applies.
+- Sonder Reference Bridge `p01`-`p16` deliver their prompt text instead of image
+  data. Trimming the `r01`-`r16` block shifted the prompt sockets into image
+  positions; no Reference Bridge socket is removed any more, only marked.
+- Reference Bridge outputs a recipe does not drive now read as unused on Nodes
+  2.0 as well as legacy LiteGraph.
 
 ### Changed
 - Reference crop/trim preview now remembers Full Source versus Applied Result,

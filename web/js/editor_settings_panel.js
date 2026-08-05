@@ -304,6 +304,7 @@ function syncSettingsPanelControls() {
     if (controls.promptChannelLabels) controls.promptChannelLabels.checked = this._promptChannelLabels === true;
     if (controls.promptSectionDelimiter) controls.promptSectionDelimiter.value = String(this._promptSectionDelimiter ?? ".");
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
+    if (controls.referenceFrameThreshold) controls.referenceFrameThreshold.value = String(this._referenceFrameThreshold ?? 0);
     if (controls.allowExternalProjectLinks) {
         const resolved = this._serverSettingsLoaded === true;
         controls.allowExternalProjectLinks.disabled = !resolved;
@@ -1498,6 +1499,36 @@ function showSettingsPanel() {
         });
         thresholdControls.appendChild(thresholdInput);
         controls.promptFrameThreshold = thresholdInput;
+    }
+    {
+        // References resolve ONE winner per lane, so unlike the prompt threshold
+        // this one can legitimately leave a lane with nothing staged for a
+        // window — which is exactly how a reference stops applying outside its
+        // own scope. Default 0 (off).
+        const referenceControls = createRow(
+            promptsSection,
+            "Reference Threshold % (project-wide)",
+            "Ignore a staged Reference item in a render window when the window only covers a small part of that item's own span (under N%). Unlike prompts this can leave a lane with no reference at all, so has_reference reports 0 for that window. 0 = off. Saved into the project."
+        );
+        const referenceInput = document.createElement("input");
+        referenceInput.type = "number";
+        referenceInput.min = "0";
+        referenceInput.max = "100";
+        referenceInput.step = "1";
+        referenceInput.value = String(this._referenceFrameThreshold ?? 0);
+        referenceInput.style.cssText = chromeInputCss({ width: "72px", textAlign: "center" });
+        const commitReferenceThreshold = () => {
+            Promise.resolve(this._setReferenceFrameThreshold(referenceInput.value))
+                .then(() => { referenceInput.value = String(this._referenceFrameThreshold ?? 0); })
+                .catch(() => { referenceInput.value = String(this._referenceFrameThreshold ?? 0); });
+        };
+        referenceInput.addEventListener("change", commitReferenceThreshold);
+        referenceInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") commitReferenceThreshold();
+            e.stopPropagation();
+        });
+        referenceControls.appendChild(referenceInput);
+        controls.referenceFrameThreshold = referenceInput;
     }
     // — Browser-local preferences
     createCheckbox(

@@ -8,6 +8,34 @@ import {
     TRACK_TYPE,
 } from "./editor_timeline_constants.js";
 import { descriptorFor } from "./lane_registry.js";
+import {
+    REFERENCE_VERDICT,
+    REFERENCE_VERDICT_LABEL,
+    resolveReferenceVerdicts,
+} from "./reference_resolution.js";
+
+/**
+ * Which staged Reference item each verdict applies to for the live generation
+ * window, or null when there is no selection.
+ *
+ * Mirrors the prompt lane: the highlight answers "what will this render use",
+ * which is not a question until a window exists, so no selection means no marks.
+ */
+function referenceVerdictsForWindow(host) {
+    const scene = host.activeScene;
+    if (!scene?.reference_items?.length) return null;
+    const range = host._selectionContextRange?.();
+    if (!range) return null;
+    return resolveReferenceVerdicts({
+        referenceItems: scene.reference_items,
+        laneCount: Math.max(1, parseInt(scene.reference_lane_count, 10) || 1),
+        sceneDuration: Math.max(0, parseInt(scene.duration_frames, 10) || host.totalFrames || 0),
+        windowStart: Math.max(0, Math.round(range.contextStart)),
+        windowEnd: Math.round(range.contextEnd),
+        laneConfigs: scene.reference_lane_configs || [],
+        frameThresholdPct: host._referenceFrameThreshold || 0,
+    }).verdicts;
+}
 export {
     LABEL_WIDTH,
     LABEL_WIDTH_FS,
@@ -1238,14 +1266,21 @@ export function _drawClips(host, ctx, width) {
 
         // Reference items are source-less timeline scopes; they deliberately
         // never resolve or draw an asset thumbnail.
+        //
+        // Which item a render will actually use is resolved ONCE here for the
+        // whole pass. Unlike the prompt-usage highlight above this needs no
+        // fetch, debounce or cached Sets: the Reference resolver is mirrored in
+        // JS, so it runs synchronously and cannot go stale.
+        const referenceVerdicts = referenceVerdictsForWindow(host);
         for (let layoutIdx = 0; layoutIdx < host._trackLayout.length; layoutIdx++) {
             const entry = host._trackLayout[layoutIdx];
             if (entry.type !== TRACK_TYPE.REFERENCE || entry.collapsed) continue;
             const y = host._trackY(layoutIdx);
             const h = host._trackH(layoutIdx);
             const laneHidden = host._isLaneHidden(entry.type, entry.laneIndex);
-            for (const item of (host.activeScene.reference_items || [])) {
+            for (const [itemIndex, item] of (host.activeScene.reference_items || []).entries()) {
                 if ((item.lane_index || 0) !== entry.laneIndex) continue;
+                const verdict = referenceVerdicts?.get(itemIndex) || null;
                 const endFrame = item.end_frame === -1 ? host.totalFrames : item.end_frame;
                 const x1 = host._frameToX(item.start_frame || 0);
                 const x2 = host._frameToX(endFrame || 0);
@@ -1283,8 +1318,8 @@ export function _drawClips(host, ctx, width) {
                         const nameW = ctx.measureText(label).width;
                         const room = (x2 - x1 - 6) - nameW - Math.round(12 * scale);
                         if (room > Math.round(30 * scale)) {
-                            ctx.fillStyle = COLORS.textMuted;
-                            ctx.font = host._canvasSansFont(Math.round(8 * scale), 400);
+                            ctx.fillStyle = COLORS.itemSubText;
+                            ctx.font = host._canvasSansFont(Math.round(8 * scale), 500);
                             const shortened = tags.map((tag) => tag.replace(/^sonder:/, ""));
                             ctx.fillText(shortened.join(", "), textX + nameW + Math.round(8 * scale), baseline);
                         }
@@ -1292,6 +1327,23 @@ export function _drawClips(host, ctx, width) {
                     ctx.restore();
                 }
                 if (hidden) host._drawMutedOverlay(ctx, x1 + 1, y + 2, x2 - x1 - 2, h - 4, item.muted ? "Muted" : "Hidden");
+                // Selection resolution, same treatment the prompt lane uses: a
+                // strong top accent for the item this window will send to the
+                // model, and a dim hatch naming why a loser will not. Muted and
+                // hidden items already carry their own overlay, so they are left
+                // alone rather than stacked with a second one.
+                if (verdict === REFERENCE_VERDICT.WINNER) {
+                    ctx.fillStyle = COLORS.accent;
+                    ctx.fillRect(x1 + 1, y + 2, x2 - x1 - 2, Math.max(2, Math.round(3 * host._scaleTimeline)));
+                } else if (!hidden
+                    && (verdict === REFERENCE_VERDICT.SUPERSEDED || verdict === REFERENCE_VERDICT.BELOW_THRESHOLD)) {
+                    ctx.save();
+                    ctx.globalAlpha = 0.5;
+                    host._drawMutedOverlay(
+                        ctx, x1 + 1, y + 2, x2 - x1 - 2, h - 4, REFERENCE_VERDICT_LABEL[verdict],
+                    );
+                    ctx.restore();
+                }
                 if (host.dragType === "trimEdge") drawTrimGhost(item, y, h, COLORS.referenceItem);
             }
             ctx.globalAlpha = 1;
