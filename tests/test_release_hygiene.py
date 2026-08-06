@@ -108,3 +108,38 @@ def test_source_text_has_no_cp1252_round_trip_damage():
                         f"{path.relative_to(ROOT)}:{number}: {match.group(0)!r} should be {recovered!r}"
                     )
     assert not findings, "cp1252 round-trip damage in source text:\n" + "\n".join(findings)
+
+
+def test_source_text_has_no_raw_nul_bytes():
+    """A raw NUL makes ripgrep treat the whole file as binary.
+
+    It is silent in both directions: a NUL is valid UTF-8, so nothing fails to
+    load and every text tool reads the file fine, while a directory-scoped
+    ripgrep SKIPS the file entirely (no output, no warning) and an
+    explicit-path search TRUNCATES at the first match past the NUL. That is how
+    two `join("\\0")` separators written as literal NULs made 16k lines of
+    `editor_widget.js` partially invisible to code search.
+
+    Write the escape (`\\u0000`), never the byte. Bytes are read directly here
+    because a NUL cannot be matched from a grep pattern.
+    """
+    findings = []
+    for path in sorted(ROOT.rglob("*")):
+        if path.is_dir() or any(part in {".git", "__pycache__", "node_modules"} for part in path.parts):
+            continue
+        # Same allowlist as the cp1252 check above: tracked .png/.webp/.woff2
+        # assets contain NUL by construction and are not source text.
+        if path.suffix not in {".js", ".py", ".md", ".json", ".toml", ".css", ".html"}:
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        offset = raw.find(b"\x00")
+        if offset >= 0:
+            line = raw.count(b"\n", 0, offset) + 1
+            findings.append(
+                f"{path.relative_to(ROOT)}:{line}: raw NUL byte at offset {offset}"
+                f" ({raw.count(chr(0).encode())} total) — write \\u0000 instead"
+            )
+    assert not findings, "raw NUL bytes in source text:\n" + "\n".join(findings)

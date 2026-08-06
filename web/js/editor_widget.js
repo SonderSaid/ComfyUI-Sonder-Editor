@@ -213,10 +213,29 @@ import { getActiveReferenceDrag, mountReferenceLibrary, SONDER_REFERENCE_MIME } 
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import { shouldApplyReferenceResponse } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
-import { resolveEffectiveReferences } from "./reference_resolution.js";
+import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
-import { normalizeChannels, composeSectionText, composeSectionsDisplayText } from "./prompt_composition.js";
+import {
+    collapseChannelsForTemplate,
+    composeSectionText,
+    composeSectionsDisplayText,
+    hasChannelText,
+    normalizeChannelExceptions,
+    globalChannelLines,
+    normalizeChannels,
+    normalizeSubjectIds,
+} from "./prompt_composition.js";
+import {
+    DEFAULT_CHANNEL_TEMPLATE_ID,
+    PROJECT_TEMPLATE_KEY,
+    PROMPT_CHANNEL_TEMPLATE_PRESETS,
+    getChannelTemplate,
+    globalChannelKeys,
+    templateChannelKeys,
+    templateFreezeValue,
+    templateLabelsOn,
+} from "./prompt_channel_templates.js";
 import { mountSharedRenderQueue, queueBatchIds, formatQueueTime } from "./shared_render_queue.js";
 import { mountEditorSettingsPanel } from "./editor_settings_panel.js";
 import {
@@ -229,6 +248,7 @@ import {
 } from "./thumbnail_repair_manager.js";
 import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
 import { mountPromptManagementPanel } from "./editor_prompt_panel.js";
+import { mountChannelTemplateEditor } from "./editor_channel_template_editor.js";
 import { evalNumericExpression } from "./editor_numeric_input.js";
 import * as TimelineCanvas from "./editor_timeline_canvas.js";
 import { RULER_HEIGHT, TIMELINE_HEIGHT } from "./editor_timeline_constants.js";
@@ -2975,15 +2995,23 @@ export class EditorWidget {
 
     _applyLocalPromptCreate(fields = {}) {
         if (!this.activeScene) return null;
-        const channels = normalizeChannels(fields.channels, fields.prompt || "");
+        const channels = normalizeChannels(fields.channels, fields.prompt || "", this._channelKeys());
         const section = {
             prompt_id: fields.prompt_id || this._newLocalItemId("prompt"),
             start_frame: parseInt(fields.start_frame, 10) || 0,
             end_frame: parseInt(fields.end_frame, 10) || 0,
             channels,
-            // Label-free composed mirror, matching backend to_dict
+            // Label-free composed mirror, matching backend to_dict. Deliberately
+            // template-LESS: PromptSection.prompt has no project metadata to
+            // consult, so the mirror stays on the legacy three channels and the
+            // timeline label composes its own template-aware text instead.
             prompt: composeSectionText(channels, false),
             muted: !!fields.muted,
+            starts_new_shot: !!fields.starts_new_shot,
+            shot_timestamp: fields.shot_timestamp === true,
+            subject_ids: normalizeSubjectIds(fields.subject_ids),
+            global_channel_exceptions: normalizeChannelExceptions(
+                fields.global_channel_exceptions),
         };
         this.activeScene.prompt_sections = this.activeScene.prompt_sections || [];
         this.activeScene.prompt_sections.push(section);
@@ -2998,7 +3026,9 @@ export class EditorWidget {
         const { channels, prompt, ...rest } = fields || {};
         Object.assign(section, rest);
         if (channels && typeof channels === "object") {
-            section.channels = normalizeChannels(channels);
+            // Merge, never replace — mirrors prompt_payload.merge_channels, so
+            // an edit under one template cannot delete another template's text.
+            section.channels = normalizeChannels({ ...(section.channels || {}), ...channels });
             section.prompt = composeSectionText(section.channels, false);
         } else if (prompt !== undefined) {
             section.channels = normalizeChannels(null, prompt);
@@ -5482,6 +5512,10 @@ export class EditorWidget {
             _loadServerSettings: () => editor._loadServerSettings(),
             _setAllowExternalProjectLinks: (enabled) => editor._setAllowExternalProjectLinks(enabled),
             _togglePromptChannelLabels: (on) => editor._togglePromptChannelLabels(on),
+            _channelTemplate: () => editor._channelTemplate(),
+            _promptChannelTemplateOptions: () => editor._promptChannelTemplateOptions(),
+            _setPromptChannelTemplate: (templateId) => editor._setPromptChannelTemplate(templateId),
+            _openChannelTemplateEditor: () => editor._openChannelTemplateEditor(),
             _toggleGuideCollisionAutoOffset: (on) => editor._toggleGuideCollisionAutoOffset(on),
             _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
             _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
@@ -9253,28 +9287,87 @@ export class EditorWidget {
     }
 
     /** Three channel textareas (Visual/Speech/Sounds) for inline prompt bars. */
-    _buildChannelInputs(initialChannels, onEnter, onEscape) {
-        const channels = normalizeChannels(initialChannels);
+    // Active project channel template. The channel SET determines the served
+    // prompt, so it is project-durable metadata and never a browser preference.
+    _channelTemplate() {
+        return getChannelTemplate(this._promptChannelTemplateRaw ?? DEFAULT_CHANNEL_TEMPLATE_ID);
+    }
+
+    _channelKeys() {
+        return templateChannelKeys(this._channelTemplate());
+    }
+
+    /** Label-free composed text for one section's timeline bar, over the
+     *  ACTIVE template rather than the legacy three-channel `prompt` mirror.
+     *  Without this a MiniMax section draws a blank bar. */
+    _promptSectionBarLabel(section) {
+        if (!section) return "";
+        const template = this._channelTemplate();
+        const channels = normalizeChannels(section.channels, section.prompt,
+                                           templateChannelKeys(template));
+        return composeSectionText(channels, false, template) || (section.prompt || "");
+    }
+
+    /** Label-free composed text for the scene-global lane bar, over the GLOBAL
+     *  channels of the ACTIVE template. `Scene.prompt` is a mirror the backend
+     *  derives without a template, so it is empty on any non-legacy channel set
+     *  and the lane drew "(empty)" over text that was plainly there. Kept as the
+     *  fallback for legacy scenes whose channels were never populated. */
+    _promptGlobalBarLabel() {
+        const scene = this.activeScene;
+        if (!scene) return "";
+        return globalChannelLines(scene.global_channels, this._channelTemplate(), false).join(" ")
+            || (scene.prompt || "");
+    }
+
+    // "detailed_description" -> "Detailed description…"
+    _channelPlaceholder(key) {
+        const words = String(key || "").replace(/_/g, " ").trim();
+        if (!words) return "…";
+        return `${words[0].toUpperCase()}${words.slice(1)}…`;
+    }
+
+    /** `keys` narrows the template's channels — the global bar uses it so a
+     *  template with per-channel globals off renders one box, not n. */
+    _buildChannelInputs(initialChannels, onEnter, onEscape, { keys: keyOverride = null } = {}) {
+        const template = this._channelTemplate();
+        const keys = keyOverride || templateChannelKeys(template);
+        const channels = normalizeChannels(initialChannels, "", keys);
         const wrap = document.createElement("div");
-        wrap.style.cssText = "display: flex; gap: 4px; flex: 1; min-width: 0; align-items: flex-start;";
+        // Wraps so a six-field template stays usable in the inline bar instead
+        // of squeezing every field below a readable width.
+        wrap.style.cssText = "display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; align-items: flex-start;";
         const inputs = {};
-        const placeholders = { visual: "Visual…", speech: "Speech…", sounds: "Sounds…" };
-        for (const key of ["visual", "speech", "sounds"]) {
+        // The channel carrying shot markers is the body field and gets the room;
+        // with no marker channel the first channel does, which is `visual` for
+        // the default template.
+        const wideKey = keys.includes(template.shot_marker_channel)
+            ? template.shot_marker_channel
+            : keys[0];
+        for (const key of keys) {
+            const entry = (template.channels || []).find((c) => c.key === key) || { key };
             const input = this._makePromptTextarea({
                 value: channels[key] || "",
-                placeholder: placeholders[key],
-                title: `${key[0].toUpperCase()}${key.slice(1)} channel`,
-                flex: key === "visual" ? 2 : 1,
+                placeholder: this._channelPlaceholder(key),
+                title: entry.description || `${this._channelPlaceholder(key).slice(0, -1)} channel`,
+                flex: key === wideKey ? 2 : 1,
             }, onEnter, onEscape);
+            input.style.minWidth = keys.length > 3 ? "140px" : "40px";
             inputs[key] = input;
             wrap.appendChild(input);
         }
-        const read = () => ({
-            visual: inputs.visual.value.trim(),
-            speech: inputs.speech.value.trim(),
-            sounds: inputs.sounds.value.trim(),
-        });
-        return { wrap, inputs, read };
+        const read = () => {
+            const out = {};
+            for (const key of keys) {
+                out[key] = inputs[key] ? inputs[key].value.trim() : "";
+            }
+            return out;
+        };
+        // Named rather than reached for by key: the first channel is `visual`
+        // only under the default template, and a hard-coded key throws on every
+        // named-field template that does not happen to define it.
+        const focusFirst = () => { inputs[keys[0]]?.focus(); };
+        return { wrap, inputs, read, keys, template, focusFirst };
     }
 
     _showPromptCreator(startFrame, endFrame) {
@@ -9303,7 +9396,7 @@ export class EditorWidget {
             if (this._promptEditorEl !== editor) return;
             if (created || discard) return;
             const channels = channelInputs.read();
-            if (channels.visual || channels.speech || channels.sounds) {
+            if (hasChannelText(channels, this._channelTemplate())) {
                 created = true;
                 this._saveNewPromptSection(startFrame, endFrame, channels);
             }
@@ -9335,9 +9428,10 @@ export class EditorWidget {
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
         this._promptEditorCommit = commit;
+        this._observeInlinePromptEditor(editor);
         this._refreshTimelineLayout();
 
-        setTimeout(() => channelInputs.inputs.visual.focus(), 50);
+        setTimeout(() => channelInputs.focusFirst(), 50);
     }
 
     async _saveNewPromptSection(startFrame, endFrame, channels) {
@@ -9391,16 +9485,14 @@ export class EditorWidget {
         // Last durably-written channels. Focus loss and every close path commit
         // through here, so the comparison is what keeps repeated focus changes
         // from stacking no-op mutations and undo entries.
-        let committed = normalizeChannels(section.channels, section.prompt);
+        let committed = normalizeChannels(section.channels, section.prompt, this._channelKeys());
         let discard = false;
         const commit = ({ close = true } = {}) => {
             // Teardown fires a final focusout; only the mounted bar may write,
             // so Esc and Delete cannot be reversed by their own removal.
             if (this._promptEditorEl !== editor) return;
             const next = channelInputs.read();
-            if (next.visual !== committed.visual
-                || next.speech !== committed.speech
-                || next.sounds !== committed.sounds) {
+            if (Object.keys(next).some((key) => next[key] !== (committed[key] ?? ""))) {
                 committed = next;
                 this._updatePromptSection(idx, { channels: next });
                 // The mutation clears the lane highlight; an open bar should
@@ -9455,13 +9547,20 @@ export class EditorWidget {
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
         this._promptEditorCommit = () => commit({ close: false });
+        this._observeInlinePromptEditor(editor);
         this._refreshTimelineLayout();
 
         // Focus input
-        setTimeout(() => channelInputs.inputs.visual.focus(), 50);
+        setTimeout(() => channelInputs.focusFirst(), 50);
     }
 
-    /** Inline editor bar for the scene-global prompt lane (Scene.prompt).
+    /** Inline editor bar for the scene-global prompt lane.
+     *
+     *  Per channel, like the panel: the global prompt's source of truth is
+     *  `global_channels`, and committing through the flat `prompt` setter here
+     *  would wipe channels 2..n on every edit. A template with global channels
+     *  off renders exactly one box, which is the bar's original shape.
+     *
      *  Auto-commits on Enter/blur (no Save button); Esc cancels — the cancel
      *  path must beat the removal-triggered blur via the suppress flag. */
     _showGlobalPromptEditor() {
@@ -9480,42 +9579,108 @@ export class EditorWidget {
         label.style.cssText = `font-size: 10px; color: ${COLORS.promptBorder}; white-space: nowrap; padding-top: 5px;`;
         label.textContent = "Global:";
 
+        const keys = this._globalChannelKeys();
+        let committed = normalizeChannels(
+            this.activeScene.global_channels, this.activeScene.prompt, keys);
         let suppressBlurCommit = false;
         const commit = () => {
             if (suppressBlurCommit) return;
-            this._updateScenePrompt(input.value);
+            if (this._promptEditorEl !== editor) return;
+            const next = channelInputs.read();
+            if (Object.keys(next).every((key) => next[key] === (committed[key] ?? ""))) return;
+            committed = next;
+            this._updateSceneGlobalChannels(next);
         };
-        const input = this._makePromptTextarea({
-            value: this.activeScene.prompt || "",
-            placeholder: "Scene-global prompt (style, identity, location)…",
-            title: "Global prompt — auto-commits on Enter or focus loss; Esc cancels",
-        }, () => {
+        const channelInputs = this._buildChannelInputs(committed, () => {
             commit();
             this._hidePromptEditor();
         }, () => {
             suppressBlurCommit = true;
             this._hidePromptEditor({ commit: false });
-        });
-        input.addEventListener("blur", () => {
+        }, { keys });
+        editor.addEventListener("focusout", (e) => {
+            if (e.relatedTarget && editor.contains(e.relatedTarget)) return;
             commit();
             // Blur from clicking elsewhere closes the bar; the hide itself
             // re-triggers no commit because the element is already detached
             if (this._promptEditorEl === editor) this._hidePromptEditor();
         });
 
-        editor.append(label, input);
+        editor.append(label, channelInputs.wrap);
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
         // Close paths flush too: browsers disagree on whether removing a
-        // focused element fires blur, and `_updateScenePrompt` already
-        // no-ops on an unchanged value, so a double call is harmless.
+        // focused element fires blur, and the commit above already no-ops on
+        // unchanged text, so a double call is harmless.
         this._promptEditorCommit = commit;
+        this._observeInlinePromptEditor(editor);
         this._refreshTimelineLayout();
 
-        setTimeout(() => input.focus(), 50);
+        setTimeout(() => channelInputs.focusFirst(), 50);
     }
 
-    /** Durable write of the scene-global prompt via the mutation pipeline. */
+    /** Per-channel scene-global text. Sends a channel PATCH — the backend
+     *  merges, so channels not named here keep their value. */
+    async _updateSceneGlobalChannels(patch) {
+        if (!this.activeScene || !this.projectDir) return;
+        if (this._isGlobalPromptTrackLocked()) return;
+        const sceneRef = this.activeScene;
+        const sceneId = this.activeSceneId;
+        const previous = { ...(sceneRef.global_channels || {}) };
+        const next = normalizeChannels({ ...previous, ...patch });
+        if (JSON.stringify(next) === JSON.stringify(normalizeChannels(previous))) return;
+        const undoLabel = "edit global prompt";
+        this._pushUndo(undoLabel);
+        sceneRef.global_channels = next;
+        // Keep the local label-free mirror in step with the channels, exactly
+        // as Scene.to_dict derives it server-side.
+        sceneRef.prompt = composeSectionText(next, false);
+        this._renderSceneAfterLocalMutation({ viewport: false });
+        try {
+            await this._runSceneMutation(
+                [{ type: "update_scene_fields", fields: { global_channels: patch } }],
+                {
+                    key: `scene:${sceneId}:global_channels`,
+                    label: "global prompt",
+                    coalesce: true,
+                    refreshScenes: false,
+                }
+            );
+        } catch (e) {
+            this._discardLastUndo(undoLabel);
+            if (sceneRef === this.activeScene) {
+                sceneRef.global_channels = previous;
+                sceneRef.prompt = composeSectionText(previous, false);
+            }
+            notifyWarning(e?.message || "Global prompt edit was refused.", { source: "prompt-global-refused" });
+            this._renderTimeline();
+        }
+    }
+
+    /** Whether ONE section inherits ONE global channel.
+     *
+     *  Stored as exceptions — the keys a section does NOT inherit — so the
+     *  default is inherit-everything and a channel added to the template later
+     *  needs no per-section write. Routed through `_updatePromptSection` so it
+     *  shares the section's identity check, undo entry and coalescing. */
+    async _setSectionGlobalInherit(idx, key, inherits) {
+        const section = (this.activeScene?.prompt_sections || [])[idx];
+        if (!section) return;
+        const current = new Set(normalizeChannelExceptions(section.global_channel_exceptions));
+        if (inherits) current.delete(String(key));
+        else current.add(String(key));
+        const next = [...current].sort();
+        if (next.join("\u0000") === normalizeChannelExceptions(
+            section.global_channel_exceptions).join("\u0000")) return;
+        await this._updatePromptSection(idx, { global_channel_exceptions: next });
+    }
+
+    /** Global channel keys for the active template — every channel, or just the
+     *  first when the template turns per-channel globals off. */
+    _globalChannelKeys() {
+        return globalChannelKeys(this._channelTemplate());
+    }
+
     async _updateScenePrompt(value) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isGlobalPromptTrackLocked()) return;
@@ -9578,6 +9743,135 @@ export class EditorWidget {
             notifyWarning(e?.message || "Failed to update channel-labels setting.", { source: "prompt-labels-refused" });
             throw e;
         }
+    }
+
+    /** How much authored text a template switch would strand: the channels the
+     *  CURRENT template names that the NEXT one does not, counted across every
+     *  scene, because the template is project-level. */
+    _channelTemplateSwitchImpact(nextTemplateOrId) {
+        const nextKeys = new Set(templateChannelKeys(getChannelTemplate(nextTemplateOrId)));
+        const losing = templateChannelKeys(this._channelTemplate())
+            .filter((key) => !nextKeys.has(key));
+        let sections = 0;
+        let scenes = 0;
+        for (const scene of (this.scenes || [])) {
+            let touched = 0;
+            for (const section of (scene.prompt_sections || [])) {
+                const channels = section.channels || {};
+                if (losing.some((key) => String(channels[key] ?? "").trim())) touched++;
+            }
+            if (touched) { scenes++; sections += touched; }
+        }
+        return { losing, sections, scenes };
+    }
+
+    /** Project-durable channel template. Same mutation exemption as the
+     *  channel-labels toggle: project metadata, infrequent, not undo-enrolled.
+     *
+     *  The switch REWRITES section text — the backend collapses each section
+     *  under `key:` headers and re-splits it against the incoming template,
+     *  inside the same save that moves the pointer, so the two can never
+     *  disagree. Text is never hidden, but it is moved, and scene-scoped undo
+     *  will not switch the template back. Both facts go in the confirm. */
+    async _setPromptChannelTemplate(nextTemplateId, { confirm = true } = {}) {
+        const dirName = this._projectDirName();
+        if (!dirName) return false;
+        const next = getChannelTemplate(nextTemplateId);
+        const current = this._channelTemplate();
+        // Compare the whole frozen value, not just the id: editing a custom
+        // template in place keeps its id while changing what it means, and an
+        // id-only guard would swallow every save after the first.
+        if (JSON.stringify(templateFreezeValue(next))
+            === JSON.stringify(templateFreezeValue(current))) return true;
+
+        if (confirm) {
+            const impact = this._channelTemplateSwitchImpact(next);
+            if (impact.sections) {
+                const fields = impact.losing.join(", ");
+                const scope = impact.scenes === 1
+                    ? `${impact.sections} section`
+                    : `${impact.sections} sections across ${impact.scenes} scenes`;
+                const landing = next.channels?.[0]?.key || "the first channel";
+                const ok = window.confirm(
+                    `Switch this project to "${next.name}"?\n\n`
+                    + `${scope} carry text in ${fields}, which "${next.name}" does not use. `
+                    + `That text will be rewritten into ${landing}, each part kept under a `
+                    + `"${fields.split(", ")[0]}:" heading so you can see and move it. `
+                    + `Switching back puts it where it was.\n\n`
+                    + `The template is project-wide, so this rewrites every scene, and Undo `
+                    + `will not switch it back.`);
+                if (!ok) return false;
+            }
+        }
+
+        const previous = this._promptChannelTemplateRaw;
+        // Built-ins travel as an id; a project-owned fork travels as its whole
+        // dict, so the project does not depend on a preset that may not exist.
+        const frozen = templateFreezeValue(next);
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ metadata: { [PROJECT_TEMPLATE_KEY]: frozen } }),
+                },
+                { projectId: dirName }
+            );
+            this._promptChannelTemplateRaw = frozen;
+            // The backend rewrote every section in the same save, so the
+            // client's scene copies are stale by definition — re-read before
+            // the panel and timeline draw from them.
+            await this._fetchScenes({ ignoreMutationGate: true, reason: "channel_template_switch" });
+            this._promptPanelHandle?.refresh?.();
+            this._renderTimeline();
+            notifySuccess(`Prompt channels switched to "${next.name}".`);
+            return true;
+        } catch (e) {
+            this._promptChannelTemplateRaw = previous;
+            notifyWarning(e?.message || "Failed to switch the prompt channel template.",
+                          { source: "prompt-template-refused" });
+            return false;
+        }
+    }
+
+    /** Preset catalog for the panel's template picker. A project-owned fork is
+     *  appended so the picker can show what the project is actually using —
+     *  otherwise a custom template would leave the dropdown showing something
+     *  the project is not on. */
+    _promptChannelTemplateOptions() {
+        const options = Object.values(PROMPT_CHANNEL_TEMPLATE_PRESETS).map((template) => ({
+            id: template.id,
+            name: template.name,
+            description: template.description,
+            channelCount: templateChannelKeys(template).length,
+            builtin: true,
+        }));
+        const active = this._channelTemplate();
+        if (!active.builtin) {
+            options.push({
+                id: active.id,
+                name: `${active.name} (custom)`,
+                description: active.description,
+                channelCount: templateChannelKeys(active).length,
+                builtin: false,
+            });
+        }
+        return options;
+    }
+
+    /** Opens the channel-template editor overlay. Saving routes through
+     *  `_setPromptChannelTemplate`, so a channel-set edit collapses and
+     *  re-splits section text exactly as a preset switch does. */
+    _openChannelTemplateEditor() {
+        if (!this._projectDirName()) {
+            notifyWarning("Open a project before editing its channel template.",
+                          { source: "channel-template-editor" });
+            return null;
+        }
+        this._channelTemplateEditorHandle?.close?.();
+        this._channelTemplateEditorHandle = mountChannelTemplateEditor(this);
+        return this._channelTemplateEditorHandle;
     }
 
     /** Project-durable section-seam delimiter (changes model-visible text).
@@ -9655,47 +9949,70 @@ export class EditorWidget {
             frameThresholdPct: this._referenceFrameThreshold || 0,
         };
         const total = chunks.length;
-        const flipped = [];
-        const silenced = [];
-        for (let lane = 0; lane < laneCount; lane++) {
-            const staged = (scene.reference_items || []).some((item) => (item.lane_index || 0) === lane);
-            if (!staged) continue;
-            const present = chunks.map((chunk) => !!resolveEffectiveReferences({
-                ...shared, windowStart: chunk.start, windowEnd: chunk.end,
-            })[lane]);
-            const dropped = present.filter((value) => !value).length;
-            const label = laneLabel(scene, TRACK_TYPE.REFERENCE, lane);
-            if (dropped && dropped < total) {
-                flipped.push(`${label} (${dropped} of ${total})`);
-            } else if (dropped === total) {
-                // A threshold set above the per-chunk coverage drops the lane in
-                // EVERY chunk, so nothing flips and the flip check stayed quiet —
-                // but the reference silently never reaches the model at all.
-                silenced.push(label);
-            }
-        }
-        if (flipped.length) {
+        const lanes = classifyReferenceChunks(chunks, shared).filter((lane) => lane.staged);
+        const labelFor = (lane) => laneLabel(scene, TRACK_TYPE.REFERENCE, lane.laneIndex);
+        // Counted per CAUSE, not per failure: one lane can lose some chunks to
+        // the threshold and others to simple non-overlap, and a single tally
+        // would put a number in a sentence that does not explain it.
+        const named = (list, cause) => list
+            .map((lane) => `${labelFor(lane)} (${lane.causeCounts[cause]} of ${total})`)
+            .join(", ");
+
+        const flipping = lanes.filter((lane) => lane.resolved > 0);
+        const thresholdFlips = flipping.filter(
+            (lane) => lane.causeCounts[REFERENCE_LANE_CAUSE.BELOW_THRESHOLD] > 0);
+        const scopeFlips = flipping.filter(
+            (lane) => lane.causeCounts[REFERENCE_LANE_CAUSE.OUTSIDE] > 0);
+
+        // Both cases flip `has_reference` 1->0 mid-batch and both change the
+        // inferred task mode, so neither is silent. They differ in whether the
+        // user chose it: a scoped item dropping outside its own range is the
+        // feature working, while the threshold dropping a chunk it does overlap
+        // is a setting the user probably did not mean to hit. Sticky for the
+        // one worth stopping over, transient for the one worth knowing.
+        if (thresholdFlips.length) {
             notifyWarning(
-                `${flipped.join(", ")} — dropped from some chunks of this batch but not others. `
-                + "Mechanisms that infer their task from which sockets are connected will run those chunks "
-                + "in a different mode. Widen the staged range to cover the whole batch, or lower the "
-                + "Reference Threshold in Settings.",
+                `${named(thresholdFlips, REFERENCE_LANE_CAUSE.BELOW_THRESHOLD)} — dropped from chunks this `
+                + "item does overlap, because each chunk covers too little of its own span for the current "
+                + "Reference Threshold. Those chunks lose the reference, and mechanisms that infer their task "
+                + "from which sockets are connected will run them in a different mode. Lower the Reference "
+                + "Threshold in Settings, or widen the staged item.",
                 { source: "reference-batch-flip", duration: 0 },
             );
         }
-        if (silenced.length) {
-            // Name the actual cause: with the threshold off, a lane that never
-            // resolves simply does not overlap the batch, and pointing at a
-            // setting that is not involved sends the user to the wrong fix.
-            const remedy = shared.frameThresholdPct > 0
-                ? "Each chunk covers too little of the item's own span for the current Reference Threshold. "
-                  + "Lower it in Settings, or widen the staged item."
-                : "The staged range does not overlap this batch. Move or extend the item to cover it.";
-            notifyWarning(
-                `${silenced.join(", ")} — dropped from all ${total} chunks, so the staged reference reaches `
-                + `nothing in this batch. ${remedy}`,
-                { source: "reference-batch-silenced", duration: 0 },
+        if (scopeFlips.length) {
+            notifyInfo(
+                `${named(scopeFlips, REFERENCE_LANE_CAUSE.OUTSIDE)} — chunks outside the staged range carry no `
+                + "reference, which is what scoping the item does. Mechanisms that infer their task from which "
+                + "sockets are connected will run those chunks in a different mode. Widen the staged range if "
+                + "the whole batch should match.",
+                { source: "reference-batch-scope" },
             );
+        }
+
+        const silenced = lanes.filter((lane) => lane.resolved === 0);
+        if (silenced.length) {
+            // Remedy comes from what actually happened to THIS lane. Reading it
+            // off the global threshold setting told a lane sitting outside the
+            // batch to lower a threshold that never touched it, and told a muted
+            // lane about overlap it does not have a problem with.
+            const remedies = {
+                [REFERENCE_LANE_CAUSE.BELOW_THRESHOLD]:
+                    "Each chunk covers too little of the item's own span for the current Reference Threshold. "
+                    + "Lower it in Settings, or widen the staged item.",
+                [REFERENCE_LANE_CAUSE.OUTSIDE]:
+                    "The staged range does not overlap this batch. Move or extend the item to cover it.",
+                [REFERENCE_LANE_CAUSE.EXCLUDED]:
+                    "Every staged item on it is muted, or the lane is hidden. Unmute the item or unhide the "
+                    + "lane to let it through.",
+            };
+            for (const lane of silenced) {
+                notifyWarning(
+                    `${labelFor(lane)} — dropped from all ${total} chunks, so the staged reference reaches `
+                    + `nothing in this batch. ${remedies[lane.dominantCause] || remedies.outside}`,
+                    { source: "reference-batch-silenced", duration: 0 },
+                );
+            }
         }
     }
 
@@ -10009,12 +10326,30 @@ export class EditorWidget {
     /** Replace the scene's prompt state with a history entry / template:
      *  ONE mutation request (deletes high-index-first, then creates, then the
      *  global text) so the apply is a single save and a single undo step. */
-    async _applyPromptSetup({ global: globalText, sections, extendDurationTo = 0, source_fps: sourceFps = 0 } = {}) {
+    async _applyPromptSetup({ global: globalText, global_channels: globalChannels = null,
+                              sections, extendDurationTo = 0, source_fps: sourceFps = 0,
+                              source_channel_template: sourceChannelTemplateId = null } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
             notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
             return;
         }
+        // Entries saved before this field existed predate multi-channel
+        // templates entirely, so the default template is the right assumption.
+        const sourceChannelTemplate = getChannelTemplate(
+            sourceChannelTemplateId || DEFAULT_CHANNEL_TEMPLATE_ID);
+        const activeChannelTemplate = this._channelTemplate();
+        // A same-template apply must NOT round-trip through the collapse. That
+        // path is deliberately lossy: `joinChannelHeaders` folds any key outside
+        // the template into channel 1 carrying a literal `key:` label, and the
+        // anchored re-parse reclaims a line that merely starts with a template
+        // key. Both are correct when retargeting across templates and wrong when
+        // there is nothing to retarget. Still emit every key explicitly, because
+        // channel updates MERGE server-side — a key left out keeps its old text.
+        const retargetChannels = (channels) => (
+            sourceChannelTemplate.id === activeChannelTemplate.id
+                ? normalizeChannels(channels, "", templateChannelKeys(activeChannelTemplate))
+                : collapseChannelsForTemplate(channels, sourceChannelTemplate, activeChannelTemplate));
         const sceneRef = this.activeScene;
         const undoLabel = "apply prompt setup";
         this._pushUndo(undoLabel);
@@ -10037,7 +10372,13 @@ export class EditorWidget {
             .filter((s) => (s?.end_frame || 0) > (s?.start_frame || 0))
             .sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0))
             .map((s) => {
-                const channels = normalizeChannels(s.channels, s.prompt);
+                // Browser prompt templates are cross-project, so the entry may
+                // have been authored under a different channel template. Run
+                // the same collapse-then-re-split a template switch uses, from
+                // the recorded source template to the current one — otherwise a
+                // Standard-authored entry lands invisibly in `visual` here.
+                const channels = retargetChannels(
+                    normalizeChannels(s.channels, s.prompt));
                 const startFrame = Math.max(previousEnd, Math.round((s.start_frame || 0) * timeScale));
                 const endFrame = Math.max(startFrame + 1, Math.round((s.end_frame || 0) * timeScale));
                 previousEnd = endFrame;
@@ -10048,12 +10389,26 @@ export class EditorWidget {
                     channels,
                     prompt: composeSectionText(channels, false),
                     muted: !!s.muted,
+                    // Carried through history entries and browser templates —
+                    // dropping them here would wipe shot and subject data on
+                    // every Apply.
+                    starts_new_shot: !!s.starts_new_shot,
+                    shot_timestamp: s.shot_timestamp === true,
+                    subject_ids: normalizeSubjectIds(s.subject_ids),
+                    global_channel_exceptions: normalizeChannelExceptions(
+                        s.global_channel_exceptions),
                 };
             });
         for (const s of nextSections) {
             operations.push({
                 type: "create_prompt_section",
-                fields: { prompt_id: s.prompt_id, start_frame: s.start_frame, end_frame: s.end_frame, channels: s.channels, muted: !!s.muted },
+                fields: {
+                    prompt_id: s.prompt_id, start_frame: s.start_frame, end_frame: s.end_frame,
+                    channels: s.channels, muted: !!s.muted,
+                    starts_new_shot: s.starts_new_shot, shot_timestamp: s.shot_timestamp,
+                    subject_ids: s.subject_ids,
+                    global_channel_exceptions: s.global_channel_exceptions,
+                },
             });
         }
         // Optionally grow the scene to fit the new sections (writing-mode
@@ -10063,11 +10418,22 @@ export class EditorWidget {
         const curDuration = sceneRef.duration_frames || this.totalFrames || 0;
         const nextDuration = Math.max(0, Math.round(extendDurationTo || 0));
         const willExtend = nextDuration > curDuration;
-        const sceneFields = { prompt: String(globalText ?? "") };
+        // Entries saved before global channels existed carry only the flat
+        // text; `prompt` is destructive server-side, which is the right
+        // restore for them. Newer entries re-split their channels the same way
+        // sections do.
+        const sceneFields = globalChannels
+            ? { global_channels: retargetChannels(globalChannels) }
+            : { prompt: String(globalText ?? "") };
         if (willExtend) sceneFields.duration_frames = nextDuration;
         operations.push({ type: "update_scene_fields", fields: sceneFields });
 
-        sceneRef.prompt = String(globalText ?? "");
+        if (sceneFields.global_channels) {
+            sceneRef.global_channels = normalizeChannels(sceneFields.global_channels);
+            sceneRef.prompt = composeSectionText(sceneRef.global_channels, false);
+        } else {
+            sceneRef.prompt = String(globalText ?? "");
+        }
         sceneRef.prompt_sections = [...nextSections].sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
         if (willExtend) {
             sceneRef.duration_frames = nextDuration;
@@ -10107,11 +10473,23 @@ export class EditorWidget {
             id: `pt-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`,
             name: trimmed,
             global: scene.prompt || "",
+            global_channels: { ...(scene.global_channels || {}) },
             source_fps: Math.max(0.001, Number(this._effectiveFps) || 24),
+            // Authoring channel template, stored for the same reason as
+            // source_fps: these templates are browser-local and CROSS-PROJECT,
+            // so one saved under a six-channel project can be applied to a
+            // three-channel one. normalizeChannels preserves every authored
+            // key, so the text survives the trip; this records what it meant.
+            source_channel_template: this._channelTemplate().id,
             sections: (scene.prompt_sections || []).map((s) => ({
                 start_frame: s.start_frame || 0,
                 end_frame: s.end_frame || 0,
                 channels: normalizeChannels(s.channels, s.prompt),
+                starts_new_shot: !!s.starts_new_shot,
+                shot_timestamp: s.shot_timestamp === true,
+                subject_ids: normalizeSubjectIds(s.subject_ids),
+                global_channel_exceptions: normalizeChannelExceptions(
+                    s.global_channel_exceptions),
             })),
         };
         this._updateSettings({ promptTemplates: [...this._getPromptTemplates(), template] });
@@ -10140,10 +10518,41 @@ export class EditorWidget {
         if (commit && pendingCommit) pendingCommit();
         const editorEl = this._promptEditorEl;
         this._promptEditorEl = null;
+        this._disconnectInlinePromptEditorObserver();
         if (editorEl) {
             editorEl.remove();
             this._refreshTimelineLayout();
         }
+    }
+
+    /** Keeps the timeline's chrome reservation honest for as long as an inline
+     *  bar is open. A bar's height is NOT knowable when it is inserted: its
+     *  textareas auto-grow on a 0ms timeout, and a six-field channel row wraps
+     *  to a second line only once the browser has laid it out. The synchronous
+     *  `_refreshTimelineLayout` at each mount therefore measures a pre-grow,
+     *  single-row bar, and the real one is clipped. Re-measuring on actual
+     *  height changes also covers re-wrapping when the window is resized. */
+    _observeInlinePromptEditor(editor) {
+        this._disconnectInlinePromptEditorObserver();
+        if (typeof ResizeObserver !== "function" || !editor) return;
+        let lastHeight = Math.round(editor.offsetHeight || 0);
+        const observer = new ResizeObserver(() => {
+            // Height-only, and only on a real change: `_recalcFullscreenHeights`
+            // can itself resize the bar, and an unguarded observer would loop.
+            const height = Math.round(editor.offsetHeight || 0);
+            if (height === lastHeight) return;
+            lastHeight = height;
+            if (this._promptEditorEl !== editor) return;
+            if (this.isFullscreen) this._recalcFullscreenHeights();
+        });
+        observer.observe(editor);
+        this._promptEditorResizeObserver = observer;
+    }
+
+    _disconnectInlinePromptEditorObserver() {
+        if (!this._promptEditorResizeObserver) return;
+        this._promptEditorResizeObserver.disconnect();
+        this._promptEditorResizeObserver = null;
     }
 
     async _updatePromptSection(idx, updates) {
@@ -11033,8 +11442,19 @@ export class EditorWidget {
         if (isGlobal) {
             tag = "Global";
             rangeText = "scene-wide";
-            const text = (this.activeScene?.prompt || "").trim();
-            lines = text ? [text] : ["(empty global prompt)"];
+            // Per-channel lines, the same shape the section branch below
+            // produces — this panel is 360px of readable full text, so the flat
+            // one-line lane label would read as an unlabelled blob directly
+            // above labelled sections. Over GLOBAL channels only, so a template
+            // with per-channel globals off shows the one channel it actually
+            // serves. The legacy mirror stays as the fallback for scenes whose
+            // channels were never populated.
+            lines = globalChannelLines(this.activeScene?.global_channels,
+                                       this._channelTemplate(), labelsOn);
+            if (!lines.length) {
+                const text = (this.activeScene?.prompt || "").trim();
+                lines = text ? [text] : ["(empty global prompt)"];
+            }
         } else {
             const section = hit.data;
             tag = "Prompt";
@@ -11046,11 +11466,15 @@ export class EditorWidget {
             rangeText = this._timecodeMode === "timecode"
                 ? `${this._frameToTimecode(start)}–${this._frameToTimecode(lastFrame)}`
                 : `f${start}–f${lastFrame}`;
-            const channels = normalizeChannels(section.channels, section.prompt);
+            const template = this._channelTemplate();
+            const channels = normalizeChannels(section.channels, section.prompt,
+                                               templateChannelKeys(template));
+            const showLabels = templateLabelsOn(template, labelsOn);
             lines = [];
-            for (const key of ["visual", "speech", "sounds"]) {
-                const text = (channels[key] || "").trim();
-                if (text) lines.push(labelsOn ? `[${key.toUpperCase()}]: ${text}` : text);
+            for (const entry of template.channels || []) {
+                const text = (channels[entry.key] || "").trim();
+                if (!text) continue;
+                lines.push(showLabels && entry.label ? `${entry.label} ${text}` : text);
             }
             if (!lines.length) lines = ["(empty section)"];
         }
@@ -14507,8 +14931,16 @@ export class EditorWidget {
                     prompt_id: s.prompt_id || "",
                     start_frame: s.start_frame,
                     end_frame: s.end_frame,
-                    channels: normalizeChannels(s.channels, s.prompt),
+                    channels: normalizeChannels(s.channels, s.prompt, this._channelKeys()),
                     muted: !!s.muted,
+                    // Shot grouping, subject bindings and the global opt-outs
+                    // are model-visible, so they must ride the frozen envelope
+                    // like the channels do.
+                    starts_new_shot: !!s.starts_new_shot,
+                    shot_timestamp: s.shot_timestamp === true,
+                    subject_ids: normalizeSubjectIds(s.subject_ids),
+                    global_channel_exceptions: normalizeChannelExceptions(
+                        s.global_channel_exceptions),
                     prompt: s.prompt || "",
                 });
             }
@@ -14519,7 +14951,8 @@ export class EditorWidget {
         // the response jobs, which replace the temp rows. A stale delimiter
         // stash is cosmetic only — never block enqueue on it.
         const displaySectionText = composeSectionsDisplayText(
-            promptSections, labelsOn, this._promptSectionDelimiter ?? ".");
+            promptSections, labelsOn, this._promptSectionDelimiter ?? ".",
+            this._channelTemplate());
         const prompt = [scenePrompt.trim(), displaySectionText].filter(Boolean).join(" ");
 
         const guideFrameSnapshots = [];
@@ -14626,6 +15059,9 @@ export class EditorWidget {
             selection_end: clampedEnd,
             prompt,
             scene_prompt: scenePrompt,
+            // Per-channel global text rides beside the flat mirror so a frozen
+            // job merges each global channel into its own field.
+            scene_global_channels: globalHidden ? {} : (this.activeScene.global_channels || {}),
             context_frames: Math.max(preContextFrames, postContextFrames),
             pre_context_frames: preContextFrames,
             post_context_frames: postContextFrames,
@@ -15490,6 +15926,11 @@ export class EditorWidget {
                 this._templateId = getTemplateById(data.template_id, this._settings).id;
                 // Project-durable channel-labels toggle (render-affecting; default off)
                 this._promptChannelLabels = data.metadata?.prompt_channel_labels === true;
+                // Project-durable channel template (render-affecting; the channel
+                // SET determines the served prompt, so it is never a browser
+                // preference). May be a preset id or a project-owned fork dict.
+                this._promptChannelTemplateRaw = data.metadata?.[PROJECT_TEMPLATE_KEY]
+                    ?? DEFAULT_CHANNEL_TEMPLATE_ID;
                 this._guideCollisionAutoOffset = data.metadata?.guide_collision_auto_offset !== false;
                 // Project-durable section-seam delimiter (render-affecting; default ".")
                 this._promptSectionDelimiter = String(data.metadata?.prompt_section_delimiter ?? ".");

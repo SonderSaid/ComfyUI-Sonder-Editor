@@ -3,7 +3,9 @@
 // always returns every value. This module only decides what LiteGraph DISPLAYS:
 // the effective r-block, plus the fixed outputs the lane recipe actually drives.
 // Three rules hold that safe:
-//   1. A connected slot is never removed, whatever the recipe says.
+//   1. A connected slot is never removed, whatever the recipe says. It is still
+//      marked — see rule 1 in reference_bridge_shape.js for why wiring answers a
+//      different question than liveness.
 //   2. An unresolved project shows everything — a slow project load must not
 //      look like a broken node.
 //   3. The backend fallback is untouched; hiding is presentation only.

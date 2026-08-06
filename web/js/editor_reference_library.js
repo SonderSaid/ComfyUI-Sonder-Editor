@@ -193,13 +193,13 @@ export function mountReferenceLibrary(container, host) {
         classSelect.addEventListener("change", () => { draft.reference_class = classSelect.value; });
         classWrap.appendChild(classSelect);
         editor.appendChild(classWrap);
-        const { wrap: notesLabel } = fieldShell("Notes", "Project-only authoring notes. Notes are not automatically inserted into prompts.");
-        const notes = el("textarea", "", `${css.input}min-height:72px;resize:vertical;line-height:1.45;`);
-        notes.setAttribute("aria-label", "Notes");
-        notes.value = draft.notes;
-        notes.addEventListener("input", () => { draft.notes = notes.value; });
-        notesLabel.appendChild(notes);
-        editor.appendChild(notesLabel);
+        const { wrap: descriptionLabel } = fieldShell("Description", "What this Reference is, in one line — so a crowded Library stays readable when the name alone is not enough. Project-only: nothing here is inserted into prompts. Per-member prompt text is what reaches the model.");
+        const description = el("textarea", "", `${css.input}min-height:56px;resize:vertical;line-height:1.45;`);
+        description.setAttribute("aria-label", "Description");
+        description.value = draft.description;
+        description.addEventListener("input", () => { draft.description = description.value; });
+        descriptionLabel.appendChild(description);
+        editor.appendChild(descriptionLabel);
         const row = el("div", "", "display:flex;gap:6px;margin:3px -10px -10px;padding:9px 10px;border-top:1px solid #303a43;background:#12181d;border-radius:0 0 8px 8px;");
         const save = el("button", "Save", `${css.button}background:#476d88;border-color:#668ca7;`);
         const cancel = el("button", "Cancel", css.button);
@@ -210,7 +210,7 @@ export function mountReferenceLibrary(container, host) {
             if (reference) {
                 const fields = {};
                 const expected = {};
-                for (const key of ["name", "kind", "reference_class", "notes"]) {
+                for (const key of ["name", "kind", "reference_class", "description"]) {
                     if (values[key] !== reference[key]) { fields[key] = values[key]; expected[key] = reference[key]; }
                 }
                 if (!Object.keys(fields).length) { state.entityDraft = null; render(); return; }
@@ -433,7 +433,7 @@ export function mountReferenceLibrary(container, host) {
                 remove.addEventListener("click", (event) => {
                     event.stopPropagation();
                     if (!host.confirm(`Delete “${reference.name}” and its ${reference.members?.length || 0} member(s)?`)) return;
-                    void perform([{ type: "delete_reference", reference_id: reference.reference_id, expected: { name: reference.name, kind: reference.kind, reference_class: reference.reference_class, notes: reference.notes, member_ids: (reference.members || []).map((member) => member.member_id) } }]);
+                    void perform([{ type: "delete_reference", reference_id: reference.reference_id, expected: { name: reference.name, kind: reference.kind, reference_class: reference.reference_class, description: reference.description || "", member_ids: (reference.members || []).map((member) => member.member_id) } }]);
                 });
                 topLine.append(edit, remove);
             }
@@ -443,7 +443,7 @@ export function mountReferenceLibrary(container, host) {
                 badges.appendChild(el("span", value, "padding:2px 5px;border:1px solid #34424d;border-radius:999px;color:#91a5b5;background:#11171c;font-size:9px;text-transform:capitalize;"));
             }
             header.appendChild(badges);
-            if (reference.notes) header.appendChild(el("div", reference.notes, "font-size:10px;line-height:1.35;color:#b7c0c8;white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;"));
+            if (reference.description) header.appendChild(el("div", reference.description, "font-size:10px;line-height:1.35;color:#b7c0c8;white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;"));
             const statuses = [];
             if (unresolved) statuses.push(`${unresolved} unresolved`);
             if (missingFiles) statuses.push(`${missingFiles} missing file${missingFiles === 1 ? "" : "s"}`);

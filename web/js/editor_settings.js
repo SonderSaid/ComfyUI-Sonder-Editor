@@ -754,6 +754,45 @@ function normalizePromptsSettings(stored, defaults) {
 // into scene state, so project truth never depends on this library.
 // NOTE: defined ABOVE the eager normalizeEditorSettings init (TDZ trap —
 // durable_rules.md > Technical Traps).
+
+// Channel bags are copied key-for-key and NEVER enumerated against a fixed set.
+// This normalizer runs on every settings load, so naming channels here silently
+// deletes stored text: a template saved under a six-field MiniMax project used
+// to survive `_savePromptTemplate` intact and then lose every field but
+// visual/speech/sounds on the next read — leaving the section boundaries and a
+// blank prompt. Prompt templates are cross-project by design, so this side has
+// no way to know which channel set is the "right" one, and must keep them all.
+function normalizeChannelBag(raw, legacyText = "", firstKeyFallback = "visual") {
+    const bag = {};
+    if (raw && typeof raw === "object") {
+        for (const [key, value] of Object.entries(raw)) {
+            if (typeof value === "string" || typeof value === "number") {
+                bag[key] = String(value);
+            }
+        }
+    }
+    const legacy = String(legacyText ?? "");
+    if (legacy && !Object.keys(bag).length) bag[firstKeyFallback] = legacy;
+    return bag;
+}
+
+function nullIfBlank(bag) {
+    return Object.values(bag).some((text) => String(text).trim()) ? bag : null;
+}
+
+function normalizeIdList(value) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set();
+    const ids = [];
+    for (const entry of value) {
+        const id = String(entry || "").trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        ids.push(id);
+    }
+    return ids;
+}
+
 function normalizePromptTemplates(templates) {
     if (!Array.isArray(templates)) return [];
     const normalized = [];
@@ -768,17 +807,27 @@ function normalizePromptTemplates(templates) {
                 .map((s) => ({
                     start_frame: Math.max(0, parseInt(s.start_frame, 10) || 0),
                     end_frame: Math.max(0, parseInt(s.end_frame, 10) || 0),
-                    channels: {
-                        visual: String(s.channels?.visual ?? s.prompt ?? ""),
-                        speech: String(s.channels?.speech ?? ""),
-                        sounds: String(s.channels?.sounds ?? ""),
-                    },
+                    channels: normalizeChannelBag(s.channels, s.prompt),
+                    starts_new_shot: s.starts_new_shot === true,
+                    shot_timestamp: s.shot_timestamp === true,
+                    subject_ids: normalizeIdList(s.subject_ids),
+                    global_channel_exceptions: normalizeIdList(
+                        s.global_channel_exceptions),
                 }))
             : [];
         normalized.push({
             id: String(raw.id || `prompt-template-${index}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`),
             name,
             global: String(raw.global ?? ""),
+            // Null rather than `{}` when nothing was authored: applying a
+            // channel bag MERGES server-side, so an empty bag would silently
+            // keep the target scene's global instead of replacing it. The null
+            // keeps those entries on the flat-text path, which does replace.
+            global_channels: nullIfBlank(normalizeChannelBag(raw.global_channels, raw.global)),
+            // Records which channel set the text was AUTHORED under, so applying
+            // it to a project on another template can collapse and re-split
+            // rather than dropping the fields the target does not name.
+            source_channel_template: String(raw.source_channel_template || ""),
             // New templates capture their authoring FPS so section endpoints
             // can preserve seconds when applied to a scene at another rate.
             // Legacy templates have no rate metadata and retain frame-exact
@@ -939,7 +988,10 @@ function normalizeRenderExportSettings(nextValue) {
     };
 }
 
-function normalizeEditorSettings(source = null) {
+// Exported for the settings round-trip tests: this is the single chokepoint
+// every stored value passes through on load, so it is where a normalizer that
+// drops data can be caught (see tests/test_prompt_template_settings_js.py).
+export function normalizeEditorSettings(source = null) {
     const stored = source && typeof source === "object" ? source : {};
     const legacyLayout = legacyLayoutSettings();
     const defaults = DEFAULT_EDITOR_SETTINGS;

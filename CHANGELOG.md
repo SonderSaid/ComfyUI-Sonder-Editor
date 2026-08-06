@@ -12,6 +12,45 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Prompt channels are now a project-wide template rather than a fixed three.
+  Pick one in Settings > Prompts: **Standard** (one plain channel), **Visual +
+  Speech + Sound** (the previous three, still the default), or **MiniMax H3** in
+  base and full-reference form. Each channel carries its own authoring guidance,
+  and a named-field template always writes its field names no matter how the
+  Channel Labels toggle is set. Switching asks first and says what it is about
+  to rewrite, across every scene.
+- Channel templates are editable. **Edit…** beside the picker opens the channel
+  keys, their headers, per-channel guidance, which field carries shot markers,
+  the label policy, the separators between fields, and whether the scene-global
+  prompt is per channel. Editing a built-in saves a project copy you own and
+  Reset puts the project back on a built-in; a channel-set change rewrites your
+  text the same reversible way a template switch does.
+- Prompt sections can open a new shot and stamp a cut time as fully independent
+  choices — either, both or neither. A section can read `At 00:07.000, he takes
+  out a gun` while continuing the same shot, and the first section is no longer
+  forced to open one. Timestamps are relative to the render window, so the same
+  section reads correctly whether you render the whole scene or one slice of it.
+- The scene-global prompt is per channel too, so a style opening can sit at the
+  head of the description rather than ahead of the whole prompt. Each prompt
+  section chooses which global channels it takes; a global channel is written
+  once, and only if some section in the render actually takes it. Templates that
+  turn per-channel globals off get a single global box instead, written ahead of
+  everything — and switching either way keeps the text.
+- The writing tool speaks channels. A line like `summary:` starts that channel
+  and `---` still splits sections, so a whole MiniMax-format model output can be
+  pasted in and arranges itself.
+- Switching channel templates now rewrites your text instead of hiding it. Text
+  in channels the new template does not use is collapsed into the first channel
+  under its old channel name, visible and movable; switching back puts it where
+  it was. The same applies when a saved prompt template was written under a
+  different channel set.
+- Library entries gained a one-line **Description** so a crowded Reference
+  Library stays readable when the name alone is not enough. It is project-only
+  and never enters a prompt — per-member prompt text is what reaches the model.
+- Reference prompt patterns gained `{subject_n}`, `{picture_n}`, `{audio_n}`
+  and `{speaker_n}`, which number the same entity identically on every lane —
+  an image lane and an audio lane staging one character agree. `{n}` keeps its
+  existing per-lane meaning.
 - Added scene-durable Reference lanes and scoped Reference items with drag/drop,
   range editing, hide/mute/lock, undoable exact mutations, hard media-kind
   enforcement, built-in and project-custom assembly recipes, and queue freezes.
@@ -65,8 +104,52 @@ a fresh `[Unreleased]` block.
   The lane panel uses the same wording, and nothing is marked without a
   selection.
 
+### Removed
+- Reference Library entries no longer carry **Notes**. Description replaced it —
+  the two overlapped, and neither had shipped. Existing note text is dropped.
+
 ### Fixed
 
+- **Apply in the prompt writing tool no longer erases the scene-global prompt.**
+  It rewrote sections correctly but handed the global text back through the flat
+  legacy field, which clears every channel past the first — so on a MiniMax or
+  custom channel set the whole global prompt vanished, and on the default set
+  the three channels were flattened into the first. Globals authored before this
+  fix and lost to it cannot be recovered.
+- The scene-global lane on the timeline shows its text again. The lane bar and
+  the hover preview read a legacy three-channel mirror, so any other channel set
+  drew "Global prompt (empty)" over text plainly visible in the inline editor.
+  The hover preview now lists the global text per channel, the way it already
+  did for prompt sections.
+- Reference Bridge outputs a recipe does not drive now read `(unused)` even when
+  something is plugged into them. `reference_frames` is wired in almost every
+  workflow, so it was the one output that could never show the mark — while
+  quietly feeding a black-frame fallback down that link.
+- Batching a scene with a Reference staged over part of the range no longer
+  reports it as a problem. The warning could not tell "this chunk is outside the
+  range you scoped" from "the Reference Threshold dropped a chunk this item does
+  cover", and blamed the threshold for both. Both are still announced, because
+  either one changes which sockets are wired mid-batch, but they now say which
+  happened and what to do about it — including when the item is simply muted or
+  its lane hidden.
+- A saved prompt template now comes back with all its text. A template saved
+  under a six-field MiniMax project used to reload with its section ranges
+  intact and every channel blank, because the browser-local settings normalizer
+  only knew the three original channel names. Templates saved before this fix
+  were emptied at rest and need re-saving.
+- Prompt boxes in the Prompt panel obey their drag-resize again, and the inline
+  prompt bar on the timeline no longer clips its lower half when a template with
+  many channels wraps it onto a second row.
+- Opening the inline prompt bar under a MiniMax template no longer throws while
+  trying to focus a channel that template does not have.
+- A queued job now keeps the channel-label setting it was queued with. Changing
+  the project toggle used to silently rewrite a pending job's prompt.
+- A Reference member with a prompt pattern but no prompt text no longer renders
+  a dangling clause like `<Subject 2> is the  from <Picture 2>`; it falls back
+  to the Reference's name rather than vanishing while its image still reaches
+  the model.
+- Deleting a Reference now also clears it from any prompt section that named it,
+  across every scene.
 - Reference item-bar tags are legible again.
 - A pegged Reference recipe value now displays what the render will use instead
   of the number it replaced, read-only, with its source beside it.

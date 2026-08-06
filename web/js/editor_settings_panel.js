@@ -301,6 +301,9 @@ function syncSettingsPanelControls() {
             radius: "6px",
         });
     }
+    if (controls.promptChannelTemplate && this._channelTemplate) {
+        controls.promptChannelTemplate.value = this._channelTemplate().id;
+    }
     if (controls.promptChannelLabels) controls.promptChannelLabels.checked = this._promptChannelLabels === true;
     if (controls.promptSectionDelimiter) controls.promptSectionDelimiter.value = String(this._promptSectionDelimiter ?? ".");
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
@@ -1435,11 +1438,52 @@ function showSettingsPanel() {
 
     const promptsSection = createSection(
         "Prompts",
-        "Prompt lane behavior. Channel labels, section delimiter, and boundary threshold are PROJECT-WIDE; the rest are browser-local preferences."
+        "Prompt lane behavior. Channel template, channel labels, section delimiter, and boundary threshold are PROJECT-WIDE; the rest are browser-local preferences."
     );
     // — Project-wide (host-owned versioned project PUTs, not settings writes).
     //   syncSettingsPanelControls only syncs settings-backed controls, so
     //   these read host getters directly at build time.
+    {
+        const templateControls = createRow(
+            promptsSection,
+            "Channel Template (project-wide)",
+            "The set of named prompt channels every section authors, and how they are labelled in the composed output. Named-field templates such as MiniMax H3 always emit their field names regardless of the Channel Labels toggle. Saved into the project."
+        );
+        const templateSelect = document.createElement("select");
+        templateSelect.style.cssText = chromeInputCss({ width: "200px", textAlign: "left" });
+        const options = this._promptChannelTemplateOptions?.() || [];
+        for (const option of options) {
+            const el = document.createElement("option");
+            el.value = option.id;
+            el.textContent = `${option.name} (${option.channelCount})`;
+            el.title = option.description || "";
+            templateSelect.appendChild(el);
+        }
+        templateSelect.value = this._channelTemplate?.().id || "sonder";
+        templateSelect.addEventListener("change", () => {
+            const requested = templateSelect.value;
+            Promise.resolve(this._setPromptChannelTemplate(requested))
+                // A refused or cancelled switch must not leave the picker
+                // showing a template the project is not actually using.
+                .then(() => { templateSelect.value = this._channelTemplate().id; })
+                .catch(() => { templateSelect.value = this._channelTemplate().id; });
+        });
+        templateSelect.addEventListener("keydown", (e) => e.stopPropagation());
+        templateControls.appendChild(templateSelect);
+        controls.promptChannelTemplate = templateSelect;
+
+        const editTemplateBtn = document.createElement("button");
+        editTemplateBtn.textContent = "Edit…";
+        editTemplateBtn.title = "Edit the channel keys, headers, guidance, shot-marker"
+            + " channel, separators and global-prompt behavior. Editing a built-in"
+            + " saves a project copy; Reset points the project back at a built-in.";
+        editTemplateBtn.style.cssText = chromeButtonCss({ fontSize: "11px", padding: "3px 8px" });
+        editTemplateBtn.addEventListener("click", () => {
+            this._openChannelTemplateEditor?.();
+        });
+        templateControls.appendChild(editTemplateBtn);
+        controls.promptChannelTemplateEdit = editTemplateBtn;
+    }
     createCheckbox(
         promptsSection,
         "promptChannelLabels",
@@ -1508,7 +1552,7 @@ function showSettingsPanel() {
         const referenceControls = createRow(
             promptsSection,
             "Reference Threshold % (project-wide)",
-            "Ignore a staged Reference item in a render window when the window only covers a small part of that item's own span (under N%). Unlike prompts this can leave a lane with no reference at all, so has_reference reports 0 for that window. 0 = off. Saved into the project."
+            "Ignore a staged Reference item in a render window when the window only covers a small part of that item's own span (under N%). Unlike prompts this can leave a lane with no reference at all, so has_reference reports 0 for that window. Batches warn when that changes mid-batch, naming whether the threshold or the staged range caused it. 0 = off. Saved into the project."
         );
         const referenceInput = document.createElement("input");
         referenceInput.type = "number";

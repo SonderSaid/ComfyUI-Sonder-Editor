@@ -17,7 +17,11 @@ import folder_paths
 
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server import external_links
-from ..server.timeline_state import ClipReference, GuideFrame, TimelineProject, Scene
+from ..server import prompt_channel_templates
+from ..server import prompt_payload
+from ..server.timeline_state import (
+    ClipReference, GuideFrame, TimelineProject, Scene, effective_scene_fps,
+)
 from ..server.guide_collision import resolve_execution_window, resolve_guide_collisions
 from ..server.media_helpers import (
     CROP_POSITIONS,
@@ -1253,18 +1257,27 @@ class SonderEditor:
                     prompt_threshold = float(proj_metadata.get("prompt_frame_threshold", 10.0) or 0.0)
                 except (TypeError, ValueError):
                     prompt_threshold = 10.0
+            # A frozen job's params win, so an un-composed snapshot still uses
+            # the channel template it was enqueued under.
+            prompt_template = prompt_channel_templates.resolve_channel_template(
+                proj_metadata, getattr(queue_job, "params", None) if queue_job else None)
+            # Shot timestamps need the EFFECTIVE rate: a scene inheriting
+            # project FPS stores 0.0, which would silently drop every stamp.
+            prompt_fps = effective_scene_fps(proj, scene)
             if queue_job:
                 prompt_text = getattr(queue_job, "prompt", "")
                 if snapshot_version <= 0 and not prompt_text:
                     prompt_text = scene.get_prompt_for_range(
                         render_start, render_end,
                         labels_on=prompt_labels_on, delimiter=prompt_delimiter,
-                        boundary_threshold_pct=prompt_threshold)
+                        boundary_threshold_pct=prompt_threshold,
+                        template=prompt_template, fps=prompt_fps)
             else:
                 prompt_text = scene.get_prompt_for_range(
                     render_start, render_end,
                     labels_on=prompt_labels_on, delimiter=prompt_delimiter,
-                    boundary_threshold_pct=prompt_threshold)
+                    boundary_threshold_pct=prompt_threshold,
+                    template=prompt_template, fps=prompt_fps)
 
             # --- Load audio from scene's audio tracks for the render range ---
             if audio_needed:

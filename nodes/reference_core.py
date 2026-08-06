@@ -137,6 +137,100 @@ def _source(project, scene) -> dict[str, Any]:
     }
 
 
+def _staged_entity_order(project, resolved_lanes) -> list:
+    """Every staged entity id, in lane, then item, then member order.
+
+    That staging order IS the numbering rule for `<Subject N>` — plan decision
+    8. Prompt sections do not participate: a section's `subject_ids` bindings
+    are durable but no longer feed composition, so seeding from them would make
+    the Bridge prompt sockets depend on prompt-lane state they cannot see.
+    """
+    order = []
+    seen = set()
+    for lane_value in resolved_lanes or []:
+        item = lane_value.get("item") if isinstance(lane_value, dict) else None
+        for record in _entity_records_for(project, item):
+            entity_id = str(getattr(record["reference"], "reference_id", "") or "")
+            if entity_id and entity_id not in seen:
+                seen.add(entity_id)
+                order.append(entity_id)
+    return order
+
+
+def _entity_records_for(project, item) -> list[dict[str, Any]]:
+    """(reference, member) pairs for a staged item, tolerating broken links.
+
+    Unlike `_member_records` this never raises: the registry is metadata that
+    rides the selector fingerprint, so a missing member must not turn a lane
+    the user is not even rendering into an execution failure.
+    """
+    if item is None:
+        return []
+    item_dict = item.to_dict() if hasattr(item, "to_dict") else dict(item or {})
+    lookup = {
+        str(member.member_id): (reference, member)
+        for reference in (getattr(project, "references", None) or [])
+        for member in (getattr(reference, "members", None) or [])
+    }
+    records = []
+    for member_ref in item_dict.get("members", []) or []:
+        member_id = str(member_ref.get("member_id", "") or "") if isinstance(member_ref, dict) else ""
+        resolved = lookup.get(member_id)
+        if resolved is not None:
+            records.append({"reference": resolved[0], "member": resolved[1]})
+    return records
+
+
+_VOICE_TAGS = ("sonder:voice_identity",)
+
+
+def build_reference_registry(project, resolved_lanes) -> dict[str, Any]:
+    """Project-scoped, cross-lane numbering for the four reference labels.
+
+    Four independent dense sequences, because MiniMax's own example pairs
+    `<Subject 3>` with `(S1)` — speakers are a different population, not a
+    renaming of subjects.
+    """
+    assets = {str(asset.asset_id): asset
+              for asset in (getattr(project, "assets", None) or [])}
+    subjects = {}
+    for entity_id in _staged_entity_order(project, resolved_lanes):
+        subjects[entity_id] = len(subjects) + 1
+
+    pictures, audios, speakers = {}, {}, {}
+    for lane_value in resolved_lanes or []:
+        item = lane_value.get("item") if isinstance(lane_value, dict) else None
+        for record in _entity_records_for(project, item):
+            member = record["member"]
+            member_id = str(getattr(member, "member_id", "") or "")
+            entity_id = str(getattr(record["reference"], "reference_id", "") or "")
+            asset = assets.get(str(getattr(member, "asset_id", "") or ""))
+            is_audio = str(getattr(asset, "asset_type", "") or "") == "audio"
+            if member_id and not is_audio and member_id not in pictures:
+                pictures[member_id] = len(pictures) + 1
+            if member_id and is_audio and member_id not in audios:
+                audios[member_id] = len(audios) + 1
+            tags = [str(tag) for tag in (getattr(member, "tags", None) or [])]
+            voices = is_audio and any(tag in _VOICE_TAGS for tag in tags)
+            if voices and entity_id and entity_id not in speakers:
+                speakers[entity_id] = len(speakers) + 1
+    return {"subjects": subjects, "pictures": pictures,
+            "audios": audios, "speakers": speakers}
+
+
+def registry_numbers_for(registry, reference, member) -> dict:
+    """The four project-scoped token values for one staged member."""
+    registry = registry if isinstance(registry, dict) else {}
+    entity_id = str(getattr(reference, "reference_id", "") or "")
+    member_id = str(getattr(member, "member_id", "") or "")
+    return {
+        "subject_n": (registry.get("subjects") or {}).get(entity_id, 0),
+        "picture_n": (registry.get("pictures") or {}).get(member_id, 0),
+        "audio_n": (registry.get("audios") or {}).get(member_id, 0),
+        "speaker_n": (registry.get("speakers") or {}).get(entity_id, 0),
+    }
+
+
 def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
     """Resolve one lane against the current execution window without decoding."""
 
@@ -154,6 +248,7 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
         *(end for end in explicit_item_ends if end >= 0),
     )
     selected = None
+    registry = {"subjects": {}, "pictures": {}, "audios": {}, "speakers": {}}
     if lane_index < source["lane_count"]:
         resolved = resolve_effective_references(
             reference_items=source["items"],
@@ -166,6 +261,10 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
         )
         lane_value = resolved[lane_index] if lane_index < len(resolved) else None
         selected = lane_value.get("item") if isinstance(lane_value, dict) else None
+        # Over ALL lanes, not just this one: resolve_effective_references
+        # already returns every lane, and the registry must be cross-lane so an
+        # image lane and an audio lane staging the same entity agree.
+        registry = build_reference_registry(project, resolved)
     recipe = source["recipes"][lane_index] if lane_index < len(source["recipes"]) else ReferenceLaneRecipe()
     item_dict = selected.to_dict() if hasattr(selected, "to_dict") else dict(selected or {})
     recipe_dict = recipe.to_dict() if hasattr(recipe, "to_dict") else dict(recipe or {})
@@ -184,6 +283,10 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
         # the same way whether it runs live or from a frozen job, and so they
         # land in the selector fingerprint.
         "pegs": {**source["pegs"], "window_frames": max(0, render_end - render_start)},
+        # Rides reference_fingerprint (which hashes the whole dict) and inherits
+        # the snapshot-vs-live split in _source, so it reaches _assemble_prompt
+        # and _member_prompts without a second resolution pass.
+        "registry": registry,
     }
 
 
@@ -407,7 +510,11 @@ def _grid_frame_count(hard: dict, minimum: int) -> int:
     return span if remainder == 0 else span + (step - remainder)
 
 
-def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str) -> str:
+PROJECT_SCOPED_PROMPT_TOKENS = ("{subject_n}", "{picture_n}", "{audio_n}", "{speaker_n}")
+
+
+def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str,
+                           registry_numbers: dict | None = None) -> str:
     """Expand one member's slice of the derived prompt.
 
     A pattern may use `{n}` (1-based), `{index}` (0-based), `{prompt}` and
@@ -416,24 +523,54 @@ def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str) -> 
     token. With no `{prompt}`/`{name}` placeholder the member text is appended
     after the expanded pattern, which is what the original `token: label` form
     did and is why existing recipes keep composing identically.
+
+    `{n}` stays LANE-LOCAL — the member's order within this item. The four
+    project-scoped tokens (`{subject_n}`, `{picture_n}`, `{audio_n}`,
+    `{speaker_n}`) come from the cross-lane registry instead, so the same
+    entity gets the same number on an image lane and an audio lane. They are
+    collision-free against `{n}` under both the Python `.replace` chain and the
+    JS `.split/.join` chain because each is a distinct whole token.
     """
     member_prompt = str(prompt or "").strip()
     entity_name = str(name or "").strip()
     label = member_prompt or entity_name
     if not pattern:
         return label
+    numbers = registry_numbers if isinstance(registry_numbers, dict) else {}
     expanded = (
-        pattern.replace("{n}", str(index + 1))
+        pattern.replace("{subject_n}", str(numbers.get("subject_n", 0) or 0))
+        .replace("{picture_n}", str(numbers.get("picture_n", 0) or 0))
+        .replace("{audio_n}", str(numbers.get("audio_n", 0) or 0))
+        .replace("{speaker_n}", str(numbers.get("speaker_n", 0) or 0))
+        .replace("{n}", str(index + 1))
         .replace("{index}", str(index))
         .replace("{prompt}", member_prompt)
         .replace("{name}", entity_name)
     )
     if "{prompt}" in pattern or "{name}" in pattern:
+        # An empty member prompt inside a `{prompt}` pattern used to leave a
+        # dangling clause ("<Subject 2> is the  from <Picture 2>") because the
+        # entity-name fallback only existed on the no-placeholder branch.
+        # Falling back to the name is required rather than dropping the
+        # fragment: omission would remove a staged member from the prompt while
+        # its image still reaches the model.
+        if not member_prompt and entity_name and "{prompt}" in pattern:
+            expanded = (
+                pattern.replace("{subject_n}", str(numbers.get("subject_n", 0) or 0))
+                .replace("{picture_n}", str(numbers.get("picture_n", 0) or 0))
+                .replace("{audio_n}", str(numbers.get("audio_n", 0) or 0))
+                .replace("{speaker_n}", str(numbers.get("speaker_n", 0) or 0))
+                .replace("{n}", str(index + 1))
+                .replace("{index}", str(index))
+                .replace("{prompt}", entity_name)
+                .replace("{name}", entity_name)
+            )
         return expanded.strip()
     return f"{expanded}: {label}" if label else expanded
 
 
-def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict) -> str:
+def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict,
+                     registry: dict | None = None) -> str:
     override = str(item.get("prompt_override", "") or "").strip()
     if override:
         return override
@@ -446,6 +583,7 @@ def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict) ->
             index,
             getattr(record["member"], "prompt", ""),
             getattr(record["reference"], "name", ""),
+            registry_numbers_for(registry, record["reference"], record["member"]),
         )
         if fragment:
             values.append(fragment)
@@ -454,7 +592,8 @@ def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict) ->
     return " ".join(value for value in (prefix, joined) if value)
 
 
-def _member_prompts(records: list[dict[str, Any]], recipe: dict) -> list[str]:
+def _member_prompts(records: list[dict[str, Any]], recipe: dict,
+                    registry: dict | None = None) -> list[str]:
     """Per-slot prompt text, one entry per staged member, for p01..p16."""
     soft = recipe.get("soft", {}) if isinstance(recipe.get("soft"), dict) else {}
     pattern = str(soft.get("prompt_tokens", "") or "")
@@ -463,6 +602,7 @@ def _member_prompts(records: list[dict[str, Any]], recipe: dict) -> list[str]:
             pattern, index,
             getattr(record["member"], "prompt", ""),
             getattr(record["reference"], "name", ""),
+            registry_numbers_for(registry, record["reference"], record["member"]),
         )
         for index, record in enumerate(records)
     ]
@@ -546,7 +686,8 @@ def decode_reference_set(reference_set) -> tuple:
     live = reference_live_outputs(hard)
     media_kind = "audio" if recipe_wrapper.get("media_kind") == "audio" else "image"
     names = ", ".join(str(getattr(record["reference"], "name", "") or "") for record in records)
-    prompt = _assemble_prompt(item, records, recipe)
+    prompt = _assemble_prompt(item, records, recipe,
+                              ref.get("registry") if isinstance(ref.get("registry"), dict) else None)
     local_index = max(0, _int(item.get("start_frame"), 0) - _int(ref.get("render_start"), 0))
     if media_kind == "audio":
         if len(records) != 1:
@@ -623,5 +764,8 @@ def decode_reference_set(reference_set) -> tuple:
         frames=frames, reference_index=reference_index, strength=1.0,
         prompt=prompt, names=names, context=context,
         slots=member_tensors[:MAX_REFERENCE_SLOTS],
-        slot_prompts=_member_prompts(records, recipe)[:MAX_REFERENCE_SLOTS],
+        slot_prompts=_member_prompts(
+            records, recipe,
+            ref.get("registry") if isinstance(ref.get("registry"), dict) else None,
+        )[:MAX_REFERENCE_SLOTS],
     )

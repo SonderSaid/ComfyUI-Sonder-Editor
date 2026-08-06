@@ -35,20 +35,38 @@ export function referenceLiveOutputs(hard) {
  * the member text is appended after the expanded pattern, preserving the
  * original `token: label` behaviour.
  */
-export function memberPromptFragment(pattern, index, prompt, name) {
+export const PROJECT_SCOPED_PROMPT_TOKENS = Object.freeze([
+    "{subject_n}", "{picture_n}", "{audio_n}", "{speaker_n}",
+]);
+
+export function memberPromptFragment(pattern, index, prompt, name, registryNumbers = null) {
     const memberPrompt = String(prompt || "").trim();
     const entityName = String(name || "").trim();
     const label = memberPrompt || entityName;
     if (!pattern) return label;
+    const numbers = registryNumbers && typeof registryNumbers === "object" ? registryNumbers : {};
     // split/join, not String.replace: a string-literal replace substitutes only
     // the first occurrence, while Python's str.replace substitutes every one.
-    const expanded = String(pattern)
+    // `{n}` stays lane-local; the four project-scoped tokens come from the
+    // cross-lane registry so one entity numbers the same on every lane.
+    const expand = (promptValue) => String(pattern)
+        .split("{subject_n}").join(String(numbers.subject_n || 0))
+        .split("{picture_n}").join(String(numbers.picture_n || 0))
+        .split("{audio_n}").join(String(numbers.audio_n || 0))
+        .split("{speaker_n}").join(String(numbers.speaker_n || 0))
         .split("{n}").join(String(index + 1))
         .split("{index}").join(String(index))
-        .split("{prompt}").join(memberPrompt)
+        .split("{prompt}").join(promptValue)
         .split("{name}").join(entityName);
-    if (pattern.includes("{prompt}") || pattern.includes("{name}")) return expanded.trim();
-    return label ? `${expanded}: ${label}` : expanded;
+    if (pattern.includes("{prompt}") || pattern.includes("{name}")) {
+        // An empty member prompt inside a `{prompt}` pattern would otherwise
+        // leave a dangling clause; fall back to the entity name rather than
+        // dropping the fragment, which would hide a member whose image still
+        // reaches the model.
+        const useName = !memberPrompt && entityName && pattern.includes("{prompt}");
+        return expand(useName ? entityName : memberPrompt).trim();
+    }
+    return label ? `${expand(memberPrompt)}: ${label}` : expand(memberPrompt);
 }
 
 export function deriveReferencePrompt({ promptOverride = "", members = [], soft = {} } = {}) {
@@ -169,6 +187,93 @@ export function resolveReferenceVerdicts({
         }
     });
     return { winners, verdicts };
+}
+
+/**
+ * The lane an item belongs to, normalized exactly as the scorer does.
+ *
+ * Export rather than re-spell: `(item.lane_index || 0)` and a raw read both
+ * disagree with the scorer for `undefined`, `"2"` and `1.7`, which the scorer
+ * reads as lanes 0, 2 and 1. Any caller bucketing items by lane must agree with
+ * the function that decided the verdicts, or a resolved lane reads unresolved.
+ */
+export function referenceLaneIndex(item) {
+    return integer(item?.lane_index, 0);
+}
+
+/** Why a lane failed to resolve for one chunk, most actionable first. */
+export const REFERENCE_LANE_CAUSE = Object.freeze({
+    BELOW_THRESHOLD: "below_threshold",
+    OUTSIDE: "outside",
+    EXCLUDED: "excluded",
+});
+
+/**
+ * Per-lane outcome across a batch's chunks, with the CAUSE of each failure.
+ *
+ * `resolveEffectiveReferences` answers "did this lane resolve" and throws the
+ * reason away, so a caller reading it cannot tell a deliberately scoped item
+ * (never overlapped this chunk) from one the frame threshold dropped. Both flip
+ * `has_reference` 1->0 and both matter, but they need different words and a
+ * different urgency, and only one of them is fixed by touching a setting.
+ *
+ * Cause precedence per chunk: BELOW_THRESHOLD dominates, because it is the only
+ * one where the item DID overlap the chunk and a setting is what dropped it.
+ * EXCLUDED (muted item / hidden lane) is window-independent, so it can only ever
+ * apply to every chunk at once — it never produces a flip.
+ *
+ * @returns {Array<{laneIndex, staged, resolved, causeCounts, dominantCause}>}
+ */
+export function classifyReferenceChunks(chunks = [], options = {}) {
+    const { referenceItems = [], laneCount = 1 } = options;
+    const count = Math.max(1, integer(laneCount, 1));
+    const items = Array.isArray(referenceItems) ? referenceItems : [];
+    const windows = Array.isArray(chunks) ? chunks : [];
+    const lanes = Array.from({ length: count }, (_, laneIndex) => ({
+        laneIndex,
+        staged: items.some((item) => referenceLaneIndex(item) === laneIndex),
+        resolved: 0,
+        causeCounts: {
+            [REFERENCE_LANE_CAUSE.BELOW_THRESHOLD]: 0,
+            [REFERENCE_LANE_CAUSE.OUTSIDE]: 0,
+            [REFERENCE_LANE_CAUSE.EXCLUDED]: 0,
+        },
+        dominantCause: null,
+    }));
+
+    for (const chunk of windows) {
+        const { winners, verdicts } = resolveReferenceVerdicts({
+            ...options,
+            windowStart: chunk?.start,
+            windowEnd: chunk?.end,
+        });
+        const seen = lanes.map(() => new Set());
+        verdicts.forEach((verdict, itemIndex) => {
+            const laneIndex = referenceLaneIndex(items[itemIndex]);
+            if (laneIndex < 0 || laneIndex >= count) return;
+            seen[laneIndex].add(verdict);
+        });
+        for (const lane of lanes) {
+            if (!lane.staged) continue;
+            if (winners[lane.laneIndex]) { lane.resolved += 1; continue; }
+            const reasons = seen[lane.laneIndex];
+            const cause = reasons.has(REFERENCE_VERDICT.BELOW_THRESHOLD)
+                ? REFERENCE_LANE_CAUSE.BELOW_THRESHOLD
+                : reasons.has(REFERENCE_VERDICT.OUTSIDE)
+                    ? REFERENCE_LANE_CAUSE.OUTSIDE
+                    : REFERENCE_LANE_CAUSE.EXCLUDED;
+            lane.causeCounts[cause] += 1;
+        }
+    }
+    for (const lane of lanes) {
+        const ranked = [
+            REFERENCE_LANE_CAUSE.BELOW_THRESHOLD,
+            REFERENCE_LANE_CAUSE.OUTSIDE,
+            REFERENCE_LANE_CAUSE.EXCLUDED,
+        ].filter((cause) => lane.causeCounts[cause] > 0);
+        lane.dominantCause = ranked[0] || null;
+    }
+    return lanes;
 }
 
 /**

@@ -1158,7 +1158,11 @@ export function _drawClips(host, ctx, width) {
         }
 
         // Global prompt lane — one full-width non-draggable item showing the
-        // scene-global prompt text (Scene.prompt)
+        // scene-global prompt text. Composed against the ACTIVE template's
+        // GLOBAL channels, not the stored `Scene.prompt` mirror: that mirror is
+        // derived without a template, so it is empty for every non-legacy
+        // channel set and the lane read "(empty)" over text plainly present in
+        // the inline editor. Same treatment the section lane already gets below.
         const gpi = host._globalPromptLayoutIdx();
         if (gpi >= 0 && !host._trackLayout[gpi].collapsed) {
             const globalY = host._trackY(gpi);
@@ -1167,7 +1171,9 @@ export function _drawClips(host, ctx, width) {
             const gx1 = host._frameToX(0);
             const gx2 = host._frameToX(host.totalFrames || host.activeScene.duration_frames || 0);
             if (gx2 >= 0 && gx1 <= width) {
-                const globalText = String(host.activeScene.prompt || "");
+                const globalText = String(host._promptGlobalBarLabel
+                    ? host._promptGlobalBarLabel()
+                    : (host.activeScene.prompt || ""));
                 const isSelected = host._isSelected("prompt_global", 0);
                 ctx.globalAlpha = globalHidden ? 0.42 : 1.0;
                 ctx.fillStyle = isSelected ? COLORS.promptSectionSelected : COLORS.promptSection;
@@ -1225,8 +1231,15 @@ export function _drawClips(host, ctx, width) {
                 ctx.lineWidth = isSelected ? 1.5 : 1;
                 ctx.strokeRect(x1 + 1, promptY + 2, x2 - x1 - 2, promptH - 4);
 
-                // Prompt text label (truncated)
-                if (section.prompt && (x2 - x1) > 20) {
+                // Prompt text label (truncated). The stored `prompt` mirror is
+                // label-free over the LEGACY three channels only, so a section
+                // whose text lives in channels 4-6 would draw an empty bar —
+                // compose against the active template instead, falling back to
+                // the mirror when the host has no template resolver.
+                const sectionLabel = host._promptSectionBarLabel
+                    ? host._promptSectionBarLabel(section)
+                    : (section.prompt || "");
+                if (sectionLabel && (x2 - x1) > 20) {
                     ctx.fillStyle = COLORS.text;
                     ctx.font = host._canvasSansFont(Math.round(9 * host._scaleTimeline), 500);
                     ctx.textAlign = "left";
@@ -1234,7 +1247,7 @@ export function _drawClips(host, ctx, width) {
                     ctx.beginPath();
                     ctx.rect(x1 + 3, promptY + 2, x2 - x1 - 6, promptH - 4);
                     ctx.clip();
-                    ctx.fillText(section.prompt, x1 + Math.round(9 * host._scaleTimeline), promptY + promptH / 2 + Math.round(3 * host._scaleTimeline));
+                    ctx.fillText(sectionLabel, x1 + Math.round(9 * host._scaleTimeline), promptY + promptH / 2 + Math.round(3 * host._scaleTimeline));
                     ctx.restore();
                 }
                 ctx.globalAlpha = 1.0;

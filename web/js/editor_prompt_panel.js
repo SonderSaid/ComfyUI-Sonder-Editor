@@ -35,7 +35,14 @@ import {
     register as registerKeyboardConsumer,
     PRIORITY as KEY_PRIORITY,
 } from "./keyboard_ownership.js";
-import { composeSectionText, normalizeChannels } from "./prompt_composition.js";
+import {
+    composeSectionText,
+    joinChannelHeaders,
+    normalizeChannels,
+    sectionInheritsGlobal,
+    splitChannelHeaders,
+} from "./prompt_composition.js";
+import { globalChannelKeys, templateChannelKeys } from "./prompt_channel_templates.js";
 import { notifySuccess, notifyWarning } from "./editor_notifications.js";
 
 const WRITING_BREAK = "---";
@@ -110,6 +117,11 @@ function smallInput({ value = "", placeholder = "", width = "", numeric = false 
 // OVERLAY consumer, not here. Native `resize` is OFF — the corner grip
 // disappears under the scrollbar once content overflows, so each box kind
 // gets an explicit drag grip (makeHeightGrip) below it instead.
+//
+// `flex: 0 0 auto` is load-bearing, not tidiness: every box now sits in a
+// column-flex wrapper, where `flex: 1` resolves to `flex-basis: 0%` on the
+// VERTICAL axis and silently overrides the height the grip writes. The box must
+// own its height for resizing to work at all.
 function promptBox(host, { value = "", placeholder = "", heightKey = "", title = "", defaultHeight = 56 } = {}) {
     const area = document.createElement("textarea");
     area.value = value;
@@ -118,7 +130,7 @@ function promptBox(host, { value = "", placeholder = "", heightKey = "", title =
         ? `${title} — Enter or clicking away commits, Shift+Enter inserts a newline, Esc discards`
         : "Enter or clicking away commits, Shift+Enter inserts a newline, Esc discards";
     const persisted = heightKey ? (host._settings?.prompts?.[heightKey] || 0) : 0;
-    area.style.cssText = `${chromeInputCss({ padding: "4px 6px" })}; flex:1; min-width:40px; resize: none; line-height: 1.4; min-height: 28px; height: ${persisted > 0 ? `${persisted}px` : `${defaultHeight}px`}; overflow-y: auto;`;
+    area.style.cssText = `${chromeInputCss({ padding: "4px 6px" })}; flex:0 0 auto; min-width:0; resize: none; line-height: 1.4; min-height: 28px; height: ${persisted > 0 ? `${persisted}px` : `${defaultHeight}px`}; overflow-y: auto;`;
     area.dataset.sonderPromptBox = "1";
     if (heightKey) area.dataset.sonderBoxKind = heightKey;
     return area;
@@ -231,10 +243,17 @@ export function mountPromptManagementPanel(host) {
     // updates cannot delete map keys, so clearing stores an empty entry).
     const writingState = { key: "", draft: "", allocations: [] };
     const writingDraftKey = () => `${host._projectDirName?.() || ""}::${host.activeSceneId || ""}`;
+    // Writing mode is one flat text, and `key:` headers are what let it carry
+    // every channel rather than just one. `---` still splits sections; headers
+    // split channels within a section. A whole MiniMax-format model output
+    // therefore pastes in and arranges itself.
     const reconstructDraftFromSections = () => {
         const sections = host.activeScene?.prompt_sections || [];
+        const template = host._channelTemplate();
+        const keys = templateChannelKeys(template);
         writingState.draft = sections
-            .map((s) => composeSectionText(normalizeChannels(s.channels, s.prompt), false))
+            .map((s) => joinChannelHeaders(
+                normalizeChannels(s.channels, s.prompt, keys), template))
             .join(`\n${WRITING_BREAK}\n`);
         writingState.allocations = sections.map((s) => ({
             length: Math.max(1, (s.end_frame || 0) - (s.start_frame || 0)),
@@ -319,7 +338,7 @@ export function mountPromptManagementPanel(host) {
         bodyEl.appendChild(sectionTitle("Writing Mode — narrative draft"));
         const hint = document.createElement("div");
         hint.style.cssText = `font-size:10px; color:${COLORS.textDim};`;
-        hint.textContent = `Write freely; a line containing only ${WRITING_BREAK} splits sections. Apply replaces the lane's sections (undoable; all text lands in the Visual channel).`;
+        hint.textContent = `Write freely; a line containing only ${WRITING_BREAK} splits sections, and a line like "${templateChannelKeys(host._channelTemplate())[0]}:" starts that channel. Unlabelled text goes to the first channel. Apply replaces the lane's sections (undoable).`;
         bodyEl.appendChild(hint);
 
         const draftArea = promptBox(host, {
@@ -330,9 +349,6 @@ export function mountPromptManagementPanel(host) {
             defaultHeight: 160,
         });
         draftArea.style.minHeight = "120px";
-        // In the column-flex body, flex:1 would fight manual height — the
-        // draft box must own its height for the grip to work
-        draftArea.style.flex = "0 0 auto";
         registerPromptBoxGuard(draftArea, () => writingState.draft);
         let draftTimer = null;
         draftArea.addEventListener("input", () => {
@@ -460,18 +476,29 @@ export function mountPromptManagementPanel(host) {
             let cursor = 0;
             const sections = blocks.map((text, i) => {
                 const length = Math.max(minLen, writingState.allocations[i]?.length ?? minLen);
+                const channels = splitChannelHeaders(text, host._channelTemplate());
                 const section = {
                     start_frame: cursor,
                     end_frame: cursor + length,
-                    channels: { visual: text, speech: "", sounds: "" },
+                    channels,
                 };
                 cursor += length;
                 return section;
             });
             const sceneDur = host.activeScene?.duration_frames || host.totalFrames || 0;
             const extendDurationTo = cursor > sceneDur ? cursor : 0;
+            // The writing tool rewrites SECTIONS only, so the scene-global text
+            // has to be handed back untouched. Passing just `global` is not that:
+            // it is the label-free mirror over the LEGACY three channels, so it
+            // reads empty on any other template, and the flat field is
+            // destructive server-side (`Scene.set_global_prompt` clears channels
+            // 2..n). Apply would silently erase the whole global bag. Carry the
+            // channels themselves, tagged with the template they were authored
+            // under so no retarget is attempted.
             await host._applyPromptSetup({
                 global: host.activeScene?.prompt || "",
+                global_channels: { ...(host.activeScene?.global_channels || {}) },
+                source_channel_template: host._channelTemplate().id,
                 sections,
                 extendDurationTo,
             });
@@ -500,30 +527,58 @@ export function mountPromptManagementPanel(host) {
 
         // ── Global prompt (auto-commits on Enter/blur; no Save button) ─
         body.appendChild(sectionTitle(`Global Prompt (always-on)${globalLocked ? " — locked" : ""}`));
+        // The global prompt is per channel too: under a named-field template a
+        // single blob has nowhere correct to go, and MiniMax wants its style
+        // opening at the head of the description rather than ahead of the first
+        // field name. Which sections take each channel is a per-SECTION choice,
+        // shown on the section cards below.
+        const globalTemplate = host._channelTemplate();
+        // One box per channel, or a single box when the template turns
+        // per-channel globals off.
+        const globalKeys = globalChannelKeys(globalTemplate);
+        const globalChannels = normalizeChannels(
+            scene.global_channels, scene.prompt, globalKeys);
         const globalRow = document.createElement("div");
-        globalRow.style.cssText = "display:flex; gap:6px; align-items:flex-start;";
-        const globalInput = promptBox(host, {
-            value: scene.prompt || "",
-            placeholder: "Scene-global prompt (style, identity, location)…",
-            heightKey: "panelGlobalBoxHeight",
-            title: "Global prompt — auto-commits on Enter or focus loss",
-        });
-        globalInput.disabled = globalLocked;
-        registerPromptBoxGuard(globalInput, () => host.activeScene?.prompt || "");
-        const commitGlobal = async () => {
-            if (globalLocked || guard.suppressBlurCommit) return;
-            if (globalInput.value === (host.activeScene?.prompt || "")) return;
-            await host._updateScenePrompt(globalInput.value);
-        };
-        globalInput.addEventListener("keydown", (e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                commitGlobal().catch(() => {});
-            }
-            e.stopPropagation();
-        });
-        globalInput.addEventListener("blur", () => { commitGlobal().catch(() => {}); });
-        globalRow.append(globalInput);
+        globalRow.style.cssText = `
+            display:grid; gap:6px; align-items:start;
+            grid-template-columns: ${globalKeys.map(() => "1fr").join(" ")};
+        `;
+        for (const key of globalKeys) {
+            const channel = (globalTemplate.channels || []).find((c) => c.key === key) || { key };
+            const column = document.createElement("div");
+            column.style.cssText = "display:flex; flex-direction:column; gap:2px; min-width:0;";
+            // Which sections take this text is decided per section now, so the
+            // global row is text only.
+            const head = document.createElement("div");
+            head.style.cssText = `font-size:9px; color:${COLORS.textDim}; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;`;
+            head.textContent = key;
+            head.title = channel.description
+                || `Global ${key}. Each section chooses whether to take it.`;
+
+            const input = promptBox(host, {
+                value: globalChannels[key] || "",
+                placeholder: `Global ${key}…`,
+                heightKey: "panelGlobalBoxHeight",
+                title: channel.description || `Global ${key}`,
+            });
+            input.disabled = globalLocked;
+            registerPromptBoxGuard(input, () => globalChannels[key] || "");
+            const commitGlobal = async () => {
+                if (globalLocked || guard.suppressBlurCommit) return;
+                if (input.value === (globalChannels[key] || "")) return;
+                await host._updateSceneGlobalChannels({ [key]: input.value });
+            };
+            input.addEventListener("keydown", (e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    commitGlobal().catch(() => {});
+                }
+                e.stopPropagation();
+            });
+            input.addEventListener("blur", () => { commitGlobal().catch(() => {}); });
+            column.append(head, input);
+            globalRow.appendChild(column);
+        }
         body.appendChild(globalRow);
         body.appendChild(makeHeightGrip(host, body, "panelGlobalBoxHeight", { label: "Drag to resize the global prompt box (persists)" }));
 
@@ -580,23 +635,63 @@ export function mountPromptManagementPanel(host) {
             list.appendChild(empty);
         }
         sections.forEach((section, idx) => {
+            const template = host._channelTemplate();
+            const channelKeys = templateChannelKeys(template);
+            // The shot toggle only exists for templates that actually place
+            // shot markers; showing it otherwise is a control that does nothing.
+            const showsShotToggle = !!template.shot_marker_channel;
+
+            // Two rows, not one. Sharing a single grid row with the range
+            // inputs and four fixed-width buttons squeezed six channels to
+            // ~40px each — one character per line. The channels now own a
+            // full-width row of their own beneath the controls.
+            const card = document.createElement("div");
+            card.style.cssText = `
+                display:flex; flex-direction:column; gap:6px; padding:6px 8px;
+                background:${COLORS.panel}; border:1px solid ${COLORS.promptBorder}; border-radius:4px;
+            `;
             const row = document.createElement("div");
             row.style.cssText = `
-                display:grid; grid-template-columns: 58px 58px 2fr 1.2fr 1.2fr auto auto auto auto;
-                gap:6px; align-items:start; padding:6px 8px;
-                background:${COLORS.panel}; border:1px solid ${COLORS.promptBorder}; border-radius:4px;
+                display:grid; grid-template-columns: 58px 58px 1fr${showsShotToggle ? " auto auto" : ""} auto auto auto auto;
+                gap:6px; align-items:center;
+            `;
+            // The body field takes twice the width of the rest; at one channel
+            // it simply fills the row.
+            const wideKey = template.shot_marker_channel || channelKeys[0];
+            const channelRow = document.createElement("div");
+            channelRow.style.cssText = `
+                display:grid; gap:6px; align-items:start;
+                grid-template-columns: ${channelKeys.map((key) => (key === wideKey ? "2fr" : "1fr")).join(" ")};
             `;
             const startInput = smallInput({ value: String(section.start_frame ?? 0), numeric: true, width: "100%" });
             const endInput = smallInput({ value: String(section.end_frame ?? 0), numeric: true, width: "100%" });
             startInput.title = "Start frame";
             endInput.title = "End frame (exclusive)";
-            const channels = normalizeChannels(section.channels, section.prompt);
-            const visualInput = promptBox(host, { value: channels.visual, placeholder: "Visual…", heightKey: "panelChannelBoxHeight", title: "Visual channel" });
-            const speechInput = promptBox(host, { value: channels.speech, placeholder: "Speech…", heightKey: "panelChannelBoxHeight", title: "Speech channel" });
-            const soundsInput = promptBox(host, { value: channels.sounds, placeholder: "Sounds…", heightKey: "panelChannelBoxHeight", title: "Sounds channel" });
-            registerPromptBoxGuard(visualInput, () => channels.visual);
-            registerPromptBoxGuard(speechInput, () => channels.speech);
-            registerPromptBoxGuard(soundsInput, () => channels.sounds);
+            const channels = normalizeChannels(section.channels, section.prompt, channelKeys);
+            const channelInputs = {};
+            for (const channel of template.channels || []) {
+                const key = channel.key;
+                const column = document.createElement("div");
+                column.style.cssText = "display:flex; flex-direction:column; gap:2px; min-width:0;";
+                // A standing label, not just a placeholder: the placeholder
+                // disappears once a box has text, which is precisely when a
+                // six-channel row most needs to say which field is which.
+                const caption = document.createElement("div");
+                caption.style.cssText = `font-size:9px; color:${COLORS.textDim}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;`;
+                caption.textContent = key;
+                caption.title = channel.description || `${key} channel`;
+                const input = promptBox(host, {
+                    value: channels[key] || "",
+                    placeholder: host._channelPlaceholder(key),
+                    heightKey: "panelChannelBoxHeight",
+                    // The template's own authoring guidance is the tooltip.
+                    title: channel.description || `${key} channel`,
+                });
+                registerPromptBoxGuard(input, () => channels[key] || "");
+                channelInputs[key] = input;
+                column.append(caption, input);
+                channelRow.appendChild(column);
+            }
 
             const commitRange = async () => {
                 if (guard.suppressBlurCommit) return;
@@ -612,12 +707,11 @@ export function mountPromptManagementPanel(host) {
             };
             const commitChannels = async () => {
                 if (guard.suppressBlurCommit) return;
-                const next = {
-                    visual: visualInput.value.trim(),
-                    speech: speechInput.value.trim(),
-                    sounds: soundsInput.value.trim(),
-                };
-                if (next.visual === channels.visual && next.speech === channels.speech && next.sounds === channels.sounds) return;
+                const next = {};
+                for (const key of channelKeys) {
+                    next[key] = channelInputs[key].value.trim();
+                }
+                if (Object.keys(next).every((key) => next[key] === (channels[key] ?? ""))) return;
                 await host._updatePromptSection(idx, { channels: next });
                 render();
             };
@@ -632,7 +726,11 @@ export function mountPromptManagementPanel(host) {
                 input.addEventListener("blur", () => commit().catch(() => render()));
             };
             for (const el of [startInput, endInput]) { el.disabled = sectionsLocked; onEnterBlur(el, commitRange); }
-            for (const el of [visualInput, speechInput, soundsInput]) { el.disabled = sectionsLocked; onEnterBlur(el, commitChannels); }
+            for (const key of channelKeys) {
+                const el = channelInputs[key];
+                el.disabled = sectionsLocked;
+                onEnterBlur(el, commitChannels);
+            }
 
             const selectBtn = makeBtn("Select", "Set selection to this section");
             selectBtn.addEventListener("click", () => {
@@ -656,8 +754,87 @@ export function mountPromptManagementPanel(host) {
                 render();
             });
 
-            row.append(startInput, endInput, visualInput, speechInput, soundsInput, selectBtn, queueBtn, addAfterBtn, deleteBtn);
-            list.appendChild(row);
+            // Opening a shot and stamping its cut time are separate choices.
+            const shotToggle = (label, title, checked, disabled, field) => {
+                const wrap = document.createElement("label");
+                wrap.style.cssText = `display:flex; align-items:center; gap:4px; font-size:10px; color:${COLORS.textDim}; white-space:nowrap;${disabled ? " opacity:0.45;" : ""}`;
+                wrap.title = title;
+                const box = document.createElement("input");
+                box.type = "checkbox";
+                box.checked = checked;
+                box.disabled = disabled;
+                box.addEventListener("keydown", (e) => e.stopPropagation());
+                box.addEventListener("change", () => {
+                    host._updatePromptSection(idx, { [field]: box.checked })
+                        .then(() => render())
+                        .catch(() => render());
+                });
+                const text = document.createElement("span");
+                text.textContent = label;
+                wrap.append(box, text);
+                return wrap;
+            };
+            const shotControls = [];
+            if (showsShotToggle) {
+                shotControls.push(shotToggle(
+                    "New shot",
+                    "Open a new shot at this section. Shots are numbered densely over the sections a render window actually uses.",
+                    !!section.starts_new_shot, sectionsLocked, "starts_new_shot"));
+                shotControls.push(shotToggle(
+                    "Cut time",
+                    // Independent of New shot: a section can stamp a cut time
+                    // while continuing the current shot.
+                    "Stamp this section with its cut time inside the render window. Independent of New shot — either, both or neither is valid.",
+                    section.shot_timestamp === true,
+                    sectionsLocked, "shot_timestamp"));
+            }
+            // The 1fr spacer keeps the buttons right-aligned now that the
+            // channels no longer occupy the middle of the controls row.
+            const spacer = document.createElement("div");
+            row.append(startInput, endInput, spacer,
+                       ...shotControls,
+                       selectBtn, queueBtn, addAfterBtn, deleteBtn);
+            card.append(row, channelRow);
+
+            // Which scene-global channels this section takes. One checkbox per
+            // global channel, so a template with global channels off shows
+            // exactly one. Only channels that actually carry text are offered —
+            // a checkbox for an empty global does nothing either way.
+            const inheritKeys = globalKeys.filter((key) => (globalChannels[key] || "").trim());
+            if (inheritKeys.length) {
+                const inheritRow = document.createElement("div");
+                inheritRow.style.cssText = `display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:9px; color:${COLORS.textDim};`;
+                const lead = document.createElement("span");
+                lead.textContent = inheritKeys.length > 1 ? "Takes global:" : "Takes global";
+                lead.title = "Scene-global text this section takes. Unticked, the"
+                    + " global text is dropped from any render that only covers"
+                    + " sections which opted out.";
+                inheritRow.appendChild(lead);
+                for (const key of inheritKeys) {
+                    const wrap = document.createElement("label");
+                    wrap.style.cssText = `display:flex; align-items:center; gap:3px;${sectionsLocked ? " opacity:0.45;" : ""}`;
+                    wrap.title = `Take the scene-global ${key} in this section.`;
+                    const box = document.createElement("input");
+                    box.type = "checkbox";
+                    box.checked = sectionInheritsGlobal(section, key);
+                    box.disabled = sectionsLocked;
+                    box.addEventListener("keydown", (e) => e.stopPropagation());
+                    box.addEventListener("change", () => {
+                        host._setSectionGlobalInherit(idx, key, box.checked)
+                            .then(() => render())
+                            .catch(() => render());
+                    });
+                    wrap.append(box);
+                    if (inheritKeys.length > 1) {
+                        const text = document.createElement("span");
+                        text.textContent = key;
+                        wrap.append(text);
+                    }
+                    inheritRow.appendChild(wrap);
+                }
+                card.appendChild(inheritRow);
+            }
+            list.appendChild(card);
         });
         body.appendChild(list);
         if (sections.length) {
@@ -753,7 +930,10 @@ export function mountPromptManagementPanel(host) {
                     };
                     if (entry.global) addDetailLine(`Global: ${entry.global}`);
                     for (const s of entry.sections || []) {
-                        const composed = composeSectionText(normalizeChannels(s.channels, s.prompt), false);
+                        const composed = composeSectionText(
+                            normalizeChannels(s.channels, s.prompt,
+                                              templateChannelKeys(host._channelTemplate())),
+                            false, host._channelTemplate());
                         addDetailLine(`[${s.start_frame ?? 0}–${s.end_frame ?? 0}] ${composed || "(empty)"}`);
                     }
                     label.addEventListener("click", () => {

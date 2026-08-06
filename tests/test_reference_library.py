@@ -75,7 +75,7 @@ def test_reference_project_roundtrip_and_legacy_default(tmp_path):
         name="Character 1",
         kind="character",
         reference_class="subject",
-        notes="Lead",
+        description="Lead",
         members=[ReferenceMember(
             member_id="member-1",
             asset_id="image-1",
@@ -136,7 +136,7 @@ def test_reference_mutation_crud_tags_and_reorder(tmp_path):
     project = _project(tmp_path)
     payload = routes._apply_reference_mutation_operations(project, [{
         "type": "create_reference",
-        "fields": {"name": "Character 1", "kind": "character", "reference_class": "subject", "notes": ""},
+        "fields": {"name": "Character 1", "kind": "character", "reference_class": "subject", "description": ""},
     }])
     reference_id = payload["results"][0]["reference_id"]
     payload = routes._apply_reference_mutation_operations(project, [{
@@ -225,10 +225,24 @@ def test_reference_mutations_reject_stale_expected_values(tmp_path):
             "reference_id": "ref-1",
             "expected": {
                 "name": "Current", "kind": "character", "reference_class": "subject",
-                "notes": "", "member_ids": [],
+                "description": "", "member_ids": [],
             },
         }])
     assert (exc_info.value.status, exc_info.value.code) == (409, "identity_mismatch")
+
+    # A delete snapshot that omits `description` is incomplete, not merely
+    # stale: model-facing text is part of the exact-prior-value contract, so a
+    # client that has not seen the field is refused before any comparison.
+    with pytest.raises(routes.ProjectMutationRequestError) as exc_info:
+        routes._apply_reference_mutation_operations(project, [{
+            "type": "delete_reference",
+            "reference_id": "ref-1",
+            "expected": {
+                "name": "Stale", "kind": "character", "reference_class": "subject",
+                "member_ids": [],
+            },
+        }])
+    assert (exc_info.value.status, exc_info.value.code) == (400, "missing_expected_identity")
 
     with pytest.raises(routes.ProjectMutationRequestError) as exc_info:
         routes._apply_reference_mutation_operations(project, [{

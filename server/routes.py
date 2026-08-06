@@ -119,6 +119,7 @@ from .lane_registry import (
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 from . import external_links
+from . import prompt_channel_templates
 from . import prompt_payload
 from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
@@ -900,6 +901,24 @@ def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> 
         expected_channels = prompt_payload.normalize_channels(expected.get("channels"))
         if expected_channels != getattr(section, "channels", None):
             _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    if "starts_new_shot" in expected:
+        if bool(expected["starts_new_shot"]) != bool(getattr(section, "starts_new_shot", False)):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    if "shot_timestamp" in expected:
+        if bool(expected["shot_timestamp"]) != bool(getattr(section, "shot_timestamp", False)):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    if "subject_ids" in expected:
+        # Order-insensitive: a client that merely reordered bindings has not
+        # changed the section, and must not be told it conflicts.
+        if (prompt_payload.subject_ids_identity(expected["subject_ids"])
+                != prompt_payload.subject_ids_identity(getattr(section, "subject_ids", None))):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    if "global_channel_exceptions" in expected:
+        # A set, so the normalizer's sort makes this order-insensitive too.
+        if (prompt_payload.normalize_channel_exceptions(expected["global_channel_exceptions"])
+                != prompt_payload.normalize_channel_exceptions(
+                    getattr(section, "global_channel_exceptions", None))):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
 
 
 def _require_no_prompt_overlap(scene: Scene, start_frame: int, end_frame: int,
@@ -1282,7 +1301,8 @@ def _apply_linked_bounds_update(
     elif item_type == "prompt":
         section = _find_prompt_section_by_id(scene, item_id)
         if isinstance(fields.get("channels"), dict):
-            section.channels = prompt_payload.normalize_channels(fields["channels"])
+            section.channels = prompt_payload.merge_channels(
+                section.channels, fields["channels"])
         elif "prompt" in fields:
             section.prompt = str(fields["prompt"])
         if "muted" in fields:
@@ -1362,6 +1382,14 @@ def _split_prompt_object(scene: Scene, section: PromptSection, split_frame: int)
         end_frame=section.end_frame,
         channels=dict(getattr(section, "channels", {}) or {}),
         muted=bool(getattr(section, "muted", False)),
+        # Neither shot flag is inherited: a split is a range operation, and
+        # inheriting would turn one shot into two and shift every later
+        # [Shot N], or stamp a cut time at a frame the user never marked.
+        # subject_ids IS copied (a fresh list, never an alias) — both halves
+        # still show the same subjects.
+        starts_new_shot=False,
+        shot_timestamp=False,
+        subject_ids=[dict(entry) for entry in getattr(section, "subject_ids", []) or []],
     )
     section.end_frame = split_frame
     scene.prompt_sections.append(right)
@@ -1444,7 +1472,10 @@ def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) ->
         _clamp_reference_items_to_scene(scene)
     if "prompt" in fields:
         _require_lane_unlocked(scene, "prompt_global")
-        scene.prompt = str(fields["prompt"])
+        scene.set_global_prompt(fields["prompt"])
+    if "global_channels" in fields:
+        _require_lane_unlocked(scene, "prompt_global")
+        scene.set_global_channels(fields["global_channels"])
     if "generation_params" in fields:
         scene.generation_params = fields["generation_params"] if isinstance(fields["generation_params"], dict) else {}
     if "width" in fields:
@@ -2224,11 +2255,20 @@ def _apply_update_prompt_section(scene: Scene, index: int, fields: dict, expecte
     section.end_frame = new_end
     raw_channels = fields.get("channels")
     if isinstance(raw_channels, dict):
-        section.channels = prompt_payload.normalize_channels(raw_channels)
+        section.channels = prompt_payload.merge_channels(section.channels, raw_channels)
     elif "prompt" in fields:
         section.prompt = str(fields["prompt"])
     if "muted" in fields:
         section.muted = bool(fields["muted"])
+    if "starts_new_shot" in fields:
+        section.starts_new_shot = bool(fields["starts_new_shot"])
+    if "shot_timestamp" in fields:
+        section.shot_timestamp = bool(fields["shot_timestamp"])
+    if "subject_ids" in fields:
+        section.subject_ids = prompt_payload.normalize_subject_ids(fields["subject_ids"])
+    if "global_channel_exceptions" in fields:
+        section.global_channel_exceptions = prompt_payload.normalize_channel_exceptions(
+            fields["global_channel_exceptions"])
     scene.prompt_sections.sort(key=lambda s: s.start_frame)
     return section
 
@@ -2254,6 +2294,10 @@ def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
         prompt=str(fields.get("prompt", "") or ""),
         channels=raw_channels if isinstance(raw_channels, dict) else None,
         muted=bool(fields.get("muted", False)),
+        starts_new_shot=bool(fields.get("starts_new_shot", False)),
+        shot_timestamp=bool(fields.get("shot_timestamp", False)),
+        subject_ids=fields.get("subject_ids"),
+        global_channel_exceptions=fields.get("global_channel_exceptions"),
     )
     if fields.get("prompt_id"):
         section.prompt_id = str(fields.get("prompt_id"))
@@ -2772,6 +2816,13 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
     )):
         params["snapshot_version"] = 1
 
+    # Per-channel scene-global text rides params rather than a new job field:
+    # `scene_prompt` keeps carrying the flat mirror, so the relay socket and
+    # every existing reader are untouched.
+    raw_global_channels = body.get("scene_global_channels")
+    if isinstance(raw_global_channels, dict):
+        params["scene_global_channels"] = prompt_payload.normalize_channels(raw_global_channels)
+
     raw_take_placement_mode = body.get("take_placement_mode", "trimmed")
     take_placement_mode = raw_take_placement_mode if raw_take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
     # take_placement_linked / take_placement_muted are deliberately NOT read from
@@ -2848,6 +2899,12 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         "prompt_channel_labels",
         metadata.get("prompt_channel_labels", False),
     ) is True
+    params["prompt_channel_labels"] = labels_on  # frozen for reproducibility
+    template = prompt_channel_templates.resolve_channel_template(metadata, params)
+    # Frozen so a queued job re-composes under the template it was enqueued
+    # with, not whatever the project carries when it finally runs.
+    params[prompt_channel_templates.PROJECT_TEMPLATE_KEY] = (
+        prompt_channel_templates.template_freeze_value(template))
     delimiter = str(metadata.get("prompt_section_delimiter",
                                  prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
     params["prompt_section_delimiter"] = delimiter  # frozen for reproducibility
@@ -2868,12 +2925,30 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
                        - int(getattr(job, "pre_context_frames", 0) or 0))
     window_end = (int(getattr(job, "selection_end", 0) or 0)
                   + int(getattr(job, "post_context_frames", 0) or 0))
+    # `Scene.fps` defaults to 0.0 meaning "inherit from project", and the
+    # enqueue body sends the raw scene value — so a frozen job commonly carries
+    # scene_fps == 0. Resolving the effective rate here is what stops every
+    # shot timestamp from silently vanishing on a default inherit-FPS scene.
+    try:
+        job_fps = float(getattr(job, "scene_fps", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        job_fps = 0.0
+    if job_fps <= 0:
+        try:
+            job_fps = float(getattr(project, "fps", 24.0) or 24.0)
+        except (TypeError, ValueError):
+            job_fps = 24.0
+    params["prompt_effective_fps"] = job_fps  # frozen for reproducibility
+    job.params = params
+    frozen_global = params.get("scene_global_channels")
     job.prompt = prompt_payload.compose_range_prompt(
         getattr(job, "scene_prompt", "") or "",
         getattr(job, "prompt_sections", []) or [],
         window_start, window_end,
         labels_on=labels_on, delimiter=delimiter,
-        boundary_threshold_pct=threshold,
+        boundary_threshold_pct=threshold, template=template,
+        fps=job_fps,
+        global_channels=frozen_global if isinstance(frozen_global, dict) else None,
     )
 
 
@@ -3014,6 +3089,8 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
         history = []
 
     for job in jobs or []:
+        # This projection is also what the panel's Apply rewrites the scene
+        # from, so any per-section field missing here is WIPED on restore.
         sections = [
             {
                 "start_frame": int(s.get("start_frame", 0)),
@@ -3021,6 +3098,11 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
                 "channels": prompt_payload.normalize_channels(
                     s.get("channels"), legacy_prompt=s.get("prompt", "")
                 ),
+                "starts_new_shot": bool(s.get("starts_new_shot", False)),
+                "shot_timestamp": bool(s.get("shot_timestamp", False)),
+                "subject_ids": prompt_payload.normalize_subject_ids(s.get("subject_ids")),
+                "global_channel_exceptions": prompt_payload.normalize_channel_exceptions(
+                    s.get("global_channel_exceptions")),
             }
             for s in (getattr(job, "prompt_sections", []) or [])
             if isinstance(s, dict)
@@ -3141,7 +3223,7 @@ _REFERENCE_PRESET_BY_ID = {
     str(preset["id"]).casefold(): preset
     for preset in REFERENCE_TAG_PRESETS
 }
-_REFERENCE_ENTITY_FIELDS = {"name", "kind", "reference_class", "notes"}
+_REFERENCE_ENTITY_FIELDS = {"name", "kind", "reference_class", "description"}
 _REFERENCE_MEMBER_FIELDS = {
     "asset_id", "tags", "prompt", "crop", "source_start_sec", "source_end_sec",
 }
@@ -3390,7 +3472,7 @@ def _apply_create_reference(project: TimelineProject, fields: dict) -> Reference
         reference_class=_validated_reference_class(
             fields.get("reference_class", default_reference_class(kind))
         ),
-        notes=str(fields.get("notes", "") or ""),
+        description=str(fields.get("description", "") or ""),
         members=[],
     )
     project.references.append(reference)
@@ -3413,19 +3495,25 @@ def _apply_update_reference(project: TimelineProject, operation: dict) -> Refere
         reference.kind = _validated_reference_kind(fields["kind"])
     if "reference_class" in fields:
         reference.reference_class = _validated_reference_class(fields["reference_class"])
-    if "notes" in fields:
-        reference.notes = str(fields["notes"] or "")
+    if "description" in fields:
+        reference.description = str(fields["description"] or "")
     return reference
 
 
 def _apply_delete_reference(project: TimelineProject, operation: dict) -> ReferenceEntity:
     reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
-    required = {"name", "kind", "reference_class", "notes", "member_ids"}
+    # `description` is included deliberately, keeping the exact-prior-value
+    # rule whole: it is model-facing text, so a delete racing an edit to it
+    # would destroy work the deleting client never saw. The cost is that a
+    # stale browser tab's delete fails loudly, which is the correct outcome
+    # for a client acting on stale Library state.
+    required = {"name", "kind", "reference_class", "description", "member_ids"}
     expected = _require_expected(operation.get("expected"), required, "delete_reference")
     _validate_reference_expected(reference, expected, required)
     removed_member_ids = {member.member_id for member in reference.members}
     project.references = [candidate for candidate in project.references if candidate is not reference]
-    _reconcile_staged_reference_members(project, removed_member_ids)
+    _reconcile_staged_reference_members(project, removed_member_ids,
+                                        {reference.reference_id})
     return reference
 
 
@@ -3614,7 +3702,86 @@ def _validate_recipe_expected(recipe: dict, expected) -> None:
             _mutation_error("Reference recipe identity mismatch", 409, "identity_mismatch")
 
 
-def _reconcile_staged_reference_members(project: TimelineProject, removed_member_ids: set[str]) -> dict:
+def _recollapse_prompt_channels(project: TimelineProject, from_template: dict,
+                                to_template: dict) -> int:
+    """Move every section in every scene onto a new channel template.
+
+    Collapse-then-re-split, in both directions (see
+    `prompt_payload.collapse_channels_for_template`). Returns the number of
+    sections rewritten, for logging.
+    """
+    rewritten = 0
+    for scene in getattr(project, "scenes", None) or []:
+        for section in getattr(scene, "prompt_sections", None) or []:
+            patch = prompt_payload.collapse_channels_for_template(
+                getattr(section, "channels", None), from_template, to_template)
+            updated = prompt_payload.merge_channels(section.channels, patch)
+            # Compare only channels that carry text: merge_channels normalizes,
+            # so an all-empty section would otherwise "change" by gaining keys
+            # and be counted as a rewrite.
+            if _populated_channels(updated) != _populated_channels(section.channels):
+                section.channels = updated
+                rewritten += 1
+    return rewritten
+
+
+def _recollapse_scene_globals(project: TimelineProject, from_template: dict,
+                              to_template: dict) -> int:
+    """Move every scene's GLOBAL channels onto a new template.
+
+    Same collapse-then-re-split as the sections, but through the global view of
+    each template — which is the whole template when global channels are on and
+    the first channel alone when they are off. That is what makes toggling the
+    flag reversible: turning it off folds the other channels into the single box
+    under their own names, and turning it back on puts them where they were.
+    """
+    from_view = prompt_channel_templates.global_template_view(from_template)
+    to_view = prompt_channel_templates.global_template_view(to_template)
+    rewritten = 0
+    for scene in getattr(project, "scenes", None) or []:
+        patch = prompt_payload.collapse_channels_for_template(
+            getattr(scene, "global_channels", None), from_view, to_view)
+        updated = prompt_payload.merge_channels(scene.global_channels, patch)
+        if _populated_channels(updated) != _populated_channels(scene.global_channels):
+            scene.global_channels = updated
+            scene._refresh_global_mirror()
+            rewritten += 1
+    return rewritten
+
+
+def _populated_channels(channels) -> dict:
+    if not isinstance(channels, dict):
+        return {}
+    return {key: value for key, value in channels.items() if str(value or "").strip()}
+
+
+def _prune_prompt_subject_ids(project: TimelineProject, removed_entity_ids: set[str]) -> list[str]:
+    """Drop deleted Reference entities from every scene's prompt sections.
+
+    `PromptSection.subject_ids` is a durable reference from scene state into a
+    PROJECT entity, and nothing else walks prompt_sections — so without this a
+    deleted entity leaves orphan bindings that compose to a silently missing
+    `<Subject N>` and shift the numbering of every later subject.
+    """
+    if not removed_entity_ids:
+        return []
+    affected_scene_ids = []
+    for scene in project.scenes:
+        changed = False
+        for section in getattr(scene, "prompt_sections", []) or []:
+            bindings = getattr(section, "subject_ids", None) or []
+            kept = [entry for entry in bindings
+                    if entry.get("entity_id") not in removed_entity_ids]
+            if len(kept) != len(bindings):
+                section.subject_ids = kept
+                changed = True
+        if changed:
+            affected_scene_ids.append(scene.scene_id)
+    return affected_scene_ids
+
+
+def _reconcile_staged_reference_members(project: TimelineProject, removed_member_ids: set[str],
+                                        removed_entity_ids: set[str] | None = None) -> dict:
     affected_scene_ids = []
     removed_item_ids = []
     thinned_item_ids = []
@@ -3636,6 +3803,11 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
         if changed:
             scene.reference_items = next_items
             affected_scene_ids.append(scene.scene_id)
+    # Same atomic batch as the delete: an orphan binding would otherwise
+    # survive to the next compose.
+    for scene_id in _prune_prompt_subject_ids(project, removed_entity_ids or set()):
+        if scene_id not in affected_scene_ids:
+            affected_scene_ids.append(scene_id)
     return {
         "affected_scene_ids": affected_scene_ids,
         "removed_reference_item_ids": removed_item_ids,
@@ -5056,6 +5228,8 @@ def _build_dormant_summary(
             labels_on=labels_on,
             delimiter=delimiter,
             boundary_threshold_pct=threshold,
+            template=prompt_channel_templates.resolve_channel_template(metadata),
+            fps=effective_scene_fps(project, active_scene),
         )
         active_scene_payload = {
             "scene_id": active_scene.scene_id,
@@ -6651,7 +6825,35 @@ if routes is not None:
             raw = body.get("dimension_constraint")
             project.dimension_constraint = raw if isinstance(raw, dict) and raw else None
         if "metadata" in body:
-            project.metadata.update(body["metadata"])
+            incoming = body["metadata"]
+            # A channel-template switch rewrites every section in every scene,
+            # because the template is project-level. It happens HERE, inside the
+            # one save that moves the pointer, so the metadata and the section
+            # text can never disagree — a client-side sweep would leave them
+            # split if it failed partway.
+            template_key = prompt_channel_templates.PROJECT_TEMPLATE_KEY
+            if isinstance(incoming, dict) and template_key in incoming:
+                previous = prompt_channel_templates.resolve_channel_template(project.metadata)
+                raw_next = incoming[template_key]
+                if isinstance(raw_next, dict):
+                    # A project-owned fork from the template editor. Normalize
+                    # before it reaches the project, so a malformed dict cannot
+                    # become the template every later read resolves against.
+                    nxt = prompt_channel_templates.normalize_channel_template(raw_next)
+                    incoming = dict(incoming)
+                    incoming[template_key] = prompt_channel_templates.template_freeze_value(nxt)
+                else:
+                    nxt = prompt_channel_templates.get_channel_template(raw_next)
+                # Compare the channel SETS, not just the ids: editing a custom
+                # template in place keeps its id while renaming or removing
+                # channels, which is exactly a template switch for the text.
+                if (prompt_channel_templates.template_channel_keys(previous)
+                        != prompt_channel_templates.template_channel_keys(nxt)):
+                    _recollapse_prompt_channels(project, previous, nxt)
+                if (prompt_channel_templates.global_channel_keys(previous)
+                        != prompt_channel_templates.global_channel_keys(nxt)):
+                    _recollapse_scene_globals(project, previous, nxt)
+            project.metadata.update(incoming)
 
         save_project(project)
         return web.json_response(project.to_dict())
@@ -8085,7 +8287,7 @@ if routes is not None:
         if "prompt" in body:
             if getattr(scene.global_prompt_track_config, "locked", False):
                 return _json_error("Global prompt track is locked", 409)
-            scene.prompt = body["prompt"]
+            scene.set_global_prompt(body["prompt"])
         if "prompt_sections" in body:
             scene.prompt_sections = [
                 PromptSection.from_dict(p) for p in body["prompt_sections"]
@@ -8207,7 +8409,8 @@ if routes is not None:
         # Restore all mutable scene fields from the snapshot
         scene.name = body.get("name", scene.name)
         scene.duration_frames = body.get("duration_frames", scene.duration_frames)
-        scene.prompt = body.get("prompt", scene.prompt)
+        if "prompt" in body:
+            scene.set_global_prompt(body["prompt"])
 
         if "prompt_sections" in body:
             scene.prompt_sections = [
@@ -8626,6 +8829,10 @@ if routes is not None:
             labels_on = params.get("prompt_channel_labels", False) is True \
                 if isinstance(params, dict) else False
             threshold = _coerce_threshold(params)
+            # Frozen params win, so a queued job keeps re-composing under the
+            # template it was enqueued with.
+            template = prompt_channel_templates.resolve_channel_template(
+                getattr(project, "metadata", None), params)
             global_text = str(getattr(active_job, "scene_prompt", "") or "")
             sections = list(getattr(active_job, "prompt_sections", []) or [])
             source_label = "snapshot"
@@ -8634,6 +8841,7 @@ if routes is not None:
             labels_on = metadata.get("prompt_channel_labels", False) is True \
                 if isinstance(metadata, dict) else False
             threshold = _coerce_threshold(metadata)
+            template = prompt_channel_templates.resolve_channel_template(metadata)
             global_hidden = bool(getattr(scene.global_prompt_track_config, "hidden", False))
             sections_hidden = bool(getattr(scene.prompt_track_config, "hidden", False))
             global_text = "" if global_hidden else (scene.prompt or "")
@@ -8655,8 +8863,9 @@ if routes is not None:
         if window_end <= window_start:
             window_start, window_end = 0, duration
 
+        labels_on = prompt_channel_templates.template_labels_on(template, labels_on)
         segments = prompt_payload.resolve_segments(
-            sections, window_start, window_end, labels_on, threshold)
+            sections, window_start, window_end, labels_on, threshold, template)
         relay = prompt_payload.build_relay_payload(global_text, segments)
 
         # Which authored sections survive (used) vs were dropped by the
@@ -8665,7 +8874,7 @@ if routes is not None:
         used_sections = sorted({int(s["section_start"]) for s in segments
                                 if "section_start" in s})
         candidates = prompt_payload.resolve_segments(
-            sections, window_start, window_end, labels_on, 0.0)
+            sections, window_start, window_end, labels_on, 0.0, template)
         candidate_keys = {int(s["section_start"]) for s in candidates
                           if "section_start" in s}
         dropped_sections = sorted(candidate_keys.difference(used_sections))
@@ -9282,11 +9491,20 @@ if routes is not None:
         section.end_frame = new_end
         raw_channels = body.get("channels")
         if isinstance(raw_channels, dict):
-            section.channels = prompt_payload.normalize_channels(raw_channels)
+            section.channels = prompt_payload.merge_channels(section.channels, raw_channels)
         elif "prompt" in body:
             section.prompt = body["prompt"]
         if "muted" in body:
             section.muted = bool(body["muted"])
+        if "starts_new_shot" in body:
+            section.starts_new_shot = bool(body["starts_new_shot"])
+        if "shot_timestamp" in body:
+            section.shot_timestamp = bool(body["shot_timestamp"])
+        if "subject_ids" in body:
+            section.subject_ids = prompt_payload.normalize_subject_ids(body["subject_ids"])
+        if "global_channel_exceptions" in body:
+            section.global_channel_exceptions = prompt_payload.normalize_channel_exceptions(
+                body["global_channel_exceptions"])
 
         scene.prompt_sections.sort(key=lambda s: s.start_frame)
         save_project(project)

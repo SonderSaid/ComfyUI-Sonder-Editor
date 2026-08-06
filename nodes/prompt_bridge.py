@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 
+from ..server import prompt_channel_templates
 from ..server import prompt_payload
 
 logger = logging.getLogger(__name__)
@@ -86,48 +87,53 @@ def _threshold_from(source, default: float = 10.0) -> float:
 
 
 def resolve_window_prompt_state(project):
-    """Resolve (global_text, sections, labels_on, window, source, threshold).
+    """Resolve (global_text, sections, labels_on, window, source, threshold, template).
 
     Frozen job snapshot when this execution rendered a snapshot_version>0
-    job (its hidden flags + threshold were baked at enqueue); live scene +
-    project metadata + per-lane hidden flags otherwise.
+    job (its hidden flags, threshold and channel template were baked at
+    enqueue); live scene + project metadata + per-lane hidden flags otherwise.
     """
     scene = _resolve_active_scene(project)
     window_start, window_end = _resolve_prompt_window(project, scene)
+    metadata = getattr(project, "metadata", None)
 
     queue_job = _find_ref_job(project)
     if queue_job is not None and _snapshot_version(queue_job) > 0:
         params = getattr(queue_job, "params", {}) or {}
         labels_on = params.get("prompt_channel_labels", False) is True \
             if isinstance(params, dict) else False
+        template = prompt_channel_templates.resolve_channel_template(metadata, params)
         return (
             str(getattr(queue_job, "scene_prompt", "") or ""),
             list(getattr(queue_job, "prompt_sections", []) or []),
-            labels_on,
+            prompt_channel_templates.template_labels_on(template, labels_on),
             window_start,
             window_end,
             "snapshot",
             _threshold_from(params),
+            template,
         )
 
-    labels_on = _project_labels_on(project)
-    threshold = _threshold_from(getattr(project, "metadata", None))
+    template = prompt_channel_templates.resolve_channel_template(metadata)
+    labels_on = prompt_channel_templates.template_labels_on(
+        template, _project_labels_on(project))
+    threshold = _threshold_from(metadata)
     if scene is None:
-        return "", [], labels_on, window_start, window_end, "live", threshold
+        return "", [], labels_on, window_start, window_end, "live", threshold, template
     global_hidden = bool(getattr(getattr(scene, "global_prompt_track_config", None), "hidden", False))
     sections_hidden = bool(getattr(getattr(scene, "prompt_track_config", None), "hidden", False))
     global_text = "" if global_hidden else str(getattr(scene, "prompt", "") or "")
     sections = [] if sections_hidden else list(getattr(scene, "prompt_sections", []) or [])
-    return global_text, sections, labels_on, window_start, window_end, "live", threshold
+    return (global_text, sections, labels_on, window_start, window_end, "live",
+            threshold, template)
 
 
 def build_window_relay_payload(project) -> dict:
     """Window-resolved PromptRelay payload (the bridge's testable core)."""
-    global_text, sections, labels_on, window_start, window_end, source, threshold = (
-        resolve_window_prompt_state(project)
-    )
+    (global_text, sections, labels_on, window_start, window_end, source,
+     threshold, template) = resolve_window_prompt_state(project)
     segments = prompt_payload.resolve_segments(
-        sections, window_start, window_end, labels_on, threshold)
+        sections, window_start, window_end, labels_on, threshold, template)
     payload = prompt_payload.build_relay_payload(global_text, segments)
     payload["labels_on"] = labels_on
     payload["window_start"] = window_start

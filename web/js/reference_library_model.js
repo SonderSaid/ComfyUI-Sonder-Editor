@@ -272,7 +272,7 @@ export function createReferenceDraft(source = null) {
         reference_class: VALID_CLASSES.has(source?.reference_class)
             ? source.reference_class
             : defaultReferenceClass(kind),
-        notes: source?.notes || "",
+        description: source?.description || "",
     };
 }
 
@@ -359,7 +359,7 @@ export function serializeReferenceDraft(draft) {
         name: text(draft.name),
         kind: draft.kind,
         reference_class: draft.reference_class,
-        notes: String(draft.notes ?? "").trim(),
+        description: String(draft.description ?? "").trim(),
     };
 }
 
@@ -400,7 +400,7 @@ export function filterReferences(references = [], query = "", assets = []) {
     if (!needle) return Array.isArray(references) ? references : [];
     const names = new Map((Array.isArray(assets) ? assets : []).map((asset) => [asset.asset_id, asset.name || asset.path || ""]));
     return (Array.isArray(references) ? references : []).filter((reference) => {
-        const values = [reference.name, reference.kind, reference.notes];
+        const values = [reference.name, reference.kind, reference.description];
         for (const member of reference.members || []) {
             values.push(...(member.tags || []), names.get(member.asset_id) || "");
         }

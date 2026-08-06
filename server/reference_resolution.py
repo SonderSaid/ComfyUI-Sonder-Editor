@@ -58,6 +58,14 @@ def resolve_effective_references(
     to a single winner per lane, so a lane may legitimately resolve to nothing
     and report `has_reference = 0` for that window. That is the point of the
     setting, and it is why enqueue warns when it flips across a batch.
+
+    Enqueue announces BOTH causes of that flip, under separate notifications:
+    the threshold dropping a chunk the item does overlap, and the item simply
+    not reaching a chunk at all. Only the first is a setting the user probably
+    did not mean to hit, but both change which sockets are wired and so both
+    change the inferred task mode. The frontend keeps the reason — see
+    `classifyReferenceChunks` in `web/js/reference_resolution.js`; this module
+    resolves winners only and has no verdict concept.
     """
     count = max(1, _integer(lane_count, 1))
     duration = max(0, _integer(scene_duration, 0))

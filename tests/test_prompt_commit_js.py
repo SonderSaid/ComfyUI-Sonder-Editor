@@ -55,8 +55,9 @@ def test_section_bar_commits_on_focus_loss_and_dedupes_unchanged_channels():
     assert "commit({ close: false })" in editor
     assert "this._promptEditorCommit = () => commit({ close: false });" in editor
     # Only a real text change reaches the mutation pipeline, so repeated focus
-    # changes cannot stack no-op writes or undo entries.
-    assert "next.visual !== committed.visual" in editor
+    # changes cannot stack no-op writes or undo entries. The comparison is over
+    # whatever channels the active template names, not a fixed three.
+    assert "Object.keys(next).some((key) => next[key] !== (committed[key] ?? \"\"))" in editor
     assert "committed = next;" in editor
     # Esc discards; Delete arms before the blur it causes.
     assert "this._hidePromptEditor({ commit: false });" in editor

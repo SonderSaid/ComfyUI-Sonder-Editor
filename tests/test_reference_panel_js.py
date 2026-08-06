@@ -373,7 +373,9 @@ const makeNode = (names) => ({{
   addOutput(name, type, opts) {{ this.outputs.push({{ name, type, link: null, links: [], ...opts }}); }},
   removeOutput(index) {{ this.outputs.splice(index, 1); }},
 }});
-const shape = (node, s) => resolveBridgeOutputs(node, s, {{ metadata, order }});
+// `meta` is overridable so a test can mimic ensureState() re-capturing metadata
+// from already-marked live outputs after a graph reload.
+const shape = (node, s, meta = metadata) => resolveBridgeOutputs(node, s, {{ metadata: meta, order }});
 const describe = (node) => node.outputs.map((slot, i) => [i, slot.name, slot.type, slot.label ?? null]);
 const results = {{}};
 
@@ -392,11 +394,27 @@ results.r02Label = trimmed.outputs.find((s) => s.name === 'r02').label;
 results.p01Label = trimmed.outputs.find((s) => s.name === 'p01').label;
 results.p02Label = trimmed.outputs.find((s) => s.name === 'p02').label;
 
-// A connected dead output is not even marked — it is in active use.
+// A connected dead FIXED output is still marked. Wiring says the user
+// connected something, not that the recipe drives it — the slot emits a
+// type-correct fallback into a live link, which is the case most worth
+// naming. Only removal is gated on connection.
 const wired = makeNode([...FIXED_OUTPUT_NAMES]);
 wired.outputs.find((s) => s.name === 'reference_audio').links = [7];
 shape(wired, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
 results.wiredLabel = wired.outputs.find((s) => s.name === 'reference_audio').label;
+
+// Reloading a graph captures metadata from the LIVE outputs, so a node saved
+// while marked must not accumulate a second suffix on the next shape pass.
+const reloaded = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(reloaded, {{ slotCount: 0, liveOutputs: ['reference_frames'] }});
+const reloadedMeta = new Map(reloaded.outputs.map((s) => [
+  s.name, {{ type: s.type, label: s.label, localized_name: s.localized_name }},
+]));
+shape(reloaded, {{ slotCount: 0, liveOutputs: ['reference_frames'] }}, reloadedMeta);
+results.reloadedLabel = reloaded.outputs.find((s) => s.name === 'reference_audio').label;
+// And the mark still clears when the recipe revives the output.
+shape(reloaded, {{ slotCount: 0, liveOutputs: null }}, reloadedMeta);
+results.reloadedRevived = reloaded.outputs.find((s) => s.name === 'reference_audio').label;
 
 // No declaration: everything present and nothing marked.
 const unknown = makeNode([...FIXED_OUTPUT_NAMES]);
@@ -453,7 +471,14 @@ console.log(JSON.stringify(results));
     # Rule 2 still holds for the numbered blocks: with no liveness declaration
     # every slot shows unmarked rather than looking broken during a slow load.
     assert out["unknownSlotLabels"] == ["r01", "r16", "p01", "p16"]
-    assert out["wiredLabel"] == "reference_audio", "a wired output is in use, not unused"
+    # Wiring gates REMOVAL, not marking. A wired output the recipe does not
+    # drive still emits its fallback into that link, so it must say so —
+    # `reference_frames` is wired in almost every real workflow and was
+    # therefore the one output the old connection guard could never mark.
+    assert out["wiredLabel"] == "reference_audio (unused)", "a wired dead output still marks"
+    # Re-capturing metadata from marked outputs must not stack suffixes.
+    assert out["reloadedLabel"] == "reference_audio (unused)", "no doubled suffix after reload"
+    assert out["reloadedRevived"] == "reference_audio", "reload-captured marks still clear"
     assert out["unknownLabels"] == FIXED_OUTPUT_NAMES
     assert out["slotsMode"] == ["reference_frames (unused)", "reference_frames (unused)"]
     assert out["markCycle"] == [6, 0], "marks must clear when liveness is unknown again"
@@ -550,12 +575,21 @@ def test_reference_threshold_is_project_durable_and_frozen_at_enqueue():
     # Authored in Settings as a project-wide value, not a browser preference.
     assert 'metadata: { reference_frame_threshold: pct }' in widget
     assert "Reference Threshold % (project-wide)" in panel
-    # A mid-batch has_reference flip is announced rather than silent.
+    # A mid-batch has_reference flip is announced rather than silent. Both
+    # causes are announced, under separate sources: a threshold drop is a
+    # setting the user probably did not mean to hit, a scope drop is the feature
+    # working. Silencing either would hide a mid-batch task-mode change.
     assert "_warnOnReferenceFlipAcrossBatch(chunks)" in widget
     assert 'source: "reference-batch-flip"' in widget
+    assert 'source: "reference-batch-scope"' in widget
     # A threshold above the per-chunk coverage drops the lane from EVERY chunk,
     # so nothing flips and the flip check alone stayed silent.
     assert 'source: "reference-batch-silenced"' in widget
+    # The remedy is chosen from the lane's own verdicts, never from the global
+    # setting — that is what told an out-of-range lane to lower a threshold it
+    # had never touched.
+    assert "shared.frameThresholdPct > 0" not in widget
+    assert "classifyReferenceChunks(chunks, shared)" in widget
 
 
 def test_reference_verdicts_report_why_each_item_did_or_did_not_resolve():
@@ -666,11 +700,97 @@ def test_pegged_fields_display_what_the_render_will_use():
 
 def test_threshold_batch_warnings_name_the_lane_the_count_and_the_right_remedy():
     widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    block = widget.split("_warnOnReferenceFlipAcrossBatch(chunks) {", 1)[1].split("\n    async ", 1)[0]
-    assert "${dropped} of ${total}" in block
+    # Bounded by the next method's NAME rather than by `\n    async `: that
+    # delimiter silently widened the block whenever a non-async method was added
+    # after this one, so assertions could pass against a neighbour's source.
+    start = widget.index("_warnOnReferenceFlipAcrossBatch(chunks) {")
+    block = widget[start:widget.index("_setReferenceFrameThreshold(", start)]
+    assert "of ${total}" in block
     assert "dropped from all ${total} chunks" in block
-    # Naming a setting that is not involved sends the user to the wrong fix, so
-    # the remedy follows the actual cause.
-    assert "shared.frameThresholdPct > 0" in block
+    # Each cause carries its own remedy and its own count.
+    assert "Threshold in Settings, or widen the staged item." in block
+    assert "Lower it in Settings, or widen the staged item." in block
     assert "does not overlap this batch" in block
-    assert "Lower it in Settings" in block
+    assert "Unmute the item or unhide the " in block
+    # Scope drops are announced too, but transiently — they are the feature
+    # working, not a setting the user tripped over.
+    assert "notifyInfo(" in block
+    assert 'source: "reference-batch-scope"' in block
+
+
+def test_batch_chunk_classifier_separates_threshold_scope_and_excluded():
+    """The warning needs the CAUSE, not just "did the lane resolve".
+
+    `resolveEffectiveReferences` answers only the latter, which is why a
+    deliberately scoped item and a threshold drop produced the same message.
+    This lives in `reference_resolution.js` rather than on the editor class
+    because `editor_widget.js` cannot be imported into node — a substring
+    assertion cannot reach any of the behaviour below.
+    """
+    node_bin = shutil.which("node")
+    if not node_bin:
+        pytest.skip("node is required for the classifier test")
+    thirds = [{"start": 0, "end": 100}, {"start": 100, "end": 200}, {"start": 200, "end": 300}]
+    uneven = [{"start": 0, "end": 150}, {"start": 150, "end": 200}, {"start": 200, "end": 300}]
+    cases = {
+        # Scoped to the first chunk only: overlaps nothing later, threshold off.
+        "scope": (thirds, [{"lane_index": 0, "start_frame": 0, "end_frame": 100}], 0),
+        # Spans the whole batch, but uneven chunks cover too little of its span.
+        "threshold": (uneven, [{"lane_index": 0, "start_frame": 0, "end_frame": 300}], 40),
+        # Both causes on ONE lane: wins chunk 1, thresholded in 2, absent in 3.
+        "mixed": (thirds, [{"lane_index": 0, "start_frame": 0, "end_frame": 150}], 40),
+        # Deliberate silence: muted everywhere, so it can never flip.
+        "muted": (thirds, [{"lane_index": 0, "start_frame": 0, "end_frame": 300, "muted": True}], 0),
+        # lane_index spellings the scorer normalizes: undefined -> 0, "2" -> 2, 1.7 -> 1.
+        "lanes": (thirds, [
+            {"start_frame": 0, "end_frame": 300},
+            {"lane_index": "2", "start_frame": 0, "end_frame": 300},
+            {"lane_index": 1.7, "start_frame": 0, "end_frame": 300},
+        ], 0),
+    }
+    module_url = (ROOT / "web" / "js" / "reference_resolution.js").as_uri()
+    script = f"""
+const {{ classifyReferenceChunks }} = await import({json.dumps(module_url)});
+const cases = {json.dumps(cases)};
+const out = {{}};
+for (const [name, [chunks, items, threshold]] of Object.entries(cases)) {{
+  out[name] = classifyReferenceChunks(chunks, {{
+    referenceItems: items,
+    laneCount: name === 'lanes' ? 3 : 1,
+    sceneDuration: 300,
+    laneConfigs: [],
+    frameThresholdPct: threshold,
+  }});
+}}
+console.log(JSON.stringify(out));
+"""
+    out = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+    scope = out["scope"][0]
+    assert scope["resolved"] == 1 and scope["causeCounts"]["outside"] == 2
+    assert scope["causeCounts"]["below_threshold"] == 0, "no threshold is involved when it is off"
+
+    threshold = out["threshold"][0]
+    assert threshold["resolved"] == 1 and threshold["causeCounts"]["below_threshold"] == 2
+    assert threshold["causeCounts"]["outside"] == 0, "it overlaps every chunk; only coverage fails"
+
+    # One lane, two causes, counted separately — a single tally would put a
+    # number in a sentence that does not explain it.
+    mixed = out["mixed"][0]
+    assert mixed["resolved"] == 1
+    assert mixed["causeCounts"]["below_threshold"] == 1
+    assert mixed["causeCounts"]["outside"] == 1
+    assert mixed["dominantCause"] == "below_threshold", "the actionable cause ranks first"
+
+    muted = out["muted"][0]
+    assert muted["staged"] is True, "a muted item is still staged; the lane is not empty"
+    assert muted["resolved"] == 0 and muted["causeCounts"]["excluded"] == 3
+    assert muted["dominantCause"] == "excluded"
+
+    # All three spellings must land where the SCORER put them, or a resolved
+    # lane reads unresolved and warns about nothing.
+    assert [lane["staged"] for lane in out["lanes"]] == [True, True, True]
+    assert [lane["resolved"] for lane in out["lanes"]] == [3, 3, 3]

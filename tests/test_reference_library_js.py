@@ -104,8 +104,8 @@ def test_reference_model_tags_drafts_search_and_ordering():
         ];
         assert.deepEqual(model.moveMember(members, 'b', -1).map((item) => [item.member_id, item.order]), [['b', 0], ['a', 1], ['c', 2]]);
         const references = [
-            {{ name: 'Chloe', kind: 'character', notes: '', members: [{{ asset_id: 'image-1', tags: ['Blue Coat'] }}] }},
-            {{ name: 'Cafe', kind: 'location', notes: 'night', members: [] }},
+            {{ name: 'Chloe', kind: 'character', description: '', members: [{{ asset_id: 'image-1', tags: ['Blue Coat'] }}] }},
+            {{ name: 'Cafe', kind: 'location', description: 'night', members: [] }},
         ];
         const assets = [{{ asset_id: 'image-1', name: 'portrait.png' }}];
         assert.equal(model.filterReferences(references, 'portrait.png', assets)[0].name, 'Chloe');

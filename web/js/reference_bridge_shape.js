@@ -18,8 +18,12 @@
 // so nothing is removed.
 //
 // Two further rules:
-//   1. A connected slot is never removed, whatever the recipe says. Removing it
-//      would silently drop the user's link.
+//   1. A connected slot is never REMOVED, whatever the recipe says. Removing it
+//      would silently drop the user's link. It is still MARKED: wiring says the
+//      user connected something, not that the recipe drives it, and a wired
+//      output the recipe ignores emits its fallback into a live link. That is
+//      the case most worth naming, not the one to stay quiet about. Marking
+//      touches only the label, so the link is untouched either way.
 //   2. No liveness declaration means show everything unmarked. An unresolved
 //      project, an unwired selector, a lane index pointing at nothing and a
 //      failed fetch are all "we don't know", not "this recipe drives nothing" —
@@ -131,12 +135,28 @@ export const UNUSED_SUFFIX = " (unused)";
  * Nodes 2.0 reads `localized_name`, so setting only one leaves the other
  * renderer showing the bare name. Same pairing as `bridge_nodes.js` and
  * `autogrow_passthrough.js`.
+ *
+ * `ignoreConnection` decouples marking from wiring. Rule 1 in the module header
+ * is about REMOVAL — a connected slot must survive — but it leaked into the
+ * label too, and the two are not the same question. A wired output the recipe
+ * does not drive is exactly the case worth announcing: it emits a type-correct
+ * fallback (a black frame for `reference_frames`) into a live link under a
+ * clean-looking name. `reference_frames` is wired in essentially every real
+ * workflow, so the guard made the one output that most needed the mark the one
+ * output that could never carry it.
  */
-function markOutput(slot, live, metadata) {
+function markOutput(slot, live, metadata, { ignoreConnection = false } = {}) {
     if (!slot) return false;
     const meta = metadata?.get(slot.name);
-    const original = meta?.label ?? meta?.localized_name ?? slot.name;
-    const dead = live && !live.has(slot.name) && !outputConnected(slot);
+    const captured = meta?.label ?? meta?.localized_name ?? slot.name;
+    // Strip a suffix we previously wrote. `metadata` is captured from live
+    // `node.outputs` at nodeCreated/loadedGraphNode, so a graph reloaded while a
+    // slot was marked would otherwise re-mark an already-marked label and drift
+    // to "name (unused) (unused)" on every load.
+    const original = String(captured).endsWith(UNUSED_SUFFIX)
+        ? String(captured).slice(0, -UNUSED_SUFFIX.length)
+        : captured;
+    const dead = live && !live.has(slot.name) && (ignoreConnection || !outputConnected(slot));
     const label = dead ? `${original}${UNUSED_SUFFIX}` : original;
     if (slot.label === label && slot.localized_name === label) return false;
     slot.label = label;
@@ -171,7 +191,12 @@ export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order 
 
     for (const name of FIXED_OUTPUT_NAMES) {
         ensureOutput(node, name, metadata, canonical);
-        markOutput(node.outputs[outputIndex(node, name)], live, metadata);
+        // Fixed outputs mark on liveness alone. The numbered blocks below keep
+        // the connection guard: they are what the socket-pair reorder will
+        // redesign, and `connectedSlotCeiling` already folds wired r-slots into
+        // `staged` there, so changing them is a separate decision.
+        markOutput(node.outputs[outputIndex(node, name)], live, metadata,
+                   { ignoreConnection: true });
     }
     // Numbered slots past the staged member count carry a fallback rather than a
     // member, so they read as unused — but they keep their index, because the

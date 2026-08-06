@@ -549,7 +549,12 @@ class ReferenceEntity:
     name: str = "Untitled Reference"
     kind: str = "character"
     reference_class: str = "subject"
-    notes: str = ""
+    # One-line identity for Library browsing, so a crowded Library stays
+    # readable when the name alone is not enough. Project-only: nothing
+    # composes it into a prompt — per-member prompt text is what reaches the
+    # model. It replaced a longer free-form `notes` field, which is dropped on
+    # load rather than migrated: the two overlapped, and neither had shipped.
+    description: str = ""
     members: list[ReferenceMember] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -558,7 +563,7 @@ class ReferenceEntity:
             "name": self.name,
             "kind": self.kind,
             "reference_class": self.reference_class,
-            "notes": self.notes,
+            "description": self.description,
             "members": [member.to_dict() for member in self.members],
         }
 
@@ -597,7 +602,7 @@ class ReferenceEntity:
             name=name,
             kind=kind,
             reference_class=reference_class,
-            notes=str(data.get("notes", "") or ""),
+            description=str(data.get("description", "") or ""),
             members=members,
         )
 
@@ -988,6 +993,20 @@ class LaneConfig:
 # Scene — a composition segment (e.g., "dog eating", "bridge shot")
 # ---------------------------------------------------------------------------
 
+def _migrated_shot_timestamp(data: dict) -> bool:
+    """`shot_timestamp` for a stored section, migrated to the ungated rule.
+
+    The flag used to be gated behind `starts_new_shot` and defaulted True, so a
+    section that opened no shot could carry a meaningless `True` that emitted
+    nothing. Ungated, that stored value would suddenly stamp the section. Drop
+    it: under the old rule the combination was unobservable, so this migration
+    cannot change any existing project's output.
+    """
+    if not bool(data.get("shot_timestamp", False)):
+        return False
+    return bool(data.get("starts_new_shot", False))
+
+
 class PromptSection:
     """A prompt assigned to a range of frames within a scene.
 
@@ -1002,11 +1021,32 @@ class PromptSection:
 
     def __init__(self, start_frame: int = 0, end_frame: int = 0,
                  prompt: str = "", channels: dict | None = None,
-                 muted: bool = False):
+                 muted: bool = False, starts_new_shot: bool = False,
+                 subject_ids: list | None = None, shot_timestamp: bool = False,
+                 global_channel_exceptions: list | None = None):
         self.prompt_id = uuid.uuid4().hex[:8]
         self.start_frame = start_frame
         self.end_frame = end_frame
         self.muted = bool(muted)
+        # Opens a new shot in the composed output. NOT inherited across a
+        # split: a split is a range operation, and inheriting would open two
+        # shots from one and shift every later [Shot N].
+        self.starts_new_shot = bool(starts_new_shot)
+        # Whether this section stamps its cut time. FULLY independent of
+        # `starts_new_shot`: all four combinations are legal, including a bare
+        # `At 00:07.000,` on a section that continues the current shot. Defaults
+        # OFF — ungated, an on-by-default would stamp every section.
+        self.shot_timestamp = bool(shot_timestamp)
+        # Reference entities appearing in this section, as
+        # [{entity_id, retention}, ...] — retention is a per-BINDING attribute,
+        # which is why this is not a flat list of ids.
+        self.subject_ids = prompt_payload.normalize_subject_ids(subject_ids)
+        # Scene-global channels this section does NOT inherit. An EXCEPTIONS
+        # set, not an inherit map: the default is to inherit everything, so a
+        # channel added to the template later is inherited without touching a
+        # single section, and an untouched project stores nothing.
+        self.global_channel_exceptions = prompt_payload.normalize_channel_exceptions(
+            global_channel_exceptions)
         if isinstance(channels, dict):
             self.channels = prompt_payload.normalize_channels(channels)
         else:
@@ -1025,7 +1065,11 @@ class PromptSection:
             return NotImplemented
         return (self.start_frame == other.start_frame
                 and self.end_frame == other.end_frame
-                and self.channels == other.channels)
+                and self.channels == other.channels
+                and self.starts_new_shot == other.starts_new_shot
+                and self.shot_timestamp == other.shot_timestamp
+                and self.subject_ids == other.subject_ids
+                and self.global_channel_exceptions == other.global_channel_exceptions)
 
     def __repr__(self):
         return (f"PromptSection(start_frame={self.start_frame}, "
@@ -1038,6 +1082,10 @@ class PromptSection:
             "end_frame": self.end_frame,
             "channels": dict(self.channels),
             "muted": self.muted,
+            "starts_new_shot": self.starts_new_shot,
+            "shot_timestamp": self.shot_timestamp,
+            "subject_ids": [dict(entry) for entry in self.subject_ids],
+            "global_channel_exceptions": list(self.global_channel_exceptions),
             # Label-free composed mirror for older readers / downgrades.
             "prompt": self.prompt,
         }
@@ -1053,6 +1101,12 @@ class PromptSection:
             prompt=data.get("prompt", ""),
             channels=raw_channels if isinstance(raw_channels, dict) else None,
             muted=bool(data.get("muted", False)),
+            # Pre-upgrade dicts carry none of these keys; everything defaults
+            # off/empty. See the migration note below for stored `True`s.
+            starts_new_shot=bool(data.get("starts_new_shot", False)),
+            shot_timestamp=_migrated_shot_timestamp(data),
+            subject_ids=data.get("subject_ids"),
+            global_channel_exceptions=data.get("global_channel_exceptions"),
         )
         section.prompt_id = data.get("prompt_id", uuid.uuid4().hex[:8])
         return section
@@ -1065,7 +1119,8 @@ class Scene:
     name: str = "Untitled Scene"
     order: int = 0                          # position in the main composition
     duration_frames: int = 0                # desired total length (0 = empty/placeholder)
-    prompt: str = ""                        # scene-global prompt (always-on; also the fallback when no sections exist)
+    prompt: str = ""                        # DERIVED label-free mirror of global_channels; see set_global_prompt
+    global_channels: dict = field(default_factory=dict)  # scene-global prompt, per channel (source of truth)
     prompt_sections: list = field(default_factory=list)  # list[PromptSection]
     generation_params: dict = field(default_factory=dict)  # seed, cfg, sampler, model, etc.
     batch_config: BatchConfig = field(default_factory=BatchConfig)
@@ -1093,6 +1148,41 @@ class Scene:
     fps: float = 0.0                            # 0 = inherit from project
     saved_selections: list = field(default_factory=list)  # list[dict] {name, start, end, pre/post context, mask pre/post offsets}
 
+    def __post_init__(self):
+        # A legacy scene carries only the flat `prompt`; seed the channels from
+        # it so the two never start out disagreeing.
+        if not isinstance(self.global_channels, dict) or not self.global_channels:
+            self.global_channels = prompt_payload.normalize_channels(
+                None, legacy_prompt=self.prompt or "")
+        self._refresh_global_mirror()
+
+    def _refresh_global_mirror(self) -> None:
+        """Recompute the label-free `prompt` mirror from `global_channels`."""
+        self.prompt = prompt_payload.compose_section_text(
+            self.global_channels, labels_on=False)
+
+    def set_global_prompt(self, value) -> None:
+        """DESTRUCTIVE, mirroring `PromptSection.prompt`'s setter.
+
+        Assigning the flat global prompt replaces the whole thing: the text
+        lands in the first channel and every other channel is cleared. Every
+        route that writes `body["prompt"]` must come through here, or an
+        ordinary scene update would silently wipe global channels 2..n.
+        """
+        self.global_channels = prompt_payload.normalize_channels(
+            None, legacy_prompt=str(value or ""))
+        self._refresh_global_mirror()
+
+    def set_global_channels(self, patch) -> None:
+        """Merge a channel patch into the scene-global prompt.
+
+        Merges rather than replaces for the same reason section channels do:
+        a client only sends the channels of the template it is authoring under.
+        """
+        self.global_channels = prompt_payload.merge_channels(self.global_channels, patch)
+        self._refresh_global_mirror()
+
+
     @property
     def duration_seconds(self) -> float:
         """Duration based on desired frames. Needs project fps to be accurate."""
@@ -1112,15 +1202,18 @@ class Scene:
 
     def get_prompt_at_frame(self, frame: int, labels_on: bool = True,
                             delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER,
-                            boundary_threshold_pct: float = 0.0) -> str:
+                            boundary_threshold_pct: float = 0.0,
+                            template=None, fps: float = 0.0) -> str:
         """Composed prompt (global + covering section) for a single frame."""
         return self.get_prompt_for_range(frame, frame + 1, labels_on=labels_on,
                                          delimiter=delimiter,
-                                         boundary_threshold_pct=boundary_threshold_pct)
+                                         boundary_threshold_pct=boundary_threshold_pct,
+                                         template=template, fps=fps)
 
     def get_prompt_for_range(self, start: int, end: int, labels_on: bool = True,
                              delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER,
-                             boundary_threshold_pct: float = 0.0) -> str:
+                             boundary_threshold_pct: float = 0.0,
+                             template=None, fps: float = 0.0) -> str:
         """Composed single-string prompt for a frame range.
 
         Global lane text + ALL segments overlapping the window in temporal
@@ -1134,11 +1227,16 @@ class Scene:
         global_hidden = getattr(self.global_prompt_track_config, "hidden", False)
         sections_hidden = getattr(self.prompt_track_config, "hidden", False)
         global_text = "" if global_hidden else (self.prompt or "")
+        # Raw, NOT pre-filtered: which global channels apply is a per-section
+        # decision now, and only the composer knows which sections the window
+        # actually reaches.
+        global_channels = None if global_hidden else dict(self.global_channels or {})
         sections = [] if sections_hidden else self.prompt_sections
         return prompt_payload.compose_range_prompt(
             global_text, sections, start, end,
             labels_on=labels_on, delimiter=delimiter,
             boundary_threshold_pct=boundary_threshold_pct,
+            template=template, fps=fps, global_channels=global_channels,
         )
 
     def to_dict(self) -> dict:
@@ -1167,7 +1265,12 @@ class Scene:
             "name": self.name,
             "order": self.order,
             "duration_frames": self.duration_frames,
-            "prompt": self.prompt,
+            # Derived at the persistence boundary, never trusted from the field,
+            # so a stray direct assignment cannot be saved out of step with
+            # the channels that actually compose.
+            "prompt": prompt_payload.compose_section_text(
+                self.global_channels, labels_on=False),
+            "global_channels": dict(self.global_channels),
             "prompt_sections": [p.to_dict() for p in self.prompt_sections],
             "generation_params": self.generation_params,
             "batch_config": self.batch_config.to_dict(),
@@ -1210,6 +1313,10 @@ class Scene:
             order=data.get("order", 0),
             duration_frames=data.get("duration_frames", 0),
             prompt=data.get("prompt", ""),
+            # Absent on a pre-upgrade scene; __post_init__ then seeds the
+            # channels from the flat prompt above.
+            global_channels=(data.get("global_channels")
+                             if isinstance(data.get("global_channels"), dict) else {}),
             generation_params=data.get("generation_params", {}),
             batch_config=BatchConfig.from_dict(data.get("batch_config", {})),
             asset_ids=data.get("asset_ids", []),
