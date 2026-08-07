@@ -96,7 +96,10 @@ def _minimax_template():
                 "channels": {key: f"{key} text" for key in MINIMAX_KEYS},
                 "starts_new_shot": True,
                 "shot_timestamp": False,
-                "subject_ids": ["ref-a", "ref-b"],
+                "subject_ids": [
+                    {"entity_id": "ref-a", "retention": "fully_preserved"},
+                    {"entity_id": "ref-b", "retention": "partially_preserved"},
+                ],
             },
             {
                 "start_frame": 96,
@@ -106,29 +109,94 @@ def _minimax_template():
                 "shot_timestamp": True,
                 "subject_ids": [],
             },
+            {
+                "start_frame": 192,
+                "end_frame": 288,
+                "channels": {key: f"{key} three" for key in MINIMAX_KEYS},
+                "starts_new_shot": True,
+                "shot_timestamp": True,
+                "subject_ids": [
+                    {"entity_id": "ref-c", "retention": "attribute_transfer"},
+                    {"entity_id": "ref-d", "retention": "weak_reference"},
+                ],
+            },
         ],
     }
 
 
+def _binding(entity_id, retention="fully_preserved"):
+    return {"entity_id": entity_id, "retention": retention}
+
+
 def test_six_channel_template_keeps_every_channel():
     [template] = _round_trip([_minimax_template()])
-    assert len(template["sections"]) == 2
-    for index, section in enumerate(template["sections"]):
+    assert len(template["sections"]) == 3
+    for suffix, section in zip(("text", "two", "three"), template["sections"]):
         assert sorted(section["channels"]) == sorted(MINIMAX_KEYS)
-        suffix = "text" if index == 0 else "two"
         for key in MINIMAX_KEYS:
             assert section["channels"][key] == f"{key} {suffix}"
 
 
 def test_round_trip_keeps_per_section_shot_and_subject_fields():
     [template] = _round_trip([_minimax_template()])
-    first, second = template["sections"]
+    first, second, third = template["sections"]
     assert first["starts_new_shot"] is True
     assert first["shot_timestamp"] is False
-    assert first["subject_ids"] == ["ref-a", "ref-b"]
+    # Bindings are `{entity_id, retention}` objects and must survive as such —
+    # the settings normalizer used to String() each one into "[object Object]"
+    # and then dedupe them all into a single entry.
+    assert first["subject_ids"] == [
+        _binding("ref-a"), _binding("ref-b", "partially_preserved")]
     assert second["starts_new_shot"] is False
     assert second["shot_timestamp"] is True
     assert second["subject_ids"] == []
+    # Authored objects survive with their own retention markers intact.
+    assert third["subject_ids"] == [
+        _binding("ref-c", "attribute_transfer"),
+        _binding("ref-d", "weak_reference"),
+    ]
+
+
+def test_round_trip_keeps_distinct_bindings_apart():
+    """The defect that motivated this: every binding String()-ed to the same
+    literal, so the normalizer's own dedupe then collapsed them into one."""
+    template = _minimax_template()
+    template["sections"][0]["subject_ids"] = [
+        {"entity_id": "ref-a", "retention": "fully_preserved"},
+        {"entity_id": "ref-b", "retention": "partially_preserved"},
+        {"entity_id": "ref-c", "retention": "weak_reference"},
+    ]
+    [out] = _round_trip([template])
+    assert out["sections"][0]["subject_ids"] == [
+        _binding("ref-a"),
+        _binding("ref-b", "partially_preserved"),
+        _binding("ref-c", "weak_reference"),
+    ]
+
+
+@pytest.mark.parametrize("stored", [{}, {"entity_id": "ref-a"}, 5, "abc", None, True])
+def test_non_list_subject_ids_never_aborts_the_settings_module(stored):
+    """`normalizeEditorSettings` evaluates at module scope over user-editable
+    localStorage with no try/catch, so a throw here would abort every static
+    importer of editor_settings.js. A string must not iterate per character
+    either. Matches prompt_payload.normalize_subject_ids, which returns []."""
+    template = _minimax_template()
+    template["sections"][0]["subject_ids"] = stored
+    [out] = _round_trip([template])
+    assert out["sections"][0]["subject_ids"] == []
+
+
+def test_bare_string_bindings_are_dropped_not_revived():
+    """A binding is an object. `retention` shipped in the same commit as
+    `subject_ids`, so no bare-string form was ever authored — and the strings
+    actually sitting in dev browser storage are the literal "[object Object]"
+    the pre-fix normalizer wrote. Reviving either would mint a binding to an
+    entity that never existed, one `_prune_prompt_subject_ids` can never clear
+    because it only drops ids that were actually removed."""
+    template = _minimax_template()
+    template["sections"][0]["subject_ids"] = ["[object Object]", "ref-a"]
+    [out] = _round_trip([template])
+    assert out["sections"][0]["subject_ids"] == []
 
 
 def test_round_trip_keeps_global_channels_and_source_template():

@@ -399,9 +399,15 @@ def test_subject_ids_normalizer_dedupes_and_keeps_authored_order():
     assert normalize(None) == []
     assert [entry["entity_id"] for entry in
             normalize([{"entity_id": "b"}, {"entity_id": "a"}, {"entity_id": "b"}])] == ["b", "a"]
-    assert normalize(["a"]) == normalize([{"entity_id": "a"}])
+    # A binding is an OBJECT. There is no bare-string form to accept: retention
+    # shipped in the same commit as subject_ids, so accepting one would only
+    # revive junk such as the "[object Object]" left in dev browser storage.
+    assert normalize(["a", "[object Object]"]) == []
     assert normalize([{"entity_id": "a", "retention": "bogus"}])[0]["retention"] == (
         getattr(pp, "DEFAULT_SUBJECT_RETENTION"))
+    # Malformed containers reach this straight from request bodies; never raise.
+    for malformed in ({}, {"entity_id": "a"}, 5, "abc", True):
+        assert normalize(malformed) == []
 
 
 def test_subject_ids_identity_ignores_order_and_duplicates():

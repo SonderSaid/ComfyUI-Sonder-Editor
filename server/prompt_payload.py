@@ -83,19 +83,32 @@ def normalize_subject_ids(raw) -> list:
 
     The ONE normalizer used by the model, the routes and the identity check.
     Duplicates collapse (first wins) and authored order is preserved, because
-    order is the tie-break when one section binds several subjects. A bare
-    string is accepted as a bindng with the default retention. Unknown
+    order is the tie-break when one section binds several subjects. Unknown
     retention markers fall back to the default rather than reaching the model.
+
+    Non-list in, empty out. This is reached straight from request bodies, and
+    `raw or []` alone was not a guard: an int raised TypeError out of a route,
+    and a bare dict iterated its KEYS, minting a binding to "entity_id".
+
+    A binding is an OBJECT. `retention` shipped in the same commit as
+    `subject_ids`, so a bare-string form never existed in any release or any
+    stored project, and accepting one would only resurrect junk — including the
+    "[object Object]" strings the pre-fix browser settings normalizer left
+    behind, which are dropped here for free because they are not objects.
     """
+    if not isinstance(raw, list):
+        return []
     normalized = []
     seen = set()
-    for entry in raw or []:
-        if isinstance(entry, dict):
-            entity_id = str(entry.get("entity_id") or "").strip()
-            retention = str(entry.get("retention") or "").strip()
-        else:
-            entity_id = str(entry or "").strip()
-            retention = ""
+    for entry in raw:
+        # Ids and markers are always strings. Coercing anything else with str()
+        # also diverged from the JS mirror, which uses `??` and turned 0 into
+        # the id "0" where this returned "".
+        if not isinstance(entry, dict):
+            continue
+        raw_id, raw_retention = entry.get("entity_id"), entry.get("retention")
+        entity_id = raw_id.strip() if isinstance(raw_id, str) else ""
+        retention = raw_retention.strip() if isinstance(raw_retention, str) else ""
         if not entity_id or entity_id in seen:
             continue
         seen.add(entity_id)

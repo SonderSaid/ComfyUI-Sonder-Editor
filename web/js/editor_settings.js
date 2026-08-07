@@ -4,6 +4,11 @@ import {
     getChannelTemplate,
     strictNormalizeChannelTemplate,
 } from "./prompt_channel_templates.js";
+// Subject bindings are `{entity_id, retention}` objects, so they need the
+// canonical normalizer rather than the local string-list one. Both modules are
+// browser-free and the graph stays acyclic (prompt_channel_templates.js is a
+// leaf), so the node-subprocess settings harness still loads this file alone.
+import { normalizeSubjectIds } from "./prompt_composition.js";
 
 // Renamed during the Sonder pivot. No fallback read by design.
 const SETTINGS_STORAGE_KEY = "sonder-editor-settings";
@@ -851,7 +856,10 @@ function normalizePromptTemplates(templates) {
                     channels: normalizeChannelBag(s.channels, s.prompt),
                     starts_new_shot: s.starts_new_shot === true,
                     shot_timestamp: s.shot_timestamp === true,
-                    subject_ids: normalizeIdList(s.subject_ids),
+                    // Binding OBJECTS — normalizeIdList would String() each one
+                    // into "[object Object]" and then dedupe them all into one.
+                    // global_channel_exceptions below genuinely is a string list.
+                    subject_ids: normalizeSubjectIds(s.subject_ids),
                     global_channel_exceptions: normalizeIdList(
                         s.global_channel_exceptions),
                 }))

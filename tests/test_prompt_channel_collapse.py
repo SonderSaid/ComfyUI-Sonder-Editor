@@ -245,3 +245,52 @@ def test_collapse_matches_between_python_and_javascript():
         ".map(([c, from_, to]) => mod.collapseChannelsForTemplate(c, from_, to))")
     assert actual == expected
     assert any(entry.get("visual") for entry in expected)
+
+
+# Malformed shapes matter as much as well-formed ones: this normalizer is
+# reached from `normalizeEditorSettings`, which evaluates at module scope over
+# user-editable localStorage. The JS half used to throw on a non-array and
+# iterate a string per character, while the Python half returned [].
+_SUBJECT_ID_CASES = [
+    [{"entity_id": "ref-a"}, {"entity_id": "ref-b"}],
+    [{"entity_id": "ref-a", "retention": "attribute_transfer"}],
+    [{"entity_id": "ref-a", "retention": "not-a-marker"}],
+    [{"entity_id": "ref-a", "retention": 7}],
+    [{"entity_id": "  ref-a  "}, {"entity_id": ""}],
+    [{"entity_id": "ref-a", "retention": "weak_reference"},
+     {"entity_id": "ref-a", "retention": "attribute_transfer"}],
+    [],
+    # Not bindings. A binding is an object, so bare strings — including the
+    # "[object Object]" the pre-fix settings normalizer wrote — are dropped.
+    ["ref-a", "ref-b"],
+    ["[object Object]"],
+    [None, 0, False, [], ["nested"]],
+    [{"entity_id": 0}, {"entity_id": None}, {"entity_id": ["ref-a"]}],
+    # Malformed containers. These reach the normalizer from request bodies and
+    # from user-editable localStorage, so neither side may raise.
+    {},
+    {"entity_id": "ref-a"},
+    5,
+    "abc",
+    None,
+    True,
+]
+
+
+def test_subject_id_normalization_matches_between_python_and_javascript():
+    expected = [pp.normalize_subject_ids(case) for case in _SUBJECT_ID_CASES]
+    actual = _node_json(
+        f"{json.dumps(_SUBJECT_ID_CASES)}.map((c) => mod.normalizeSubjectIds(c))")
+    assert actual == expected
+    # Anti-vacuity: the fixtures must exercise retention fallback and
+    # first-wins dedupe, not just agree on a pile of empties.
+    default = {"entity_id": "ref-a", "retention": "fully_preserved"}
+    assert expected[0] == [default, {"entity_id": "ref-b",
+                                     "retention": "fully_preserved"}]
+    assert expected[1] == [{"entity_id": "ref-a", "retention": "attribute_transfer"}]
+    assert expected[2] == [default]  # unknown marker falls back
+    assert expected[3] == [default]  # non-string marker falls back
+    assert expected[4] == [default]  # whitespace trimmed, blank dropped
+    assert expected[5] == [{"entity_id": "ref-a", "retention": "weak_reference"}]
+    # Everything from the first non-binding case on yields nothing.
+    assert all(entry == [] for entry in expected[6:])

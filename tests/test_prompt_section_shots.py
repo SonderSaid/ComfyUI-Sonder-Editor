@@ -23,6 +23,11 @@ def _section(start, end, text="a dog walks", **kwargs):
     return PromptSection(start, end, channels={"visual": text}, **kwargs)
 
 
+def _b(*entity_ids):
+    """Subject bindings. A binding is an OBJECT — there is no bare-string form."""
+    return [{"entity_id": entity_id} for entity_id in entity_ids]
+
+
 # --- model ---------------------------------------------------------------------
 
 def test_round_trip_preserves_both_fields():
@@ -47,8 +52,12 @@ def test_tolerant_coercion_of_hand_edited_values():
     section = PromptSection.from_dict({
         "start_frame": 0, "end_frame": 120,
         "starts_new_shot": "yes",
-        # Bare strings, a duplicate, a blank, and an unknown retention marker.
-        "subject_ids": ["ent_a", {"entity_id": "ent_a"}, {"entity_id": ""},
+        # A duplicate, a blank, an unknown retention marker, and two things that
+        # are not bindings at all: a bare string (no such form ever existed —
+        # `retention` shipped in the same commit as `subject_ids`) and the
+        # "[object Object]" the pre-fix browser settings normalizer wrote.
+        "subject_ids": [{"entity_id": "ent_a"}, {"entity_id": "ent_a"},
+                        {"entity_id": ""}, "ent_c", "[object Object]",
                         {"entity_id": "ent_b", "retention": "made_up"}],
     })
     assert section.starts_new_shot is True
@@ -105,9 +114,9 @@ def test_equality_is_sensitive_to_both_fields():
 # --- composition carry-through ---------------------------------------------------
 
 def test_segments_carry_both_fields_from_objects_and_from_raw_dicts():
-    objects = [_section(0, 120, starts_new_shot=True, subject_ids=["ent_a"])]
+    objects = [_section(0, 120, starts_new_shot=True, subject_ids=_b("ent_a"))]
     raw = [{"start_frame": 0, "end_frame": 120, "channels": {"visual": "a dog walks"},
-            "starts_new_shot": True, "subject_ids": ["ent_a"]}]
+            "starts_new_shot": True, "subject_ids": _b("ent_a")}]
     for sections in (objects, raw):
         segments = pp.resolve_segments(sections, 0, 120, labels_on=False)
         assert [s["starts_new_shot"] for s in segments] == [True]
@@ -201,7 +210,7 @@ def test_first_section_may_stamp_zero_when_it_asks():
 
 
 def test_split_keeps_the_flag_left_and_copies_subjects_to_both():
-    left = _section(0, 240, starts_new_shot=True, subject_ids=["ent_a", "ent_b"])
+    left = _section(0, 240, starts_new_shot=True, subject_ids=_b("ent_a", "ent_b"))
     scene = _scene_with(left)
     right = routes._split_prompt_object(scene, left, 120)
 
@@ -219,7 +228,7 @@ def test_split_keeps_the_flag_left_and_copies_subjects_to_both():
 # --- identity validation ------------------------------------------------------------
 
 def test_identity_409_on_mismatch_of_either_field():
-    section = _section(0, 120, starts_new_shot=True, subject_ids=["ent_a"])
+    section = _section(0, 120, starts_new_shot=True, subject_ids=_b("ent_a"))
     routes._validate_prompt_identity(section, section.to_dict())  # must not raise
 
     with pytest.raises(routes.ProjectMutationRequestError):
@@ -234,13 +243,13 @@ def test_identity_409_on_mismatch_of_either_field():
 def test_no_409_when_the_client_omits_the_new_keys():
     # An older client sends the pre-upgrade expected shape; that is agreement
     # about the fields it knows, not a conflict.
-    section = _section(0, 120, starts_new_shot=True, subject_ids=["ent_a"])
+    section = _section(0, 120, starts_new_shot=True, subject_ids=_b("ent_a"))
     routes._validate_prompt_identity(section, {
         "start_frame": 0, "end_frame": 120, "channels": dict(section.channels)})
 
 
 def test_no_409_when_the_client_merely_reordered_subject_bindings():
-    section = _section(0, 120, subject_ids=["ent_a", "ent_b"])
+    section = _section(0, 120, subject_ids=_b("ent_a", "ent_b"))
     routes._validate_prompt_identity(section, {
         "subject_ids": [{"entity_id": "ent_b"}, {"entity_id": "ent_a"},
                         {"entity_id": "ent_b"}]})
@@ -254,7 +263,7 @@ def test_create_and_update_carry_both_fields():
     scene.prompt_sections = []
     created = routes._apply_create_prompt_section(scene, {
         "start_frame": 0, "end_frame": 120, "channels": {"visual": "x"},
-        "starts_new_shot": True, "shot_timestamp": False, "subject_ids": ["ent_a"],
+        "starts_new_shot": True, "shot_timestamp": False, "subject_ids": _b("ent_a"),
     })
     assert created.starts_new_shot is True
     assert created.shot_timestamp is False
@@ -327,8 +336,8 @@ def test_deleting_an_entity_prunes_its_bindings_across_every_scene():
         scene = Scene(scene_id=f"scene-{index}", duration_frames=360)
         scene.prompt_track_config = LaneConfig()
         scene.prompt_sections = [
-            _section(0, 120, subject_ids=[entity.reference_id, "ent_keep"]),
-            _section(120, 240, subject_ids=["ent_keep"]),
+            _section(0, 120, subject_ids=_b(entity.reference_id, "ent_keep")),
+            _section(120, 240, subject_ids=_b("ent_keep")),
         ]
         project.scenes.append(scene)
 
@@ -343,7 +352,7 @@ def test_pruning_nothing_touches_nothing():
     project = TimelineProject(name="Project")
     scene = Scene(scene_id="scene-0", duration_frames=360)
     scene.prompt_track_config = LaneConfig()
-    scene.prompt_sections = [_section(0, 120, subject_ids=["ent_keep"])]
+    scene.prompt_sections = [_section(0, 120, subject_ids=_b("ent_keep"))]
     project.scenes.append(scene)
     assert routes._prune_prompt_subject_ids(project, set()) == []
     assert routes._prune_prompt_subject_ids(project, {"ent_other"}) == []
