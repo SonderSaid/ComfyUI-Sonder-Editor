@@ -280,7 +280,7 @@ REFERENCE_RECIPE_FIELDS = (
          "reference_idx": "Frame index each member occupies in the assembled sequence. Only temporal layouts place references in time; unchecked emits 0.",
          "reference_strength": "Conditioning strength for the set. Unchecked emits 0.0.",
          "reference_audio": "Trimmed audio from an audio lane. Unchecked emits the required silent fallback, never None.",
-         "reference_prompt": "Text derived from the staged members, or the item's override. Unchecked emits an empty string.",
+         "reference_prompt": "Text derived from the staged members, or the item's override. It also drives the whole p01-p16 block, which carries the same composition split per member. Unchecked emits an empty string and collapses that block.",
          "reference_names": "Library names of the staged members in slot order. Unchecked emits an empty string.",
          "context": "A background member routed out of the main set, for mechanisms with a dedicated background input. Unchecked emits a black frame.",
          "slots": "The whole r01-r16 block. Unchecked collapses it to no slots at all.",

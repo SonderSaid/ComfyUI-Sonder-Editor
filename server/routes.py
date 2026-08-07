@@ -8787,17 +8787,28 @@ if routes is not None:
             materialized = getattr(recipe, "recipe", {}) or {}
             hard = materialized.get("hard") if isinstance(materialized.get("hard"), dict) else {}
             live = reference_live_outputs(hard)
+            media_kind = getattr(recipe, "media_kind", "image")
             rows.append({
                 "lane_index": lane_index,
                 "lane_name": getattr(configs[lane_index], "name", "") or f"Reference {lane_index + 1}",
                 "hidden": bool(getattr(configs[lane_index], "hidden", False)),
-                "media_kind": getattr(recipe, "media_kind", "image"),
+                "media_kind": media_kind,
                 "recipe_id": getattr(recipe, "recipe_id", ""),
                 "recipe_name": str(materialized.get("name", "") or "Detached / Custom"),
                 "item_count": len(lane_items),
                 "member_count": min(16, member_count),
                 # Recipes that do not consume the r-block show no slots at all.
                 "slot_count": min(16, member_count) if "slots" in live else 0,
+                # The p-block is gated on reference_prompt ALONE, never on
+                # slots: five presets (Ingredients, Best Face ID, VACE, Phantom,
+                # SCAIL) drive per-member text without touching the r-block, and
+                # folding the two counts together marked their real output
+                # unused. The audio term mirrors decode_reference_set's audio
+                # branch in nodes/reference_core.py, which passes no
+                # slot_prompts, so that p-block genuinely is empty.
+                "prompt_slot_count": (min(16, member_count)
+                                      if "reference_prompt" in live and media_kind != "audio"
+                                      else 0),
                 "live_outputs": sorted(live),
                 "member_tags": lane_tags,
             })

@@ -388,11 +388,42 @@ results.lean = describe(lean);
 // sits behind the r-block, so trimming an r-slot used to slide p01 into an
 // r-block position and deliver an image tensor from a STRING socket.
 const trimmed = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(trimmed, {{ slotCount: 1, liveOutputs: ['slots', 'reference_prompt'] }});
+shape(trimmed, {{ slotCount: 1, promptSlotCount: 1, liveOutputs: ['slots', 'reference_prompt'] }});
 results.slotNames = trimmed.outputs.map((s) => s.name);
 results.r02Label = trimmed.outputs.find((s) => s.name === 'r02').label;
 results.p01Label = trimmed.outputs.find((s) => s.name === 'p01').label;
 results.p02Label = trimmed.outputs.find((s) => s.name === 'p02').label;
+
+// The five presets that drive per-member TEXT without touching the r-block:
+// Ingredients, Best Face ID, VACE, Phantom and SCAIL. The p-block is gated on
+// reference_prompt alone, so it must go live while every r-slot stays marked.
+const promptOnly = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(promptOnly, {{ slotCount: 0, promptSlotCount: 2,
+                     liveOutputs: ['reference_frames', 'reference_prompt', 'reference_names'] }});
+results.promptOnly = ['p01', 'p02', 'p03', 'r01'].map(
+  (n) => promptOnly.outputs.find((s) => s.name === n).label);
+
+// Relaxing the COUNT on an absent promptSlotCount must not relax the LIVENESS.
+// A recipe that genuinely omits reference_prompt still marks the whole p-block.
+const noPromptLive = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(noPromptLive, {{ slotCount: 1, liveOutputs: ['slots', 'reference_names'] }});
+results.noPromptLive = ['p01', 'p16'].map(
+  (n) => noPromptLive.outputs.find((s) => s.name === n).label);
+
+// A payload with no promptSlotCount at all is "we don't know", not "zero" —
+// the old server field, or a response in flight across a version change.
+const absentCount = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(absentCount, {{ slotCount: 0, liveOutputs: ['reference_prompt'] }});
+results.absentCount = ['p01', 'p16', 'r01'].map(
+  (n) => absentCount.outputs.find((s) => s.name === n).label);
+
+// The audio lane: routes reports 0 because decode_reference_set's audio branch
+// passes no slot_prompts, so the p-block really is empty and must say so.
+const audioLane = makeNode([...FIXED_OUTPUT_NAMES]);
+shape(audioLane, {{ slotCount: 0, promptSlotCount: 0,
+                    liveOutputs: ['reference_audio', 'reference_prompt', 'reference_names'] }});
+results.audioLane = ['p01', 'p02'].map(
+  (n) => audioLane.outputs.find((s) => s.name === n).label);
 
 // A connected dead FIXED output is still marked. Wiring says the user
 // connected something, not that the recipe drives it — the slot emits a
@@ -443,8 +474,9 @@ results.markCycle = [markedCount, markedFixed()];
 
 // Idempotent.
 const stable = makeNode([...FIXED_OUTPUT_NAMES]);
-shape(stable, {{ slotCount: 2, liveOutputs: ['reference_frames'] }});
-results.secondRunChanged = shape(stable, {{ slotCount: 2, liveOutputs: ['reference_frames'] }});
+shape(stable, {{ slotCount: 2, promptSlotCount: 2, liveOutputs: ['reference_frames'] }});
+results.secondRunChanged = shape(stable, {{ slotCount: 2, promptSlotCount: 2,
+                                            liveOutputs: ['reference_frames'] }});
 
 console.log(JSON.stringify(results));
 """
@@ -483,6 +515,18 @@ console.log(JSON.stringify(results));
     assert out["slotsMode"] == ["reference_frames (unused)", "reference_frames (unused)"]
     assert out["markCycle"] == [6, 0], "marks must clear when liveness is unknown again"
     assert out["secondRunChanged"] is False
+
+    # The p-block is gated on reference_prompt ALONE. Five presets drive
+    # per-member text without the r-block; folding both into one count marked
+    # real output unused (nodes/reference_core.py fills p01..pN whenever
+    # reference_prompt is live, independent of slots).
+    assert out["promptOnly"] == ["p01", "p02", "p03 (unused)", "r01 (unused)"]
+    # Absent means "we don't know", so only the COUNT relaxes. Liveness is
+    # untouched: a recipe omitting reference_prompt still marks the whole block.
+    assert out["noPromptLive"] == ["p01 (unused)", "p16 (unused)"]
+    assert out["absentCount"] == ["p01", "p16", "r01 (unused)"]
+    # An audio lane's p-block genuinely is empty and must keep saying so.
+    assert out["audioLane"] == ["p01 (unused)", "p02 (unused)"]
 
 
 def test_bridge_shape_module_stays_free_of_browser_imports():

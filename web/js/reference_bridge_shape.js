@@ -170,14 +170,17 @@ function markOutput(slot, live, metadata, { ignoreConnection = false } = {}) {
  * Every output stays present at its declared index; unused ones are relabelled.
  * See the module header for why nothing may be removed.
  *
- * @param shape.slotCount   staged member count — r/p slots above it read as unused
- * @param shape.liveOutputs fixed output names the recipe drives, or null for "show everything"
- * @param options.metadata  Map of name -> {type,label,tooltip} captured at node creation
- * @param options.order     canonical name order; defaults to the tuple order
+ * @param shape.slotCount        staged member count for the r-block — r slots above it read as unused
+ * @param shape.promptSlotCount  staged member count for the p-block; absent means "we don't know"
+ * @param shape.liveOutputs      fixed output names the recipe drives, or null for "show everything"
+ * @param options.metadata       Map of name -> {type,label,tooltip} captured at node creation
+ * @param options.order          canonical name order; defaults to the tuple order
  * @returns true when anything visible changed
  */
 export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order = null } = {}) {
-    const { slotCount = 0, liveOutputs = null } = typeof shape === "number" ? { slotCount: shape } : (shape || {});
+    const {
+        slotCount = 0, promptSlotCount = undefined, liveOutputs = null,
+    } = typeof shape === "number" ? { slotCount: shape } : (shape || {});
     const canonical = order || canonicalOutputOrder();
     const signature = () => (node.outputs || [])
         .map((slot) => `${slot?.name}:${slot?.label ?? ""}:${slot?.localized_name ?? ""}`).join("|");
@@ -187,14 +190,28 @@ export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order 
         Math.min(MAX_REFERENCE_SLOTS, parseInt(slotCount, 10) || 0),
         connectedSlotCeiling(node),
     );
+    // The p-block has its OWN count. Folding it into `staged` meant a recipe
+    // driving reference_prompt without the r-block reported zero slots and
+    // marked real per-member text as unused. Absent means "we don't know", so
+    // the COUNT relaxes to the full block — but only the count: the
+    // `reference_prompt` liveness check below still applies, and a null
+    // `liveOutputs` still means show everything unmarked.
+    const promptStaged = promptSlotCount === undefined || promptSlotCount === null
+        ? MAX_REFERENCE_SLOTS
+        : Math.max(
+            0,
+            Math.min(MAX_REFERENCE_SLOTS, parseInt(promptSlotCount, 10) || 0),
+        );
     const live = Array.isArray(liveOutputs) ? new Set(liveOutputs) : null;
 
     for (const name of FIXED_OUTPUT_NAMES) {
         ensureOutput(node, name, metadata, canonical);
         // Fixed outputs mark on liveness alone. The numbered blocks below keep
         // the connection guard: they are what the socket-pair reorder will
-        // redesign, and `connectedSlotCeiling` already folds wired r-slots into
-        // `staged` there, so changing them is a separate decision.
+        // redesign, so changing them is a separate decision. Note
+        // `connectedSlotCeiling` reads SLOT_NAME_RE, which is r-only, so it
+        // raises `staged` but never `promptStaged` — a wired p-slot is protected
+        // by markOutput's own connection guard instead.
         markOutput(node.outputs[outputIndex(node, name)], live, metadata,
                    { ignoreConnection: true });
     }
@@ -212,7 +229,7 @@ export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order 
     }
     for (let index = 1; index <= MAX_REFERENCE_SLOTS; index++) {
         const imageLive = live ? (live.has("slots") && index <= staged) : true;
-        const textLive = live ? (live.has("reference_prompt") && index <= staged) : true;
+        const textLive = live ? (live.has("reference_prompt") && index <= promptStaged) : true;
         markOutput(node.outputs[outputIndex(node, slotName(index))], imageLive ? null : new Set(), metadata);
         markOutput(node.outputs[outputIndex(node, promptSlotName(index))], textLive ? null : new Set(), metadata);
     }

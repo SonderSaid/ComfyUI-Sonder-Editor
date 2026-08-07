@@ -72,7 +72,11 @@ function upstreamSelector(node) {
 
 // "Show everything": used whenever the project cannot be resolved, so a slow or
 // unwired editor never presents itself as a node with missing outputs.
-const FULL_SHAPE = { slotCount: MAX_REFERENCE_SLOTS, liveOutputs: null };
+const FULL_SHAPE = {
+    slotCount: MAX_REFERENCE_SLOTS,
+    promptSlotCount: MAX_REFERENCE_SLOTS,
+    liveOutputs: null,
+};
 
 async function referenceShapeForBridge(node) {
     const selector = upstreamSelector(node);
@@ -107,6 +111,13 @@ async function referenceShapeForBridge(node) {
         // slot_count is member count gated by the lane recipe's output liveness:
         // recipes that never drive the r-block resolve to zero slots.
         slotCount: Math.max(0, parseInt(lane.slot_count ?? lane.member_count, 10) || 0),
+        // The p-block is gated separately, on reference_prompt. Absent must stay
+        // UNDEFINED and not collapse through `|| 0`, or a payload from a server
+        // that predates the field would mark every live p-slot unused — exactly
+        // the bug the separate count exists to fix.
+        promptSlotCount: lane.prompt_slot_count === undefined || lane.prompt_slot_count === null
+            ? undefined
+            : Math.max(0, parseInt(lane.prompt_slot_count, 10) || 0),
         liveOutputs: Array.isArray(lane.live_outputs) ? lane.live_outputs : null,
     };
 }

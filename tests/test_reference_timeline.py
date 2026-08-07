@@ -1,3 +1,4 @@
+import asyncio
 import json
 import shutil
 import subprocess
@@ -271,3 +272,80 @@ console.log(JSON.stringify({json.dumps(hards)}.map(h => [...mod.referenceLiveOut
             assert live == {"reference_audio", "reference_prompt", "reference_names"}
         else:
             assert "reference_audio" not in live
+
+
+# --- bridge-references payload ------------------------------------------------
+
+def _bridge_reference_rows(monkeypatch, preset_id, member_count=2):
+    """Call the real GET handler for a lane staging `member_count` members."""
+    import importlib
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+
+    import server
+    import server.routes as routes_module
+    from server.timeline_state import REFERENCE_RECIPE_PRESETS
+
+    monkeypatch.setattr(
+        server, "PromptServer",
+        SimpleNamespace(instance=SimpleNamespace(routes=web.RouteTableDef())),
+        raising=False)
+    module = importlib.reload(routes_module)
+
+    preset = next(p for p in REFERENCE_RECIPE_PRESETS if p["id"] == preset_id)
+    asset_type = "audio" if preset["media_kind"] == "audio" else "image"
+    assets, members = [], []
+    for index in range(member_count):
+        assets.append(Asset(asset_id=f"asset-{index}", name=f"A{index}",
+                            asset_type=asset_type, path=f"media/{index}.{asset_type}"))
+        members.append(ReferenceMember(member_id=f"member-{index}", asset_id=f"asset-{index}"))
+    reference = ReferenceEntity(reference_id="entity-1", name="Subject", members=members)
+    scene = Scene(
+        scene_id="scene-1", duration_frames=100,
+        reference_lane_count=1, reference_lane_configs=[LaneConfig()],
+        reference_lane_recipes=[ReferenceLaneRecipe(
+            media_kind=preset["media_kind"], recipe_id=preset["id"],
+            recipe={k: v for k, v in preset.items() if k != "id"})],
+        reference_items=[ReferenceItem(
+            reference_item_id="item-1", lane_index=0, start_frame=0, end_frame=-1,
+            members=[{"entity_id": "entity-1", "member_id": m.member_id} for m in members])],
+    )
+    project = TimelineProject(project_id="project-1", assets=assets,
+                              references=[reference], scenes=[scene])
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+
+    handler = next(r.handler for r in module.routes
+                   if r.method == "GET" and r.path.endswith("/bridge-references"))
+    request = make_mocked_request(
+        "GET", "/sonder-editor/project/project-1/scenes/scene-1/bridge-references")
+    request.match_info.update({"project_id": "project-1", "scene_id": "scene-1"})
+    response = asyncio.run(handler(request))
+    assert response.status == 200
+    return json.loads(response.text)["references"][0]
+
+
+def test_bridge_references_gates_the_prompt_block_apart_from_the_r_block(monkeypatch):
+    """The p-block follows reference_prompt ALONE.
+
+    `_bridge_tuple` fills p01..pN whenever reference_prompt is live, regardless
+    of `slots`, and the image path always passes slot_prompts. Reusing
+    `slot_count` for both meant five presets that drive per-member text without
+    the r-block reported zero and the canvas marked real output unused.
+    """
+    # Drives both blocks: counts agree.
+    both = _bridge_reference_rows(monkeypatch, "sonder:wan_bernini")
+    assert both["slot_count"] == 2 and both["prompt_slot_count"] == 2
+
+    # Drives text but never the r-block — the reported bug.
+    text_only = _bridge_reference_rows(monkeypatch, "sonder:wan_vace")
+    assert text_only["slot_count"] == 0, "VACE composites; it drives no r-slot"
+    assert text_only["prompt_slot_count"] == 2, "but its per-member text is real"
+
+    # The audio lane is NOT the same case: decode_reference_set's audio branch
+    # passes no slot_prompts, so its p-block genuinely is empty.
+    audio = _bridge_reference_rows(monkeypatch, "sonder:ltx_id_lora_audio", member_count=1)
+    assert audio["media_kind"] == "audio"
+    assert "reference_prompt" in audio["live_outputs"]
+    assert audio["slot_count"] == 0 and audio["prompt_slot_count"] == 0
