@@ -1,5 +1,5 @@
-// Channel Template editor — centered overlay for editing the project's prompt
-// channel set: the channel keys and their headers, per-channel authoring
+// Channel Template editor — centered overlay for creating and copying catalog
+// templates or editing one template's channel keys, headers, per-channel authoring
 // guidance, the shot-marker channel, the label policy, the separators between
 // fields, and whether the scene-global prompt is authored per channel.
 //
@@ -7,13 +7,11 @@
 // networking, and durable writes; this module owns its DOM/listeners and
 // returns a cleanup handle. Host surface used:
 //   _channelTemplate(), _promptChannelTemplateOptions(),
-//   _setPromptChannelTemplate(templateOrId), _keyboardConsumerId(suffix)
+//   _savePromptChannelTemplate(template, options), _keyboardConsumerId(suffix)
 //
-// Saving goes through the SAME path a preset switch does, so editing the
-// channel set collapses and re-splits every section's text exactly as a switch
-// would. That is not incidental: renaming or removing a channel key IS a
-// template switch as far as authored text is concerned, and routing it
-// anywhere else would leave text stranded under a key nothing reads.
+// Built-ins are read-only and can only be copied. Catalog edits are browser-local;
+// when the edited custom is active, the host also updates the project through the
+// same switch transaction so renamed or removed keys cannot strand authored text.
 
 import {
     EDITOR_COLORS as COLORS,
@@ -32,10 +30,8 @@ import {
     GLOBAL_MERGE_PER_CHANNEL,
     LABELS_ALWAYS,
     LABELS_NEVER,
-    LABELS_PROJECT,
     normalizeChannelTemplate,
 } from "./prompt_channel_templates.js";
-import { notifyWarning } from "./editor_notifications.js";
 
 const CUSTOM_ID_PREFIX = "custom:";
 
@@ -52,7 +48,6 @@ const LABEL_SEPARATORS = [
     { value: ":\n", label: "Colon + newline — field:⏎text" },
 ];
 const LABEL_POLICIES = [
-    { value: LABELS_PROJECT, label: "Follow the project's Channel Labels toggle" },
     { value: LABELS_ALWAYS, label: "Always write field names" },
     { value: LABELS_NEVER, label: "Never write field names" },
 ];
@@ -71,7 +66,8 @@ function draftFrom(template) {
         })),
         field_separator: template.field_separator ?? " ",
         label_separator: template.label_separator ?? " ",
-        labels: template.labels ?? LABELS_PROJECT,
+        labels: [LABELS_ALWAYS, LABELS_NEVER].includes(template.labels)
+            ? template.labels : LABELS_NEVER,
         shot_marker_channel: template.shot_marker_channel ?? "",
         global_merge: template.global_merge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: template.global_channels_enabled !== false,
@@ -104,11 +100,29 @@ export function validateTemplateDraft(draft) {
     return errors;
 }
 
-/** The template dict a draft saves as. Forks keep a stable custom id. */
-export function templateFromDraft(draft, { fork = false } = {}) {
-    const id = fork || !String(draft.id || "").startsWith(CUSTOM_ID_PREFIX)
-        ? `${CUSTOM_ID_PREFIX}${slug(draft.name)}`
-        : draft.id;
+export function mintCustomTemplateId(name, usedIds = []) {
+    const base = `${CUSTOM_ID_PREFIX}${slug(name)}`;
+    const used = new Set(usedIds || []);
+    let candidate = base;
+    let suffix = 2;
+    while (used.has(candidate)) {
+        candidate = `${base}-${suffix}`;
+        suffix += 1;
+    }
+    return candidate;
+}
+
+/** The template dict a draft saves as. Edits retain ids; copies mint now. */
+export function templateFromDraft(draft, {
+    fork = false,
+    mode = fork ? "copy" : "edit",
+    usedIds = [],
+} = {}) {
+    const retainId = mode === "edit"
+        && String(draft.id || "").startsWith(CUSTOM_ID_PREFIX);
+    const id = retainId
+        ? draft.id
+        : mintCustomTemplateId(draft.name, usedIds);
     return normalizeChannelTemplate({
         ...draft,
         id,
@@ -120,12 +134,28 @@ export function templateFromDraft(draft, { fork = false } = {}) {
     });
 }
 
+function blankDraft() {
+    return {
+        id: "",
+        name: "New Channel Template",
+        description: "",
+        builtin: false,
+        channels: [{ key: "prompt", label: "", description: "The prompt text." }],
+        field_separator: " ",
+        label_separator: " ",
+        labels: LABELS_NEVER,
+        shot_marker_channel: "",
+        global_merge: GLOBAL_MERGE_LEADING,
+        global_channels_enabled: false,
+    };
+}
+
 function slug(name) {
     return String(name || "custom").toLowerCase().replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") || "custom";
 }
 
-export function mountChannelTemplateEditor(host) {
+export function mountChannelTemplateEditor(host, { template = null, mode = "edit" } = {}) {
     const backdrop = document.createElement("div");
     backdrop.style.cssText = `
         position: fixed; inset: 0; z-index: 10001;
@@ -141,7 +171,15 @@ export function mountChannelTemplateEditor(host) {
     panel.style.fontFamily = FONT;
     backdrop.appendChild(panel);
 
-    const state = { draft: draftFrom(host._channelTemplate()), error: "", busy: false };
+    const source = template || host._channelTemplate();
+    const initialDraft = mode === "new" ? blankDraft() : draftFrom(source);
+    if (mode === "copy") {
+        initialDraft.id = "";
+        initialDraft.name = `${initialDraft.name} Copy`;
+        initialDraft.builtin = false;
+    }
+    const state = { draft: initialDraft, mode, error: "", busy: false };
+    const isReadOnly = () => state.mode === "edit" && state.draft.builtin;
 
     const makeBtn = (text, title, variant = "subtle") => {
         const btn = document.createElement("button");
@@ -165,6 +203,7 @@ export function mountChannelTemplateEditor(host) {
         el.value = value ?? "";
         el.placeholder = placeholder;
         el.style.cssText = `${chromeInputCss({ padding: "4px 6px", textAlign: "left" })} width:${width};`;
+        el.disabled = isReadOnly();
         el.addEventListener("keydown", (e) => e.stopPropagation());
         return el;
     };
@@ -178,6 +217,7 @@ export function mountChannelTemplateEditor(host) {
             el.appendChild(opt);
         }
         el.value = value;
+        el.disabled = isReadOnly();
         el.addEventListener("keydown", (e) => e.stopPropagation());
         return el;
     };
@@ -206,18 +246,18 @@ export function mountChannelTemplateEditor(host) {
 
     function render() {
         const draft = state.draft;
-        title.textContent = draft.builtin
-            ? `Channel Template — ${draft.name} (built-in)`
-            : `Channel Template — ${draft.name}`;
+        const modeLabel = state.mode === "new"
+            ? "New Channel Template"
+            : (state.mode === "copy" ? "Save as Custom" : `Channel Template — ${draft.name}`);
+        title.textContent = draft.builtin ? `${modeLabel} (built-in)` : modeLabel;
         body.replaceChildren();
         footer.replaceChildren();
 
         if (draft.builtin) {
             const note = document.createElement("div");
             note.style.cssText = `font-size:10px; color:${COLORS.textDim}; line-height:1.45;`;
-            note.textContent = "Built-in templates are read-only. Editing anything here"
-                + " saves a project copy you own; the built-in stays available under"
-                + " Reset.";
+            note.textContent = "Built-in templates are read-only. Save as Custom creates"
+                + " an independent browser-local copy; the shipped preset never changes.";
             body.appendChild(note);
         }
         if (state.error) {
@@ -250,6 +290,7 @@ export function mountChannelTemplateEditor(host) {
             "The ordered set of fields every prompt section authors.");
         channelsTitle.style.flex = "1";
         const addBtn = makeBtn("+ Channel", "Append a channel to this template");
+        addBtn.disabled = isReadOnly();
         addBtn.addEventListener("click", () => {
             draft.channels.push({ key: "", label: "", description: "" });
             render();
@@ -282,18 +323,19 @@ export function mountChannelTemplateEditor(host) {
             labelCol.append(label("Header"), labelInput);
 
             const upBtn = makeBtn("↑", "Move this channel earlier");
-            upBtn.disabled = index === 0;
+            upBtn.disabled = isReadOnly() || index === 0;
             upBtn.addEventListener("click", () => {
                 draft.channels.splice(index - 1, 0, draft.channels.splice(index, 1)[0]);
                 render();
             });
             const downBtn = makeBtn("↓", "Move this channel later");
-            downBtn.disabled = index === draft.channels.length - 1;
+            downBtn.disabled = isReadOnly() || index === draft.channels.length - 1;
             downBtn.addEventListener("click", () => {
                 draft.channels.splice(index + 1, 0, draft.channels.splice(index, 1)[0]);
                 render();
             });
             const delBtn = makeBtn("✕", "Remove this channel", "danger");
+            delBtn.disabled = isReadOnly();
             delBtn.addEventListener("click", () => {
                 draft.channels.splice(index, 1);
                 render();
@@ -304,6 +346,7 @@ export function mountChannelTemplateEditor(host) {
             guidance.value = channel.description;
             guidance.placeholder = "Authoring guidance — shown as this field's tooltip";
             guidance.rows = 2;
+            guidance.disabled = isReadOnly();
             guidance.style.cssText = `${chromeInputCss({ padding: "4px 6px", textAlign: "left" })} width:100%; resize:vertical; line-height:1.4; font-size:10px;`;
             guidance.addEventListener("input", () => { channel.description = guidance.value; });
             guidance.addEventListener("keydown", (e) => e.stopPropagation());
@@ -324,8 +367,8 @@ export function mountChannelTemplateEditor(host) {
             return col;
         };
         shapeRow.append(
-            mk("Field names", "A named-field format must own its labels, or the"
-                + " project's Channel Labels toggle could strip them.",
+            mk("Field names", "Whether composed output always writes each channel's"
+                + " header or emits plain field text.",
                 LABEL_POLICIES, draft.labels, (v) => { draft.labels = v; }),
             mk("Shot markers in", "The body field that carries [Shot N] and cut times."
                 + " No channel means this template places no shot markers.",
@@ -345,6 +388,7 @@ export function mountChannelTemplateEditor(host) {
         const globalBox = document.createElement("input");
         globalBox.type = "checkbox";
         globalBox.checked = draft.global_channels_enabled;
+        globalBox.disabled = isReadOnly();
         globalBox.style.marginTop = "2px";
         globalBox.addEventListener("keydown", (e) => e.stopPropagation());
         globalBox.addEventListener("change", () => {
@@ -366,51 +410,39 @@ export function mountChannelTemplateEditor(host) {
         body.appendChild(globalWrap);
 
         // ── Footer ────────────────────────────────────────────────────
-        const resetBtn = makeBtn("Reset to built-in", "Point this project back at a built-in preset");
-        resetBtn.addEventListener("click", () => { void resetToPreset(); });
         const spacer = document.createElement("div");
         spacer.style.flex = "1";
         const cancelBtn = makeBtn("Cancel", "Close without saving");
         cancelBtn.addEventListener("click", () => close());
-        const saveBtn = makeBtn(draft.builtin ? "Save as custom" : "Save", "Apply this channel set to the project", "primary");
+        const saveLabel = draft.builtin || state.mode === "copy"
+            ? "Save as Custom"
+            : (state.mode === "new" ? "Create" : "Save");
+        const saveBtn = makeBtn(saveLabel, "Save this template to your catalog", "primary");
         saveBtn.disabled = state.busy;
         saveBtn.addEventListener("click", () => { void save(); });
-        footer.append(resetBtn, spacer, cancelBtn, saveBtn);
+        footer.append(spacer, cancelBtn, saveBtn);
     }
 
     async function save() {
         state.error = "";
         const errors = validateTemplateDraft(state.draft);
         if (errors.length) { state.error = errors[0]; render(); return; }
-        const next = templateFromDraft(state.draft, { fork: state.draft.builtin });
+        const saveMode = state.draft.builtin ? "copy" : state.mode;
+        const usedIds = (host._promptChannelTemplateOptions?.() || [])
+            .map((option) => option.id)
+            .filter((id) => !(saveMode === "edit" && id === state.draft.id));
+        const next = templateFromDraft(state.draft, { mode: saveMode, usedIds });
         state.busy = true;
         render();
         try {
-            const ok = await host._setPromptChannelTemplate(next);
+            const ok = await host._savePromptChannelTemplate(next, {
+                updateActive: saveMode === "edit",
+            });
             if (ok) close();
         } finally {
             state.busy = false;
             if (backdrop.isConnected) render();
         }
-    }
-
-    async function resetToPreset() {
-        const options = host._promptChannelTemplateOptions?.() || [];
-        const names = options.map((option) => `${option.id} — ${option.name}`).join("\n");
-        const requested = window.prompt(
-            `Reset this project to a built-in template?\n\n${names}\n\n`
-            + "Type the id to use. Section text is rewritten the same way a"
-            + " template switch rewrites it, so nothing is lost.",
-            options[0]?.id || "");
-        if (requested == null) return;
-        const id = String(requested).trim();
-        if (!options.some((option) => option.id === id)) {
-            notifyWarning(`No built-in template with the id "${id}".`,
-                          { source: "channel-template-reset" });
-            return;
-        }
-        const ok = await host._setPromptChannelTemplate(id);
-        if (ok) close();
     }
 
     let released = false;

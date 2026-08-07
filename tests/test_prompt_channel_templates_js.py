@@ -129,6 +129,58 @@ def test_template_resolution_matches_between_python_and_javascript():
     assert expected[0] != expected[2], "expected distinct templates in the fixtures"
 
 
+def test_custom_id_resolution_uses_the_catalog_instead_of_defaulting():
+    actual = _node_json(
+        "mod.getChannelTemplate('custom:mine', [{id:'custom:mine', name:'Mine',"
+        " channels:[{key:'body', label:'Body'}], labels:'always'}])")
+    assert actual["id"] == "custom:mine"
+    assert [entry["key"] for entry in actual["channels"]] == ["body"]
+
+
+def test_catalog_lists_active_custom_once_and_keeps_an_orphan_active():
+    custom = {"id": "custom:mine", "name": "Mine",
+              "channels": [{"key": "body", "label": "Body"}],
+              "labels": "always"}
+    present = _node_json(
+        f"mod.mergeChannelTemplateCatalog([{json.dumps(custom)}], {json.dumps(custom)})"
+        ".map((entry) => entry.id)")
+    orphan = _node_json(
+        f"mod.mergeChannelTemplateCatalog([], {json.dumps(custom)})"
+        ".map((entry) => entry.id)")
+    assert present == ["custom:mine"]
+    assert orphan == ["custom:mine"]
+
+
+def test_project_and_job_projections_split_for_builtins():
+    actual = _node_json(
+        "({project: mod.projectTemplateValue('sonder'),"
+        " job: mod.templateFreezeValue('sonder')})")
+    assert actual["project"] == "sonder"
+    assert actual["job"]["id"] == "sonder"
+    assert [entry["key"] for entry in actual["job"]["channels"]] == [
+        "visual", "speech", "sounds"]
+
+
+def test_retarget_guard_compares_channel_key_sets_not_ids_or_order():
+    actual = _node_json(
+        "(() => { const a={id:'custom:a',channels:[{key:'x'},{key:'y'}]};"
+        " const b={id:'custom:b',channels:[{key:'y'},{key:'x'}]};"
+        " const c={id:'custom:a',channels:[{key:'x'},{key:'z'}]};"
+        " return [mod.channelTemplateKeySetsEqual(a,b),"
+        " mod.channelTemplateKeySetsEqual(a,c)]; })()")
+    assert actual == [True, False]
+
+
+def test_strict_normalizer_rejects_and_fallback_is_mutation_safe():
+    actual = _node_json(
+        "(() => { const bad = mod.strictNormalizeChannelTemplate({channels:[]});"
+        " const fallback = mod.normalizeChannelTemplate({channels:[]});"
+        " fallback.labels = 'never'; fallback.channels[0].label = 'changed';"
+        " const fresh = mod.getChannelTemplate('sonder');"
+        " return {bad, labels:fresh.labels, label:fresh.channels[0].label}; })()")
+    assert actual == {"bad": None, "labels": "always", "label": "[VISUAL]:"}
+
+
 _LABEL_CASES = [["minimax_h3_ref", False], ["minimax_h3_ref", True],
                 ["standard", True], ["standard", False],
                 ["sonder", True], ["sonder", False]]

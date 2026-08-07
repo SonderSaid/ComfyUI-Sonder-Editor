@@ -527,9 +527,9 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
     self-contained, so the bridge keeps per-segment labels.
 
     `template` selects the channel set, labels, and the separators between
-    fields; None is the default three-channel behavior, byte for byte. The
-    template OWNS the label policy, because `labels_on` defaults to False at
-    every read site and a named-field format with no field names is prose soup.
+    fields; None is the default three-channel behavior. The template owns the
+    label policy. `labels_on` remains an explicit compatibility input for legacy
+    templates/jobs whose frozen policy is `project`; current presets never use it.
 
     `fps` is consumed by shot-marker timestamps and is inert for a template
     that declares no shot-marker channel.

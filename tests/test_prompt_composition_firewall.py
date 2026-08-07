@@ -18,7 +18,17 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server import prompt_payload as pp
+from server import prompt_channel_templates as pct
 from server.timeline_state import PromptSection
+
+
+_LABEL_TEMPLATE = pct.get_channel_template("sonder")
+_PLAIN_TEMPLATE = pct.normalize_channel_template({
+    **{key: value for key, value in _LABEL_TEMPLATE.items() if key != "builtin"},
+    "id": "custom:firewall-label-free",
+    "channels": [dict(channel) for channel in _LABEL_TEMPLATE["channels"]],
+    "labels": pct.LABELS_NEVER,
+})
 
 
 # --- fixture ------------------------------------------------------------------
@@ -108,7 +118,8 @@ def test_compose_range_prompt_grid_is_byte_identical():
     produced = [
         (label, pp.compose_range_prompt(global_text, sections, start, end,
                                         labels_on=labels_on, delimiter=delimiter,
-                                        boundary_threshold_pct=threshold))
+                                        boundary_threshold_pct=threshold,
+                                        template=_LABEL_TEMPLATE if labels_on else _PLAIN_TEMPLATE))
         for (label, global_text, start, end,
              labels_on, delimiter, threshold) in _CASES
     ]

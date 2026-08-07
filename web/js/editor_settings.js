@@ -1,3 +1,10 @@
+import {
+    DEFAULT_NEW_PROJECT_CHANNEL_TEMPLATE_ID,
+    PROMPT_CHANNEL_TEMPLATE_PRESETS,
+    getChannelTemplate,
+    strictNormalizeChannelTemplate,
+} from "./prompt_channel_templates.js";
+
 // Renamed during the Sonder pivot. No fallback read by design.
 const SETTINGS_STORAGE_KEY = "sonder-editor-settings";
 const SETTINGS_VERSION = 1;
@@ -377,6 +384,9 @@ export const DEFAULT_EDITOR_SETTINGS = {
         customTemplates: [],
         builtinOverrides: {},
     },
+    promptChannelTemplates: {
+        customTemplates: [],
+    },
     promptTemplates: [],
     prompts: {
         queueSectionBatch: false,
@@ -395,6 +405,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         defaultGuideStrength: 0.7,
         defaultMotionDriverStrength: 0.95,
         defaultTemplateId: "free",
+        defaultChannelTemplateId: DEFAULT_NEW_PROJECT_CHANNEL_TEMPLATE_ID,
         defaultFitMode: "cover",
         defaultCropPosition: "center",
     },
@@ -749,6 +760,36 @@ function normalizePromptsSettings(stored, defaults) {
     };
 }
 
+// Channel-template catalog: unlike promptTemplates below, each entry's own
+// declared channel list IS its definition. Enumerating those keys here is
+// required and must never be copied into promptTemplates, whose channel bags
+// are authored text and therefore pass through key-for-key (durable rule 233).
+// Defined above the eager normalizeEditorSettings() call to avoid the TDZ trap.
+function normalizePromptChannelTemplates(raw) {
+    const source = Array.isArray(raw?.customTemplates) ? raw.customTemplates : [];
+    const usedIds = new Set(Object.keys(PROMPT_CHANNEL_TEMPLATE_PRESETS));
+    const customTemplates = [];
+    for (const entry of source) {
+        const normalized = strictNormalizeChannelTemplate(entry);
+        if (!normalized) continue;
+        const slug = String(normalized.name || "custom").toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "custom";
+        let base = String(normalized.id || "").startsWith("custom:")
+            ? String(normalized.id)
+            : `custom:${slug}`;
+        if (base === "custom:") base = `custom:${slug}`;
+        let candidate = base;
+        let suffix = 2;
+        while (usedIds.has(candidate)) {
+            candidate = `${base}-${suffix}`;
+            suffix += 1;
+        }
+        usedIds.add(candidate);
+        customTemplates.push({ ...normalized, id: candidate, builtin: false });
+    }
+    return { customTemplates };
+}
+
 // Prompt templates: browser-local reusable prompt setups (global text +
 // channel-bearing sections). Applying a template materializes concrete text
 // into scene state, so project truth never depends on this library.
@@ -815,6 +856,13 @@ function normalizePromptTemplates(templates) {
                         s.global_channel_exceptions),
                 }))
             : [];
+        const rawSourceTemplate = raw.source_channel_template;
+        const sourceTemplate = (rawSourceTemplate && typeof rawSourceTemplate === "object")
+            ? strictNormalizeChannelTemplate(rawSourceTemplate)
+            : null;
+        const legacySourceId = typeof rawSourceTemplate === "string"
+            ? rawSourceTemplate
+            : "";
         normalized.push({
             id: String(raw.id || `prompt-template-${index}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`),
             name,
@@ -827,7 +875,12 @@ function normalizePromptTemplates(templates) {
             // Records which channel set the text was AUTHORED under, so applying
             // it to a project on another template can collapse and re-split
             // rather than dropping the fields the target does not name.
-            source_channel_template: String(raw.source_channel_template || ""),
+            source_channel_template: sourceTemplate || legacySourceId,
+            source_channel_template_id: String(
+                raw.source_channel_template_id
+                || sourceTemplate?.id
+                || legacySourceId
+                || ""),
             // New templates capture their authoring FPS so section endpoints
             // can preserve seconds when applied to a scene at another rate.
             // Legacy templates have no rate metadata and retain frame-exact
@@ -996,6 +1049,8 @@ export function normalizeEditorSettings(source = null) {
     const legacyLayout = legacyLayoutSettings();
     const defaults = DEFAULT_EDITOR_SETTINGS;
     const customTemplates = normalizeCustomTemplates(stored?.modelTemplates?.customTemplates);
+    const promptChannelTemplates = normalizePromptChannelTemplates(
+        stored?.promptChannelTemplates);
     const validTemplateIds = new Set([
         ...BUILTIN_MODEL_TEMPLATE_IDS,
         ...customTemplates.map((template) => template.id),
@@ -1273,6 +1328,7 @@ export function normalizeEditorSettings(source = null) {
             customTemplates,
             builtinOverrides: normalizeBuiltinOverrides(stored?.modelTemplates?.builtinOverrides),
         },
+        promptChannelTemplates,
         promptTemplates: normalizePromptTemplates(stored?.promptTemplates),
         prompts: normalizePromptsSettings(stored?.prompts, defaults.prompts),
         projectDefaults: {
@@ -1301,6 +1357,12 @@ export function normalizeEditorSettings(source = null) {
             defaultTemplateId: validTemplateIds.has(normalizeModelTemplateId(stored?.projectDefaults?.defaultTemplateId))
                 ? normalizeModelTemplateId(stored.projectDefaults.defaultTemplateId)
                 : defaults.projectDefaults.defaultTemplateId,
+            defaultChannelTemplateId: new Set([
+                ...Object.keys(PROMPT_CHANNEL_TEMPLATE_PRESETS),
+                ...promptChannelTemplates.customTemplates.map((template) => template.id),
+            ]).has(String(stored?.projectDefaults?.defaultChannelTemplateId || ""))
+                ? String(stored.projectDefaults.defaultChannelTemplateId)
+                : defaults.projectDefaults.defaultChannelTemplateId,
             defaultFitMode: VALID_FIT_MODES.has(stored?.projectDefaults?.defaultFitMode)
                 ? stored.projectDefaults.defaultFitMode
                 : defaults.projectDefaults.defaultFitMode,
@@ -1453,6 +1515,18 @@ export function getAllModelTemplates(settings) {
         };
     });
     return [...builtins, ...(settings?.modelTemplates?.customTemplates || [])];
+}
+
+export function getAllPromptChannelTemplates(settings) {
+    const builtins = Object.values(PROMPT_CHANNEL_TEMPLATE_PRESETS)
+        .map((template) => getChannelTemplate(template));
+    const customs = settings?.promptChannelTemplates?.customTemplates || [];
+    return [...builtins, ...customs.map((template) => getChannelTemplate(template))];
+}
+
+export function getPromptChannelTemplateById(id, settings) {
+    const customs = settings?.promptChannelTemplates?.customTemplates || [];
+    return getChannelTemplate(id, customs);
 }
 
 export function getTemplateById(id, settings) {

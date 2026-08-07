@@ -1244,14 +1244,13 @@ class SonderEditor:
                 strengths_str = ""
 
             # --- Get prompt for render range ---
-            # Channel-label + delimiter composition honors the project-durable
-            # knobs; queued jobs use their frozen composed prompt instead.
+            # Template-owned label policy plus the project delimiter govern live
+            # composition; queued jobs use their frozen envelope instead.
             prompt_labels_on = False
             prompt_delimiter = "."
             prompt_threshold = 10.0
             proj_metadata = getattr(proj, "metadata", None)
             if isinstance(proj_metadata, dict):
-                prompt_labels_on = proj_metadata.get("prompt_channel_labels", False) is True
                 prompt_delimiter = str(proj_metadata.get("prompt_section_delimiter", ".") or "")
                 try:
                     prompt_threshold = float(proj_metadata.get("prompt_frame_threshold", 10.0) or 0.0)
@@ -1261,6 +1260,10 @@ class SonderEditor:
             # the channel template it was enqueued under.
             prompt_template = prompt_channel_templates.resolve_channel_template(
                 proj_metadata, getattr(queue_job, "params", None) if queue_job else None)
+            if queue_job:
+                queue_params = getattr(queue_job, "params", None)
+                if isinstance(queue_params, dict):
+                    prompt_labels_on = queue_params.get("prompt_channel_labels", False) is True
             # Shot timestamps need the EFFECTIVE rate: a scene inheriting
             # project FPS stores 0.0, which would silently drop every stamp.
             prompt_fps = effective_scene_fps(proj, scene)

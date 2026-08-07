@@ -10,6 +10,14 @@ from server.timeline_state import (
     Asset, GuideFrame, BatchConfig, Scene, PromptSection,
     ClipReference, AudioTrack, GenerationJob, TimelineProject, LaneConfig,
 )
+from server import prompt_channel_templates as pct
+
+
+LEGACY_PROJECT_LABELS_TEMPLATE = {
+    **pct.get_channel_template("sonder"),
+    "labels": pct.LABELS_PROJECT,
+    "builtin": False,
+}
 
 
 # --- Asset ---
@@ -790,8 +798,11 @@ def test_scene_get_prompt_at_frame():
     # Hold-until-next: the last section's tail extends past its drawn end
     assert scene.get_prompt_at_frame(200) == "global style [VISUAL]: section B"
     assert scene.get_prompt_at_frame(999) == "global style [VISUAL]: section B"
-    # Labels off
-    assert scene.get_prompt_at_frame(0, labels_on=False) == "global style section A"
+    # The boolean remains meaningful for legacy templates/jobs whose frozen
+    # policy was project-controlled; current presets own their policy.
+    assert scene.get_prompt_at_frame(
+        0, labels_on=False, template=LEGACY_PROJECT_LABELS_TEMPLATE
+    ) == "global style section A"
 
 
 def test_scene_get_prompt_for_range():

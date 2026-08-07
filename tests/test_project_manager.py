@@ -263,6 +263,21 @@ def test_create_project_idempotent():
         assert project2.scenes[0].clips[0].clip_id == "important_clip"
 
 
+def test_create_project_can_report_created_without_guessing_from_loaded_state():
+    with tempfile.TemporaryDirectory() as base_dir:
+        first, first_created = create_project(
+            "Created Flag", base_dir=base_dir, return_created=True)
+        first.metadata["prompt_channel_template"] = "standard"
+        save_project(first)
+
+        second, second_created = create_project(
+            "Created Flag", base_dir=base_dir, return_created=True)
+
+        assert first_created is True
+        assert second_created is False
+        assert second.metadata["prompt_channel_template"] == "standard"
+
+
 def test_save_project_retries_transient_permission_error(monkeypatch):
     """save_project survives a transient Windows-style PermissionError by retrying
     the atomic os.replace, and leaves no orphan temp file behind."""

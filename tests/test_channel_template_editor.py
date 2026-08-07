@@ -103,6 +103,17 @@ def test_editing_a_custom_template_keeps_its_id():
     assert saved["id"] == "custom:my-set"
 
 
+def test_two_copies_from_one_builtin_mint_distinct_ids_at_creation():
+    first = _node_json(
+        f"mod.templateFromDraft({json.dumps(_VALID_DRAFT)}, "
+        "{mode:'copy', usedIds:[]})")
+    second = _node_json(
+        f"mod.templateFromDraft({json.dumps(_VALID_DRAFT)}, "
+        f"{{mode:'copy', usedIds:{json.dumps([first['id']])}}})")
+    assert first["id"] == "custom:my-set"
+    assert second["id"] == "custom:my-set-2"
+
+
 # --- what the backend does with it -------------------------------------------
 
 def _project_with_text():
@@ -126,8 +137,8 @@ def _project_with_text():
 def _fork_with(template, **overrides):
     """A project-owned copy of `template` with fields overridden.
 
-    `template_freeze_value` returns a bare id for a built-in by design, so a
-    fork is built from the preset's own fields rather than from its freeze.
+    A fork is built from a mutation-safe copy of the preset's own fields, then
+    stored through the custom project projection rather than as a preset id.
     """
     raw = {key: value for key, value in template.items() if key != "builtin"}
     raw["channels"] = [dict(channel) for channel in template["channels"]]

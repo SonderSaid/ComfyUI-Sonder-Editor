@@ -88,7 +88,8 @@ def create_project(
     height: int = 720,
     template_id: str = "free",
     base_dir: str = "",
-) -> TimelineProject:
+    return_created: bool = False,
+):
     if not base_dir:
         raise ValueError("base_dir must be specified")
 
@@ -98,7 +99,8 @@ def create_project(
     project_file = os.path.join(project_dir, "project.json")
     if os.path.isfile(project_file):
         logger.info("Project '%s' already exists at %s — loading existing", name, project_dir)
-        return load_project(project_dir)
+        project = load_project(project_dir)
+        return (project, False) if return_created else project
 
     os.makedirs(project_dir, exist_ok=True)
 
@@ -115,7 +117,7 @@ def create_project(
 
     save_project(project)
     logger.info("Created project '%s' at %s", name, project_dir)
-    return project
+    return (project, True) if return_created else project
 
 
 def save_project(

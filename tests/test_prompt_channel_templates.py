@@ -48,7 +48,7 @@ def test_label_policy_resolution():
 
     sonder = pct.get_channel_template("sonder")
     assert pct.template_labels_on(sonder, True) is True
-    assert pct.template_labels_on(sonder, False) is False
+    assert pct.template_labels_on(sonder, False) is True
 
 
 # --- custom (project-owned) templates -------------------------------------------
@@ -97,8 +97,11 @@ def test_frozen_params_win_over_live_project_metadata():
     assert pct.resolve_channel_template({}, {})["id"] == pct.DEFAULT_CHANNEL_TEMPLATE_ID
 
 
-def test_builtin_freezes_as_an_id_and_a_fork_freezes_whole():
-    assert pct.template_freeze_value("minimax_h3_ref") == "minimax_h3_ref"
+def test_project_and_job_projections_are_deliberately_different():
+    assert pct.project_template_value("minimax_h3_ref") == "minimax_h3_ref"
+    builtin_frozen = pct.template_freeze_value("minimax_h3_ref")
+    assert isinstance(builtin_frozen, dict)
+    assert builtin_frozen["id"] == "minimax_h3_ref"
     fork = pct.normalize_channel_template({
         "id": "custom:mine", "name": "Mine",
         "channels": [{"key": "a", "label": "A", "description": "d"}],
@@ -108,6 +111,7 @@ def test_builtin_freezes_as_an_id_and_a_fork_freezes_whole():
     # job ever runs, and an id alone would then resolve to something else.
     assert isinstance(frozen, dict)
     assert pct.template_channel_keys(pct.get_channel_template(frozen)) == ("a",)
+    assert pct.project_template_value(fork) == frozen
 
 
 def _job_with_sections(**params):
@@ -126,7 +130,7 @@ def _job_with_sections(**params):
     return job
 
 
-def test_queued_job_recomposes_identically_after_the_project_template_changes():
+def test_queued_job_recomposes_identically_after_the_preset_changes(monkeypatch):
     import server.routes as routes
 
     project = TimelineProject(name="Project")
@@ -138,26 +142,63 @@ def test_queued_job_recomposes_identically_after_the_project_template_changes():
     frozen_prompt = job.prompt
     # Anti-vacuity: the template must actually be doing something here.
     assert "integrated_multimodal_description:" in frozen_prompt
-    assert job.params[pct.PROJECT_TEMPLATE_KEY] == "minimax_h3_base"
+    assert job.params[pct.PROJECT_TEMPLATE_KEY]["id"] == "minimax_h3_base"
 
-    # The project switches template AFTER the job was queued.
+    # Both the project and shipped preset change AFTER the job was queued.
     project.metadata[pct.PROJECT_TEMPLATE_KEY] = "sonder"
-    requeued = _job_with_sections(**{pct.PROJECT_TEMPLATE_KEY: "minimax_h3_base"})
+    changed = dict(pct.PROMPT_CHANNEL_TEMPLATE_PRESETS["minimax_h3_base"])
+    changed["labels"] = pct.LABELS_NEVER
+    monkeypatch.setitem(pct.PROMPT_CHANNEL_TEMPLATE_PRESETS, "minimax_h3_base", changed)
+    requeued = _job_with_sections(**{
+        pct.PROJECT_TEMPLATE_KEY: job.params[pct.PROJECT_TEMPLATE_KEY],
+    })
     routes._compose_frozen_job_prompt(project, requeued)
     assert requeued.prompt == frozen_prompt
 
 
-def test_freeze_records_the_label_policy_it_used():
+def test_new_job_freeze_carries_policy_in_the_whole_template():
     import server.routes as routes
 
     project = TimelineProject(name="Project")
     project.metadata = {"prompt_channel_labels": True, "prompt_frame_threshold": 0.0}
     job = _job_with_sections()
     routes._compose_frozen_job_prompt(project, job)
-    # Previously read without ever being frozen, so a project-level toggle
-    # change silently rewrote a pending job's labels.
-    assert job.params["prompt_channel_labels"] is True
-    assert job.params[pct.PROJECT_TEMPLATE_KEY] == pct.DEFAULT_CHANNEL_TEMPLATE_ID
+    assert "prompt_channel_labels" not in job.params
+    assert job.params[pct.PROJECT_TEMPLATE_KEY]["id"] == pct.DEFAULT_CHANNEL_TEMPLATE_ID
+    assert job.params[pct.PROJECT_TEMPLATE_KEY]["labels"] == pct.LABELS_ALWAYS
+
+
+def test_legacy_bare_preset_job_keeps_its_frozen_label_toggle_without_mutation():
+    preset_before = pct.get_channel_template("sonder")
+    params = {
+        pct.PROJECT_TEMPLATE_KEY: "sonder",
+        "prompt_channel_labels": False,
+    }
+    resolved = pct.resolve_channel_template({}, params)
+    assert resolved["labels"] == pct.LABELS_PROJECT
+    assert pct.template_labels_on(resolved, params["prompt_channel_labels"]) is False
+    assert pct.get_channel_template("sonder") == preset_before
+
+
+def test_strict_normalizer_rejects_instead_of_adopting_default():
+    assert pct.strict_normalize_channel_template(None) is None
+    assert pct.strict_normalize_channel_template({"id": "broken", "channels": []}) is None
+    assert pct.strict_normalize_channel_template({
+        "id": "broken",
+        "channels": [{"key": "a"}, {"key": "a"}],
+    }) is None
+    assert pct.strict_normalize_channel_template({
+        "id": "broken", "channels": [{"key": "a"}], "labels": "sometimes",
+    }) is None
+
+
+def test_normalizer_fallback_is_not_the_shared_preset_object():
+    fallback = pct.normalize_channel_template(None)
+    fallback["labels"] = pct.LABELS_NEVER
+    fallback["channels"][0]["label"] = "changed"
+    fresh = pct.get_channel_template("sonder")
+    assert fresh["labels"] == pct.LABELS_ALWAYS
+    assert fresh["channels"][0]["label"] == "[VISUAL]:"
 
 
 # --- composition under a template -----------------------------------------------

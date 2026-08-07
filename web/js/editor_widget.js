@@ -229,9 +229,11 @@ import {
 import {
     DEFAULT_CHANNEL_TEMPLATE_ID,
     PROJECT_TEMPLATE_KEY,
-    PROMPT_CHANNEL_TEMPLATE_PRESETS,
+    channelTemplateKeySetsEqual,
     getChannelTemplate,
     globalChannelKeys,
+    mergeChannelTemplateCatalog,
+    projectTemplateValue,
     templateChannelKeys,
     templateFreezeValue,
     templateLabelsOn,
@@ -308,6 +310,7 @@ import {
     frameConstraintsEqual,
     getEditorSettings,
     getAllModelTemplates,
+    getAllPromptChannelTemplates,
     getTemplateById,
     getDimensionConstraint,
     getTemplateFpsValues,
@@ -689,7 +692,6 @@ export class EditorWidget {
         this.fps = 24;
         this.sceneWidth = DEFAULT_EDITOR_SETTINGS.projectDefaults.width;
         this.sceneHeight = DEFAULT_EDITOR_SETTINGS.projectDefaults.height;
-        this._promptChannelLabels = false;
         this._guideCollisionAutoOffset = true;
         this._promptSectionDelimiter = ".";
         this._promptFrameThreshold = 10;
@@ -5476,6 +5478,7 @@ export class EditorWidget {
             _settingsPanelControls: null,
             _settingsPanelKeyOff: null,
             _renderModelTemplateSettings: null,
+            _renderPromptChannelTemplateSettings: null,
             get _settings() { return editor._settings; },
             get _templateId() { return editor._templateId; },
             set _templateId(value) { editor._templateId = value; },
@@ -5502,7 +5505,6 @@ export class EditorWidget {
             _deleteCustomModelTemplate: (templateId) => editor._deleteCustomModelTemplate(templateId),
             // Prompts section — project-wide knobs are host-owned versioned
             // project PUTs (not settings writes); getters back their sync
-            get _promptChannelLabels() { return editor._promptChannelLabels; },
             get _promptSectionDelimiter() { return editor._promptSectionDelimiter; },
             get _promptFrameThreshold() { return editor._promptFrameThreshold; },
             get _referenceFrameThreshold() { return editor._referenceFrameThreshold; },
@@ -5511,11 +5513,13 @@ export class EditorWidget {
             get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
             _loadServerSettings: () => editor._loadServerSettings(),
             _setAllowExternalProjectLinks: (enabled) => editor._setAllowExternalProjectLinks(enabled),
-            _togglePromptChannelLabels: (on) => editor._togglePromptChannelLabels(on),
             _channelTemplate: () => editor._channelTemplate(),
             _promptChannelTemplateOptions: () => editor._promptChannelTemplateOptions(),
-            _setPromptChannelTemplate: (templateId) => editor._setPromptChannelTemplate(templateId),
-            _openChannelTemplateEditor: () => editor._openChannelTemplateEditor(),
+            _setPromptChannelTemplate: (template) => editor._setPromptChannelTemplate(template),
+            _openChannelTemplateEditor: (template, mode) => editor._openChannelTemplateEditor(template, mode),
+            _savePromptChannelTemplate: (template, options) => editor._savePromptChannelTemplate(template, options),
+            _deletePromptChannelTemplate: (templateId) => editor._deletePromptChannelTemplate(templateId),
+            _adoptPromptChannelTemplate: (template) => editor._adoptPromptChannelTemplate(template),
             _toggleGuideCollisionAutoOffset: (on) => editor._toggleGuideCollisionAutoOffset(on),
             _setPromptSectionDelimiter: (value) => editor._setPromptSectionDelimiter(value),
             _setPromptFrameThreshold: (value) => editor._setPromptFrameThreshold(value),
@@ -9290,7 +9294,13 @@ export class EditorWidget {
     // Active project channel template. The channel SET determines the served
     // prompt, so it is project-durable metadata and never a browser preference.
     _channelTemplate() {
-        return getChannelTemplate(this._promptChannelTemplateRaw ?? DEFAULT_CHANNEL_TEMPLATE_ID);
+        return getChannelTemplate(
+            this._promptChannelTemplateRaw ?? DEFAULT_CHANNEL_TEMPLATE_ID,
+            this._settings?.promptChannelTemplates?.customTemplates || []);
+    }
+
+    _promptChannelTemplateCatalog() {
+        return getAllPromptChannelTemplates(this._settings);
     }
 
     _channelKeys() {
@@ -9721,35 +9731,13 @@ export class EditorWidget {
         this._promptPanelHandle = mountPromptManagementPanel(this);
     }
 
-    /** Project-durable channel-labels toggle.
-     *  Deliberately OUTSIDE the ProjectMutationQueue (documented exemption):
-     *  project-level metadata — not a scene mutation op — an infrequent single
-     *  toggle following the asset_folders precedent; not undo-enrolled. */
-    async _togglePromptChannelLabels(on) {
-        const dirName = this._projectDirName();
-        if (!dirName) return;
-        try {
-            await this._runVersionedProjectMutation(
-                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
-                {
-                    method: "PUT",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ metadata: { prompt_channel_labels: !!on } }),
-                },
-                { projectId: dirName }
-            );
-            this._promptChannelLabels = !!on;
-        } catch (e) {
-            notifyWarning(e?.message || "Failed to update channel-labels setting.", { source: "prompt-labels-refused" });
-            throw e;
-        }
-    }
-
     /** How much authored text a template switch would strand: the channels the
      *  CURRENT template names that the NEXT one does not, counted across every
      *  scene, because the template is project-level. */
     _channelTemplateSwitchImpact(nextTemplateOrId) {
-        const nextKeys = new Set(templateChannelKeys(getChannelTemplate(nextTemplateOrId)));
+        const nextKeys = new Set(templateChannelKeys(getChannelTemplate(
+            nextTemplateOrId,
+            this._settings?.promptChannelTemplates?.customTemplates || [])));
         const losing = templateChannelKeys(this._channelTemplate())
             .filter((key) => !nextKeys.has(key));
         let sections = 0;
@@ -9773,16 +9761,18 @@ export class EditorWidget {
      *  inside the same save that moves the pointer, so the two can never
      *  disagree. Text is never hidden, but it is moved, and scene-scoped undo
      *  will not switch the template back. Both facts go in the confirm. */
-    async _setPromptChannelTemplate(nextTemplateId, { confirm = true } = {}) {
+    async _setPromptChannelTemplate(nextTemplateOrId, { confirm = true } = {}) {
         const dirName = this._projectDirName();
         if (!dirName) return false;
-        const next = getChannelTemplate(nextTemplateId);
+        const next = getChannelTemplate(
+            nextTemplateOrId,
+            this._settings?.promptChannelTemplates?.customTemplates || []);
         const current = this._channelTemplate();
         // Compare the whole frozen value, not just the id: editing a custom
         // template in place keeps its id while changing what it means, and an
         // id-only guard would swallow every save after the first.
-        if (JSON.stringify(templateFreezeValue(next))
-            === JSON.stringify(templateFreezeValue(current))) return true;
+        if (JSON.stringify(projectTemplateValue(next))
+            === JSON.stringify(projectTemplateValue(current))) return true;
 
         if (confirm) {
             const impact = this._channelTemplateSwitchImpact(next);
@@ -9807,7 +9797,7 @@ export class EditorWidget {
         const previous = this._promptChannelTemplateRaw;
         // Built-ins travel as an id; a project-owned fork travels as its whole
         // dict, so the project does not depend on a preset that may not exist.
-        const frozen = templateFreezeValue(next);
+        const frozen = projectTemplateValue(next);
         try {
             await this._runVersionedProjectMutation(
                 `/sonder-editor/project/${encodeURIComponent(dirName)}`,
@@ -9835,42 +9825,89 @@ export class EditorWidget {
         }
     }
 
-    /** Preset catalog for the panel's template picker. A project-owned fork is
-     *  appended so the picker can show what the project is actually using —
-     *  otherwise a custom template would leave the dropdown showing something
-     *  the project is not on. */
+    /** Browser catalog for the panel picker, plus a project-owned active orphan
+     *  when needed so the picker always represents what the project uses. */
     _promptChannelTemplateOptions() {
-        const options = Object.values(PROMPT_CHANNEL_TEMPLATE_PRESETS).map((template) => ({
+        const catalog = this._promptChannelTemplateCatalog();
+        const active = this._channelTemplate();
+        const templates = mergeChannelTemplateCatalog(catalog, active);
+        return templates.map((template) => ({
             id: template.id,
             name: template.name,
             description: template.description,
             channelCount: templateChannelKeys(template).length,
-            builtin: true,
+            builtin: !!template.builtin,
+            inCatalog: catalog.some((entry) => entry.id === template.id),
+            template,
         }));
-        const active = this._channelTemplate();
-        if (!active.builtin) {
-            options.push({
-                id: active.id,
-                name: `${active.name} (custom)`,
-                description: active.description,
-                channelCount: templateChannelKeys(active).length,
-                builtin: false,
-            });
-        }
-        return options;
     }
 
-    /** Opens the channel-template editor overlay. Saving routes through
-     *  `_setPromptChannelTemplate`, so a channel-set edit collapses and
-     *  re-splits section text exactly as a preset switch does. */
-    _openChannelTemplateEditor() {
-        if (!this._projectDirName()) {
-            notifyWarning("Open a project before editing its channel template.",
-                          { source: "channel-template-editor" });
-            return null;
+    async _savePromptChannelTemplate(template, { updateActive = false } = {}) {
+        const next = getChannelTemplate(template);
+        if (next.builtin || !String(next.id || "").startsWith("custom:")) return false;
+        if (updateActive && this._channelTemplate().id === next.id) {
+            const updated = await this._setPromptChannelTemplate(next);
+            if (!updated) return false;
         }
+        const current = this._settings?.promptChannelTemplates?.customTemplates || [];
+        const customTemplates = current.some((entry) => entry.id === next.id)
+            ? current.map((entry) => entry.id === next.id ? next : entry)
+            : [...current, next];
+        this._updateSettings({ promptChannelTemplates: { customTemplates } });
+        notifySuccess(`Channel template "${next.name}" saved.`);
+        return true;
+    }
+
+    async _adoptPromptChannelTemplate(template) {
+        const next = getChannelTemplate(template);
+        const current = this._settings?.promptChannelTemplates?.customTemplates || [];
+        if (next.builtin || current.some((entry) => entry.id === next.id)) return false;
+        this._updateSettings({
+            promptChannelTemplates: { customTemplates: [...current, next] },
+        });
+        notifySuccess(`Channel template "${next.name}" added to your catalog.`);
+        return true;
+    }
+
+    async _deletePromptChannelTemplate(templateId) {
+        const id = String(templateId || "");
+        if (!id) return false;
+        if (this._channelTemplate().id === id) {
+            notifyWarning("The active project template cannot be deleted. Switch away first.",
+                          { source: "channel-template-delete-refused" });
+            return false;
+        }
+        const current = this._settings?.promptChannelTemplates?.customTemplates || [];
+        const target = current.find((entry) => entry.id === id);
+        if (!target) return false;
+        const ok = window.confirm(
+            `Delete "${target.name}" from your catalog?\n\n`
+            + "Other projects keep using their materialized copy, but this template "
+            + "will no longer appear in your catalog.");
+        if (!ok) return false;
+        const defaultId = this._settings?.projectDefaults?.defaultChannelTemplateId;
+        this._updateSettings({
+            promptChannelTemplates: {
+                customTemplates: current.filter((entry) => entry.id !== id),
+            },
+            projectDefaults: {
+                defaultChannelTemplateId: defaultId === id
+                    ? DEFAULT_CHANNEL_TEMPLATE_ID : defaultId,
+            },
+        });
+        notifySuccess(`Channel template "${target.name}" deleted.`);
+        return true;
+    }
+
+    /** Opens the explicit new/edit/copy overlay. Catalog saves stay local;
+     *  editing the active custom also routes through `_setPromptChannelTemplate`
+     *  so channel-key changes use the normal collapse/re-split transaction. */
+    _openChannelTemplateEditor(template = null, mode = "edit") {
         this._channelTemplateEditorHandle?.close?.();
-        this._channelTemplateEditorHandle = mountChannelTemplateEditor(this);
+        this._channelTemplateEditorHandle = mountChannelTemplateEditor(this, {
+            template: template || this._channelTemplate(),
+            mode,
+        });
         return this._channelTemplateEditorHandle;
     }
 
@@ -10328,16 +10365,19 @@ export class EditorWidget {
      *  global text) so the apply is a single save and a single undo step. */
     async _applyPromptSetup({ global: globalText, global_channels: globalChannels = null,
                               sections, extendDurationTo = 0, source_fps: sourceFps = 0,
-                              source_channel_template: sourceChannelTemplateId = null } = {}) {
+                              source_channel_template: sourceChannelTemplate = null,
+                              source_channel_template_id: sourceChannelTemplateId = null } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
             notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
             return;
         }
-        // Entries saved before this field existed predate multi-channel
-        // templates entirely, so the default template is the right assumption.
-        const sourceChannelTemplate = getChannelTemplate(
-            sourceChannelTemplateId || DEFAULT_CHANNEL_TEMPLATE_ID);
+        // New entries carry the whole authored definition. Legacy entries carry
+        // only an id, which must resolve through the browser-local catalog so a
+        // custom id never falls through to the default preset.
+        const resolvedSourceChannelTemplate = getChannelTemplate(
+            sourceChannelTemplate || sourceChannelTemplateId || DEFAULT_CHANNEL_TEMPLATE_ID,
+            this._settings?.promptChannelTemplates?.customTemplates || []);
         const activeChannelTemplate = this._channelTemplate();
         // A same-template apply must NOT round-trip through the collapse. That
         // path is deliberately lossy: `joinChannelHeaders` folds any key outside
@@ -10347,9 +10387,11 @@ export class EditorWidget {
         // there is nothing to retarget. Still emit every key explicitly, because
         // channel updates MERGE server-side — a key left out keeps its old text.
         const retargetChannels = (channels) => (
-            sourceChannelTemplate.id === activeChannelTemplate.id
+            channelTemplateKeySetsEqual(
+                resolvedSourceChannelTemplate, activeChannelTemplate)
                 ? normalizeChannels(channels, "", templateChannelKeys(activeChannelTemplate))
-                : collapseChannelsForTemplate(channels, sourceChannelTemplate, activeChannelTemplate));
+                : collapseChannelsForTemplate(
+                    channels, resolvedSourceChannelTemplate, activeChannelTemplate));
         const sceneRef = this.activeScene;
         const undoLabel = "apply prompt setup";
         this._pushUndo(undoLabel);
@@ -10480,7 +10522,8 @@ export class EditorWidget {
             // so one saved under a six-channel project can be applied to a
             // three-channel one. normalizeChannels preserves every authored
             // key, so the text survives the trip; this records what it meant.
-            source_channel_template: this._channelTemplate().id,
+            source_channel_template_id: this._channelTemplate().id,
+            source_channel_template: templateFreezeValue(this._channelTemplate()),
             sections: (scene.prompt_sections || []).map((s) => ({
                 start_frame: s.start_frame || 0,
                 end_frame: s.end_frame || 0,
@@ -11432,7 +11475,6 @@ export class EditorWidget {
             this._hidePromptHoverPreview();
             return;
         }
-        const labelsOn = this._promptChannelLabels === true;
         const isGlobal = hit.type === "prompt_global";
         const hidden = isGlobal ? this._isGlobalPromptTrackHidden() : (this._isPromptTrackHidden() || !!hit.data?.muted);
         const hiddenLabel = !isGlobal && hit.data?.muted ? "Muted" : "Hidden";
@@ -11450,7 +11492,7 @@ export class EditorWidget {
             // serves. The legacy mirror stays as the fallback for scenes whose
             // channels were never populated.
             lines = globalChannelLines(this.activeScene?.global_channels,
-                                       this._channelTemplate(), labelsOn);
+                                       this._channelTemplate(), false);
             if (!lines.length) {
                 const text = (this.activeScene?.prompt || "").trim();
                 lines = text ? [text] : ["(empty global prompt)"];
@@ -11469,7 +11511,7 @@ export class EditorWidget {
             const template = this._channelTemplate();
             const channels = normalizeChannels(section.channels, section.prompt,
                                                templateChannelKeys(template));
-            const showLabels = templateLabelsOn(template, labelsOn);
+            const showLabels = templateLabelsOn(template, false);
             lines = [];
             for (const entry of template.channels || []) {
                 const text = (channels[entry.key] || "").trim();
@@ -14916,7 +14958,6 @@ export class EditorWidget {
 
         const promptHidden = !!this.activeScene.prompt_track_config?.hidden;
         const globalHidden = !!this.activeScene.global_prompt_track_config?.hidden;
-        const labelsOn = this._promptChannelLabels === true;
         const scenePrompt = globalHidden ? "" : (this.activeScene.prompt || "");
         const sections = promptHidden ? [] : (this.activeScene.prompt_sections || []);
         // Freeze ALL window-overlapping sections (channel-bearing) — the relay
@@ -14951,7 +14992,7 @@ export class EditorWidget {
         // the response jobs, which replace the temp rows. A stale delimiter
         // stash is cosmetic only — never block enqueue on it.
         const displaySectionText = composeSectionsDisplayText(
-            promptSections, labelsOn, this._promptSectionDelimiter ?? ".",
+            promptSections, false, this._promptSectionDelimiter ?? ".",
             this._channelTemplate());
         const prompt = [scenePrompt.trim(), displaySectionText].filter(Boolean).join(" ");
 
@@ -15085,8 +15126,6 @@ export class EditorWidget {
             // take_placement_linked / take_placement_muted intentionally NOT
             // snapshotted: they resolve from live settings/widgets at execution
             // (user decision 2026-06-11).
-            // Labels toggle frozen for reproducibility (read by the relay bridge)
-            params: { prompt_channel_labels: labelsOn },
         };
     }
 
@@ -15924,8 +15963,6 @@ export class EditorWidget {
                     this.sceneHeight = data.resolution[1] || DEFAULT_EDITOR_SETTINGS.projectDefaults.height;
                 }
                 this._templateId = getTemplateById(data.template_id, this._settings).id;
-                // Project-durable channel-labels toggle (render-affecting; default off)
-                this._promptChannelLabels = data.metadata?.prompt_channel_labels === true;
                 // Project-durable channel template (render-affecting; the channel
                 // SET determines the served prompt, so it is never a browser
                 // preference). May be a preset id or a project-owned fork dict.

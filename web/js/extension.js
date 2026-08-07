@@ -18,10 +18,12 @@ import {
     getTemplateFpsValues,
     snapFpsToAllowed,
     getEditorSettings,
+    getPromptChannelTemplateById,
     notificationCoreConfig,
     resolveFrameConstraintForTemplate,
     subscribeEditorSettings,
 } from "./editor_settings.js";
+import { projectTemplateValue } from "./prompt_channel_templates.js";
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
 import { notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
@@ -265,6 +267,8 @@ async function createProjectFromNode(node, projectWidget, { isCurrent = () => tr
     const defaultSceneDuration = Math.max(1, Number(settings?.projectDefaults?.newSceneDuration || defaults.newSceneDuration));
     const templateId = settings.projectDefaults.defaultTemplateId || "free";
     const template = getTemplateById(templateId, settings);
+    const channelTemplate = getPromptChannelTemplateById(
+        settings.projectDefaults.defaultChannelTemplateId, settings);
 
     const projectName = String(projectNameWidget?.value || "").trim();
     if (!projectName) {
@@ -281,6 +285,7 @@ async function createProjectFromNode(node, projectWidget, { isCurrent = () => tr
             height: Number(heightWidget?.value || defaults.height),
             template_id: templateId,
             frame_constraint: resolveFrameConstraintForTemplate(templateId, settings),
+            prompt_channel_template: projectTemplateValue(channelTemplate),
         }),
     });
     if (!resp.ok) {

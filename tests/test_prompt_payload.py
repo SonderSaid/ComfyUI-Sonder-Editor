@@ -10,7 +10,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server import prompt_payload as pp
+from server import prompt_channel_templates as pct
 from server.timeline_state import PromptSection
+
+
+LEGACY_PROJECT_LABELS_TEMPLATE = {
+    **pct.get_channel_template("sonder"),
+    "labels": pct.LABELS_PROJECT,
+    "builtin": False,
+}
 
 
 # --- compose -----------------------------------------------------------------
@@ -242,9 +250,10 @@ def test_threshold_relay_lengths_realign_after_drop():
 def test_threshold_compose_range_prompt_drops_sliver_text():
     sections = _sections((0, 120, "A"), (120, 240, "B"))
     assert pp.compose_range_prompt("", sections, 0, 125, labels_on=False,
-                                   delimiter=".") == "A. B"
+                                   delimiter=".", template=LEGACY_PROJECT_LABELS_TEMPLATE) == "A. B"
     assert pp.compose_range_prompt("", sections, 0, 125, labels_on=False,
-                                   delimiter=".", boundary_threshold_pct=10.0) == "A"
+                                   delimiter=".", boundary_threshold_pct=10.0,
+                                   template=LEGACY_PROJECT_LABELS_TEMPLATE) == "A"
 
 
 # --- join + compose_range_prompt -------------------------------------------------
@@ -261,7 +270,9 @@ def test_join_segment_texts():
 
 def test_compose_range_prompt_multi_segment_temporal_order():
     sections = _sections((0, 30, "walks"), (30, 60, "runs"), (60, 90, "jumps"))
-    out = pp.compose_range_prompt("global", sections, 0, 90, labels_on=False)
+    out = pp.compose_range_prompt(
+        "global", sections, 0, 90, labels_on=False,
+        template=LEGACY_PROJECT_LABELS_TEMPLATE)
     assert out == "global walks. runs. jumps"
     # Labels ON groups by channel: ONE label, segment texts joined in order
     out = pp.compose_range_prompt("global", sections, 0, 90, labels_on=True, delimiter=",")
@@ -277,19 +288,25 @@ def test_compose_range_prompt_groups_channels_across_segments():
     # One label per channel; texts in temporal order; empty channels omitted
     assert out == "g [VISUAL]: a dog. it barks [SPEECH]: woof [SOUNDS]: rain"
     # Labels OFF keeps plain temporal per-segment concatenation
-    out = pp.compose_range_prompt("g", sections, 0, 60, labels_on=False)
+    out = pp.compose_range_prompt(
+        "g", sections, 0, 60, labels_on=False,
+        template=LEGACY_PROJECT_LABELS_TEMPLATE)
     assert out == "g a dog woof. it barks rain"
 
 
 def test_compose_range_prompt_before_window_hold_included():
     # A section entirely before the window still holds (hold-until-next)
-    out = pp.compose_range_prompt("g", _sections((0, 10, "early")), 40, 50, labels_on=False)
+    out = pp.compose_range_prompt(
+        "g", _sections((0, 10, "early")), 40, 50, labels_on=False,
+        template=LEGACY_PROJECT_LABELS_TEMPLATE)
     assert out == "g early"
 
 
 def test_compose_range_prompt_zero_sections_and_empty_global():
     assert pp.compose_range_prompt("only global", [], 0, 50) == "only global"
-    assert pp.compose_range_prompt("", _sections((0, 50, "sec")), 0, 50, labels_on=False) == "sec"
+    assert pp.compose_range_prompt(
+        "", _sections((0, 50, "sec")), 0, 50, labels_on=False,
+        template=LEGACY_PROJECT_LABELS_TEMPLATE) == "sec"
     assert pp.compose_range_prompt("", [], 0, 50) == ""
 
 

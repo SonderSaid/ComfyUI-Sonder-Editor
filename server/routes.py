@@ -2895,11 +2895,6 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         return
     metadata = getattr(project, "metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
-    labels_on = params.get(
-        "prompt_channel_labels",
-        metadata.get("prompt_channel_labels", False),
-    ) is True
-    params["prompt_channel_labels"] = labels_on  # frozen for reproducibility
     template = prompt_channel_templates.resolve_channel_template(metadata, params)
     # Frozen so a queued job re-composes under the template it was enqueued
     # with, not whatever the project carries when it finally runs.
@@ -2945,7 +2940,8 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
         getattr(job, "scene_prompt", "") or "",
         getattr(job, "prompt_sections", []) or [],
         window_start, window_end,
-        labels_on=labels_on, delimiter=delimiter,
+        labels_on=params.get("prompt_channel_labels", False) is True,
+        delimiter=delimiter,
         boundary_threshold_pct=threshold, template=template,
         fps=job_fps,
         global_channels=frozen_global if isinstance(frozen_global, dict) else None,
@@ -3110,8 +3106,14 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
         global_text = str(getattr(job, "scene_prompt", "") or "")
         if not global_text and not sections:
             continue
+        params = getattr(job, "params", {}) or {}
+        source_template = prompt_channel_templates.resolve_channel_template(
+            project.metadata, params if isinstance(params, dict) else None)
+        source_template_value = prompt_channel_templates.template_freeze_value(
+            source_template)
         digest = hashlib.sha256(json.dumps(
-            {"global": global_text, "sections": sections}, sort_keys=True
+            {"global": global_text, "sections": sections,
+             "source_channel_template": source_template_value}, sort_keys=True
         ).encode("utf-8")).hexdigest()[:16]
         timestamp = _dt.now().isoformat()
         existing = next((entry for entry in history
@@ -3126,6 +3128,8 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
             "window": [int(getattr(job, "selection_start", 0) or 0),
                        int(getattr(job, "selection_end", 0) or 0)],
             "global": global_text,
+            "source_channel_template_id": source_template.get("id", ""),
+            "source_channel_template": source_template_value,
             "sections": sections,
         })
 
@@ -5215,7 +5219,6 @@ def _build_dormant_summary(
         # fallback lives in _build_selection_summary). Snapshot jobs carry
         # their own frozen preview_prompt — see _dormant_queue_job_payload.
         metadata = project.metadata if isinstance(getattr(project, "metadata", None), dict) else {}
-        labels_on = metadata.get("prompt_channel_labels", False) is True
         delimiter = str(metadata.get("prompt_section_delimiter",
                                      prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
         try:
@@ -5225,7 +5228,7 @@ def _build_dormant_summary(
         preview_prompt = active_scene.get_prompt_for_range(
             selection["context_start_frame"],
             selection["context_end_frame"],
-            labels_on=labels_on,
+            labels_on=False,
             delimiter=delimiter,
             boundary_threshold_pct=threshold,
             template=prompt_channel_templates.resolve_channel_template(metadata),
@@ -6781,6 +6784,21 @@ if routes is not None:
         template_id = body.get("template_id", "free") or "free"
         raw_frame_constraint = body.get("frame_constraint")
         frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
+        raw_channel_template = body.get(
+            prompt_channel_templates.PROJECT_TEMPLATE_KEY,
+            prompt_channel_templates.DEFAULT_NEW_PROJECT_CHANNEL_TEMPLATE_ID,
+        )
+        if isinstance(raw_channel_template, dict):
+            channel_template = prompt_channel_templates.strict_normalize_channel_template(
+                raw_channel_template)
+            if channel_template is None:
+                return _json_error("Invalid prompt channel template", 400)
+        else:
+            channel_template_id = str(raw_channel_template or "")
+            if channel_template_id not in prompt_channel_templates.PROMPT_CHANNEL_TEMPLATE_PRESETS:
+                return _json_error("Unknown prompt channel template", 400)
+            channel_template = prompt_channel_templates.get_channel_template(
+                channel_template_id)
         if "base_dir" in body or "base_dir" in request.query:
             return _json_error("base_dir is no longer accepted", 400)
         base_dir = _configured_base_dir()
@@ -6789,9 +6807,20 @@ if routes is not None:
             return _json_error("base_dir is required", 400)
 
         try:
-            project = create_project(name, fps, width, height, template_id, base_dir)
+            project, was_created = create_project(
+                name, fps, width, height, template_id, base_dir,
+                return_created=True)
+            changed = False
             if frame_constraint is not None:
                 project.frame_constraint = frame_constraint
+                changed = True
+            if was_created:
+                if not isinstance(project.metadata, dict):
+                    project.metadata = {}
+                project.metadata[prompt_channel_templates.PROJECT_TEMPLATE_KEY] = (
+                    prompt_channel_templates.project_template_value(channel_template))
+                changed = True
+            if changed:
                 save_project(project)
             return web.json_response(project.to_dict(), status=201)
         except Exception as e:
@@ -6839,11 +6868,13 @@ if routes is not None:
                     # A project-owned fork from the template editor. Normalize
                     # before it reaches the project, so a malformed dict cannot
                     # become the template every later read resolves against.
-                    nxt = prompt_channel_templates.normalize_channel_template(raw_next)
-                    incoming = dict(incoming)
-                    incoming[template_key] = prompt_channel_templates.template_freeze_value(nxt)
+                    nxt = prompt_channel_templates.strict_normalize_channel_template(raw_next)
+                    if nxt is None:
+                        return _json_error("Invalid prompt channel template", 400)
                 else:
                     nxt = prompt_channel_templates.get_channel_template(raw_next)
+                incoming = dict(incoming)
+                incoming[template_key] = prompt_channel_templates.project_template_value(nxt)
                 # Compare the channel SETS, not just the ids: editing a custom
                 # template in place keeps its id while renaming or removing
                 # channels, which is exactly a template switch for the text.
@@ -8838,8 +8869,7 @@ if routes is not None:
             source_label = "snapshot"
         else:
             metadata = getattr(project, "metadata", None)
-            labels_on = metadata.get("prompt_channel_labels", False) is True \
-                if isinstance(metadata, dict) else False
+            labels_on = False
             threshold = _coerce_threshold(metadata)
             template = prompt_channel_templates.resolve_channel_template(metadata)
             global_hidden = bool(getattr(scene.global_prompt_track_config, "hidden", False))

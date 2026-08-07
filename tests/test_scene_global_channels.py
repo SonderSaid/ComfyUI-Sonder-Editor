@@ -298,13 +298,14 @@ def test_writing_tool_apply_carries_global_channels_not_the_flat_mirror():
     apply_call = panel.split("await host._applyPromptSetup({", 1)[1].split("});", 1)[0]
     assert "global_channels: { ...(host.activeScene?.global_channels || {}) }" in apply_call
     # Tagged with the template it was authored under so no retarget is attempted.
-    assert "source_channel_template: host._channelTemplate().id" in apply_call
+    assert "source_channel_template_id: host._channelTemplate().id" in apply_call
+    assert "source_channel_template: host._channelTemplate()" in apply_call
 
     # And a same-template apply must not round-trip through the collapse: that
     # path folds keys outside the template into channel 1 with a literal `key:`
     # label, which is right when retargeting and lossy when there is nothing to
     # retarget.
-    assert "sourceChannelTemplate.id === activeChannelTemplate.id" in widget
+    assert "channelTemplateKeySetsEqual(" in widget
     assert "? normalizeChannels(channels, \"\", templateChannelKeys(activeChannelTemplate))" in widget
 
 

@@ -24,11 +24,19 @@ import {
     TIMECODE_MODE_OPTIONS,
     describeConstraintFormula,
     getAllModelTemplates,
+    getAllPromptChannelTemplates,
     getTemplateById,
     getTemplateFpsValues,
     isBuiltinModelTemplate,
     previewConstraintValues,
 } from "./editor_settings.js";
+import {
+    DEFAULT_CHANNEL_TEMPLATE_ID,
+    LABELS_ALWAYS,
+    LABELS_NEVER,
+    templateChannelKeys,
+    templateFreezeValue,
+} from "./prompt_channel_templates.js";
 import { VARIABLE_TRACK_TYPES, descriptorFor } from "./lane_registry.js";
 
 const DECIMAL_GB_BYTES = 1_000_000_000;
@@ -304,7 +312,6 @@ function syncSettingsPanelControls() {
     if (controls.promptChannelTemplate && this._channelTemplate) {
         controls.promptChannelTemplate.value = this._channelTemplate().id;
     }
-    if (controls.promptChannelLabels) controls.promptChannelLabels.checked = this._promptChannelLabels === true;
     if (controls.promptSectionDelimiter) controls.promptSectionDelimiter.value = String(this._promptSectionDelimiter ?? ".");
     if (controls.promptFrameThreshold) controls.promptFrameThreshold.value = String(this._promptFrameThreshold ?? 10);
     if (controls.referenceFrameThreshold) controls.referenceFrameThreshold.value = String(this._referenceFrameThreshold ?? 0);
@@ -317,6 +324,7 @@ function syncSettingsPanelControls() {
             : "Loading server setting…";
     }
     this._renderModelTemplateSettings?.();
+    this._renderPromptChannelTemplateSettings?.();
 }
 
 function showSettingsPanel() {
@@ -1436,9 +1444,10 @@ function showSettingsPanel() {
     externalLinksToggle.disabled = true;
     externalLinksToggle.title = "Loading server setting…";
 
+    let channelTemplatesSection = null;
     const promptsSection = createSection(
         "Prompts",
-        "Prompt lane behavior. Channel template, channel labels, section delimiter, and boundary threshold are PROJECT-WIDE; the rest are browser-local preferences."
+        "Prompt lane behavior. Channel template, section delimiter, and boundary threshold are PROJECT-WIDE; the rest are browser-local preferences."
     );
     // — Project-wide (host-owned versioned project PUTs, not settings writes).
     //   syncSettingsPanelControls only syncs settings-backed controls, so
@@ -1447,7 +1456,7 @@ function showSettingsPanel() {
         const templateControls = createRow(
             promptsSection,
             "Channel Template (project-wide)",
-            "The set of named prompt channels every section authors, and how they are labelled in the composed output. Named-field templates such as MiniMax H3 always emit their field names regardless of the Channel Labels toggle. Saved into the project."
+            "The set of named prompt channels every section authors, including its field-name policy. Saved into the project."
         );
         const templateSelect = document.createElement("select");
         templateSelect.style.cssText = chromeInputCss({ width: "200px", textAlign: "left" });
@@ -1462,7 +1471,8 @@ function showSettingsPanel() {
         templateSelect.value = this._channelTemplate?.().id || "sonder";
         templateSelect.addEventListener("change", () => {
             const requested = templateSelect.value;
-            Promise.resolve(this._setPromptChannelTemplate(requested))
+            const resolved = options.find((option) => option.id === requested)?.template;
+            Promise.resolve(this._setPromptChannelTemplate(resolved || requested))
                 // A refused or cancelled switch must not leave the picker
                 // showing a template the project is not actually using.
                 .then(() => { templateSelect.value = this._channelTemplate().id; })
@@ -1474,26 +1484,14 @@ function showSettingsPanel() {
 
         const editTemplateBtn = document.createElement("button");
         editTemplateBtn.textContent = "Edit…";
-        editTemplateBtn.title = "Edit the channel keys, headers, guidance, shot-marker"
-            + " channel, separators and global-prompt behavior. Editing a built-in"
-            + " saves a project copy; Reset points the project back at a built-in.";
+        editTemplateBtn.title = "Open Channel Templates management.";
         editTemplateBtn.style.cssText = chromeButtonCss({ fontSize: "11px", padding: "3px 8px" });
         editTemplateBtn.addEventListener("click", () => {
-            this._openChannelTemplateEditor?.();
+            channelTemplatesSection?.scrollIntoView?.({ block: "start", behavior: "smooth" });
         });
         templateControls.appendChild(editTemplateBtn);
         controls.promptChannelTemplateEdit = editTemplateBtn;
     }
-    createCheckbox(
-        promptsSection,
-        "promptChannelLabels",
-        "Channel Labels (project-wide)",
-        "Prefix channels as [VISUAL]: / [SPEECH]: / [SOUNDS]: in composed prompt output. Saved into the project.",
-        () => this._promptChannelLabels === true,
-        (checked) => {
-            Promise.resolve(this._togglePromptChannelLabels(checked)).catch(() => {});
-        }
-    );
     {
         const delimiterControls = createRow(
             promptsSection,
@@ -1605,6 +1603,146 @@ function showSettingsPanel() {
             },
         })
     );
+
+    channelTemplatesSection = createSection(
+        "Channel Templates",
+        "Manage browser-local custom channel definitions. Projects keep their own active value; changes never propagate to closed projects."
+    );
+    const channelDefaultRow = createRow(
+        channelTemplatesSection,
+        "Default for new projects",
+        "The channel template applied only when a project is first created."
+    );
+    const channelDefaultSelect = document.createElement("select");
+    channelDefaultSelect.style.cssText = chromeInputCss({ width: "220px", textAlign: "left" });
+    channelDefaultSelect.addEventListener("change", () => {
+        this._updateSettings({
+            projectDefaults: { defaultChannelTemplateId: channelDefaultSelect.value },
+        });
+    });
+    channelDefaultSelect.addEventListener("keydown", (e) => e.stopPropagation());
+    channelDefaultRow.appendChild(channelDefaultSelect);
+    controls.defaultChannelTemplateId = channelDefaultSelect;
+
+    const channelTemplateList = document.createElement("div");
+    channelTemplateList.style.cssText = "display:flex;flex-direction:column;gap:8px;";
+    channelTemplatesSection.appendChild(channelTemplateList);
+
+    const channelAction = (text, variant, onClick) => {
+        const button = document.createElement("button");
+        button.textContent = text;
+        button.style.cssText = chromeButtonCss({
+            variant, padding: "4px 9px", fontSize: "10px", radius: "6px",
+        });
+        button.addEventListener("click", onClick);
+        return button;
+    };
+
+    this._renderPromptChannelTemplateSettings = () => {
+        const active = this._channelTemplate?.();
+        const options = this._promptChannelTemplateOptions?.() || [];
+        const catalog = getAllPromptChannelTemplates(this._settings);
+        channelDefaultSelect.replaceChildren();
+        for (const template of catalog) {
+            const option = document.createElement("option");
+            option.value = template.id;
+            option.textContent = template.name;
+            channelDefaultSelect.appendChild(option);
+        }
+        const requestedDefault = this._settings?.projectDefaults?.defaultChannelTemplateId
+            || DEFAULT_CHANNEL_TEMPLATE_ID;
+        channelDefaultSelect.value = Array.from(channelDefaultSelect.options)
+            .some((option) => option.value === requestedDefault)
+            ? requestedDefault : DEFAULT_CHANNEL_TEMPLATE_ID;
+
+        channelTemplateList.replaceChildren();
+        for (const option of options) {
+            const template = option.template;
+            const isActive = active?.id === template.id;
+            const olderCopy = isActive && option.inCatalog
+                && JSON.stringify(templateFreezeValue(active))
+                    !== JSON.stringify(templateFreezeValue(template));
+            const card = document.createElement("div");
+            card.style.cssText = `
+                border:1px solid ${COLORS.borderSoft}; border-radius:8px;
+                padding:10px 11px; display:flex; flex-direction:column; gap:7px;
+                background:${COLORS.panelMuted};
+            `;
+            const head = document.createElement("div");
+            head.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:10px;";
+            const nameWrap = document.createElement("div");
+            const name = document.createElement("div");
+            name.style.cssText = `font-size:11px;font-weight:700;color:${COLORS.text};`;
+            name.textContent = template.name;
+            const badge = document.createElement("div");
+            badge.style.cssText = `font-size:10px;color:${COLORS.textMuted};`;
+            const kind = template.builtin
+                ? "Built-in"
+                : (option.inCatalog ? "Custom" : "Custom (not in your catalog)");
+            const activeBadge = isActive
+                ? (olderCopy
+                    ? " • Active Project Template (project has an older copy)"
+                    : " • Active Project Template")
+                : "";
+            badge.textContent = `${kind}${activeBadge}`;
+            nameWrap.append(name, badge);
+
+            const actions = document.createElement("div");
+            actions.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;";
+            const useButton = channelAction("Use", isActive && !olderCopy ? "active" : "primary", () => {
+                Promise.resolve(this._setPromptChannelTemplate(template))
+                    .then(() => this._renderPromptChannelTemplateSettings?.());
+            });
+            useButton.title = olderCopy
+                ? "Replace the project's older materialized copy with this catalog definition."
+                : "Use this template in the active project.";
+            actions.appendChild(useButton);
+
+            if (template.builtin) {
+                actions.appendChild(channelAction("Save as Custom", "subtle", () => {
+                    this._openChannelTemplateEditor(template, "edit");
+                }));
+            } else if (!option.inCatalog) {
+                actions.appendChild(channelAction("Save as Custom", "subtle", () => {
+                    Promise.resolve(this._adoptPromptChannelTemplate(template))
+                        .then(() => this._renderPromptChannelTemplateSettings?.());
+                }));
+            } else {
+                actions.append(
+                    channelAction("Edit", "subtle", () => {
+                        this._openChannelTemplateEditor(template, "edit");
+                    }),
+                    channelAction("Save as Custom", "subtle", () => {
+                        this._openChannelTemplateEditor(template, "copy");
+                    }),
+                    channelAction("Delete", "danger", () => {
+                        Promise.resolve(this._deletePromptChannelTemplate(template.id))
+                            .then(() => this._renderPromptChannelTemplateSettings?.());
+                    }),
+                );
+            }
+            head.append(nameWrap, actions);
+
+            const summary = document.createElement("div");
+            summary.style.cssText = "font-size:10px;color:#9ca9b5;line-height:1.45;";
+            const keys = templateChannelKeys(template);
+            const policy = template.labels === LABELS_ALWAYS
+                ? "field names always"
+                : (template.labels === LABELS_NEVER ? "field names never" : "legacy project policy");
+            const marker = template.shot_marker_channel
+                ? `shot markers: ${template.shot_marker_channel}` : "no shot markers";
+            summary.textContent = `${keys.length} channel${keys.length === 1 ? "" : "s"}`
+                + ` | ${keys.join(", ")} | ${policy} | ${marker}`;
+            card.append(head, summary);
+            channelTemplateList.appendChild(card);
+        }
+    };
+
+    const newChannelTemplateButton = channelAction(
+        "New Channel Template", "subtle",
+        () => this._openChannelTemplateEditor(null, "new"));
+    channelTemplatesSection.appendChild(newChannelTemplateButton);
+    this._renderPromptChannelTemplateSettings();
 
     const appearanceSection = createSection(
         "Appearance",
@@ -2013,6 +2151,7 @@ function hideSettingsPanel() {
         this._settingsPanelEl = null;
         this._settingsPanelControls = null;
         this._renderModelTemplateSettings = null;
+        this._renderPromptChannelTemplateSettings = null;
     }
     if (this._settingsPanelKeyOff) {
         this._settingsPanelKeyOff();

@@ -8,6 +8,8 @@
 // prompt_composition.js is a compose-only twin of prompt_payload.py.
 
 export const DEFAULT_CHANNEL_TEMPLATE_ID = "sonder";
+// Keep creation policy separate from the legacy/composition fallback above.
+export const DEFAULT_NEW_PROJECT_CHANNEL_TEMPLATE_ID = "standard";
 
 export const LABELS_ALWAYS = "always";
 export const LABELS_NEVER = "never";
@@ -96,9 +98,9 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
     // Display name only — the id stays `sonder` so existing projects and frozen
     // jobs keep resolving. This channel split is not ours to claim.
     sonder: template(DEFAULT_CHANNEL_TEMPLATE_ID, "Visual + Speech + Sound",
-        "The editor's default: separate visual, speech and sound channels, "
-        + "labelled only when the project's channel-label toggle is on.",
-        SONDER_CHANNELS),
+        "The editor's three-field format: separate visual, speech and sound channels, "
+        + "always labelled in composed prompt output.",
+        SONDER_CHANNELS, { labels: LABELS_ALWAYS }),
     minimax_h3_base: template("minimax_h3_base", "MiniMax H3",
         "MiniMax H3's three core fields for text- and keyframe-driven "
         + "generation (T2VA / I2VA / FL2VA / L2VA).",
@@ -121,38 +123,70 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
 
 // An unknown id resolves to the default rather than throwing: a project saved
 // against a custom template that was later removed must still render.
-export function getChannelTemplate(templateId) {
+function cloneTemplate(value) {
+    return {
+        ...value,
+        channels: (value?.channels || []).map((entry) => ({ ...entry })),
+    };
+}
+
+export function getChannelTemplate(templateId, catalog = null) {
     if (templateId && typeof templateId === "object" && !Array.isArray(templateId)) {
+        if (templateId.builtin === true
+            && PROMPT_CHANNEL_TEMPLATE_PRESETS[templateId.id]) {
+            return cloneTemplate(PROMPT_CHANNEL_TEMPLATE_PRESETS[templateId.id]);
+        }
         return normalizeChannelTemplate(templateId);
     }
     const key = String(templateId ?? "") || DEFAULT_CHANNEL_TEMPLATE_ID;
-    return PROMPT_CHANNEL_TEMPLATE_PRESETS[key]
-        || PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID];
+    const preset = PROMPT_CHANNEL_TEMPLATE_PRESETS[key];
+    if (preset) return cloneTemplate(preset);
+    const custom = Array.isArray(catalog)
+        ? catalog.find((entry) => entry?.id === key)
+        : null;
+    if (custom) return normalizeChannelTemplate(custom);
+    return cloneTemplate(PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID]);
 }
 
-export function normalizeChannelTemplate(raw) {
-    const fallback = PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID];
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return fallback;
+export function mergeChannelTemplateCatalog(catalog, activeTemplate) {
+    const merged = [];
+    const seen = new Set();
+    for (const raw of catalog || []) {
+        const template = getChannelTemplate(raw);
+        if (seen.has(template.id)) continue;
+        seen.add(template.id);
+        merged.push(template);
+    }
+    const active = getChannelTemplate(activeTemplate);
+    if (!seen.has(active.id)) merged.push(active);
+    return merged;
+}
+
+export function strictNormalizeChannelTemplate(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    if (!Array.isArray(raw.channels) || !raw.channels.length) return null;
 
     const channels = [];
     const seen = new Set();
-    for (const entry of raw.channels || []) {
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    for (const entry of raw.channels) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
         const key = String(entry.key ?? "").trim();
-        if (!key || seen.has(key)) continue;
+        if (!key || seen.has(key)) return null;
         seen.add(key);
         channels.push(channel(key, String(entry.label ?? ""), String(entry.description ?? "")));
     }
-    if (!channels.length) return fallback;
 
     let labels = String(raw.labels ?? LABELS_PROJECT);
-    if (![LABELS_ALWAYS, LABELS_NEVER, LABELS_PROJECT].includes(labels)) labels = LABELS_PROJECT;
+    if (![LABELS_ALWAYS, LABELS_NEVER, LABELS_PROJECT].includes(labels)) return null;
     let globalMerge = String(raw.global_merge ?? GLOBAL_MERGE_LEADING);
     if (![GLOBAL_MERGE_LEADING, GLOBAL_MERGE_PER_CHANNEL].includes(globalMerge)) {
-        globalMerge = GLOBAL_MERGE_LEADING;
+        return null;
     }
     let shotMarkerChannel = String(raw.shot_marker_channel ?? "");
-    if (!seen.has(shotMarkerChannel)) shotMarkerChannel = "";
+    if (!seen.has(shotMarkerChannel)) {
+        if (shotMarkerChannel) return null;
+        shotMarkerChannel = "";
+    }
 
     return {
         id: String(raw.id ?? "custom"),
@@ -171,14 +205,38 @@ export function normalizeChannelTemplate(raw) {
     };
 }
 
-// Mirror of prompt_channel_templates.template_freeze_value. A built-in freezes
-// as its id; a project-owned fork freezes as its whole dict, because the project
-// could edit or delete it before a queued job runs.
-export function templateFreezeValue(templateOrId) {
-    const resolved = (templateOrId && typeof templateOrId === "object" && templateOrId.channels)
-        ? templateOrId
-        : getChannelTemplate(templateOrId);
-    if (resolved.builtin) return resolved.id;
+export function normalizeChannelTemplate(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        return cloneTemplate(PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID]);
+    }
+    const channels = [];
+    const seen = new Set();
+    for (const entry of raw.channels || []) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        const key = String(entry.key ?? "").trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        channels.push({ ...entry, key });
+    }
+    let labels = String(raw.labels ?? LABELS_PROJECT);
+    if (![LABELS_ALWAYS, LABELS_NEVER, LABELS_PROJECT].includes(labels)) labels = LABELS_PROJECT;
+    let globalMerge = String(raw.global_merge ?? GLOBAL_MERGE_LEADING);
+    if (![GLOBAL_MERGE_LEADING, GLOBAL_MERGE_PER_CHANNEL].includes(globalMerge)) {
+        globalMerge = GLOBAL_MERGE_LEADING;
+    }
+    let shotMarkerChannel = String(raw.shot_marker_channel ?? "");
+    if (!seen.has(shotMarkerChannel)) shotMarkerChannel = "";
+    return strictNormalizeChannelTemplate({
+        ...raw,
+        channels,
+        labels,
+        global_merge: globalMerge,
+        shot_marker_channel: shotMarkerChannel,
+    })
+        || cloneTemplate(PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID]);
+}
+
+function templateDict(resolved) {
     return {
         id: resolved.id,
         name: resolved.name,
@@ -191,6 +249,23 @@ export function templateFreezeValue(templateOrId) {
         global_merge: resolved.global_merge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: globalChannelsEnabled(resolved),
     };
+}
+
+export function projectTemplateValue(templateOrId, catalog = null) {
+    const resolved = (templateOrId && typeof templateOrId === "object" && templateOrId.channels)
+        ? templateOrId
+        : getChannelTemplate(templateOrId, catalog);
+    if (resolved.builtin) return resolved.id;
+    return templateDict(resolved);
+}
+
+// Queue projection: always whole, including shipped presets. A pending job
+// therefore cannot change meaning when a later release edits a preset policy.
+export function templateFreezeValue(templateOrId, catalog = null) {
+    const resolved = (templateOrId && typeof templateOrId === "object" && templateOrId.channels)
+        ? templateOrId
+        : getChannelTemplate(templateOrId, catalog);
+    return templateDict(resolved);
 }
 
 export function resolveChannelTemplate(metadata = null, params = null) {
@@ -207,6 +282,17 @@ export function templateChannelKeys(templateOrId) {
         ? templateOrId
         : getChannelTemplate(templateOrId);
     return (resolved.channels || []).map((entry) => entry.key);
+}
+
+export function channelTemplateKeySetsEqual(left, right, catalog = null) {
+    const leftTemplate = (left && typeof left === "object")
+        ? left : getChannelTemplate(left, catalog);
+    const rightTemplate = (right && typeof right === "object")
+        ? right : getChannelTemplate(right, catalog);
+    const leftKeys = new Set(templateChannelKeys(leftTemplate));
+    const rightKeys = new Set(templateChannelKeys(rightTemplate));
+    return leftKeys.size === rightKeys.size
+        && [...leftKeys].every((key) => rightKeys.has(key));
 }
 
 // Whether the scene-global prompt is authored per channel. Off means ONE global

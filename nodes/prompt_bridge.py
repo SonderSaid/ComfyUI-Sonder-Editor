@@ -70,13 +70,6 @@ def _snapshot_version(queue_job) -> int:
         return 0
 
 
-def _project_labels_on(project) -> bool:
-    metadata = getattr(project, "metadata", None)
-    if isinstance(metadata, dict):
-        return metadata.get("prompt_channel_labels", False) is True
-    return False
-
-
 def _threshold_from(source, default: float = 10.0) -> float:
     if not isinstance(source, dict):
         return default
@@ -115,8 +108,7 @@ def resolve_window_prompt_state(project):
         )
 
     template = prompt_channel_templates.resolve_channel_template(metadata)
-    labels_on = prompt_channel_templates.template_labels_on(
-        template, _project_labels_on(project))
+    labels_on = prompt_channel_templates.template_labels_on(template, False)
     threshold = _threshold_from(metadata)
     if scene is None:
         return "", [], labels_on, window_start, window_end, "live", threshold, template

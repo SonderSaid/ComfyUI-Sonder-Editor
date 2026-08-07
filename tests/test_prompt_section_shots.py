@@ -291,6 +291,11 @@ def test_prompt_history_entry_preserves_both_fields():
 
     class _Job:
         scene_prompt = "global"
+        params = {"prompt_channel_template": {
+            "id": "custom:history", "name": "History",
+            "channels": [{"key": "visual", "label": "Visual"}],
+            "labels": "always",
+        }}
         prompt_sections = [{
             "start_frame": 0, "end_frame": 120,
             "channels": {"visual": "a dog walks", "speech": "", "sounds": ""},
@@ -307,6 +312,9 @@ def test_prompt_history_entry_preserves_both_fields():
     assert entry["shot_timestamp"] is False
     assert entry["subject_ids"] == [
         {"entity_id": "ent_a", "retention": "attribute_transfer"}]
+    history = project.metadata["prompt_history"][0]
+    assert history["source_channel_template_id"] == "custom:history"
+    assert history["source_channel_template"]["id"] == "custom:history"
 
 
 # --- orphan pruning ---------------------------------------------------------------------

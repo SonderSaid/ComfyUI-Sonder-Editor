@@ -13,18 +13,18 @@ a fresh `[Unreleased]` block.
 
 ### Added
 - Prompt channels are now a project-wide template rather than a fixed three.
-  Pick one in Settings > Prompts: **Standard** (one plain channel), **Visual +
-  Speech + Sound** (the previous three, still the default), or **MiniMax H3** in
+  Pick one in Settings > Prompts: **Standard** (one plain channel and the
+  new-project default), **Visual + Speech + Sound** (the previous three), or **MiniMax H3** in
   base and full-reference form. Each channel carries its own authoring guidance,
-  and a named-field template always writes its field names no matter how the
-  Channel Labels toggle is set. Switching asks first and says what it is about
-  to rewrite, across every scene.
-- Channel templates are editable. **Edit…** beside the picker opens the channel
-  keys, their headers, per-channel guidance, which field carries shot markers,
-  the label policy, the separators between fields, and whether the scene-global
-  prompt is per channel. Editing a built-in saves a project copy you own and
-  Reset puts the project back on a built-in; a channel-set change rewrites your
-  text the same reversible way a template switch does.
+  and each template owns whether its field names are written. Switching asks
+  first and says what it is about to rewrite, across every scene.
+- Channel templates now have their own Settings catalog. Built-ins are read-only
+  and offer **Save as Custom**; custom templates persist independently of the
+  project using them and support explicit new, copy, edit, delete, and default-
+  for-new-project actions. The editor covers channel keys and headers, guidance,
+  shot-marker placement, field-name policy, separators, and scene-global mode.
+  Channel-key changes rewrite text through the same guarded project transaction
+  as a template switch.
 - Prompt sections can open a new shot and stamp a cut time as fully independent
   choices — either, both or neither. A section can read `At 00:07.000, he takes
   out a gun` while continuing the same shot, and the first section is no longer
@@ -137,13 +137,23 @@ a fresh `[Unreleased]` block.
   intact and every channel blank, because the browser-local settings normalizer
   only knew the three original channel names. Templates saved before this fix
   were emptied at rest and need re-saving.
+- Custom channel templates remain available after switching to a preset. Their
+  definitions now live in a browser catalog instead of only in the active
+  project's metadata, while projects keep an independent copy so catalog edits
+  never propagate silently.
+- Prompt history and browser prompt templates retain the full source channel
+  template and compare channel-key sets when applied. Custom ids no longer fall
+  through to the default, and same-structure MiniMax text is not needlessly
+  collapsed and reparsed.
 - Prompt boxes in the Prompt panel obey their drag-resize again, and the inline
   prompt bar on the timeline no longer clips its lower half when a template with
   many channels wraps it onto a second row.
 - Opening the inline prompt bar under a MiniMax template no longer throws while
   trying to focus a channel that template does not have.
-- A queued job now keeps the channel-label setting it was queued with. Changing
-  the project toggle used to silently rewrite a pending job's prompt.
+- A queued job now freezes the complete resolved channel template, including
+  label policy. Later preset or custom-catalog edits cannot rewrite pending work,
+  while legacy jobs carrying a bare preset id plus the old label toggle retain
+  their original behavior.
 - A Reference member with a prompt pattern but no prompt text no longer renders
   a dangling clause like `<Subject 2> is the  from <Picture 2>`; it falls back
   to the Reference's name rather than vanishing while its image still reaches
@@ -162,6 +172,14 @@ a fresh `[Unreleased]` block.
   2.0 as well as legacy LiteGraph.
 
 ### Changed
+- New projects start with **Standard** channels and **No Model Template**, a
+  model-agnostic one-field baseline. Existing projects and stored browser
+  defaults are unchanged.
+- **Visual + Speech + Sound now always emits `[VISUAL]:`, `[SPEECH]:`, and
+  `[SOUNDS]:` field names, including for released projects whose old Channel
+  Labels toggle was off.** The project-level toggle has been removed; Standard
+  remains unlabelled, both MiniMax templates remain labelled, and legacy queued
+  jobs replay their frozen setting.
 - Reference crop/trim preview now remembers Full Source versus Applied Result,
   uses the shared gallery seek bar for audio and video, and makes audio
   waveform-first with movable trim ranges and visible playback lines.

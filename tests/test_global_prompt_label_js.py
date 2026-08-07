@@ -107,5 +107,5 @@ def test_surfaces_consume_the_shared_helper_rather_than_the_legacy_mirror():
     hover = widget.split("_showPromptHoverPreview(hit, clientX, clientY) {", 1)[1]
     hover = hover.split("\n    _hidePromptHoverPreview", 1)[0]
     assert "globalChannelLines(this.activeScene?.global_channels," in hover
-    assert "this._channelTemplate(), labelsOn)" in hover
+    assert "this._channelTemplate(), false)" in hover
     assert '"(empty global prompt)"' in hover

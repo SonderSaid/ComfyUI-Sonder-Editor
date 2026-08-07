@@ -58,8 +58,8 @@ def test_bridge_live_resolution_with_ctx_window():
     assert payload["source"] == "live"
     assert payload["global_prompt"] == "global style"
     # Rebased real frames: walks covers [0,10), runs holds [10,40)
-    assert payload["smart_prompt"] == "walks [0-10] | runs [10-40]"
-    assert payload["local_prompts"] == "walks | runs"
+    assert payload["smart_prompt"] == "[VISUAL]: walks [0-10] | [VISUAL]: runs [10-40]"
+    assert payload["local_prompts"] == "[VISUAL]: walks | [VISUAL]: runs"
     assert payload["segment_lengths"] == "10,30"
 
 
@@ -89,7 +89,7 @@ def test_bridge_respects_boundary_threshold():
     project._execution_context = {"scene_id": "scene-1", "context_start": 0, "context_end": 42}
 
     payload = prompt_bridge.build_window_relay_payload(project)
-    assert payload["local_prompts"] == "a"
+    assert payload["local_prompts"] == "[VISUAL]: a"
     assert payload["segment_lengths"] == "42"
 
 
@@ -138,7 +138,8 @@ def test_bridge_legacy_v1_snapshot_flat_prompt_dicts():
         scene_id="scene-1",
         scene_prompt="",  # pre-upgrade jobs default to empty global
         prompt_sections=[{"start_frame": 0, "end_frame": 40, "prompt": "old flat text"}],
-        params={"snapshot_version": 1},
+        params={"snapshot_version": 1, "prompt_channel_template": "sonder",
+                "prompt_channel_labels": False},
     )
     project.generation_queue = [job]
     project._execution_context = {
@@ -150,7 +151,7 @@ def test_bridge_legacy_v1_snapshot_flat_prompt_dicts():
     assert payload["global_prompt"] == ""
 
 
-def test_bridge_live_hidden_lanes_and_labels_off():
+def test_bridge_live_hidden_lanes_and_template_owned_labels():
     prompt_bridge = _import_prompt_bridge()
     project, scene = _project_with_scene(
         prompt="global", prompt_sections=[PromptSection(0, 100, prompt="sec")],
@@ -159,7 +160,7 @@ def test_bridge_live_hidden_lanes_and_labels_off():
     scene.global_prompt_track_config = LaneConfig(hidden=True)
     payload = prompt_bridge.build_window_relay_payload(project)
     assert payload["global_prompt"] == ""
-    assert payload["smart_prompt"] == "sec [0-100]"  # labels off
+    assert payload["smart_prompt"] == "[VISUAL]: sec [0-100]"
 
     scene.prompt_track_config = LaneConfig(hidden=True)
     payload = prompt_bridge.build_window_relay_payload(project)
@@ -243,6 +244,60 @@ def _route_handler(route_module, method, path):
     raise AssertionError(f"Route not found: {method} {path}")
 
 
+def test_project_create_seeds_channel_default_only_on_actual_creation(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    monkeypatch.setattr(route_module, "_configured_base_dir", lambda: str(tmp_path))
+    handler = _route_handler(route_module, "POST", "/sonder-editor/project")
+    custom = {
+        "id": "custom:seed", "name": "Seed",
+        "channels": [{"key": "body", "label": "Body"}],
+        "labels": "always",
+    }
+    request = DummyRequest(method="POST", body={
+        "name": "Seeded", "prompt_channel_template": custom,
+    })
+    response = asyncio.run(handler(request))
+    assert response.status == 201
+    created = json.loads(response.body.decode("utf-8"))
+    assert created["metadata"]["prompt_channel_template"]["id"] == "custom:seed"
+
+    project = route_module.load_project(str(tmp_path / "Seeded"))
+    project.metadata["prompt_channel_template"] = "standard"
+    route_module.save_project(project)
+    response = asyncio.run(handler(request))
+    existing = json.loads(response.body.decode("utf-8"))
+    assert existing["metadata"]["prompt_channel_template"] == "standard"
+
+
+def test_project_create_without_channel_seed_uses_standard(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    monkeypatch.setattr(route_module, "_configured_base_dir", lambda: str(tmp_path))
+    handler = _route_handler(route_module, "POST", "/sonder-editor/project")
+    response = asyncio.run(handler(DummyRequest(
+        method="POST", body={"name": "Defaulted"})))
+    assert response.status == 201
+    created = json.loads(response.body.decode("utf-8"))
+    assert created["metadata"]["prompt_channel_template"] == "standard"
+
+
+def test_project_update_rejects_malformed_channel_template(monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    project = TimelineProject(project_dir=str(tmp_path), name="Project")
+    project.metadata["prompt_channel_template"] = "standard"
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    handler = _route_handler(
+        route_module, "PUT", "/sonder-editor/project/{project_id}")
+    request = DummyRequest(
+        method="PUT",
+        body={"metadata": {"prompt_channel_template": {
+            "id": "custom:broken", "channels": [],
+        }}},
+    )
+    response = asyncio.run(handler(request))
+    assert response.status == 400
+    assert project.metadata["prompt_channel_template"] == "standard"
+
+
 def test_prompt_payload_route_live_and_snapshot(monkeypatch, tmp_path):
     route_module = _load_route_module(monkeypatch)
     scene = Scene(scene_id="scene-1", name="Scene", duration_frames=80,
@@ -262,7 +317,7 @@ def test_prompt_payload_route_live_and_snapshot(monkeypatch, tmp_path):
     assert payload["source"] == "live"
     assert payload["window_end"] == 80
     # Full-scene window: gap-fill extends the only section over everything
-    assert payload["relay"]["smart_prompt"] == "mid [0-80]"
+    assert payload["relay"]["smart_prompt"] == "[VISUAL]: mid [0-80]"
     assert payload["global_prompt"] == "global"
 
     # A running snapshot job wins

@@ -1,12 +1,12 @@
 // Prompt Management panel — centered overlay for editing the scene-global
 // prompt, the segment lane's sections (ranges + channels), the project-durable
-// channel-labels toggle, and a PromptRelay payload preview.
+// channel-template-aware prompt state and a PromptRelay payload preview.
 //
 // Module-host contract (fullscreen seam pattern): the host owns state,
 // networking, and durable writes; this module owns its DOM/listeners and
 // returns a cleanup handle. Host surface used:
 //   activeScene, totalFrames, _settings, _updateSettings,
-//   _promptChannelLabels, _projectDirName(), _timecodeMode/_frameToTimecode,
+//   _projectDirName(), _timecodeMode/_frameToTimecode,
 //   _resolveFrameConstraintForTemplate(_templateId),
 //   _updateScenePrompt(text), _updatePromptSection(idx, fields),
 //   _deletePromptSection(idx), _setSelectionToFrameRange(start, end),
@@ -15,8 +15,6 @@
 //   _fetchPromptPayload()/_fetchPromptHistory() -> Promise,
 //   _getPromptTemplates()/_savePromptTemplate()/_deletePromptTemplate(),
 //   _isPromptTrackLocked(), _isGlobalPromptTrackLocked()
-// (The channel-labels toggle lives in Settings > Prompts via the settings
-// host adapter, not here.)
 //
 // Improvements over the guide-management template: focus-aware Escape via
 // keyboard_ownership at PRIORITY.OVERLAY (first Esc reverts the focused box
@@ -498,7 +496,8 @@ export function mountPromptManagementPanel(host) {
             await host._applyPromptSetup({
                 global: host.activeScene?.prompt || "",
                 global_channels: { ...(host.activeScene?.global_channels || {}) },
-                source_channel_template: host._channelTemplate().id,
+                source_channel_template_id: host._channelTemplate().id,
+                source_channel_template: host._channelTemplate(),
                 sections,
                 extendDurationTo,
             });

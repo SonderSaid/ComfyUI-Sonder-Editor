@@ -6,11 +6,12 @@ any) carries shot markers. `server/prompt_payload.py` stays authoritative for
 composition; this module is authoritative for the *format vocabulary* that
 composition is given.
 
-Templates follow the reference-recipe pattern, not the model-template pattern:
-a backend-served preset catalog is materialized onto the project and frozen into
-job params. A channel set determines the served prompt, so it can never be a
-browser preference — see the `size_multiple_source: "template"` precedent in
-nodes/reference_core.py, which copies a number rather than resolving it live.
+Shipped presets are backend/frontend mirrors and are read-only. Browser settings
+own a cross-project catalog of custom templates and the default for newly created
+projects. The active project stores a thin preset id or a full custom dict, while
+every queued job freezes the resolved full dict. Browser catalog changes never
+rewrite projects implicitly; composition uses only the value the project or job
+already carries.
 
 The frontend mirror is web/js/prompt_channel_templates.js — keep the preset ids,
 channel keys, labels and separators in lockstep with it.
@@ -25,14 +26,16 @@ MiniMaxAI/MiniMax-H3). Where this file and those guides disagree, the guides win
 """
 
 DEFAULT_CHANNEL_TEMPLATE_ID = "sonder"
+# Creation default is deliberately separate from the legacy/composition
+# fallback above: changing the latter would reinterpret old projects.
+DEFAULT_NEW_PROJECT_CHANNEL_TEMPLATE_ID = "standard"
 
-# Label policy. A named-field format must OWN its labels: the project-durable
-# `prompt_channel_labels` toggle defaults to False at every read site, so a
-# template that deferred to it would silently emit prose soup with no field
-# names at all.
+# Label policy. New templates own their label behavior. LABELS_PROJECT remains
+# only for legacy custom definitions/jobs created while the removed project
+# toggle still existed.
 LABELS_ALWAYS = "always"      # template forces labels on
 LABELS_NEVER = "never"        # template forces labels off
-LABELS_PROJECT = "project"    # honor the project's prompt_channel_labels toggle
+LABELS_PROJECT = "project"    # honor a legacy job's frozen prompt_channel_labels value
 
 # Global-prompt merge policy (P5). `leading` prepends the global text once,
 # ahead of everything — today's behavior. `per_channel` merges each global
@@ -171,9 +174,10 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         # Display name only — the id stays `sonder` so existing projects and
         # frozen jobs keep resolving. This channel split is not ours to claim.
         DEFAULT_CHANNEL_TEMPLATE_ID, "Visual + Speech + Sound",
-        "The editor's default: separate visual, speech and sound channels, "
-        "labelled only when the project's channel-label toggle is on.",
+        "The editor's three-field format: separate visual, speech and sound channels, "
+        "always labelled in composed prompt output.",
         _SONDER_CHANNELS,
+        labels=LABELS_ALWAYS,
     ),
     "minimax_h3_base": _template(
         "minimax_h3_base", "MiniMax H3",
@@ -196,6 +200,14 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
 }
 
 
+def _clone_template(template: dict) -> dict:
+    """Return a mutation-safe copy of a preset or normalized custom."""
+    return {
+        **template,
+        "channels": tuple(dict(channel) for channel in template.get("channels") or ()),
+    }
+
+
 def get_channel_template(template_id) -> dict:
     """Return the preset for `template_id`, falling back to the default.
 
@@ -208,43 +220,40 @@ def get_channel_template(template_id) -> dict:
     preset = PROMPT_CHANNEL_TEMPLATE_PRESETS.get(key)
     if preset is None:
         preset = PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID]
-    return preset
+    return _clone_template(preset)
 
 
-def normalize_channel_template(raw) -> dict:
-    """Coerce a project-owned (forked) template dict into the full shape.
-
-    Anything missing or malformed falls back to the default template's value,
-    so a hand-edited project.json cannot produce a template with no channels.
-    """
-    default = PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID]
+def strict_normalize_channel_template(raw):
+    """Validate a materialized custom template, returning None if malformed."""
     if not isinstance(raw, dict):
-        return default
+        return None
+    raw_channels = raw.get("channels")
+    if not isinstance(raw_channels, (list, tuple)) or not raw_channels:
+        return None
 
     channels = []
     seen = set()
-    for entry in raw.get("channels") or ():
+    for entry in raw_channels:
         if not isinstance(entry, dict):
-            continue
+            return None
         key = str(entry.get("key") or "").strip()
         if not key or key in seen:
-            continue
+            return None
         seen.add(key)
         channels.append(_channel(key,
                                  str(entry.get("label") or ""),
                                  str(entry.get("description") or "")))
-    if not channels:
-        return default
 
     labels = str(raw.get("labels") or LABELS_PROJECT)
     if labels not in (LABELS_ALWAYS, LABELS_NEVER, LABELS_PROJECT):
-        labels = LABELS_PROJECT
+        return None
     global_merge = str(raw.get("global_merge") or GLOBAL_MERGE_LEADING)
     if global_merge not in (GLOBAL_MERGE_LEADING, GLOBAL_MERGE_PER_CHANNEL):
-        global_merge = GLOBAL_MERGE_LEADING
+        return None
     shot_marker_channel = str(raw.get("shot_marker_channel") or "")
     if shot_marker_channel not in seen:
-        shot_marker_channel = ""
+        if shot_marker_channel:
+            return None
     return {
         "id": str(raw.get("id") or "custom"),
         "name": str(raw.get("name") or "Custom"),
@@ -255,11 +264,48 @@ def normalize_channel_template(raw) -> dict:
         "labels": labels,
         "shot_marker_channel": shot_marker_channel,
         "global_merge": global_merge,
-        # Absent means on: a hand-edited or pre-flag template keeps the
-        # per-channel global it was authored with.
         "global_channels_enabled": raw.get("global_channels_enabled", True) is not False,
         "builtin": False,
     }
+
+
+def normalize_channel_template(raw) -> dict:
+    """Coerce a project-owned (forked) template dict into the full shape.
+
+    Anything missing or malformed falls back to the default template's value,
+    so a hand-edited project.json cannot produce a template with no channels.
+    """
+    if not isinstance(raw, dict):
+        return _clone_template(PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID])
+    channels = []
+    seen = set()
+    for entry in raw.get("channels") or ():
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("key") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        channels.append(dict(entry, key=key))
+    labels = str(raw.get("labels") or LABELS_PROJECT)
+    if labels not in (LABELS_ALWAYS, LABELS_NEVER, LABELS_PROJECT):
+        labels = LABELS_PROJECT
+    global_merge = str(raw.get("global_merge") or GLOBAL_MERGE_LEADING)
+    if global_merge not in (GLOBAL_MERGE_LEADING, GLOBAL_MERGE_PER_CHANNEL):
+        global_merge = GLOBAL_MERGE_LEADING
+    marker = str(raw.get("shot_marker_channel") or "")
+    if marker not in seen:
+        marker = ""
+    normalized = strict_normalize_channel_template({
+        **raw,
+        "channels": channels,
+        "labels": labels,
+        "global_merge": global_merge,
+        "shot_marker_channel": marker,
+    })
+    if normalized is not None:
+        return normalized
+    return _clone_template(PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID])
 
 
 PROJECT_TEMPLATE_KEY = "prompt_channel_template"
@@ -274,20 +320,24 @@ def resolve_channel_template(metadata=None, params=None) -> dict:
     project-owned template dict.
     """
     for source in (params, metadata):
-        if isinstance(source, dict) and source.get(PROJECT_TEMPLATE_KEY):
-            return get_channel_template(source[PROJECT_TEMPLATE_KEY])
-    return PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID]
+        if not isinstance(source, dict) or not source.get(PROJECT_TEMPLATE_KEY):
+            continue
+        raw = source[PROJECT_TEMPLATE_KEY]
+        resolved = get_channel_template(raw)
+        # Compatibility for jobs queued before whole-dict freezing. A bare
+        # preset id plus the legacy frozen toggle must keep its enqueue-time
+        # label behavior even if the shipped preset policy changed later.
+        if (source is params and isinstance(raw, str)
+                and raw in PROMPT_CHANNEL_TEMPLATE_PRESETS
+                and "prompt_channel_labels" in source):
+            resolved = _clone_template(resolved)
+            resolved["labels"] = LABELS_PROJECT
+        return resolved
+    return _clone_template(PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID])
 
 
-def template_freeze_value(template) -> object:
-    """The value to write into a job's params so it re-composes identically.
-
-    Built-in presets freeze as their id; a project-owned fork freezes as its
-    full dict, because the project could edit or delete it before the job runs.
-    """
-    resolved = template if isinstance(template, dict) else get_channel_template(template)
-    if resolved.get("builtin"):
-        return resolved["id"]
+def _template_dict(resolved) -> dict:
+    """Serializable complete projection for project-custom and job paths."""
     return {
         "id": resolved["id"],
         "name": resolved["name"],
@@ -300,6 +350,20 @@ def template_freeze_value(template) -> object:
         "global_merge": resolved.get("global_merge", GLOBAL_MERGE_LEADING),
         "global_channels_enabled": global_channels_enabled(resolved),
     }
+
+
+def project_template_value(template) -> object:
+    """Project projection: preset id for built-ins, full dict for customs."""
+    resolved = template if isinstance(template, dict) else get_channel_template(template)
+    if resolved.get("builtin"):
+        return resolved["id"]
+    return _template_dict(resolved)
+
+
+def template_freeze_value(template) -> dict:
+    """Job projection: always the complete resolved template dict."""
+    resolved = template if isinstance(template, dict) else get_channel_template(template)
+    return _template_dict(resolved)
 
 
 def template_channel_keys(template) -> tuple:

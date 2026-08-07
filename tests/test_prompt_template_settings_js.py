@@ -49,6 +49,35 @@ def _round_trip(templates):
     return json.loads(result.stdout)
 
 
+def _normalize_settings(stored):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the settings tests")
+    script = (
+        f"const mod = await import({json.dumps(MODULE_URL)});\n"
+        f"console.log(JSON.stringify(mod.normalizeEditorSettings({json.dumps(stored)})));\n"
+    )
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+
+def _all_channel_templates(stored):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the settings tests")
+    script = (
+        f"const mod = await import({json.dumps(MODULE_URL)});\n"
+        f"const settings = mod.normalizeEditorSettings({json.dumps(stored)});\n"
+        "console.log(JSON.stringify(mod.getAllPromptChannelTemplates(settings)));\n"
+    )
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+
+
 def _minimax_template():
     return {
         "id": "pt-minimax",
@@ -155,3 +184,70 @@ def test_unknown_channel_keys_survive():
         }],
     }])
     assert template["sections"][0]["channels"] == {"mood": "tense", "camera": "handheld"}
+
+
+def test_channel_template_catalog_drops_malformed_entries_and_renames_collisions():
+    valid = {
+        "id": "custom:mine", "name": "Mine",
+        "channels": [{"key": "body", "label": "Body"}],
+        "labels": "always",
+    }
+    settings = _normalize_settings({
+        "promptChannelTemplates": {
+            "customTemplates": [valid, {**valid}, {"id": "broken", "channels": []}],
+        },
+    })
+    templates = settings["promptChannelTemplates"]["customTemplates"]
+    assert [entry["id"] for entry in templates] == ["custom:mine", "custom:mine-2"]
+    assert all([channel["key"] for channel in entry["channels"]] == ["body"]
+               for entry in templates)
+
+
+def test_new_project_defaults_are_standard_and_model_agnostic():
+    settings = _normalize_settings({})
+    assert settings["projectDefaults"]["defaultChannelTemplateId"] == "standard"
+    assert settings["projectDefaults"]["defaultTemplateId"] == "free"
+
+
+def test_channel_template_catalog_keeps_builtins_read_only_and_customs_owned():
+    templates = _all_channel_templates({
+        "promptChannelTemplates": {"customTemplates": [{
+            "id": "custom:mine", "name": "Mine",
+            "channels": [{"key": "body", "label": "Body"}],
+            "labels": "always",
+        }]},
+    })
+    builtins = [entry for entry in templates if entry["id"] == "sonder"]
+    customs = [entry for entry in templates if entry["id"] == "custom:mine"]
+    assert len(builtins) == 1 and builtins[0]["builtin"] is True
+    assert len(customs) == 1 and customs[0].get("builtin") is not True
+
+
+def test_channel_catalog_normalization_never_touches_prompt_template_text_bags():
+    prompt = _minimax_template()
+    settings = _normalize_settings({
+        "promptChannelTemplates": {
+            "customTemplates": [{
+                "id": "custom:mine", "name": "Mine",
+                "channels": [{"key": "mood", "label": "Mood"}],
+                "labels": "always",
+            }],
+        },
+        "promptTemplates": [prompt],
+    })
+    section = settings["promptTemplates"][0]["sections"][0]
+    assert sorted(section["channels"]) == sorted(MINIMAX_KEYS)
+
+
+def test_prompt_template_keeps_whole_source_definition_alongside_legacy_id():
+    prompt = _minimax_template()
+    prompt["source_channel_template_id"] = "custom:authored"
+    prompt["source_channel_template"] = {
+        "id": "custom:authored", "name": "Authored",
+        "channels": [{"key": "body", "label": "Body"}],
+        "labels": "always",
+    }
+    [restored] = _round_trip([prompt])
+    assert restored["source_channel_template_id"] == "custom:authored"
+    assert restored["source_channel_template"]["id"] == "custom:authored"
+    assert [entry["key"] for entry in restored["source_channel_template"]["channels"]] == ["body"]
