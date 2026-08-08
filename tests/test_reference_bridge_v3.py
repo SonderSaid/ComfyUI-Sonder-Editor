@@ -165,7 +165,7 @@ def test_msr_places_each_reference_on_a_contiguous_grid_segment_from_index_zero(
     core = _import_module(monkeypatch, "reference_core")
     monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
     project = _multi_member_project(tmp_path, _preset("sonder:ltx_msr"), [(255, 0, 0), (0, 255, 0), (0, 0, 255)])
-    frames = core.decode_reference_set(core.resolve_reference_set(project, 0))[0]
+    frames = core.decode_reference_images(core.resolve_reference_set(project, 0))[0]
 
     # 3 refs on the 8k+1 LTX grid is the 25-frame bucket, split into contiguous
     # segments: the first ref owns index 0 and the last absorbs the +1 tail.
@@ -176,19 +176,19 @@ def test_msr_places_each_reference_on_a_contiguous_grid_segment_from_index_zero(
     assert float(frames.reshape(25, -1).max(dim=1).values.min()) > 0.5
 
 
-def test_msr_routes_a_context_member_to_the_background_output(monkeypatch, tmp_path):
+def test_msr_places_a_context_member_in_the_final_temporal_segment(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
     project = _multi_member_project(
         tmp_path, _preset("sonder:ltx_msr"), [(255, 0, 0), (0, 0, 255)],
         tags=([], ["sonder:location"]),
     )
-    result = core.decode_reference_set(core.resolve_reference_set(project, 0))
-    frames, context = result[0], result[6]
-    # The context member leaves the temporal sequence entirely.
+    frames = core.decode_reference_images(core.resolve_reference_set(project, 0))[0]
+    # Sonder deliberately keeps the context member in the sequence and sorts it
+    # to the tail, overriding the surveyed separate background socket.
     assert frames.shape[0] == 17
-    assert frames.reshape(17, -1, 3).mean(dim=1).argmax(dim=1).unique().tolist() == [0]
-    assert float(context[0, :, :, 2].mean()) > 0.5
+    channel = frames.reshape(17, -1, 3).mean(dim=1).argmax(dim=1).tolist()
+    assert channel == [0] * 8 + [2] * 9
 
 
 def test_ingredients_loops_the_sheet_without_constraining_the_render_window(monkeypatch, tmp_path):
@@ -197,11 +197,9 @@ def test_ingredients_loops_the_sheet_without_constraining_the_render_window(monk
     project = _multi_member_project(tmp_path, _preset("sonder:ltx_ingredients"), [(255, 0, 0), (0, 255, 0)])
     # The render window is 18 frames — far under the 121-frame reference
     # sequence. That must not refuse the render.
-    result = core.decode_reference_set(core.resolve_reference_set(project, 0))
-    frames = result[0]
+    frames = core.decode_reference_images(core.resolve_reference_set(project, 0))[0]
     assert tuple(frames.shape) == (121, 48, 64, 3)
     assert bool((frames[0] == frames[120]).all())
-    assert result[6].shape[0] == 1  # context is dead for Ingredients
 
 
 def test_vace_composites_an_equal_width_strip_on_floored_divisible_16_geometry(monkeypatch, tmp_path):
@@ -230,28 +228,25 @@ def test_best_face_id_uses_the_bust_size_for_a_lone_member(monkeypatch):
     assert core._member_geometry(frame, hard, 64, 48, 4) == (1536, 1024)
 
 
-def test_dead_recipe_outputs_emit_documented_fallbacks(monkeypatch, tmp_path):
+def test_homogeneous_bridges_emit_assembled_and_per_member_payloads(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
     project = _multi_member_project(tmp_path, _preset("sonder:wan_vace"), [(255, 0, 0), (0, 255, 0)])
-    result = core.decode_reference_set(core.resolve_reference_set(project, 0))
-    # VACE drives reference_frames plus the two strings; everything else is dead.
-    assert result[1] == 0                                   # reference_idx
-    assert result[2] == 0.0                                 # reference_strength
-    assert result[3]["waveform"].abs().max() == 0.0         # silent AUDIO
-    assert result[4] and result[5]
-    assert float(result[6].abs().max()) == 0.0              # context
-    assert all(float(slot.abs().max()) == 0.0 for slot in result[7:23])  # r01..r16
-    # p01..p16 follow reference_prompt liveness: VACE drives it, so the two
-    # staged members carry text and the unstaged tail stays empty.
-    assert result[23] and result[24]
-    assert all(slot == "" for slot in result[25:])
+    resolved = core.resolve_reference_set(project, 0)
+    images = core.decode_reference_images(resolved)
+    prompts = core.decode_reference_prompts(resolved)
+    assert len(images) == 16 and len(prompts) == 18
+    assert float(images[0].abs().max()) > 0.0
+    assert all(float(slot.abs().max()) == 0.0 for slot in images[1:])
+    assert prompts[0] and prompts[1]
+    assert prompts[2] and prompts[3]
+    assert all(slot == "" for slot in prompts[4:])
 
     bernini = _multi_member_project(tmp_path / "b", _preset("sonder:wan_bernini"), [(255, 0, 0), (0, 255, 0)])
-    slots = core.decode_reference_set(core.resolve_reference_set(bernini, 0))
-    assert float(slots[0].abs().max()) == 0.0               # reference_frames is dead
-    assert float(slots[7].abs().max()) > 0.0                # r01 carries the member
-    assert float(slots[9].abs().max()) == 0.0               # r03 is unstaged
+    slots = core.decode_reference_images(core.resolve_reference_set(bernini, 0))
+    assert float(slots[0].abs().max()) > 0.0
+    assert float(slots[1].abs().max()) > 0.0
+    assert float(slots[2].abs().max()) == 0.0
 
 
 def test_selector_is_effective_in_window_and_cache_identity_tracks_window(monkeypatch, tmp_path):
@@ -275,10 +270,12 @@ def test_selector_is_effective_in_window_and_cache_identity_tracks_window(monkey
 def test_selector_uses_frozen_explicit_snapshot_end_after_scene_shrinks(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     project = _project(tmp_path, ReferenceLaneRecipe())
+    project.fps = 30.0
     project.generation_queue = [GenerationJob(
         job_id="queued",
         scene_id="scene",
         params={"snapshot_version": 1},
+        scene_fps=0.0,
         reference_lane_count=1,
         reference_lane_configs=[LaneConfig().to_dict()],
         reference_lane_recipes=[ReferenceLaneRecipe().to_dict()],
@@ -299,6 +296,8 @@ def test_selector_uses_frozen_explicit_snapshot_end_after_scene_shrinks(monkeypa
     selected = core.resolve_reference_set(project, 0)
     assert selected["source"] == "snapshot"
     assert selected["item"]["reference_item_id"] == "frozen"
+    assert selected["pegs"]["fps"] == 30.0
+    assert core._reference_frame_rate(core._reference_decode_context(selected, "image")) == 30.0
 
 
 def test_selector_excludes_hidden_lane(monkeypatch, tmp_path):
@@ -317,19 +316,19 @@ def test_bridge_absent_fallback_and_present_slot_assembly(monkeypatch, tmp_path)
         }},
     ))
     monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
-    absent = core.decode_reference_set({"has_reference": 0, "width": 64, "height": 48})
-    assert len(absent) == 39  # 7 fixed + r01..r16 + p01..p16
+    absent = core.decode_reference_images({"has_reference": 0, "width": 64, "height": 48})
+    assert len(absent) == 16
     assert tuple(absent[0].shape) == (1, 48, 64, 3)
-    assert absent[2] == 0.0
-    assert absent[3]["waveform"].shape[1] == 2
 
-    present = core.decode_reference_set(core.resolve_reference_set(project, 0))
-    assert len(present) == 39  # 7 fixed + r01..r16 + p01..p16
-    assert present[2] == 1.0
-    assert present[4] == "image0: red subject"
-    assert present[5] == "Hero"
-    assert present[7].shape[0] == 1  # r01
-    assert tuple(present[8].shape) == (1, 48, 64, 3)  # r02 fallback
+    resolved = core.resolve_reference_set(project, 0)
+    present = core.decode_reference_images(resolved)
+    prompts = core.decode_reference_prompts(resolved)
+    assert len(present) == 16 and len(prompts) == 18
+    assert resolved["strength"] == 1.0
+    assert prompts[0] == "image0: red subject"
+    assert prompts[1] == "Hero"
+    assert present[0].shape[0] == 1
+    assert tuple(present[1].shape) == (1, 48, 64, 3)
 
 
 def test_sheet_assembly_preserves_recipe_background_padding(monkeypatch):
@@ -350,38 +349,107 @@ def test_bridge_refuses_silent_member_loss_and_missing_media(monkeypatch, tmp_pa
     project.scenes[0].reference_items[0].members.append({"entity_id": "entity", "member_id": "member"})
     ref = core.resolve_reference_set(project, 0)
     with pytest.raises(RuntimeError, match="at most 1"):
-        core.decode_reference_set(ref)
+        core.decode_reference_images(ref)
     project.scenes[0].reference_items[0].members = [{"entity_id": "entity", "member_id": "missing"}]
     with pytest.raises(RuntimeError, match="no longer exists"):
-        core.decode_reference_set(core.resolve_reference_set(project, 0))
+        core.decode_reference_images(core.resolve_reference_set(project, 0))
 
 
-def test_v3_schema_freezes_selector_and_bridge_socket_names(monkeypatch):
+def test_v3_schema_freezes_selector_and_homogeneous_bridge_socket_names(monkeypatch):
     _install_io(monkeypatch)
     module = _import_module(monkeypatch, "reference_bridge_v3")
     selector = module.SonderReferenceSelector.define_schema()
-    bridge = module.SonderReferenceBridge.define_schema()
+    image = module.SonderReferenceImageBridge.define_schema()
+    audio = module.SonderReferenceAudioBridge.define_schema()
+    prompt = module.SonderReferencePromptBridge.define_schema()
     assert selector.node_id == "SonderReferenceSelector"
     assert [value.id for value in selector.inputs] == ["project", "reference_lane_index"]
-    assert [value.display_name for value in selector.outputs] == ["reference_set", "has_reference"]
-    assert bridge.node_id == "SonderReferenceBridge"
-    names = [value.display_name for value in bridge.outputs]
-    fixed = [
-        "reference_frames", "reference_idx", "reference_strength", "reference_audio",
-        "reference_prompt", "reference_names", "context",
+    assert [value.display_name for value in selector.outputs] == ["reference_set", "has_reference", "reference_strength"]
+    assert image.node_id == "SonderReferenceImageBridge"
+    assert audio.node_id == "SonderReferenceAudioBridge"
+    assert prompt.node_id == "SonderReferencePromptBridge"
+    assert [value.id for value in image.outputs] == [f"r{index:02d}" for index in range(1, 17)]
+    assert [value.id for value in audio.outputs] == [f"a{index:02d}" for index in range(1, 17)]
+    assert [value.id for value in prompt.outputs] == [
+        "reference_prompt", "reference_names", *[f"p{index:02d}" for index in range(1, 17)],
     ]
-    slots = [f"r{index:02d}" for index in range(1, 17)]
-    prompts = [f"p{index:02d}" for index in range(1, 17)]
-    assert names == [*fixed, *slots, *prompts]
-    # p01..p16 are TAIL growth. ComfyUI type-checks a connection by slot index
-    # against the static definition, so every pre-existing socket must keep the
-    # index it had before the block was appended.
-    for index, name in enumerate([*fixed, *slots]):
-        assert names[index] == name, f"slot {index} moved: expected {name}, got {names[index]}"
-    assert all(value.display_name.startswith("p") for value in bridge.outputs[len(fixed) + len(slots):])
-    # Every output carries a hover description.
-    assert all(getattr(value, "tooltip", "") for value in bridge.outputs)
+    assert all(getattr(value, "tooltip", "") for schema in (image, audio, prompt) for value in schema.outputs)
     assert all(getattr(value, "tooltip", "") for value in selector.outputs)
+
+
+def test_cross_kind_bridge_wiring_fails_with_a_sonder_owned_message(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    project = _project(tmp_path, ReferenceLaneRecipe(media_kind="image", recipe={"hard": {"assembly": "slots"}}))
+    ref = core.resolve_reference_set(project, 0)
+    with pytest.raises(RuntimeError, match="Audio Bridge cannot decode an image Reference lane"):
+        core.decode_reference_audios(ref)
+
+
+def test_audio_bridge_emits_one_trimmed_member_per_slot(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    project = _multi_member_project(
+        tmp_path,
+        ReferenceLaneRecipe(
+            media_kind="audio",
+            recipe={"hard": {"assembly": "audio", "max_members": 16,
+                              "live_outputs": ["audio_slots"]}},
+        ),
+        [(255, 0, 0), (0, 255, 0), (0, 0, 255)],
+    )
+    for asset in project.assets:
+        asset.asset_type = "audio"
+    monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
+    monkeypatch.setattr(core, "_audio_output", lambda record: {
+        "waveform": record["member"].member_id,
+        "sample_rate": 44100,
+    })
+    values = core.decode_reference_audios(core.resolve_reference_set(project, 0))
+    assert len(values) == 16
+    assert [value["waveform"] for value in values[:3]] == ["member0", "member1", "member2"]
+    assert values[3]["waveform"].shape[1] == 2
+
+
+def test_authored_strength_and_sequence_length_reach_selector_and_temporal_assembly(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    project = _multi_member_project(tmp_path, _preset("sonder:ltx_msr"), [(255, 0, 0), (0, 255, 0)])
+    item = project.scenes[0].reference_items[0]
+    item.strength = 0.35
+    item.sequence_frames = 33
+    monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
+    resolved = core.resolve_reference_set(project, 0)
+    assert resolved["strength"] == pytest.approx(0.35)
+    assert core.decode_reference_images(resolved)[0].shape[0] == 33
+
+
+def test_video_member_span_decodes_and_resamples_to_recipe_rate(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(recipe={"hard": {
+        "assembly": "batch", "max_members": 4, "output_size": "scene",
+        "frame_rate_source": "custom", "frame_rate": 24,
+        "live_outputs": ["image_slots"],
+    }})
+    project = _project(tmp_path, recipe)
+    asset = project.assets[0]
+    asset.asset_type = "video"
+    asset.fps = 30.0
+    asset.frame_count = 30
+    asset.duration_sec = 1.0
+    project.references[0].members[0].source_end_sec = 1.0
+    monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
+    monkeypatch.setattr(core, "resolve_source_color_interpretation", lambda *_args, **_kwargs: None)
+
+    calls = []
+    def fake_range(_path, start, end, **_kwargs):
+        calls.append((start, end))
+        for index in range(start, end):
+            yield np.full((24, 40, 3), index, dtype=np.uint8)
+
+    monkeypatch.setattr(core, "decode_video_range", fake_range)
+    frames = core.decode_reference_images(core.resolve_reference_set(project, 0))[0]
+    assert calls == [(0, 30)]
+    assert frames.shape[0] == 24
+    assert int(round(float(frames[0].mean()) * 255)) == 0
+    assert int(round(float(frames[-1].mean()) * 255)) == 29
 
 
 # The pre-redesign `hard` geometry blocks, kept verbatim. The Output size

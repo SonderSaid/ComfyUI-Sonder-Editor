@@ -10,6 +10,7 @@ from server import routes
 from server.reference_resolution import resolve_effective_references
 from server.timeline_state import (
     Asset,
+    GenerationJob,
     LaneConfig,
     ReferenceEntity,
     ReferenceItem,
@@ -67,6 +68,11 @@ def test_reference_scene_and_queue_round_trip_preserves_sentinel_and_recipe():
     assert [recipe.to_dict() for recipe in restored.reference_lane_recipes] == [recipe.to_dict() for recipe in scene.reference_lane_recipes]
     assert restored.reference_items[0].end_frame == -1
     assert restored.reference_lane_recipes[0].recipe["hard"]["max_members"] == 4
+    malformed = restored.reference_items[0].to_dict()
+    malformed.update({"strength": "not-a-number", "sequence_frames": "not-an-integer"})
+    healed = ReferenceItem.from_dict(malformed)
+    assert (healed.lane_index, healed.start_frame, healed.end_frame) == (0, 12, -1)
+    assert (healed.strength, healed.sequence_frames) == (1.0, 0)
 
 
 def test_reference_item_crud_enforces_exact_expected_overlap_and_media_kind():
@@ -78,6 +84,21 @@ def test_reference_item_crud_enforces_exact_expected_overlap_and_media_kind():
         "members": [{"entity_id": "wrong-is-canonicalized", "member_id": "member-1"}],
     })
     assert first.members == [{"entity_id": "entity-1", "member_id": "member-1"}]
+    assert first.strength == 1.0 and first.sequence_frames == 0
+
+    routes._apply_update_reference_item(project, scene, {
+        "reference_item_id": first.reference_item_id,
+        "expected": {"strength": 1.0, "sequence_frames": 0},
+        "fields": {"strength": 0.4, "sequence_frames": 33},
+    })
+    assert first.strength == pytest.approx(0.4) and first.sequence_frames == 33
+    with pytest.raises(routes.ProjectMutationRequestError) as nonfinite:
+        routes._apply_update_reference_item(project, scene, {
+            "reference_item_id": first.reference_item_id,
+            "expected": {"strength": 0.4},
+            "fields": {"strength": float("nan")},
+        })
+    assert nonfinite.value.status == 400
 
     with pytest.raises(routes.ProjectMutationRequestError) as overlap:
         routes._apply_create_reference_item(project, scene, {
@@ -236,7 +257,10 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     client = (ROOT / "web" / "js" / "api_client.js").read_text(encoding="utf-8")
     assert 'import { onProjectVersionChanged } from "./api_client.js";' in bridge
     assert "onProjectVersionChanged(refreshAllBridges);" in bridge
-    assert "lane.slot_count ?? lane.member_count" in bridge
+    assert "lane.image_slot_count" in bridge
+    assert "lane.audio_slot_count" in bridge
+    assert "lane.prompt_slot_count" in bridge
+    assert "BRIDGES.has(nodeType(target))" in bridge
     assert "controller.whenProjectReady(() => refreshShape(node));" in bridge
     assert "Refresh reference slots" in bridge
     # Every "we don't know" path resolves to the full shape, never a subset: an
@@ -269,9 +293,54 @@ console.log(JSON.stringify({json.dumps(hards)}.map(h => [...mod.referenceLiveOut
         live = reference_live_outputs(preset["hard"])
         assert live.issubset(set(REFERENCE_OUTPUT_NAMES))
         if preset["media_kind"] == "audio":
-            assert live == {"reference_audio", "reference_prompt", "reference_names"}
+            assert live == {"audio_slots", "reference_prompt", "reference_names"}
         else:
-            assert "reference_audio" not in live
+            assert "image_slots" in live and "audio_slots" not in live
+
+
+def test_legacy_live_outputs_migrate_in_all_four_stores_and_remain_writable():
+    from server.reference_resolution import REFERENCE_OUTPUT_NAMES, reference_live_outputs
+    from server.timeline_state import REFERENCE_RECIPE_PRESETS
+
+    legacy_wrapper = {
+        "media_kind": "image",
+        "recipe_id": "legacy",
+        "recipe": {"hard": {"assembly": "slots", "live_outputs": ["slots", "reference_idx", "context"]}},
+    }
+    scene = Scene.from_dict({
+        "scene_id": "scene",
+        "reference_lane_count": 1,
+        "reference_lane_recipes": [legacy_wrapper],
+    })
+    assert scene.reference_lane_recipes[0].recipe["hard"]["live_outputs"] == ["image_slots"]
+
+    job = GenerationJob.from_dict({"reference_lane_recipes": [legacy_wrapper]})
+    assert job.reference_lane_recipes[0]["recipe"]["hard"]["live_outputs"] == ["image_slots"]
+
+    project = TimelineProject.from_dict({
+        "project_id": "project",
+        "reference_recipes": [{
+            "id": "custom:legacy", "name": "Legacy", "media_kind": "audio",
+            "hard": {"assembly": "audio", "live_outputs": ["reference_audio"]}, "soft": {},
+        }],
+    })
+    assert project.reference_recipes[0]["hard"]["live_outputs"] == ["audio_slots"]
+    normalized = routes._normalize_reference_recipe_section(
+        {"assembly": "slots", "live_outputs": ["slots", "reference_audio", "reference_idx"]},
+        "hard",
+    )
+    assert normalized["live_outputs"] == ["image_slots", "audio_slots"]
+
+    # A retired-only declaration fails open instead of becoming "drives nothing".
+    empty = routes._normalize_reference_recipe_section({"live_outputs": ["reference_idx", "context"]}, "hard")
+    assert "live_outputs" not in empty
+    assert reference_live_outputs(empty) == set(REFERENCE_OUTPUT_NAMES)
+
+    # The shipped catalog is the fourth store and must already be canonical.
+    assert all(
+        set(preset["hard"].get("live_outputs", [])).issubset(set(REFERENCE_OUTPUT_NAMES))
+        for preset in REFERENCE_RECIPE_PRESETS
+    )
 
 
 # --- bridge-references payload ------------------------------------------------
@@ -334,6 +403,20 @@ def test_bridge_references_gates_the_prompt_block_apart_from_the_r_block(monkeyp
     `slot_count` for both meant five presets that drive per-member text without
     the r-block reported zero and the canvas marked real output unused.
     """
+    both = _bridge_reference_rows(monkeypatch, "sonder:wan_bernini")
+    assert both["image_slot_count"] == 2 and both["prompt_slot_count"] == 2
+    assert both["audio_slot_count"] == 0
+
+    assembled = _bridge_reference_rows(monkeypatch, "sonder:wan_vace")
+    assert assembled["image_slot_count"] == 1
+    assert assembled["prompt_slot_count"] == 2
+
+    audio = _bridge_reference_rows(monkeypatch, "sonder:ltx_id_lora_audio", member_count=3)
+    assert audio["media_kind"] == "audio"
+    assert audio["image_slot_count"] == 0
+    assert audio["audio_slot_count"] == 3 and audio["prompt_slot_count"] == 3
+    return
+
     # Drives both blocks: counts agree.
     both = _bridge_reference_rows(monkeypatch, "sonder:wan_bernini")
     assert both["slot_count"] == 2 and both["prompt_slot_count"] == 2

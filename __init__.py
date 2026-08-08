@@ -92,17 +92,27 @@ try:
 
     try:
         from .nodes.reference_bridge_v3 import (
-            BRIDGE_NODE_ID,
+            AUDIO_BRIDGE_NODE_ID,
+            IMAGE_BRIDGE_NODE_ID,
+            PROMPT_BRIDGE_NODE_ID,
             SELECTOR_NODE_ID,
-            SonderReferenceBridge,
+            SonderReferenceAudioBridge,
+            SonderReferenceImageBridge,
+            SonderReferencePromptBridge,
             SonderReferenceSelector,
         )
         _reference_selector_schema = SonderReferenceSelector.GET_SCHEMA()
-        _reference_bridge_schema = SonderReferenceBridge.GET_SCHEMA()
+        _reference_image_bridge_schema = SonderReferenceImageBridge.GET_SCHEMA()
+        _reference_audio_bridge_schema = SonderReferenceAudioBridge.GET_SCHEMA()
+        _reference_prompt_bridge_schema = SonderReferencePromptBridge.GET_SCHEMA()
         if getattr(_reference_selector_schema, "node_id", None) != SELECTOR_NODE_ID:
             raise RuntimeError("Sonder Reference Selector schema returned an unexpected node id")
-        if getattr(_reference_bridge_schema, "node_id", None) != BRIDGE_NODE_ID:
-            raise RuntimeError("Sonder Reference Bridge schema returned an unexpected node id")
+        if getattr(_reference_image_bridge_schema, "node_id", None) != IMAGE_BRIDGE_NODE_ID:
+            raise RuntimeError("Sonder Reference Image Bridge schema returned an unexpected node id")
+        if getattr(_reference_audio_bridge_schema, "node_id", None) != AUDIO_BRIDGE_NODE_ID:
+            raise RuntimeError("Sonder Reference Audio Bridge schema returned an unexpected node id")
+        if getattr(_reference_prompt_bridge_schema, "node_id", None) != PROMPT_BRIDGE_NODE_ID:
+            raise RuntimeError("Sonder Reference Prompt Bridge schema returned an unexpected node id")
     except ModuleNotFoundError as exc:
         if not (exc.name or "").startswith("comfy_api"):
             logging.getLogger(__name__).warning(
@@ -115,11 +125,15 @@ try:
     else:
         NODE_CLASS_MAPPINGS.update({
             SELECTOR_NODE_ID: SonderReferenceSelector,
-            BRIDGE_NODE_ID: SonderReferenceBridge,
+            IMAGE_BRIDGE_NODE_ID: SonderReferenceImageBridge,
+            AUDIO_BRIDGE_NODE_ID: SonderReferenceAudioBridge,
+            PROMPT_BRIDGE_NODE_ID: SonderReferencePromptBridge,
         })
         NODE_DISPLAY_NAME_MAPPINGS.update({
             SELECTOR_NODE_ID: "Sonder Reference Selector",
-            BRIDGE_NODE_ID: "Sonder Reference Bridge",
+            IMAGE_BRIDGE_NODE_ID: "Sonder Reference Image Bridge",
+            AUDIO_BRIDGE_NODE_ID: "Sonder Reference Audio Bridge",
+            PROMPT_BRIDGE_NODE_ID: "Sonder Reference Prompt Bridge",
         })
 
     WEB_DIRECTORY = "./web"

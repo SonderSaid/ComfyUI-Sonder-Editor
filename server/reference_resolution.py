@@ -3,18 +3,54 @@
 from __future__ import annotations
 
 
-# Bridge output names in tuple order, plus the "slots" pseudo-name covering the
-# whole r01..r16 block. Mirrored in web/js/reference_resolution.js.
+# Type-homogeneous Bridge output groups. Mirrored in
+# web/js/reference_resolution.js. Numbered socket names are presentation detail;
+# recipes declare which whole bridge block they drive.
 REFERENCE_OUTPUT_NAMES = (
-    "reference_frames",
-    "reference_idx",
-    "reference_strength",
-    "reference_audio",
+    "image_slots",
+    "audio_slots",
     "reference_prompt",
     "reference_names",
-    "context",
-    "slots",
 )
+
+_RETIRED_REFERENCE_OUTPUT_NAMES = {
+    "reference_frames": "image_slots",
+    "slots": "image_slots",
+    "reference_audio": "audio_slots",
+    "reference_prompt": "reference_prompt",
+    "reference_names": "reference_names",
+    # These values moved to the Selector or were deliberately retired.
+    "reference_idx": None,
+    "reference_strength": None,
+    "context": None,
+}
+
+
+def migrate_live_outputs(hard) -> dict:
+    """Rewrite the pre-split Bridge vocabulary without losing authoring.
+
+    Unknown values are retained so route validation can still refuse typos. If
+    every declared value retired, the declaration is removed: an empty set must
+    fail open to the documented all-live default, not turn a legacy recipe into
+    one that drives nothing.
+    """
+    result = dict(hard) if isinstance(hard, dict) else {}
+    declared = result.get("live_outputs")
+    if not isinstance(declared, list):
+        return result
+    migrated = []
+    for raw_name in declared:
+        if not isinstance(raw_name, str):
+            migrated.append(raw_name)
+            continue
+        mapped = _RETIRED_REFERENCE_OUTPUT_NAMES.get(raw_name, raw_name)
+        if mapped is not None and mapped not in migrated:
+            migrated.append(mapped)
+    if migrated:
+        result["live_outputs"] = migrated
+    else:
+        result.pop("live_outputs", None)
+    return result
 
 
 def reference_live_outputs(hard) -> set:

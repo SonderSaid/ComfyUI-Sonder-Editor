@@ -579,6 +579,7 @@ export class EditorWidget {
         this.projectDir = "";
         this.projectId = "";
         this._frameConstraintHealedFor = "";
+        this._dimensionConstraintHealedFor = "";
         this._destroyed = false;
         this._settings = getEditorSettings();
         this._settingsUnsubscribe = null;
@@ -4844,6 +4845,8 @@ export class EditorWidget {
                     end_frame: data.end_frame ?? -1,
                     members: Array.isArray(data.members) ? data.members : [],
                     prompt_override: data.prompt_override || "",
+                    strength: Number.isFinite(Number(data.strength)) ? Number(data.strength) : 1.0,
+                    sequence_frames: Math.max(0, parseInt(data.sequence_frames, 10) || 0),
                     muted: !!data.muted,
                 },
             };
@@ -7820,6 +7823,8 @@ export class EditorWidget {
                 end_frame: Number.isFinite(nextStart) ? nextStart : -1,
                 members: payload.members,
                 prompt_override: "",
+                strength: 1.0,
+                sequence_frames: 0,
                 muted: false,
             },
         });
@@ -10752,7 +10757,23 @@ export class EditorWidget {
                     muteBtn.textContent = data.muted ? "Muted" : "Active";
                     this._renderTimeline();
                 });
-                editor.append(setupBtn, muteBtn);
+                const strengthLabel = this._makeEditorLabel("Strength:");
+                const strengthInput = this._makeEditorInput((Number(data.strength ?? 1)).toFixed(2), 0, 1);
+                strengthInput.step = "0.05";
+                strengthInput.addEventListener("change", async () => {
+                    const strength = Math.max(0, Math.min(1, Number(strengthInput.value)));
+                    const previous = Number(data.strength ?? 1);
+                    if (!Number.isFinite(strength) || strength === previous) {
+                        strengthInput.value = previous.toFixed(2);
+                        return;
+                    }
+                    // Build expected from the unmutated item. A Reference 409 is
+                    // terminal, so this edit is deliberately non-coalesced.
+                    this._pushUndo("change reference strength");
+                    await this._updateItemProperty(type, id, { strength }, { coalesce: false });
+                    strengthInput.value = strength.toFixed(2);
+                });
+                editor.append(setupBtn, muteBtn, strengthLabel, strengthInput);
             } else if (type === "clip") {
                 if (isMotionDriverClip) {
                     const strengthLabel = this._makeEditorLabel("Strength:");
@@ -11074,7 +11095,7 @@ export class EditorWidget {
         }
     }
 
-    async _updateItemProperty(type, id, props, { refresh = true } = {}) {
+    async _updateItemProperty(type, id, props, { refresh = true, coalesce = true } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         // Linked mute propagation (manual-test #7): muting one linked member mutes
         // the whole group atomically. Only `muted` propagates through links —
@@ -11137,6 +11158,10 @@ export class EditorWidget {
                 ...nextIntent,
                 operations: [{
                     ...nextIntent.operations[0],
+                    expected: {
+                        ...(nextIntent.operations[0].expected || {}),
+                        ...(oldIntent.operations[0].expected || {}),
+                    },
                     fields: {
                         ...(oldIntent.operations[0].fields || {}),
                         ...(nextIntent.operations[0].fields || {}),
@@ -11149,7 +11174,7 @@ export class EditorWidget {
             await this._runSceneMutation([operation], {
                 key,
                 label: "item property",
-                coalesce: true,
+                coalesce,
                 merge,
                 refreshScenes: refresh,
             });
@@ -15088,6 +15113,8 @@ export class EditorWidget {
                     end_frame: itemEnd,
                     members: Array.isArray(item.members) ? item.members.map((member) => ({ ...member })) : [],
                     prompt_override: item.prompt_override || "",
+                    strength: Number.isFinite(Number(item.strength)) ? Number(item.strength) : 1.0,
+                    sequence_frames: Math.max(0, parseInt(item.sequence_frames, 10) || 0),
                     muted: !!item.muted,
                 });
             }
@@ -15122,6 +15149,7 @@ export class EditorWidget {
             scene_fps: Math.max(0, parseFloat(this.activeScene.fps) || 0),
             template_id: this._templateId || "free",
             frame_constraint: this._resolveFrameConstraintForTemplate(this._templateId),
+            dimension_constraint: getDimensionConstraint(this._getActiveTemplate()),
             take_placement_mode: this._settings?.render?.takePlacementMode ?? "trimmed",
             // take_placement_linked / take_placement_muted intentionally NOT
             // snapshotted: they resolve from live settings/widgets at execution
@@ -15797,6 +15825,7 @@ export class EditorWidget {
         this._referenceFetchSeq += 1;
         this.projectDir = projectDir;
         this._frameConstraintHealedFor = "";
+        this._dimensionConstraintHealedFor = "";
         this.activeSceneId = "";
         this.activeScene = null;
         this.scenes = [];
@@ -15975,6 +16004,7 @@ export class EditorWidget {
                 this._promptFrameThreshold = Number(data.metadata?.prompt_frame_threshold ?? 10) || 0;
                 this._referenceFrameThreshold = Number(data.metadata?.reference_frame_threshold ?? 0) || 0;
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
+                await this._maybeHealDimensionConstraint(this.projectDir, dirName, data.dimension_constraint);
                 this._syncSceneResolutionControls({ detectSelections: false });
                 this._updateViewportHeader();
                 this._resizeViewportCanvas();
@@ -16008,6 +16038,33 @@ export class EditorWidget {
             this._frameConstraintHealedFor = projectDir;
         } catch (error) {
             console.warn("[Sonder] Frame-constraint self-heal threw:", error);
+        }
+    }
+
+    async _maybeHealDimensionConstraint(projectDir, dirName, persistedConstraint) {
+        if (!projectDir || this._dimensionConstraintHealedFor === projectDir) return;
+        const expected = getDimensionConstraint(this._getActiveTemplate());
+        if (EditorWidget._frameConstraintsEqual(expected, persistedConstraint)) {
+            this._dimensionConstraintHealedFor = projectDir;
+            return;
+        }
+        if (this._hasPendingProjectMutations()) {
+            this._deferProjectBackedRefresh(["project"], "dimension_constraint_heal");
+            return;
+        }
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ dimension_constraint: expected }),
+                },
+                { projectId: dirName }
+            );
+            this._dimensionConstraintHealedFor = projectDir;
+        } catch (error) {
+            console.warn("[Sonder] Dimension-constraint self-heal threw:", error);
         }
     }
 

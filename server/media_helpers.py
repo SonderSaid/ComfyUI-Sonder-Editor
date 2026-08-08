@@ -1382,17 +1382,51 @@ def decode_video_range(
         "rgb24",
         "pipe:1",
     ]
-    timeout = max(30, min(600, frame_count * 5))
-    result = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace")[:500])
-
     frame_size = width * height * 3
-    decoded_count = len(result.stdout) // frame_size
-    for idx in range(min(decoded_count, frame_count)):
-        offset = idx * frame_size
-        frame = np.frombuffer(result.stdout[offset:offset + frame_size], dtype=np.uint8)
-        yield frame.reshape((height, width, 3)).copy()
+    timeout = max(30, min(600, frame_count * 5))
+    timed_out = threading.Event()
+    with tempfile.TemporaryFile() as stderr_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+        )
+
+        def kill_on_timeout() -> None:
+            timed_out.set()
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        timer = threading.Timer(float(timeout), kill_on_timeout)
+        timer.daemon = True
+        timer.start()
+        try:
+            if proc.stdout is None:
+                raise RuntimeError("ffmpeg frame decode failed: stdout pipe was not available")
+            for _index in range(frame_count):
+                chunks = bytearray()
+                while len(chunks) < frame_size:
+                    chunk = proc.stdout.read(frame_size - len(chunks))
+                    if not chunk:
+                        break
+                    chunks.extend(chunk)
+                if len(chunks) < frame_size:
+                    break
+                frame = np.frombuffer(chunks, dtype=np.uint8)
+                yield frame.reshape((height, width, 3)).copy()
+            proc.stdout.close()
+            returncode = proc.wait(timeout=5)
+            if timed_out.is_set():
+                raise _timeout_expired(cmd, timeout, stderr_file)
+            if returncode != 0:
+                raise RuntimeError(_read_process_stderr(stderr_file).decode(errors="replace")[:500])
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                _terminate_process(proc)
 
 
 def decode_video_frame(

@@ -47,7 +47,7 @@ from .path_security import (
     sanitize_filename_component,
 )
 from .atomic_io import atomic_replace
-from .reference_resolution import reference_live_outputs
+from .reference_resolution import migrate_live_outputs, reference_live_outputs
 from .render_cache import (
     RenderCacheActiveError,
     RenderCacheError,
@@ -668,13 +668,27 @@ def _mutation_int(value, field_name: str, default: int | None = None) -> int:
         _mutation_error(f"Invalid integer for {field_name}: {value!r}", 400)
 
 
-def _mutation_float(value, field_name: str, default: float | None = None) -> float:
+def _mutation_float(
+    value,
+    field_name: str,
+    default: float | None = None,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
     if value is None and default is not None:
         return default
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         _mutation_error(f"Invalid number for {field_name}: {value!r}", 400)
+    if not math.isfinite(result):
+        _mutation_error(f"Invalid non-finite number for {field_name}", 400)
+    if minimum is not None:
+        result = max(float(minimum), result)
+    if maximum is not None:
+        result = min(float(maximum), result)
+    return result
 
 
 def _scene_lane_configs(scene: Scene, lane_type: str) -> list[LaneConfig]:
@@ -2307,7 +2321,8 @@ def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
 
 
 _REFERENCE_ITEM_FIELDS = {
-    "lane_index", "start_frame", "end_frame", "members", "prompt_override", "muted",
+    "lane_index", "start_frame", "end_frame", "members", "prompt_override",
+    "strength", "sequence_frames", "muted",
 }
 
 
@@ -2450,6 +2465,8 @@ def _apply_create_reference_item(project: TimelineProject, scene: Scene, fields:
         end_frame=end_frame,
         members=members,
         prompt_override=str(fields.get("prompt_override", "") or ""),
+        strength=_mutation_float(fields.get("strength", 1.0), "strength", 1.0, minimum=0.0, maximum=1.0),
+        sequence_frames=max(0, min(4096, _mutation_int(fields.get("sequence_frames", 0), "sequence_frames", 0))),
         muted=bool(fields.get("muted", False)),
     )
     if any(existing.reference_item_id == item.reference_item_id for existing in scene.reference_items):
@@ -2492,6 +2509,10 @@ def _apply_update_reference_item(project: TimelineProject, scene: Scene, operati
     item.members = members
     if "prompt_override" in fields:
         item.prompt_override = str(fields["prompt_override"] or "")
+    if "strength" in fields:
+        item.strength = _mutation_float(fields["strength"], "strength", minimum=0.0, maximum=1.0)
+    if "sequence_frames" in fields:
+        item.sequence_frames = max(0, min(4096, _mutation_int(fields["sequence_frames"], "sequence_frames")))
     if "muted" in fields:
         item.muted = bool(fields["muted"])
     return item
@@ -3645,6 +3666,8 @@ def _normalize_reference_recipe_section(values: dict, section: str) -> dict:
     Unknown keys are refused rather than stored: a silently-kept typo reads as
     the assembler's default and produces a wrong render with no error anywhere.
     """
+    if section == "hard":
+        values = migrate_live_outputs(values)
     schema = {
         field["key"]: field
         for field in REFERENCE_RECIPE_FIELDS
@@ -8770,6 +8793,11 @@ if routes is not None:
             for reference in project.references
             for member in reference.members
         }
+        references_by_member_id = {
+            member.member_id: reference
+            for reference in project.references
+            for member in reference.members
+        }
         rows = []
         for lane_index in range(lane_count):
             lane_items = [item for item in reference_items if int(getattr(item, "lane_index", 0) or 0) == lane_index]
@@ -8788,6 +8816,24 @@ if routes is not None:
             hard = materialized.get("hard") if isinstance(materialized.get("hard"), dict) else {}
             live = reference_live_outputs(hard)
             media_kind = getattr(recipe, "media_kind", "image")
+            assembly = str(hard.get("assembly", "batch") or "batch")
+            slot_labels = []
+            for slot_index in range(min(16, member_count)):
+                values = []
+                for item in lane_items:
+                    member_refs = getattr(item, "members", []) or []
+                    if slot_index >= len(member_refs):
+                        continue
+                    member_id = str((member_refs[slot_index] or {}).get("member_id", "") or "")
+                    reference = references_by_member_id.get(member_id)
+                    if reference is None:
+                        continue
+                    name = str(getattr(reference, "name", "") or "Reference")
+                    role = str(getattr(reference, "reference_class", "") or "subject")
+                    label = f"{name} ({role})"
+                    if label not in values:
+                        values.append(label)
+                slot_labels.append(" / ".join(values) if values else f"Reference {slot_index + 1}")
             rows.append({
                 "lane_index": lane_index,
                 "lane_name": getattr(configs[lane_index], "name", "") or f"Reference {lane_index + 1}",
@@ -8797,20 +8843,22 @@ if routes is not None:
                 "recipe_name": str(materialized.get("name", "") or "Detached / Custom"),
                 "item_count": len(lane_items),
                 "member_count": min(16, member_count),
-                # Recipes that do not consume the r-block show no slots at all.
-                "slot_count": min(16, member_count) if "slots" in live else 0,
-                # The p-block is gated on reference_prompt ALONE, never on
-                # slots: five presets (Ingredients, Best Face ID, VACE, Phantom,
-                # SCAIL) drive per-member text without touching the r-block, and
-                # folding the two counts together marked their real output
-                # unused. The audio term mirrors decode_reference_set's audio
-                # branch in nodes/reference_core.py, which passes no
-                # slot_prompts, so that p-block genuinely is empty.
-                "prompt_slot_count": (min(16, member_count)
-                                      if "reference_prompt" in live and media_kind != "audio"
-                                      else 0),
+                # Non-slot image assemblies produce one assembled payload on
+                # r01. Slot recipes and audio/prompt bridges grow per member.
+                "image_slot_count": (
+                    (min(16, member_count) if assembly == "slots" else int(member_count > 0))
+                    if "image_slots" in live and media_kind == "image" else 0
+                ),
+                "audio_slot_count": (
+                    min(16, member_count)
+                    if "audio_slots" in live and media_kind == "audio" else 0
+                ),
+                "prompt_slot_count": (
+                    min(16, member_count) if "reference_prompt" in live else 0
+                ),
                 "live_outputs": sorted(live),
                 "member_tags": lane_tags,
+                "slot_labels": slot_labels,
             })
         return web.json_response({
             "scene_name": getattr(scene, "name", "") or scene_id,

@@ -154,7 +154,9 @@ console.log(JSON.stringify({json.dumps(cases)}.map(
     assert "layout" not in batch and "layout" in sheet
     assert "loop_frames" in sheet and "loop_frames" not in temporal
     assert "allowed_frame_counts" in temporal and "allowed_frame_counts" not in sheet
-    assert "context_slot" in temporal and "context_slot" not in batch
+    assert "context_slot" not in temporal and "context_slot" not in batch
+    assert "frame_rate" in batch and "frame_rate_source" in batch
+    assert "frame_rate" not in sheet and "frame_rate_source" not in temporal
     assert "primary_model_position" in batch and "primary_model_position" not in sheet
     assert "recommended_duration_sec" in audio
     assert "output_size" not in audio and "width" not in audio
@@ -268,11 +270,11 @@ def test_selector_panel_view_keeps_an_orphaned_lane_visible():
     lanes = [
         {"lane_index": 0, "lane_name": "Reference 1", "recipe_name": "Wan VACE Reference Sheet",
          "media_kind": "image", "item_count": 2, "member_count": 3, "hidden": False,
-         "live_outputs": ["reference_frames", "reference_prompt", "slots"],
+         "live_outputs": ["image_slots", "reference_prompt", "reference_names"],
          "member_tags": ["sonder:face_closeup", "sonder:location"]},
         {"lane_index": 1, "lane_name": "Voices", "recipe_name": "LTX ID-LoRA Voice Identity",
          "media_kind": "audio", "item_count": 1, "member_count": 1, "hidden": True,
-         "live_outputs": ["reference_audio"], "member_tags": []},
+         "live_outputs": ["audio_slots"], "member_tags": []},
     ]
     module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
     script = f"""
@@ -292,7 +294,11 @@ console.log(JSON.stringify({{
 
     assert out["first"]["options"][0]["label"] == "Reference 1 — Wan VACE Reference Sheet"
     assert out["first"]["status"] == "image · 2 items · 3 members"
-    assert out["first"]["outputs"] == ["reference_frames", "reference_prompt", "r01..r16"]
+    assert out["first"]["outputs"] == [
+        "Image Bridge r01..r16",
+        "Prompt Bridge aggregate + p01..p16",
+        "Prompt Bridge reference_names",
+    ]
     # Tags identify WHICH references the lane carries; the namespace is dropped.
     assert out["first"]["tags"] == ["face_closeup", "location"]
     assert out["hiddenAudio"]["tags"] == []
@@ -340,6 +346,18 @@ def test_reference_item_editor_defers_the_prompt_to_the_lane_panel():
     assert "prompt_override" not in block
     assert 'this._makeBtn("Lane Setup…"' in block
     assert "_showReferenceLanePanel(laneEntry)" in block
+    strength = block.split('this._makeEditorLabel("Strength:")', 1)[1]
+    assert 'strengthInput.addEventListener("change"' in strength
+    assert "{ strength }, { coalesce: false }" in strength
+    assert "data.strength = strength" not in strength
+
+
+def test_dimension_constraint_is_frozen_and_old_projects_self_heal():
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    assert "dimension_constraint: getDimensionConstraint(this._getActiveTemplate())" in widget
+    assert "await this._maybeHealDimensionConstraint(" in widget
+    heal = widget.split("async _maybeHealDimensionConstraint", 1)[1].split("_ensureViewportSurface", 1)[0]
+    assert "JSON.stringify({ dimension_constraint: expected })" in heal
 
 
 FIXED_OUTPUT_NAMES = [name for name in REFERENCE_OUTPUT_NAMES if name != "slots"]
@@ -359,6 +377,60 @@ def test_bridge_never_removes_a_fixed_output_because_slot_index_is_the_contract(
     if not node_bin:
         pytest.skip("node is required for the bridge shape test")
     module_url = (ROOT / "web" / "js" / "reference_bridge_shape.js").as_uri()
+    split_script = rf"""
+const {{ resolveBridgeOutputs, canonicalOutputOrder, UNUSED_SUFFIX }} =
+  await import({json.dumps(module_url)});
+const makeNode = (type) => ({{
+  type,
+  comfyClass: type,
+  outputs: canonicalOutputOrder(type).map((name) => ({{ name, type: type.includes('Audio') ? 'AUDIO' : type.includes('Prompt') ? 'STRING' : 'IMAGE', links: [] }})),
+  addOutput(name, slotType, opts) {{ this.outputs.push({{ name, type: slotType, links: [], ...opts }}); }},
+  removeOutput(index) {{ this.outputs.splice(index, 1); }},
+}});
+const image = makeNode('SonderReferenceImageBridge');
+image.outputs.find((slot) => slot.name === 'r03').links = [17];
+resolveBridgeOutputs(image, {{ imageSlotCount: 2, liveOutputs: ['image_slots'], slotLabels: ['Hero (subject)', 'Prop (subject)'] }});
+const saved = image.outputs.map((slot) => slot.name);
+const reloaded = makeNode('SonderReferenceImageBridge');
+reloaded.outputs.find((slot) => slot.name === 'r03').links = [17];
+resolveBridgeOutputs(reloaded, {{ imageSlotCount: 2, liveOutputs: ['image_slots'], slotLabels: ['Hero (subject)', 'Prop (subject)'] }});
+const repaired = makeNode('SonderReferenceImageBridge');
+repaired.outputs = repaired.outputs.filter((slot) => slot.name === 'r01' || slot.name === 'r03');
+resolveBridgeOutputs(repaired, {{ imageSlotCount: 3, liveOutputs: ['image_slots'] }});
+const audio = makeNode('SonderReferenceAudioBridge');
+resolveBridgeOutputs(audio, {{ audioSlotCount: 3, liveOutputs: ['audio_slots'], slotLabels: ['Voice A', 'Voice B', 'Voice C'] }});
+const prompt = makeNode('SonderReferencePromptBridge');
+resolveBridgeOutputs(prompt, {{ promptSlotCount: 2, liveOutputs: ['reference_prompt', 'reference_names'], slotLabels: ['Hero', 'Prop'] }});
+const promptNamesDead = makeNode('SonderReferencePromptBridge');
+resolveBridgeOutputs(promptNamesDead, {{ promptSlotCount: 1, liveOutputs: ['reference_prompt'] }});
+console.log(JSON.stringify({{
+  imageNames: image.outputs.map((slot) => slot.name),
+  imageLabels: image.outputs.map((slot) => [slot.label, slot.localized_name]),
+  saved,
+  reloadedNames: reloaded.outputs.map((slot) => slot.name),
+  repairedNames: repaired.outputs.map((slot) => slot.name),
+  audioNames: audio.outputs.map((slot) => slot.name),
+  promptNames: prompt.outputs.map((slot) => slot.name),
+  deadNamesLabel: promptNamesDead.outputs.find((slot) => slot.name === 'reference_names').label,
+  suffix: UNUSED_SUFFIX,
+}}));
+"""
+    split = json.loads(subprocess.run(
+        [node_bin, "--input-type=module", "-e", split_script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+    # The r03 connection pins one ceiling. r02 survives even though it is not
+    # connected: no per-slot removal, no hole, no silent r03 -> r02 shift.
+    assert split["imageNames"] == ["r01", "r02", "r03"]
+    assert split["saved"] == split["reloadedNames"]
+    assert split["repairedNames"] == ["r01", "r02", "r03"]
+    assert all(label.startswith("r01") and "Hero (subject)" in label for label in split["imageLabels"][0])
+    assert split["imageLabels"][2][0].endswith(split["suffix"])
+    assert split["audioNames"] == ["a01", "a02", "a03"]
+    assert split["promptNames"] == ["reference_prompt", "reference_names", "p01", "p02"]
+    assert split["deadNamesLabel"].endswith(split["suffix"])
+    return
+
     script = rf"""
 const {{ resolveBridgeOutputs, canonicalOutputOrder, FIXED_OUTPUT_NAMES, UNUSED_SUFFIX }} =
   await import({json.dumps(module_url)});

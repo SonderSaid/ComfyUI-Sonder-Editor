@@ -111,8 +111,10 @@ ComfyUI.
 | **Sonder Guides Bridge Start / End** | Paired loop nodes that wrap a generation body to inject per-frame guide images. |
 | **Sonder Driver Selector** | Resolves a selected Driver lane *without* decoding media and exposes a `has_driver` presence flag for lazy routing; pass its reference to the Driver Bridge. |
 | **Sonder Driver Bridge** | Decodes the selected Driver lane's frames from a Driver Selector reference, emitting driver images, local start index, and conditioning strength for the render window. |
-| **Sonder Reference Selector** | Resolves one Reference lane for the active editor window without decoding media and exposes `has_reference` for lazy branch routing. |
-| **Sonder Reference Bridge** | Decodes and assembles the selected set according to its durable recipe, with image/audio, prompt/name, context, and `r01`–`r16` outputs; absent sets emit type-correct fallbacks and unreadable staged media fails loudly. |
+| **Sonder Reference Selector** | Resolves one Reference lane for the active editor window without decoding media and exposes `has_reference` for lazy branch routing plus the item's authored conditioning strength. |
+| **Sonder Reference Image Bridge** | Decodes image references according to the lane recipe. Slot recipes grow as `r01`–`r16`; assembled batches, sheets, and temporal sequences use `r01`. |
+| **Sonder Reference Audio Bridge** | Decodes up to 16 trimmed audio members as homogeneous `a01`–`a16` outputs. |
+| **Sonder Reference Prompt Bridge** | Exports `reference_prompt`, `reference_names`, and per-member `p01`–`p16` strings. |
 | **Sonder Masks Bridge** | Exposes the editor's generation-mask window as separate video/audio mask-time pairs, each gated by an Edit/Freeze toggle (a frozen channel emits a zero-width window, so nothing is generated for it). Feed a downstream temporal mask node. |
 | **Sonder Prompt Relay Bridge** | Exports the render window's prompt lanes as ComfyUI-PromptRelay payload strings (no model patching). |
 
@@ -133,8 +135,8 @@ ComfyUI.
 | **Sonder Switch** | Routes any one data type across N branches and evaluates only the selected branch (lazy). |
 | **Sonder Cluster** | Routes a shared branch selection across multiple lanes, each lane carrying its own type (lazy). |
 
-> **Sonder Switch**, **Sonder Cluster**, **Sonder Reference Selector**, **Sonder
-> Reference Bridge**, and **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
+> **Sonder Switch**, **Sonder Cluster**, **Sonder Reference Selector**, the three
+> **Sonder Reference Bridges**, and **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
 > newer V3 node API and load only on recent ComfyUI builds.
 > V3 registration is schema-validated before it changes discovery:
 > older or incompatible builds keep the complete V1 node set under the

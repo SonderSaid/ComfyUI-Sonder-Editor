@@ -22,12 +22,18 @@ from ..server.media_helpers import (
     color_correction_for_interpretation,
     decode_audio_samples,
     decode_video_frame,
+    decode_video_range,
     fit_frame_to_canvas,
     resolve_source_color_interpretation,
 )
 from ..server.path_security import resolve_existing_project_path
 from ..server.reference_resolution import reference_live_outputs, resolve_effective_references
-from ..server.timeline_state import LaneConfig, ReferenceItem, ReferenceLaneRecipe
+from ..server.timeline_state import (
+    LaneConfig,
+    ReferenceItem,
+    ReferenceLaneRecipe,
+    effective_scene_fps,
+)
 
 
 MAX_REFERENCE_SLOTS = 16
@@ -106,9 +112,11 @@ def _source(project, scene) -> dict[str, Any]:
         # Frozen at enqueue so a queued job resolves the same set it was
         # queued with, mirroring how the prompt threshold rides job params.
         threshold = _float((getattr(job, "params", {}) or {}).get("reference_frame_threshold", 0.0))
+        frozen_scene_fps = _float(getattr(job, "scene_fps", 0.0), 0.0)
         pegs = {
             "frame_constraint": getattr(job, "frame_constraint", None),
             "dimension_constraint": getattr(job, "dimension_constraint", None),
+            "fps": frozen_scene_fps if frozen_scene_fps > 0 else effective_scene_fps(project, None),
         }
         source_name = "snapshot"
     else:
@@ -120,6 +128,7 @@ def _source(project, scene) -> dict[str, Any]:
         pegs = {
             "frame_constraint": getattr(project, "frame_constraint", None),
             "dimension_constraint": getattr(project, "dimension_constraint", None),
+            "fps": effective_scene_fps(project, scene),
         }
         source_name = "live"
     while len(configs) < lane_count:
@@ -273,6 +282,7 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
         "source": source["source"],
         "lane_index": lane_index,
         "has_reference": int(bool(item_dict)),
+        "strength": _float(item_dict.get("strength"), 1.0) if item_dict else 0.0,
         "item": item_dict,
         "recipe": recipe_dict,
         "render_start": render_start,
@@ -356,10 +366,15 @@ def _apply_member_crop(frame: np.ndarray, crop) -> np.ndarray:
     return frame[y0:y1, x0:x1]
 
 
+def _asset_video_fps(asset) -> float:
+    value = _float(getattr(asset, "fps", 0.0), 0.0)
+    return value if value > 0 else 24.0
+
+
 def _load_member_image(record: dict[str, Any]) -> np.ndarray:
     asset, member, path = record["asset"], record["member"], record["path"]
     if getattr(asset, "asset_type", "") == "video":
-        fps = max(0.001, _float(getattr(asset, "fps", 0.0), 24.0))
+        fps = _asset_video_fps(asset)
         frame_index = max(0, round(_float(getattr(member, "source_start_sec", 0.0)) * fps))
         interpretation = resolve_source_color_interpretation(asset, path)
         frame = decode_video_frame(path, frame_index, color_interpretation=interpretation)
@@ -372,6 +387,70 @@ def _load_member_image(record: dict[str, Any]) -> np.ndarray:
     if frame is None or frame.size == 0:
         raise RuntimeError(f"Reference member {getattr(member, 'member_id', '')} could not be decoded.")
     return _apply_member_crop(frame, getattr(member, "crop", None))
+
+
+def _load_member_images(
+    record: dict[str, Any],
+    *,
+    decode_span: bool,
+    target_fps: float,
+) -> list[np.ndarray]:
+    """Decode one still or a resampled video span without buffering raw ffmpeg output."""
+    asset, member = record["asset"], record["member"]
+    if getattr(asset, "asset_type", "") != "video" or not decode_span:
+        return [_load_member_image(record)]
+
+    source_fps = _asset_video_fps(asset)
+    start_sec = max(0.0, _float(getattr(member, "source_start_sec", 0.0), 0.0))
+    raw_end = getattr(member, "source_end_sec", None)
+    if raw_end is None:
+        end_sec = _float(getattr(asset, "duration_sec", 0.0), 0.0)
+        if end_sec <= start_sec:
+            native_count = max(0, _int(getattr(asset, "frame_count", 0), 0))
+            end_sec = native_count / source_fps if native_count > 0 else start_sec + (1.0 / source_fps)
+    else:
+        end_sec = _float(raw_end, start_sec)
+    end_sec = max(start_sec + (1.0 / source_fps), end_sec)
+
+    source_start = max(0, int(math.floor(start_sec * source_fps + 0.5)))
+    source_end = max(source_start + 1, int(math.ceil(end_sec * source_fps)))
+    native_count = max(0, _int(getattr(asset, "frame_count", 0), 0))
+    if native_count > 0:
+        source_end = min(native_count, source_end)
+    source_end = max(source_start + 1, source_end)
+
+    served_fps = max(0.001, _float(target_fps, source_fps))
+    source_count = source_end - source_start
+    target_count = max(1, int(math.floor((source_count / source_fps) * served_fps + 0.5)))
+    rate_ratio = source_fps / served_fps
+    requested = [
+        min(source_count - 1, max(0, int(math.floor((index + 0.5) * rate_ratio))))
+        for index in range(target_count)
+    ]
+    by_source_index: dict[int, int] = {}
+    for relative_index in requested:
+        by_source_index[relative_index] = by_source_index.get(relative_index, 0) + 1
+
+    interpretation = resolve_source_color_interpretation(asset, record["path"])
+    frames = []
+    decode_end = source_start + max(requested) + 1
+    for relative_index, frame in enumerate(decode_video_range(
+        record["path"],
+        source_start,
+        decode_end,
+        color_interpretation=interpretation,
+    )):
+        repeats = by_source_index.get(relative_index, 0)
+        if not repeats:
+            continue
+        cropped = _apply_member_crop(frame, getattr(member, "crop", None))
+        frames.extend(cropped.copy() for _ in range(repeats))
+    if len(frames) != target_count:
+        raise RuntimeError(
+            f"Reference video member {getattr(member, 'member_id', '')} decoded "
+            f"{len(frames)} of {target_count} requested frames."
+        )
+    return frames
 
 
 def resolve_pegged_hard(hard: dict, pegs: dict) -> dict:
@@ -421,25 +500,39 @@ def _member_geometry(
     output_height: int,
     member_count: int = 1,
 ) -> tuple[int, int]:
+    def bounded(width_value, height_value, *, floor=False, ceiling=None):
+        width_value = max(1.0, float(width_value))
+        height_value = max(1.0, float(height_value))
+        short_edge_max = max(0, _int(hard.get("short_edge_max"), 0))
+        if short_edge_max and min(width_value, height_value) > short_edge_max:
+            scale = short_edge_max / min(width_value, height_value)
+            width_value *= scale
+            height_value *= scale
+            floor = True
+        return (
+            _snap_dimension(width_value, multiple, floor=floor, ceiling=ceiling),
+            _snap_dimension(height_value, multiple, floor=floor, ceiling=ceiling),
+        )
+
     mode = str(hard.get("output_size", "scene") or "scene")
     multiple = max(1, _int(hard.get("size_multiple"), 1))
     if mode == "native":
         height, width = frame.shape[:2]
         long_edge = min(max(width, height), max(16, _int(hard.get("long_edge_max"), 848)))
         scale = long_edge / max(1, max(width, height))
-        return _snap_dimension(width * scale, multiple, ceiling=long_edge), _snap_dimension(height * scale, multiple, ceiling=long_edge)
+        return bounded(width * scale, height * scale, ceiling=long_edge)
     # A lone member may have its own canonical size (Best Face ID's bust crop is
     # ~460x406 where its 4-panel sheet is exactly 1536x1024).
     single = hard.get("single_member_size")
     if member_count <= 1 and isinstance(single, list) and len(single) >= 2:
-        return max(1, _int(single[0], output_width)), max(1, _int(single[1], output_height))
+        return bounded(_int(single[0], output_width), _int(single[1], output_height))
     if mode == "custom" and _int(hard.get("width"), 0) and _int(hard.get("height"), 0):
-        return _int(hard["width"]), _int(hard["height"])
+        return bounded(_int(hard["width"]), _int(hard["height"]))
     if multiple > 1:
         # Floor, never round up: exceeding the requested output is worse than
         # losing a few pixels (this is what VACE's /16 rule needs).
-        return _snap_dimension(output_width, multiple, floor=True), _snap_dimension(output_height, multiple, floor=True)
-    return output_width, output_height
+        return bounded(output_width, output_height, floor=True)
+    return bounded(output_width, output_height)
 
 
 def _to_tensor(frame: np.ndarray, width: int, height: int) -> torch.Tensor:
@@ -620,152 +713,198 @@ def _audio_output(record: dict[str, Any]) -> dict:
     return {"waveform": torch.from_numpy(waveform).unsqueeze(0), "sample_rate": int(sample_rate)}
 
 
-def _bridge_tuple(
-    live: set,
-    width: int,
-    height: int,
-    *,
-    frames=None,
-    reference_index: int = 0,
-    strength: float = 0.0,
-    audio=None,
-    prompt: str = "",
-    names: str = "",
-    context=None,
-    slots=None,
-    slot_prompts=None,
-) -> tuple:
-    """Emit the frozen tuple, replacing every dead output with its fallback."""
-
-    empty = _empty_image(width, height)
-    slot_values = list(slots or []) if "slots" in live else []
-    # p01..p16 follow the same liveness as reference_prompt: they are the same
-    # composition, split per slot.
-    prompt_values = list(slot_prompts or []) if "reference_prompt" in live else []
-    return (
-        frames if frames is not None and "reference_frames" in live else empty,
-        int(reference_index) if "reference_idx" in live else 0,
-        float(strength) if "reference_strength" in live else 0.0,
-        audio if audio is not None and "reference_audio" in live else _silent_audio(),
-        prompt if "reference_prompt" in live else "",
-        names if "reference_names" in live else "",
-        context if context is not None and "context" in live else empty,
-        *[
-            slot_values[index] if index < len(slot_values) else empty
-            for index in range(MAX_REFERENCE_SLOTS)
-        ],
-        *[
-            prompt_values[index] if index < len(prompt_values) else ""
-            for index in range(MAX_REFERENCE_SLOTS)
-        ],
-    )
-
-
-def decode_reference_set(reference_set) -> tuple:
-    """Decode and assemble the frozen bridge tuple plus ``r01..r16``."""
-
+def _reference_decode_context(reference_set, expected_media_kind: str | None = None) -> dict[str, Any]:
     ref = reference_set if isinstance(reference_set, dict) else {}
-    width, height = max(1, _int(ref.get("width"), 1280)), max(1, _int(ref.get("height"), 720))
-    empty = _empty_image(width, height)
+    width = max(1, _int(ref.get("width"), 1280))
+    height = max(1, _int(ref.get("height"), 720))
     if not ref.get("has_reference"):
-        return _bridge_tuple(set(), width, height)
-    project = ref.get("project")
-    item = ref.get("item") if isinstance(ref.get("item"), dict) else {}
+        return {"present": False, "ref": ref, "width": width, "height": height}
+
     recipe_wrapper = ref.get("recipe") if isinstance(ref.get("recipe"), dict) else {}
+    media_kind = "audio" if recipe_wrapper.get("media_kind") == "audio" else "image"
+    if expected_media_kind and media_kind != expected_media_kind:
+        bridge_name = "Image" if expected_media_kind == "image" else "Audio"
+        article = "an" if media_kind[:1].lower() in "aeiou" else "a"
+        raise RuntimeError(
+            f"Sonder Reference {bridge_name} Bridge cannot decode {article} {media_kind} Reference lane. "
+            f"Connect this Selector to the {media_kind.title()} Bridge instead."
+        )
+
     recipe = recipe_wrapper.get("recipe") if isinstance(recipe_wrapper.get("recipe"), dict) else {}
     hard = resolve_pegged_hard(
         recipe.get("hard") if isinstance(recipe.get("hard"), dict) else {},
         ref.get("pegs") if isinstance(ref.get("pegs"), dict) else {},
     )
-    records = _member_records(project, item)
-    cap = max(1, _int(hard.get("max_members"), MAX_REFERENCE_SLOTS))
-    if len(records) > min(cap, MAX_REFERENCE_SLOTS):
-        raise RuntimeError(
-            f"Reference recipe accepts at most {min(cap, MAX_REFERENCE_SLOTS)} members; {len(records)} were staged."
-        )
-    live = reference_live_outputs(hard)
-    media_kind = "audio" if recipe_wrapper.get("media_kind") == "audio" else "image"
-    names = ", ".join(str(getattr(record["reference"], "name", "") or "") for record in records)
-    prompt = _assemble_prompt(item, records, recipe,
-                              ref.get("registry") if isinstance(ref.get("registry"), dict) else None)
-    local_index = max(0, _int(item.get("start_frame"), 0) - _int(ref.get("render_start"), 0))
-    if media_kind == "audio":
-        if len(records) != 1:
-            raise RuntimeError("Audio reference recipes require exactly one member.")
-        return _bridge_tuple(
-            live, width, height,
-            audio=_audio_output(records[0]), prompt=prompt, names=names,
-        )
+    item = ref.get("item") if isinstance(ref.get("item"), dict) else {}
+    records = _member_records(ref.get("project"), item)
+    cap = min(MAX_REFERENCE_SLOTS, max(1, _int(hard.get("max_members"), MAX_REFERENCE_SLOTS)))
+    if len(records) > cap:
+        raise RuntimeError(f"Reference recipe accepts at most {cap} members; {len(records)} were staged.")
 
-    images = [_load_member_image(record) for record in records]
-    assembly = str(hard.get("assembly", "batch") or "batch")
-    member_tensors = []
-    for image in images:
-        member_width, member_height = _member_geometry(image, hard, width, height, len(images))
-        member_tensors.append(_to_tensor(image, member_width, member_height).unsqueeze(0))
-    context = None
-    temporal_tensors = list(member_tensors)
-    if assembly == "temporal" and hard.get("context_slot"):
-        context_index = next((
-            index for index, record in enumerate(records)
-            if getattr(record["reference"], "reference_class", "") == "context"
-            or "sonder:location" in (getattr(record["member"], "tags", []) or [])
+    return {
+        "present": True,
+        "ref": ref,
+        "width": width,
+        "height": height,
+        "item": item,
+        "recipe": recipe,
+        "hard": hard,
+        "live": reference_live_outputs(hard),
+        "records": records,
+        "media_kind": media_kind,
+    }
+
+
+def _reference_frame_rate(context: dict[str, Any]) -> float:
+    hard = context["hard"]
+    source = str(hard.get("frame_rate_source", "scene") or "scene")
+    pegs = context["ref"].get("pegs") if isinstance(context["ref"].get("pegs"), dict) else {}
+    scene_fps = max(0.001, _float(pegs.get("fps"), 24.0))
+    if source == "custom":
+        return max(0.001, _float(hard.get("frame_rate"), scene_fps))
+    if source == "native":
+        # Several video members feed one sequence. The first staged video's rate
+        # is authoritative; later videos resample to it. With no video, fall
+        # back to the effective scene rate.
+        first_video = next((
+            record for record in context["records"]
+            if getattr(record["asset"], "asset_type", "") == "video"
         ), None)
-        if context_index is not None:
-            context = member_tensors[context_index]
-            temporal_tensors = [tensor for index, tensor in enumerate(member_tensors) if index != context_index]
-        if not temporal_tensors:
-            temporal_tensors = [empty]
+        if first_video is not None:
+            return _asset_video_fps(first_video["asset"])
+    return scene_fps
+
+
+def _member_tensor_batch(
+    frames: list[np.ndarray],
+    hard: dict,
+    output_width: int,
+    output_height: int,
+    member_count: int,
+) -> torch.Tensor:
+    width, height = _member_geometry(frames[0], hard, output_width, output_height, member_count)
+    return torch.stack([_to_tensor(frame, width, height) for frame in frames], dim=0)
+
+
+def decode_reference_images(reference_set) -> tuple:
+    """Return the fixed r01..r16 IMAGE tuple for an image Reference lane."""
+    context = _reference_decode_context(reference_set, "image")
+    empty = _empty_image(context["width"], context["height"])
+    if not context["present"] or "image_slots" not in context.get("live", set()):
+        return tuple(empty for _ in range(MAX_REFERENCE_SLOTS))
+
+    hard = context["hard"]
+    records = list(context["records"])
+    assembly = str(hard.get("assembly", "batch") or "batch")
+    if assembly == "temporal":
+        # Deliberate Sonder override of the surveyed separate-background socket:
+        # context-class references occupy the final temporal segment.
+        records.sort(key=lambda record: getattr(record["reference"], "reference_class", "") == "context")
+    decode_span = assembly in {"batch", "slots"}
+    target_fps = _reference_frame_rate(context)
+    member_frames = [
+        _load_member_images(record, decode_span=decode_span, target_fps=target_fps)
+        for record in records
+    ]
+    member_tensors = [
+        _member_tensor_batch(frames, hard, context["width"], context["height"], len(records))
+        for frames in member_frames
+    ]
+
     if assembly == "sheet":
-        sheet_width, sheet_height = _member_geometry(images[0], hard, width, height, len(images))
+        sheet_width, sheet_height = _member_geometry(
+            member_frames[0][0], hard, context["width"], context["height"], len(records)
+        )
         compositor = _strip if hard.get("layout") == "strip" else _sheet
-        frames = compositor(images, sheet_width, sheet_height, str(hard.get("background", "black")))
-        # Ingredients loops one static panel sheet as a reference video. This is
-        # the assembled sequence length only — it never constrains the render
-        # window, which the editor's own {step, offset} governs.
+        assembled = compositor(
+            [frames[0] for frames in member_frames],
+            sheet_width,
+            sheet_height,
+            str(hard.get("background", "black")),
+        )
         loop_frames = max(0, _int(hard.get("loop_frames"), 0))
         if loop_frames:
-            frames = frames.repeat(_grid_frame_count(hard, loop_frames), 1, 1, 1)
-        reference_index = 0
+            assembled = assembled.repeat(_grid_frame_count(hard, loop_frames), 1, 1, 1)
+        values = [assembled]
     elif assembly == "temporal":
-        # MSR assembles a frame sequence in which each reference occupies a
-        # contiguous segment on the temporal VAE grid, the first starting at
-        # index 0. Occupied length is the authored likeness-strength control, so
-        # sparse single frames separated by black are not the same conditioning.
         step = max(1, _int(hard.get("frame_step"), 8))
         offset = max(0, _int(hard.get("frame_offset"), 1))
-        count = len(temporal_tensors)
-        allowed = sorted(max(1, _int(value, 0)) for value in (hard.get("allowed_frame_counts") or []))
+        count = len(member_tensors)
         required = step * count + offset
-        frame_count = next((value for value in allowed if value >= required), required)
+        allowed = sorted({
+            max(1, _int(value, 0)) for value in (hard.get("allowed_frame_counts") or [])
+            if _int(value, 0) > 0
+        })
+        safe_allowed = [value for value in allowed if value >= required]
+        if allowed and not safe_allowed:
+            raise RuntimeError(
+                f"Reference temporal assembly needs at least {required} frames for {count} members, "
+                f"but the recipe's largest allowed length is {allowed[-1]}."
+            )
+        requested = max(0, _int(context["item"].get("sequence_frames"), 0))
+        if safe_allowed:
+            frame_count = safe_allowed[0] if requested == 0 else min(
+                safe_allowed, key=lambda value: (abs(value - requested), value)
+            )
+        else:
+            frame_count = max(required, requested)
         blocks = max(count, (frame_count - offset) // step)
         sequence = torch.zeros(
-            (frame_count, temporal_tensors[0].shape[1], temporal_tensors[0].shape[2], 3),
+            (frame_count, member_tensors[0].shape[1], member_tensors[0].shape[2], 3),
             dtype=torch.float32,
         )
-        for index, tensor in enumerate(temporal_tensors):
+        for index, tensor in enumerate(member_tensors):
             segment_start = (index * blocks // count) * step
             segment_end = frame_count if index == count - 1 else ((index + 1) * blocks // count) * step
             sequence[segment_start:segment_end] = tensor[0]
-        frames = sequence
-        reference_index = local_index
+        values = [sequence]
     elif assembly == "slots":
-        frames = member_tensors[0]
-        reference_index = 0
+        values = member_tensors
     else:
-        # Batch recipes require uniform shapes. Recipe geometry guarantees it.
-        ordered_tensors = list(member_tensors)
-        if hard.get("primary_model_position") == "last" and len(ordered_tensors) > 1:
-            ordered_tensors = [*ordered_tensors[1:], ordered_tensors[0]]
-        frames = torch.cat(ordered_tensors, dim=0)
-        reference_index = 0
-    return _bridge_tuple(
-        live, width, height,
-        frames=frames, reference_index=reference_index, strength=1.0,
-        prompt=prompt, names=names, context=context,
-        slots=member_tensors[:MAX_REFERENCE_SLOTS],
-        slot_prompts=_member_prompts(
-            records, recipe,
-            ref.get("registry") if isinstance(ref.get("registry"), dict) else None,
-        )[:MAX_REFERENCE_SLOTS],
+        ordered = list(member_tensors)
+        if hard.get("primary_model_position") == "last" and len(ordered) > 1:
+            ordered = [*ordered[1:], ordered[0]]
+        # A custom batch+native recipe may still raise here for mixed geometry;
+        # that is the pre-existing schema gap recorded by the plan.
+        values = [torch.cat(ordered, dim=0)]
+
+    return tuple(
+        values[index] if index < len(values) else empty
+        for index in range(MAX_REFERENCE_SLOTS)
+    )
+
+
+def decode_reference_audios(reference_set) -> tuple:
+    """Return the fixed a01..a16 AUDIO tuple, one trimmed member per slot."""
+    context = _reference_decode_context(reference_set, "audio")
+    if not context["present"] or "audio_slots" not in context.get("live", set()):
+        return tuple(_silent_audio() for _ in range(MAX_REFERENCE_SLOTS))
+    values = [_audio_output(record) for record in context["records"]]
+    return tuple(
+        values[index] if index < len(values) else _silent_audio()
+        for index in range(MAX_REFERENCE_SLOTS)
+    )
+
+
+def decode_reference_prompts(reference_set) -> tuple:
+    """Return aggregate prompt/names followed by p01..p16."""
+    context = _reference_decode_context(reference_set)
+    if not context["present"]:
+        return ("", "", *("" for _ in range(MAX_REFERENCE_SLOTS)))
+    live = context["live"]
+    records = context["records"]
+    ref = context["ref"]
+    registry = ref.get("registry") if isinstance(ref.get("registry"), dict) else None
+    prompt = _assemble_prompt(context["item"], records, context["recipe"], registry)
+    names = ", ".join(str(getattr(record["reference"], "name", "") or "") for record in records)
+    slot_prompts = _member_prompts(records, context["recipe"], registry)
+    return (
+        prompt if "reference_prompt" in live else "",
+        names if "reference_names" in live else "",
+        *(
+            slot_prompts[index]
+            if "reference_prompt" in live and index < len(slot_prompts)
+            else ""
+            for index in range(MAX_REFERENCE_SLOTS)
+        ),
     )

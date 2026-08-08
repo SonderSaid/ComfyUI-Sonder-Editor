@@ -1,29 +1,14 @@
 // Which Reference Bridge outputs LiteGraph displays, and how dead ones read.
 //
-// THE SLOT INDEX IS THE TYPE CONTRACT. ComfyUI validates a connection against
-// the node's static `/object_info` definition by slot index, not against the
-// live `node.outputs[i].type`. Removing a MIDDLE output shifts every later slot
-// into a position whose declared type belongs to something else — dragging from
-// a slot labelled `r01` sitting at index 3 is read as `reference_audio`/AUDIO
-// and refused. That is a tuple reshape in everything but name, which
-// `durable_rules.md` forbids.
-//
-// So NO output is ever removed. Outputs a recipe does not drive are RELABELLED
-// as unused, which changes nothing about index, name or type.
-//
-// The r-block used to shrink, because it was a contiguous TAIL and trimming
-// r05..r16 moved no surviving slot. Appending p01..p16 after it ended that:
-// removing an r-slot now slides every p-slot down into an r-block position, so
-// a socket labelled p01 delivered an image tensor. Nothing is a tail any more,
-// so nothing is removed.
+// THE SLOT INDEX IS THE PAYLOAD CONTRACT. Each replacement bridge has one
+// homogeneous numbered tuple, so removing its true tail cannot create a type
+// mismatch. It can still create a semantic shift if a lower hole is removed,
+// so the displayed block never shrinks below its highest connected slot.
+// Removal runs high-to-low above max(staged count, connected-slot ceiling).
 //
 // Two further rules:
-//   1. A connected slot is never REMOVED, whatever the recipe says. Removing it
-//      would silently drop the user's link. It is still MARKED: wiring says the
-//      user connected something, not that the recipe drives it, and a wired
-//      output the recipe ignores emits its fallback into a live link. That is
-//      the case most worth naming, not the one to stay quiet about. Marking
-//      touches only the label, so the link is untouched either way.
+//   1. A connected-but-unstaged slot survives and is MARKED unused. Wiring says
+//      the user connected something, not that the recipe currently drives it.
 //   2. No liveness declaration means show everything unmarked. An unresolved
 //      project, an unwired selector, a lane index pointing at nothing and a
 //      failed fetch are all "we don't know", not "this recipe drives nothing" —
@@ -32,17 +17,26 @@
 // The backend is untouched either way: it always returns the full tuple with
 // its documented fallbacks, so AUDIO still never returns None.
 
-import { REFERENCE_OUTPUT_NAMES } from "./reference_resolution.js";
-
 export const MAX_REFERENCE_SLOTS = 16;
-export const SLOT_NAME_RE = /^r(0[1-9]|1[0-6])$/;
+export const SLOT_NAME_RE = /^[rap](0[1-9]|1[0-6])$/;
 
-// Fixed outputs in tuple order. "slots" is the r-block pseudo-name used by
-// `live_outputs`, not a socket, so it is excluded and handled by slotCount.
-export const FIXED_OUTPUT_NAMES = REFERENCE_OUTPUT_NAMES.filter((name) => name !== "slots");
+export const BRIDGE_CONFIGS = Object.freeze({
+    SonderReferenceImageBridge: Object.freeze({
+        prefix: "r", fixed: [], liveName: "image_slots", countKey: "imageSlotCount", type: "IMAGE",
+    }),
+    SonderReferenceAudioBridge: Object.freeze({
+        prefix: "a", fixed: [], liveName: "audio_slots", countKey: "audioSlotCount", type: "AUDIO",
+    }),
+    SonderReferencePromptBridge: Object.freeze({
+        prefix: "p", fixed: ["reference_prompt", "reference_names"],
+        liveName: "reference_prompt", countKey: "promptSlotCount", type: "STRING",
+    }),
+});
 
 export const slotName = (index) => `r${String(index).padStart(2, "0")}`;
+export const audioSlotName = (index) => `a${String(index).padStart(2, "0")}`;
 export const promptSlotName = (index) => `p${String(index).padStart(2, "0")}`;
+export const numberedSlotName = (prefix, index) => `${prefix}${String(index).padStart(2, "0")}`;
 
 export function slotNumber(slot) {
     const match = SLOT_NAME_RE.exec(String(slot?.name || ""));
@@ -53,16 +47,18 @@ export function outputConnected(slot) {
     return Array.isArray(slot?.links) ? slot.links.length > 0 : slot?.link != null;
 }
 
-export function connectedSlotCeiling(node) {
-    return Math.max(0, ...(node?.outputs || []).filter(outputConnected).map(slotNumber));
+export function connectedSlotCeiling(node, prefix = null) {
+    return Math.max(0, ...(node?.outputs || [])
+        .filter((slot) => outputConnected(slot) && (!prefix || String(slot?.name || "").startsWith(prefix)))
+        .map(slotNumber));
 }
 
-/** Canonical tuple order: the fixed block, then r01..r16. */
-export function canonicalOutputOrder() {
+/** Canonical tuple order for one homogeneous bridge. */
+export function canonicalOutputOrder(bridgeType = "SonderReferenceImageBridge") {
+    const config = BRIDGE_CONFIGS[bridgeType] || BRIDGE_CONFIGS.SonderReferenceImageBridge;
     return [
-        ...FIXED_OUTPUT_NAMES,
-        ...Array.from({ length: MAX_REFERENCE_SLOTS }, (_, i) => slotName(i + 1)),
-        ...Array.from({ length: MAX_REFERENCE_SLOTS }, (_, i) => promptSlotName(i + 1)),
+        ...config.fixed,
+        ...Array.from({ length: MAX_REFERENCE_SLOTS }, (_, i) => numberedSlotName(config.prefix, i + 1)),
     ];
 }
 
@@ -111,7 +107,12 @@ export function selectorPanelView({ lanes = [], laneIndex = 0, status = "", scen
         selectedValue: selected,
         disabled: !rows.length,
         status: statusText,
-        outputs: (lane?.live_outputs || []).map((name) => (name === "slots" ? "r01..r16" : name)),
+        outputs: (lane?.live_outputs || []).map((name) => ({
+            image_slots: "Image Bridge r01..r16",
+            audio_slots: "Audio Bridge a01..a16",
+            reference_prompt: "Prompt Bridge aggregate + p01..p16",
+            reference_names: "Prompt Bridge reference_names",
+        }[name] || name)),
         // The `sonder:` namespace is noise on a node this small; the tag name is
         // what identifies the reference.
         tags: (lane?.member_tags || []).map((tag) => String(tag).replace(/^sonder:/, "")),
@@ -122,8 +123,16 @@ const outputIndex = (node, name) => (node.outputs || []).findIndex((slot) => slo
 
 function ensureOutput(node, name, metadata, order) {
     if (outputIndex(node, name) >= 0) return;
-    const meta = metadata?.get(name) || { type: "IMAGE" };
+    const fallbackType = name.startsWith("a") ? "AUDIO"
+        : name.startsWith("p") || name.startsWith("reference_") ? "STRING" : "IMAGE";
+    const meta = metadata?.get(name) || { type: fallbackType };
+    // All dynamic additions use LiteGraph's {label, tooltip} option keys.
     node.addOutput?.(name, meta.type || "IMAGE", { label: meta.label, tooltip: meta.tooltip });
+    const rank = new Map((order || []).map((entry, index) => [entry, index]));
+    node.outputs?.sort((left, right) => (
+        (rank.get(left?.name) ?? Number.MAX_SAFE_INTEGER)
+        - (rank.get(right?.name) ?? Number.MAX_SAFE_INTEGER)
+    ));
 }
 
 export const UNUSED_SUFFIX = " (unused)";
@@ -136,16 +145,11 @@ export const UNUSED_SUFFIX = " (unused)";
  * renderer showing the bare name. Same pairing as `bridge_nodes.js` and
  * `autogrow_passthrough.js`.
  *
- * `ignoreConnection` decouples marking from wiring. Rule 1 in the module header
- * is about REMOVAL — a connected slot must survive — but it leaked into the
- * label too, and the two are not the same question. A wired output the recipe
- * does not drive is exactly the case worth announcing: it emits a type-correct
- * fallback (a black frame for `reference_frames`) into a live link under a
- * clean-looking name. `reference_frames` is wired in essentially every real
- * workflow, so the guard made the one output that most needed the mark the one
- * output that could never carry it.
+ * `ignoreConnection` decouples marking from wiring. A connected slot must
+ * survive, but a connected output the recipe does not drive is exactly the case
+ * worth announcing because it emits its type-correct fallback into a live link.
  */
-function markOutput(slot, live, metadata, { ignoreConnection = false } = {}) {
+function markOutput(slot, live, metadata, { ignoreConnection = false, authoredLabel = "" } = {}) {
     if (!slot) return false;
     const meta = metadata?.get(slot.name);
     const captured = meta?.label ?? meta?.localized_name ?? slot.name;
@@ -153,9 +157,9 @@ function markOutput(slot, live, metadata, { ignoreConnection = false } = {}) {
     // `node.outputs` at nodeCreated/loadedGraphNode, so a graph reloaded while a
     // slot was marked would otherwise re-mark an already-marked label and drift
     // to "name (unused) (unused)" on every load.
-    const original = String(captured).endsWith(UNUSED_SUFFIX)
+    const original = authoredLabel || (String(captured).endsWith(UNUSED_SUFFIX)
         ? String(captured).slice(0, -UNUSED_SUFFIX.length)
-        : captured;
+        : captured);
     const dead = live && !live.has(slot.name) && (ignoreConnection || !outputConnected(slot));
     const label = dead ? `${original}${UNUSED_SUFFIX}` : original;
     if (slot.label === label && slot.localized_name === label) return false;
@@ -167,71 +171,68 @@ function markOutput(slot, live, metadata, { ignoreConnection = false } = {}) {
 /**
  * Reshape a bridge node's displayed outputs.
  *
- * Every output stays present at its declared index; unused ones are relabelled.
- * See the module header for why nothing may be removed.
+ * Each homogeneous numbered block shrinks only from its real tail. A connected
+ * slot pins the ceiling so no surviving Reference can shift to another link.
  *
- * @param shape.slotCount        staged member count for the r-block — r slots above it read as unused
- * @param shape.promptSlotCount  staged member count for the p-block; absent means "we don't know"
+ * @param shape.imageSlotCount   staged member count for the r-block
+ * @param shape.audioSlotCount   staged member count for the a-block
+ * @param shape.promptSlotCount  staged member count for the p-block
  * @param shape.liveOutputs      fixed output names the recipe drives, or null for "show everything"
  * @param options.metadata       Map of name -> {type,label,tooltip} captured at node creation
  * @param options.order          canonical name order; defaults to the tuple order
  * @returns true when anything visible changed
  */
 export function resolveBridgeOutputs(node, shape = {}, { metadata = null, order = null } = {}) {
-    const {
-        slotCount = 0, promptSlotCount = undefined, liveOutputs = null,
-    } = typeof shape === "number" ? { slotCount: shape } : (shape || {});
-    const canonical = order || canonicalOutputOrder();
-    const signature = () => (node.outputs || [])
-        .map((slot) => `${slot?.name}:${slot?.label ?? ""}:${slot?.localized_name ?? ""}`).join("|");
-    const before = signature();
-    const staged = Math.max(
-        0,
-        Math.min(MAX_REFERENCE_SLOTS, parseInt(slotCount, 10) || 0),
-        connectedSlotCeiling(node),
-    );
-    // The p-block has its OWN count. Folding it into `staged` meant a recipe
-    // driving reference_prompt without the r-block reported zero slots and
-    // marked real per-member text as unused. Absent means "we don't know", so
-    // the COUNT relaxes to the full block — but only the count: the
-    // `reference_prompt` liveness check below still applies, and a null
-    // `liveOutputs` still means show everything unmarked.
-    const promptStaged = promptSlotCount === undefined || promptSlotCount === null
-        ? MAX_REFERENCE_SLOTS
-        : Math.max(
+    {
+        const bridgeType = String(node?.comfyClass || node?.type || "SonderReferenceImageBridge");
+        const config = BRIDGE_CONFIGS[bridgeType] || BRIDGE_CONFIGS.SonderReferenceImageBridge;
+        const canonical = order || canonicalOutputOrder(bridgeType);
+        const signature = () => (node.outputs || [])
+            .map((slot) => `${slot?.name}:${slot?.label ?? ""}:${slot?.localized_name ?? ""}`).join("|");
+        const before = signature();
+        const live = Array.isArray(shape?.liveOutputs) ? new Set(shape.liveOutputs) : null;
+        const requested = Math.max(
             0,
-            Math.min(MAX_REFERENCE_SLOTS, parseInt(promptSlotCount, 10) || 0),
+            Math.min(MAX_REFERENCE_SLOTS, parseInt(shape?.[config.countKey], 10) || 0),
         );
-    const live = Array.isArray(liveOutputs) ? new Set(liveOutputs) : null;
+        const connected = connectedSlotCeiling(node, config.prefix);
+        const ceiling = live === null
+            ? MAX_REFERENCE_SLOTS
+            : Math.max(connected, live.has(config.liveName) ? requested : 0);
+        const slotLabels = Array.isArray(shape?.slotLabels) ? shape.slotLabels : [];
 
-    for (const name of FIXED_OUTPUT_NAMES) {
-        ensureOutput(node, name, metadata, canonical);
-        // Fixed outputs mark on liveness alone. The numbered blocks below keep
-        // the connection guard: they are what the socket-pair reorder will
-        // redesign, so changing them is a separate decision. Note
-        // `connectedSlotCeiling` reads SLOT_NAME_RE, which is r-only, so it
-        // raises `staged` but never `promptStaged` — a wired p-slot is protected
-        // by markOutput's own connection guard instead.
-        markOutput(node.outputs[outputIndex(node, name)], live, metadata,
-                   { ignoreConnection: true });
+        for (const name of config.fixed) {
+            ensureOutput(node, name, metadata, canonical);
+            const fixedLive = live === null || live.has(name);
+            markOutput(
+                node.outputs[outputIndex(node, name)],
+                fixedLive ? null : new Set(),
+                metadata,
+                { ignoreConnection: true },
+            );
+        }
+        for (let index = 1; index <= ceiling; index++) {
+            ensureOutput(node, numberedSlotName(config.prefix, index), metadata, canonical);
+        }
+        // Homogeneous tuples make tail removal index-safe. The ceiling, not a
+        // per-slot connection check, prevents holes and silent reference shifts.
+        for (let outputIndexValue = (node.outputs || []).length - 1; outputIndexValue >= 0; outputIndexValue--) {
+            const slot = node.outputs[outputIndexValue];
+            if (!String(slot?.name || "").startsWith(config.prefix)) continue;
+            if (slotNumber(slot) > ceiling) node.removeOutput?.(outputIndexValue);
+        }
+        for (let index = 1; index <= ceiling; index++) {
+            const name = numberedSlotName(config.prefix, index);
+            const labelSuffix = String(slotLabels[index - 1] || "").trim();
+            const authoredLabel = labelSuffix ? `${name} · ${labelSuffix}` : name;
+            const numberedLive = live === null || (live.has(config.liveName) && index <= requested);
+            markOutput(
+                node.outputs[outputIndex(node, name)],
+                numberedLive ? null : new Set(),
+                metadata,
+                { ignoreConnection: true, authoredLabel },
+            );
+        }
+        return signature() !== before;
     }
-    // Numbered slots past the staged member count carry a fallback rather than a
-    // member, so they read as unused — but they keep their index, because the
-    // p-block sits behind them and would otherwise slide into r-block positions.
-    // Two passes, not one interleaved pass: ensureOutput appends, so creating
-    // r01,p01,r02,p02… would build the wrong canonical order on a node that is
-    // missing slots.
-    for (let index = 1; index <= MAX_REFERENCE_SLOTS; index++) {
-        ensureOutput(node, slotName(index), metadata, canonical);
-    }
-    for (let index = 1; index <= MAX_REFERENCE_SLOTS; index++) {
-        ensureOutput(node, promptSlotName(index), metadata, canonical);
-    }
-    for (let index = 1; index <= MAX_REFERENCE_SLOTS; index++) {
-        const imageLive = live ? (live.has("slots") && index <= staged) : true;
-        const textLive = live ? (live.has("reference_prompt") && index <= promptStaged) : true;
-        markOutput(node.outputs[outputIndex(node, slotName(index))], imageLive ? null : new Set(), metadata);
-        markOutput(node.outputs[outputIndex(node, promptSlotName(index))], textLive ? null : new Set(), metadata);
-    }
-    return signature() !== before;
 }

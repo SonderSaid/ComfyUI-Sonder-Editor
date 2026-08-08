@@ -8,7 +8,7 @@ from typing import Any
 
 from . import prompt_payload
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs, pad_lane_recipes
-from .reference_resolution import REFERENCE_OUTPUT_NAMES
+from .reference_resolution import REFERENCE_OUTPUT_NAMES, migrate_live_outputs
 
 logger = logging.getLogger("sonder_editor")
 
@@ -62,15 +62,14 @@ REFERENCE_TAG_PRESETS = (
 REFERENCE_RECIPE_PRESETS = (
     {
         "id": "sonder:ltx_msr",
-        # LiconMSR is an assembler, not an injector: refs occupy contiguous
-        # segments of a frame sequence on the 8x temporal VAE grid, the first
-        # ref starting at index 0, and `background` is a separate socket.
+        # Surveyed LiconMSR uses contiguous 8x-grid segments from index 0 and a
+        # separate `background` socket. Sonder deliberately overrides the latter
+        # by sorting a context-class member to the temporal tail (user decision).
         "name": "LTX Multiple Subject Reference",
         "media_kind": "image",
         "hard": {"assembly": "temporal", "max_members": 5, "frame_step": 8, "frame_offset": 1,
-                 "allowed_frame_counts": [17, 25, 33, 41, 49, 57, 65], "context_slot": True,
-                 "live_outputs": ["reference_frames", "reference_idx", "reference_strength",
-                                  "reference_prompt", "reference_names", "context", "slots"]},
+                 "allowed_frame_counts": [17, 25, 33, 41, 49, 57, 65],
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:subject_still"], "context_tag": "sonder:location"},
     },
     {
@@ -82,8 +81,7 @@ REFERENCE_RECIPE_PRESETS = (
         "media_kind": "image",
         "hard": {"assembly": "sheet", "max_members": 16, "output_size": "scene", "background": "black",
                  "loop_frames": 121, "frame_step": 8, "frame_offset": 1,
-                 "live_outputs": ["reference_frames", "reference_idx", "reference_strength",
-                                  "reference_prompt", "reference_names"]},
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:face_closeup", "sonder:full_body", "sonder:turnaround"],
                  "prompt_prefix": "Reference sheet:"},
     },
@@ -94,16 +92,15 @@ REFERENCE_RECIPE_PRESETS = (
         "media_kind": "image",
         "hard": {"assembly": "sheet", "max_members": 4, "output_size": "custom", "width": 1536, "height": 1024,
                  "single_member_size": [460, 406], "background": "black",
-                 "live_outputs": ["reference_frames", "reference_strength",
-                                  "reference_prompt", "reference_names"]},
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:face_closeup"], "prompt_prefix": "ref_t2v:"},
     },
     {
         "id": "sonder:ltx_id_lora_audio",
         "name": "LTX ID-LoRA Voice Identity",
         "media_kind": "audio",
-        "hard": {"assembly": "audio", "max_members": 1,
-                 "live_outputs": ["reference_audio", "reference_prompt", "reference_names"]},
+        "hard": {"assembly": "audio", "max_members": 16,
+                 "live_outputs": ["audio_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:voice_identity"], "recommended_duration_sec": 5.0},
     },
     {
@@ -116,7 +113,7 @@ REFERENCE_RECIPE_PRESETS = (
         "media_kind": "image",
         "hard": {"assembly": "sheet", "layout": "strip", "max_members": 16,
                  "output_size": "scene", "size_multiple": 16, "background": "white",
-                 "live_outputs": ["reference_frames", "reference_prompt", "reference_names"]},
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"silent_single_input": True},
     },
     {
@@ -124,7 +121,7 @@ REFERENCE_RECIPE_PRESETS = (
         "name": "Wan Phantom Identities",
         "media_kind": "image",
         "hard": {"assembly": "batch", "max_members": 4, "output_size": "scene",
-                 "live_outputs": ["reference_frames", "reference_prompt", "reference_names"]},
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"suggested_tags": ["sonder:subject_still"]},
     },
     {
@@ -133,7 +130,7 @@ REFERENCE_RECIPE_PRESETS = (
         "media_kind": "image",
         "hard": {"assembly": "batch", "max_members": 6, "output_size": "custom", "width": 512, "height": 896,
                  "primary_model_position": "last",
-                 "live_outputs": ["reference_frames", "reference_prompt", "reference_names"]},
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"requires_identity_masks": True},
     },
     {
@@ -142,7 +139,7 @@ REFERENCE_RECIPE_PRESETS = (
         "media_kind": "image",
         "hard": {"assembly": "slots", "max_members": 8, "output_size": "native",
                  "long_edge_max": 848, "size_multiple": 16,
-                 "live_outputs": ["slots", "reference_prompt", "reference_names"]},
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
         "soft": {"prompt_tokens": "image{index}"},
     },
 )
@@ -161,7 +158,7 @@ REFERENCE_RECIPE_FIELDS = (
     {"key": "assembly", "section": "hard", "group": "Assembly", "label": "Assembly",
      "type": "enum", "values": ["batch", "sheet", "temporal", "slots", "audio"], "default": "batch",
      "applies_to": [], "requires": "", "requires_value": "",
-     "help": "How staged members become the reference_frames output.",
+     "help": "How staged members become the numbered image-bridge outputs.",
      "value_help": {
          "batch": "Each member stays a separate image, stacked into one batch. The model receives them as a set of identities.",
          "sheet": "Members are composited into ONE image - a panel grid or a vertical strip - because the model only reads a single reference image.",
@@ -206,6 +203,10 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "int", "min": 16, "max": 8192, "default": 848,
      "applies_to": list(IMAGE_ASSEMBLIES), "requires": "output_size", "requires_value": "native",
      "help": "Upper bound on the longer side, so a large still is not passed through untouched."},
+    {"key": "short_edge_max", "section": "hard", "group": "Geometry", "label": "Short-edge maximum",
+     "type": "int", "min": 0, "max": 8192, "default": 0,
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
+     "help": "Upper bound on the shorter side. 0 disables it; MiniMax H3 uses 2048."},
     {"key": "single_member_size", "section": "hard", "group": "Geometry", "label": "Lone-member size",
      "type": "int_pair", "min": 1, "max": 8192, "default": [],
      "applies_to": ["sheet"], "requires": "", "requires_value": "",
@@ -221,6 +222,19 @@ REFERENCE_RECIPE_FIELDS = (
      "value_help": {
          "custom": "The number you typed. It stays put whatever model the scene uses.",
          "template": "Pegged to the scene's model template, so it follows whenever you change model.",
+     }},
+    {"key": "frame_rate", "section": "hard", "group": "Frame rate", "label": "Reference FPS",
+     "type": "number", "min": 0.001, "max": 240, "default": 24.0,
+     "applies_to": ["batch", "slots"], "requires": "", "requires_value": "",
+     "help": "Frame rate used when a video member is served as a sequence."},
+    {"key": "frame_rate_source", "section": "hard", "group": "Frame rate", "label": "Reference FPS taken from",
+     "type": "enum", "values": ["native", "scene", "custom"], "default": "scene",
+     "applies_to": ["batch", "slots"], "requires": "", "requires_value": "",
+     "help": "Native uses the first staged video member's rate; scene follows the effective scene rate; custom uses Reference FPS.",
+     "value_help": {
+         "native": "Use the first staged video member's native rate. Other video members resample to it.",
+         "scene": "Follow the scene's effective frame rate, including project inheritance.",
+         "custom": "Use the authored Reference FPS value.",
      }},
     {"key": "frame_step", "section": "hard", "group": "Frame grid", "label": "Frame step",
      "type": "int", "min": 1, "max": 64, "default": 8,
@@ -242,7 +256,7 @@ REFERENCE_RECIPE_FIELDS = (
     {"key": "allowed_frame_counts", "section": "hard", "group": "Frame grid", "label": "Allowed lengths",
      "type": "int_list", "min": 1, "max": 4096, "default": [],
      "applies_to": ["temporal"], "requires": "", "requires_value": "",
-     "help": "Trained sequence lengths. The shortest one that fits every member is used."},
+     "help": "Trained sequence lengths offered per staged item. 0 on the item auto-picks the shortest safe value."},
     {"key": "loop_frames", "section": "hard", "group": "Frame grid", "label": "Loop sheet to",
      "type": "int", "min": 0, "max": 4096, "default": 0,
      "applies_to": ["sheet"], "requires": "", "requires_value": "",
@@ -259,10 +273,6 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "int", "min": 1, "max": 16, "default": 16,
      "applies_to": [], "requires": "", "requires_value": "",
      "help": "Staging more than this refuses the render rather than dropping members silently."},
-    {"key": "context_slot", "section": "hard", "group": "Members", "label": "Separate background slot",
-     "type": "bool", "default": False,
-     "applies_to": ["temporal"], "requires": "", "requires_value": "",
-     "help": "A context-class member leaves the sequence and drives the context output instead."},
     {"key": "primary_model_position", "section": "hard", "group": "Members", "label": "Primary arrives",
      "type": "enum", "values": ["first", "last"], "default": "first",
      "applies_to": ["batch"], "requires": "", "requires_value": "",
@@ -276,14 +286,10 @@ REFERENCE_RECIPE_FIELDS = (
      "applies_to": [], "requires": "", "requires_value": "",
      "help": "Unchecked outputs read as unused on the Bridge and emit a type-correct fallback.",
      "value_help": {
-         "reference_frames": "The assembled image or sequence. Unchecked emits a black frame at the output size.",
-         "reference_idx": "Frame index each member occupies in the assembled sequence. Only temporal layouts place references in time; unchecked emits 0.",
-         "reference_strength": "Conditioning strength for the set. Unchecked emits 0.0.",
-         "reference_audio": "Trimmed audio from an audio lane. Unchecked emits the required silent fallback, never None.",
-         "reference_prompt": "Text derived from the staged members, or the item's override. It also drives the whole p01-p16 block, which carries the same composition split per member. Unchecked emits an empty string and collapses that block.",
-         "reference_names": "Library names of the staged members in slot order. Unchecked emits an empty string.",
-         "context": "A background member routed out of the main set, for mechanisms with a dedicated background input. Unchecked emits a black frame.",
-         "slots": "The whole r01-r16 block. Unchecked collapses it to no slots at all.",
+          "image_slots": "The image bridge's r01-r16 block. Non-slot assemblies emit their single assembled batch or sequence on r01.",
+          "audio_slots": "The audio bridge's a01-a16 block, one trimmed member per socket.",
+          "reference_prompt": "Text derived from the staged members, or the item's override. It also drives p01-p16. Unchecked emits empty strings and collapses that block.",
+          "reference_names": "Library names of the staged members in slot order. Unchecked emits an empty string.",
      }},
     {"key": "prompt_prefix", "section": "soft", "group": "Prompt", "label": "Prompt prefix",
      "type": "string", "default": "",
@@ -303,25 +309,42 @@ REFERENCE_RECIPE_FIELDS = (
      "help": "Staging without one of these raises a quality suggestion; it never blocks."},
     {"key": "context_tag", "section": "soft", "group": "Advisories", "label": "Background tag",
      "type": "string", "default": "",
-     "applies_to": ["temporal"], "requires": "", "requires_value": "",
-     "help": "Tag that marks the background member for the context slot."},
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Advisory tag for a background member. A context-class member is placed last in temporal assembly."},
     {"key": "recommended_duration_sec", "section": "soft", "group": "Advisories", "label": "Recommended seconds",
      "type": "number", "min": 0, "max": 3600, "default": 0,
-     "applies_to": ["audio"], "requires": "", "requires_value": "",
+     "applies_to": [], "requires": "", "requires_value": "",
      "help": "Suggests a longer take when the staged audio is shorter than this."},
     {"key": "silent_single_input", "section": "soft", "group": "Advisories", "label": "Model reads one image",
      "type": "bool", "default": False,
-     "applies_to": ["sheet"], "requires": "", "requires_value": "",
+     "applies_to": [], "requires": "", "requires_value": "",
      "help": "Warns that the model consumes a single image, which is why members are composited."},
     {"key": "requires_identity_masks", "section": "soft", "group": "Advisories", "label": "Needs identity masks",
      "type": "bool", "default": False,
-     "applies_to": ["batch"], "requires": "", "requires_value": "",
+     "applies_to": [], "requires": "", "requires_value": "",
      "help": "Warns that this mechanism also needs colour-matched masks supplied outside the Bridge."},
 )
 
 
 def reference_recipe_field(key: str) -> dict | None:
     return next((field for field in REFERENCE_RECIPE_FIELDS if field["key"] == key), None)
+
+
+def migrate_reference_recipe(recipe) -> dict:
+    """Return one materialized/custom recipe with current hard-field vocabulary."""
+    result = dict(recipe) if isinstance(recipe, dict) else {}
+    if "hard" in result:
+        result["hard"] = migrate_live_outputs(result.get("hard"))
+    if isinstance(result.get("soft"), dict):
+        result["soft"] = dict(result["soft"])
+    return result
+
+
+def migrate_reference_lane_recipe_data(value) -> dict:
+    """Migrate the wrapper shape stored on scenes and frozen jobs."""
+    result = dict(value) if isinstance(value, dict) else {}
+    result["recipe"] = migrate_reference_recipe(result.get("recipe"))
+    return result
 
 
 def default_reference_class(kind: str) -> str:
@@ -627,7 +650,7 @@ class ReferenceLaneRecipe:
         media_kind = str(data.get("media_kind", "image") or "image")
         if media_kind not in {"image", "audio"}:
             media_kind = "image"
-        recipe = data.get("recipe", {})
+        recipe = migrate_reference_recipe(data.get("recipe", {}))
         return cls(
             media_kind=media_kind,
             recipe_id=str(data.get("recipe_id", "") or ""),
@@ -643,6 +666,8 @@ class ReferenceItem:
     end_frame: int = -1
     members: list[dict] = field(default_factory=list)
     prompt_override: str = ""
+    strength: float = 1.0
+    sequence_frames: int = 0
     muted: bool = False
 
     def to_dict(self) -> dict:
@@ -653,6 +678,8 @@ class ReferenceItem:
             "end_frame": int(self.end_frame),
             "members": [dict(member) for member in self.members if isinstance(member, dict)],
             "prompt_override": str(self.prompt_override or ""),
+            "strength": float(self.strength),
+            "sequence_frames": int(self.sequence_frames),
             "muted": bool(self.muted),
         }
 
@@ -677,6 +704,17 @@ class ReferenceItem:
             end_frame = int(data.get("end_frame", -1))
         except (TypeError, ValueError, OverflowError):
             lane_index, start_frame, end_frame = 0, 0, -1
+        try:
+            strength = float(data.get("strength", 1.0))
+        except (TypeError, ValueError, OverflowError):
+            strength = 1.0
+        if not math.isfinite(strength):
+            strength = 1.0
+        strength = max(0.0, min(1.0, strength))
+        try:
+            sequence_frames = max(0, min(4096, int(data.get("sequence_frames", 0) or 0)))
+        except (TypeError, ValueError, OverflowError):
+            sequence_frames = 0
         if end_frame != -1 and end_frame <= start_frame:
             end_frame = start_frame + 1
         return cls(
@@ -686,6 +724,8 @@ class ReferenceItem:
             end_frame=end_frame,
             members=members,
             prompt_override=str(data.get("prompt_override", "") or ""),
+            strength=strength,
+            sequence_frames=sequence_frames,
             muted=bool(data.get("muted", False)),
         )
 
@@ -1816,7 +1856,11 @@ class GenerationJob:
             reference_item_snapshots=list(data.get("reference_item_snapshots", []) or []),
             reference_lane_count=max(1, int(data.get("reference_lane_count", 1) or 1)),
             reference_lane_configs=list(data.get("reference_lane_configs", []) or []),
-            reference_lane_recipes=list(data.get("reference_lane_recipes", []) or []),
+            reference_lane_recipes=[
+                migrate_reference_lane_recipe_data(value)
+                for value in (data.get("reference_lane_recipes", []) or [])
+                if isinstance(value, dict)
+            ],
             prompt_sections=list(data.get("prompt_sections", []) or []),
             scene_width=data.get("scene_width", 0),
             scene_height=data.get("scene_height", 0),
@@ -2027,7 +2071,7 @@ class TimelineProject:
         if not isinstance(raw_reference_recipes, list):
             raw_reference_recipes = []
         project.reference_recipes = [
-            dict(recipe) for recipe in raw_reference_recipes if isinstance(recipe, dict)
+            migrate_reference_recipe(recipe) for recipe in raw_reference_recipes if isinstance(recipe, dict)
         ]
         repair_reference_ids(project)
         project.generation_queue = [

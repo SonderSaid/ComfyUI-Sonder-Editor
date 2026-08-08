@@ -12,6 +12,16 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Replaced the mixed 39-output Reference Bridge with separate, type-homogeneous
+  Image, Audio, and Prompt bridges. Their numbered blocks grow only to the
+  staged or connected-slot ceiling, keeping links index-safe while removing the
+  unusable wall of empty sockets.
+- Reference items now author conditioning strength and temporal sequence length.
+  Recipes can bound the short image edge and choose native, scene, or custom
+  reference frame rate; video members serve their trimmed spans with streaming
+  decode and resampling, and audio recipes can expose multiple members.
+- Existing Reference recipes migrate the retired Bridge liveness vocabulary in
+  scene copies, frozen jobs, project custom recipes, and built-in presets.
 - Prompt channels are now a project-wide template rather than a fixed three.
   Pick one in Settings > Prompts: **Standard** (one plain channel and the
   new-project default), **Visual + Speech + Sound** (the previous three), or **MiniMax H3** in

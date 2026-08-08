@@ -11,14 +11,18 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on ComfyUI vers
 
 from .reference_core import (
     MAX_REFERENCE_SLOTS,
-    decode_reference_set,
+    decode_reference_audios,
+    decode_reference_images,
+    decode_reference_prompts,
     reference_fingerprint,
     resolve_reference_set,
 )
 
 
 SELECTOR_NODE_ID = "SonderReferenceSelector"
-BRIDGE_NODE_ID = "SonderReferenceBridge"
+IMAGE_BRIDGE_NODE_ID = "SonderReferenceImageBridge"
+AUDIO_BRIDGE_NODE_ID = "SonderReferenceAudioBridge"
+PROMPT_BRIDGE_NODE_ID = "SonderReferencePromptBridge"
 ProjectType = io.Custom("SONDER_PROJECT")
 ReferenceSetType = io.Custom("SONDER_REFERENCE_SET")
 
@@ -34,7 +38,7 @@ class SonderReferenceSelector(io.ComfyNode):
             category="Sonder",
             description=(
                 "Resolves one Reference lane for the active editor window without decoding media. "
-                "Use has_reference to gate the branch that contains Sonder Reference Bridge."
+                "Use has_reference to gate the branch that contains the required Reference Bridges."
             ),
             inputs=[
                 ProjectType.Input("project", tooltip="Wire from the Sonder Editor project output."),
@@ -51,7 +55,7 @@ class SonderReferenceSelector(io.ComfyNode):
             outputs=[
                 ReferenceSetType.Output(
                     display_name="reference_set",
-                    tooltip="Resolved Reference set for the selected lane. Wire to Sonder Reference Bridge.",
+                    tooltip="Resolved Reference set for the selected lane. Fan out to the required Reference Bridges.",
                 ),
                 io.Int.Output(
                     display_name="has_reference",
@@ -59,6 +63,10 @@ class SonderReferenceSelector(io.ComfyNode):
                         "0 when no staged item is effective for this window, 1 when one is. "
                         "Gate the branch containing the Bridge on this so it genuinely does not execute."
                     ),
+                ),
+                io.Float.Output(
+                    display_name="reference_strength",
+                    tooltip="Authored strength of the effective Reference item, or 0.0 when none is effective.",
                 ),
             ],
         )
@@ -70,84 +78,81 @@ class SonderReferenceSelector(io.ComfyNode):
     @classmethod
     def execute(cls, project, reference_lane_index=0) -> io.NodeOutput:
         result = resolve_reference_set(project, reference_lane_index)
-        return io.NodeOutput(result, int(result["has_reference"]))
+        return io.NodeOutput(result, int(result["has_reference"]), float(result.get("strength", 0.0)))
 
 
-class SonderReferenceBridge(io.ComfyNode):
-    """Decode and assemble a selected Reference set inside the active branch."""
+def _numbered_outputs(output_type, prefix: str, noun: str):
+    return [
+        output_type.Output(
+            id=f"{prefix}{index:02d}",
+            display_name=f"{prefix}{index:02d}",
+            tooltip=f"{noun} Reference payload {index}. Slot order follows staged member order.",
+        )
+        for index in range(1, MAX_REFERENCE_SLOTS + 1)
+    ]
 
+
+class SonderReferenceImageBridge(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
-        # Tooltips stay generic: a socket cannot know which lane it is carrying,
-        # so per-recipe meaning (which outputs are live, how slots map to model
-        # positions) belongs in the Reference lane panel, not here.
-        fixed_outputs = [
-            io.Image.Output(
-                display_name="reference_frames",
-                tooltip="Staged members assembled per the lane recipe — a batch, a composited sheet, or a temporal sequence.",
-            ),
-            io.Int.Output(
-                display_name="reference_idx",
-                tooltip="Frame index each member occupies in the assembled sequence. Meaningful only for recipes that place references in time.",
-            ),
-            io.Float.Output(
-                display_name="reference_strength",
-                tooltip="Conditioning strength for the assembled set, 0.0 when this recipe does not drive it.",
-            ),
-            io.Audio.Output(
-                display_name="reference_audio",
-                tooltip="Trimmed audio for an audio Reference lane. Image recipes emit the required silent fallback rather than None.",
-            ),
-            io.String.Output(
-                display_name="reference_prompt",
-                tooltip="Prompt derived from the staged members, or the item's override. Bridge-local; the scene prompt lanes remain authoritative for composition.",
-            ),
-            io.String.Output(
-                display_name="reference_names",
-                tooltip="Comma-separated Library names of the staged members, in slot order.",
-            ),
-            io.Image.Output(
-                display_name="context",
-                tooltip="Background or context member routed out of the main set, for recipes with a dedicated background input.",
-            ),
-        ]
-        slots = [
-            io.Image.Output(
-                display_name=f"r{index:02d}",
-                tooltip=(
-                    f"Staged member {index} as its own image, for models that take numbered reference "
-                    "sockets. Slot order is the order staged on the lane."
-                ),
-            )
-            for index in range(1, MAX_REFERENCE_SLOTS + 1)
-        ]
-        # Appended AFTER the r-block: tail growth moves no existing slot index,
-        # which is the contract ComfyUI type-checks against.
-        slot_prompts = [
-            io.String.Output(
-                display_name=f"p{index:02d}",
-                tooltip=(
-                    f"Prompt text for staged member {index} alone, expanded from the recipe's per-member "
-                    "pattern. Lets a graph address references positionally instead of splitting "
-                    "reference_prompt."
-                ),
-            )
-            for index in range(1, MAX_REFERENCE_SLOTS + 1)
-        ]
         return io.Schema(
-            node_id=BRIDGE_NODE_ID,
-            display_name="Sonder Reference Bridge",
+            node_id=IMAGE_BRIDGE_NODE_ID,
+            display_name="Sonder Reference Image Bridge",
             category="Sonder",
             description=(
-                "Decodes and assembles the selected Reference set according to its durable lane recipe. "
-                "Absent references emit type-correct compatibility fallbacks; unreadable staged media raises."
+                "Decodes an image Reference lane. Non-slot assemblies emit their one assembled batch "
+                "or sequence on r01; slot recipes emit one member per output."
             ),
-            inputs=[
-                ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector."),
-            ],
-            outputs=[*fixed_outputs, *slots, *slot_prompts],
+            inputs=[ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector.")],
+            outputs=_numbered_outputs(io.Image, "r", "Image"),
         )
 
     @classmethod
     def execute(cls, reference_set) -> io.NodeOutput:
-        return io.NodeOutput(*decode_reference_set(reference_set))
+        return io.NodeOutput(*decode_reference_images(reference_set))
+
+
+class SonderReferenceAudioBridge(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id=AUDIO_BRIDGE_NODE_ID,
+            display_name="Sonder Reference Audio Bridge",
+            category="Sonder",
+            description="Decodes an audio Reference lane into one trimmed AUDIO output per staged member.",
+            inputs=[ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector.")],
+            outputs=_numbered_outputs(io.Audio, "a", "Audio"),
+        )
+
+    @classmethod
+    def execute(cls, reference_set) -> io.NodeOutput:
+        return io.NodeOutput(*decode_reference_audios(reference_set))
+
+
+class SonderReferencePromptBridge(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id=PROMPT_BRIDGE_NODE_ID,
+            display_name="Sonder Reference Prompt Bridge",
+            category="Sonder",
+            description="Exports the aggregate Reference prompt and names, followed by per-member prompts.",
+            inputs=[ReferenceSetType.Input("reference_set", tooltip="Wire from Sonder Reference Selector.")],
+            outputs=[
+                io.String.Output(
+                    id="reference_prompt",
+                    display_name="reference_prompt",
+                    tooltip="Prompt derived from the staged members, or the item's override.",
+                ),
+                io.String.Output(
+                    id="reference_names",
+                    display_name="reference_names",
+                    tooltip="Comma-separated Library names in staged order.",
+                ),
+                *_numbered_outputs(io.String, "p", "Prompt"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, reference_set) -> io.NodeOutput:
+        return io.NodeOutput(*decode_reference_prompts(reference_set))

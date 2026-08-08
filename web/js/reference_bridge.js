@@ -1,7 +1,6 @@
 // Sonder Reference Bridge frontend shape.
-// The backend publishes the full output tuple as an immutable workflow API and
-// always returns every value. This module only decides what LiteGraph DISPLAYS:
-// the effective r-block, plus the fixed outputs the lane recipe actually drives.
+// Each backend publishes a fixed homogeneous tuple. This module only decides
+// how much of the r/a/p tail LiteGraph displays and how every socket is labelled.
 // Three rules hold that safe:
 //   1. A connected slot is never removed, whatever the recipe says. It is still
 //      marked — see rule 1 in reference_bridge_shape.js for why wiring answers a
@@ -23,7 +22,11 @@ import {
 
 const EXT_NAME = "sonder.reference_bridge";
 const SELECTOR = "SonderReferenceSelector";
-const BRIDGE = "SonderReferenceBridge";
+const BRIDGES = new Set([
+    "SonderReferenceImageBridge",
+    "SonderReferenceAudioBridge",
+    "SonderReferencePromptBridge",
+]);
 const STATE = Symbol("sonderReferenceBridgeState");
 const SELECTOR_STATE = Symbol("sonderReferenceSelectorState");
 
@@ -32,14 +35,13 @@ const findWidget = (node, name) => (node?.widgets || []).find((widget) => widget
 
 function ensureState(node) {
     if (node[STATE]) return node[STATE];
-    // Capture EVERY output, not just the r-block: a hidden fixed output has to
-    // be restorable with its original type, label and tooltip.
+    // Capture every currently materialized output so a later grow restores its
+    // original type, label and tooltip. Ordering always comes from the backend
+    // tuple contract, never from a possibly shrunk saved node.
     const metadata = new Map();
-    const order = [];
     for (const slot of node.outputs || []) {
         const name = String(slot?.name || "");
         if (!name) continue;
-        order.push(name);
         metadata.set(name, {
             type: slot.type || "IMAGE",
             label: slot.label,
@@ -47,12 +49,17 @@ function ensureState(node) {
             tooltip: slot.tooltip,
         });
     }
-    node[STATE] = { metadata, order: order.length ? order : canonicalOutputOrder(), initialized: false, refreshToken: 0 };
+    node[STATE] = {
+        metadata,
+        order: canonicalOutputOrder(nodeType(node)),
+        initialized: false,
+        refreshToken: 0,
+    };
     return node[STATE];
 }
 
 export function applyReferenceBridgeShape(node, shape = {}) {
-    if (nodeType(node) !== BRIDGE) return;
+    if (!BRIDGES.has(nodeType(node))) return;
     const state = ensureState(node);
     const changed = resolveBridgeOutputs(node, shape, { metadata: state.metadata, order: state.order });
     // Project writes are frequent and mostly unrelated to this node; only a real
@@ -73,9 +80,11 @@ function upstreamSelector(node) {
 // "Show everything": used whenever the project cannot be resolved, so a slow or
 // unwired editor never presents itself as a node with missing outputs.
 const FULL_SHAPE = {
-    slotCount: MAX_REFERENCE_SLOTS,
+    imageSlotCount: MAX_REFERENCE_SLOTS,
+    audioSlotCount: MAX_REFERENCE_SLOTS,
     promptSlotCount: MAX_REFERENCE_SLOTS,
     liveOutputs: null,
+    slotLabels: [],
 };
 
 async function referenceShapeForBridge(node) {
@@ -108,22 +117,18 @@ async function referenceShapeForBridge(node) {
     // statement, so it shows everything rather than an empty node.
     if (!lane) return FULL_SHAPE;
     return {
-        // slot_count is member count gated by the lane recipe's output liveness:
-        // recipes that never drive the r-block resolve to zero slots.
-        slotCount: Math.max(0, parseInt(lane.slot_count ?? lane.member_count, 10) || 0),
-        // The p-block is gated separately, on reference_prompt. Absent must stay
-        // UNDEFINED and not collapse through `|| 0`, or a payload from a server
-        // that predates the field would mark every live p-slot unused — exactly
-        // the bug the separate count exists to fix.
-        promptSlotCount: lane.prompt_slot_count === undefined || lane.prompt_slot_count === null
-            ? undefined
-            : Math.max(0, parseInt(lane.prompt_slot_count, 10) || 0),
+        // Each count is independently gated by the matching liveness group.
+        imageSlotCount: Math.max(0, parseInt(lane.image_slot_count, 10) || 0),
+        audioSlotCount: Math.max(0, parseInt(lane.audio_slot_count, 10) || 0),
+        // The p-block is gated on reference_prompt, independently of media kind.
+        promptSlotCount: Math.max(0, parseInt(lane.prompt_slot_count, 10) || 0),
         liveOutputs: Array.isArray(lane.live_outputs) ? lane.live_outputs : null,
+        slotLabels: Array.isArray(lane.slot_labels) ? lane.slot_labels : [],
     };
 }
 
 function refreshShape(node) {
-    if (nodeType(node) !== BRIDGE) return;
+    if (!BRIDGES.has(nodeType(node))) return;
     const state = ensureState(node);
     const token = ++state.refreshToken;
     referenceShapeForBridge(node)
@@ -149,7 +154,7 @@ function refreshAllBridges() {
     versionRefreshTimer = setTimeout(() => {
         versionRefreshTimer = null;
         for (const node of app.graph?._nodes || []) {
-            if (nodeType(node) === BRIDGE) refreshShape(node);
+            if (BRIDGES.has(nodeType(node))) refreshShape(node);
             else if (nodeType(node) === SELECTOR) refreshSelectorPanel(node);
         }
     }, 250);
@@ -163,7 +168,7 @@ function downstreamBridges(selector) {
     for (const linkId of links) {
         const link = getGraphLink(graph, linkId);
         const target = getGraphNode(graph, link?.target_id);
-        if (nodeType(target) === BRIDGE) bridges.push(target);
+        if (BRIDGES.has(nodeType(target))) bridges.push(target);
     }
     return bridges;
 }
@@ -358,7 +363,7 @@ function installSelector(node) {
 }
 
 function install(node) {
-    if (nodeType(node) !== BRIDGE) return;
+    if (!BRIDGES.has(nodeType(node))) return;
     const state = ensureState(node);
     if (state.initialized) return;
     state.initialized = true;

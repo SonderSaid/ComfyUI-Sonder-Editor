@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 from types import SimpleNamespace
@@ -207,11 +208,27 @@ def test_iter_scene_frames_passthrough_for_legacy_self_encode(tmp_path):
 def _capture_decode_cmd(monkeypatch):
     captured = {}
 
-    def fake_run(cmd, **kwargs):
-        captured["cmd"] = [str(part) for part in cmd]
-        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    class FakeProcess:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = [str(part) for part in cmd]
+            self.stdout = io.BytesIO()
+            self.returncode = None
 
-    monkeypatch.setattr(media_helpers.subprocess, "run", fake_run)
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = [str(part) for part in cmd]
+        return FakeProcess(cmd, **kwargs)
+
+    monkeypatch.setattr(media_helpers.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
     return captured
 

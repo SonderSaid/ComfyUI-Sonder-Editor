@@ -1017,6 +1017,47 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 el("span", "→", `font-size:11px;color:${COLORS.textMuted};`),
                 endInput,
             );
+            const strengthInput = el("input", "", chromeInputCss({ padding: "3px 6px", fontSize: "11px" }) + "width:64px;");
+            strengthInput.type = "number";
+            strengthInput.min = "0";
+            strengthInput.max = "1";
+            strengthInput.step = "0.05";
+            strengthInput.value = Number(item.strength ?? 1).toFixed(2);
+            strengthInput.title = "Conditioning strength for this staged item";
+            strengthInput.disabled = locked;
+            strengthInput.addEventListener("change", () => {
+                const value = Math.max(0, Math.min(1, Number(strengthInput.value)));
+                if (Number.isFinite(value) && value !== Number(item.strength ?? 1)) {
+                    void writeItem(item, { strength: value }, "change reference strength");
+                }
+            });
+            top.append(el("span", "Strength", `font-size:11px;color:${COLORS.textMuted};`), strengthInput);
+
+            const hard = recipe.recipe?.hard || {};
+            const allowedLengths = Array.isArray(hard.allowed_frame_counts)
+                ? hard.allowed_frame_counts.filter((value) => Number.isFinite(Number(value)) && Number(value) > 0)
+                : [];
+            if (hard.assembly === "temporal" && allowedLengths.length) {
+                const sequenceSelect = el("select", "", chromeInputCss({ padding: "3px 6px", fontSize: "11px" }) + "width:92px;");
+                const auto = el("option", "Auto length");
+                auto.value = "0";
+                sequenceSelect.appendChild(auto);
+                for (const length of allowedLengths) {
+                    const option = el("option", `${Math.trunc(Number(length))} frames`);
+                    option.value = String(Math.trunc(Number(length)));
+                    sequenceSelect.appendChild(option);
+                }
+                sequenceSelect.value = String(Math.max(0, parseInt(item.sequence_frames, 10) || 0));
+                sequenceSelect.disabled = locked;
+                sequenceSelect.title = "Temporal Reference sequence length";
+                sequenceSelect.addEventListener("change", () => {
+                    const value = Math.max(0, parseInt(sequenceSelect.value, 10) || 0);
+                    if (value !== Math.max(0, parseInt(item.sequence_frames, 10) || 0)) {
+                        void writeItem(item, { sequence_frames: value }, "change reference sequence length");
+                    }
+                });
+                top.append(sequenceSelect);
+            }
             const mute = button(item.muted ? "Muted" : "Active", "Exclude this item from resolution without deleting it");
             mute.disabled = locked;
             mute.addEventListener("click", () => void writeItem(item, { muted: !item.muted }, "toggle reference mute"));
@@ -1079,6 +1120,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 end_frame: Number.isFinite(nextStart) ? nextStart : -1,
                 members,
                 prompt_override: "",
+                strength: 1.0,
+                sequence_frames: 0,
                 muted: false,
             },
         }, "add reference item");

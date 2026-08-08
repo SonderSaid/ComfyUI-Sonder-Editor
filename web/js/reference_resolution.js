@@ -1,14 +1,10 @@
-// Bridge output names in tuple order, plus the "slots" pseudo-name covering the
-// whole r01..r16 block. Mirrored in server/reference_resolution.py.
+// Type-homogeneous Bridge output groups. Mirrored in
+// server/reference_resolution.py.
 export const REFERENCE_OUTPUT_NAMES = [
-    "reference_frames",
-    "reference_idx",
-    "reference_strength",
-    "reference_audio",
+    "image_slots",
+    "audio_slots",
     "reference_prompt",
     "reference_names",
-    "context",
-    "slots",
 ];
 
 // A recipe without a `live_outputs` declaration (detached/custom) keeps every
