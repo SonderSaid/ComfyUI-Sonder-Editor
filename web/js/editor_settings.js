@@ -876,8 +876,6 @@ function normalizePromptTemplates(templates) {
                         channel_docs: normalizePromptDocumentBag(s.channel_docs, channels),
                         attachments: normalizePromptAttachments(s.attachments),
                         muted: s.muted === true,
-                        starts_new_shot: s.starts_new_shot === true,
-                        shot_timestamp: s.shot_timestamp === true,
                         global_channel_exceptions: normalizeIdList(
                             s.global_channel_exceptions),
                     };

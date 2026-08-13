@@ -17,6 +17,7 @@ from server import prompt_channel_templates as pct
 from server import prompt_payload as pp
 import server.routes as routes
 from server import prompt_context
+from server import minimax_h3
 from server.timeline_state import LaneConfig, PromptSection, Scene, TimelineProject
 
 
@@ -94,7 +95,7 @@ def test_flat_global_replacement_of_anchored_document_is_controlled_conflict():
 
 
 def test_flat_section_replacement_of_anchor_is_controlled_and_atomic():
-    attachment = prompt_context.normalize_attachment({"kind": "guide"})
+    attachment = prompt_context.normalize_attachment({"kind": "custom"})
     section = PromptSection(
         0, 20, channels={"visual": "before"}, attachments=[attachment],
         channel_docs={"visual": {"nodes": [
@@ -151,17 +152,26 @@ def test_inherit_defaults_on_and_only_named_channels_opt_out():
 
 def _sections():
     # Opens a shot explicitly: nothing about being first implies one.
-    return [PromptSection(0, 120, starts_new_shot=True, channels={
-        "detailed_description": "he opens the shutters"})]
+    return [PromptSection(
+        0, 120,
+        channels={"detailed_description": "he opens the shutters"},
+        attachments=[prompt_context.normalize_attachment({"kind": "shot"})],
+    )]
 
 
 def test_global_channel_merges_into_its_own_field():
     # The MiniMax full-reference guide puts the style opening BEFORE [Shot 1]
     # inside detailed_description — not ahead of the first field name, which is
     # where the pre-P5 interim rule put it.
-    composed = pp.compose_range_prompt(
-        "", _sections(), 0, 120, delimiter=".", template=REF, fps=24.0,
-        global_channels={"detailed_description": "The target video is cinematic"})
+    scene = _scene()
+    scene.prompt_sections = _sections()
+    scene.set_global_channels(
+        {"detailed_description": "The target video is cinematic"})
+    setup = minimax_h3.default_reference_setup()
+    scene.minimax_h3_conditioning_setups = [setup]
+    scene.active_minimax_h3_setup_id = setup["setup_id"]
+    composed = scene.get_prompt_for_range(
+        0, 120, delimiter=".", template=REF, fps=24.0)
     assert composed == (
         "detailed_description:\n"
         "The target video is cinematic. [Shot 1] he opens the shutters")
@@ -189,8 +199,11 @@ def test_global_channel_is_emitted_once_when_any_section_inherits():
     # opening several times over.
     scene = _scene()
     scene.prompt_sections = [
-        PromptSection(0, 120, starts_new_shot=True,
-                      channels={"detailed_description": "he opens the shutters"}),
+        PromptSection(
+            0, 120,
+            channels={"detailed_description": "he opens the shutters"},
+            attachments=[prompt_context.normalize_attachment({"kind": "shot"})],
+        ),
         PromptSection(120, 240, channels={"detailed_description": "he steps back"}),
     ]
     scene.set_global_channels({"detailed_description": "The target video is cinematic"})
@@ -249,44 +262,56 @@ def test_default_template_still_prepends_global_once():
 
 # --- frozen job -------------------------------------------------------------
 
-def _job_with(global_channels):
+def _job_with(project, template):
     from server.timeline_state import GenerationJob
 
     job = GenerationJob()
+    job.scene_id = "scene-1"
     job.selection_start = 0
     job.selection_end = 120
     job.scene_prompt = "the flat mirror"
-    job.prompt_sections = [{"start_frame": 0, "end_frame": 120,
-                            "starts_new_shot": True,
-                            "channels": {"detailed_description": "he opens the shutters"}}]
-    job.params = {"snapshot_version": 1,
-                  pct.PROJECT_TEMPLATE_KEY: "minimax_h3_ref",
-                  "prompt_frame_threshold": 0.0,
-                  "scene_global_channels": global_channels}
+    job.params = {
+        "snapshot_version": 1,
+        "prompt_context_format": "prompt_context_v1",
+        pct.PROJECT_TEMPLATE_KEY: template,
+        "prompt_frame_threshold": 0.0,
+    }
     return job
 
 
 def test_frozen_job_composes_from_its_frozen_global_channels():
     project = TimelineProject(name="Project")
-    project.metadata = {pct.PROJECT_TEMPLATE_KEY: "minimax_h3_ref",
-                        "prompt_frame_threshold": 0.0}
-    job = _job_with({"detailed_description": "The target video is cinematic"})
+    scene = _scene(prompt_context_profile_id="generic@1")
+    scene.prompt_sections = _sections()
+    scene.set_global_channels(
+        {"detailed_description": "The target video is cinematic"})
+    setup = minimax_h3.default_reference_setup()
+    scene.minimax_h3_conditioning_setups = [setup]
+    scene.active_minimax_h3_setup_id = setup["setup_id"]
+    project.scenes = [scene]
+    job = _job_with(project, REF)
     routes._compose_frozen_job_prompt(project, job)
     assert "The target video is cinematic. [Shot 1] he opens the shutters" in job.prompt
-    # `scene_prompt` keeps carrying the flat mirror, so the relay socket and
-    # every existing reader are untouched.
-    assert job.scene_prompt == "the flat mirror"
+    frozen = job.prompt
+    scene.set_global_channels({"detailed_description": "changed live"})
+    assert job.prompt == frozen
+    # The old three-channel tuple mirror stays shape-compatible; MiniMax's
+    # authoritative global fields are frozen separately in params.
+    assert job.scene_prompt == ""
+    assert job.params["scene_global_channels"]["detailed_description"].startswith(
+        "The target video")
 
 
-def test_frozen_job_without_global_channels_falls_back_to_the_flat_mirror():
+def test_v1_enqueue_freezes_a_flat_scene_mirror_under_standard_template():
     project = TimelineProject(name="Project")
-    project.metadata = {pct.PROJECT_TEMPLATE_KEY: "minimax_h3_ref",
-                        "prompt_frame_threshold": 0.0}
-    job = _job_with(None)
-    job.params.pop("scene_global_channels")
+    standard = pct.get_channel_template("standard")
+    scene = _scene(prompt="the flat mirror", prompt_context_profile_id="generic@1")
+    scene.prompt_sections = [PromptSection(0, 120, channels={"visual": "section"})]
+    project.scenes = [scene]
+    job = _job_with(project, standard)
     routes._compose_frozen_job_prompt(project, job)
-    # Pre-upgrade snapshot: still inside a field, never ahead of one.
-    assert job.prompt.startswith("subject_definitions:\nthe flat mirror")
+    assert job.prompt == "the flat mirror section"
+    assert job.params["scene_global_channels"]["visual"] == "the flat mirror"
 
 
 # --- route --------------------------------------------------------------------

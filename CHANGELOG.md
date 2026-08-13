@@ -20,13 +20,12 @@ a fresh `[Unreleased]` block.
 - Live Editor execution and Prompt Relay now share the project-aware Prompt Context compiler used by preview/enqueue, with demand-gated blocking diagnostics instead of silent blank prompts.
 - Prompt diagnostics retain a visibly stale scene-keyed result while recompiling, avoiding per-keystroke placeholder reflow and cross-scene preview leakage.
 - Context projections now follow every compiler placement above/below channel text, including multiple placements in one channel, and keep routed silent or linked-deduped chips visible with an explanation.
-- Shot and standalone section Time chips now have real editors; Time remains window-local, template-gated, and compatible with legacy timed-Shot migration.
+- Shot and standalone section Time chips now have real editors and are the only authored marker state; Time remains window-local and template-gated.
 - Scope rows can reuse configured chips as linked emission groups with atomic propagated edits and Unlink, while Reference-backed Subjects now render as a directly actionable authored/generated list.
 - Prompt authoring now defaults inline bars to an all-channel view, uses a shared caret-aware context menu, shows per-channel Reference-chip projections, supports late-bound stable-id tokens, treats resolvable empty content as advisory, restores persisted box heights, and distinguishes protected generated Subjects from deletable authored composites.
-- Timestamp is now an option on the Shot Context chip, and legacy standalone
-  Timestamp data migrates to a timed Shot. Guide authoring is folded into Custom
-  text with an optional H3 physical Guide binding; legacy Guide chips still load
-  and compile.
+- Timestamp is now an option on the Shot Context chip. Guide authoring is folded
+  into Custom text with an optional H3 physical Guide binding; unsupported raw
+  Guide/unknown kinds remain visible for repair and block while enabled.
 - MiniMax H3 Full Reference scenes now add Picture, Video, and Audio lanes
   independently instead of installing an all-three setup. Reference lane Members
   and Advisories start collapsed, remember browser-local disclosure choices, and
@@ -36,8 +35,19 @@ a fresh `[Unreleased]` block.
   video-only authored population but is served as a 24 fps IMAGE sequence on
   the `17n+5` frame grid; bridge shape and labels follow the effective render
   window or the running job's frozen window.
+- New queue jobs use an explicit `prompt_context_v1` envelope with complete
+  Prompt Context, template, and Reference freezes; released unmarked v0.2.2
+  jobs replay through an isolated frozen-only composer.
+- Prompt profile, role, recipe, and validator authoring now consumes one
+  schema-versioned server catalog, including sanitized built-in fork seeds.
+- MiniMax H3 Picture, Video, and Audio population creation is one atomic,
+  version-checked server mutation that reuses only safe unowned lanes.
 
 ### Removed
+- Removed unpublished Shot/Time marker mirrors and migrations, Guide Context
+  compilation, role aliases, paired-Audio semantics, retired Reference output
+  vocabulary, implicit ordinal/audio text fallbacks, and frozen-to-live
+  Reference/template fallbacks.
 - Removed the six provider-shaped MiniMax H3 setup/bridge workflow nodes and
   setup-owned paired Audio. Base physical keyframe outputs and paired Audio are
   intentionally unavailable until their dedicated replacement design sessions;
@@ -86,8 +96,6 @@ a fresh `[Unreleased]` block.
   Recipes can bound the short image edge and choose native, scene, or custom
   reference frame rate; video members serve their trimmed spans with streaming
   decode and resampling, and audio recipes can expose multiple members.
-- Existing Reference recipes migrate the retired Bridge liveness vocabulary in
-  scene copies, frozen jobs, project custom recipes, and built-in presets.
 - Prompt channels are now a project-wide template rather than a fixed three.
   Pick one in Settings > Prompts: **Standard** (one plain channel and the
   new-project default), **Visual + Speech + Sound** (the previous three), or **MiniMax H3** in

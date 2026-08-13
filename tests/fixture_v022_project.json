@@ -1,0 +1,34 @@
+{
+  "project_id": "v022-project",
+  "name": "Released v0.2.2 fixture",
+  "fps": 24,
+  "resolution": [1280, 720],
+  "template_id": "free",
+  "metadata": {
+    "prompt_channel_labels": true,
+    "prompt_section_delimiter": " | ",
+    "published_unknown_setting": {"keep": "opaque"}
+  },
+  "scenes": [{
+    "scene_id": "scene",
+    "name": "Scene 1",
+    "duration_frames": 120,
+    "prompt": "global",
+    "video_lane_count": 18,
+    "video_lane_configs": [],
+    "prompt_sections": [{
+      "prompt_id": "section",
+      "start_frame": 0,
+      "end_frame": 120,
+      "channels": {
+        "visual": "old visual",
+        "speech": "old speech",
+        "sounds": "old sounds",
+        "vendor_channel": "preserve authored unknown channel"
+      }
+    }]
+  }],
+  "assets": [],
+  "generation_queue": [],
+  "future_top_level_blob": [1, 2, 3]
+}

@@ -86,3 +86,133 @@ def format_reference_prompt(*, item=None, members=None, recipe=None) -> tuple[st
     aggregate = override or " ".join(value for value in (
         prefix, ", ".join(value for value in fragments if value)) if value)
     return aggregate, fragments
+
+
+def as_plain_record(value) -> dict:
+    """Return a serializable record view without choosing any authority."""
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return {}
+
+
+def _field(value, name, default=""):
+    return value.get(name, default) if isinstance(value, dict) \
+        else getattr(value, name, default)
+
+
+def build_reference_formatter_context(*, winners, catalog_records, assets,
+                                      recipes, setup_data=None) -> dict:
+    """Build registry numbers and formatted lane records from resolved inputs.
+
+    This helper is intentionally authority-blind: callers must already choose
+    live versus frozen data and resolve winning lane items.  It never loads a
+    project, locates a scene, or resolves a setup.
+    """
+    setup_data = setup_data if isinstance(setup_data, dict) else {}
+    seed = setup_data.get("registry") if isinstance(
+        setup_data.get("registry"), dict) else {}
+    registry = {
+        "subjects": dict(seed.get("subjects") or {}),
+        "pictures": dict(seed.get("pictures") or {}),
+        "audios": dict(seed.get("audios") or {}),
+        "speakers": dict(seed.get("speakers") or {}),
+    }
+    references = list(catalog_records or [])
+    asset_lookup = {str(_field(asset, "asset_id") or ""): asset
+                    for asset in assets or []}
+    member_lookup = {}
+    for reference in references:
+        for member in _field(reference, "members", []) or []:
+            member_id = str(_field(member, "member_id") or "")
+            if member_id:
+                member_lookup[member_id] = (reference, member)
+
+    resolved = []
+    for lane_index, winner in enumerate(winners or []):
+        if not isinstance(winner, dict):
+            continue
+        item = as_plain_record(winner.get("item"))
+        records = []
+        for member_ref in item.get("members") or []:
+            if not isinstance(member_ref, dict):
+                continue
+            pair = member_lookup.get(str(member_ref.get("member_id") or ""))
+            if pair is not None:
+                records.append(pair)
+        resolved.append((lane_index, item, records))
+
+    def assign(population, key):
+        if key and key not in registry[population]:
+            existing = [int(value) for value in registry[population].values()
+                        if isinstance(value, int) and value > 0]
+            registry[population][key] = (max(existing) if existing else 0) + 1
+
+    for _lane_index, _item, records in resolved:
+        for reference, member in records:
+            entity_id = str(_field(reference, "reference_id") or "")
+            member_id = str(_field(member, "member_id") or "")
+            asset = asset_lookup.get(str(_field(member, "asset_id") or ""))
+            is_audio = str(_field(asset, "asset_type") or "") == "audio"
+            assign("subjects", entity_id)
+            assign("audios" if is_audio else "pictures", member_id)
+            tags = [str(value) for value in (_field(member, "tags", []) or [])]
+            if is_audio and "sonder:voice_identity" in tags:
+                assign("speakers", entity_id)
+
+    recipe_values = list(recipes or [])
+    lanes = []
+    generic = {}
+    for lane_index, item, records in resolved:
+        wrapper = as_plain_record(recipe_values[lane_index]) \
+            if lane_index < len(recipe_values) else {}
+        recipe = wrapper.get("recipe") if isinstance(
+            wrapper.get("recipe"), dict) else {}
+        soft = recipe.get("soft") if isinstance(recipe.get("soft"), dict) else {}
+        members = []
+        for reference, member in records:
+            entity_id = str(_field(reference, "reference_id") or "")
+            member_id = str(_field(member, "member_id") or "")
+            members.append({
+                "name": str(_field(reference, "name") or ""),
+                "entity_name": str(_field(reference, "name") or ""),
+                "member_name": str(_field(member, "name") or ""),
+                "prompt": str(_field(member, "prompt") or ""),
+                "member_id": member_id,
+                "entity_id": entity_id,
+                "registry_numbers": {
+                    "subject_n": registry["subjects"].get(entity_id, 0),
+                    "picture_n": registry["pictures"].get(member_id, 0),
+                    "audio_n": registry["audios"].get(member_id, 0),
+                    "speaker_n": registry["speakers"].get(entity_id, 0),
+                },
+            })
+        aggregate, fragments = format_reference_prompt(
+            item=item, members=members, recipe=recipe)
+        lane = {"lane_index": lane_index, "item": item, "wrapper": wrapper,
+                "recipe": recipe, "members": members,
+                "prompt": aggregate, "member_prompts": fragments}
+        lanes.append(lane)
+        item_id = str(item.get("reference_item_id") or "")
+        if item_id:
+            generic[item_id] = {
+                "reference_item_id": item_id,
+                "lane_index": lane_index,
+                "lane_id": str(wrapper.get("lane_id") or ""),
+                "recipe_id": str(wrapper.get("recipe_id") or ""),
+                "prompt": aggregate,
+                "member_prompts": fragments,
+                "members": members,
+                "compatible_profiles": [str(value) for value in
+                                        soft.get("compatible_profiles", ["generic@1"])],
+                "physical_population": str(
+                    soft.get("physical_population") or "none"),
+                "exposed_capabilities": [str(value) for value in
+                                          soft.get("exposed_capabilities",
+                                                   ["derived_prompt"])],
+                "role_fields": [str(value) for value in
+                                soft.get("role_fields", [])],
+            }
+    return {"registry": registry, "lanes": lanes,
+            "generic_references": generic}

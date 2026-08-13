@@ -1,0 +1,19 @@
+{
+  "job_id": "released-job",
+  "scene_id": "scene",
+  "selection_start": 5,
+  "selection_end": 65,
+  "scene_prompt": "global",
+  "prompt_sections": [
+    {"prompt_id": "one", "start_frame": 0, "end_frame": 30,
+     "channels": {"visual": "first", "speech": "", "sounds": ""}},
+    {"prompt_id": "two", "start_frame": 30, "end_frame": 80,
+     "channels": {"visual": "second", "speech": "", "sounds": ""}}
+  ],
+  "params": {
+    "snapshot_version": 1,
+    "prompt_channel_labels": false,
+    "prompt_section_delimiter": ",",
+    "prompt_frame_threshold": 10
+  }
+}

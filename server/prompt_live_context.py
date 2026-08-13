@@ -1,7 +1,7 @@
 """Shared live Prompt Context assembly for preview, execution, and Relay."""
 
 from . import minimax_h3, prompt_channel_templates, prompt_context
-from .reference_prompt_formatter import format_reference_prompt
+from .reference_prompt_formatter import build_reference_formatter_context
 from .reference_resolution import resolve_effective_references
 
 
@@ -51,82 +51,14 @@ def resolve_scene_prompt_context(project, scene, template, window_start,
             window_start=window_start, window_end=window_end,
             lane_configs=scene.reference_lane_configs,
             frame_threshold_pct=reference_threshold)
-        member_lookup = {
-            str(member.member_id): (reference, member)
-            for reference in project.references for member in reference.members
-        }
-        asset_lookup = {str(asset.asset_id): asset for asset in project.assets}
-        resolved_records = []
-        for lane_index, winner in enumerate(winners):
-            if not winner:
-                continue
-            item = winner.get("item")
-            item_value = item.to_dict() if hasattr(item, "to_dict") else dict(item or {})
-            records = []
-            for member_ref in item_value.get("members") or []:
-                if not isinstance(member_ref, dict):
-                    continue
-                pair = member_lookup.get(str(member_ref.get("member_id") or ""))
-                if pair:
-                    records.append((pair[0], pair[1]))
-            resolved_records.append((lane_index, item_value, records))
-
-        subjects, pictures, audios, speakers = {}, {}, {}, {}
-        for _lane_index, _item, records in resolved_records:
-            for reference, member in records:
-                entity_id = str(reference.reference_id or "")
-                member_id = str(member.member_id or "")
-                asset = asset_lookup.get(str(member.asset_id or ""))
-                if entity_id and entity_id not in subjects:
-                    subjects[entity_id] = len(subjects) + 1
-                if getattr(asset, "asset_type", "") == "audio":
-                    if member_id and member_id not in audios:
-                        audios[member_id] = len(audios) + 1
-                    if (entity_id and "sonder:voice_identity" in (member.tags or [])
-                            and entity_id not in speakers):
-                        speakers[entity_id] = len(speakers) + 1
-                elif member_id and member_id not in pictures:
-                    pictures[member_id] = len(pictures) + 1
-        recipes = list(scene.reference_lane_recipes or [])
-        generic = {}
-        for lane_index, item_value, records in resolved_records:
-            wrapper = recipes[lane_index].to_dict() if lane_index < len(recipes) else {}
-            recipe = wrapper.get("recipe") if isinstance(wrapper.get("recipe"), dict) else {}
-            soft = recipe.get("soft") if isinstance(recipe.get("soft"), dict) else {}
-            formatter_records = []
-            for reference, member in records:
-                formatter_records.append({
-                    "name": reference.name,
-                    "entity_name": reference.name,
-                    "member_name": member.name,
-                    "prompt": member.prompt,
-                    "member_id": member.member_id,
-                    "entity_id": reference.reference_id,
-                    "registry_numbers": {
-                        "subject_n": subjects.get(reference.reference_id, 0),
-                        "picture_n": pictures.get(member.member_id, 0),
-                        "audio_n": audios.get(member.member_id, 0),
-                        "speaker_n": speakers.get(reference.reference_id, 0),
-                    },
-                })
-            aggregate, fragments = format_reference_prompt(
-                item=item_value, members=formatter_records, recipe=recipe)
-            item_id = str(item_value.get("reference_item_id") or "")
-            if item_id:
-                generic[item_id] = {
-                    "reference_item_id": item_id, "lane_index": lane_index,
-                    "lane_id": str(wrapper.get("lane_id") or ""),
-                    "recipe_id": str(wrapper.get("recipe_id") or ""),
-                    "prompt": aggregate, "member_prompts": fragments,
-                    "members": formatter_records,
-                    "compatible_profiles": [str(value) for value in
-                                            soft.get("compatible_profiles", ["generic@1"])],
-                    "physical_population": str(soft.get("physical_population") or "none"),
-                    "exposed_capabilities": [str(value) for value in
-                                             soft.get("exposed_capabilities", ["derived_prompt"])],
-                    "role_fields": [str(value) for value in soft.get("role_fields", [])],
-                }
-        result["generic_references"] = generic
+        formatter_context = build_reference_formatter_context(
+            winners=winners,
+            catalog_records=project.references,
+            assets=project.assets,
+            recipes=scene.reference_lane_recipes,
+            setup_data=result,
+        )
+        result["generic_references"] = formatter_context["generic_references"]
     return result
 
 

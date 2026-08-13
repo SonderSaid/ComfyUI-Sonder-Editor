@@ -19,7 +19,7 @@ import server.routes as routes
 import server.media_helpers as media_helpers
 import server.thumbnail_service as thumbnail_service
 from server.project_manager import create_project, load_project, save_project
-from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, Scene, TimelineProject
+from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, PromptSection, Scene, TimelineProject
 
 
 class DummyRequest:
@@ -847,6 +847,10 @@ def test_list_dormant_assets_filters_trashed_by_default(tmp_path, monkeypatch):
 def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     module = _load_route_module(monkeypatch)
     project = _make_project(tmp_path)
+    scene = Scene(scene_id="scene-1", name="Opening", duration_frames=96)
+    scene.prompt_sections = [PromptSection(
+        0, 96, channels={"visual": "section prompt"})]
+    project.scenes = [scene]
 
     monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
     monkeypatch.setattr(module, "save_project", lambda project, **kwargs: None)
@@ -895,6 +899,7 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
         "take_placement_mode": "untrimmed",
         "take_placement_linked": False,
         "take_placement_muted": True,
+        "params": {"prompt_context_format": "prompt_context_v1"},
     })
     response = asyncio.run(module.api_add_queue_job(request))
     payload = _response_json(response)
@@ -927,6 +932,7 @@ def test_add_queue_job_route_persists_snapshot_fields(tmp_path, monkeypatch):
     # neutral defaults; execution resolves them from live widgets/settings.
     assert payload["take_placement_linked"] is True
     assert payload["take_placement_muted"] is False
+    assert payload["params"]["prompt_context_format"] == "prompt_context_v1"
     assert project.generation_queue[0].frame_constraint == {"step": 8, "offset": 1, "min": 1, "max": 257}
     assert project.generation_queue[0].take_placement_mode == "untrimmed"
     assert project.generation_queue[0].take_placement_linked is True

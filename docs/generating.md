@@ -113,10 +113,11 @@ dialogue wrappers and camera phrases is inserted as a profile-provided **Writing
 aid**. Hover previews use the latest live
 compiler result; blocking diagnostics must be repaired before queueing.
 
-Timeline prompt bars show one active channel at a time and remember it per
-Channel Template. Hidden channels stay mounted with their caret/undo state and
-show non-empty counts beside the Channel selector. Switching is presentation
-only; it never moves or flattens authored text or chips.
+Timeline prompt bars show **All channels** by default. You can focus one channel,
+and that presentation choice is remembered per Channel Template. Hidden
+channels stay mounted with their caret/undo state and show non-empty counts
+beside the Channel selector. Switching is presentation only; it never moves or
+flattens authored text or chips.
 
 - **Boundary Prompt Threshold** (project-wide) drops a section from a window
   when the selection clips only a tiny edge sliver of it — so frame snapping
@@ -231,7 +232,7 @@ edits affect a queued job and which don't.
 
 Rules of thumb:
 
-- Edit **conditioning** (guides, prompts, Drivers, geometry, template)
+- Edit **conditioning** (guides, prompts, References, Drivers, geometry, template)
   *before* queueing — those are locked per job.
 - **Picture is live, and that cuts both ways.** Clips and audio render as
   they are at the moment a job executes. That's what lets a later batch

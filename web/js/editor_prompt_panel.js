@@ -144,99 +144,6 @@ export function allocateWritingBlocks(blocks, total, minLen, existing = []) {
     return result;
 }
 
-/** Plan one explicitly requested H3 Reference population without inventing
- * the other two. IDs are injected so the state transition stays pure/testable. */
-export function planH3ReferencePopulation(scene, definition, {
-    newLaneId = "", newSetupId = "",
-} = {}) {
-    const setupKey = String(definition?.setupKey || "");
-    if (!setupKey || !["picture_lane_ids", "video_lane_ids", "audio_lane_ids"].includes(setupKey)) {
-        throw new Error("invalid_h3_reference_population");
-    }
-    const recipes = structuredClone(scene?.reference_lane_recipes || []);
-    const setups = structuredClone(scene?.minimax_h3_conditioning_setups || []);
-    const selectedSetup = setups.find((value) =>
-        value?.setup_id === scene?.active_minimax_h3_setup_id)
-        || (setups.length === 1 ? setups[0] : null);
-    const active = selectedSetup?.mode === "reference"
-        ? selectedSetup
-        : setups.find((value) => value?.mode === "reference") || null;
-    let laneCount = Math.max(1, Number(scene?.reference_lane_count || 1));
-    let index = recipes.findIndex((value) => value?.recipe_id === definition.id);
-    const operations = [];
-    if (index < 0) {
-        const reusable = Array.from({ length: laneCount }, (_value, candidate) => candidate)
-            .find((candidate) => {
-                const wrapper = recipes[candidate];
-                // Backend-canonical blank lanes still serialize media_kind
-                // (currently "image"); authored state begins with a recipe id
-                // or non-empty materialized recipe.
-                const blankPlaceholder = !wrapper || (!wrapper.recipe_id
-                    && (!wrapper.recipe || !Object.keys(wrapper.recipe).length));
-                return blankPlaceholder
-                && !(scene?.reference_items || []).some((item) =>
-                    Number(item?.lane_index || 0) === candidate);
-            });
-        index = Number.isInteger(reusable) ? reusable : -1;
-        if (index < 0) index = laneCount++;
-        const materializedLaneId = String(recipes[index]?.lane_id || newLaneId || "");
-        if (!materializedLaneId) throw new Error("missing_h3_reference_lane_id");
-        const wrapper = {
-            lane_id: materializedLaneId,
-            media_kind: definition.kind,
-            recipe_id: definition.id,
-            recipe: {
-                id: definition.id, name: definition.name,
-                media_kind: definition.kind,
-                hard: structuredClone(definition.hard || {}),
-                soft: structuredClone(definition.soft || {}),
-            },
-        };
-        recipes[index] = wrapper;
-        operations.push({
-            type: "update_lane_config", lane_type: "reference", lane_index: index,
-            fields: { name: definition.name, reference_recipe: wrapper },
-        });
-    }
-    const laneId = String(recipes[index]?.lane_id || "");
-    if (!laneId) throw new Error("missing_h3_reference_lane_id");
-    if (active?.mode === "reference"
-            && (active[setupKey] || []).map(String).includes(laneId)) {
-        const operations = active.setup_id === scene?.active_minimax_h3_setup_id
-            ? []
-            : [{ type: "update_scene_fields", fields: {
-                active_minimax_h3_setup_id: active.setup_id,
-            } }];
-        return { operations, laneIndex: index, laneId, alreadyLinked: true };
-    }
-    if (laneCount !== Number(scene?.reference_lane_count || 1)) {
-        operations.unshift({
-            type: "set_lane_count", lane_type: "reference", count: laneCount,
-        });
-    }
-    const setupId = active?.mode === "reference" ? active.setup_id : newSetupId;
-    if (!setupId) throw new Error("missing_h3_reference_setup_id");
-    const setup = {
-        ...(active?.mode === "reference" ? active : {}),
-        schema: "minimax_h3_setup_v1", setup_id: setupId,
-        name: "MiniMax H3 Reference Setup", mode: "reference",
-        task_mode: active?.mode === "reference" ? active.task_mode || "T2VA" : "T2VA",
-        picture_lane_ids: active?.mode === "reference"
-            ? [...(active.picture_lane_ids || [])] : [],
-        video_lane_ids: active?.mode === "reference"
-            ? [...(active.video_lane_ids || [])] : [],
-        audio_lane_ids: active?.mode === "reference"
-            ? [...(active.audio_lane_ids || [])] : [],
-    };
-    setup[setupKey] = [...new Set([...setup[setupKey].map(String), laneId])];
-    operations.push({ type: "update_scene_fields", fields: {
-        minimax_h3_conditioning_setups: [
-            ...setups.filter((value) => value?.setup_id !== setup.setup_id), setup],
-        active_minimax_h3_setup_id: setup.setup_id,
-    } });
-    return { operations, laneIndex: index, laneId, alreadyLinked: false };
-}
-
 function makeBtn(label, title, variant = "secondary") {
     const btn = document.createElement("button");
     btn.textContent = label;
@@ -1219,8 +1126,6 @@ export function mountPromptManagementPanel(host) {
                     global_channel_exceptions: [...new Set(
                         (writingState.blockMeta[i]?.global_channel_exceptions || [])
                             .map(String))],
-                    starts_new_shot: attachments.some((value) => value.kind === "shot" && value.enabled !== false),
-                    shot_timestamp: attachments.some((value) => value.kind === "timestamp" && value.enabled !== false),
                 };
                 cursor += length;
                 return section;
@@ -1292,18 +1197,13 @@ export function mountPromptManagementPanel(host) {
         // requirements nothing checks. Incompatible choices are shown disabled
         // rather than hidden, so an existing bad pairing stays visible.
         const catalog = host._promptContextCatalog || {};
+        const catalogReady = Number(catalog.schema_version) === 1
+            && Array.isArray(catalog.profiles);
+        const catalogProfiles = catalogReady ? catalog.profiles : [];
         const universal = String(catalog.universal_template || "*");
         const activeTemplateId = String(activeTemplate.id || "");
-        const profileTemplates = catalog.profile_templates || {};
-        // Fallback for a custom the catalog has not caught up with yet. It must
-        // read the same two fields the server does: reconstructing from
-        // `template_id` alone would disable a multi-template pairing the
-        // compiler accepts.
-        const customTemplates = new Map((host._promptContextProfiles || []).map(
-            (value) => [`${value.profile_id}@${value.version}`,
-                Array.isArray(value.compatible_templates) && value.compatible_templates.length
-                    ? value.compatible_templates.map(String)
-                    : [String(value.template_id || "standard")]]));
+        const catalogByKey = new Map(catalogProfiles.map(
+            (value) => [String(value?.key || ""), value]));
         const compatible = (key) => {
             if (!key) return true;
             // A template naming a format as its own default has declared the
@@ -1311,8 +1211,8 @@ export function mountPromptManagementPanel(host) {
             // MiniMax template shows its own default disabled while the server
             // happily compiles it.
             if (key === defaultProfile) return true;
-            const allowed = profileTemplates[key] || customTemplates.get(key);
-            if (!Array.isArray(allowed) || !allowed.length) return true;
+            const allowed = catalogByKey.get(key)?.compatible_templates;
+            if (!Array.isArray(allowed) || !allowed.length) return false;
             return allowed.includes(universal) || allowed.includes("standard")
                 || allowed.includes(activeTemplateId);
         };
@@ -1326,49 +1226,36 @@ export function mountPromptManagementPanel(host) {
             return option;
         };
         addProfileOption("", `Template default (${defaultProfile})`);
-        addProfileOption("generic@1", "Generic");
-        addProfileOption("minimax_h3_base@1", "MiniMax H3 Base");
-        addProfileOption("minimax_h3_ref@1", "MiniMax H3 Full Reference");
-        for (const value of host._promptContextProfiles || []) {
-            const key = `${value.profile_id}@${value.version}`;
-            addProfileOption(key, value.name || key);
+        for (const value of catalogProfiles) {
+            const key = String(value?.key || "");
+            if (key) addProfileOption(key, value.name || key);
         }
-        profile.value = scene.prompt_context_profile_id || "";
+        const selectedProfileKey = String(scene.prompt_context_profile_id || "");
+        if (selectedProfileKey && !catalogByKey.has(selectedProfileKey)) {
+            addProfileOption(selectedProfileKey,
+                `${selectedProfileKey} - unavailable from catalog`);
+        }
+        profile.value = selectedProfileKey;
+        profile.disabled = !catalogReady;
         const profileRow = document.createElement("label");
         profileRow.style.cssText = `display:flex;align-items:center;gap:8px;font-size:10px;color:${COLORS.textDim};`;
         profileRow.append("Prompt format", profile); card.appendChild(profileRow);
+        if (!catalogReady) {
+            const state = document.createElement("div");
+            state.style.cssText = `font-size:10px;color:${host._referencesError ? "#e08b6a" : COLORS.textDim};`;
+            state.textContent = host._referencesError
+                ? `Prompt format catalog failed to load: ${host._referencesError}`
+                : "Loading the authoritative prompt format catalog...";
+            card.appendChild(state);
+        }
         const fork = makeBtn("Fork prompt format", "Create a bounded declarative project prompt format");
+        fork.disabled = !catalogReady;
         fork.addEventListener("click", () => {
             if (card.querySelector("[data-profile-editor]")) return;
-            const builtins = {
-                "generic@1": { capabilities: { shot: { placement: "section_prefix" },
-                    timestamp: { placement: "section_prefix" }, prompt_link: { placement: "inline" },
-                    guide: { placement: "inline" }, reference: { placement: "inline" },
-                    vocal_event: { placement: "inline" } }, validators: [] },
-                "minimax_h3_base@1": { capabilities: { shot: { channel_key: "integrated_multimodal_description", placement: "section_prefix" },
-                    timestamp: { channel_key: "integrated_multimodal_description", placement: "section_prefix" },
-                    prompt_link: { placement: "inline" }, guide: { channel_key: "integrated_multimodal_description", placement: "inline" },
-                    vocal_event: { channel_key: "integrated_multimodal_description", placement: "inline" } }, validators: ["minimax_base_setup", "managed_speakers"] },
-                "minimax_h3_ref@1": { capabilities: { shot: { channel_key: "detailed_description", placement: "section_prefix" },
-                    timestamp: { channel_key: "detailed_description", placement: "section_prefix" }, prompt_link: { placement: "inline" },
-                    guide: { channel_key: "detailed_description", placement: "inline" },
-                    reference: { routes: { definitions: "subject_definitions", summary: "summary", retention: "retention_analysis", mentions: "detailed_description", audio_relationship: "summary" } },
-                    vocal_event: { channel_key: "detailed_description", placement: "inline" } }, validators: ["minimax_reference_setup", "managed_speakers"],
-                    role_catalogs: {
-                        pictures: ["first_frame", "last_frame", "keyframe", "storyboard", "composition_anchor", "identity", "environment", "style", "motion"],
-                        videos: ["video_editing", "video_continuation", "temporal_structure", "motion"],
-                        standalone_audios: ["audio_reuse", "audio_reference", "timbre", "rhythm", "sound_texture"],
-                    } },
-            };
             const selectedKey = profile.value || defaultProfile;
-            const selectedCustom = (host._promptContextProfiles || []).find(
-                (value) => `${value.profile_id}@${value.version}` === selectedKey);
-            const selected = structuredClone(selectedCustom
-                || builtins[selectedKey] || builtins["generic@1"]);
-            if (!selectedCustom) {
-                selected.writing_aids = structuredClone(
-                    host._promptContextCatalog?.writing_aids?.[selectedKey] || []);
-            }
+            const descriptor = catalogByKey.get(selectedKey);
+            if (!descriptor?.fork_seed) return;
+            const selected = structuredClone(descriptor.fork_seed);
             const editor = document.createElement("div"); editor.dataset.profileEditor = "1";
             editor.style.cssText = "display:grid;grid-template-columns:110px minmax(0,1fr);gap:5px;align-items:center;font-size:10px;";
             const addField = (label, value = "") => {
@@ -1475,8 +1362,7 @@ export function mountPromptManagementPanel(host) {
                 // active id would silently lock a fork made under, say, Visual +
                 // Speech + Sound to that one template forever; a fork of a
                 // MiniMax format must still stay bound to its own template.
-                const sourceTemplates = (host._promptContextCatalog
-                    ?.profile_templates || {})[selectedKey]
+                const sourceTemplates = descriptor.compatible_templates
                     || (Array.isArray(selected.compatible_templates)
                         ? selected.compatible_templates : null)
                     || [String(selected.template_id || "standard")];
@@ -1487,24 +1373,27 @@ export function mountPromptManagementPanel(host) {
                     : { template_id: String(sourceTemplates[0] || "standard"),
                         ...(sourceTemplates.length > 1
                             ? { compatible_templates: [...sourceTemplates] } : {}) };
-                const nextProfile = { profile_id: profileId, version: version.value.trim(),
-                    name: name.value.trim() || profileId, ...forkBinding,
+                const definition = { ...forkBinding,
                     capabilities, writing_aids: structuredClone(writingAids),
                     separators: structuredClone(selected.separators || { attachment: " ", line: "\n" }),
                     validators, role_catalogs };
                 const collision = (host._promptContextProfiles || []).find(
-                    (value) => value.profile_id === nextProfile.profile_id
-                        && String(value.version) === String(nextProfile.version));
+                    (value) => value.profile_id === profileId
+                        && String(value.version) === String(version.value.trim()));
                 if (collision) {
                     notifyWarning("That prompt format version already exists. Choose a new version or stable ID.",
                         { source: "prompt-profile-immutable" });
                     return;
                 }
                 try {
-                    await host._savePromptContextProfiles?.([
-                        ...(host._promptContextProfiles || []), nextProfile]);
+                    await host._createPromptContextProfile?.({
+                        profile_id: profileId,
+                        version: version.value.trim(),
+                        name: name.value.trim() || profileId,
+                        definition,
+                    });
                     await commit([{ type: "update_scene_fields", fields: {
-                        prompt_context_profile_id: `${nextProfile.profile_id}@${nextProfile.version}`,
+                        prompt_context_profile_id: `${profileId}@${version.value.trim()}`,
                     } }], "select custom prompt profile");
                 } catch (error) {
                     notifyWarning(error?.message || "Custom profile was rejected.",
@@ -1840,38 +1729,18 @@ export function mountPromptManagementPanel(host) {
         } else if (templateId === "minimax_h3_ref") {
             const recipes = Array.isArray(scene.reference_lane_recipes)
                 ? structuredClone(scene.reference_lane_recipes) : [];
-            const definitions = [
-                { id: "sonder:minimax_h3_picture", name: "MiniMax H3 Pictures", kind: "image",
-                    label: "Picture", setupKey: "picture_lane_ids",
-                    hard: { assembly: "slots", max_members: 9, output_size: "native", short_edge_max: 2048, size_multiple: 32,
-                        size_rounding: "floor",
-                        live_outputs: ["image_slots", "reference_prompt", "reference_names"] },
-                    soft: { suggested_tags: ["sonder:h3_identity", "sonder:h3_environment", "sonder:h3_style", "sonder:h3_motion"],
-                        compatible_profiles: ["minimax_h3_ref@1"], physical_population: "pictures",
-                        exposed_capabilities: ["definitions", "retention", "mentions"],
-                        role_fields: ["role", "visual_intent"] } },
-                { id: "sonder:minimax_h3_video", name: "MiniMax H3 Videos (IMAGE sequences)", kind: "image",
-                    label: "Video", setupKey: "video_lane_ids",
-                    hard: { assembly: "slots", max_members: 3, output_size: "native",
-                        short_edge_max: 2048, size_multiple: 32, size_rounding: "floor",
-                        frame_rate: 24, frame_rate_source: "custom",
-                        frame_count_snap: "floor_grid", minimum_frames: 5,
-                        frame_step: 17, frame_offset: 5,
-                        live_outputs: ["image_slots", "reference_prompt", "reference_names"] },
-                    soft: { suggested_tags: ["sonder:h3_edit", "sonder:h3_continuation", "sonder:h3_temporal_structure"],
-                        recommended_duration_min_sec: 2, recommended_duration_max_sec: 15,
-                        compatible_profiles: ["minimax_h3_ref@1"], physical_population: "videos",
-                        exposed_capabilities: ["definitions", "retention", "mentions", "audio_relationship"],
-                        role_fields: ["role", "visual_intent", "audio_intent"] } },
-                { id: "sonder:minimax_h3_audio", name: "MiniMax H3 Standalone Audio", kind: "audio",
-                    label: "Audio", setupKey: "audio_lane_ids",
-                    hard: { assembly: "audio", max_members: 3,
-                        live_outputs: ["audio_slots", "reference_prompt", "reference_names"] },
-                    soft: { suggested_tags: ["sonder:h3_audio_copy", "sonder:h3_music_rhythm", "sonder:h3_sound_texture", "sonder:h3_audio_reference"],
-                        compatible_profiles: ["minimax_h3_ref@1"], physical_population: "standalone_audios",
-                        exposed_capabilities: ["definitions", "retention", "mentions", "audio_relationship"],
-                        role_fields: ["role", "audio_intent"] } },
+            const populationSpecs = [
+                { population: "picture", physical: "pictures", label: "Picture",
+                    setupKey: "picture_lane_ids" },
+                { population: "video", physical: "videos", label: "Video",
+                    setupKey: "video_lane_ids" },
+                { population: "audio", physical: "standalone_audios", label: "Audio",
+                    setupKey: "audio_lane_ids" },
             ];
+            const definitions = populationSpecs.map((spec) => ({ ...spec,
+                id: (host._referenceRecipePresets || []).find((preset) =>
+                    preset?.soft?.physical_population === spec.physical)?.id || "",
+            })).filter((definition) => definition.id);
             const linked = (definition) => active?.mode === "reference"
                 && recipes.some((value) => value?.recipe_id === definition.id
                     && (active[definition.setupKey] || []).map(String).includes(
@@ -1899,14 +1768,11 @@ export function mountPromptManagementPanel(host) {
                     const priorDisabled = populationButtons.map((button) => button.disabled);
                     populationButtons.forEach((button) => { button.disabled = true; });
                     try {
-                        const planned = planH3ReferencePopulation(scene, definition, {
-                            newLaneId: uid(), newSetupId: uid(),
-                        });
-                        if (planned.operations.length) {
-                            const completed = await commit(planned.operations,
-                                `add MiniMax H3 ${definition.label} Reference lane`);
-                            if (completed) return;
-                        }
+                        const completed = await commit([{
+                            type: "ensure_minimax_h3_reference_population",
+                            population: definition.population,
+                        }], `add MiniMax H3 ${definition.label} Reference lane`);
+                        if (completed) return;
                     } catch (error) {
                         notifyWarning(error?.message || "Reference population could not be planned.",
                             { source: "prompt-context-refused" });

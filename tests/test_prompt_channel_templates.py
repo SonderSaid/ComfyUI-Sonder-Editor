@@ -11,8 +11,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server import prompt_channel_templates as pct
+from server import prompt_context
 from server import prompt_payload as pp
-from server.timeline_state import GenerationJob, PromptSection, TimelineProject
+from server.timeline_state import GenerationJob, PromptSection, Scene, TimelineProject
 
 
 # --- catalog ------------------------------------------------------------------
@@ -115,7 +116,7 @@ def test_project_and_job_projections_are_deliberately_different():
 
 
 def _job_with_sections(**params):
-    job = GenerationJob()
+    job = GenerationJob(scene_id="scene-1")
     job.selection_start = 0
     job.selection_end = 360
     job.scene_prompt = ""
@@ -126,18 +127,32 @@ def _job_with_sections(**params):
         {"start_frame": 180, "end_frame": 360,
          "channels": {"integrated_multimodal_description": "it barks"}},
     ]
-    job.params = {"snapshot_version": 1, **params}
+    job.params = {"snapshot_version": 1,
+                  "prompt_context_format": "prompt_context_v1", **params}
     return job
+
+
+def _project_with_job_sections(template="minimax_h3_base"):
+    scene = Scene(scene_id="scene-1", duration_frames=360, prompt_sections=[
+        PromptSection(0, 180, channels={
+            "integrated_multimodal_description": "a dog walks",
+            "overall_soundscape": "rain"}),
+        PromptSection(180, 360, channels={
+            "integrated_multimodal_description": "it barks"}),
+    ])
+    project = TimelineProject(name="Project", scenes=[scene])
+    project.metadata = {pct.PROJECT_TEMPLATE_KEY: template,
+                        "prompt_frame_threshold": 0.0}
+    return project
 
 
 def test_queued_job_recomposes_identically_after_the_preset_changes(monkeypatch):
     import server.routes as routes
 
-    project = TimelineProject(name="Project")
-    project.metadata = {pct.PROJECT_TEMPLATE_KEY: "minimax_h3_base",
-                        "prompt_frame_threshold": 0.0}
+    project = _project_with_job_sections()
 
     job = _job_with_sections()
+    routes._freeze_new_job_channel_template(project, job)
     routes._compose_frozen_job_prompt(project, job)
     frozen_prompt = job.prompt
     # Anti-vacuity: the template must actually be doing something here.
@@ -159,11 +174,12 @@ def test_queued_job_recomposes_identically_after_the_preset_changes(monkeypatch)
 def test_new_job_freeze_carries_policy_in_the_whole_template():
     import server.routes as routes
 
-    project = TimelineProject(name="Project")
+    project = _project_with_job_sections("standard")
     project.metadata = {"prompt_channel_labels": True, "prompt_frame_threshold": 0.0}
-    job = _job_with_sections()
+    job = _job_with_sections(prompt_channel_labels=True)
+    routes._freeze_new_job_channel_template(project, job)
     routes._compose_frozen_job_prompt(project, job)
-    assert "prompt_channel_labels" not in job.params
+    assert job.params["prompt_channel_labels"] is True
     assert job.params[pct.PROJECT_TEMPLATE_KEY]["id"] == pct.DEFAULT_CHANNEL_TEMPLATE_ID
     assert job.params[pct.PROJECT_TEMPLATE_KEY]["labels"] == pct.LABELS_ALWAYS
 
@@ -215,7 +231,8 @@ def test_section_text_living_only_in_a_late_channel_still_resolves():
 
 
 def test_same_sections_compose_differently_under_each_template():
-    sections = [PromptSection(0, 120, starts_new_shot=True, channels={
+    sections = [PromptSection(0, 120, attachments=[
+        prompt_context.shot_attachment()], channels={
         "visual": "a dog walks",
         "integrated_multimodal_description": "a dog walks",
     })]
@@ -223,24 +240,25 @@ def test_same_sections_compose_differently_under_each_template():
                                      template=pct.get_channel_template("sonder"))
     minimax = pp.compose_range_prompt("", sections, 0, 120, labels_on=False,
                                       template=pct.get_channel_template("minimax_h3_base"))
-    assert sonder == "[VISUAL]: [Shot 1] a dog walks"
+    assert sonder == "[VISUAL]: a dog walks"
     # labels_on=False, yet the named-field template still emits its field name,
     # and its shot-marker channel opens the first shot.
-    assert minimax == "integrated_multimodal_description: [Shot 1] a dog walks"
+    assert minimax == "integrated_multimodal_description: a dog walks"
 
 
 def test_global_text_merges_into_the_first_emitted_field_not_ahead_of_it():
     # Interim P1 rule. Left alone the global text would print before the first
     # field name and produce a malformed named-field payload.
     template = pct.get_channel_template("minimax_h3_base")
-    sections = [PromptSection(0, 120, starts_new_shot=True, channels={
+    sections = [PromptSection(0, 120, attachments=[
+        prompt_context.shot_attachment()], channels={
         "integrated_multimodal_description": "a dog walks"})]
     composed = pp.compose_range_prompt("cinematic", sections, 0, 120,
                                        delimiter=".", template=template)
     # The global text lands ahead of [Shot 1] inside the field, which is where
     # the MiniMax full-reference guide puts the style opening.
     assert composed == (
-        "integrated_multimodal_description: cinematic. [Shot 1] a dog walks")
+        "integrated_multimodal_description: cinematic. a dog walks")
     assert not composed.startswith("cinematic")
 
 

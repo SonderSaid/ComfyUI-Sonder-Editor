@@ -8,7 +8,7 @@ from typing import Any
 
 from . import minimax_h3, prompt_context, prompt_live_context, prompt_payload
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs, pad_lane_recipes
-from .reference_resolution import REFERENCE_OUTPUT_NAMES, migrate_live_outputs
+from .reference_resolution import REFERENCE_OUTPUT_NAMES
 
 logger = logging.getLogger("sonder_editor")
 
@@ -160,9 +160,8 @@ REFERENCE_RECIPE_PRESETS = (
 )
 
 # H3's three coordinated populations are setup-owned rather than ordinary
-# interchangeable Reference recipes. Keep them in a distinct catalog so the
-# legacy eight-recipe compatibility surface remains stable while the API can
-# still present every built-in to new authoring clients.
+# interchangeable Reference recipes. Keep them in a distinct catalog so setup
+# population materialization cannot be mistaken for a generic recipe choice.
 MINIMAX_H3_REFERENCE_RECIPE_PRESETS = (
     {
         "id": "sonder:minimax_h3_picture",
@@ -456,20 +455,21 @@ def reference_recipe_field(key: str) -> dict | None:
     return next((field for field in REFERENCE_RECIPE_FIELDS if field["key"] == key), None)
 
 
-def migrate_reference_recipe(recipe) -> dict:
-    """Return one materialized/custom recipe with current hard-field vocabulary."""
+def normalize_reference_recipe_data(recipe) -> dict:
+    """Return one materialized/custom recipe without rewriting its vocabulary."""
     result = dict(recipe) if isinstance(recipe, dict) else {}
     if "hard" in result:
-        result["hard"] = migrate_live_outputs(result.get("hard"))
+        result["hard"] = (dict(result.get("hard"))
+                          if isinstance(result.get("hard"), dict) else {})
     if isinstance(result.get("soft"), dict):
         result["soft"] = dict(result["soft"])
     return result
 
 
-def migrate_reference_lane_recipe_data(value) -> dict:
-    """Migrate the wrapper shape stored on scenes and frozen jobs."""
+def normalize_reference_lane_recipe_data(value) -> dict:
+    """Normalize the wrapper shape stored on scenes and frozen jobs."""
     result = dict(value) if isinstance(value, dict) else {}
-    result["recipe"] = migrate_reference_recipe(result.get("recipe"))
+    result["recipe"] = normalize_reference_recipe_data(result.get("recipe"))
     return result
 
 
@@ -797,7 +797,7 @@ class ReferenceLaneRecipe:
         media_kind = str(data.get("media_kind", "image") or "image")
         if media_kind not in {"image", "audio", "video"}:
             media_kind = "image"
-        recipe = migrate_reference_recipe(data.get("recipe", {}))
+        recipe = normalize_reference_recipe_data(data.get("recipe", {}))
         if recipe_id in {"sonder:minimax_h3_picture", "sonder:minimax_h3_video"}:
             recipe = dict(recipe)
             hard = dict(recipe.get("hard") or {})
@@ -813,9 +813,6 @@ class ReferenceLaneRecipe:
                              "frame_offset": 5})
                 soft = dict(recipe.get("soft") or {})
                 soft["physical_population"] = "videos"
-                soft["role_fields"] = [value for value in
-                                       soft.get("role_fields", [])
-                                       if value != "paired_audio_asset_id"]
                 recipe["soft"] = soft
             recipe["hard"] = hard
         return cls(
@@ -1287,11 +1284,6 @@ class LaneConfig:
 # Scene — a composition segment (e.g., "dog eating", "bridge shot")
 # ---------------------------------------------------------------------------
 
-def _migrated_shot_timestamp(data: dict) -> bool:
-    """Read the legacy boolean mirror before attachment canonicalization."""
-    return bool(data.get("shot_timestamp", False))
-
-
 class PromptSection:
     """A prompt assigned to a range of frames within a scene.
 
@@ -1306,8 +1298,7 @@ class PromptSection:
 
     def __init__(self, start_frame: int = 0, end_frame: int = 0,
                  prompt: str = "", channels: dict | None = None,
-                 muted: bool = False, starts_new_shot: bool = False,
-                 shot_timestamp: bool = False,
+                 muted: bool = False,
                  global_channel_exceptions: list | None = None,
                  channel_docs: dict | None = None,
                  attachments: list | None = None):
@@ -1315,13 +1306,6 @@ class PromptSection:
         self.start_frame = start_frame
         self.end_frame = end_frame
         self.muted = bool(muted)
-        # Opens a new shot in the composed output. NOT inherited across a
-        # split: a split is a range operation, and inheriting would open two
-        # shots from one and shift every later [Shot N].
-        self.starts_new_shot = bool(starts_new_shot)
-        # Legacy mirror for Shot.config.timestamp. Constructor migration turns
-        # a timestamp-only input into a timed Shot before the object is exposed.
-        self.shot_timestamp = bool(shot_timestamp)
         # Scene-global channels this section does NOT inherit. An EXCEPTIONS
         # set, not an inherit map: the default is to inherit everything, so a
         # channel added to the template later is inherited without touching a
@@ -1334,30 +1318,7 @@ class PromptSection:
         self.channel_docs = prompt_context.normalize_channel_documents(
             channel_docs, mirrors, mirrors.keys())
         self.channels = prompt_context.channel_document_mirrors(self.channel_docs)
-        legacy_timestamp_ids = {
-            value["attachment_id"]
-            for value in prompt_context.normalize_attachments(attachments)
-            if (value["kind"] == "timestamp"
-                and not bool((value.get("config") or {}).get("standalone")))
-        }
-        self.attachments = prompt_context.migrate_legacy_markers(
-            attachments, self.starts_new_shot, self.shot_timestamp)
-        if legacy_timestamp_ids:
-            # Marker placement was always section-level even when the old
-            # inline picker allowed a Timestamp anchor. The canonical Shot
-            # option replaces that record, so remove its now-meaningless anchor
-            # instead of persisting a dangling document node.
-            self.channel_docs = {
-                key: prompt_context.normalize_prompt_document({
-                    "nodes": [node for node in document.get("nodes", [])
-                              if not (node.get("type") == "attachment"
-                                      and node.get("attachment_id")
-                                      in legacy_timestamp_ids)]
-                })
-                for key, document in self.channel_docs.items()
-            }
-            self._refresh_channel_mirrors()
-        self.refresh_marker_mirrors()
+        self.attachments = prompt_context.normalize_attachments(attachments)
 
     @property
     def prompt(self) -> str:
@@ -1390,27 +1351,14 @@ class PromptSection:
             documents, self.channels, keys)
         self._refresh_channel_mirrors()
 
-    def refresh_marker_mirrors(self) -> None:
-        self.attachments = prompt_context.migrate_legacy_markers(self.attachments)
-        self.starts_new_shot = any(
-            value.get("enabled", True) and value.get("kind") == "shot"
-            for value in self.attachments)
-        self.shot_timestamp = any(
-            value.get("enabled", True) and (
-                (value.get("kind") == "shot"
-                 and bool((value.get("config") or {}).get("timestamp")))
-                or (value.get("kind") == "timestamp"
-                    and bool((value.get("config") or {}).get("standalone"))))
-            for value in self.attachments)
-
     def __eq__(self, other):
         if not isinstance(other, PromptSection):
             return NotImplemented
         return (self.start_frame == other.start_frame
                 and self.end_frame == other.end_frame
-                and self.channels == other.channels
-                and self.starts_new_shot == other.starts_new_shot
-                and self.shot_timestamp == other.shot_timestamp
+                and self.channel_docs == other.channel_docs
+                and self.attachments == other.attachments
+                and self.muted == other.muted
                 and self.global_channel_exceptions == other.global_channel_exceptions)
 
     def __repr__(self):
@@ -1429,8 +1377,6 @@ class PromptSection:
             },
             "attachments": [dict(value) for value in self.attachments],
             "muted": self.muted,
-            "starts_new_shot": self.starts_new_shot,
-            "shot_timestamp": self.shot_timestamp,
             "global_channel_exceptions": list(self.global_channel_exceptions),
             # Label-free composed mirror for older readers / downgrades.
             "prompt": self.prompt,
@@ -1447,10 +1393,6 @@ class PromptSection:
             prompt=data.get("prompt", ""),
             channels=raw_channels if isinstance(raw_channels, dict) else None,
             muted=bool(data.get("muted", False)),
-            # Pre-upgrade dicts carry none of these keys; everything defaults
-            # off/empty. See the migration note below for stored `True`s.
-            starts_new_shot=bool(data.get("starts_new_shot", False)),
-            shot_timestamp=_migrated_shot_timestamp(data),
             global_channel_exceptions=data.get("global_channel_exceptions"),
             channel_docs=(data.get("channel_docs")
                           if isinstance(data.get("channel_docs"), dict) else None),
@@ -2295,7 +2237,7 @@ class GenerationJob:
             reference_lane_count=max(1, int(data.get("reference_lane_count", 1) or 1)),
             reference_lane_configs=list(data.get("reference_lane_configs", []) or []),
             reference_lane_recipes=[
-                migrate_reference_lane_recipe_data(value)
+                normalize_reference_lane_recipe_data(value)
                 for value in (data.get("reference_lane_recipes", []) or [])
                 if isinstance(value, dict)
             ],
@@ -2518,7 +2460,7 @@ class TimelineProject:
         if not isinstance(raw_reference_recipes, list):
             raw_reference_recipes = []
         project.reference_recipes = [
-            migrate_reference_recipe(recipe) for recipe in raw_reference_recipes if isinstance(recipe, dict)
+            normalize_reference_recipe_data(recipe) for recipe in raw_reference_recipes if isinstance(recipe, dict)
         ]
         raw_profiles = data.get("prompt_context_profiles", [])
         if not isinstance(raw_profiles, list):

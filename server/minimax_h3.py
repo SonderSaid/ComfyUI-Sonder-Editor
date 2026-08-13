@@ -7,6 +7,7 @@ import math
 import uuid
 
 from .reference_resolution import resolve_effective_references
+from .reference_prompt_formatter import as_plain_record
 from .reference_prompt_formatter import reference_member_labels
 
 
@@ -63,10 +64,10 @@ def normalize_setup(raw) -> dict:
 
 
 def _lane_population(recipe_wrapper) -> str:
-    wrapper = _as_dict(recipe_wrapper)
-    recipe = (_as_dict(wrapper.get("recipe"))
+    wrapper = as_plain_record(recipe_wrapper)
+    recipe = (as_plain_record(wrapper.get("recipe"))
               if wrapper.get("recipe") is not None else wrapper)
-    soft = _as_dict(recipe.get("soft"))
+    soft = as_plain_record(recipe.get("soft"))
     population = str(soft.get("physical_population") or "")
     if population:
         return population
@@ -120,7 +121,7 @@ def repair_setup_lane_bindings(setups, lane_recipes) -> tuple[list[dict], list[d
     candidates = {population: [] for population in SETUP_LANE_POPULATIONS.values()}
     all_lane_ids = set()
     for lane_index, raw_recipe in enumerate(lane_recipes or []):
-        recipe = _as_dict(raw_recipe)
+        recipe = as_plain_record(raw_recipe)
         lane_id = str(recipe.get("lane_id") or "")
         population = _lane_population(recipe)
         if lane_id:
@@ -224,24 +225,16 @@ def active_setup(scene_or_dict) -> dict | None:
     return normalized[0] if len(normalized) == 1 else None
 
 
-def _as_dict(value):
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "to_dict"):
-        return value.to_dict()
-    return {}
-
-
 def _entity_lookup(references):
     entities = {}
     members = {}
     for reference in references or []:
-        ref = _as_dict(reference)
+        ref = as_plain_record(reference)
         entity_id = str(ref.get("reference_id") or "")
         if entity_id:
             entities[entity_id] = ref
         for member in ref.get("members") or []:
-            member = _as_dict(member)
+            member = as_plain_record(member)
             member_id = str(member.get("member_id") or "")
             if member_id:
                 members[member_id] = (ref, member)
@@ -251,7 +244,7 @@ def _entity_lookup(references):
 def _asset_lookup(assets):
     result = {}
     for value in assets or []:
-        asset = _as_dict(value)
+        asset = as_plain_record(value)
         asset_id = str(asset.get("asset_id") or "")
         if asset_id:
             result[asset_id] = asset
@@ -261,7 +254,7 @@ def _asset_lookup(assets):
 def _recipe_lookup(recipes):
     result = {}
     for index, value in enumerate(recipes or []):
-        recipe = _as_dict(value)
+        recipe = as_plain_record(value)
         lane_id = str(recipe.get("lane_id") or "")
         if lane_id:
             result[lane_id] = (index, recipe)
@@ -271,7 +264,7 @@ def _recipe_lookup(recipes):
 def _member_slots(winner, lane_id, population, member_lookup, asset_lookup):
     if not winner:
         return []
-    item = _as_dict(winner.get("item"))
+    item = as_plain_record(winner.get("item"))
     item_id = str(item.get("reference_item_id") or "")
     result = []
     for member_ref in item.get("members") or []:
@@ -362,7 +355,7 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
                 "videos": [], "standalone_audios": [],
                 "presentation": []}
     ordinals = {"subjects": {}, "pictures": {}, "videos": {}, "audios": {}}
-    guide_lookup = {str(_as_dict(g).get("guide_id") or ""): _as_dict(g)
+    guide_lookup = {str(as_plain_record(g).get("guide_id") or ""): as_plain_record(g)
                     for g in guide_frames or []}
     invalid = setup_validation_errors(value)
     if invalid:
@@ -404,10 +397,10 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
                                "message": "A conditioning setup lane no longer exists."})
                 continue
             lane_index, recipe_wrapper = lane_value
-            recipe = (_as_dict(recipe_wrapper.get("recipe"))
+            recipe = (as_plain_record(recipe_wrapper.get("recipe"))
                       if recipe_wrapper.get("recipe") is not None
                       else recipe_wrapper)
-            soft = _as_dict(recipe.get("soft"))
+            soft = as_plain_record(recipe.get("soft"))
             compatible_profiles = [str(entry) for entry in
                                    soft.get("compatible_profiles", [])]
             physical_population = str(soft.get("physical_population") or "none")
@@ -516,7 +509,7 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
                       if row.get("member_id") or row.get("video_member_id")}
     units = []
     for unit in semantic_units or []:
-        unit = _as_dict(unit)
+        unit = as_plain_record(unit)
         contributions = unit.get("source_members") or []
         first = min((physical_order.get(str(value.get("member_id")), 10**9)
                      for value in contributions if isinstance(value, dict)),

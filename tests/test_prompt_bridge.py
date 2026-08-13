@@ -198,6 +198,42 @@ def test_bridge_snapshot_via_queue_job_ref_id_on_peek():
     assert payload["segment_lengths"] == "50,50"
 
 
+def test_bridge_prompt_context_v1_uses_only_complete_compiled_snapshot():
+    prompt_bridge = _import_prompt_bridge()
+    project, scene = _project_with_scene(
+        prompt="live", prompt_sections=[PromptSection(0, 100, prompt="live section")])
+    frozen_relay = {
+        "global_prompt": "frozen global",
+        "smart_prompt": "frozen section [0-100]",
+        "local_prompts": "frozen section",
+        "segment_lengths": "100",
+        "segments": [{"text": "frozen section", "start": 0, "end": 100}],
+    }
+    job = GenerationJob(
+        job_id="job-v1", scene_id="scene-1",
+        params={"snapshot_version": 1,
+                "prompt_context_format": "prompt_context_v1"},
+        compiled_prompt_context={
+            "format": "prompt_context_v1",
+            "profile": {"template_id": "standard"},
+            "window": {"start_frame": 0, "end_frame": 100},
+            "relay": frozen_relay,
+        })
+    project.generation_queue = [job]
+    project._execution_context = {
+        "scene_id": "scene-1", "context_start": 0, "context_end": 100,
+        "queue_job_ref_id": "job-v1",
+    }
+    first = prompt_bridge.build_window_relay_payload(project)
+    scene.set_global_prompt("mutated live global")
+    scene.prompt_sections = [PromptSection(0, 100, prompt="mutated live section")]
+    project.metadata["prompt_channel_template"] = "minimax_h3_base"
+    second = prompt_bridge.build_window_relay_payload(project)
+    assert first == second
+    assert second["global_prompt"] == "frozen global"
+    assert "mutated" not in second["smart_prompt"]
+
+
 def test_bridge_legacy_v1_snapshot_flat_prompt_dicts():
     prompt_bridge = _import_prompt_bridge()
     project, _scene = _project_with_scene(prompt="live")
@@ -206,8 +242,7 @@ def test_bridge_legacy_v1_snapshot_flat_prompt_dicts():
         scene_id="scene-1",
         scene_prompt="",  # pre-upgrade jobs default to empty global
         prompt_sections=[{"start_frame": 0, "end_frame": 40, "prompt": "old flat text"}],
-        params={"snapshot_version": 1, "prompt_channel_template": "sonder",
-                "prompt_channel_labels": False},
+        params={"snapshot_version": 1, "prompt_channel_labels": False},
     )
     project.generation_queue = [job]
     project._execution_context = {

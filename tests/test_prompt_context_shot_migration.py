@@ -17,45 +17,51 @@ from server.timeline_state import LaneConfig, PromptSection, Scene
 SHOT_KEY = "integrated_multimodal_description"
 
 
-def _section(start=0, end=120, text="a dog walks", **kwargs):
-    return PromptSection(start, end, channels={SHOT_KEY: text}, **kwargs)
+def _section(start=0, end=120, text="a dog walks", *, shot=False,
+             timestamp=False, attachments=None, **kwargs):
+    authored = list(attachments or [])
+    if shot:
+        authored.append(pp_context.shot_attachment(timestamp=timestamp))
+    elif timestamp:
+        authored.append(pp_context.timestamp_attachment())
+    return PromptSection(start, end, channels={SHOT_KEY: text},
+                         attachments=authored, **kwargs)
 
 
 def _compose(first, second):
     sections = [
-        _section(0, 120, starts_new_shot=first[0], shot_timestamp=first[1]),
-        _section(120, 240, text="it barks", starts_new_shot=second[0],
-                 shot_timestamp=second[1]),
+        _section(0, 120, shot=first[0], timestamp=first[1]),
+        _section(120, 240, text="it barks", shot=second[0],
+                 timestamp=second[1]),
     ]
-    return pp.compose_range_prompt(
-        "", sections, 0, 240, delimiter=".",
+    compiled = pp_context.compile_prompt_context(
+        sections=sections, window_start=0, window_end=240, delimiter=".",
         template=pct.get_channel_template("minimax_h3_base"), fps=24.0)
+    assert compiled["errors"] == []
+    return compiled["prompt"]
 
 
-def test_model_round_trip_keeps_markers_as_attachments():
-    section = _section(starts_new_shot=True, shot_timestamp=True)
+def test_model_round_trip_keeps_canonical_shot_attachment_only():
+    section = _section(shot=True, timestamp=True)
     restored = PromptSection.from_dict(section.to_dict())
-    assert restored.starts_new_shot is True
-    assert restored.shot_timestamp is True
+    assert not hasattr(restored, "starts_new_shot")
+    assert not hasattr(restored, "shot_timestamp")
     assert [item["kind"] for item in restored.attachments] == ["shot"]
     assert restored.attachments[0]["config"]["timestamp"] is True
     assert restored == section
 
 
-def test_marker_mutations_persist_one_shot_with_timestamp_option():
-    attachments = pp_context.set_marker_attachment([], "timestamp", True)
-    assert [value["kind"] for value in attachments] == ["shot"]
-    assert attachments[0]["config"]["timestamp"] is True
-
-    attachments = pp_context.set_marker_attachment(attachments, "timestamp", False)
-    assert [value["kind"] for value in attachments] == ["shot"]
-    assert attachments[0]["config"]["timestamp"] is False
-
-    attachments = pp_context.set_marker_attachment(attachments, "shot", False)
-    assert attachments == []
+def test_shot_and_standalone_time_are_explicit_canonical_attachments():
+    shot = pp_context.shot_attachment(timestamp=False)
+    timed_shot = pp_context.shot_attachment(timestamp=True)
+    standalone = pp_context.timestamp_attachment()
+    assert shot["kind"] == "shot" and shot["config"]["timestamp"] is False
+    assert timed_shot["kind"] == "shot" and timed_shot["config"]["timestamp"] is True
+    assert standalone["kind"] == "timestamp"
+    assert standalone["config"]["standalone"] is True
 
 
-def test_legacy_inline_timestamp_anchor_is_removed_during_shot_migration():
+def test_inline_standalone_time_anchor_is_preserved_without_marker_migration():
     section = PromptSection.from_dict({
         "start_frame": 0, "end_frame": 24,
         "channels": {SHOT_KEY: "before after"},
@@ -65,27 +71,33 @@ def test_legacy_inline_timestamp_anchor_is_removed_during_shot_migration():
              "attachment_id": "legacy-time"},
             {"type": "text", "node_id": "after", "text": "after"},
         ]}},
-        "attachments": [{"attachment_id": "legacy-time", "kind": "timestamp"}],
+        "attachments": [{"attachment_id": "legacy-time", "kind": "timestamp",
+                         "config": {"standalone": True}}],
     })
-    assert section.starts_new_shot is True and section.shot_timestamp is True
-    assert [value["kind"] for value in section.attachments] == ["shot"]
-    assert all(node.get("attachment_id") != "legacy-time"
+    assert [value["kind"] for value in section.attachments] == ["timestamp"]
+    assert any(node.get("attachment_id") == "legacy-time"
                for node in section.channel_docs[SHOT_KEY]["nodes"])
     assert section.channels[SHOT_KEY] == "before after"
 
 
-def test_legacy_subject_ids_are_ignored_without_conversion():
+def test_legacy_subject_ids_and_marker_booleans_are_ignored_without_conversion():
     restored = PromptSection.from_dict({
         "start_frame": 0,
         "end_frame": 120,
         "channels": {"visual": "old"},
         "subject_ids": [{"entity_id": "retired"}],
+        "starts_new_shot": True,
+        "shot_timestamp": True,
     })
     assert not hasattr(restored, "subject_ids")
-    assert "subject_ids" not in restored.to_dict()
+    assert not hasattr(restored, "starts_new_shot")
+    saved = restored.to_dict()
+    assert "subject_ids" not in saved
+    assert "starts_new_shot" not in saved and "shot_timestamp" not in saved
+    assert saved["attachments"] == []
 
 
-def test_legacy_timestamp_only_combination_canonicalizes_to_timed_shot():
+def test_shot_and_time_attachment_combinations_compile_independently():
     composed = {
         "neither": _compose((True, False), (False, False)),
         "shot": _compose((True, False), (True, False)),
@@ -94,43 +106,41 @@ def test_legacy_timestamp_only_combination_canonicalizes_to_timed_shot():
     }
     assert "walks. it barks" in composed["neither"]
     assert "[Shot 2] it barks" in composed["shot"]
-    assert "[Shot 2] At 00:05.000, it barks" in composed["time"]
+    assert "At 00:05.000, it barks" in composed["time"]
     assert "[Shot 2] At 00:05.000, it barks" in composed["both"]
-    assert composed["time"] == composed["both"]
-    assert len(set(composed.values())) == 3
+    assert len(set(composed.values())) == 4
 
 
 def test_first_section_can_stamp_zero_and_is_not_forced_to_open_shot():
     template = pct.get_channel_template("minimax_h3_base")
-    stamped = pp.compose_range_prompt(
-        "", [_section(starts_new_shot=True, shot_timestamp=True)], 0, 120,
-        template=template, fps=24.0)
+    stamped = pp_context.compile_prompt_context(
+        sections=[_section(shot=True, timestamp=True)], window_start=0,
+        window_end=120, template=template, fps=24.0)["prompt"]
     assert "[Shot 1] At 00:00.000, a dog walks" in stamped
-    unmarked = pp.compose_range_prompt(
-        "", [_section(starts_new_shot=False, shot_timestamp=False)], 0, 120,
-        template=template, fps=24.0)
+    unmarked = pp_context.compile_prompt_context(
+        sections=[_section()], window_start=0, window_end=120,
+        template=template, fps=24.0)["prompt"]
     assert "[Shot " not in unmarked
 
 
-def test_split_does_not_inherit_markers_and_clones_context():
+def test_split_keeps_markers_left_and_clones_context():
     attachment = {
         "attachment_id": "a1",
         "emission_group_id": "g1",
-        "kind": "guide",
-        "source": {"text": "guide"},
+        "kind": "custom",
+        "source": {"text": "context"},
     }
-    left = _section(0, 240, starts_new_shot=True, shot_timestamp=True,
+    left = _section(0, 240, shot=True, timestamp=True,
                     attachments=[attachment])
     scene = Scene(scene_id="scene-1", duration_frames=360)
     scene.prompt_track_config = LaneConfig()
     scene.prompt_sections = [left]
     right = routes._split_prompt_object(scene, left, 120)
-    assert left.starts_new_shot is True and left.shot_timestamp is True
-    assert right.starts_new_shot is False and right.shot_timestamp is False
-    guides = [item for item in right.attachments if item["kind"] == "guide"]
-    assert len(guides) == 1
-    assert guides[0]["attachment_id"] != "a1"
-    assert guides[0]["emission_group_id"] == "g1"
+    assert [item["kind"] for item in left.attachments] == ["custom", "shot"]
+    cloned = [item for item in right.attachments if item["kind"] == "custom"]
+    assert len(cloned) == 1
+    assert cloned[0]["attachment_id"] != "a1"
+    assert cloned[0]["emission_group_id"] == "g1"
 
 
 def test_structured_identity_checks_documents_and_attachments():

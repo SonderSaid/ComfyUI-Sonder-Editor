@@ -23,10 +23,15 @@ from server.timeline_state import (
 
 def _section(start, end, text, *, shot=False, timestamp=False,
              prompt_id=None, attachments=None, document=None):
+    authored_attachments = list(attachments or [])
+    if shot:
+        authored_attachments.insert(0, prompt_context.shot_attachment(
+            timestamp=timestamp))
+    elif timestamp:
+        authored_attachments.insert(0, prompt_context.timestamp_attachment())
     section = PromptSection(
         start_frame=start, end_frame=end, channels={"visual": text},
-        starts_new_shot=shot, shot_timestamp=timestamp,
-        attachments=attachments,
+        attachments=authored_attachments,
         channel_docs={"visual": document} if document else None,
     )
     if prompt_id:
@@ -46,32 +51,33 @@ def test_shot_timestamp_option_round_trips_and_compiles(
         shot, timestamp, prefix):
     section = _section(0, 24, "plain", shot=shot, timestamp=timestamp)
     restored = PromptSection.from_dict(section.to_dict())
-    assert restored.starts_new_shot is shot
-    assert restored.shot_timestamp is timestamp
+    marker = next((value for value in restored.attachments
+                   if value["kind"] in {"shot", "timestamp"}), None)
+    assert (marker is not None) is (shot or timestamp)
+    if marker:
+        assert marker["kind"] == ("shot" if shot else "timestamp")
     compiled = prompt_context.compile_prompt_context(
         global_channels={}, sections=[restored], window_start=0,
         window_end=24, fps=24, template="standard")
     assert compiled["prompt"] == prefix
 
 
-def test_legacy_timestamp_only_state_migrates_to_timed_shot():
+def test_removed_marker_mirrors_do_not_migrate_into_authored_state():
     restored = PromptSection.from_dict({
         "start_frame": 0, "end_frame": 24,
         "channels": {"visual": "plain"},
         "starts_new_shot": False, "shot_timestamp": True,
     })
-    assert restored.starts_new_shot is True
-    assert restored.shot_timestamp is True
-    assert [value["kind"] for value in restored.attachments] == ["shot"]
-    assert restored.attachments[0]["config"]["timestamp"] is True
+    assert restored.attachments == []
     compiled = prompt_context.compile_prompt_context(
         global_channels={}, sections=[restored], window_start=0,
         window_end=24, fps=24, template="standard")
-    assert compiled["prompt"] == "[Shot 1] At 00:00.000, plain"
+    assert compiled["prompt"] == "plain"
 
 
 def test_flat_document_edit_refuses_to_delete_inline_anchor():
-    attachment = prompt_context.normalize_attachment({"kind": "guide"})
+    attachment = prompt_context.normalize_attachment({
+        "kind": "custom", "config": {"text": "anchor"}})
     document = {"nodes": [
         {"type": "text", "node_id": "a", "text": "before "},
         {"type": "attachment", "node_id": "b",
@@ -82,7 +88,7 @@ def test_flat_document_edit_refuses_to_delete_inline_anchor():
         section.set_channels({"visual": "replacement"})
 
 
-def test_inline_guide_renders_at_document_position():
+def test_enabled_guide_is_preserved_and_blocks_as_unsupported():
     attachment = prompt_context.normalize_attachment({
         "kind": "guide", "config": {"text": "at the midpoint"}})
     document = {"nodes": [
@@ -95,8 +101,10 @@ def test_inline_guide_renders_at_document_position():
     compiled = prompt_context.compile_prompt_context(
         global_channels={}, sections=[section], window_start=0,
         window_end=10, fps=24, template="standard")
-    assert compiled["prompt"] == "Move at the midpoint slowly."
-    assert compiled["attachment_previews"][attachment["attachment_id"]] == "at the midpoint"
+    assert any(value["code"] == "unsupported_attachment_kind"
+               and value["attachment_id"] == attachment["attachment_id"]
+               for value in compiled["errors"])
+    assert section.to_dict()["attachments"][0]["kind"] == "guide"
 
 
 def _link_attachment(source_id):
@@ -321,10 +329,9 @@ def test_invalid_attachment_route_diagnostic_targets_the_chip():
     assert diagnostic["attachment_id"] == attachment["attachment_id"]
 
 
-@pytest.mark.parametrize("kind", ["guide", "custom"])
-def test_h3_picture_guidance_text_must_bind_to_active_setup_role(kind):
+def test_h3_custom_picture_guidance_text_must_bind_to_active_setup_role():
     guide = prompt_context.normalize_attachment({
-        "kind": kind, "config": {"text": "Use <Picture 1> as the pose"}})
+        "kind": "custom", "config": {"text": "Use <Picture 1> as the pose"}})
     compiled = prompt_context.compile_prompt_context(
         global_channels={}, sections=[_section(0, 10, "move", attachments=[guide])],
         window_start=0, window_end=10, fps=24, template="minimax_h3_base",
@@ -543,7 +550,10 @@ def test_server_prompt_history_freezes_custom_profile_and_subject_dependency_clo
         prompt_semantic_units=[unit])
     job = GenerationJob(
         scene_id="scene", selection_start=0, selection_end=10,
-        scene_prompt="global", params={"snapshot_version": 1},
+            scene_prompt="global", params={
+                "snapshot_version": 1,
+                "prompt_context_format": "prompt_context_v1",
+            },
         prompt_sections=[{
             "prompt_id": "section", "start_frame": 0, "end_frame": 10,
             "channels": {"visual": "scene"}, "attachments": [attachment],
@@ -644,7 +654,8 @@ def test_prompt_editor_sources_preserve_writing_state_and_prune_deleted_chips():
     assert "global_channel_exceptions" in panel
     assert "muted: writingState.blockMeta" in panel
     assert "physicalOptions" in editor
-    assert 'physical_population: "pictures"' in panel
+    assert "host._referenceRecipePresets" in panel
+    assert 'type: "ensure_minimax_h3_reference_population"' in panel
     assert "pre_context_frames: this._contextFrameValue" in widget
     assert "frame_constraint: this._getActiveFrameConstraint()" in widget
 
@@ -657,7 +668,7 @@ def test_prompt_frontend_preserves_profile_aids_dependency_history_and_split_con
         encoding="utf-8")
     chips = (root / "web" / "js" / "prompt_context_chips.js").read_text(
         encoding="utf-8")
-    assert "_promptContextCatalog?.writing_aids?.[selectedKey]" in panel
+    assert "descriptor?.fork_seed" in panel
     assert "const writingAids = structuredClone(selected.writing_aids || [])" in panel
     assert 'makeBtn("Add writing aid"' in panel and "writingAids.splice(index, 1)" in panel
     assert "prompt-profile-immutable" in panel
@@ -736,7 +747,7 @@ def test_prompt_links_export_transitive_dependency_edges_by_default():
 
 def test_prompt_link_does_not_duplicate_selected_attachment_only_source():
     guide = prompt_context.normalize_attachment({
-        "kind": "guide", "config": {"text": "GUIDE"},
+        "kind": "custom", "config": {"text": "GUIDE"},
         "link_exportable": True,
     })
     source = _section(0, 10, "", prompt_id="source", attachments=[guide],

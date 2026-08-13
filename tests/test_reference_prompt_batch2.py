@@ -46,10 +46,12 @@ def test_shared_live_compiler_is_the_scene_and_routes_authority():
     through_scene = scene.compile_for_execution(
         project, 0, 24, template=template, fps=24, labels_on=False)
 
-    assert routes._compile_live_scene_prompt_context is (
+    assert routes.compile_live_scene_prompt_context is (
         prompt_live_context.compile_live_scene_prompt_context)
-    assert routes._resolve_scene_prompt_context is (
+    assert routes.resolve_scene_prompt_context is (
         prompt_live_context.resolve_scene_prompt_context)
+    assert not hasattr(routes, "_compile_live_scene_prompt_context")
+    assert not hasattr(routes, "_resolve_scene_prompt_context")
     assert through_scene == direct
     assert scene.get_prompt_for_range(
         0, 24, project=project, template=template, fps=24,
@@ -73,13 +75,20 @@ def test_preview_only_channel_routes_are_stripped_at_both_freeze_sites(scene_pre
     job = routes.GenerationJob(
         scene_id="scene", selection_start=0, selection_end=10,
         prompt_sections=[section.to_dict()],
-        params={"snapshot_version": 1, "prompt_channel_template": "standard"})
+        params={"snapshot_version": 1,
+                "prompt_context_format": "prompt_context_v1"})
+    routes._freeze_new_job_channel_template(project, job)
     expected = prompt_context.compile_prompt_context(
         global_channels={}, sections=[section], window_start=0, window_end=10,
         fps=24, template="standard", boundary_threshold_pct=10.0)
     assert "attachment_channel_routes" in expected
     assert "attachment_capability_projections" in expected
 
+    if not scene_present:
+        with pytest.raises(routes.ProjectMutationRequestError) as refused:
+            routes._compose_frozen_job_prompt(project, job)
+        assert refused.value.code == "prompt_context_scene_missing"
+        return
     routes._compose_frozen_job_prompt(project, job)
 
     assert "attachment_channel_routes" not in job.compiled_prompt_context
@@ -119,8 +128,8 @@ def test_standalone_time_survives_round_trips_and_does_not_mint_a_shot():
 
     assert [value["kind"] for value in restored.attachments] == ["timestamp"]
     assert restored.attachments[0]["config"]["standalone"] is True
-    assert restored.starts_new_shot is False
-    assert restored.shot_timestamp is True
+    assert "starts_new_shot" not in restored.to_dict()
+    assert "shot_timestamp" not in restored.to_dict()
 
     compiled = prompt_context.compile_prompt_context(
         global_channels={}, sections=[first, restored], window_start=0,

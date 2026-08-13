@@ -50,7 +50,7 @@ def test_a_template_declaring_its_own_default_format_stays_compilable():
     project = TimelineProject(project_id="project", scenes=[scene], fps=24.0)
     project.metadata["prompt_channel_template"] = (
         prompt_channel_templates.project_template_value(template))
-    compiled = routes._compile_live_scene_prompt_context(
+    compiled = routes.compile_live_scene_prompt_context(
         project, scene, template=template, window_start=0, window_end=24, fps=24.0)
     assert [value["code"] for value in compiled["errors"]] == []
 
@@ -77,7 +77,7 @@ def test_switching_templates_releases_a_now_incompatible_scene_format():
     # picker renders a stranded selection disabled, so leaving it is a dead end.
     assert stranded.prompt_context_profile_id == ""
     assert kept.prompt_context_profile_id == "generic@1"
-    compiled = routes._compile_live_scene_prompt_context(
+    compiled = routes.compile_live_scene_prompt_context(
         project, stranded,
         template=prompt_channel_templates.get_channel_template("standard"),
         window_start=0, window_end=24, fps=24.0)
@@ -133,7 +133,9 @@ def test_catalog_publishes_custom_multi_template_compatibility():
         "writing_aids": []})]
     catalog = routes._references_payload(project)["prompt_context_catalog"]
     # The surface must not have to re-derive compatibility from `template_id`.
-    assert catalog["profile_templates"]["house@1"] == ["sonder", "standard"]
+    descriptor = next(value for value in catalog["profiles"]
+                      if value["key"] == "house@1")
+    assert descriptor["compatible_templates"] == ["sonder", "standard"]
 
 
 # M5 — a fork must inherit the SOURCE format's binding, not the active template.
@@ -148,7 +150,7 @@ def test_a_fork_inheriting_several_templates_resolves_under_each():
     project = TimelineProject(project_id="project", scenes=[scene], fps=24.0)
     project.prompt_context_profiles = [forked]
     for template_id in ("sonder", "standard"):
-        compiled = routes._compile_live_scene_prompt_context(
+        compiled = routes.compile_live_scene_prompt_context(
             project, scene,
             template=prompt_channel_templates.get_channel_template(template_id),
             window_start=0, window_end=24, fps=24.0)
@@ -249,7 +251,7 @@ def test_an_internal_value_error_is_not_reported_as_a_bad_prompt_format():
     prompt_context.compile_prompt_context = exploding
     try:
         with pytest.raises(ValueError, match="invalid literal"):
-            routes._compile_live_scene_prompt_context(
+            routes.compile_live_scene_prompt_context(
                 project, scene,
                 template=prompt_channel_templates.get_channel_template("standard"),
                 window_start=0, window_end=24, fps=24.0)
@@ -260,7 +262,7 @@ def test_an_internal_value_error_is_not_reported_as_a_bad_prompt_format():
 def test_a_profile_resolution_failure_is_still_reported_to_the_surface():
     scene = _scene_with_text("minimax_h3_ref@1")
     project = TimelineProject(project_id="project", scenes=[scene], fps=24.0)
-    compiled = routes._compile_live_scene_prompt_context(
+    compiled = routes.compile_live_scene_prompt_context(
         project, scene,
         template=prompt_channel_templates.get_channel_template("standard"),
         window_start=0, window_end=24, fps=24.0)

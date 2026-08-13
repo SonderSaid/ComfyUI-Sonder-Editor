@@ -56,15 +56,22 @@ class _Type:
 
 
 def _install_io(monkeypatch):
+    def typed(name):
+        return types.SimpleNamespace(
+            Input=lambda id=None, **kwargs: _Value(
+                id=id, socket_type=name, **kwargs),
+            Output=lambda id=None, **kwargs: _Value(
+                id=id, socket_type=name, **kwargs),
+        )
     io = types.SimpleNamespace(
         ComfyNode=_Node,
         Schema=_Schema,
-        Custom=lambda _name: _Type,
-        Int=_Type,
-        Float=_Type,
-        String=_Type,
-        Image=_Type,
-        Audio=_Type,
+        Custom=lambda name: typed(name),
+        Int=typed("INT"),
+        Float=typed("FLOAT"),
+        String=typed("STRING"),
+        Image=typed("IMAGE"),
+        Audio=typed("AUDIO"),
         NumberDisplay=types.SimpleNamespace(number="number"),
         NodeOutput=_NodeOutput,
     )
@@ -341,6 +348,10 @@ def test_selector_uses_frozen_explicit_snapshot_end_after_scene_shrinks(monkeypa
             "end_frame": 60,
             "members": [{"entity_id": "entity", "member_id": "member"}],
         }],
+        reference_input_snapshots=[
+            {"kind": "reference", "value": project.references[0].to_dict()},
+            {"kind": "asset", "value": project.assets[0].to_dict()},
+        ],
     )]
     project.scenes[0].duration_frames = 20
     project._execution_context.update({
@@ -505,8 +516,12 @@ def test_v3_schema_freezes_selector_and_homogeneous_bridge_socket_names(monkeypa
     audio = module.SonderReferenceAudioBridge.define_schema()
     prompt = module.SonderReferencePromptBridge.define_schema()
     assert selector.node_id == "SonderReferenceSelector"
+    assert selector.category == "Sonder"
     assert [value.id for value in selector.inputs] == ["project", "reference_lane_index"]
     assert [value.display_name for value in selector.outputs] == ["reference_set", "has_reference", "reference_strength"]
+    assert [value.socket_type for value in selector.inputs] == ["SONDER_PROJECT", "INT"]
+    assert [value.socket_type for value in selector.outputs] == [
+        "SONDER_REFERENCE_SET", "INT", "FLOAT"]
     assert image.node_id == "SonderReferenceImageBridge"
     assert audio.node_id == "SonderReferenceAudioBridge"
     assert prompt.node_id == "SonderReferencePromptBridge"
@@ -515,6 +530,16 @@ def test_v3_schema_freezes_selector_and_homogeneous_bridge_socket_names(monkeypa
     assert [value.id for value in prompt.outputs] == [
         "reference_prompt", "reference_names", *[f"p{index:02d}" for index in range(1, 17)],
     ]
+    assert [value.socket_type for value in image.outputs] == ["IMAGE"] * 16
+    assert [value.socket_type for value in audio.outputs] == ["AUDIO"] * 16
+    assert [value.socket_type for value in prompt.outputs] == ["STRING"] * 18
+    assert [value.id for value in image.inputs] == ["reference_set"]
+    assert [value.id for value in audio.inputs] == ["reference_set"]
+    assert [value.id for value in prompt.inputs] == ["reference_set"]
+    assert all(schema.category == "Sonder" for schema in (selector, image, audio, prompt))
+    assert all(callable(getattr(cls, "execute", None)) for cls in (
+        module.SonderReferenceSelector, module.SonderReferenceImageBridge,
+        module.SonderReferenceAudioBridge, module.SonderReferencePromptBridge))
     assert all(getattr(value, "tooltip", "") for schema in (image, audio, prompt) for value in schema.outputs)
     assert all(getattr(value, "tooltip", "") for value in selector.outputs)
 

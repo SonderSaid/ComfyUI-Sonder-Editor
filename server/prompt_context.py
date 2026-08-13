@@ -28,10 +28,11 @@ MAX_ATTACHMENTS_PER_SCENE = 512
 MAX_ATTACHMENT_OUTPUT = 16 * 1024
 MAX_COMPILED_PROMPT = 256 * 1024
 
-ATTACHMENT_KINDS = {
-    "shot", "timestamp", "prompt_link", "reference", "guide",
+SUPPORTED_ATTACHMENT_KINDS = {
+    "shot", "timestamp", "prompt_link", "reference",
     "vocal_event", "custom",
 }
+MAX_ATTACHMENT_KIND = 64
 PLACEMENT_PHASES = (
     "document_preamble", "channel_prefix", "global_document",
     "section_prefix", "inline", "section_suffix", "channel_suffix",
@@ -105,14 +106,6 @@ MINIMAX_H3_ROLE_CATALOGS = {
         {"value": "sound_texture", "label": "Sound texture"},
     ],
 }
-REFERENCE_ROLE_ALIASES = {
-    "edit": "video_editing", "editing": "video_editing",
-    "video_edit": "video_editing", "continue": "video_continuation",
-    "continuation": "video_continuation", "copy": "audio_reuse",
-    "reference": "audio_reference",
-}
-
-
 def _normalized_role_catalog(raw) -> dict:
     result = {}
     if not isinstance(raw, dict) or len(raw) > 16:
@@ -174,7 +167,7 @@ def normalize_reference_role(role, recipe, *, profiles=None,
         profile_ids, population, profiles=profiles,
         active_profile=active_profile)
     if not catalog:
-        # Deserialization may preserve an unknown legacy role before its project
+        # Deserialization preserves an unknown saved role before its project
         # profile is available.  A project mutation receives `profiles` (even
         # when empty) and must instead refuse authoring a value with no catalog.
         if profiles is not None:
@@ -182,7 +175,6 @@ def normalize_reference_role(role, recipe, *, profiles=None,
         if len(role) > 128:
             raise ValueError("Reference role is too long")
         return role
-    role = REFERENCE_ROLE_ALIASES.get(role.lower().replace("-", "_"), role)
     if role not in {entry["value"] for entry in catalog}:
         raise ValueError(f"Unsupported Reference role: {role}")
     return role
@@ -399,9 +391,9 @@ def normalize_capability(raw, *, index=0) -> dict:
 def normalize_attachment(raw) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     attachment_id = str(raw.get("attachment_id") or "").strip() or _new_id()
-    kind = str(raw.get("kind") or "custom")
-    if kind not in ATTACHMENT_KINDS:
-        kind = "custom"
+    kind = str(raw.get("kind") or "custom").strip() or "custom"
+    if len(kind) > MAX_ATTACHMENT_KIND:
+        kind = kind[:MAX_ATTACHMENT_KIND]
     # Over-cap declarations are preserved, never sliced: deserialization must
     # not silently discard authored data, and `attachment_limit_errors` reports
     # the overflow where a controlled validation error can be returned.
@@ -481,60 +473,6 @@ def timestamp_attachment(*, attachment_id=None) -> dict:
     return normalize_attachment({"attachment_id": attachment_id,
                                  "kind": "timestamp",
                                  "config": {"standalone": True}})
-
-
-def migrate_legacy_markers(attachments, starts_new_shot=False,
-                           shot_timestamp=False) -> list:
-    """Canonicalize legacy Shot/Timestamp state to one Shot attachment."""
-    normalized = normalize_attachments(attachments)
-    has_standalone_time = any(
-        value["enabled"] and value["kind"] == "timestamp"
-        and bool((value.get("config") or {}).get("standalone"))
-        for value in normalized)
-    legacy_time = (bool(shot_timestamp) and not has_standalone_time) or any(
-        value["enabled"] and value["kind"] == "timestamp"
-        and not bool((value.get("config") or {}).get("standalone"))
-        for value in normalized)
-    shots = [value for value in normalized if value["kind"] == "shot"]
-    enabled_shot = next((value for value in shots if value["enabled"]), None)
-    wants_shot = bool(starts_new_shot) or enabled_shot is not None or legacy_time
-    if wants_shot and enabled_shot is None:
-        enabled_shot = shot_attachment(timestamp=legacy_time)
-        normalized.append(enabled_shot)
-    if enabled_shot is not None:
-        config = dict(enabled_shot.get("config") or {})
-        config["timestamp"] = bool(config.get("timestamp")) or legacy_time
-        enabled_shot["config"] = config
-    # Only legacy Timestamp records fold into Shot. Explicit standalone Time
-    # markers remain independently authored section-scope attachments.
-    return [value for value in normalized
-            if value["kind"] != "timestamp"
-            or bool((value.get("config") or {}).get("standalone"))]
-
-
-def set_marker_attachment(attachments, kind, enabled) -> list:
-    """Toggle Shot or its timestamp option through attachment authority."""
-    if kind not in {"shot", "timestamp"}:
-        raise ValueError("invalid_marker_kind")
-    normalized = migrate_legacy_markers(attachments)
-    shots = [value for value in normalized
-             if value["kind"] == "shot" and value["enabled"]]
-    if kind == "shot":
-        if enabled and not shots:
-            normalized.append(shot_attachment())
-        elif not enabled:
-            normalized = [value for value in normalized
-                          if value["kind"] != "shot"]
-        return normalized
-    if enabled and not shots:
-        shot = shot_attachment(timestamp=True)
-        normalized.append(shot)
-        shots = [shot]
-    for shot in shots:
-        config = dict(shot.get("config") or {})
-        config["timestamp"] = bool(enabled)
-        shot["config"] = config
-    return normalized
 
 
 def clone_for_split(channel_documents, attachments) -> tuple[dict, list]:
@@ -666,7 +604,6 @@ BUILTIN_PROFILES = {
             "shot": {"placement": "section_prefix"},
             "timestamp": {"placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
-            "guide": {"placement": "inline"},
             "reference": {"placement": "inline"},
             "vocal_event": {"placement": "inline"},
         }, writing_aids=_GENERIC_AIDS),
@@ -678,8 +615,6 @@ BUILTIN_PROFILES = {
             "timestamp": {"channel_key": "integrated_multimodal_description",
                           "placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
-            "guide": {"channel_key": "integrated_multimodal_description",
-                      "placement": "inline"},
             "vocal_event": {"channel_key": "integrated_multimodal_description",
                             "placement": "inline"},
         }, writing_aids=_MINIMAX_AIDS,
@@ -692,7 +627,6 @@ BUILTIN_PROFILES = {
             "timestamp": {"channel_key": "detailed_description",
                           "placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
-            "guide": {"channel_key": "detailed_description", "placement": "inline"},
             "reference": {
                 "routes": {"definitions": "subject_definitions",
                            "summary": "summary", "retention": "retention_analysis",
@@ -704,6 +638,29 @@ BUILTIN_PROFILES = {
         validators=["minimax_reference_setup", "managed_speakers"],
         role_catalogs=MINIMAX_H3_ROLE_CATALOGS),
 }
+
+PROFILE_DEFINITION_FIELDS = (
+    "template_id", "compatible_templates", "capabilities", "writing_aids",
+    "separators", "validators", "role_catalogs",
+)
+PROFILE_RESERVED_DEFINITION_FIELDS = {
+    "profile_id", "version", "name", "builtin", "content_hash", "fork_seed",
+}
+
+
+def profile_fork_seed(profile) -> dict:
+    """Return only the editable definition owned by a profile fork.
+
+    Identity and server-derived fields are deliberately excluded.  This is the
+    sole profile definition published to authoring clients, so a built-in can be
+    forked without teaching the browser a second canonical profile registry.
+    """
+    source = profile if isinstance(profile, dict) else {}
+    return {
+        key: copy.deepcopy(source[key])
+        for key in PROFILE_DEFINITION_FIELDS
+        if key in source
+    }
 
 TEMPLATE_DEFAULT_PROFILES = {
     "standard": "generic@1", "sonder": "generic@1",
@@ -761,7 +718,7 @@ def normalize_profile(raw, *, builtin=False) -> dict:
         if not isinstance(separator_value, str) or len(separator_value) > 16:
             raise ValueError("invalid_profile_separator")
     for capability_kind, declaration in capabilities.items():
-        if str(capability_kind) not in ATTACHMENT_KINDS:
+        if str(capability_kind) not in SUPPORTED_ATTACHMENT_KINDS:
             raise ValueError("unknown_profile_capability_kind")
         # A non-object declaration reaches `.get` in routing/default-capability
         # resolution.  Refuse it here rather than crashing compilation.
@@ -866,7 +823,7 @@ def normalize_profile(raw, *, builtin=False) -> dict:
             normalized_validator["limit"] = limit
         if kind == "require_attachment_kind":
             attachment_kind = str(validator.get("attachment_kind") or "")
-            if attachment_kind not in ATTACHMENT_KINDS:
+            if attachment_kind not in SUPPORTED_ATTACHMENT_KINDS:
                 raise ValueError("profile_validator_attachment_kind_invalid")
             normalized_validator["attachment_kind"] = attachment_kind
         validators.append(normalized_validator)
@@ -1087,20 +1044,18 @@ def _minimax_task_types(context, configured=()):
             found.add("reference generation")
     for row in manifest.get("videos") or []:
         role = str(row.get("role") or "").strip().lower().replace("-", "_")
-        if role in {"edit", "editing", "video_edit", "video_editing"}:
+        if role == "video_editing":
             found.add("video editing")
-        elif role in {"continue", "continuation", "video_continuation"}:
+        elif role == "video_continuation":
             found.add("video continuation")
         elif role in {"temporal_structure", "motion", "camera", "rhythm",
                       "reference_generation"}:
             found.add("reference generation")
     for row in manifest.get("standalone_audios") or []:
         role = str(row.get("role") or "").strip().lower()
-        if role in {"copy", "copy_full", "copy_partial", "audio_reuse",
-                    "fully_copy", "partially_copy"}:
+        if role == "audio_reuse":
             found.add("audio reuse")
-        elif role in {"reference", "reference_characteristics", "reference_loosely",
-                      "audio_reference", "timbre", "rhythm", "sound_texture"}:
+        elif role in {"audio_reference", "timbre", "rhythm", "sound_texture"}:
             found.add("audio reference")
     return [value for value in MINIMAX_TASK_TYPES if value in found]
 
@@ -1143,14 +1098,7 @@ def _render_reference_capability(attachment, capability, context):
         prefix = f"[{' + '.join(task_types)}] " if task_types else ""
         return f"{prefix}{str(config.get('summary') or '').strip()}".strip()
     if kind == "audio_relationship":
-        # The chip editor owns this under its capability's own key. `text` is a
-        # compatibility fallback ONLY for documents authored before that key
-        # existed: the same attachment's `text` also holds the Mention prose, so
-        # an empty-but-present audio_relationship must render empty rather than
-        # duplicating the mention into the summary channel.
-        if "audio_relationship" in config:
-            return str(config.get("audio_relationship") or "").strip()
-        return str(config.get("text") or "").strip()
+        return str(config.get("audio_relationship") or "").strip()
     return str(config.get("text") or "").strip()
 
 
@@ -1183,12 +1131,6 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                 else:
                     joined_labels = ", ".join(visual_labels[:-1]) + f", and {visual_labels[-1]}"
                 source = f" from {joined_labels}"
-            else:
-                # Compatibility for frozen manifests written by the first
-                # prompt_context_v1 preview builds.
-                member_slots = context.get("unit_picture_ordinals", {}).get(str(unit_id)) or []
-                if member_slots:
-                    source = f" from <Picture {member_slots[0]}>"
             if number and definition:
                 lines.append((("subject_definition", str(unit_id)),
                               f"<Subject {number}> is {definition}{source}"))
@@ -1311,8 +1253,6 @@ def _render_generic(attachment, capability, context, speaker_numbers=None):
     config = {**attachment.get("config", {}), **capability.get("config", {})}
     if kind == "vocal_event":
         return _render_vocal_event(attachment, speaker_numbers or [])
-    if kind == "guide":
-        return str(config.get("text") or "").strip()
     if kind == "reference":
         return _render_reference_capability(attachment, capability, context)
     if kind == "custom":
@@ -1532,9 +1472,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                          if isinstance(value, dict)}
         for row in setup_manifest.get(manifest_key) or []:
             role = str(row.get("role") or "").strip()
-            canonical_role = REFERENCE_ROLE_ALIASES.get(
-                role.lower().replace("-", "_"), role)
-            if role and (not allowed_roles or canonical_role not in allowed_roles):
+            if role and (not allowed_roles or role not in allowed_roles):
                 errors.append({
                     "code": "unsupported_reference_role",
                     "member_id": str(row.get("member_id") or ""),
@@ -1572,15 +1510,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "channels": getattr(raw, "channels", {}),
                 "channel_docs": getattr(raw, "channel_docs", {}),
                 "attachments": getattr(raw, "attachments", []),
-                "starts_new_shot": getattr(raw, "starts_new_shot", False),
-                "shot_timestamp": getattr(raw, "shot_timestamp", False),
                 "global_channel_exceptions": getattr(raw, "global_channel_exceptions", []),
             }
         if not str(value.get("prompt_id") or ""):
             value["prompt_id"] = f"__compile_section_{raw_index}"
-        value["attachments"] = migrate_legacy_markers(
-            value.get("attachments"), value.get("starts_new_shot"),
-            value.get("shot_timestamp"))
+        value["attachments"] = normalize_attachments(value.get("attachments"))
         value["channel_docs"] = normalize_channel_documents(
             value.get("channel_docs"), value.get("channels"), keys)
         scene_attachments.extend(value["attachments"])
@@ -1606,7 +1540,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             "end_frame": section.get("end_frame", 0),
             "muted": bool(section.get("muted", False)),
             "channels": mirrors,
-            "starts_new_shot": False, "shot_timestamp": False,
+            "_opens_shot": False, "_shot_timestamp": False,
             "global_channel_exceptions": section.get(
                 "global_channel_exceptions", []),
         })
@@ -1624,6 +1558,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     all_attachments = list(global_attachment_values)
     for value in selected_sections:
         all_attachments.extend(value["attachments"])
+    for attachment in all_attachments:
+        if not attachment.get("enabled", True):
+            continue
+        kind = str(attachment.get("kind") or "")
+        if kind not in SUPPORTED_ATTACHMENT_KINDS:
+            errors.append({
+                "code": "unsupported_attachment_kind",
+                "attachment_id": attachment.get("attachment_id", ""),
+                "kind": kind,
+                "message": f"Unsupported Context attachment kind: {kind}",
+            })
+        elif (kind == "timestamp"
+              and not bool((attachment.get("config") or {}).get("standalone"))):
+            errors.append({
+                "code": "invalid_timestamp_attachment",
+                "attachment_id": attachment.get("attachment_id", ""),
+                "message": "A standalone Time attachment must declare config.standalone.",
+            })
 
     def warn_authored_prompt_tokens(origin, documents):
         for channel_key, document in (documents or {}).items():
@@ -1886,7 +1838,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         for value in (context.get("setup_manifest", {}).get("guides") or [])}
         for attachment in all_attachments:
             if (not attachment["enabled"]
-                    or attachment["kind"] not in {"guide", "custom"}):
+                    or attachment["kind"] != "custom"):
                 continue
             config = attachment.get("config") or {}
             role = str(config.get("setup_role") or "")
@@ -2410,8 +2362,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             "end_frame": section.get("end_frame", 0),
             "muted": bool(section.get("muted", False)),
             "channels": mirrors,
-            "starts_new_shot": shot,
-            "shot_timestamp": timestamp,
+            "_opens_shot": shot,
+            "_shot_timestamp": timestamp,
             "global_channel_exceptions": section.get("global_channel_exceptions", []),
         })
 
@@ -2536,7 +2488,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             duration = max(0.0, (float(window_end) - float(window_start)) / float(fps))
         except (TypeError, ValueError, ZeroDivisionError):
             duration = 0.0
-        shot_count = sum(1 for value in segments if value.get("starts_new_shot"))
+        shot_count = sum(1 for value in segments if value.get("_opens_shot"))
         final_shot = max(1, shot_count)
         instruction = ""
         if task_mode in {"I2VA", "FL2VA", "L2VA"} and shot_count == 0:

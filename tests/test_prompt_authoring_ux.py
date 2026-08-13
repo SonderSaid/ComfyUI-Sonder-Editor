@@ -63,8 +63,8 @@ def test_linked_edits_use_exact_identity_snapshots_in_one_noncoalesced_batch():
     method = _method(widget, "_updateLinkedPromptAttachment", "_deletePromptSection")
     for identity_field in (
         "prompt_id", "start_frame", "end_frame", "prompt", "muted",
-        "channels", "channel_docs", "attachments", "starts_new_shot",
-        "shot_timestamp", "global_channel_exceptions",
+        "channels", "channel_docs", "attachments",
+        "global_channel_exceptions",
     ):
         assert identity_field in method
     assert 'type: "update_prompt_section"' in method

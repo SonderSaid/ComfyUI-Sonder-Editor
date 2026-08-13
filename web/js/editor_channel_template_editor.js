@@ -285,28 +285,37 @@ export function mountChannelTemplateEditor(host, { template = null, mode = "edit
         nameRow.append(nameCol, descCol);
         body.appendChild(nameRow);
 
-        const profileOptions = [
-            { profile_id: "generic@1", name: "Generic" },
-            { profile_id: "minimax_h3_base@1", name: "MiniMax H3 Base" },
-            { profile_id: "minimax_h3_ref@1", name: "MiniMax H3 Full Reference" },
-            ...(Array.isArray(host._promptContextProfiles) ? host._promptContextProfiles : [])
-                .map((value) => ({ ...value,
-                    profile_id: `${value.profile_id}@${value.version || "1"}` })),
-        ].filter((value, index, values) => value?.profile_id
-            && values.findIndex((candidate) => candidate?.profile_id === value.profile_id) === index);
+        const profileCatalog = host._promptContextCatalog;
+        const profileCatalogReady = Number(profileCatalog?.schema_version) === 1
+            && Array.isArray(profileCatalog?.profiles);
+        const profileOptions = (profileCatalogReady ? profileCatalog.profiles : [])
+            .map((value) => ({ profile_id: String(value?.key || ""),
+                name: value?.name || value?.key }))
+            .filter((value) => value.profile_id);
+        if (draft.default_context_profile
+                && !profileOptions.some((value) => value.profile_id
+                    === draft.default_context_profile)) {
+            profileOptions.push({ profile_id: draft.default_context_profile,
+                name: `${draft.default_context_profile} - unavailable from catalog` });
+        }
         const profileCol = document.createElement("div");
         profileCol.style.cssText = "display:flex;flex-direction:column;gap:2px;";
         const profileSelect = select(profileOptions.map((value) => ({
             value: value.profile_id,
             label: `${value.name || value.profile_id} (${value.profile_id})`,
         })), draft.default_context_profile || "generic@1");
-        profileSelect.disabled = isReadOnly();
+        profileSelect.disabled = isReadOnly() || !profileCatalogReady;
         profileSelect.addEventListener("change", () => {
             draft.default_context_profile = profileSelect.value || "generic@1";
         });
         profileCol.append(label("Default prompt format",
             "Scenes using this channel template inherit this prompt format unless the scene overrides it."),
         profileSelect);
+        if (!profileCatalogReady) {
+            profileCol.append(label(host._referencesError
+                ? `Prompt format catalog failed to load: ${host._referencesError}`
+                : "Loading the authoritative prompt format catalog..."));
+        }
         body.appendChild(profileCol);
 
         // ── Channels ──────────────────────────────────────────────────

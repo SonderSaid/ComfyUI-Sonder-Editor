@@ -28,7 +28,11 @@ from ..server.media_helpers import (
     resolve_source_color_interpretation,
 )
 from ..server.path_security import resolve_existing_project_path
+from ..server.frozen_reference import decode_frozen_reference_catalog
 from ..server.reference_prompt_formatter import (
+    PROJECT_SCOPED_PROMPT_TOKENS,
+    build_reference_formatter_context,
+    format_reference_prompt,
     member_prompt_fragment as _shared_member_prompt_fragment,
     reference_member_labels,
 )
@@ -79,21 +83,10 @@ def _find_queue_job(project):
 
 def _snapshot_catalog_project(project, job):
     """Return a shallow project view backed by the job's frozen References."""
-    raw = getattr(job, "reference_input_snapshots", []) or []
-    catalog_entries = [value for value in raw if isinstance(value, dict)
-                       and value.get("kind") in {"reference", "asset"}]
-    if not catalog_entries:
-        # Compatibility for jobs queued before Reference input freezing shipped.
-        return project
+    references, assets = decode_frozen_reference_catalog(job)
     frozen = copy.copy(project)
-    frozen.references = [
-        ReferenceEntity.from_dict(value.get("value") or {})
-        for value in catalog_entries if value.get("kind") == "reference"
-    ]
-    frozen.assets = [
-        Asset.from_dict(value.get("value") or {})
-        for value in catalog_entries if value.get("kind") == "asset"
-    ]
+    frozen.references = references
+    frozen.assets = assets
     return frozen
 
 
@@ -176,50 +169,6 @@ def _source(project, scene) -> dict[str, Any]:
     }
 
 
-def _staged_entity_order(project, resolved_lanes) -> list:
-    """Every staged entity id, in lane, then item, then member order.
-
-    That staging order IS the numbering rule for `<Subject N>` — plan decision
-    8. Prompt sections do not participate: semantic Context-unit bindings
-    are durable but no longer feed composition, so seeding from them would make
-    the Bridge prompt sockets depend on prompt-lane state they cannot see.
-    """
-    order = []
-    seen = set()
-    for lane_value in resolved_lanes or []:
-        item = lane_value.get("item") if isinstance(lane_value, dict) else None
-        for record in _entity_records_for(project, item):
-            entity_id = str(getattr(record["reference"], "reference_id", "") or "")
-            if entity_id and entity_id not in seen:
-                seen.add(entity_id)
-                order.append(entity_id)
-    return order
-
-
-def _entity_records_for(project, item) -> list[dict[str, Any]]:
-    """(reference, member) pairs for a staged item, tolerating broken links.
-
-    Unlike `_member_records` this never raises: the registry is metadata that
-    rides the selector fingerprint, so a missing member must not turn a lane
-    the user is not even rendering into an execution failure.
-    """
-    if item is None:
-        return []
-    item_dict = item.to_dict() if hasattr(item, "to_dict") else dict(item or {})
-    lookup = {
-        str(member.member_id): (reference, member)
-        for reference in (getattr(project, "references", None) or [])
-        for member in (getattr(reference, "members", None) or [])
-    }
-    records = []
-    for member_ref in item_dict.get("members", []) or []:
-        member_id = str(member_ref.get("member_id", "") or "") if isinstance(member_ref, dict) else ""
-        resolved = lookup.get(member_id)
-        if resolved is not None:
-            records.append({"reference": resolved[0], "member": resolved[1]})
-    return records
-
-
 _VOICE_TAGS = ("sonder:voice_identity",)
 
 
@@ -230,31 +179,14 @@ def build_reference_registry(project, resolved_lanes) -> dict[str, Any]:
     `<Subject 3>` with `(S1)` — speakers are a different population, not a
     renaming of subjects.
     """
-    assets = {str(asset.asset_id): asset
-              for asset in (getattr(project, "assets", None) or [])}
-    subjects = {}
-    for entity_id in _staged_entity_order(project, resolved_lanes):
-        subjects[entity_id] = len(subjects) + 1
-
-    pictures, audios, speakers = {}, {}, {}
-    for lane_value in resolved_lanes or []:
-        item = lane_value.get("item") if isinstance(lane_value, dict) else None
-        for record in _entity_records_for(project, item):
-            member = record["member"]
-            member_id = str(getattr(member, "member_id", "") or "")
-            entity_id = str(getattr(record["reference"], "reference_id", "") or "")
-            asset = assets.get(str(getattr(member, "asset_id", "") or ""))
-            is_audio = str(getattr(asset, "asset_type", "") or "") == "audio"
-            if member_id and not is_audio and member_id not in pictures:
-                pictures[member_id] = len(pictures) + 1
-            if member_id and is_audio and member_id not in audios:
-                audios[member_id] = len(audios) + 1
-            tags = [str(tag) for tag in (getattr(member, "tags", None) or [])]
-            voices = is_audio and any(tag in _VOICE_TAGS for tag in tags)
-            if voices and entity_id and entity_id not in speakers:
-                speakers[entity_id] = len(speakers) + 1
-    return {"subjects": subjects, "pictures": pictures,
-            "audios": audios, "speakers": speakers}
+    context = build_reference_formatter_context(
+        winners=resolved_lanes,
+        catalog_records=getattr(project, "references", None) or [],
+        assets=getattr(project, "assets", None) or [],
+        recipes=[],
+        setup_data={},
+    )
+    return context["registry"]
 
 
 def registry_numbers_for(registry, reference, member) -> dict:
@@ -654,9 +586,6 @@ def _grid_frame_count(hard: dict, minimum: int) -> int:
     return span if remainder == 0 else span + (step - remainder)
 
 
-PROJECT_SCOPED_PROMPT_TOKENS = ("{subject_n}", "{picture_n}", "{audio_n}", "{speaker_n}")
-
-
 def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str,
                            registry_numbers: dict | None = None,
                            member_name: str = "") -> str:
@@ -680,45 +609,27 @@ def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str,
         pattern, index, prompt, name, registry_numbers, member_name)
 
 
+def _formatted_prompts(item: dict, records: list[dict[str, Any]], recipe: dict,
+                       registry: dict | None = None) -> tuple[str, list[str]]:
+    members = [{
+        "prompt": getattr(record["member"], "prompt", ""),
+        "entity_name": getattr(record["reference"], "name", ""),
+        "member_name": getattr(record["member"], "name", ""),
+        "registry_numbers": registry_numbers_for(
+            registry, record["reference"], record["member"]),
+    } for record in records]
+    return format_reference_prompt(item=item, members=members, recipe=recipe)
+
+
 def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict,
                      registry: dict | None = None) -> str:
-    override = str(item.get("prompt_override", "") or "").strip()
-    if override:
-        return override
-    soft = recipe.get("soft", {}) if isinstance(recipe.get("soft"), dict) else {}
-    token_pattern = str(soft.get("prompt_tokens", "") or "")
-    values = []
-    for index, record in enumerate(records):
-        fragment = member_prompt_fragment(
-            token_pattern,
-            index,
-            getattr(record["member"], "prompt", ""),
-            getattr(record["reference"], "name", ""),
-            registry_numbers_for(registry, record["reference"], record["member"]),
-            getattr(record["member"], "name", ""),
-        )
-        if fragment:
-            values.append(fragment)
-    prefix = str(soft.get("prompt_prefix", "") or "").strip()
-    joined = ", ".join(values)
-    return " ".join(value for value in (prefix, joined) if value)
+    return _formatted_prompts(item, records, recipe, registry)[0]
 
 
 def _member_prompts(records: list[dict[str, Any]], recipe: dict,
                     registry: dict | None = None) -> list[str]:
     """Per-slot prompt text, one entry per staged member, for p01..p16."""
-    soft = recipe.get("soft", {}) if isinstance(recipe.get("soft"), dict) else {}
-    pattern = str(soft.get("prompt_tokens", "") or "")
-    return [
-        member_prompt_fragment(
-            pattern, index,
-            getattr(record["member"], "prompt", ""),
-            getattr(record["reference"], "name", ""),
-            registry_numbers_for(registry, record["reference"], record["member"]),
-            getattr(record["member"], "name", ""),
-        )
-        for index, record in enumerate(records)
-    ]
+    return _formatted_prompts({}, records, recipe, registry)[1]
 
 
 def _audio_output(record: dict[str, Any]) -> dict:
@@ -915,12 +826,12 @@ def decode_reference_prompts(reference_set) -> tuple:
     records = context["records"]
     ref = context["ref"]
     registry = ref.get("registry") if isinstance(ref.get("registry"), dict) else None
-    prompt = _assemble_prompt(context["item"], records, context["recipe"], registry)
+    prompt, slot_prompts = _formatted_prompts(
+        context["item"], records, context["recipe"], registry)
     names = ", ".join(reference_member_labels(
         getattr(record["reference"], "name", ""),
         getattr(record["member"], "name", ""),
     )["name"] for record in records)
-    slot_prompts = _member_prompts(records, context["recipe"], registry)
     return (
         prompt if "reference_prompt" in live else "",
         names if "reference_names" in live else "",

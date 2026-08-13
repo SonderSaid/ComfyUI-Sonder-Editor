@@ -266,6 +266,7 @@ import {
     sceneWithDraftGlobal,
     sceneWithDraftSection,
     setPromptAttachmentCapabilityEnabled,
+    PROMPT_CONTEXT_FORMAT,
 } from "./prompt_context_chips.js";
 import { resolvePromptCandidateSelection } from "./prompt_context_diagnostics.js";
 import { openContextMenu } from "./editor_context_menu.js";
@@ -1834,13 +1835,33 @@ export class EditorWidget {
         return this._promptContextProfiles;
     }
 
+    async _createPromptContextProfile(profile) {
+        if (!this.projectDir) return null;
+        const before = this._captureProjectDependencies();
+        const dirName = this._projectDirName();
+        const { payload } = await fetchProjectJson(
+            api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
+            { method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ create_prompt_context_profile: profile }) },
+            { projectId: dirName },
+        );
+        this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
+            ? payload.prompt_context_profiles : [];
+        this._pushProjectDependencyUndo("create prompt format", before);
+        await this._fetchReferences({ ignoreMutationGate: true,
+            reason: "prompt_context_profile_create", force: true });
+        return this._promptContextProfiles;
+    }
+
     _promptContextWritingAids(profileKey = "") {
         const key = String(profileKey || this.activeScene?.prompt_context_profile_id
             || this._channelTemplate?.()?.default_context_profile || "generic@1");
         const custom = (this._promptContextProfiles || []).find((value) =>
             `${value.profile_id}@${value.version || "1"}` === key);
-        return custom?.writing_aids
-            || this._promptContextCatalog?.writing_aids?.[key] || [];
+        if (custom?.writing_aids) return custom.writing_aids;
+        const descriptor = (this._promptContextCatalog?.profiles || [])
+            .find((value) => String(value?.key || "") === key);
+        return descriptor?.fork_seed?.writing_aids || [];
     }
 
     async _savePromptSemanticUnits(units) {
@@ -1926,6 +1947,7 @@ export class EditorWidget {
         this._referencesLoading = true;
         this._referencesError = "";
         this._referenceLibraryHandle?.render?.();
+        this._refreshPromptContextDependencyConsumers();
         try {
             const result = await fetchProjectJson(
                 api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}/references`),
@@ -1941,6 +1963,7 @@ export class EditorWidget {
                 this._referencesLoading = false;
                 this._referencesError = error?.message || "Failed to load references.";
                 this._referenceLibraryHandle?.render?.();
+                this._refreshPromptContextDependencyConsumers();
             }
             return null;
         }
@@ -3140,8 +3163,6 @@ export class EditorWidget {
             // timeline label composes its own template-aware text instead.
             prompt: composeSectionText(channels, false),
             muted: !!fields.muted,
-            starts_new_shot: !!fields.starts_new_shot,
-            shot_timestamp: fields.shot_timestamp === true,
             global_channel_exceptions: normalizeChannelExceptions(
                 fields.global_channel_exceptions),
         };
@@ -9680,7 +9701,7 @@ export class EditorWidget {
                 // the compiler rejects them globally, so offering them here only
                 // produced a chip that blocks the job.
                 allowedKinds: globalScope
-                    ? ["reference", "guide", "custom"]
+                    ? ["reference", "custom"]
                     : undefined,
                 onCreate: configure,
                 onInserted: async () => { await onEnter?.({ close: false }); },
@@ -9842,7 +9863,7 @@ export class EditorWidget {
                 previews,
                 attachmentLabelFor,
                 allowedKinds: globalScope
-                    ? ["reference", "guide", "custom"]
+                    ? ["reference", "custom"]
                     : (template.shot_marker_channel
                         ? ["shot", "timestamp", "reference", "custom"]
                         : ["reference", "custom"]),
@@ -11186,8 +11207,6 @@ export class EditorWidget {
                     // Carried through history entries and browser templates —
                     // dropping them here would wipe shot and subject data on
                     // every Apply.
-                    starts_new_shot: !!s.starts_new_shot,
-                    shot_timestamp: s.shot_timestamp === true,
                     global_channel_exceptions: normalizeChannelExceptions(
                         s.global_channel_exceptions),
                 };
@@ -11340,8 +11359,6 @@ export class EditorWidget {
                 channel_docs: structuredClone(s.channel_docs || {}),
                 attachments: structuredClone(s.attachments || []),
                 muted: !!s.muted,
-                starts_new_shot: !!s.starts_new_shot,
-                shot_timestamp: s.shot_timestamp === true,
                 global_channel_exceptions: normalizeChannelExceptions(
                     s.global_channel_exceptions),
             })),
@@ -11491,8 +11508,6 @@ export class EditorWidget {
                     channels: structuredClone(section.channels || {}),
                     channel_docs: structuredClone(section.channel_docs || {}),
                     attachments: structuredClone(section.attachments || []),
-                    starts_new_shot: Boolean(section.starts_new_shot),
-                    shot_timestamp: Boolean(section.shot_timestamp),
                     global_channel_exceptions: structuredClone(
                         section.global_channel_exceptions || []),
                 },
@@ -15830,8 +15845,6 @@ export class EditorWidget {
                     // Shot grouping, Context chips and the global opt-outs
                     // are model-visible, so they must ride the frozen envelope
                     // like the channels do.
-                    starts_new_shot: !!s.starts_new_shot,
-                    shot_timestamp: s.shot_timestamp === true,
                     global_channel_exceptions: normalizeChannelExceptions(
                         s.global_channel_exceptions),
                     prompt: s.prompt || "",
@@ -15948,6 +15961,7 @@ export class EditorWidget {
         }
 
         return {
+            prompt_context_format: PROMPT_CONTEXT_FORMAT,
             scene_id: range.sceneId,
             scene_name: range.sceneName,
             selection_start: clampedStart,

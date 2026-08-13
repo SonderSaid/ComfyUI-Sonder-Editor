@@ -234,16 +234,16 @@ def test_panel_uses_catalog_controls_and_progressive_disclosure():
     assert '"Model input"' in panel
     assert '"Prompt parts added"' in panel
     assert '"Per-member options"' in panel
-    assert '"Reset to suggestions"' in panel
+    assert '"Reset to suggestions"' not in panel
     assert "Unsupported:" in panel
     assert 'el("details"' in panel
     assert "disclosureStorageKey" in panel and "rememberDisclosure" in panel
     assert 'block.addEventListener("toggle"' in panel
     assert 'select.dataset.sonderInvalid = "1"' in panel
     assert "Unsupported saved value:" in panel
-    assert '["pictures", "videos", "standalone_audios"]' in panel
+    assert "role_catalogs?.[population]" in panel
     assert "writeMemberAudioIntent" in panel
-    assert "role_aliases" in panel
+    assert "role_aliases" not in panel
 
 
 def test_reference_panel_keeps_details_collapsed_and_offers_inspectable_thumbnails():
@@ -258,7 +258,7 @@ def test_reference_panel_keeps_details_collapsed_and_offers_inspectable_thumbnai
     assert "width:80px; height:60px" in panel
 
 
-def test_h3_reference_population_planner_adds_only_requested_lanes():
+def _removed_client_h3_reference_population_planner_example():
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for H3 population planner coverage")
@@ -371,7 +371,8 @@ def test_h3_population_creation_serializes_snapshot_planning_and_refuses_stale_r
     assert "retryOnConflict: false" in source
     assert "const populationButtons = []" in source
     assert "populationButtons.forEach((button) => { button.disabled = true; });" in source
-    assert "const completed = await commit(planned.operations" in source
+    assert 'type: "ensure_minimax_h3_reference_population"' in source
+    assert "planH3ReferencePopulation" not in source
 
 
 # One fixture set, computed in Python and in node, compared. Not a golden file:

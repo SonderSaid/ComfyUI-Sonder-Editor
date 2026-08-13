@@ -1,7 +1,11 @@
 """Parity and freeze contracts for candidate, execution, Relay, and dormant prompt views."""
 
 from server import prompt_context
-from server.routes import _build_dormant_summary, _compose_frozen_job_prompt
+from server.routes import (
+    _build_dormant_summary,
+    _compose_frozen_job_prompt,
+    _freeze_new_job_channel_template,
+)
 from server.timeline_state import GenerationJob, PromptSection, Scene, TimelineProject
 
 
@@ -68,8 +72,10 @@ def test_queued_dormant_prompt_stays_frozen_after_authored_edit(tmp_path):
         selection_start=0,
         selection_end=24,
         prompt_sections=[section.to_dict()],
-        params={"snapshot_version": 1, "prompt_channel_template": "standard"},
+        params={"snapshot_version": 1,
+                "prompt_context_format": "prompt_context_v1"},
     )
+    _freeze_new_job_channel_template(project, job)
     _compose_frozen_job_prompt(project, job)
     frozen = job.prompt
     project.generation_queue = [job]

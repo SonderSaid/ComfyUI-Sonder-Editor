@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from server import minimax_h3, routes
+from server import minimax_h3, prompt_channel_templates, routes
 from server.reference_resolution import resolve_effective_references
 from server.timeline_state import (
     Asset,
@@ -84,7 +84,12 @@ def test_generic_queue_freezes_reference_entity_member_and_asset_catalog():
     )]
     job = GenerationJob(
         scene_id=scene.scene_id, selection_start=0, selection_end=20,
-        params={"snapshot_version": 1}, reference_lane_count=3,
+        params={
+            "snapshot_version": 1,
+            "prompt_context_format": "prompt_context_v1",
+            "prompt_channel_template": prompt_channel_templates.template_freeze_value(
+                "standard"),
+        }, reference_lane_count=3,
         reference_lane_configs=[LaneConfig(hidden=True).to_dict()],
         reference_lane_recipes=[ReferenceLaneRecipe(media_kind="audio").to_dict()],
         reference_item_snapshots=[],
@@ -600,7 +605,7 @@ console.log(JSON.stringify({json.dumps(hards)}.map(h => [...mod.referenceLiveOut
             assert "image_slots" in live and "audio_slots" not in live
 
 
-def test_legacy_live_outputs_migrate_in_all_four_stores_and_remain_writable():
+def test_retired_live_outputs_are_preserved_raw_but_not_accepted_for_authoring():
     from server.reference_resolution import REFERENCE_OUTPUT_NAMES, reference_live_outputs
     from server.timeline_state import REFERENCE_RECIPE_PRESETS
 
@@ -614,10 +619,11 @@ def test_legacy_live_outputs_migrate_in_all_four_stores_and_remain_writable():
         "reference_lane_count": 1,
         "reference_lane_recipes": [legacy_wrapper],
     })
-    assert scene.reference_lane_recipes[0].recipe["hard"]["live_outputs"] == ["image_slots"]
+    retired = ["slots", "reference_idx", "context"]
+    assert scene.reference_lane_recipes[0].recipe["hard"]["live_outputs"] == retired
 
     job = GenerationJob.from_dict({"reference_lane_recipes": [legacy_wrapper]})
-    assert job.reference_lane_recipes[0]["recipe"]["hard"]["live_outputs"] == ["image_slots"]
+    assert job.reference_lane_recipes[0]["recipe"]["hard"]["live_outputs"] == retired
 
     project = TimelineProject.from_dict({
         "project_id": "project",
@@ -626,17 +632,15 @@ def test_legacy_live_outputs_migrate_in_all_four_stores_and_remain_writable():
             "hard": {"assembly": "audio", "live_outputs": ["reference_audio"]}, "soft": {},
         }],
     })
-    assert project.reference_recipes[0]["hard"]["live_outputs"] == ["audio_slots"]
-    normalized = routes._normalize_reference_recipe_section(
-        {"assembly": "slots", "live_outputs": ["slots", "reference_audio", "reference_idx"]},
-        "hard",
-    )
-    assert normalized["live_outputs"] == ["image_slots", "audio_slots"]
-
-    # A retired-only declaration fails open instead of becoming "drives nothing".
-    empty = routes._normalize_reference_recipe_section({"live_outputs": ["reference_idx", "context"]}, "hard")
-    assert "live_outputs" not in empty
-    assert reference_live_outputs(empty) == set(REFERENCE_OUTPUT_NAMES)
+    assert project.reference_recipes[0]["hard"]["live_outputs"] == ["reference_audio"]
+    with pytest.raises(routes.ProjectMutationRequestError) as exc:
+        routes._normalize_reference_recipe_section(
+            {"assembly": "slots",
+             "live_outputs": ["slots", "reference_audio", "reference_idx"]},
+            "hard",
+        )
+    assert exc.value.code == "invalid_reference_recipe"
+    assert reference_live_outputs({"live_outputs": retired}) == set()
 
     # The shipped catalog is the fourth store and must already be canonical.
     assert all(
@@ -829,6 +833,8 @@ def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monke
         compiled_prompt_context={"window": {"start_frame": 0, "end_frame": 20}},
         reference_input_snapshots=[{
             "kind": "reference", "value": references[0].to_dict(),
+        }, {
+            "kind": "asset", "value": assets[0].to_dict(),
         }],
         minimax_h3_setup_snapshot={"videos": [{
             "lane_id": "video-lane", "member_id": "early-member",

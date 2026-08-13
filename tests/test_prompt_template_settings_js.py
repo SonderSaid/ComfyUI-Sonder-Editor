@@ -94,8 +94,8 @@ def _minimax_template():
                 "start_frame": 0,
                 "end_frame": 96,
                 "channels": {key: f"{key} text" for key in MINIMAX_KEYS},
-                "starts_new_shot": True,
-                "shot_timestamp": False,
+                "attachments": [{"attachment_id": "shot-1", "kind": "shot",
+                                 "config": {"timestamp": False}}],
                 "subject_ids": [
                     {"entity_id": "ref-a", "retention": "fully_preserved"},
                     {"entity_id": "ref-b", "retention": "partially_preserved"},
@@ -105,16 +105,16 @@ def _minimax_template():
                 "start_frame": 96,
                 "end_frame": 192,
                 "channels": {key: f"{key} two" for key in MINIMAX_KEYS},
-                "starts_new_shot": False,
-                "shot_timestamp": True,
+                "attachments": [{"attachment_id": "time-1", "kind": "timestamp",
+                                 "config": {"standalone": True}}],
                 "subject_ids": [],
             },
             {
                 "start_frame": 192,
                 "end_frame": 288,
                 "channels": {key: f"{key} three" for key in MINIMAX_KEYS},
-                "starts_new_shot": True,
-                "shot_timestamp": True,
+                "attachments": [{"attachment_id": "shot-2", "kind": "shot",
+                                 "config": {"timestamp": True}}],
                 "subject_ids": [
                     {"entity_id": "ref-c", "retention": "attribute_transfer"},
                     {"entity_id": "ref-d", "retention": "weak_reference"},
@@ -137,19 +137,21 @@ def test_six_channel_template_keeps_every_channel():
             assert section["channels"][key] == f"{key} {suffix}"
 
 
-def test_round_trip_keeps_shot_fields_and_drops_legacy_subject_ids():
+def test_round_trip_keeps_canonical_markers_and_drops_legacy_subject_ids():
     [template] = _round_trip([_minimax_template()])
     first, second, third = template["sections"]
-    assert first["starts_new_shot"] is True
-    assert first["shot_timestamp"] is False
+    assert first["attachments"][0]["kind"] == "shot"
+    assert first["attachments"][0]["config"]["timestamp"] is False
+    assert "starts_new_shot" not in first and "shot_timestamp" not in first
     # Bindings are `{entity_id, retention}` objects and must survive as such —
     # the settings normalizer used to String() each one into "[object Object]"
     # and then dedupe them all into a single entry.
     assert "subject_ids" not in first
-    assert second["starts_new_shot"] is False
-    assert second["shot_timestamp"] is True
+    assert second["attachments"][0]["kind"] == "timestamp"
+    assert second["attachments"][0]["config"]["standalone"] is True
     assert "subject_ids" not in second
-    # Authored objects survive with their own retention markers intact.
+    assert third["attachments"][0]["kind"] == "shot"
+    assert third["attachments"][0]["config"]["timestamp"] is True
     assert "subject_ids" not in third
 
 

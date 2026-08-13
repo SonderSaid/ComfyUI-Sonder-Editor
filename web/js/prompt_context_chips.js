@@ -11,10 +11,7 @@ import { openContextMenu } from "./editor_context_menu.js";
 export const PROMPT_DOCUMENT_SCHEMA = "prompt_document_v1";
 export const PROMPT_CONTEXT_FORMAT = "prompt_context_v1";
 
-const KINDS = ["shot", "timestamp", "reference", "guide", "vocal_event", "prompt_link", "custom"];
-// Guide remains a readable legacy kind. Time is authored only in section-scope
-// rows, never through the inline Context menu.
-const AUTHORING_KINDS = KINDS.filter((kind) => kind !== "guide");
+const AUTHORING_KINDS = ["shot", "timestamp", "reference", "vocal_event", "prompt_link", "custom"];
 export const SCOPE_ONLY_KINDS = ["timestamp"];
 // A Prompt Link resolves only through an inline document anchor, and a Vocal
 // Event's document position *is* its place in the spoken order. Authored as
@@ -23,7 +20,7 @@ export const SCOPE_ONLY_KINDS = ["timestamp"];
 export const INLINE_ONLY_KINDS = ["prompt_link", "vocal_event"];
 const SCOPE_KINDS = AUTHORING_KINDS.filter((kind) => !INLINE_ONLY_KINDS.includes(kind));
 const LABELS = {
-    shot: "Shot", timestamp: "Time", reference: "Reference", guide: "Guide",
+    shot: "Shot", timestamp: "Time", reference: "Reference",
     vocal_event: "Vocal event", prompt_link: "Prompt link", custom: "Context",
 };
 const CAPABILITY_LABELS = {
@@ -42,29 +39,6 @@ const PLACEMENT_LABELS = {
     section_suffix: "Section suffix",
     channel_suffix: "Channel suffix",
 };
-const DEFAULT_WRITING_AIDS = [
-    { id: "dialogue", label: "Dialogue", text: "<d>[{language}] {text}</d>",
-        fields: { language: { type: "enum", values: [
-            "English", "Spanish", "French", "German", "Italian", "Japanese",
-            "Korean", "Chinese", "Portuguese", "Hindi",
-        ] } } },
-    { id: "voiceover", label: "Voiceover", text: "Voiceover: {text}" },
-    { id: "group_speech", label: "Group speech", text: "Group says: {text}" },
-    // Fallback catalog only — the profile's server-owned writing aids override
-    // these. It must match the Generic profile: the MiniMax <d>[Language] …</d>
-    // form needs a declared language enum, and without one `{language}` was
-    // inserted into the prompt literally.
-    { id: "singing", label: "Singing", text: "Singing: {text}" },
-    { id: "scene_transition", label: "Scene transition", text: "<scenetrans>" },
-    { id: "cutoff", label: "Cutoff", text: "<cutoff>" },
-    { id: "visible_text", label: "Visible text", text: "\"{text}\"" },
-    { id: "camera_motion", label: "Camera motion", text: "The camera {motion}.",
-        fields: { motion: { type: "enum", values: [
-            "pushes in", "pulls out", "pans left", "pans right", "tilts up",
-            "tilts down", "trucks left", "trucks right", "orbits the subject",
-            "remains static",
-        ] } } },
-];
 const DIALOGUE_LANGUAGES = ["English", "Spanish", "French", "German", "Italian",
     "Japanese", "Korean", "Chinese", "Portuguese", "Hindi"];
 
@@ -354,7 +328,7 @@ export function retargetChannelDocuments(channelDocuments, sourceKeys, targetKey
 
 export function normalizePromptAttachment(raw = {}) {
     const attachmentId = String(raw.attachment_id || "").trim() || uid();
-    const kind = KINDS.includes(raw.kind) ? raw.kind : "custom";
+    const kind = (String(raw.kind || "custom").trim() || "custom").slice(0, 64);
     return {
         attachment_id: attachmentId,
         emission_group_id: String(raw.emission_group_id || "").trim() || attachmentId,
@@ -651,10 +625,6 @@ export function attachmentReuseLabel(attachment, ctx = {}) {
         const channel = (ctx.template?.channels || []).find((value) =>
             String(value?.key || "") === channelKey);
         return `Prompt link → ${sectionLabel} · ${channel?.label || channelKey || "channel"}`;
-    }
-    if (kind === "guide") {
-        const text = String(attachment?.config?.text || "").trim().replace(/\s+/g, " ");
-        return text ? `Guide: ${text.slice(0, 40)}${text.length > 40 ? "…" : ""}` : "Guide";
     }
     if (kind === "vocal_event") {
         return `Vocal event: ${String(attachment?.config?.event_type || "speech").replaceAll("_", " ")}`;
@@ -1339,11 +1309,8 @@ function restorePromptInsertion(editor, bookmark) {
 }
 
 function promptWritingAids(writingAids) {
-    const aidById = new Map(DEFAULT_WRITING_AIDS.map((aid) => [String(aid.id), aid]));
-    for (const aid of Array.isArray(writingAids) ? writingAids : []) {
-        aidById.set(String(aid?.id || ""), aid);
-    }
-    return [...aidById.values()].filter((aid) => aid?.id);
+    return (Array.isArray(writingAids) ? writingAids : [])
+        .filter((aid) => aid?.id);
 }
 
 async function insertWritingAid(editor, bookmark, aid, onInserted) {
@@ -1569,19 +1536,6 @@ export function configurePromptAttachment(rawAttachment, {
                 ? `Resolved section time: ${resolved}`
                 : "Standalone Time resolves from this section's start/cut position at preview and execution time.";
             panel.appendChild(timeNotice);
-        } else if (attachment.kind === "guide") {
-            controls.text = textField(attachment.config.text, true);
-            panel.append(fieldRow("Guidance text", controls.text,
-                "Textual guidance only. H3 Picture guidance additionally requires an active setup Guide."));
-            if (["minimax_h3_base", "minimax_h3_ref"].includes(templateId)) {
-                controls.setupRole = selectField([
-                    ["", "Textual guidance only"],
-                    ["first", "Bound to active first-frame Guide"],
-                    ["last", "Bound to active last-frame Guide"],
-                ], attachment.config.setup_role || "");
-                panel.append(fieldRow("Physical Guide binding", controls.setupRole,
-                    "A Picture/keyframe claim is valid only when this role is assigned in the active H3 setup."));
-            }
         } else if (attachment.kind === "custom") {
             controls.text = textField(attachment.config.text, true);
             panel.append(fieldRow("Fixed text", controls.text));
@@ -2141,7 +2095,7 @@ export function configurePromptAttachment(rawAttachment, {
                 attachment.config.timestamp = controls.shotTimestamp.checked;
             } else if (attachment.kind === "timestamp") {
                 attachment.config.standalone = true;
-            } else if (attachment.kind === "guide" || attachment.kind === "custom") {
+            } else if (attachment.kind === "custom") {
                 attachment.config.text = controls.text.value;
                 if (controls.setupRole) {
                     if (controls.setupRole.value) {

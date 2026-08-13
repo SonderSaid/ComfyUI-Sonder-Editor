@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from ..server import prompt_channel_templates
+from ..server import frozen_prompt, prompt_channel_templates
 from ..server import prompt_payload
 from ..server.prompt_live_context import compile_live_scene_prompt_context
 from ..server.timeline_state import effective_scene_fps
@@ -134,9 +134,21 @@ def resolve_window_prompt_state(project):
 def build_window_relay_payload(project) -> dict:
     """Window-resolved PromptRelay payload (the bridge's testable core)."""
     queue_job = _find_ref_job(project)
+    if queue_job is not None and _snapshot_version(queue_job) > 0:
+        try:
+            frozen_format = frozen_prompt.classify_frozen_prompt(queue_job)
+        except frozen_prompt.FrozenPromptEnvelopeError as exc:
+            raise RuntimeError(f"{exc.code}: {exc}") from exc
+    else:
+        frozen_format = None
+
     frozen = (getattr(queue_job, "compiled_prompt_context", {})
-              if queue_job is not None and _snapshot_version(queue_job) > 0 else {})
-    if isinstance(frozen, dict) and frozen.get("format") == "prompt_context_v1":
+              if frozen_format == frozen_prompt.PROMPT_CONTEXT_FORMAT else {})
+    if frozen_format == frozen_prompt.PROMPT_CONTEXT_FORMAT:
+        if not isinstance(frozen, dict) or frozen.get("format") != frozen_format:
+            raise RuntimeError(
+                "invalid_frozen_prompt_context: prompt_context_v1 job has no "
+                "matching compiled prompt envelope")
         payload = dict(frozen.get("relay") or {})
         window = frozen.get("window") or {}
         profile = frozen.get("profile") or {}
@@ -147,6 +159,20 @@ def build_window_relay_payload(project) -> dict:
         payload["window_start"] = int(window.get("start_frame", 0))
         payload["window_end"] = int(window.get("end_frame", 0))
         payload["source"] = "snapshot"
+        payload.setdefault("global_prompt", "")
+        payload.setdefault("smart_prompt", "")
+        payload.setdefault("local_prompts", "")
+        payload.setdefault("segment_lengths", "")
+        payload.setdefault("segments", [])
+        return payload
+    if frozen_format == "v0.2.2":
+        _global, _sections, _labels, window_start, window_end, _source, \
+            _threshold, _template = resolve_window_prompt_state(project)
+        try:
+            payload = frozen_prompt.build_v022_relay_payload(
+                queue_job, window_start, window_end)
+        except frozen_prompt.FrozenPromptEnvelopeError as exc:
+            raise RuntimeError(f"{exc.code}: {exc}") from exc
         payload.setdefault("global_prompt", "")
         payload.setdefault("smart_prompt", "")
         payload.setdefault("local_prompts", "")

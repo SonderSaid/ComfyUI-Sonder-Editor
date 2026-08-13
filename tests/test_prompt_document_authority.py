@@ -1,6 +1,6 @@
 """Instrument the prompt document authority from edit through frozen enqueue."""
 
-from server import prompt_context
+from server import prompt_channel_templates, prompt_context
 from server.project_manager import load_project, save_project
 from server.routes import _compose_frozen_job_prompt
 from server.timeline_state import GenerationJob, PromptSection, Scene, TimelineProject
@@ -13,7 +13,12 @@ def _freeze(project, section):
         selection_end=24,
         scene_prompt="",
         prompt_sections=[section.to_dict()],
-        params={"snapshot_version": 1, "prompt_channel_template": "standard"},
+        params={
+            "snapshot_version": 1,
+            "prompt_context_format": "prompt_context_v1",
+            "prompt_channel_template": prompt_channel_templates.template_freeze_value(
+                "standard"),
+        },
     )
     _compose_frozen_job_prompt(project, job)
     return job.prompt

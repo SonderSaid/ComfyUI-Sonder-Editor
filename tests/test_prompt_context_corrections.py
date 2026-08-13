@@ -54,7 +54,7 @@ def _h3_base_project(task_mode="T2VA"):
 
 
 def _compile_base(project, scene):
-    return routes._compile_live_scene_prompt_context(
+    return routes.compile_live_scene_prompt_context(
         project, scene,
         template=prompt_channel_templates.get_channel_template("minimax_h3_base"),
         window_start=0, window_end=48, fps=24.0)
@@ -113,9 +113,9 @@ def test_unknown_h3_mode_and_task_mode_are_reported_not_coerced():
      "unknown_profile_separator"),
     ({"capabilities": {}, "separators": []}, "invalid_profile_separators"),
     ({"capabilities": {"not_a_kind": {}}}, "unknown_profile_capability_kind"),
-    ({"capabilities": {"guide": {"placement": "somewhere"}}},
+    ({"capabilities": {"custom": {"placement": "somewhere"}}},
      "invalid_capability_placement"),
-    ({"capabilities": {"guide": {"channel_key": 5}}},
+    ({"capabilities": {"custom": {"channel_key": 5}}},
      "invalid_capability_channel_key"),
     ({"capabilities": {"reference": {"routes": {"definitions": 5}}}},
      "invalid_capability_routes"),
@@ -163,7 +163,7 @@ def test_incompatible_profile_compiles_to_a_blocking_error_not_a_crash():
     scene.prompt_context_profile_id = "minimax_h3_ref@1"
     scene.prompt_sections = [_section(0, 24, "text")]
     project = TimelineProject(project_id="project", scenes=[scene], fps=24.0)
-    compiled = routes._compile_live_scene_prompt_context(
+    compiled = routes.compile_live_scene_prompt_context(
         project, scene,
         template=prompt_channel_templates.get_channel_template("standard"),
         window_start=0, window_end=24, fps=24.0)
@@ -176,8 +176,10 @@ def test_catalog_publishes_profile_template_compatibility():
     payload = routes._references_payload(TimelineProject(project_id="project"))
     catalog = payload["prompt_context_catalog"]
     assert catalog["universal_template"] == prompt_context.UNIVERSAL_PROFILE_TEMPLATE
-    assert catalog["profile_templates"]["minimax_h3_base@1"] == ["minimax_h3_base"]
-    assert catalog["profile_templates"]["generic@1"] == [
+    descriptors = {value["key"]: value for value in catalog["profiles"]}
+    assert descriptors["minimax_h3_base@1"]["compatible_templates"] == [
+        "minimax_h3_base"]
+    assert descriptors["generic@1"]["compatible_templates"] == [
         prompt_context.UNIVERSAL_PROFILE_TEMPLATE]
     assert catalog["minimax_task_types"] == list(prompt_context.MINIMAX_TASK_TYPES)
 
@@ -222,7 +224,7 @@ def test_audio_relationship_reads_the_key_the_chip_editor_writes():
         "kind": "reference", "source": {"semantic_unit_ids": ["unit"]},
         "config": {"text": "Legacy text."}})
     assert prompt_context._render_reference_capability(
-        legacy, capability, context) == "Legacy text."
+        legacy, capability, context) == ""
 
 
 # 7 — overlapping Subject selections dedupe per unit.
@@ -394,11 +396,11 @@ def test_minimax_singing_aid_uses_the_bounded_language_envelope():
     assert generic["singing"]["text"] == "Singing: {text}"
 
 
-def test_frontend_fallback_writing_aid_declares_every_substitution():
+def test_frontend_writing_aids_have_no_canonical_fallback_copy():
     chips = (ROOT / "web" / "js" / "prompt_context_chips.js").read_text(
         encoding="utf-8")
-    fallback = chips.split("const DEFAULT_WRITING_AIDS", 1)[1].split("];", 1)[0]
-    assert '{ id: "singing", label: "Singing", text: "Singing: {text}" }' in fallback
+    assert "DEFAULT_WRITING_AIDS" not in chips
+    assert "Array.isArray(writingAids) ? writingAids : []" in chips
 
 
 # 14 — silent video in an H3 audio slot.
@@ -482,6 +484,7 @@ def _history_job(task_mode, setup_id):
     return GenerationJob(
         scene_id="scene", selection_start=0, selection_end=10,
         scene_prompt="same authored text", params={
+            "prompt_context_format": "prompt_context_v1",
             "prompt_context_profile_config": {"task_mode": task_mode}},
         prompt_sections=[],
         compiled_prompt_context={"profile": prompt_context.BUILTIN_PROFILES[
@@ -1282,7 +1285,8 @@ def test_timeline_global_inline_picker_matches_structured_kinds():
     widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
     menu = widget.split("installPromptContextMenu({", 1)[1]
     assert 'allowedKinds: globalScope' in menu.split("});", 1)[0]
-    assert '["reference", "guide", "custom"]' in menu.split("});", 1)[0]
+    assert '["reference", "custom"]' in menu.split("});", 1)[0]
+    assert '"guide"' not in menu.split("});", 1)[0]
 
 
 def _run_bridge_shape_script(body):
@@ -1386,6 +1390,6 @@ def test_reference_bridge_shows_every_socket_while_liveness_is_unknown():
 def test_profile_picker_disables_incompatible_channel_templates():
     panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(
         encoding="utf-8")
-    assert "profile_templates" in panel
+    assert "catalogByKey" in panel
     assert "option.disabled = !compatible(value)" in panel
     assert "not available for this channel template" in panel

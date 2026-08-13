@@ -450,16 +450,11 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
 
     const promptContextChoices = (field) => {
         if (field.key === "compatible_profiles") {
-            const builtIns = [
-                { value: "generic@1", label: "Generic" },
-                { value: "minimax_h3_base@1", label: "MiniMax H3 Base" },
-                { value: "minimax_h3_ref@1", label: "MiniMax H3 Full Reference" },
-            ];
-            const custom = (host._promptContextProfiles || []).map((profile) => ({
-                value: `${profile.profile_id}@${profile.version || "1"}`,
-                label: profile.name || `${profile.profile_id}@${profile.version || "1"}`,
-            }));
-            return [...builtIns, ...custom];
+            if (Number(host._promptContextCatalog?.schema_version) !== 1) return [];
+            return (host._promptContextCatalog?.profiles || []).map((profile) => ({
+                value: String(profile?.key || ""),
+                label: profile?.name || String(profile?.key || ""),
+            })).filter((profile) => profile.value);
         }
         if (field.key === "exposed_capabilities") {
             const labels = {
@@ -518,31 +513,6 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             wrap.appendChild(unsupported);
         }
         return wrap;
-    };
-
-    const suggestedPromptContext = (recipe) => {
-        const media = String(recipe.media_kind || "image");
-        const current = recipe.recipe?.soft || {};
-        const h3 = (current.compatible_profiles || []).includes("minimax_h3_ref@1")
-            || ["pictures", "videos", "standalone_audios"].includes(current.physical_population);
-        if (!h3) return {
-            compatible_profiles: ["generic@1"], physical_population: "none",
-            exposed_capabilities: ["derived_prompt"], role_fields: [],
-        };
-        const declaredPopulation = String(current.physical_population || "");
-        const physical_population = ["pictures", "videos", "standalone_audios"].includes(declaredPopulation)
-            ? declaredPopulation
-            : (media === "audio" ? "standalone_audios" : "pictures");
-        return {
-            compatible_profiles: ["minimax_h3_ref@1"], physical_population,
-            exposed_capabilities: media === "image"
-                ? ["definitions", "retention", "mentions"]
-                : ["definitions", "retention", "mentions", "audio_relationship"],
-            role_fields: physical_population === "pictures" ? ["role", "visual_intent"]
-                : (physical_population === "videos"
-                    ? ["role", "visual_intent", "audio_intent"]
-                    : ["role", "audio_intent"]),
-        };
     };
 
     const fieldControl = (recipe, field, locked) => {
@@ -773,16 +743,6 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             }
             block.appendChild(summary);
             const groupBody = el("div", "", "display:flex;flex-direction:column;gap:6px;padding:0 10px 9px;");
-            if (group === "Prompt Context" && !locked) {
-                const reset = button("Reset to suggestions", "Replace Prompt Context settings with suggestions for this prompt format and media type");
-                reset.addEventListener("click", () => {
-                    const next = laneRecipe();
-                    next.recipe = next.recipe && typeof next.recipe === "object" ? next.recipe : {};
-                    next.recipe.soft = { ...(next.recipe.soft || {}), ...suggestedPromptContext(next) };
-                    void writeRecipe(next);
-                });
-                groupBody.appendChild(reset);
-            }
             for (const field of fields) {
                 const row = el("div", "", "display:flex;align-items:center;gap:10px;");
                 // Help is on hover, not permanently expanded: a visible line under
@@ -998,9 +958,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             ? (activeProfileKey === "minimax_h3_ref@1"
                 ? builtInRoleCatalog : (customProfile?.role_catalogs?.[population] || []))
             : [];
-        const roleAliases = host._promptContextCatalog?.role_aliases || {};
-        const canonicalRole = roleAliases[String(memberRef.role || "").toLowerCase().replaceAll("-", "_")]
-            || String(memberRef.role || "");
+        const canonicalRole = String(memberRef.role || "");
         if (roleFields.size) {
             row.style.flexWrap = "wrap";
             const controls = el("div", "", "display:flex;gap:4px;align-items:center;flex-wrap:wrap;width:100%;padding-left:56px;");
@@ -1257,9 +1215,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 ? builtInItemRoleCatalog : (customProfile?.role_catalogs?.[population] || []))
             : [];
         const allowedRoles = new Set(itemRoleCatalog.map((entry) => String(entry.value)));
-        const roleAliases = host._promptContextCatalog?.role_aliases || {};
-        const canonicalRole = (value) => roleAliases[String(value || "").toLowerCase().replaceAll("-", "_")]
-            || String(value || "");
+        const canonicalRole = (value) => String(value || "");
         const header = el("div", "", "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px;");
         header.appendChild(sectionTitle(`Staged items (${items.length})`));
         const add = button("+ Add item", "Stage a new item at the playhead");

@@ -257,8 +257,8 @@ def _section_entries(sections, keys=None):
                 section.get("channels"), legacy_prompt=section.get("prompt", ""),
                 keys=keys,
             )
-            starts_new_shot = bool(section.get("starts_new_shot", False))
-            shot_timestamp = bool(section.get("shot_timestamp", False))
+            opens_shot = bool(section.get("_opens_shot", False))
+            shot_timestamp = bool(section.get("_shot_timestamp", False))
             exceptions = normalize_channel_exceptions(
                 section.get("global_channel_exceptions"))
             prompt_id = str(section.get("prompt_id") or "")
@@ -273,15 +273,15 @@ def _section_entries(sections, keys=None):
             channels = normalize_channels(getattr(section, "channels", None),
                                           legacy_prompt=getattr(section, "prompt", ""),
                                           keys=keys)
-            starts_new_shot = bool(getattr(section, "starts_new_shot", False))
-            shot_timestamp = bool(getattr(section, "shot_timestamp", False))
+            opens_shot = False
+            shot_timestamp = False
             exceptions = normalize_channel_exceptions(
                 getattr(section, "global_channel_exceptions", None))
             prompt_id = str(getattr(section, "prompt_id", "") or "")
         entries.append({"start": start, "end": end, "channels": channels,
                         "prompt_id": prompt_id,
-                        "starts_new_shot": starts_new_shot,
-                        "shot_timestamp": shot_timestamp,
+                        "_opens_shot": opens_shot,
+                        "_shot_timestamp": shot_timestamp,
                         "global_channel_exceptions": exceptions})
     return entries
 
@@ -343,8 +343,8 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
         survivors.append({"start": eff_start, "text": entry["text"],
                           "channels": entry["channels"],
                           "prompt_id": entry.get("prompt_id", ""),
-                          "starts_new_shot": entry.get("starts_new_shot", False),
-                          "shot_timestamp": entry.get("shot_timestamp", False),
+                          "_opens_shot": entry.get("_opens_shot", False),
+                          "_shot_timestamp": entry.get("_shot_timestamp", False),
                           "global_channel_exceptions":
                               entry.get("global_channel_exceptions", []),
                           "authored_start": entry["start"],
@@ -367,8 +367,8 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
             "text": entry["text"],
             "channels": entry["channels"],
             "prompt_id": entry.get("prompt_id", ""),
-            "starts_new_shot": entry.get("starts_new_shot", False),
-            "shot_timestamp": entry.get("shot_timestamp", False),
+            "_opens_shot": entry.get("_opens_shot", False),
+            "_shot_timestamp": entry.get("_shot_timestamp", False),
             "global_channel_exceptions": entry.get("global_channel_exceptions", []),
             "section_start": entry["authored_start"],
             "authored_start": entry["authored_start"],
@@ -426,10 +426,10 @@ def resolve_shot_markers(segments, fps) -> list[str]:
     shot_number = 0
     for segment in segments or []:
         marker = ""
-        if bool(segment.get("starts_new_shot")):
+        if bool(segment.get("_opens_shot")):
             shot_number += 1
             marker = f"[Shot {shot_number}]"
-        if bool(segment.get("shot_timestamp")):
+        if bool(segment.get("_shot_timestamp")):
             timecode = channel_templates.format_shot_timecode(
                 segment.get("start", 0), fps)
             if timecode:
@@ -575,10 +575,10 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
             for segment in segments:
                 channels = dict(segment.get("channels") or {})
                 marker = ""
-                if bool(segment.get("starts_new_shot")):
+                if bool(segment.get("_opens_shot")):
                     shot_number += 1
                     marker = f"[Shot {shot_number}]"
-                if bool(segment.get("shot_timestamp")):
+                if bool(segment.get("_shot_timestamp")):
                     timecode = channel_templates.format_shot_timecode(
                         segment.get("start", 0), fps)
                     if timecode:

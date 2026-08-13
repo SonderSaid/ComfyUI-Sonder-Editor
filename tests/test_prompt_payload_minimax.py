@@ -27,6 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from server import prompt_context
 from server import prompt_payload as pp
 from server.timeline_state import PromptSection
 
@@ -48,8 +49,8 @@ def _template(template_id):
 
 
 def _compose(sections, window_start, window_end, template, **kwargs):
-    return pp.compose_range_prompt(
-        "", sections, window_start, window_end,
+    compiled = prompt_context.compile_prompt_context(
+        sections=sections, window_start=window_start, window_end=window_end,
         labels_on=False,          # the template owns label policy, not this flag
         delimiter=".",
         boundary_threshold_pct=0.0,
@@ -57,6 +58,8 @@ def _compose(sections, window_start, window_end, template, **kwargs):
         fps=FPS,
         **kwargs,
     )
+    assert compiled["errors"] == []
+    return compiled["prompt"]
 
 
 # --- scenario -----------------------------------------------------------------
@@ -94,13 +97,9 @@ def _scenario():
                 " along its crease",
         }),
     ]
-    # Section 1 opens shot 1 and section 2 continues it; section 3 opens shot 2
-    # and asks for its cut time. Neither flag is implied by position: a section
-    # that opens no shot emits no marker, wherever it sits.
-    for section, starts, stamps in zip(sections, (True, False, True),
-                                       (False, False, True)):
-        setattr(section, "starts_new_shot", starts)
-        setattr(section, "shot_timestamp", stamps)
+    # Shot and Time are authored only as canonical Context attachments.
+    sections[0].attachments = [prompt_context.shot_attachment()]
+    sections[2].attachments = [prompt_context.shot_attachment(timestamp=True)]
     return sections
 
 
@@ -286,7 +285,7 @@ def test_a_section_may_stamp_a_cut_time_without_opening_a_shot():
     # suddenly he takes out a gun" — one shot, two timed beats.
     template = _template("minimax_h3_ref")
     sections = _scenario()
-    setattr(sections[1], "shot_timestamp", True)
+    sections[1].attachments = [prompt_context.timestamp_attachment()]
     composed = _compose(sections, 0, 360, template)
     assert "At 00:05.000, she lifts her gaze" in composed.replace("She lifts", "she lifts")
     assert "[Shot 2] At 00:05.000," not in composed
@@ -296,8 +295,7 @@ def test_no_section_opening_a_shot_emits_no_markers():
     template = _template("minimax_h3_ref")
     sections = _scenario()
     for section in sections:
-        setattr(section, "starts_new_shot", False)
-        setattr(section, "shot_timestamp", False)
+        section.attachments = []
     body = _body(_compose(sections, 0, 360, template))
     assert body
     assert "[Shot " not in body
@@ -375,25 +373,30 @@ def test_six_channel_section_round_trips_without_truncation():
     assert restored == section
 
 
-def test_starts_new_shot_round_trips_and_legacy_subject_ids_are_dropped():
-    section = PromptSection(0, 120, channels={"detailed_description": "x"})
-    setattr(section, "starts_new_shot", True)
+def test_shot_attachment_round_trips_and_legacy_fields_are_dropped():
+    section = PromptSection(
+        0, 120, channels={"detailed_description": "x"},
+        attachments=[prompt_context.shot_attachment()])
 
     data = section.to_dict()
-    assert data["starts_new_shot"] is True
+    assert [value["kind"] for value in data["attachments"]] == ["shot"]
+    assert "starts_new_shot" not in data and "shot_timestamp" not in data
     assert "subject_ids" not in data
 
     data["subject_ids"] = [{"entity_id": "abc123", "retention": "fully_preserved"}]
+    data["starts_new_shot"] = False
     restored = PromptSection.from_dict(data)
-    assert getattr(restored, "starts_new_shot") is True
+    assert not hasattr(restored, "starts_new_shot")
+    assert [value["kind"] for value in restored.attachments] == ["shot"]
     assert not hasattr(restored, "subject_ids")
     assert "subject_ids" not in restored.to_dict()
 
 
-def test_pre_upgrade_section_dict_defaults_shot_off():
+def test_pre_attachment_section_dict_does_not_invent_a_shot():
     restored = PromptSection.from_dict({
         "start_frame": 0, "end_frame": 120,
         "channels": {"visual": "old", "speech": "", "sounds": ""},
     })
-    assert getattr(restored, "starts_new_shot") is False
+    assert not hasattr(restored, "starts_new_shot")
+    assert restored.attachments == []
     assert not hasattr(restored, "subject_ids")
