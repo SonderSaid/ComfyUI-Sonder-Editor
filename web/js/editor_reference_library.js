@@ -200,6 +200,28 @@ export function mountReferenceLibrary(container, host) {
         description.addEventListener("input", () => { draft.description = description.value; });
         descriptionLabel.appendChild(description);
         editor.appendChild(descriptionLabel);
+        const intentRow = el("div", "", "display:grid;grid-template-columns:1fr 1fr;gap:8px;");
+        const { wrap: visualIntentWrap } = fieldShell("Default visual: what to preserve",
+            "Provider-neutral default used by new Subject units and staged members; a setup or chip may override it.");
+        const visualIntent = el("select", "", css.input);
+        for (const [value, label] of [["preserve", "Preserve"], ["partial", "Partial"],
+            ["transfer_attributes", "Transfer attributes"], ["reference_loosely", "Reference loosely"]]) {
+            const option = el("option", label); option.value = value;
+            option.selected = draft.visual_intent === value; visualIntent.appendChild(option);
+        }
+        visualIntent.addEventListener("change", () => { draft.visual_intent = visualIntent.value; });
+        visualIntentWrap.appendChild(visualIntent);
+        const { wrap: audioIntentWrap } = fieldShell("Default audio: what to preserve",
+            "Provider-neutral default for copy/reference behavior; physical audio presence never chooses this role.");
+        const audioIntent = el("select", "", css.input);
+        for (const [value, label] of [["copy_full", "Copy fully"], ["copy_partial", "Copy partially"],
+            ["reference_characteristics", "Reference characteristics"], ["reference_loosely", "Reference loosely"]]) {
+            const option = el("option", label); option.value = value;
+            option.selected = draft.audio_intent === value; audioIntent.appendChild(option);
+        }
+        audioIntent.addEventListener("change", () => { draft.audio_intent = audioIntent.value; });
+        audioIntentWrap.appendChild(audioIntent);
+        intentRow.append(visualIntentWrap, audioIntentWrap); editor.appendChild(intentRow);
         const row = el("div", "", "display:flex;gap:6px;margin:3px -10px -10px;padding:9px 10px;border-top:1px solid #303a43;background:#12181d;border-radius:0 0 8px 8px;");
         const save = el("button", "Save", `${css.button}background:#476d88;border-color:#668ca7;`);
         const cancel = el("button", "Cancel", css.button);
@@ -210,7 +232,8 @@ export function mountReferenceLibrary(container, host) {
             if (reference) {
                 const fields = {};
                 const expected = {};
-                for (const key of ["name", "kind", "reference_class", "description"]) {
+                for (const key of ["name", "kind", "reference_class", "description",
+                    "visual_intent", "audio_intent"]) {
                     if (values[key] !== reference[key]) { fields[key] = values[key]; expected[key] = reference[key]; }
                 }
                 if (!Object.keys(fields).length) { state.entityDraft = null; render(); return; }
@@ -256,6 +279,13 @@ export function mountReferenceLibrary(container, host) {
         }
         editor.appendChild(mediaChooser);
         if (state.memberNotice) editor.appendChild(el("div", state.memberNotice, "color:#d5aa70;font-size:10px;line-height:1.4;"));
+        const memberName = inputField("Member name", draft.name, (value) => {
+            draft.name = value;
+        }, {
+            placeholder: asset ? assetName(asset).replace(/\.[^.]+$/, "") : "Front, voice, turnaround…",
+            help: `Combined with the Reference name for display and prompt tokens, for example “${reference.name} · Front” / “${reference.name.replace(/\s+/g, "_")}_Front”.`,
+        });
+        editor.appendChild(memberName.wrap);
         if (asset) {
             const mediaActions = el("div", "", "display:flex;gap:5px;flex-wrap:wrap;");
             const inspect = el("button", "Inspect Source", css.button);
@@ -360,7 +390,7 @@ export function mountReferenceLibrary(container, host) {
             const values = serializeMemberDraft(draft, catalog);
             if (member) {
                 const fields = {};
-                for (const key of ["asset_id", "tags", "prompt", "crop", "source_start_sec", "source_end_sec"]) {
+                for (const key of ["asset_id", "name", "tags", "prompt", "crop", "source_start_sec", "source_end_sec"]) {
                     if (JSON.stringify(values[key]) !== JSON.stringify(member[key])) fields[key] = values[key];
                 }
                 if (!Object.keys(fields).length) { state.memberDraft = null; render(); return; }
@@ -432,8 +462,30 @@ export function mountReferenceLibrary(container, host) {
                 edit.addEventListener("click", (event) => { event.stopPropagation(); state.entityDraft = createReferenceDraft(reference); render(); });
                 remove.addEventListener("click", (event) => {
                     event.stopPropagation();
-                    if (!host.confirm(`Delete “${reference.name}” and its ${reference.members?.length || 0} member(s)?`)) return;
-                    void perform([{ type: "delete_reference", reference_id: reference.reference_id, expected: { name: reference.name, kind: reference.kind, reference_class: reference.reference_class, description: reference.description || "", member_ids: (reference.members || []).map((member) => member.member_id) } }]);
+                    const unitIds = new Set((data.semanticUnits || [])
+                        .filter((unit) => (unit.source_members || []).some((value) =>
+                            value.entity_id === reference.reference_id))
+                        .map((unit) => unit.semantic_unit_id));
+                    let staged = 0; let chips = 0;
+                    for (const scene of data.scenes || []) {
+                        const itemIds = new Set((scene.reference_items || [])
+                            .filter((item) => (item.members || []).some((value) =>
+                                value.entity_id === reference.reference_id))
+                            .map((item) => item.reference_item_id));
+                        staged += itemIds.size;
+                        const attachments = [...(scene.global_attachments || []),
+                            ...(scene.prompt_sections || []).flatMap((section) =>
+                                section.attachments || [])];
+                        chips += attachments.filter((attachment) =>
+                            itemIds.has(attachment?.source?.reference_item_id)
+                            || (attachment?.source?.semantic_unit_ids || []).some((id) =>
+                                unitIds.has(id))).length;
+                    }
+                    const usage = staged || chips || unitIds.size
+                        ? `\n\nWhere used: ${staged} staged item(s), ${unitIds.size} Subject unit(s), ${chips} Context chip(s). Deletion keeps broken chips visible for repair.`
+                        : "";
+                    if (!host.confirm(`Delete “${reference.name}” and its ${reference.members?.length || 0} member(s)?${usage}`)) return;
+                    void perform([{ type: "delete_reference", reference_id: reference.reference_id, expected: { name: reference.name, kind: reference.kind, reference_class: reference.reference_class, description: reference.description || "", visual_intent: reference.visual_intent || "preserve", audio_intent: reference.audio_intent || "reference_characteristics", member_ids: (reference.members || []).map((member) => member.member_id) } }]);
                 });
                 topLine.append(edit, remove);
             }
@@ -480,6 +532,9 @@ export function mountReferenceLibrary(container, host) {
                         const info = el("div", "", "min-width:0;");
                         const status = !asset ? "Missing" : (asset.trashed || asset.trashed_at ? "Trashed" : (asset.missing ? "Missing file" : ""));
                         const nameLine = el("button", `${assetName(asset)}${status ? ` · ${status}` : ""}`, `display:block;width:100%;padding:0;border:0;background:transparent;text-align:left;font-size:10px;color:${status ? "#e2ab68" : "#d7dde2"};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;`);
+                        const composite = member.name
+                            ? `${reference.name} · ${member.name}` : reference.name;
+                        nameLine.textContent = `${composite} — ${assetName(asset)}${status ? ` · ${status}` : ""}`;
                         nameLine.type = "button";
                         nameLine.title = "Inspect Reference member";
                         const inspectMember = () => {
@@ -495,7 +550,36 @@ export function mountReferenceLibrary(container, host) {
                         const controls = el("div", "", "display:flex;gap:3px;margin-top:4px;");
                         for (const [label, handler] of [
                             ["Edit", () => { state.memberDraft = createMemberDraft(member, asset); state.memberDraft.has_audio = asset?.has_audio === true; state.memberNotice = ""; state.memberMode = member.member_id; render(); }],
-                            ["Remove", () => { if (host.confirm("Remove this Library member?")) void perform([{ type: "delete_member", reference_id: reference.reference_id, member_id: member.member_id, expected: member }]); }],
+                            ["Remove", () => {
+                                const unitIds = new Set((data.semanticUnits || [])
+                                    .filter((unit) => (unit.source_members || []).some((value) =>
+                                        value.entity_id === reference.reference_id
+                                        && value.member_id === member.member_id))
+                                    .map((unit) => unit.semantic_unit_id));
+                                let staged = 0; let chips = 0;
+                                for (const scene of data.scenes || []) {
+                                    const itemIds = new Set((scene.reference_items || [])
+                                        .filter((item) => (item.members || []).some((value) =>
+                                            value.entity_id === reference.reference_id
+                                            && value.member_id === member.member_id))
+                                        .map((item) => item.reference_item_id));
+                                    staged += itemIds.size;
+                                    const attachments = [...(scene.global_attachments || []),
+                                        ...(scene.prompt_sections || []).flatMap((section) =>
+                                            section.attachments || [])];
+                                    chips += attachments.filter((attachment) =>
+                                        itemIds.has(attachment?.source?.reference_item_id)
+                                        || (attachment?.source?.semantic_unit_ids || []).some((id) =>
+                                            unitIds.has(id))).length;
+                                }
+                                const usage = staged || chips || unitIds.size
+                                    ? `\n\nWhere used: ${staged} staged item(s), ${unitIds.size} Subject unit(s), ${chips} Context chip(s). Deletion keeps broken chips visible for repair.`
+                                    : "";
+                                if (host.confirm(`Remove this Library member?${usage}`)) {
+                                    void perform([{ type: "delete_member", reference_id: reference.reference_id,
+                                        member_id: member.member_id, expected: member }]);
+                                }
+                            }],
                             ["Up", () => reorder(reference, member, -1)], ["Down", () => reorder(reference, member, 1)],
                         ]) { const button = el("button", label, `${css.button}padding:2px 5px;font-size:9px;`); button.addEventListener("click", handler); controls.appendChild(button); }
                         info.appendChild(controls);

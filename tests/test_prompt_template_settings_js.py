@@ -137,7 +137,7 @@ def test_six_channel_template_keeps_every_channel():
             assert section["channels"][key] == f"{key} {suffix}"
 
 
-def test_round_trip_keeps_per_section_shot_and_subject_fields():
+def test_round_trip_keeps_shot_fields_and_drops_legacy_subject_ids():
     [template] = _round_trip([_minimax_template()])
     first, second, third = template["sections"]
     assert first["starts_new_shot"] is True
@@ -145,19 +145,15 @@ def test_round_trip_keeps_per_section_shot_and_subject_fields():
     # Bindings are `{entity_id, retention}` objects and must survive as such —
     # the settings normalizer used to String() each one into "[object Object]"
     # and then dedupe them all into a single entry.
-    assert first["subject_ids"] == [
-        _binding("ref-a"), _binding("ref-b", "partially_preserved")]
+    assert "subject_ids" not in first
     assert second["starts_new_shot"] is False
     assert second["shot_timestamp"] is True
-    assert second["subject_ids"] == []
+    assert "subject_ids" not in second
     # Authored objects survive with their own retention markers intact.
-    assert third["subject_ids"] == [
-        _binding("ref-c", "attribute_transfer"),
-        _binding("ref-d", "weak_reference"),
-    ]
+    assert "subject_ids" not in third
 
 
-def test_round_trip_keeps_distinct_bindings_apart():
+def test_round_trip_drops_legacy_bindings_without_conversion():
     """The defect that motivated this: every binding String()-ed to the same
     literal, so the normalizer's own dedupe then collapsed them into one."""
     template = _minimax_template()
@@ -167,15 +163,11 @@ def test_round_trip_keeps_distinct_bindings_apart():
         {"entity_id": "ref-c", "retention": "weak_reference"},
     ]
     [out] = _round_trip([template])
-    assert out["sections"][0]["subject_ids"] == [
-        _binding("ref-a"),
-        _binding("ref-b", "partially_preserved"),
-        _binding("ref-c", "weak_reference"),
-    ]
+    assert "subject_ids" not in out["sections"][0]
 
 
 @pytest.mark.parametrize("stored", [{}, {"entity_id": "ref-a"}, 5, "abc", None, True])
-def test_non_list_subject_ids_never_aborts_the_settings_module(stored):
+def test_non_list_legacy_subject_ids_never_aborts_the_settings_module(stored):
     """`normalizeEditorSettings` evaluates at module scope over user-editable
     localStorage with no try/catch, so a throw here would abort every static
     importer of editor_settings.js. A string must not iterate per character
@@ -183,10 +175,10 @@ def test_non_list_subject_ids_never_aborts_the_settings_module(stored):
     template = _minimax_template()
     template["sections"][0]["subject_ids"] = stored
     [out] = _round_trip([template])
-    assert out["sections"][0]["subject_ids"] == []
+    assert "subject_ids" not in out["sections"][0]
 
 
-def test_bare_string_bindings_are_dropped_not_revived():
+def test_bare_string_legacy_bindings_are_dropped():
     """A binding is an object. `retention` shipped in the same commit as
     `subject_ids`, so no bare-string form was ever authored — and the strings
     actually sitting in dev browser storage are the literal "[object Object]"
@@ -196,7 +188,7 @@ def test_bare_string_bindings_are_dropped_not_revived():
     template = _minimax_template()
     template["sections"][0]["subject_ids"] = ["[object Object]", "ref-a"]
     [out] = _round_trip([template])
-    assert out["sections"][0]["subject_ids"] == []
+    assert "subject_ids" not in out["sections"][0]
 
 
 def test_round_trip_keeps_global_channels_and_source_template():
@@ -207,6 +199,64 @@ def test_round_trip_keeps_global_channels_and_source_template():
         "overall_soundscape": "Steady rain on metal.",
     }
     assert template["source_fps"] == 24
+
+
+def test_round_trip_keeps_context_documents_attachments_and_dependencies():
+    template = _minimax_template()
+    template.update({
+        "global_channel_docs": {
+            "detailed_description": {"schema": "prompt_document_v1", "nodes": [
+                {"type": "text", "node_id": "g-text", "text": "rain "},
+                {"type": "attachment", "node_id": "g-chip",
+                 "attachment_id": "guide-1"},
+            ]},
+        },
+        "global_attachments": [{
+            "attachment_id": "guide-1", "emission_group_id": "guide-group",
+            "kind": "guide", "source": {}, "config": {"text": "continues"},
+        }],
+        "prompt_context_profile_id": "custom:test@1",
+        "prompt_context_profile_config": {"mode": "strict"},
+        "prompt_context_profiles": [{
+            "profile_id": "custom:test", "version": "1", "name": "Test",
+            "template_id": "minimax_h3_ref", "capabilities": {},
+            "writing_aids": [],
+        }],
+        "prompt_semantic_units": [{
+            "semantic_unit_id": "unit-1", "name": "Granny",
+            "source_members": [{"entity_id": "ref-1", "member_id": "member-1"}],
+        }],
+        "minimax_h3_conditioning_setups": [{
+            "setup_id": "setup-1", "mode": "reference",
+        }],
+        "active_minimax_h3_setup_id": "setup-1",
+    })
+    template["sections"][0].update({
+        "prompt_id": "prompt-1",
+        "channel_docs": {"detailed_description": {
+            "schema": "prompt_document_v1",
+            "nodes": [{"type": "attachment", "node_id": "s-chip",
+                       "attachment_id": "shot-1"}],
+        }},
+        "attachments": [{
+            "attachment_id": "shot-1", "emission_group_id": "shot-group",
+            "kind": "shot", "source": {}, "config": {},
+        }],
+        "muted": True,
+    })
+
+    [out] = _round_trip([template])
+    assert out["global_channel_docs"]["detailed_description"]["nodes"][1]["attachment_id"] == "guide-1"
+    assert out["global_attachments"][0]["attachment_id"] == "guide-1"
+    assert out["sections"][0]["prompt_id"] == "prompt-1"
+    assert out["sections"][0]["attachments"][0]["kind"] == "shot"
+    assert out["sections"][0]["muted"] is True
+    assert out["prompt_context_profile_id"] == "custom:test@1"
+    assert out["prompt_context_profile_config"] == {"mode": "strict"}
+    assert out["prompt_context_profiles"][0]["profile_id"] == "custom:test"
+    assert out["prompt_semantic_units"][0]["semantic_unit_id"] == "unit-1"
+    assert out["minimax_h3_conditioning_setups"][0]["setup_id"] == "setup-1"
+    assert out["active_minimax_h3_setup_id"] == "setup-1"
 
 
 def test_round_trip_is_idempotent():

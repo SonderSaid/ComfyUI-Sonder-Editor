@@ -71,6 +71,7 @@ function draftFrom(template) {
         shot_marker_channel: template.shot_marker_channel ?? "",
         global_merge: template.global_merge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: template.global_channels_enabled !== false,
+        default_context_profile: String(template.default_context_profile || "generic@1"),
     };
 }
 
@@ -147,6 +148,7 @@ function blankDraft() {
         shot_marker_channel: "",
         global_merge: GLOBAL_MERGE_LEADING,
         global_channels_enabled: false,
+        default_context_profile: "generic@1",
     };
 }
 
@@ -282,6 +284,30 @@ export function mountChannelTemplateEditor(host, { template = null, mode = "edit
         descCol.append(label("Description"), descInput);
         nameRow.append(nameCol, descCol);
         body.appendChild(nameRow);
+
+        const profileOptions = [
+            { profile_id: "generic@1", name: "Generic" },
+            { profile_id: "minimax_h3_base@1", name: "MiniMax H3 Base" },
+            { profile_id: "minimax_h3_ref@1", name: "MiniMax H3 Full Reference" },
+            ...(Array.isArray(host._promptContextProfiles) ? host._promptContextProfiles : [])
+                .map((value) => ({ ...value,
+                    profile_id: `${value.profile_id}@${value.version || "1"}` })),
+        ].filter((value, index, values) => value?.profile_id
+            && values.findIndex((candidate) => candidate?.profile_id === value.profile_id) === index);
+        const profileCol = document.createElement("div");
+        profileCol.style.cssText = "display:flex;flex-direction:column;gap:2px;";
+        const profileSelect = select(profileOptions.map((value) => ({
+            value: value.profile_id,
+            label: `${value.name || value.profile_id} (${value.profile_id})`,
+        })), draft.default_context_profile || "generic@1");
+        profileSelect.disabled = isReadOnly();
+        profileSelect.addEventListener("change", () => {
+            draft.default_context_profile = profileSelect.value || "generic@1";
+        });
+        profileCol.append(label("Default prompt format",
+            "Scenes using this channel template inherit this prompt format unless the scene overrides it."),
+        profileSelect);
+        body.appendChild(profileCol);
 
         // ── Channels ──────────────────────────────────────────────────
         const channelsHead = document.createElement("div");

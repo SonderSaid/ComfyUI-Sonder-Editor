@@ -36,6 +36,7 @@ import {
 } from "./editor_theme.js";
 import { resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
+import { openContextMenu } from "./editor_context_menu.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
@@ -817,6 +818,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     const data = { assets: [], folders: [] };
     const overlayMediaCache = new Map();
     const root = style(document.createElement("div"), `display:flex;flex-direction:column;gap:8px;flex:1 1 auto;min-width:0;min-height:0;width:100%;height:100%;box-sizing:border-box;overflow:hidden;`);
+    root.dataset.sonderAssetGallery = "1";
     container.appendChild(root);
     const galleryStyle = document.createElement("style");
     galleryStyle.textContent = `
@@ -1373,83 +1375,17 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function hideContextMenu() {
-        if (state.contextMenuCleanup) {
-            state.contextMenuCleanup();
-            state.contextMenuCleanup = null;
-        }
-        if (state.contextMenuEl) {
-            state.contextMenuEl.remove();
-            state.contextMenuEl = null;
-        }
+        state.contextMenuClose?.();
+        state.contextMenuClose = null;
+        state.contextMenuEl = null;
     }
 
     function showContextMenu(x, y, items) {
         hideContextMenu();
-
-        const menu = style(document.createElement("div"), `
-            left: ${x}px; top: ${y}px;
-            ${menuChromeCss(160)}
-        `);
-
-        for (const item of items) {
-            if (!item) continue;
-            if (item.type === "separator") {
-                menu.appendChild(style(document.createElement("div"), `height:1px;background:${CHROME.border};margin:4px 0;`));
-                continue;
-            }
-            const row = document.createElement("div");
-            row.textContent = item.label;
-            const isDisabled = !!item.disabled;
-            row.style.cssText = `
-                padding: 6px 14px; cursor: ${isDisabled ? "default" : "pointer"};
-                color: ${isDisabled ? CHROME.textMuted : (item.danger ? "#efc0c4" : CHROME.text)};
-            `;
-            if (!isDisabled) {
-                row.addEventListener("mouseenter", () => {
-                    row.style.background = CHROME.panelRaisedHover;
-                });
-                row.addEventListener("mouseleave", () => {
-                    row.style.background = "transparent";
-                });
-                row.addEventListener("click", () => {
-                    hideContextMenu();
-                    item.action?.();
-                });
-            }
-            menu.appendChild(row);
-        }
-
-        document.body.appendChild(menu);
-        state.contextMenuEl = menu;
-
-        requestAnimationFrame(() => {
-            const rect = menu.getBoundingClientRect();
-            menu.style.left = `${Math.max(4, Math.min(x, window.innerWidth - rect.width - 4))}px`;
-            menu.style.top = `${Math.max(4, Math.min(y, window.innerHeight - rect.height - 4))}px`;
-        });
-
-        const closeHandler = (event) => {
-            if (!menu.contains(event.target)) hideContextMenu();
-        };
-        const scrollHandler = () => hideContextMenu();
-        const escKeyOff = registerKeyboardConsumer({
-            id: consumerId("ctxmenu"),
-            priority: KEY_PRIORITY.OVERLAY,
-            keydown: (event) => {
-                if (event.key === "Escape") { hideContextMenu(); return true; }
-                return false;
-            },
-        });
-        state.contextMenuCleanup = () => {
-            document.removeEventListener("mousedown", closeHandler);
-            window.removeEventListener("scroll", scrollHandler, true);
-            escKeyOff();
-        };
-        setTimeout(() => {
-            document.addEventListener("mousedown", closeHandler);
-            window.addEventListener("scroll", scrollHandler, true);
-        }, 10);
+        state.contextMenuClose = openContextMenu({ x, y, items, closeOnScroll: true });
+        state.contextMenuEl = state.contextMenuClose.element;
     }
+
 
     function allFolders() {
         const folders = new Set((data.folders || []).map(normalizeFolderName).filter(Boolean));

@@ -13,6 +13,7 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 import { resolveProjectSource, getGraphLink, getGraphNode } from "./project_source_resolver.js";
 import { onProjectVersionChanged } from "./api_client.js";
+import { onEditorRenderWindowChanged } from "./editor_render_window_events.js";
 import {
     MAX_REFERENCE_SLOTS,
     canonicalOutputOrder,
@@ -32,6 +33,22 @@ const SELECTOR_STATE = Symbol("sonderReferenceSelectorState");
 
 const nodeType = (node) => String(node?.comfyClass || node?.type || "");
 const findWidget = (node, name) => (node?.widgets || []).find((widget) => widget?.name === name) || null;
+
+function referenceBridgeUrl(projectId, sceneId, controllerState) {
+    const params = new URLSearchParams();
+    for (const [name, value] of [
+        ["selection_start", controllerState?.selectionStart],
+        ["selection_end", controllerState?.selectionEnd],
+        ["pre_context_frames", controllerState?.preContextFrames],
+        ["post_context_frames", controllerState?.postContextFrames],
+    ]) {
+        const number = Number(value);
+        if (Number.isFinite(number)) params.set(name, String(Math.trunc(number)));
+    }
+    const query = params.toString();
+    const path = `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-references`;
+    return query ? `${path}?${query}` : path;
+}
 
 function ensureState(node) {
     if (node[STATE]) return node[STATE];
@@ -107,7 +124,7 @@ async function referenceShapeForBridge(node) {
         return FULL_SHAPE;
     }
     const response = await fetch(api.apiURL(
-        `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-references`
+        referenceBridgeUrl(projectId, sceneId, controllerState)
     ));
     if (!response.ok) throw new Error(`Reference bridge shape fetch failed: ${response.status}`);
     const payload = await response.json();
@@ -217,7 +234,7 @@ async function selectorLanePayload(node) {
         return { status: projectId ? "No active scene." : "Loading project...", lanes: [], linked: false };
     }
     const response = await fetch(api.apiURL(
-        `/sonder-editor/project/${encodeURIComponent(projectId)}/scenes/${encodeURIComponent(sceneId)}/bridge-references`
+        referenceBridgeUrl(projectId, sceneId, controllerState)
     ));
     if (!response.ok) throw new Error(`Reference lane fetch failed: ${response.status}`);
     const payload = await response.json();
@@ -389,6 +406,7 @@ app.registerExtension({
     name: EXT_NAME,
     setup() {
         onProjectVersionChanged(refreshAllBridges);
+        onEditorRenderWindowChanged(refreshAllBridges);
     },
     nodeCreated(node) {
         installSelector(node);

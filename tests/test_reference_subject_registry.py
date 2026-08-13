@@ -62,8 +62,8 @@ def _project():
     scene = Scene(scene_id="scene-1", duration_frames=360)
     scene.prompt_track_config = LaneConfig()
     scene.prompt_sections = [
-        PromptSection(0, 240, channels={"visual": "a"}, subject_ids=["ent_chloe"]),
-        PromptSection(240, 360, channels={"visual": "b"}, subject_ids=["ent_letter"]),
+        PromptSection(0, 240, channels={"visual": "a"}),
+        PromptSection(240, 360, channels={"visual": "b"}),
     ]
     project.scenes = [scene]
     return project, scene
@@ -189,6 +189,20 @@ def test_existing_patterns_compose_identically(monkeypatch):
     assert core.member_prompt_fragment("ref{n}", 0, "", "Cat") == "ref1: Cat"
 
 
+def test_member_suffix_changes_name_token_without_changing_legacy_blank(monkeypatch):
+    core = _core(monkeypatch)
+    assert core.member_prompt_fragment(
+        "{name}|{entity_name}|{member_name}", 0, "", "Granny",
+        None, "Front view") == "Granny_Front_view|Granny|Front_view"
+    assert core.member_prompt_fragment("{name}", 0, "", "Granny") == "Granny"
+    labels = core.reference_member_labels("Granny Bear", "Front / View")
+    assert labels == {
+        "entity_name": "Granny_Bear", "member_name": "Front_View",
+        "name": "Granny_Bear_Front_View",
+        "display_name": "Granny Bear · Front / View",
+    }
+
+
 # --- JS parity ---------------------------------------------------------------------
 
 _FRAGMENT_CASES = [
@@ -204,6 +218,7 @@ _FRAGMENT_CASES = [
     ["ref{n}", 0, "", "Cat", None],
     ["<Audio {audio_n}> reused twice: {audio_n}", 0, "voice", "Chloe", {"audio_n": 4}],
     ["{name} only", 0, "", "Chloe", {"subject_n": 1}],
+    ["{name}|{entity_name}|{member_name}", 0, "", "Granny", None, "Front view"],
 ]
 
 
@@ -218,7 +233,7 @@ def test_member_prompt_fragment_matches_between_python_and_javascript(monkeypatc
     script = (
         f"const mod = await import({json.dumps(module_url)});\n"
         f"console.log(JSON.stringify({json.dumps(_FRAGMENT_CASES)}"
-        f".map((c) => mod.memberPromptFragment(c[0], c[1], c[2], c[3], c[4]))));\n"
+        f".map((c) => mod.memberPromptFragment(c[0], c[1], c[2], c[3], c[4], c[5]))));\n"
     )
     actual = json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script],

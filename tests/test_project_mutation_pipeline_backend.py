@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
+from server import prompt_context
 from server.timeline_state import Asset, AudioTrack, ClipReference, GenerationJob, GuideFrame, LaneConfig, PromptSection, Scene, TimelineProject
 
 
@@ -27,6 +28,54 @@ class DummyRequest(dict):
 
     async def json(self):
         return self._body
+
+
+def test_prompt_split_preserves_global_channel_exclusions():
+    scene = Scene(scene_id="scene", duration_frames=20)
+    section = PromptSection(
+        0, 20, channels={"visual": "one"},
+        global_channel_exceptions=["speech", "sounds"])
+    scene.prompt_sections = [section]
+    right = routes._split_prompt_object(scene, section, 10)
+    assert set(right.global_channel_exceptions) == {"speech", "sounds"}
+
+
+def test_direct_section_route_returns_structured_conflict_without_partial_mutation(
+        monkeypatch, tmp_path):
+    route_module = _load_route_module(monkeypatch)
+    attachment = prompt_context.normalize_attachment({"kind": "guide"})
+    section = PromptSection(
+        0, 20, channels={"visual": "before"}, attachments=[attachment],
+        channel_docs={"visual": {"nodes": [
+            {"type": "text", "node_id": "text", "text": "before"},
+            {"type": "attachment", "node_id": "anchor",
+             "attachment_id": attachment["attachment_id"]},
+        ]}},
+    )
+    scene = Scene(scene_id="scene", duration_frames=20,
+                  prompt_sections=[section])
+    project = TimelineProject(project_dir=str(tmp_path), project_id="proj",
+                              scenes=[scene])
+    before = section.to_dict()
+    saves = []
+    monkeypatch.setattr(route_module, "_load_project_from_request",
+                        lambda request: project)
+    monkeypatch.setattr(route_module, "save_project",
+                        lambda saved, **kwargs: saves.append(saved))
+    handler = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt_sections/{index}")
+
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene", "index": "0"},
+        body={"start_frame": 1, "channels": {"visual": "replacement"}},
+        method="PUT",
+    )))
+
+    assert response.status == 409
+    assert _response_json(response)["code"] == "structured_edit_conflict"
+    assert section.to_dict() == before
+    assert saves == []
 
 
 def _load_route_module(monkeypatch):
@@ -46,6 +95,38 @@ def _route_handler(route_module, method, path):
 
 def _response_json(response):
     return json.loads(response.body.decode("utf-8"))
+
+
+def test_prompt_context_candidate_uses_constraint_aware_execution_window(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene", duration_frames=100)
+    scene.prompt_sections = [PromptSection(
+        0, 100, channels={"visual": "body"})]
+    project = TimelineProject(project_id="proj", scenes=[scene], fps=24.0)
+    monkeypatch.setattr(
+        route_module, "_load_project_from_request",
+        lambda request, **_kwargs: project)
+    handler = _route_handler(
+        route_module, "POST",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    body = {
+        "scene": scene.to_dict(),
+        "selection_start": 30, "selection_end": 50,
+        "pre_context_frames": 6, "post_context_frames": 6,
+        "mask_pre_offset": 2, "mask_post_offset": 2,
+        "frame_constraint": {"step": 17, "offset": 5, "min": 5},
+    }
+    response = asyncio.run(handler(DummyRequest(
+        match_info={"project_id": "proj", "scene_id": "scene"}, body=body)))
+    payload = _response_json(response)
+    expected = route_module.resolve_execution_window(
+        scene_duration=100, selection_start=30, selection_end=50,
+        pre_context_frames=6, post_context_frames=6,
+        mask_pre_offset=2, mask_post_offset=2,
+        frame_constraint={"step": 17, "offset": 5, "min": 5})
+    assert payload["execution_window"] == expected
+    assert payload["window"]["start_frame"] == expected["render_start"]
+    assert payload["window"]["end_frame"] == expected["render_end"]
 
 
 def _apply_scene_operations(route_module, monkeypatch, project, scene_id, operations, saves):
@@ -1822,3 +1903,56 @@ def test_scenes_get_serves_despite_contended_repair_save(monkeypatch, tmp_path):
     assert response.status == 200
     payload = _response_json(response)
     assert payload["scenes"][0]["scene_id"] == "scene-1"
+
+
+def test_prompt_template_dependencies_import_atomically_with_scene_mutation(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    saves = []
+    profile = {
+        "profile_id": "custom:test", "version": "1", "name": "Test",
+        "template_id": "standard", "capabilities": {}, "writing_aids": [],
+    }
+    unit = {
+        "semantic_unit_id": "unit-1", "name": "Granny", "order": 0,
+        "source_members": [], "definition": "A grandmother",
+    }
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [
+        {"type": "import_prompt_context_dependencies",
+         "profiles": [profile], "semantic_units": [unit]},
+        {"type": "update_scene_fields",
+         "fields": {"prompt_context_profile_id": "custom:test@1"}},
+    ], saves)
+
+    assert response.status == 200
+    assert len(saves) == 1
+    payload = _response_json(response)
+    assert payload["prompt_context_profiles"][0]["profile_id"] == "custom:test"
+    assert payload["prompt_semantic_units"][0]["semantic_unit_id"] == "unit-1"
+    assert scene.prompt_context_profile_id == "custom:test@1"
+
+
+def test_prompt_template_dependency_collision_blocks_instead_of_overwriting(monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    scene = Scene(scene_id="scene-1", name="Scene", duration_frames=24)
+    project = TimelineProject(project_dir="", name="Project", scenes=[scene])
+    project.project_id = "proj"
+    project.prompt_semantic_units = [{
+        "semantic_unit_id": "unit-1", "name": "Existing", "order": 0,
+        "source_members": [], "visual_intent": "preserve",
+        "audio_intent": "reference_characteristics", "definition": "",
+        "intent_overrides": {},
+    }]
+    saves = []
+
+    response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [{
+        "type": "import_prompt_context_dependencies", "profiles": [],
+        "semantic_units": [{"semantic_unit_id": "unit-1", "name": "Different"}],
+    }], saves)
+
+    assert response.status == 409
+    assert saves == []
+    assert project.prompt_semantic_units[0]["name"] == "Existing"

@@ -211,45 +211,6 @@ export function sectionInheritsGlobal(section, key) {
         .includes(String(key));
 }
 
-// Retention markers from the MiniMax full-reference guide (section 4.1).
-export const SUBJECT_RETENTIONS = Object.freeze([
-    "fully_preserved", "partially_preserved", "attribute_transfer", "weak_reference",
-]);
-export const DEFAULT_SUBJECT_RETENTION = "fully_preserved";
-
-// Mirror of prompt_payload.normalize_subject_ids: duplicates collapse (first
-// wins) and authored order is preserved, because order is the tie-break when
-// one section binds several subjects.
-export function normalizeSubjectIds(raw) {
-    // Non-array in, empty out, exactly as the Python mirror does. Without this
-    // guard a stored object throws (`raw || []` is truthy but not iterable) and
-    // a stored string iterates per CHARACTER. This runs inside
-    // normalizeEditorSettings, which evaluates at module scope over
-    // user-editable localStorage with no try/catch, so a throw here aborts
-    // every static importer of editor_settings.js.
-    if (!Array.isArray(raw)) return [];
-    const out = [];
-    const seen = new Set();
-    for (const entry of raw) {
-        // A binding is an OBJECT — `retention` shipped in the same commit as
-        // `subject_ids`, so a bare-string form never existed and accepting one
-        // would only resurrect junk. It also self-cleans the "[object Object]"
-        // strings the pre-fix settings normalizer left in browser storage:
-        // they are not objects, so they are simply dropped.
-        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-        const entityId = typeof entry.entity_id === "string" ? entry.entity_id.trim() : "";
-        const retention = typeof entry.retention === "string" ? entry.retention.trim() : "";
-        if (!entityId || seen.has(entityId)) continue;
-        seen.add(entityId);
-        out.push({
-            entity_id: entityId,
-            retention: SUBJECT_RETENTIONS.includes(retention)
-                ? retention : DEFAULT_SUBJECT_RETENTION,
-        });
-    }
-    return out;
-}
-
 // True when any channel the template names carries text. The three-channel
 // `visual || speech || sounds` checks it replaces would read as "empty" for a
 // section whose text lives only in channels 4-6.

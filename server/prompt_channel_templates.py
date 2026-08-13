@@ -146,7 +146,8 @@ _MINIMAX_REF_CHANNELS = (
 
 def _template(template_id, name, description, channels, *, field_separator=" ",
               label_separator=" ", labels=LABELS_PROJECT, shot_marker_channel="",
-              global_merge=GLOBAL_MERGE_LEADING, global_channels_on=True):
+              global_merge=GLOBAL_MERGE_LEADING, global_channels_on=True,
+              default_context_profile="generic@1"):
     return {
         "id": template_id,
         "name": name,
@@ -158,6 +159,7 @@ def _template(template_id, name, description, channels, *, field_separator=" ",
         "shot_marker_channel": shot_marker_channel,
         "global_merge": global_merge,
         "global_channels_enabled": global_channels_on,
+        "default_context_profile": default_context_profile,
         "builtin": True,
     }
 
@@ -169,6 +171,7 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         (_channel("visual", "",
                   "The whole prompt for this section."),),
         labels=LABELS_NEVER,
+        shot_marker_channel="visual",
     ),
     DEFAULT_CHANNEL_TEMPLATE_ID: _template(
         # Display name only — the id stays `sonder` so existing projects and
@@ -177,7 +180,7 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         "The editor's three-field format: separate visual, speech and sound channels, "
         "always labelled in composed prompt output.",
         _SONDER_CHANNELS,
-        labels=LABELS_ALWAYS,
+        labels=LABELS_ALWAYS, shot_marker_channel="visual",
     ),
     "minimax_h3_base": _template(
         "minimax_h3_base", "MiniMax H3",
@@ -187,6 +190,7 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         field_separator="\n\n", label_separator=": ", labels=LABELS_ALWAYS,
         shot_marker_channel="integrated_multimodal_description",
         global_merge=GLOBAL_MERGE_PER_CHANNEL,
+        default_context_profile="minimax_h3_base@1",
     ),
     "minimax_h3_ref": _template(
         "minimax_h3_ref", "MiniMax H3 (full reference)",
@@ -196,6 +200,7 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         field_separator="\n\n", label_separator=":\n", labels=LABELS_ALWAYS,
         shot_marker_channel="detailed_description",
         global_merge=GLOBAL_MERGE_PER_CHANNEL,
+        default_context_profile="minimax_h3_ref@1",
     ),
 }
 
@@ -265,6 +270,7 @@ def strict_normalize_channel_template(raw):
         "shot_marker_channel": shot_marker_channel,
         "global_merge": global_merge,
         "global_channels_enabled": raw.get("global_channels_enabled", True) is not False,
+        "default_context_profile": str(raw.get("default_context_profile") or "generic@1"),
         "builtin": False,
     }
 
@@ -349,6 +355,7 @@ def _template_dict(resolved) -> dict:
         "shot_marker_channel": resolved.get("shot_marker_channel", ""),
         "global_merge": resolved.get("global_merge", GLOBAL_MERGE_LEADING),
         "global_channels_enabled": global_channels_enabled(resolved),
+        "default_context_profile": resolved.get("default_context_profile", "generic@1"),
     }
 
 

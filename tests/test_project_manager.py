@@ -4,6 +4,8 @@ import sys
 import os
 import tempfile
 import builtins
+import json
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -51,6 +53,45 @@ def test_save_and_load_roundtrip():
         assert len(loaded.clips) == 1
         assert loaded.clips[0].clip_id == "test_clip"
         assert loaded.clips[0].timeline_end_frame == 48
+
+
+def test_load_project_retries_only_transient_permission_errors(monkeypatch):
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Read Retry", base_dir=base_dir)
+        project_file = os.path.abspath(os.path.join(project.project_dir, "project.json"))
+        original_open = builtins.open
+        attempts = {"count": 0}
+
+        def flaky_open(file, mode="r", *args, **kwargs):
+            if os.path.abspath(str(file)) == project_file and "r" in str(mode):
+                attempts["count"] += 1
+                if attempts["count"] < 3:
+                    raise PermissionError(13, "sharing violation", str(file))
+            return original_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", flaky_open)
+        loaded = load_project(project.project_dir)
+        assert loaded.project_id == project.project_id
+        assert attempts["count"] == 3
+
+
+def test_load_project_does_not_retry_malformed_json(monkeypatch):
+    with tempfile.TemporaryDirectory() as base_dir:
+        project = create_project("Bad Json", base_dir=base_dir)
+        project_file = os.path.join(project.project_dir, "project.json")
+        with open(project_file, "w", encoding="utf-8") as handle:
+            handle.write("{")
+        calls = {"count": 0}
+        original_load = json.load
+
+        def counted_load(handle):
+            calls["count"] += 1
+            return original_load(handle)
+
+        monkeypatch.setattr(json, "load", counted_load)
+        with pytest.raises(json.JSONDecodeError):
+            load_project(project.project_dir)
+        assert calls["count"] == 1
 
 
 def test_legacy_template_id_roundtrips_unchanged():

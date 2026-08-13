@@ -223,7 +223,7 @@ def test_same_sections_compose_differently_under_each_template():
                                      template=pct.get_channel_template("sonder"))
     minimax = pp.compose_range_prompt("", sections, 0, 120, labels_on=False,
                                       template=pct.get_channel_template("minimax_h3_base"))
-    assert sonder == "[VISUAL]: a dog walks"
+    assert sonder == "[VISUAL]: [Shot 1] a dog walks"
     # labels_on=False, yet the named-field template still emits its field name,
     # and its shot-marker channel opens the first shot.
     assert minimax == "integrated_multimodal_description: [Shot 1] a dog walks"

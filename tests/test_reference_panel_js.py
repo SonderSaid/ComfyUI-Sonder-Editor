@@ -19,6 +19,28 @@ SCHEMA_KEYS = {field["key"] for field in REFERENCE_RECIPE_FIELDS}
 _CORE_PACKAGE = "reference_panel_testpkg"
 
 
+def test_reference_panel_recipe_edits_preserve_lane_identity_executably():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Reference lane identity coverage")
+    module_url = (ROOT / "web" / "js" / "reference_lane_identity.js").as_uri()
+    script = f"""
+const {{ preserveLaneRecipeIdentity }} = await import({json.dumps(module_url)});
+const cases = [
+  preserveLaneRecipeIdentity({{lane_id: "stable"}}, {{recipe_id: "built-in"}}, "minted"),
+  preserveLaneRecipeIdentity({{lane_id: "stable"}}, {{lane_id: "churn", media_kind: "audio"}}, "minted"),
+  preserveLaneRecipeIdentity({{}}, {{recipe_id: "detached"}}, "minted"),
+];
+console.log(JSON.stringify(cases));
+"""
+    values = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+    assert [value["lane_id"] for value in values] == [
+        "stable", "stable", "minted"]
+
+
 def _import_reference_core(monkeypatch):
     """`nodes/reference_core.py` uses package-relative imports, so it only loads
     under a synthetic package rooted at the repo (same shim as
@@ -48,12 +70,18 @@ def test_recipe_schema_declares_every_key_the_presets_and_assembler_use():
     core = (ROOT / "nodes" / "reference_core.py").read_text(encoding="utf-8")
     widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
     panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(encoding="utf-8")
+    context = (ROOT / "server" / "prompt_context.py").read_text(encoding="utf-8")
+    minimax = (ROOT / "server" / "minimax_h3.py").read_text(encoding="utf-8")
+    routes_source = (ROOT / "server" / "routes.py").read_text(encoding="utf-8")
     # `resolved` is resolve_pegged_hard's working copy of the hard block, so a
     # key read only while resolving a peg still counts as consumed.
     read_keys = set(re.findall(r'(?:hard(?:_wrapper)?|resolved)\.get\("([a-z_]+)"', core))
     read_keys.update(re.findall(r'soft\.get\("([a-z_]+)"', core))
     read_keys.update(re.findall(r'\b(?:hard|soft)\.([a-z_]+)\b', widget))
     read_keys.update(re.findall(r'\bhard\.([a-z_]+)\b', panel))
+    read_keys.update(re.findall(r'soft\.get\("([a-z_]+)"', minimax))
+    read_keys.update(re.findall(r'generic_reference\.get\("([a-z_]+)"', context))
+    read_keys.update(re.findall(r'soft\.get\("([a-z_]+)"', routes_source))
     assert read_keys & SCHEMA_KEYS, "expected the scan to find real reads"
     assert read_keys <= SCHEMA_KEYS | {"get"}, f"assembler reads undeclared keys: {sorted(read_keys - SCHEMA_KEYS)}"
 
@@ -179,6 +207,7 @@ def test_panel_honours_the_overlay_and_mutation_contracts():
     assert "unregisterKeyboard();" in panel
 
     # Every reference-item write is non-coalesced and carries exact prior values.
+    # Item writes and item operations are exact, non-coalesced mutations.
     assert panel.count("coalesce: false") == 2
     for block in ("const writeItem =", "const runItemOperation ="):
         body = panel.split(block, 1)[1].split("\n    };", 1)[0]
@@ -197,6 +226,152 @@ def test_panel_honours_the_overlay_and_mutation_contracts():
     assert "this._referencePanelHandle?.close?.();" in widget
     assert "this._referencePanelHandle?.refresh?.();" in widget
     assert "_showReferenceLaneMenu" not in widget
+
+
+def test_panel_uses_catalog_controls_and_progressive_disclosure():
+    panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(encoding="utf-8")
+    assert '"Works with prompt formats"' in panel
+    assert '"Model input"' in panel
+    assert '"Prompt parts added"' in panel
+    assert '"Per-member options"' in panel
+    assert '"Reset to suggestions"' in panel
+    assert "Unsupported:" in panel
+    assert 'el("details"' in panel
+    assert "disclosureStorageKey" in panel and "rememberDisclosure" in panel
+    assert 'block.addEventListener("toggle"' in panel
+    assert 'select.dataset.sonderInvalid = "1"' in panel
+    assert "Unsupported saved value:" in panel
+    assert '["pictures", "videos", "standalone_audios"]' in panel
+    assert "writeMemberAudioIntent" in panel
+    assert "role_aliases" in panel
+
+
+def test_reference_panel_keeps_details_collapsed_and_offers_inspectable_thumbnails():
+    panel = (ROOT / "web" / "js" / "editor_reference_panel.js").read_text(
+        encoding="utf-8")
+    assert 'disclosureOpen("item", item.reference_item_id, false)' in panel
+    assert 'disclosureOpen("advisories", laneRecipe().lane_id || state.laneIndex, false)' in panel
+    assert 'rememberDisclosure(\n            "advisories"' in panel
+    assert "createMemberDraft(resolved?.member || null, asset || null)" in panel
+    assert "host._openReferenceMediaEditor?.({ asset, draft, readOnly: true })" in panel
+    assert "width:96px;height:64px" in panel
+    assert "width:80px; height:60px" in panel
+
+
+def test_h3_reference_population_planner_adds_only_requested_lanes():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for H3 population planner coverage")
+    module_url = (ROOT / "web" / "js" / "editor_prompt_panel.js").as_uri()
+    definitions = {
+        "picture": {
+            "id": "picture-recipe", "name": "Pictures", "kind": "image",
+            "setupKey": "picture_lane_ids", "hard": {}, "soft": {},
+        },
+        "video": {
+            "id": "video-recipe", "name": "Videos", "kind": "video",
+            "setupKey": "video_lane_ids", "hard": {}, "soft": {},
+        },
+    }
+    script = f"""
+const mod = await import({json.dumps(module_url)});
+const definitions = {json.dumps(definitions)};
+const initial = {{reference_lane_count: 1, reference_lane_recipes: [],
+  reference_items: [], minimax_h3_conditioning_setups: [],
+  active_minimax_h3_setup_id: ''}};
+const picture = mod.planH3ReferencePopulation(initial, definitions.picture,
+  {{newLaneId: 'picture-lane', newSetupId: 'setup'}});
+const pictureWrapper = picture.operations.find((op) => op.type === 'update_lane_config')
+  .fields.reference_recipe;
+const pictureSetupFields = picture.operations.find((op) => op.type === 'update_scene_fields').fields;
+const afterPicture = {{...initial,
+  reference_lane_recipes: [pictureWrapper],
+  minimax_h3_conditioning_setups: pictureSetupFields.minimax_h3_conditioning_setups,
+  active_minimax_h3_setup_id: pictureSetupFields.active_minimax_h3_setup_id}};
+const video = mod.planH3ReferencePopulation(afterPicture, definitions.video,
+  {{newLaneId: 'video-lane', newSetupId: 'unused'}});
+const videoSetup = video.operations.find((op) => op.type === 'update_scene_fields')
+  .fields.minimax_h3_conditioning_setups.find((row) => row.setup_id === 'setup');
+const pictureAgain = mod.planH3ReferencePopulation(afterPicture, definitions.picture,
+  {{newLaneId: 'unused', newSetupId: 'unused'}});
+const detached = mod.planH3ReferencePopulation({{...initial,
+  reference_lane_recipes: [{{lane_id: 'stable-detached', media_kind: 'image',
+    recipe_id: '', recipe: {{}}}}]}}, definitions.picture,
+  {{newLaneId: 'must-not-replace', newSetupId: 'detached-setup'}});
+const authored = mod.planH3ReferencePopulation({{...initial,
+  reference_lane_recipes: [{{lane_id: 'generic-authored', media_kind: 'image',
+    recipe: {{id: 'custom:sheet', name: 'Authored sheet', hard: {{assembly: 'sheet'}}, soft: {{}}}}}}]}},
+  definitions.picture, {{newLaneId: 'new-picture', newSetupId: 'authored-setup'}});
+const inactiveReference = mod.planH3ReferencePopulation({{
+  reference_lane_count: 3,
+  reference_lane_recipes: [{{lane_id: 'blank'}},
+    {{lane_id: 'video-lane', recipe_id: 'video-recipe'}},
+    {{lane_id: 'audio-lane', recipe_id: 'audio-recipe'}}],
+  reference_items: [],
+  minimax_h3_conditioning_setups: [
+    {{setup_id: 'base', mode: 'base', task_mode: 'I2VA'}},
+    {{setup_id: 'reference', mode: 'reference', task_mode: 'T2VA',
+      picture_lane_ids: [], video_lane_ids: ['video-lane'], audio_lane_ids: ['audio-lane']}}],
+  active_minimax_h3_setup_id: 'base'}}, definitions.picture,
+  {{newLaneId: 'must-preserve-blank-id', newSetupId: 'must-not-create'}});
+const inactiveSetup = inactiveReference.operations.find((op) => op.type === 'update_scene_fields')
+  .fields.minimax_h3_conditioning_setups.find((row) => row.setup_id === 'reference');
+const activateExisting = mod.planH3ReferencePopulation({{
+  reference_lane_count: 1,
+  reference_lane_recipes: [{{lane_id: 'video-lane', media_kind: 'video',
+    recipe_id: 'video-recipe', recipe: {{id: 'video-recipe'}}}}], reference_items: [],
+  minimax_h3_conditioning_setups: [
+    {{setup_id: 'base', mode: 'base'}},
+    {{setup_id: 'reference', mode: 'reference', picture_lane_ids: [],
+      video_lane_ids: ['video-lane'], audio_lane_ids: []}}],
+  active_minimax_h3_setup_id: 'base'}}, definitions.video,
+  {{newLaneId: 'unused', newSetupId: 'unused'}});
+console.log(JSON.stringify({{
+  pictureTypes: picture.operations.map((op) => op.type),
+  pictureSetup: pictureSetupFields.minimax_h3_conditioning_setups[0],
+  videoTypes: video.operations.map((op) => op.type), videoSetup,
+  pictureAgain,
+  detachedLaneId: detached.laneId,
+  authoredLaneIndex: authored.laneIndex,
+  authoredLaneId: authored.laneId,
+  inactiveSetup,
+  activateExisting,
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+    assert result["pictureTypes"] == ["update_lane_config", "update_scene_fields"]
+    assert result["pictureSetup"]["picture_lane_ids"] == ["picture-lane"]
+    assert result["pictureSetup"]["video_lane_ids"] == []
+    assert result["pictureSetup"]["audio_lane_ids"] == []
+    assert result["videoTypes"] == [
+        "set_lane_count", "update_lane_config", "update_scene_fields"]
+    assert result["videoSetup"]["picture_lane_ids"] == ["picture-lane"]
+    assert result["videoSetup"]["video_lane_ids"] == ["video-lane"]
+    assert result["videoSetup"]["audio_lane_ids"] == []
+    assert result["pictureAgain"]["alreadyLinked"] is True
+    assert result["pictureAgain"]["operations"] == []
+    assert result["detachedLaneId"] == "stable-detached"
+    assert result["authoredLaneIndex"] == 1
+    assert result["authoredLaneId"] == "new-picture"
+    assert result["inactiveSetup"]["picture_lane_ids"] == ["blank"]
+    assert result["inactiveSetup"]["video_lane_ids"] == ["video-lane"]
+    assert result["inactiveSetup"]["audio_lane_ids"] == ["audio-lane"]
+    assert result["activateExisting"]["alreadyLinked"] is True
+    assert result["activateExisting"]["operations"] == [{
+        "type": "update_scene_fields",
+        "fields": {"active_minimax_h3_setup_id": "reference"},
+    }]
+
+
+def test_h3_population_creation_serializes_snapshot_planning_and_refuses_stale_retry():
+    source = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(encoding="utf-8")
+    assert "retryOnConflict: false" in source
+    assert "const populationButtons = []" in source
+    assert "populationButtons.forEach((button) => { button.disabled = true; });" in source
+    assert "const completed = await commit(planned.operations" in source
 
 
 # One fixture set, computed in Python and in node, compared. Not a golden file:

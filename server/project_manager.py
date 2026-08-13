@@ -2,6 +2,7 @@ import json
 import os
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime
 from typing import Callable
@@ -56,6 +57,34 @@ def _project_write_lock(project_dir: str) -> threading.Lock:
             lock = threading.Lock()
             _PROJECT_WRITE_LOCKS[key] = lock
         return lock
+
+
+def _read_project_json(project_file: str) -> dict:
+    """Read one project file through a short Windows sharing-violation retry.
+
+    The caller owns the canonical per-project lock when it participates in a
+    load/save compare-and-swap.  The retry is intentionally PermissionError-
+    only: missing files, malformed JSON, and other I/O failures carry useful
+    distinct meaning and must surface immediately.
+    """
+    delays = (0.0, 0.015, 0.035, 0.075)
+    first_error = None
+    for index, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            with open(project_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except PermissionError as exc:
+            if first_error is None:
+                first_error = exc
+            if index == len(delays) - 1:
+                logger.error(
+                    "Project read remained unavailable after %d attempts: %s",
+                    len(delays), project_file,
+                )
+                raise first_error
+    raise first_error  # pragma: no cover - loop always returns or raises
 
 
 class ProjectVersionConflict(RuntimeError):
@@ -138,8 +167,7 @@ def save_project(
         current_data = None
         if expected_modified_at:
             if os.path.isfile(project_file):
-                with open(project_file, "r", encoding="utf-8") as f:
-                    current_data = json.load(f)
+                current_data = _read_project_json(project_file)
                 actual_modified_at = str(current_data.get("modified_at", "") or "")
             else:
                 actual_modified_at = ""
@@ -194,8 +222,8 @@ def load_project(project_dir: str) -> TimelineProject:
     if not os.path.isfile(project_file):
         raise FileNotFoundError(f"No project.json found in {project_dir}")
 
-    with open(project_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    with _project_write_lock(project_dir):
+        data = _read_project_json(project_file)
 
     project = TimelineProject.from_dict(data, project_dir=project_dir)
 
@@ -230,8 +258,8 @@ def list_projects(base_dir: str) -> list[dict]:
         project_file = os.path.join(resolved_entry, "project.json")
         if os.path.isdir(resolved_entry) and os.path.isfile(project_file):
             try:
-                with open(project_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                with _project_write_lock(resolved_entry):
+                    data = _read_project_json(project_file)
                 scenes = data.get("scenes", [])
                 assets = data.get("assets", [])
                 # Backward compat: count clips from old flat format or from scenes

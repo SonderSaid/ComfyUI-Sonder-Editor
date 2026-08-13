@@ -11,6 +11,7 @@
 //   _referenceRecipeFieldSchema, _referenceMemberForRef(ref),
 //   _referenceLaneAdvisories(entry, definition), _defaultReferenceLaneRecipe(),
 //   _findAssetById(id), _referenceAssetPreviewUrl(asset),
+//   _openReferenceMediaEditor({ asset, draft, readOnly }),
 //   _isLaneLocked(type, laneIndex), _saveLaneConfig(entries),
 //   _runSceneMutation(ops, opts), _mutateReferences(ops),
 //   _fetchReferences(opts), _fetchScenes(opts), _buildTrackLayout(),
@@ -38,7 +39,8 @@ import {
     PRIORITY as KEY_PRIORITY,
 } from "./keyboard_ownership.js";
 import { TRACK_TYPE } from "./editor_timeline_constants.js";
-import { moveMember } from "./reference_library_model.js";
+import { preserveLaneRecipeIdentity } from "./reference_lane_identity.js";
+import { createMemberDraft, moveMember } from "./reference_library_model.js";
 import {
     REFERENCE_VERDICT,
     REFERENCE_VERDICT_LABEL,
@@ -65,7 +67,16 @@ const VERDICT_EXPLANATION = {
     outside: "This item does not overlap the current generation window.",
     excluded: "Muted, or on a hidden lane, so it never participates.",
 };
-const GROUP_ORDER = ["Assembly", "Geometry", "Frame grid", "Members", "Bridge outputs", "Prompt", "Advisories"];
+const GROUP_ORDER = [
+    "Assembly", "Members", "Geometry", "Frame grid", "Frame rate",
+    "Bridge outputs", "Prompt", "Prompt Context", "Advisories",
+];
+const FRIENDLY_FIELD_LABEL = {
+    compatible_profiles: "Works with prompt formats",
+    physical_population: "Model input",
+    exposed_capabilities: "Prompt parts added",
+    role_fields: "Per-member options",
+};
 
 /**
  * Which schema fields apply to a recipe as currently authored.
@@ -133,11 +144,37 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     }) + `display:flex; flex-direction:column; overflow:hidden; font-family:${FONT.sans};`);
     backdrop.appendChild(panel);
 
+    const disclosureStorageKey = `sonder-reference-panel-disclosure-v1:${String(
+        host._projectDirName?.() || host.projectId || "project",
+    )}`;
+    const loadDisclosures = () => {
+        try {
+            const parsed = JSON.parse(localStorage.getItem(disclosureStorageKey) || "{}");
+            return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+        } catch (_error) {
+            return {};
+        }
+    };
     const state = {
         laneIndex: Math.max(0, parseInt(laneIndex, 10) || 0),
         pickerItemId: "",
         pickerQuery: "",
         busy: false,
+        disclosures: loadDisclosures(),
+    };
+    const disclosureKey = (kind, value) => `${state.laneIndex}:${kind}:${String(value || "")}`;
+    const disclosureOpen = (kind, value, fallback = false) => {
+        const key = disclosureKey(kind, value);
+        return Object.prototype.hasOwnProperty.call(state.disclosures, key)
+            ? !!state.disclosures[key] : !!fallback;
+    };
+    const rememberDisclosure = (kind, value, open) => {
+        state.disclosures[disclosureKey(kind, value)] = !!open;
+        try {
+            localStorage.setItem(disclosureStorageKey, JSON.stringify(state.disclosures));
+        } catch (_error) {
+            // Browser-local disclosure memory is a convenience, never project authority.
+        }
     };
     let mounted = true;
 
@@ -190,8 +227,14 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     const writeRecipe = async (recipe) => {
         const entry = currentEntry();
         if (!entry || state.busy) return;
+        const current = laneRecipe();
+        const nextRecipe = preserveLaneRecipeIdentity(
+            current,
+            recipe,
+            host._defaultReferenceLaneRecipe().lane_id,
+        );
         state.busy = true;
-        entry.referenceRecipe = recipe;
+        entry.referenceRecipe = nextRecipe;
         try {
             await host._saveLaneConfig([entry]);
         } finally {
@@ -231,6 +274,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         host._buildTrackLayout?.();
         host._renderTimeline?.();
         render();
+    };
+
+    const writeMemberAudioIntent = (item, memberRef, value, label) => {
+        const members = (item.members || []).map((entry) =>
+            entry.member_id === memberRef.member_id
+                ? { ...entry, audio_intent: value } : entry);
+        return writeItem(item, { members }, label);
     };
 
     const runItemOperation = async (operation, label) => {
@@ -398,6 +448,103 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         return wrap;
     };
 
+    const promptContextChoices = (field) => {
+        if (field.key === "compatible_profiles") {
+            const builtIns = [
+                { value: "generic@1", label: "Generic" },
+                { value: "minimax_h3_base@1", label: "MiniMax H3 Base" },
+                { value: "minimax_h3_ref@1", label: "MiniMax H3 Full Reference" },
+            ];
+            const custom = (host._promptContextProfiles || []).map((profile) => ({
+                value: `${profile.profile_id}@${profile.version || "1"}`,
+                label: profile.name || `${profile.profile_id}@${profile.version || "1"}`,
+            }));
+            return [...builtIns, ...custom];
+        }
+        if (field.key === "exposed_capabilities") {
+            const labels = {
+                derived_prompt: "Derived prompt text", definitions: "Definitions",
+                summary: "Task summary", retention: "What to preserve",
+                mentions: "Subject mentions", audio_relationship: "Audio relationship",
+            };
+            return (host._promptContextCatalog?.capabilities || [])
+                .map((value) => ({ value: String(value), label: labels[value] || String(value) }));
+        }
+        if (field.key === "role_fields") {
+            return [
+                { value: "role", label: "Reference role" },
+                { value: "visual_intent", label: "What to preserve (visual)" },
+                { value: "audio_intent", label: "What to preserve (audio)" },
+            ];
+        }
+        return [];
+    };
+
+    const catalogListEditor = (field, values, locked) => {
+        const wrap = el("div", "", "display:flex;flex-wrap:wrap;gap:5px 10px;flex:1;min-width:0;");
+        const selected = [...new Set((Array.isArray(values) ? values : []).map(String))];
+        const choices = promptContextChoices(field);
+        const known = new Set(choices.map((entry) => entry.value));
+        for (const entry of choices) {
+            const label = el("label", "", `display:flex;align-items:center;gap:4px;font-size:11px;color:${COLORS.text};`);
+            const box = el("input");
+            box.type = "checkbox";
+            box.checked = selected.includes(entry.value);
+            box.disabled = locked;
+            box.addEventListener("change", () => {
+                const next = box.checked
+                    ? [...selected, entry.value]
+                    : selected.filter((value) => value !== entry.value);
+                applyField(field, [...new Set(next)]);
+            });
+            label.append(box, el("span", entry.label));
+            wrap.appendChild(label);
+        }
+        const unsupportedValues = selected.filter((entry) => !known.has(entry));
+        if (unsupportedValues.length) wrap.dataset.sonderInvalid = "1";
+        for (const value of unsupportedValues) {
+            const unsupported = el("span", `Unsupported: ${value}`, `
+                display:inline-flex;align-items:center;gap:5px;padding:2px 6px;border-radius:10px;
+                border:1px solid ${COLORS.dangerText};color:${COLORS.dangerText};font-size:10px;
+            `);
+            unsupported.title = "This saved value is preserved, but the recipe cannot be saved again until it is removed or rebound.";
+            if (!locked) {
+                const remove = button("Remove", `Remove unsupported value ${value}`, "danger");
+                remove.style.padding = "0 4px";
+                remove.addEventListener("click", () => applyField(
+                    field, selected.filter((entry) => entry !== value)));
+                unsupported.appendChild(remove);
+            }
+            wrap.appendChild(unsupported);
+        }
+        return wrap;
+    };
+
+    const suggestedPromptContext = (recipe) => {
+        const media = String(recipe.media_kind || "image");
+        const current = recipe.recipe?.soft || {};
+        const h3 = (current.compatible_profiles || []).includes("minimax_h3_ref@1")
+            || ["pictures", "videos", "standalone_audios"].includes(current.physical_population);
+        if (!h3) return {
+            compatible_profiles: ["generic@1"], physical_population: "none",
+            exposed_capabilities: ["derived_prompt"], role_fields: [],
+        };
+        const declaredPopulation = String(current.physical_population || "");
+        const physical_population = ["pictures", "videos", "standalone_audios"].includes(declaredPopulation)
+            ? declaredPopulation
+            : (media === "audio" ? "standalone_audios" : "pictures");
+        return {
+            compatible_profiles: ["minimax_h3_ref@1"], physical_population,
+            exposed_capabilities: media === "image"
+                ? ["definitions", "retention", "mentions"]
+                : ["definitions", "retention", "mentions", "audio_relationship"],
+            role_fields: physical_population === "pictures" ? ["role", "visual_intent"]
+                : (physical_population === "videos"
+                    ? ["role", "visual_intent", "audio_intent"]
+                    : ["role", "audio_intent"]),
+        };
+    };
+
     const fieldControl = (recipe, field, locked) => {
         const value = readField(recipe, field);
         const inputCss = chromeInputCss({ padding: "3px 6px", fontSize: "11px" });
@@ -418,12 +565,28 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 node.title = field.value_help?.[option] || "";
                 select.appendChild(node);
             }
-            select.value = String(value ?? field.default ?? "");
+            const selectedValue = String(value ?? field.default ?? "");
+            const knownValues = new Set((field.values || []).map(String));
+            if (selectedValue && !knownValues.has(selectedValue)) {
+                const unsupported = el("option", `Unsupported: ${selectedValue}`);
+                unsupported.value = selectedValue;
+                unsupported.dataset.unsupported = "1";
+                select.appendChild(unsupported);
+                select.dataset.sonderInvalid = "1";
+                select.title = "This saved value is preserved, but it must be rebound before the recipe can be saved.";
+            }
+            select.value = selectedValue;
             select.disabled = locked;
             // The chosen option's meaning stays visible: which mode you picked is
             // the decision, and the field label alone never explains it.
             const chosenHelp = el("div", "", `font-size:10px;color:${COLORS.textMuted};line-height:1.3;`);
-            const syncHelp = () => { chosenHelp.textContent = field.value_help?.[select.value] || ""; };
+            const syncHelp = () => {
+                chosenHelp.textContent = select.selectedOptions[0]?.dataset?.unsupported === "1"
+                    ? `Unsupported saved value: ${select.value}. Choose a supported value to rebind it.`
+                    : (field.value_help?.[select.value] || "");
+                chosenHelp.style.color = select.selectedOptions[0]?.dataset?.unsupported === "1"
+                    ? COLORS.dangerText : COLORS.textMuted;
+            };
             syncHelp();
             select.addEventListener("change", () => {
                 syncHelp();
@@ -492,6 +655,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             return input;
         }
         if (field.type === "string_list") {
+            if (["compatible_profiles", "exposed_capabilities", "role_fields"].includes(field.key)) {
+                return catalogListEditor(field, Array.isArray(value) ? value : [], locked);
+            }
             return field.key === "suggested_tags"
                 ? tagChipEditor(field, Array.isArray(value) ? value : [], locked)
                 : (() => {
@@ -537,12 +703,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 return;
             }
             if (occupied && chosen.media_kind !== recipe.media_kind) {
-                notifyWarning("Clear the Reference lane before switching between image and audio recipes.", { source: "reference-panel-refused" });
+                notifyWarning("Clear the Reference lane before switching its model input kind.", { source: "reference-panel-refused" });
                 render();
                 return;
             }
             void writeRecipe({
-                media_kind: chosen.media_kind === "audio" ? "audio" : "image",
+                media_kind: ["image", "video", "audio"].includes(chosen.media_kind)
+                    ? chosen.media_kind : "image",
                 recipe_id: chosen.id,
                 recipe: { name: chosen.name, hard: { ...(chosen.hard || {}) }, soft: { ...(chosen.soft || {}) } },
             });
@@ -550,8 +717,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         templateRow.appendChild(select);
 
         const mediaBtn = button(
-            `Media: ${recipe.media_kind === "audio" ? "Audio" : "Image"}`,
-            occupied ? "Clear the lane before changing media kind" : "Switch this lane between image and audio references",
+            `Media: ${recipe.media_kind === "audio" ? "Audio" : (recipe.media_kind === "video" ? "Video" : "Image")}`,
+            occupied ? "Clear the lane before changing media kind" : "Switch this detached lane between Image and Audio model inputs",
         );
         mediaBtn.disabled = occupied || laneLocked() || state.busy;
         if (mediaBtn.disabled) mediaBtn.style.opacity = "0.5";
@@ -579,16 +746,48 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const schema = host._referenceRecipeFieldSchema || [];
         const visible = visibleRecipeFields(schema, recipe.recipe?.hard || {}, recipe.recipe?.soft || {});
         for (const { group, fields } of groupRecipeFields(visible)) {
-            const block = el("div", "", `
-                border:1px solid ${COLORS.border}; border-radius:7px; padding:8px 10px;
-                display:flex; flex-direction:column; gap:6px; background:${COLORS.panelMuted};
+            const block = el("details", "", `
+                border:1px solid ${COLORS.border}; border-radius:7px;
+                background:${COLORS.panelMuted};
             `);
-            block.appendChild(el("div", group, `font-size:11px;font-weight:700;color:${COLORS.text};`));
+            const summary = el("summary", group, `
+                padding:8px 10px;font-size:11px;font-weight:700;color:${COLORS.text};
+                cursor:pointer;user-select:none;
+            `);
+            const invalidFields = fields.filter((field) => {
+                const value = readField(recipe, field);
+                if (field.type === "enum") {
+                    const known = new Set((field.values || []).map(String));
+                    const selected = String(value ?? field.default ?? "");
+                    return !!selected && !known.has(selected);
+                }
+                if (!["compatible_profiles", "exposed_capabilities", "role_fields"].includes(field.key)) return false;
+                const known = new Set(promptContextChoices(field).map((entry) => entry.value));
+                return (Array.isArray(value) ? value : []).some((entry) => !known.has(String(entry)));
+            });
+            block.open = invalidFields.length > 0 || disclosureOpen("recipe", group);
+            block.addEventListener("toggle", () => rememberDisclosure("recipe", group, block.open));
+            if (invalidFields.length) {
+                summary.textContent = `${group} · ${invalidFields.length} unsupported`;
+                summary.style.color = COLORS.dangerText;
+            }
+            block.appendChild(summary);
+            const groupBody = el("div", "", "display:flex;flex-direction:column;gap:6px;padding:0 10px 9px;");
+            if (group === "Prompt Context" && !locked) {
+                const reset = button("Reset to suggestions", "Replace Prompt Context settings with suggestions for this prompt format and media type");
+                reset.addEventListener("click", () => {
+                    const next = laneRecipe();
+                    next.recipe = next.recipe && typeof next.recipe === "object" ? next.recipe : {};
+                    next.recipe.soft = { ...(next.recipe.soft || {}), ...suggestedPromptContext(next) };
+                    void writeRecipe(next);
+                });
+                groupBody.appendChild(reset);
+            }
             for (const field of fields) {
                 const row = el("div", "", "display:flex;align-items:center;gap:10px;");
                 // Help is on hover, not permanently expanded: a visible line under
                 // every one of ~28 controls is what made this form unreadable.
-                const label = el("div", field.label, `font-size:11px;color:${COLORS.text};min-width:170px;flex-shrink:0;border-bottom:1px dotted ${COLORS.border};cursor:help;`);
+                const label = el("div", FRIENDLY_FIELD_LABEL[field.key] || field.label, `font-size:11px;color:${COLORS.text};min-width:170px;flex-shrink:0;border-bottom:1px dotted ${COLORS.border};cursor:help;`);
                 if (field.help) {
                     label.title = field.help;
                     row.title = field.help;
@@ -601,9 +800,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 row.append(label, fieldControl(recipe, field, locked || !!pegged));
                 const provenance = pegNote(recipe, field);
                 if (provenance) row.appendChild(provenance);
-                block.appendChild(row);
+                groupBody.appendChild(row);
             }
+            block.appendChild(groupBody);
             body.appendChild(block);
+            if (invalidFields.length) queueMicrotask(() => {
+                block.querySelector("button,select,input")?.focus?.();
+            });
         }
 
         const actions = el("div", "", "display:flex;gap:6px;flex-wrap:wrap;margin-top:2px;");
@@ -632,21 +835,27 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             soft: recipe.recipe?.soft || {},
         }) || [];
         if (!laneAdvisories.length) return;
-        body.appendChild(sectionTitle("Advisories"));
+        const details = el("details", "", `border:1px solid ${COLORS.border};border-radius:7px;padding:0 8px;`);
+        details.open = disclosureOpen("advisories", laneRecipe().lane_id || state.laneIndex, false);
+        details.addEventListener("toggle", () => rememberDisclosure(
+            "advisories", laneRecipe().lane_id || state.laneIndex, details.open));
+        details.appendChild(el("summary", `Advisories (${laneAdvisories.length})`, `font-size:11px;color:${COLORS.textMuted};padding:7px 0;cursor:pointer;`));
         for (const advisory of laneAdvisories) {
             const silent = advisory.voice === "silent-loss";
-            body.appendChild(el("div", `${silent ? "Silent loss" : "Suggestion"}: ${advisory.text}`, `
+            details.appendChild(el("div", `${silent ? "Silent loss" : "Suggestion"}: ${advisory.text}`, `
                 font-size:11px; line-height:1.35; padding:5px 8px; border-radius:6px;
                 color:${silent ? COLORS.warningText : COLORS.textMuted};
                 border:1px solid ${silent ? COLORS.warningText : COLORS.border};
             `));
         }
+        body.appendChild(details);
     };
 
     // ── Custom recipe lifecycle ────────────────────────────────────────────
     const recipePayload = (recipe, name) => ({
         name,
-        media_kind: recipe.media_kind === "audio" ? "audio" : "image",
+        media_kind: ["image", "video", "audio"].includes(recipe.media_kind)
+            ? recipe.media_kind : "image",
         hard: { ...(recipe.recipe?.hard || {}) },
         soft: { ...(recipe.recipe?.soft || {}) },
     });
@@ -733,10 +942,19 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const asset = host._findAssetById?.(resolved.member.asset_id) || null;
         const tags = (resolved.member.tags || []).join(", ");
         return {
-            title: resolved.reference.name || "Reference",
+            title: resolved.member.name
+                ? `${resolved.reference.name || "Reference"} · ${resolved.member.name}`
+                : (resolved.reference.name || "Reference"),
             detail: [resolved.member.prompt || asset?.name || "", tags].filter(Boolean).join(" · "),
             asset,
         };
+    };
+
+    const inspectMemberMedia = (memberRef, asset) => {
+        const resolved = host._referenceMemberForRef?.(memberRef);
+        const draft = createMemberDraft(resolved?.member || null, asset || null);
+        draft.has_audio = asset?.has_audio === true;
+        host._openReferenceMediaEditor?.({ asset, draft, readOnly: true });
     };
 
     const renderMemberRow = (item, memberRef, index, total, locked) => {
@@ -747,16 +965,83 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         `);
         row.appendChild(el("div", String(index + 1), `font-size:10px;color:${COLORS.textMuted};width:14px;text-align:right;`));
         const thumbUrl = asset ? host._referenceAssetPreviewUrl?.(asset) : null;
-        const thumb = el("div", "", `
-            width:34px; height:26px; border-radius:4px; flex-shrink:0;
+        const thumb = el("button", "", `
+            width:80px; height:60px; border-radius:6px; flex:0 0 80px; padding:0; cursor:pointer;
             background:${COLORS.bg} ${thumbUrl ? `url(${JSON.stringify(thumbUrl)}) center/cover no-repeat` : ""};
             border:1px solid ${COLORS.border};
         `);
+        thumb.type = "button";
+        thumb.title = `Inspect ${title}`;
+        thumb.setAttribute("aria-label", thumb.title);
+        thumb.addEventListener("click", () => inspectMemberMedia(memberRef, asset));
         row.appendChild(thumb);
         const text = el("div", "", "flex:1;min-width:0;");
         text.appendChild(el("div", title, `font-size:11px;color:${COLORS.text};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`));
         if (detail) text.appendChild(el("div", detail, `font-size:10px;color:${COLORS.textMuted};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`));
         row.appendChild(text);
+
+        const updateMember = (patch, label) => void writeItem(item, {
+            members: (item.members || []).map((entry) => entry.member_id === memberRef.member_id
+                ? { ...entry, ...patch } : entry),
+        }, label);
+        const recipe = laneRecipe();
+        const soft = recipe.recipe?.soft || {};
+        const roleFields = new Set(Array.isArray(soft.role_fields) ? soft.role_fields : []);
+        const population = String(soft.physical_population || "none");
+        const profileKeys = Array.isArray(soft.compatible_profiles) ? soft.compatible_profiles : [];
+        const activeProfileKey = String(host.activeScene?.prompt_context_profile_id
+            || host._channelTemplate?.()?.default_context_profile || "generic@1");
+        const customProfile = (host._promptContextProfiles || []).find((profile) =>
+            `${profile.profile_id}@${profile.version || "1"}` === activeProfileKey);
+        const builtInRoleCatalog = host._promptContextCatalog?.role_catalogs?.[population] || [];
+        const roleCatalog = profileKeys.includes(activeProfileKey)
+            ? (activeProfileKey === "minimax_h3_ref@1"
+                ? builtInRoleCatalog : (customProfile?.role_catalogs?.[population] || []))
+            : [];
+        const roleAliases = host._promptContextCatalog?.role_aliases || {};
+        const canonicalRole = roleAliases[String(memberRef.role || "").toLowerCase().replaceAll("-", "_")]
+            || String(memberRef.role || "");
+        if (roleFields.size) {
+            row.style.flexWrap = "wrap";
+            const controls = el("div", "", "display:flex;gap:4px;align-items:center;flex-wrap:wrap;width:100%;padding-left:56px;");
+            if (roleFields.has("role")) {
+                const role = el("select", "", chromeInputCss({ padding: "2px 4px", fontSize: "10px" }));
+                const roleValues = [["", "Role: choose…"], ...roleCatalog.map(
+                    (entry) => [entry.value, entry.label || entry.value])];
+                if (memberRef.role && !roleValues.some(([value]) => value === canonicalRole)) {
+                    roleValues.push([memberRef.role, `Unsupported: ${memberRef.role}`]);
+                    role.dataset.unsupported = "true";
+                    role.dataset.sonderInvalid = "1";
+                    role.title = "Choose a role supported by this prompt format before saving.";
+                }
+                for (const [value, label] of roleValues) {
+                    const option = el("option", label); option.value = value; role.appendChild(option);
+                }
+                role.value = canonicalRole; role.disabled = locked;
+                role.addEventListener("change", () => updateMember({ role: role.value }, "change Reference role"));
+                controls.appendChild(role);
+            }
+            if (roleFields.has("visual_intent")) {
+                const retention = el("select", "", chromeInputCss({ padding: "2px 4px", fontSize: "10px" }));
+                [["", "Entity default"], ["preserve", "Fully preserve"], ["partial", "Partially preserve"],
+                    ["transfer_attributes", "Transfer attributes"], ["reference_loosely", "Weak reference"]]
+                    .forEach(([value, label]) => { const option = el("option", label); option.value = value; retention.appendChild(option); });
+                retention.value = memberRef.visual_intent || ""; retention.disabled = locked;
+                retention.addEventListener("change", () => updateMember({ visual_intent: retention.value }, "change visual retention"));
+                controls.appendChild(retention);
+            }
+            if (roleFields.has("audio_intent")) {
+                const audioIntent = el("select", "", chromeInputCss({ padding: "2px 4px", fontSize: "10px" }));
+                [["", "Audio: entity default"], ["copy_full", "Fully copy"], ["copy_partial", "Partially copy"],
+                    ["reference_characteristics", "Reference"], ["reference_loosely", "Weak reference"]]
+                    .forEach(([value, label]) => { const option = el("option", label); option.value = value; audioIntent.appendChild(option); });
+                audioIntent.value = memberRef.audio_intent || ""; audioIntent.disabled = locked;
+                audioIntent.addEventListener("change", () => void writeMemberAudioIntent(
+                    item, memberRef, audioIntent.value, "change audio retention"));
+                controls.appendChild(audioIntent);
+            }
+            row.appendChild(controls);
+        }
 
         const reorder = (direction) => {
             // Slot order is what the model receives, so it is authored here.
@@ -789,6 +1074,10 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
      */
     const renderMemberPicker = (item, mediaKind) => {
         const creating = item.reference_item_id === NEW_ITEM;
+        const physicalPopulation = String(
+            laneRecipe().recipe?.soft?.physical_population || "");
+        const picturesOnly = physicalPopulation === "pictures";
+        const videosOnly = physicalPopulation === "videos";
         const wrap = el("div", "", `
             display:flex; flex-direction:column; gap:5px; padding:6px;
             border:1px dashed ${COLORS.border}; border-radius:6px;
@@ -818,13 +1107,19 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                     const asset = host._findAssetById?.(member.asset_id) || null;
                     // A wrong-kind member is never offered: media_kind is a hard
                     // lane property and the backend refuses the write anyway.
-                    const voice = (member.tags || []).includes("sonder:voice_identity");
-                    const kind = asset?.asset_type === "audio" || (asset?.asset_type === "video" && voice) ? "audio" : "image";
-                    if (!asset || kind !== mediaKind) continue;
+                    const compatible = mediaKind === "image"
+                        ? (picturesOnly ? asset?.asset_type === "image"
+                            : (videosOnly ? asset?.asset_type === "video"
+                                : ["image", "video"].includes(asset?.asset_type)))
+                        : (mediaKind === "video" ? asset?.asset_type === "video"
+                            : (asset?.asset_type === "audio"
+                                || (asset?.asset_type === "video" && asset?.has_audio)));
+                    if (!asset || !compatible) continue;
                     const haystack = `${reference.name} ${member.prompt || ""} ${asset.name || ""} ${(member.tags || []).join(" ")}`.toLowerCase();
                     if (query && !haystack.includes(query)) continue;
                     offered += 1;
-                    const row = button(`${reference.name} · ${member.prompt || asset.name || member.member_id}`, "Stage this member");
+                    const memberName = member.name || asset.name || member.member_id;
+                    const row = button(`${reference.name} · ${memberName}`, "Stage this member");
                     row.style.textAlign = "left";
                     row.addEventListener("click", () => {
                         state.pickerItemId = "";
@@ -885,7 +1180,11 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const soft = laneRecipe().recipe?.soft || {};
         const members = (item.members || []).map((memberRef) => {
             const resolved = host._referenceMemberForRef?.(memberRef);
-            return { name: resolved?.reference?.name || "", prompt: resolved?.member?.prompt || "" };
+            return {
+                entity_name: resolved?.reference?.name || "",
+                member_name: resolved?.member?.name || "",
+                prompt: resolved?.member?.prompt || "",
+            };
         });
         const derived = deriveReferencePrompt({ promptOverride: "", members, soft });
         const overridden = !!item.prompt_override;
@@ -945,7 +1244,22 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const recipe = laneRecipe();
         const locked = laneLocked() || state.busy;
         const verdicts = itemVerdicts();
-
+        const soft = recipe.recipe?.soft || {};
+        const population = String(soft.physical_population || "none");
+        const profileKeys = Array.isArray(soft.compatible_profiles) ? soft.compatible_profiles : [];
+        const activeProfileKey = String(host.activeScene?.prompt_context_profile_id
+            || host._channelTemplate?.()?.default_context_profile || "generic@1");
+        const customProfile = (host._promptContextProfiles || []).find((profile) =>
+            `${profile.profile_id}@${profile.version || "1"}` === activeProfileKey);
+        const builtInItemRoleCatalog = host._promptContextCatalog?.role_catalogs?.[population] || [];
+        const itemRoleCatalog = profileKeys.includes(activeProfileKey)
+            ? (activeProfileKey === "minimax_h3_ref@1"
+                ? builtInItemRoleCatalog : (customProfile?.role_catalogs?.[population] || []))
+            : [];
+        const allowedRoles = new Set(itemRoleCatalog.map((entry) => String(entry.value)));
+        const roleAliases = host._promptContextCatalog?.role_aliases || {};
+        const canonicalRole = (value) => roleAliases[String(value || "").toLowerCase().replaceAll("-", "_")]
+            || String(value || "");
         const header = el("div", "", "display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:6px;");
         header.appendChild(sectionTitle(`Staged items (${items.length})`));
         const add = button("+ Add item", "Stage a new item at the playhead");
@@ -961,7 +1275,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         if (state.pickerItemId === NEW_ITEM) {
             body.appendChild(renderMemberPicker(
                 { reference_item_id: NEW_ITEM, members: [] },
-                recipe.media_kind === "audio" ? "audio" : "image",
+                ["image", "video", "audio"].includes(recipe.media_kind)
+                    ? recipe.media_kind : "image",
             ));
         }
 
@@ -980,6 +1295,11 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 border:1px solid ${effective ? COLORS.accent : COLORS.border}; border-radius:7px; padding:8px 10px;
                 display:flex; flex-direction:column; gap:6px;
             `);
+            const invalidMember = (item.members || []).find((member) => {
+                const roleInvalid = !!member.role
+                    && (!allowedRoles.size || !allowedRoles.has(canonicalRole(member.role)));
+                return roleInvalid;
+            });
             const top = el("div", "", "display:flex;align-items:center;gap:6px;flex-wrap:wrap;");
             // Same wording the timeline draws, and nothing at all without a
             // selection — there is no window to resolve against yet.
@@ -1071,15 +1391,45 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             top.append(mute, del);
             card.appendChild(top);
 
-            card.appendChild(renderPromptRow(item, locked));
+            const compactMembers = el("div", "", "display:flex;gap:8px;align-items:stretch;flex-wrap:wrap;");
+            for (const memberRef of item.members || []) {
+                const { title, asset } = memberLabel(memberRef);
+                const chip = el("span", "", `display:inline-flex;align-items:center;gap:7px;max-width:300px;padding:4px 8px 4px 4px;border:1px solid ${COLORS.border};border-radius:8px;`);
+                const previewUrl = asset ? host._referenceAssetPreviewUrl?.(asset) : null;
+                const thumb = el("button", "", `width:96px;height:64px;flex:0 0 96px;padding:0;cursor:pointer;border:1px solid ${COLORS.border};border-radius:6px;background:${COLORS.bg} ${previewUrl ? `url(${JSON.stringify(previewUrl)}) center/cover no-repeat` : ""};`);
+                thumb.type = "button";
+                thumb.title = `Inspect ${title}`;
+                thumb.setAttribute("aria-label", thumb.title);
+                thumb.addEventListener("click", () => inspectMemberMedia(memberRef, asset));
+                const label = el("span", title, `font-size:11px;color:${COLORS.text};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+                chip.title = title;
+                chip.append(thumb, label);
+                compactMembers.appendChild(chip);
+            }
+            card.appendChild(compactMembers);
+
+            const advanced = el("details", "", `border-top:1px solid ${COLORS.border};padding-top:4px;`);
+            advanced.open = state.pickerItemId === item.reference_item_id
+                || !!invalidMember
+                || disclosureOpen("item", item.reference_item_id, false);
+            advanced.addEventListener("toggle", () => {
+                rememberDisclosure("item", item.reference_item_id, advanced.open);
+            });
+            advanced.appendChild(el("summary",
+                `${(item.members || []).length} member${(item.members || []).length === 1 ? "" : "s"} · prompt and per-member options`,
+                `font-size:10px;color:${COLORS.textMuted};cursor:pointer;user-select:none;padding:3px 0;`));
+            const advancedBody = el("div", "", "display:flex;flex-direction:column;gap:6px;padding-top:5px;");
+            advancedBody.appendChild(renderPromptRow(item, locked));
 
             const members = item.members || [];
             for (const [index, memberRef] of members.entries()) {
-                card.appendChild(renderMemberRow(item, memberRef, index, members.length, locked));
+                advancedBody.appendChild(renderMemberRow(item, memberRef, index, members.length, locked));
             }
 
             if (state.pickerItemId === item.reference_item_id) {
-                card.appendChild(renderMemberPicker(item, recipe.media_kind === "audio" ? "audio" : "image"));
+                advancedBody.appendChild(renderMemberPicker(item,
+                    ["image", "video", "audio"].includes(recipe.media_kind)
+                        ? recipe.media_kind : "image"));
             } else {
                 const addMember = button("+ Add member", "Stage another Library member on this item");
                 addMember.disabled = locked;
@@ -1088,9 +1438,14 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                     state.pickerQuery = "";
                     render();
                 });
-                card.appendChild(addMember);
+                advancedBody.appendChild(addMember);
             }
+            advanced.appendChild(advancedBody);
+            card.appendChild(advanced);
             body.appendChild(card);
+            if (invalidMember) queueMicrotask(() => {
+                advanced.querySelector("[data-sonder-invalid='1']")?.focus?.();
+            });
         }
     };
 

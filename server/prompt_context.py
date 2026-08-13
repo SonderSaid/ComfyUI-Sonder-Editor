@@ -1,0 +1,2793 @@
+"""Structured prompt documents, semantic attachments, and pure compilation.
+
+This module is deliberately UI- and Comfy-free.  The timeline, Prompt tool,
+queue freezer, Prompt Relay and nodes all consume the same normalized records.
+Provider text is produced here at compile time; projects store stable ids and
+semantic intent only.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+import uuid
+from collections import defaultdict
+
+from . import prompt_channel_templates, prompt_payload, prompt_tokens
+
+
+FORMAT_VERSION = "prompt_context_v1"
+DOCUMENT_SCHEMA = "prompt_document_v1"
+PROFILE_LIMIT_BYTES = 128 * 1024
+FORMATTER_LIMIT_BYTES = 4 * 1024
+MAX_CAPABILITIES = 64
+MAX_ATTACHMENTS_PER_SCENE = 512
+MAX_ATTACHMENT_OUTPUT = 16 * 1024
+MAX_COMPILED_PROMPT = 256 * 1024
+
+ATTACHMENT_KINDS = {
+    "shot", "timestamp", "prompt_link", "reference", "guide",
+    "vocal_event", "custom",
+}
+PLACEMENT_PHASES = (
+    "document_preamble", "channel_prefix", "global_document",
+    "section_prefix", "inline", "section_suffix", "channel_suffix",
+)
+SEPARATOR_NAMES = ("attachment", "line")
+# Declarative provider surface.  Every attachment stores `provider_id` and
+# `provider_version`; an unknown pair was authored by a build this one cannot
+# interpret, so an *enabled* chip carrying it blocks rather than rendering under
+# guessed semantics.  Legacy records normalize to generic@1 and stay valid, and
+# a disabled chip is never validated because it emits nothing.
+SUPPORTED_PROVIDERS = {
+    "generic": frozenset({"1"}),
+    "minimax_h3_base": frozenset({"1"}),
+    "minimax_h3_ref": frozenset({"1"}),
+}
+# Prompt Links resolve only through inline document anchors, and Vocal Events
+# must stay chronological, so both are inline-only in every authoring surface.
+INLINE_ONLY_KINDS = frozenset({"prompt_link", "vocal_event"})
+VISUAL_INTENTS = {
+    "preserve": "fully_preserved",
+    "partial": "partially_preserved",
+    "transfer_attributes": "attribute_transfer",
+    "reference_loosely": "weak_reference",
+}
+AUDIO_INTENTS = {
+    "copy_full": "fully_copy",
+    "copy_partial": "partially_copy",
+    "reference_characteristics": "reference",
+    "reference_loosely": "weak_reference",
+}
+VOCAL_EVENT_TYPES = {
+    "dialogue", "singing", "narration", "voiceover", "group_speech",
+}
+DIALOGUE_LANGUAGES = {
+    "English", "Spanish", "French", "German", "Italian", "Japanese",
+    "Korean", "Chinese", "Portuguese", "Hindi",
+}
+_MANUAL_SPEAKER_RE = re.compile(r"\(S\d+(?:[,+]S\d+)*\)")
+MINIMAX_TASK_TYPES = (
+    "keyframe completion", "reference generation", "video editing",
+    "video continuation", "audio reuse", "audio reference",
+)
+
+# Server-owned staged-member role vocabulary.  Recipes declare which fields
+# they expose; the selected prompt format and physical model input declare the
+# values those fields accept.  Keeping this catalog here gives the compiler,
+# mutation routes, and every frontend renderer one source of truth.
+MINIMAX_H3_ROLE_CATALOGS = {
+    "pictures": [
+        {"value": "first_frame", "label": "First frame"},
+        {"value": "last_frame", "label": "Last frame"},
+        {"value": "keyframe", "label": "Keyframe"},
+        {"value": "storyboard", "label": "Storyboard"},
+        {"value": "composition_anchor", "label": "Composition anchor"},
+        {"value": "identity", "label": "Identity"},
+        {"value": "environment", "label": "Environment"},
+        {"value": "style", "label": "Style"},
+        {"value": "motion", "label": "Motion"},
+    ],
+    "videos": [
+        {"value": "video_editing", "label": "Video editing"},
+        {"value": "video_continuation", "label": "Video continuation"},
+        {"value": "temporal_structure", "label": "Temporal structure"},
+        {"value": "motion", "label": "Motion / camera"},
+    ],
+    "standalone_audios": [
+        {"value": "audio_reuse", "label": "Audio reuse"},
+        {"value": "audio_reference", "label": "Audio reference"},
+        {"value": "timbre", "label": "Voice timbre"},
+        {"value": "rhythm", "label": "Music / rhythm"},
+        {"value": "sound_texture", "label": "Sound texture"},
+    ],
+}
+REFERENCE_ROLE_ALIASES = {
+    "edit": "video_editing", "editing": "video_editing",
+    "video_edit": "video_editing", "continue": "video_continuation",
+    "continuation": "video_continuation", "copy": "audio_reuse",
+    "reference": "audio_reference",
+}
+
+
+def _normalized_role_catalog(raw) -> dict:
+    result = {}
+    if not isinstance(raw, dict) or len(raw) > 16:
+        return result
+    for population, entries in raw.items():
+        population = str(population or "").strip()
+        if not population or not isinstance(entries, list) or len(entries) > 64:
+            continue
+        values = []
+        seen = set()
+        for entry in entries:
+            if isinstance(entry, str):
+                value, label = entry.strip(), entry.strip()
+            elif isinstance(entry, dict):
+                value = str(entry.get("value") or "").strip()
+                label = str(entry.get("label") or value).strip()
+            else:
+                continue
+            if (not value or len(value) > 128 or len(label) > 128
+                    or value in seen):
+                continue
+            seen.add(value)
+            values.append({"value": value, "label": label})
+        if values:
+            result[population] = values
+    return result
+
+
+def reference_role_catalog(profile_ids=None, population="", *, profiles=None,
+                           active_profile="") -> list[dict]:
+    profile_keys = {str(value or "") for value in (profile_ids or [])}
+    if active_profile:
+        active_key = str(active_profile)
+        if active_key not in profile_keys:
+            return []
+        profile_keys = {active_key}
+    if "minimax_h3_ref@1" in profile_keys:
+        return copy.deepcopy(MINIMAX_H3_ROLE_CATALOGS.get(str(population), []))
+    for profile in profiles or []:
+        if not isinstance(profile, dict):
+            continue
+        key = f"{profile.get('profile_id', '')}@{profile.get('version', '1')}"
+        if key in profile_keys:
+            return copy.deepcopy((_normalized_role_catalog(
+                profile.get("role_catalogs"))).get(str(population), []))
+    return []
+
+
+def normalize_reference_role(role, recipe, *, profiles=None,
+                             active_profile="") -> str:
+    role = str(role or "").strip()
+    if not role:
+        return ""
+    soft = recipe.get("soft") if isinstance(recipe, dict) else {}
+    soft = soft if isinstance(soft, dict) else {}
+    profile_ids = soft.get("compatible_profiles") or []
+    population = str(soft.get("physical_population") or "")
+    catalog = reference_role_catalog(
+        profile_ids, population, profiles=profiles,
+        active_profile=active_profile)
+    if not catalog:
+        # Deserialization may preserve an unknown legacy role before its project
+        # profile is available.  A project mutation receives `profiles` (even
+        # when empty) and must instead refuse authoring a value with no catalog.
+        if profiles is not None:
+            raise ValueError(f"Unsupported Reference role: {role}")
+        if len(role) > 128:
+            raise ValueError("Reference role is too long")
+        return role
+    role = REFERENCE_ROLE_ALIASES.get(role.lower().replace("-", "_"), role)
+    if role not in {entry["value"] for entry in catalog}:
+        raise ValueError(f"Unsupported Reference role: {role}")
+    return role
+
+
+def _new_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _canonical_json(value) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def content_hash(value) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def text_document(text="", *, node_id=None) -> dict:
+    return {
+        "schema": DOCUMENT_SCHEMA,
+        "nodes": [{"type": "text", "node_id": node_id or _new_id(),
+                   "text": str(text or "")}],
+    }
+
+
+def normalize_prompt_document(raw=None, fallback_text="") -> dict:
+    """Return a bounded, ordered text/attachment document.
+
+    Unknown node types are intentionally ignored.  Empty documents retain one
+    text node so caret mapping always has a stable landing position.
+    """
+    if isinstance(raw, str):
+        return text_document(raw)
+    nodes = []
+    seen = set()
+    for entry in (raw.get("nodes", []) if isinstance(raw, dict) else []):
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("type") or "")
+        if kind not in {"text", "attachment"}:
+            continue
+        node_id = str(entry.get("node_id") or "").strip() or _new_id()
+        while node_id in seen:
+            node_id = _new_id()
+        seen.add(node_id)
+        if kind == "text":
+            nodes.append({"type": "text", "node_id": node_id,
+                          "text": str(entry.get("text") or "")})
+        else:
+            attachment_id = str(entry.get("attachment_id") or "").strip()
+            if not attachment_id:
+                continue
+            node = {"type": "attachment", "node_id": node_id,
+                    "attachment_id": attachment_id}
+            capability_id = str(entry.get("capability_id") or "").strip()
+            if capability_id:
+                node["capability_id"] = capability_id
+            nodes.append(node)
+    if not nodes:
+        return text_document(fallback_text)
+    return {"schema": DOCUMENT_SCHEMA, "nodes": nodes}
+
+
+def prompt_document_text(document) -> str:
+    document = normalize_prompt_document(document)
+    return "".join(node["text"] for node in document["nodes"]
+                   if node["type"] == "text")
+
+
+def document_has_anchors(document) -> bool:
+    return any(node.get("type") == "attachment"
+               for node in normalize_prompt_document(document)["nodes"])
+
+
+def normalize_channel_documents(raw, channels=None, keys=None) -> dict:
+    source = raw if isinstance(raw, dict) else {}
+    mirrors = channels if isinstance(channels, dict) else {}
+    ordered = list(keys or ())
+    for key in mirrors:
+        if str(key) not in ordered:
+            ordered.append(str(key))
+    for key in source:
+        if str(key) not in ordered:
+            ordered.append(str(key))
+    return {
+        key: normalize_prompt_document(source.get(key), mirrors.get(key, ""))
+        for key in ordered
+    }
+
+
+def channel_document_mirrors(documents) -> dict:
+    return {str(key): prompt_document_text(value)
+            for key, value in (documents or {}).items()}
+
+
+def join_channel_documents(documents, keys) -> dict:
+    """Collapse channel documents without flattening attachment anchors."""
+    ordered = [str(value) for value in keys or []]
+    populated = []
+    for key in ordered:
+        document = normalize_prompt_document((documents or {}).get(key))
+        if prompt_document_text(document).strip() or document_has_anchors(document):
+            populated.append((key, document))
+    nodes = []
+    for index, (key, document) in enumerate(populated):
+        if len(ordered) > 1:
+            nodes.append({"type": "text", "node_id": _new_id(),
+                          "text": f"{key}:\n"})
+        nodes.extend(copy.deepcopy(document["nodes"]))
+        if index < len(populated) - 1:
+            nodes.append({"type": "text", "node_id": _new_id(), "text": "\n\n"})
+    return normalize_prompt_document({"nodes": nodes})
+
+
+def split_document_channels(document, keys) -> dict:
+    """Re-split `key:` header lines while keeping anchors in their block."""
+    ordered = [str(value) for value in keys or []] or ["visual"]
+    key_set = set(ordered)
+    output = {key: [] for key in ordered}
+    current = ordered[0]
+
+    def append_text(value):
+        if not value:
+            return
+        target = output[current]
+        if target and target[-1].get("type") == "text":
+            target[-1]["text"] += value
+        else:
+            target.append({"type": "text", "node_id": _new_id(), "text": value})
+
+    def trim_structural_separator():
+        """Remove the blank-line joiner immediately before a parsed header."""
+        target = output[current]
+        remaining = 2
+        while target and remaining and target[-1].get("type") == "text":
+            text = str(target[-1].get("text") or "")
+            removed = 0
+            while text.endswith("\n") and removed < remaining:
+                text = text[:-1]
+                removed += 1
+            remaining -= removed
+            if text:
+                target[-1]["text"] = text
+                break
+            target.pop()
+
+    for node in normalize_prompt_document(document)["nodes"]:
+        if node["type"] == "attachment":
+            output[current].append(copy.deepcopy(node))
+            continue
+        lines = str(node.get("text") or "").split("\n")
+        for index, line in enumerate(lines):
+            match = re.match(r"^([A-Za-z0-9_]+):[ \t]?(.*)$", line)
+            is_header = bool(match and match.group(1) in key_set)
+            if is_header:
+                trim_structural_separator()
+                current = match.group(1)
+                append_text(match.group(2))
+            else:
+                append_text(line)
+            if index < len(lines) - 1 and not is_header:
+                append_text("\n")
+    return {key: normalize_prompt_document({"nodes": nodes})
+            for key, nodes in output.items()}
+
+
+def retarget_channel_documents(documents, from_keys, to_keys) -> dict:
+    """Atomic document-aware collapse/re-split used by template switching."""
+    normalized = normalize_channel_documents(documents)
+    if not any(prompt_document_text(value).strip() or document_has_anchors(value)
+               for value in normalized.values()):
+        return normalized
+    retargeted = split_document_channels(join_channel_documents(normalized, from_keys),
+                                         to_keys)
+    # Preserve the historical superset contract: inactive channels remain as
+    # empty mirrors so switching away and back never truncates project data.
+    for key in normalized:
+        if key not in retargeted:
+            original = normalized[key]
+            node_id = next((node.get("node_id") for node in original.get("nodes", [])
+                            if node.get("type") == "text"), None)
+            retargeted[key] = text_document("", node_id=node_id)
+    return retargeted
+
+
+def replace_document_text(document, text) -> dict:
+    """Replace a flat document, refusing to silently delete inline chips."""
+    if document_has_anchors(document):
+        raise ValueError("structured_edit_conflict")
+    normalized = normalize_prompt_document(document)
+    node_id = normalized["nodes"][0]["node_id"]
+    return text_document(text, node_id=node_id)
+
+
+def normalize_capability(raw, *, index=0) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    placement = str(raw.get("placement") or "section_prefix")
+    if placement not in PLACEMENT_PHASES:
+        placement = "section_prefix"
+    result = {
+        "capability_id": str(raw.get("capability_id") or "").strip()
+                         or f"capability_{index + 1}",
+        "kind": str(raw.get("kind") or "text"),
+        "channel_key": str(raw.get("channel_key") or ""),
+        "placement": placement,
+        "enabled": raw.get("enabled") is not False,
+        "config": copy.deepcopy(raw.get("config"))
+                  if isinstance(raw.get("config"), dict) else {},
+    }
+    return result
+
+
+def normalize_attachment(raw) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    attachment_id = str(raw.get("attachment_id") or "").strip() or _new_id()
+    kind = str(raw.get("kind") or "custom")
+    if kind not in ATTACHMENT_KINDS:
+        kind = "custom"
+    # Over-cap declarations are preserved, never sliced: deserialization must
+    # not silently discard authored data, and `attachment_limit_errors` reports
+    # the overflow where a controlled validation error can be returned.
+    capabilities = [normalize_capability(value, index=index)
+                    for index, value in enumerate(raw.get("capabilities") or [])
+                    if isinstance(value, dict)]
+    return {
+        "attachment_id": attachment_id,
+        "emission_group_id": str(raw.get("emission_group_id") or "").strip()
+                             or attachment_id,
+        "kind": kind,
+        "provider_id": str(raw.get("provider_id") or "generic"),
+        "provider_version": str(raw.get("provider_version") or "1"),
+        "enabled": raw.get("enabled") is not False,
+        "source": copy.deepcopy(raw.get("source"))
+                  if isinstance(raw.get("source"), dict) else {},
+        "config": copy.deepcopy(raw.get("config"))
+                  if isinstance(raw.get("config"), dict) else {},
+        "capabilities": capabilities,
+        # Prompt Links export their own dependency edge by default so a linked
+        # source remains transitive. Other inline chips stay excluded unless
+        # the author explicitly opts them in.
+        "link_exportable": bool(raw.get(
+            "link_exportable", kind == "prompt_link")),
+    }
+
+
+def normalize_attachments(raw) -> list:
+    result = []
+    seen = set()
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        normalized = normalize_attachment(entry)
+        attachment_id = normalized["attachment_id"]
+        if attachment_id in seen:
+            normalized["attachment_id"] = _new_id()
+        seen.add(normalized["attachment_id"])
+        result.append(normalized)
+    return result
+
+
+def attachment_limit_errors(attachments) -> list[dict]:
+    """Report over-cap attachment/capability counts as controlled diagnostics."""
+    values = [value for value in (attachments if isinstance(attachments, list)
+                                  else []) if isinstance(value, dict)]
+    errors = []
+    if len(values) > MAX_ATTACHMENTS_PER_SCENE:
+        errors.append({
+            "code": "attachment_limit",
+            "message": (f"A scene may contain at most {MAX_ATTACHMENTS_PER_SCENE} "
+                        "Context attachments."),
+        })
+    for value in values:
+        capabilities = value.get("capabilities")
+        if isinstance(capabilities, list) and len(capabilities) > MAX_CAPABILITIES:
+            errors.append({
+                "code": "capability_limit",
+                "attachment_id": str(value.get("attachment_id") or ""),
+                "message": (f"A Context attachment may declare at most "
+                            f"{MAX_CAPABILITIES} capabilities."),
+            })
+    return errors
+
+
+def shot_attachment(*, timestamp=False, attachment_id=None) -> dict:
+    value = normalize_attachment({
+        "attachment_id": attachment_id,
+        "kind": "shot",
+        "config": {"timestamp": bool(timestamp)},
+    })
+    return value
+
+
+def timestamp_attachment(*, attachment_id=None) -> dict:
+    """Return the canonical standalone Time marker shape."""
+    return normalize_attachment({"attachment_id": attachment_id,
+                                 "kind": "timestamp",
+                                 "config": {"standalone": True}})
+
+
+def migrate_legacy_markers(attachments, starts_new_shot=False,
+                           shot_timestamp=False) -> list:
+    """Canonicalize legacy Shot/Timestamp state to one Shot attachment."""
+    normalized = normalize_attachments(attachments)
+    has_standalone_time = any(
+        value["enabled"] and value["kind"] == "timestamp"
+        and bool((value.get("config") or {}).get("standalone"))
+        for value in normalized)
+    legacy_time = (bool(shot_timestamp) and not has_standalone_time) or any(
+        value["enabled"] and value["kind"] == "timestamp"
+        and not bool((value.get("config") or {}).get("standalone"))
+        for value in normalized)
+    shots = [value for value in normalized if value["kind"] == "shot"]
+    enabled_shot = next((value for value in shots if value["enabled"]), None)
+    wants_shot = bool(starts_new_shot) or enabled_shot is not None or legacy_time
+    if wants_shot and enabled_shot is None:
+        enabled_shot = shot_attachment(timestamp=legacy_time)
+        normalized.append(enabled_shot)
+    if enabled_shot is not None:
+        config = dict(enabled_shot.get("config") or {})
+        config["timestamp"] = bool(config.get("timestamp")) or legacy_time
+        enabled_shot["config"] = config
+    # Only legacy Timestamp records fold into Shot. Explicit standalone Time
+    # markers remain independently authored section-scope attachments.
+    return [value for value in normalized
+            if value["kind"] != "timestamp"
+            or bool((value.get("config") or {}).get("standalone"))]
+
+
+def set_marker_attachment(attachments, kind, enabled) -> list:
+    """Toggle Shot or its timestamp option through attachment authority."""
+    if kind not in {"shot", "timestamp"}:
+        raise ValueError("invalid_marker_kind")
+    normalized = migrate_legacy_markers(attachments)
+    shots = [value for value in normalized
+             if value["kind"] == "shot" and value["enabled"]]
+    if kind == "shot":
+        if enabled and not shots:
+            normalized.append(shot_attachment())
+        elif not enabled:
+            normalized = [value for value in normalized
+                          if value["kind"] != "shot"]
+        return normalized
+    if enabled and not shots:
+        shot = shot_attachment(timestamp=True)
+        normalized.append(shot)
+        shots = [shot]
+    for shot in shots:
+        config = dict(shot.get("config") or {})
+        config["timestamp"] = bool(enabled)
+        shot["config"] = config
+    return normalized
+
+
+def clone_for_split(channel_documents, attachments) -> tuple[dict, list]:
+    """Clone applicable context for the right half of a section split.
+
+    Authored Shot/Timestamp markers stay on the left. Other attachments receive
+    fresh UI identities but retain emission_group_id so a combined render can
+    deduplicate their semantic output.
+    """
+    clones, id_map = [], {}
+    for attachment in normalize_attachments(attachments):
+        if attachment["kind"] in {"shot", "timestamp"}:
+            continue
+        clone = copy.deepcopy(attachment)
+        clone_id = _new_id()
+        id_map[attachment["attachment_id"]] = clone_id
+        clone["attachment_id"] = clone_id
+        clones.append(clone)
+    documents = {}
+    for key, raw in (channel_documents or {}).items():
+        document = normalize_prompt_document(raw)
+        nodes = []
+        for node in document["nodes"]:
+            if node["type"] == "text":
+                nodes.append({**node, "node_id": _new_id()})
+            elif node["attachment_id"] in id_map:
+                nodes.append({**node, "node_id": _new_id(),
+                              "attachment_id": id_map[node["attachment_id"]]})
+        documents[str(key)] = normalize_prompt_document({"nodes": nodes})
+    return documents, clones
+
+
+def normalize_semantic_unit(raw) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    contributions = []
+    seen = set()
+    for value in raw.get("source_members") or []:
+        if not isinstance(value, dict):
+            continue
+        key = (str(value.get("entity_id") or ""),
+               str(value.get("member_id") or ""))
+        if not all(key) or key in seen:
+            continue
+        seen.add(key)
+        contributions.append({"entity_id": key[0], "member_id": key[1]})
+    visual_intent = str(raw.get("visual_intent") or "preserve")
+    if visual_intent not in VISUAL_INTENTS:
+        visual_intent = "preserve"
+    audio_intent = str(raw.get("audio_intent") or "reference_characteristics")
+    if audio_intent not in AUDIO_INTENTS:
+        audio_intent = "reference_characteristics"
+    try:
+        # Authored/API data reaches this normalizer outside any handler, so a
+        # non-numeric order must not become a 500.
+        order = int(raw.get("order") or 0)
+    except (TypeError, ValueError):
+        order = 0
+    return {
+        "semantic_unit_id": str(raw.get("semantic_unit_id") or "").strip()
+                            or _new_id(),
+        "name": str(raw.get("name") or "Subject"),
+        "order": order,
+        "source_members": contributions,
+        "visual_intent": visual_intent,
+        "audio_intent": audio_intent,
+        "definition": str(raw.get("definition") or ""),
+        "intent_overrides": copy.deepcopy(raw.get("intent_overrides"))
+                            if isinstance(raw.get("intent_overrides"), dict) else {},
+    }
+
+
+def _profile(profile_id, name, template_id, *, capabilities, writing_aids,
+             separators=None, validators=None, role_catalogs=None) -> dict:
+    value = {
+        "profile_id": profile_id,
+        "version": "1",
+        "name": name,
+        "template_id": template_id,
+        "capabilities": capabilities,
+        "writing_aids": writing_aids,
+        "separators": separators or {"attachment": " ", "line": "\n"},
+        "validators": validators or [],
+        "role_catalogs": copy.deepcopy(role_catalogs or {}),
+        "builtin": True,
+    }
+    value["content_hash"] = content_hash(value)
+    return value
+
+
+_GENERIC_AIDS = [
+    {"id": "dialogue", "label": "Dialogue", "text": "<d>[{language}] {text}</d>",
+     "fields": {"language": {"type": "enum", "values": [
+         "English", "Spanish", "French", "German", "Italian", "Japanese",
+         "Korean", "Chinese", "Portuguese", "Hindi"]}}},
+    {"id": "voiceover", "label": "Voiceover", "text": "Voiceover: {text}"},
+    {"id": "group_speech", "label": "Group speech", "text": "Group says: {text}"},
+    {"id": "singing", "label": "Singing", "text": "Singing: {text}"},
+    {"id": "scene_transition", "label": "Scene transition", "text": "<scenetrans>"},
+    {"id": "cutoff", "label": "Cutoff", "text": "<cutoff>"},
+    {"id": "visible_text", "label": "Visible text", "text": "\"{text}\""},
+    {"id": "camera_motion", "label": "Camera motion", "text": "The camera {motion}.",
+     "fields": {"motion": {"type": "enum", "values": [
+         "pushes in", "pulls out", "pans left", "pans right", "tilts up",
+         "tilts down", "trucks left", "trucks right", "orbits the subject",
+         "remains static"]}}},
+]
+
+_MINIMAX_AIDS = copy.deepcopy(_GENERIC_AIDS)
+_MINIMAX_LANGUAGE_FIELD = {"language": {"type": "enum", "values": [
+    "English", "Spanish", "French", "German", "Italian", "Japanese",
+    "Korean", "Chinese", "Portuguese", "Hindi"]}}
+for _aid in _MINIMAX_AIDS:
+    if _aid["id"] == "voiceover":
+        _aid["text"] = ("The on-screen character says in an off-screen voiceover: "
+                        "<d>[{language}] {text}</d> while the corresponding "
+                        "on-screen character's lips remain completely closed.")
+        _aid["fields"] = copy.deepcopy(_MINIMAX_LANGUAGE_FIELD)
+    elif _aid["id"] == "singing":
+        # H3 sung lyrics use the same bounded-language <d> envelope as speech;
+        # inheriting the Generic bare "Singing: {text}" emitted lyrics the model
+        # reads as description rather than vocal content.
+        _aid["text"] = "Singing: <d>[{language}] {text}</d>"
+        _aid["fields"] = copy.deepcopy(_MINIMAX_LANGUAGE_FIELD)
+
+BUILTIN_PROFILES = {
+    "generic@1": _profile(
+        "generic", "Generic", "standard",
+        capabilities={
+            "shot": {"placement": "section_prefix"},
+            "timestamp": {"placement": "section_prefix"},
+            "prompt_link": {"placement": "inline"},
+            "guide": {"placement": "inline"},
+            "reference": {"placement": "inline"},
+            "vocal_event": {"placement": "inline"},
+        }, writing_aids=_GENERIC_AIDS),
+    "minimax_h3_base@1": _profile(
+        "minimax_h3_base", "MiniMax H3 Base", "minimax_h3_base",
+        capabilities={
+            "shot": {"channel_key": "integrated_multimodal_description",
+                     "placement": "section_prefix"},
+            "timestamp": {"channel_key": "integrated_multimodal_description",
+                          "placement": "section_prefix"},
+            "prompt_link": {"placement": "inline"},
+            "guide": {"channel_key": "integrated_multimodal_description",
+                      "placement": "inline"},
+            "vocal_event": {"channel_key": "integrated_multimodal_description",
+                            "placement": "inline"},
+        }, writing_aids=_MINIMAX_AIDS,
+        validators=["minimax_base_setup", "managed_speakers"]),
+    "minimax_h3_ref@1": _profile(
+        "minimax_h3_ref", "MiniMax H3 Full Reference", "minimax_h3_ref",
+        capabilities={
+            "shot": {"channel_key": "detailed_description",
+                     "placement": "section_prefix"},
+            "timestamp": {"channel_key": "detailed_description",
+                          "placement": "section_prefix"},
+            "prompt_link": {"placement": "inline"},
+            "guide": {"channel_key": "detailed_description", "placement": "inline"},
+            "reference": {
+                "routes": {"definitions": "subject_definitions",
+                           "summary": "summary", "retention": "retention_analysis",
+                           "mentions": "detailed_description",
+                           "audio_relationship": "summary"}},
+            "vocal_event": {"channel_key": "detailed_description",
+                            "placement": "inline"},
+        }, writing_aids=_MINIMAX_AIDS,
+        validators=["minimax_reference_setup", "managed_speakers"],
+        role_catalogs=MINIMAX_H3_ROLE_CATALOGS),
+}
+
+TEMPLATE_DEFAULT_PROFILES = {
+    "standard": "generic@1", "sonder": "generic@1",
+    "minimax_h3_base": "minimax_h3_base@1",
+    "minimax_h3_ref": "minimax_h3_ref@1",
+}
+
+
+def normalize_profile(raw, *, builtin=False) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError("invalid_profile")
+    serialized = _canonical_json(raw).encode("utf-8")
+    if len(serialized) > PROFILE_LIMIT_BYTES:
+        raise ValueError("profile_too_large")
+    capabilities = raw.get("capabilities")
+    if not isinstance(capabilities, dict) or len(capabilities) > MAX_CAPABILITIES:
+        raise ValueError("invalid_profile_capabilities")
+
+    def assert_declarative(value, depth=0):
+        if depth > 8:
+            raise ValueError("profile_recursion_limit")
+        if isinstance(value, dict):
+            for key, child in value.items():
+                lowered = str(key).lower()
+                if lowered in {"regex", "regexp", "expression", "script", "html",
+                               "javascript", "python", "callback", "function"}:
+                    raise ValueError("executable_profile_field_forbidden")
+                assert_declarative(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                assert_declarative(child, depth + 1)
+        elif isinstance(value, str):
+            lowered = value.lower()
+            if any(token in lowered for token in (
+                    "<script", "<iframe", "javascript:", "onerror=", "onclick=",
+                    "{{", "{%", "${", "eval(", "function(", "=>")):
+                raise ValueError("executable_formatter_forbidden")
+
+    assert_declarative(capabilities)
+    assert_declarative(raw.get("separators") or {})
+    assert_declarative(raw.get("validators") or [])
+    assert_declarative(raw.get("role_catalogs") or {})
+    role_catalogs = _normalized_role_catalog(raw.get("role_catalogs"))
+    if raw.get("role_catalogs") and not role_catalogs:
+        raise ValueError("invalid_profile_role_catalogs")
+    separators = raw.get("separators")
+    if separators is not None and not isinstance(separators, dict):
+        raise ValueError("invalid_profile_separators")
+    separators = separators if isinstance(separators, dict) else {}
+    for separator_name, separator_value in separators.items():
+        if str(separator_name) not in SEPARATOR_NAMES:
+            raise ValueError("unknown_profile_separator")
+        # A non-string separator reaches `str.join` at compile time and would
+        # raise AttributeError deep inside emission assembly, i.e. a 500.
+        if not isinstance(separator_value, str) or len(separator_value) > 16:
+            raise ValueError("invalid_profile_separator")
+    for capability_kind, declaration in capabilities.items():
+        if str(capability_kind) not in ATTACHMENT_KINDS:
+            raise ValueError("unknown_profile_capability_kind")
+        # A non-object declaration reaches `.get` in routing/default-capability
+        # resolution.  Refuse it here rather than crashing compilation.
+        if not isinstance(declaration, dict):
+            raise ValueError("invalid_profile_capability")
+        placement = declaration.get("placement")
+        if placement is not None and placement not in PLACEMENT_PHASES:
+            raise ValueError("invalid_capability_placement")
+        channel_key = declaration.get("channel_key")
+        if channel_key is not None and (not isinstance(channel_key, str)
+                                        or len(channel_key) > 128):
+            raise ValueError("invalid_capability_channel_key")
+        routes = declaration.get("routes")
+        if routes is not None:
+            if not isinstance(routes, dict) or len(routes) > MAX_CAPABILITIES:
+                raise ValueError("invalid_capability_routes")
+            for route_name, route_value in routes.items():
+                if (not isinstance(route_name, str) or not route_name.strip()
+                        or not isinstance(route_value, str)
+                        or not route_value.strip() or len(route_value) > 128):
+                    raise ValueError("invalid_capability_routes")
+        raw_formatter = declaration.get("formatter")
+        if raw_formatter is not None and not isinstance(raw_formatter, str):
+            raise ValueError("invalid_capability_formatter")
+        fields_declaration = declaration.get("fields")
+        if fields_declaration is not None and not isinstance(fields_declaration, dict):
+            raise ValueError("invalid_capability_fields")
+        formatter = str(raw_formatter or "")
+        if not formatter:
+            continue
+        if len(formatter.encode("utf-8")) > FORMATTER_LIMIT_BYTES:
+            raise ValueError("formatter_too_large")
+        field_declarations = (declaration.get("fields")
+                              if isinstance(declaration.get("fields"), dict)
+                              else {})
+        for field_name, field in field_declarations.items():
+            if not isinstance(field, dict) or field.get("type") != "enum":
+                raise ValueError("capability_fields_must_be_enums")
+            values = field.get("values")
+            if (not isinstance(values, list) or not values or len(values) > 64
+                    or any(not isinstance(value, str) or len(value) > 128
+                           for value in values)):
+                raise ValueError("invalid_capability_enum")
+        substitutions = set(re.findall(
+            r"\{([A-Za-z_][A-Za-z0-9_]*)\}", formatter))
+        if not substitutions.issubset(
+                set(field_declarations) | {"text", "value"}):
+            raise ValueError("unknown_formatter_substitution")
+    aids = []
+    for aid in raw.get("writing_aids") or []:
+        if not isinstance(aid, dict):
+            raise ValueError("invalid_writing_aid")
+        text = str(aid.get("text") or "")
+        if len(text.encode("utf-8")) > FORMATTER_LIMIT_BYTES:
+            raise ValueError("formatter_too_large")
+        assert_declarative(aid)
+        fields = aid.get("fields") if isinstance(aid.get("fields"), dict) else {}
+        for field_name, declaration in fields.items():
+            if not isinstance(declaration, dict) or declaration.get("type") != "enum":
+                raise ValueError("writing_aid_fields_must_be_enums")
+            values = declaration.get("values")
+            if (not isinstance(values, list) or not values or len(values) > 64
+                    or any(not isinstance(value, str) or len(value) > 128
+                           for value in values)):
+                raise ValueError("invalid_writing_aid_enum")
+        allowed_substitutions = set(fields) | {"text"}
+        substitutions = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", text))
+        if not substitutions.issubset(allowed_substitutions):
+            raise ValueError("unknown_formatter_substitution")
+        aids.append(copy.deepcopy(aid))
+    validators = []
+    for validator in raw.get("validators") or []:
+        if isinstance(validator, str):
+            if validator not in {"minimax_base_setup", "minimax_reference_setup",
+                                  "managed_speakers"}:
+                raise ValueError("unknown_profile_validator")
+            validators.append(validator)
+            continue
+        if not isinstance(validator, dict):
+            raise ValueError("invalid_profile_validator")
+        kind = str(validator.get("kind") or "")
+        if kind not in {"required_channel", "max_channel_chars",
+                        "max_final_chars", "require_attachment_kind"}:
+            raise ValueError("unknown_profile_validator")
+        severity = str(validator.get("severity") or "error")
+        if severity not in {"error", "warning"}:
+            raise ValueError("invalid_profile_validator_severity")
+        normalized_validator = {"kind": kind, "severity": severity,
+                                "message": str(validator.get("message") or "")[:512]}
+        if kind in {"required_channel", "max_channel_chars"}:
+            channel_key = str(validator.get("channel_key") or "").strip()
+            if not channel_key:
+                raise ValueError("profile_validator_channel_required")
+            normalized_validator["channel_key"] = channel_key
+        if kind in {"max_channel_chars", "max_final_chars"}:
+            try:
+                limit = int(validator.get("limit"))
+            except (TypeError, ValueError):
+                raise ValueError("profile_validator_limit_required") from None
+            if not 1 <= limit <= MAX_COMPILED_PROMPT:
+                raise ValueError("profile_validator_limit_out_of_bounds")
+            normalized_validator["limit"] = limit
+        if kind == "require_attachment_kind":
+            attachment_kind = str(validator.get("attachment_kind") or "")
+            if attachment_kind not in ATTACHMENT_KINDS:
+                raise ValueError("profile_validator_attachment_kind_invalid")
+            normalized_validator["attachment_kind"] = attachment_kind
+        validators.append(normalized_validator)
+    # An explicit multi-template declaration is the only way to author a format
+    # that several channel templates may select; without preserving it here the
+    # field read by `profile_compatible_templates` could never exist.
+    raw_templates = raw.get("compatible_templates")
+    compatible_templates = []
+    if raw_templates is not None:
+        if not isinstance(raw_templates, list) or len(raw_templates) > 64:
+            raise ValueError("invalid_profile_compatible_templates")
+        for entry in raw_templates:
+            if not isinstance(entry, str) or not entry.strip() or len(entry) > 128:
+                raise ValueError("invalid_profile_compatible_templates")
+            if entry not in compatible_templates:
+                compatible_templates.append(entry)
+    value = {
+        "profile_id": str(raw.get("profile_id") or "custom").strip(),
+        "version": str(raw.get("version") or "1").strip(),
+        "name": str(raw.get("name") or "Custom profile"),
+        "template_id": str(raw.get("template_id") or "standard"),
+        **({"compatible_templates": compatible_templates}
+           if compatible_templates else {}),
+        "capabilities": copy.deepcopy(capabilities),
+        "writing_aids": aids,
+        "separators": copy.deepcopy(separators),
+        "validators": validators,
+        "role_catalogs": role_catalogs,
+        "builtin": bool(builtin),
+    }
+    value["content_hash"] = content_hash(value)
+    return value
+
+
+UNIVERSAL_PROFILE_TEMPLATE = "*"
+
+
+class ProfileResolutionError(ValueError):
+    """A prompt format that cannot be used, with a stable diagnostic code.
+
+    A distinct type so compile call sites can convert *this* into a controlled
+    authoring diagnostic without also swallowing genuine internal ValueErrors
+    and reporting them under a nonsense code.
+    """
+
+    def __init__(self, code, detail=""):
+        self.code = str(code)
+        self.detail = str(detail)
+        super().__init__(f"{self.code}:{self.detail}" if self.detail else self.code)
+
+
+def profile_key(profile) -> str:
+    return f"{(profile or {}).get('profile_id')}@{(profile or {}).get('version')}"
+
+
+def profile_compatible_templates(profile) -> set:
+    """Channel templates a prompt format may be selected under.
+
+    Provider requirements are enforced per channel template — MiniMax H3
+    validation branches on the template id — so a Standard template paired with
+    `minimax_h3_ref@1` would claim the format while skipping every MiniMax
+    requirement.  A format declaring the neutral `standard` base stays
+    universal, which is what generic and project-custom templates rely on;
+    an explicit `compatible_templates` list names several.
+    """
+    declared = (profile or {}).get("compatible_templates")
+    if isinstance(declared, list) and declared:
+        return {str(value) for value in declared}
+    template_id = str((profile or {}).get("template_id") or "")
+    if template_id in {"", "standard"}:
+        return {UNIVERSAL_PROFILE_TEMPLATE}
+    return {template_id}
+
+
+def profile_matches_template(profile, template_id, *, template=None) -> bool:
+    allowed = profile_compatible_templates(profile)
+    if (UNIVERSAL_PROFILE_TEMPLATE in allowed
+            or str(template_id or "") in allowed):
+        return True
+    # A channel template naming this format as its own default HAS declared the
+    # pairing. Copying a MiniMax template mints a new custom id, so without this
+    # every scene inheriting that copy's default would be permanently blocked by
+    # a format the template itself selected.
+    declared = str((template or {}).get("default_context_profile") or "")
+    if not declared:
+        return False
+    return declared in {profile_key(profile),
+                        str((profile or {}).get("profile_id") or "")}
+
+
+def _require_profile_template(profile, resolved_template) -> dict:
+    template_id = str((resolved_template or {}).get("id") or "")
+    if not profile_matches_template(profile, template_id,
+                                    template=resolved_template):
+        raise ProfileResolutionError("profile_template_incompatible",
+                                     f"{profile_key(profile)}:{template_id}")
+    return profile
+
+
+def resolve_profile(profile=None, *, template=None, custom_profiles=None) -> dict:
+    resolved_template = prompt_channel_templates.get_channel_template(template)
+    requested = profile
+    if isinstance(profile, dict):
+        return _require_profile_template(normalize_profile(profile),
+                                         resolved_template)
+    if not requested:
+        requested = (resolved_template.get("default_context_profile")
+                     or TEMPLATE_DEFAULT_PROFILES.get(
+                         resolved_template.get("id"), "generic@1"))
+    key = str(requested)
+    if "@" not in key:
+        key = f"{key}@1"
+    if key in BUILTIN_PROFILES:
+        return _require_profile_template(
+            copy.deepcopy(BUILTIN_PROFILES[key]), resolved_template)
+    for value in custom_profiles or []:
+        try:
+            normalized = normalize_profile(value)
+        except ValueError:
+            continue
+        candidate = f"{normalized['profile_id']}@{normalized['version']}"
+        if candidate == key:
+            return _require_profile_template(normalized, resolved_template)
+    raise ProfileResolutionError("unknown_profile", key)
+
+
+def _attachment_map(attachments):
+    return {value["attachment_id"]: value
+            for value in normalize_attachments(attachments)}
+
+
+def _join_emissions(parts, separator=" ") -> str:
+    return separator.join(str(value or "").strip() for value in parts
+                          if str(value or "").strip()).strip()
+
+
+def _speaker_bindings(events):
+    order = {}
+    next_number = 1
+    for event in events:
+        subjects = event["attachment"]["source"].get("subject_ids") or []
+        voice_id = str(event["attachment"]["source"].get("voice_id") or "")
+        keys = [str(value) for value in subjects if str(value)]
+        if not keys and voice_id:
+            keys = [f"voice:{voice_id}"]
+        if not keys:
+            keys = [f"event:{event['attachment']['attachment_id']}"]
+        for key in keys:
+            if key not in order:
+                order[key] = next_number
+                next_number += 1
+        event["speaker_numbers"] = [order[key] for key in keys]
+    return order
+
+
+def _render_vocal_event(attachment, speaker_numbers):
+    config = attachment["config"]
+    event_type = str(config.get("event_type") or "dialogue")
+    if event_type not in VOCAL_EVENT_TYPES:
+        event_type = "dialogue"
+    text = str(config.get("text") or "").strip()
+    language = str(config.get("language") or "English").strip() or "English"
+    speakers = ",".join(f"S{value}" for value in speaker_numbers)
+    speaker_token = f"({speakers})" if speakers else ""
+    subject_phrase = str(config.get("subject_phrase") or "").strip()
+    prefix = " ".join(value for value in (subject_phrase, speaker_token) if value)
+    if event_type == "dialogue":
+        return f"{prefix} says: <d>[{language}] {text}</d>".strip()
+    if event_type == "group_speech":
+        return f"{prefix} say together: <d>[{language}] {text}</d>".strip()
+    if event_type == "singing":
+        return f"{prefix} sings: <d>[{language}] {text}</d>".strip()
+    if event_type == "voiceover":
+        return (f"{prefix} says in an off-screen voiceover: "
+                f"<d>[{language}] {text}</d> while the corresponding on-screen "
+                "character's lips remain completely closed.").strip()
+    return f"{prefix} narrates: <d>[{language}] {text}</d>".strip()
+
+
+def _reference_labels(attachment, context):
+    labels = []
+    manifest = context.get("ordinal_manifest") or {}
+    for source_id in attachment["source"].get("semantic_unit_ids") or []:
+        number = (manifest.get("subjects") or {}).get(str(source_id))
+        if number:
+            labels.append(f"<Subject {number}>")
+            for label in context.get("unit_source_labels", {}).get(str(source_id)) or []:
+                if str(label).startswith("<Audio ") and label not in labels:
+                    labels.append(str(label))
+    for population, label in (("pictures", "Picture"), ("videos", "Video"),
+                              ("audios", "Audio")):
+        for source_id in attachment["source"].get(f"{population[:-1]}_ids") or []:
+            number = (manifest.get(population) or {}).get(str(source_id))
+            if number:
+                labels.append(f"<{label} {number}>")
+    return labels
+
+
+def _minimax_task_types(context, configured=()):
+    """Return guide-ordered, explicit-role-derived H3 task types.
+
+    Physical media presence never implies editing, continuation, reuse, or
+    reference. An explicit chip selection overrides the staged-role default.
+    """
+    explicit = {str(raw or "").strip().lower() for raw in configured or []}
+    explicit.intersection_update(MINIMAX_TASK_TYPES)
+    if explicit:
+        return [value for value in MINIMAX_TASK_TYPES if value in explicit]
+    found = set()
+    manifest = context.get("setup_manifest") or {}
+    for row in manifest.get("pictures") or []:
+        role = str(row.get("role") or "").strip().lower().replace("-", "_")
+        if role in {"first_frame", "last_frame", "keyframe", "edited_keyframe",
+                    "composition_anchor"}:
+            found.add("keyframe completion")
+        elif role in {"storyboard", "identity", "environment", "style", "motion",
+                      "reference_generation"}:
+            found.add("reference generation")
+    for row in manifest.get("videos") or []:
+        role = str(row.get("role") or "").strip().lower().replace("-", "_")
+        if role in {"edit", "editing", "video_edit", "video_editing"}:
+            found.add("video editing")
+        elif role in {"continue", "continuation", "video_continuation"}:
+            found.add("video continuation")
+        elif role in {"temporal_structure", "motion", "camera", "rhythm",
+                      "reference_generation"}:
+            found.add("reference generation")
+    for row in manifest.get("standalone_audios") or []:
+        role = str(row.get("role") or "").strip().lower()
+        if role in {"copy", "copy_full", "copy_partial", "audio_reuse",
+                    "fully_copy", "partially_copy"}:
+            found.add("audio reuse")
+        elif role in {"reference", "reference_characteristics", "reference_loosely",
+                      "audio_reference", "timbre", "rhythm", "sound_texture"}:
+            found.add("audio reference")
+    return [value for value in MINIMAX_TASK_TYPES if value in found]
+
+
+def _subject_definition(config, unit, context) -> tuple[str, str]:
+    """Resolve authored Subject prose and its inheritance source."""
+    configured = str(config.get("definition") or "").strip()
+    if configured:
+        return configured, "chip"
+    unit_definition = str(unit.get("definition") or "").strip()
+    if unit_definition:
+        return unit_definition, "subject"
+    member_ids = {str(value.get("member_id") or "")
+                  for value in unit.get("source_members") or []
+                  if isinstance(value, dict)}
+    prompts = []
+    for row in (context.get("setup_manifest", {}).get("presentation") or []):
+        member_id = str(row.get("member_id") or row.get("video_member_id") or "")
+        prompt = str(row.get("member_prompt") or "").strip()
+        if member_id in member_ids and prompt and prompt not in prompts:
+            prompts.append(prompt)
+    return "; ".join(prompts), ("member" if prompts else "")
+
+
+def _render_reference_capability(attachment, capability, context):
+    kind = capability.get("kind") or capability.get("capability_id")
+    config = {**attachment.get("config", {}), **capability.get("config", {})}
+    labels = _reference_labels(attachment, context)
+    if kind == "derived_prompt":
+        item_id = str(attachment.get("source", {}).get("reference_item_id") or "")
+        row = (context.get("generic_references") or {}).get(item_id) or {}
+        return str(row.get("prompt") or "").strip()
+    if kind in {"definitions", "retention"}:
+        return "\n".join(text for _owner, text in reference_capability_lines(
+            attachment, capability, context))
+    if kind == "mentions":
+        return str(config.get("text") or " ".join(labels)).strip()
+    if kind == "summary":
+        task_types = _minimax_task_types(context, config.get("task_types") or [])
+        prefix = f"[{' + '.join(task_types)}] " if task_types else ""
+        return f"{prefix}{str(config.get('summary') or '').strip()}".strip()
+    if kind == "audio_relationship":
+        # The chip editor owns this under its capability's own key. `text` is a
+        # compatibility fallback ONLY for documents authored before that key
+        # existed: the same attachment's `text` also holds the Mention prose, so
+        # an empty-but-present audio_relationship must render empty rather than
+        # duplicating the mention into the summary channel.
+        if "audio_relationship" in config:
+            return str(config.get("audio_relationship") or "").strip()
+        return str(config.get("text") or "").strip()
+    return str(config.get("text") or "").strip()
+
+
+def reference_capability_lines(attachment, capability, context) -> list[tuple]:
+    """Owner-tagged definition/retention lines for per-semantic-unit dedupe.
+
+    Two chips may legitimately select overlapping Subjects ([A, B] and [A]).
+    Deduping by the complete selection tuple emits A twice and lets two
+    contradictory definitions through without a `conflicting_emission`, so the
+    owner key must be the semantic unit or physical slot, not the chip.
+    """
+    kind = capability.get("kind") or capability.get("capability_id")
+    config = {**attachment.get("config", {}), **capability.get("config", {})}
+    labels = _reference_labels(attachment, context)
+    units = context.get("semantic_units_by_id") or {}
+    if kind == "definitions":
+        lines = []
+        for unit_id in attachment["source"].get("semantic_unit_ids") or []:
+            unit = units.get(str(unit_id)) or {}
+            number = (context.get("ordinal_manifest", {}).get("subjects") or {}).get(str(unit_id))
+            definition, _definition_source = _subject_definition(
+                config, unit, context)
+            source = ""
+            source_labels = context.get("unit_source_labels", {}).get(str(unit_id)) or []
+            visual_labels = [str(value) for value in source_labels
+                             if str(value).startswith(("<Picture ", "<Video "))]
+            if visual_labels:
+                if len(visual_labels) == 1:
+                    joined_labels = visual_labels[0]
+                else:
+                    joined_labels = ", ".join(visual_labels[:-1]) + f", and {visual_labels[-1]}"
+                source = f" from {joined_labels}"
+            else:
+                # Compatibility for frozen manifests written by the first
+                # prompt_context_v1 preview builds.
+                member_slots = context.get("unit_picture_ordinals", {}).get(str(unit_id)) or []
+                if member_slots:
+                    source = f" from <Picture {member_slots[0]}>"
+            if number and definition:
+                lines.append((("subject_definition", str(unit_id)),
+                              f"<Subject {number}> is {definition}{source}"))
+            audio_definition = str(config.get("audio_definition") or "").strip()
+            speaker_subject_id = str(config.get("audio_speaker_subject_id") or "")
+            speaker_suffix = ""
+            if speaker_subject_id:
+                speaker_subject_number = (context.get("ordinal_manifest", {}).get(
+                    "subjects") or {}).get(speaker_subject_id)
+                speaker_number = (context.get("speaker_order") or {}).get(
+                    speaker_subject_id)
+                if speaker_subject_number and speaker_number:
+                    speaker_suffix = (f" for <Subject {speaker_subject_number}> "
+                                      f"(S{speaker_number})")
+            for audio_label in (value for value in source_labels
+                                if str(value).startswith("<Audio ")):
+                if audio_definition:
+                    lines.append((("audio_definition", str(audio_label)),
+                                  f"{audio_label} is {audio_definition}{speaker_suffix}"))
+        physical_definitions = (config.get("physical_definitions")
+                                if isinstance(config.get(
+                                    "physical_definitions"), dict) else {})
+        manifest = context.get("ordinal_manifest") or {}
+        for source_key, population, label in (
+                ("picture_ids", "pictures", "Picture"),
+                ("video_ids", "videos", "Video"),
+                ("audio_ids", "audios", "Audio")):
+            for source_id in attachment["source"].get(source_key) or []:
+                number = (manifest.get(population) or {}).get(str(source_id))
+                definition = str(physical_definitions.get(str(source_id)) or (
+                    config.get("audio_definition") if source_key == "audio_ids"
+                    else config.get("definition")) or "").strip()
+                if number and definition:
+                    lines.append((("physical_definition", population, str(source_id)),
+                                  f"<{label} {number}> is {definition}"))
+        return lines
+    if kind == "retention":
+        lines = []
+        visual_intent = str(config.get("visual_intent") or "")
+        audio_intent = str(config.get("audio_intent") or "")
+        for label in labels:
+            unit_id = ""
+            if label.startswith("<Subject"):
+                number = re.search(r"\d+", label)
+                unit_id = next((value for value in
+                                attachment["source"].get("semantic_unit_ids") or []
+                                if str((context.get("ordinal_manifest", {}).get(
+                                    "subjects") or {}).get(str(value)))
+                                == (number.group(0) if number else "")), "")
+                unit = units.get(str(unit_id)) or {}
+                resolved_visual = visual_intent or str(
+                    unit.get("visual_intent") or "preserve")
+                resolved_audio = audio_intent or str(
+                    unit.get("audio_intent") or "reference_characteristics")
+                member_ids = {str(value.get("member_id") or "")
+                              for value in unit.get("source_members") or []
+                              if isinstance(value, dict)}
+                applicable = [row for row in (
+                    (context.get("setup_manifest", {}).get("pictures") or [])
+                    + (context.get("setup_manifest", {}).get("videos") or [])
+                    + (context.get("setup_manifest", {}).get("standalone_audios") or []))
+                              if str(row.get("member_id") or
+                                     row.get("video_member_id") or "") in member_ids]
+                staged_visual = {str(row.get("visual_intent") or "")
+                                 for row in applicable if row.get("visual_intent")}
+                staged_audio = {str(row.get("audio_intent") or "")
+                                for row in applicable if row.get("audio_intent")}
+                if not visual_intent and len(staged_visual) == 1:
+                    resolved_visual = next(iter(staged_visual))
+                if not audio_intent and len(staged_audio) == 1:
+                    resolved_audio = next(iter(staged_audio))
+            else:
+                ordinal_match = re.search(r"\d+", label)
+                ordinal = int(ordinal_match.group(0)) if ordinal_match else 0
+                setup = context.get("setup_manifest") or {}
+                if label.startswith("<Picture"):
+                    staged_row = next((row for row in setup.get("pictures") or []
+                                       if int(row.get("picture_ordinal") or 0)
+                                       == ordinal), {})
+                elif label.startswith("<Video"):
+                    staged_row = next((row for row in setup.get("videos") or []
+                                       if int(row.get("video_ordinal") or 0)
+                                       == ordinal), {})
+                else:
+                    staged_row = next((row for row in (
+                        setup.get("standalone_audios") or [])
+                                       if int(row.get("audio_ordinal") or 0)
+                                       == ordinal), {})
+                resolved_visual = visual_intent or str(
+                    staged_row.get("visual_intent") or "preserve")
+                resolved_audio = audio_intent or str(
+                    staged_row.get("audio_intent") or
+                    "reference_characteristics")
+            marker = AUDIO_INTENTS.get(resolved_audio, "reference") if label.startswith("<Audio") \
+                else VISUAL_INTENTS.get(resolved_visual, "fully_preserved")
+            unit_shots = context.get("reference_unit_shots") or {}
+            appearances = (unit_shots.get(str(unit_id)) if label.startswith("<Subject")
+                           else None) or (context.get("reference_group_shots") or {}).get(
+                               attachment.get("emission_group_id"), [])
+            appearance = ""
+            if label.startswith("<Subject") and appearances:
+                appearance = " (appears in " + ", ".join(
+                    f"[Shot {number}]" for number in appearances) + ")"
+            details = config.get("retention_details")
+            detail = ""
+            if isinstance(details, dict):
+                detail = str(details.get(label) or "").strip()
+            detail = detail or str(config.get("retention_detail") or "").strip()
+            owner = (("retention_subject", str(unit_id))
+                     if label.startswith("<Subject")
+                     else ("retention_physical", str(label)))
+            lines.append((owner, f"{label}{appearance}: {marker}"
+                          + (f" - {detail}" if detail else "")))
+        return lines
+    return []
+
+
+def _render_generic(attachment, capability, context, speaker_numbers=None):
+    kind = attachment["kind"]
+    config = {**attachment.get("config", {}), **capability.get("config", {})}
+    if kind == "vocal_event":
+        return _render_vocal_event(attachment, speaker_numbers or [])
+    if kind == "guide":
+        return str(config.get("text") or "").strip()
+    if kind == "reference":
+        return _render_reference_capability(attachment, capability, context)
+    if kind == "custom":
+        declaration = _custom_declaration(context.get("profile"))
+        formatter = str(declaration.get("formatter") or "")
+        if formatter:
+            declared = _custom_field_declarations(declaration)
+            authored = _custom_authored_fields(config)
+            value = formatter
+            # Only declared field names substitute, and only with a value from
+            # that field's declared enum.  An API-authored config may carry
+            # anything; substituting it unchecked is exactly the bounded-enum
+            # bypass this guards, and `custom_capability_errors` reports it.
+            for name, field in declared.items():
+                allowed = {str(entry) for entry in field.get("values") or []}
+                authored_value = str(authored.get(name) or "")
+                value = value.replace(
+                    "{" + name + "}",
+                    authored_value if authored_value in allowed else "")
+            for name in ("text", "value"):
+                if name in declared:
+                    continue
+                value = value.replace("{" + name + "}",
+                                      str(config.get("text") or ""))
+            return value.strip()
+        return str(config.get("text") or "").strip()
+    return ""
+
+
+def _custom_declaration(profile) -> dict:
+    declaration = ((profile or {}).get("capabilities") or {}).get("custom")
+    return declaration if isinstance(declaration, dict) else {}
+
+
+def _custom_field_declarations(declaration) -> dict:
+    fields = declaration.get("fields")
+    return {str(name): value for name, value in fields.items()
+            if isinstance(value, dict)} if isinstance(fields, dict) else {}
+
+
+def _custom_authored_fields(config) -> dict:
+    """Authored substitution values: an explicit `fields` bag, else flat config."""
+    fields = config.get("fields")
+    source = fields if isinstance(fields, dict) else config
+    return {str(name): value for name, value in source.items()}
+
+
+def custom_capability_errors(attachment, capability, profile) -> list[dict]:
+    """Validate authored custom fields against the profile's declaration."""
+    declaration = _custom_declaration(profile)
+    formatter = str(declaration.get("formatter") or "")
+    if not formatter:
+        return []
+    declared = _custom_field_declarations(declaration)
+    config = {**(attachment.get("config") or {}),
+              **((capability or {}).get("config") or {})}
+    authored = _custom_authored_fields(config)
+    attachment_id = str(attachment.get("attachment_id") or "")
+    errors = []
+    substitutions = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", formatter))
+    # An explicit `fields` bag states substitution intent, so every name in it
+    # must be declared. A flat legacy config is not checked for extra keys: it
+    # doubles as the chip's own configuration and carries unrelated state.
+    candidates = set(authored) if isinstance(config.get("fields"), dict) else (
+        set(authored) & set(declared))
+    checked = set()
+    for name in sorted(substitutions | candidates):
+        if name in checked:
+            continue
+        checked.add(name)
+        field = declared.get(name)
+        if field is None:
+            if name in {"text", "value"}:
+                continue
+            errors.append({
+                "code": "unknown_custom_capability_field",
+                "attachment_id": attachment_id,
+                "message": f"Custom Context field {name!r} is not declared by this prompt format.",
+            })
+            continue
+        allowed = [str(value) for value in field.get("values") or []]
+        raw_value = authored.get(name)
+        if raw_value is None or not str(raw_value).strip():
+            if name in substitutions:
+                errors.append({
+                    "code": "missing_custom_capability_field",
+                    "attachment_id": attachment_id,
+                    "message": f"Custom Context field {name!r} is required by this prompt format.",
+                })
+            continue
+        if str(raw_value) not in allowed:
+            errors.append({
+                "code": "invalid_custom_capability_field",
+                "attachment_id": attachment_id,
+                "message": (f"Custom Context field {name!r} value {str(raw_value)!r} "
+                            "is not one of its declared values."),
+            })
+    return errors
+
+
+def _document_render(document, attachment_by_id, render_anchor):
+    parts = []
+    for node in normalize_prompt_document(document)["nodes"]:
+        if node["type"] == "text":
+            parts.append(node["text"])
+            continue
+        attachment = attachment_by_id.get(node["attachment_id"])
+        if attachment and attachment["enabled"]:
+            parts.append(render_anchor(
+                attachment, node.get("capability_id"), node.get("node_id")))
+    return "".join(parts).strip()
+
+
+def _default_capability(attachment, profile):
+    declaration = (profile.get("capabilities") or {}).get(attachment["kind"], {})
+    return normalize_capability({
+        "capability_id": attachment["kind"],
+        "kind": attachment["kind"],
+        "channel_key": declaration.get("channel_key", ""),
+        "placement": declaration.get("placement", "section_prefix"),
+    })
+
+
+def _capabilities(attachment, profile):
+    return attachment["capabilities"] or [_default_capability(attachment, profile)]
+
+
+def _enabled_capabilities(attachment, profile):
+    """Capabilities that actually render.
+
+    Rendering already skips disabled capabilities, so validation and config
+    merging must skip them too; otherwise a disabled capability can block a
+    job or contribute configuration to text it never appears in.
+    """
+    return [value for value in _capabilities(attachment, profile)
+            if value.get("enabled", True)]
+
+
+def _route_for(attachment, capability, profile, fallback_channel):
+    if capability.get("channel_key"):
+        return capability["channel_key"]
+    declaration = (profile.get("capabilities") or {}).get(attachment["kind"], {})
+    routes = declaration.get("routes") or {}
+    kind = capability.get("kind") or capability.get("capability_id")
+    return str(routes.get(kind) or declaration.get("channel_key") or fallback_channel)
+
+
+_PROFILE_ERROR_MESSAGES = {
+    "unknown_profile": "The selected prompt format is not available in this project.",
+    "profile_template_incompatible": ("The selected prompt format is not compatible "
+                                      "with the active channel template."),
+}
+
+
+def profile_error_result(exc, *, window_start=0, window_end=1, fps=24.0) -> dict:
+    """A compiled-shaped payload carrying one blocking profile diagnostic.
+
+    An unusable profile cannot produce trustworthy text, but it is an authoring
+    mistake rather than a server fault, so every surface receives the normal
+    result contract with a blocking error instead of a 500.  Only
+    `ProfileResolutionError` reaches here; a plain ValueError from anywhere else
+    in compilation is a real bug and must keep its traceback.
+    """
+    code = getattr(exc, "code", "") or "invalid_profile"
+    result = {
+        "format": FORMAT_VERSION, "prompt": "", "channels": {}, "segments": [],
+        "relay": prompt_payload.build_relay_payload("", []),
+        "window": {"start_frame": int(window_start), "end_frame": int(window_end),
+                   "fps": float(fps)},
+        "emissions": [], "attachment_previews": {},
+        "attachment_channel_previews": {},
+        "attachment_channel_routes": {},
+        "attachment_capability_projections": [],
+        "managed_speaker_subject_ids": [],
+        "setup_manifest": {}, "ordinal_manifest": {},
+        "profile": {}, "profile_hash": "",
+        "warnings": [],
+        "errors": [{"code": code, "detail": str(exc),
+                    "message": _PROFILE_ERROR_MESSAGES.get(
+                        code, f"Prompt Context profile is invalid ({exc}).")}],
+    }
+    result["content_hash"] = content_hash({
+        "prompt": "", "channels": {}, "segments": [],
+        "window": result["window"], "profile_hash": "", "setup_manifest": {},
+    })
+    return result
+
+
+def compile_prompt_context(*, global_documents=None, global_channels=None,
+                           global_attachments=None, sections=None,
+                           window_start=0, window_end=1, fps=24.0,
+                           template=None, profile=None, custom_profiles=None,
+                           context=None, labels_on=True,
+                           delimiter=prompt_payload.DEFAULT_SECTION_DELIMITER,
+                           boundary_threshold_pct=0.0) -> dict:
+    """Compile candidate state to a frozen, provider-ready prompt.
+
+    The function never mutates inputs.  It returns diagnostics instead of
+    throwing for semantic authoring mistakes; invalid/unknown profiles remain
+    a hard error because their formatter cannot be trusted.
+    """
+    context = copy.deepcopy(context) if isinstance(context, dict) else {}
+    resolved_template = prompt_channel_templates.get_channel_template(template)
+    resolved_profile = resolve_profile(profile, template=resolved_template,
+                                       custom_profiles=custom_profiles)
+    keys = prompt_channel_templates.template_channel_keys(resolved_template)
+    global_docs = normalize_channel_documents(global_documents, global_channels, keys)
+    global_mirror = channel_document_mirrors(global_docs)
+    errors, warnings, emissions = [], [], []
+    setup_manifest = context.get("setup_manifest") or {}
+    role_catalogs = resolved_profile.get("role_catalogs") or {}
+    for manifest_key, population in (
+            ("pictures", "pictures"), ("videos", "videos"),
+            ("standalone_audios", "standalone_audios")):
+        allowed_roles = {str(value.get("value") or "") for value in
+                         role_catalogs.get(population, [])
+                         if isinstance(value, dict)}
+        for row in setup_manifest.get(manifest_key) or []:
+            role = str(row.get("role") or "").strip()
+            canonical_role = REFERENCE_ROLE_ALIASES.get(
+                role.lower().replace("-", "_"), role)
+            if role and (not allowed_roles or canonical_role not in allowed_roles):
+                errors.append({
+                    "code": "unsupported_reference_role",
+                    "member_id": str(row.get("member_id") or ""),
+                    "message": (f"Reference role {role!r} is not supported by "
+                                f"{resolved_profile.get('name') or 'this prompt format'}; rebind it."),
+                })
+    raw_sections = []
+    global_attachment_values = normalize_attachments(global_attachments)
+    for attachment in global_attachment_values:
+        if attachment.get("kind") in {"shot", "timestamp", "prompt_link"}:
+            errors.append({
+                "code": "invalid_global_attachment",
+                "attachment_id": attachment.get("attachment_id", ""),
+                "message": (f"{attachment.get('kind')} is section-scoped; "
+                            "move this chip to a prompt section."),
+            })
+        elif attachment.get("kind") == "vocal_event":
+            errors.append({
+                "code": "global_vocal_event",
+                "attachment_id": attachment.get("attachment_id", ""),
+                "message": ("Vocal Events require a section/inline position so "
+                            "speaker order is deterministic; move this chip to a section."),
+            })
+    scene_attachments = list(global_attachment_values)
+
+    for raw_index, raw in enumerate(sections or []):
+        if isinstance(raw, dict):
+            value = copy.deepcopy(raw)
+        else:
+            value = {
+                "prompt_id": getattr(raw, "prompt_id", ""),
+                "start_frame": getattr(raw, "start_frame", 0),
+                "end_frame": getattr(raw, "end_frame", 0),
+                "muted": getattr(raw, "muted", False),
+                "channels": getattr(raw, "channels", {}),
+                "channel_docs": getattr(raw, "channel_docs", {}),
+                "attachments": getattr(raw, "attachments", []),
+                "starts_new_shot": getattr(raw, "starts_new_shot", False),
+                "shot_timestamp": getattr(raw, "shot_timestamp", False),
+                "global_channel_exceptions": getattr(raw, "global_channel_exceptions", []),
+            }
+        if not str(value.get("prompt_id") or ""):
+            value["prompt_id"] = f"__compile_section_{raw_index}"
+        value["attachments"] = migrate_legacy_markers(
+            value.get("attachments"), value.get("starts_new_shot"),
+            value.get("shot_timestamp"))
+        value["channel_docs"] = normalize_channel_documents(
+            value.get("channel_docs"), value.get("channels"), keys)
+        scene_attachments.extend(value["attachments"])
+        raw_sections.append(value)
+
+    errors.extend(attachment_limit_errors(scene_attachments))
+
+    # Determine the effective segment origins before validating or rendering
+    # section-owned Context.  Out-of-window chips are dormant for this job and
+    # must not block it or claim a Prompt Link fallback.  A private sentinel
+    # keeps attachment-only sections in the same first-wins/hold/threshold
+    # resolver without leaking into authored output.
+    preliminary = []
+    for section in raw_sections:
+        mirrors = channel_document_mirrors(section["channel_docs"])
+        has_attachment = any(value["enabled"] for value in section["attachments"])
+        if has_attachment and not any(str(mirrors.get(key) or "").strip()
+                                      for key in keys) and keys:
+            mirrors[keys[0]] = "\ue000"
+        preliminary.append({
+            "prompt_id": str(section.get("prompt_id") or ""),
+            "start_frame": section.get("start_frame", 0),
+            "end_frame": section.get("end_frame", 0),
+            "muted": bool(section.get("muted", False)),
+            "channels": mirrors,
+            "starts_new_shot": False, "shot_timestamp": False,
+            "global_channel_exceptions": section.get(
+                "global_channel_exceptions", []),
+        })
+    preliminary_segments = prompt_payload.resolve_segments(
+        preliminary, window_start, window_end,
+        prompt_channel_templates.template_labels_on(resolved_template, labels_on),
+        boundary_threshold_pct, resolved_template)
+    selected_prompt_ids = {str(value.get("prompt_id") or "")
+                           for value in preliminary_segments}
+    selected_sections = [value for value in raw_sections
+                         if str(value.get("prompt_id") or "")
+                         in selected_prompt_ids]
+    selected_sections.sort(key=lambda row: (
+        int(row.get("start_frame", 0)), str(row.get("prompt_id") or "")))
+    all_attachments = list(global_attachment_values)
+    for value in selected_sections:
+        all_attachments.extend(value["attachments"])
+
+    def warn_authored_prompt_tokens(origin, documents):
+        for channel_key, document in (documents or {}).items():
+            text = prompt_document_text(document)
+            if not prompt_tokens.find(text):
+                continue
+            warnings.append({
+                "code": "authored_prompt_token_literal",
+                "origin": str(origin or ""),
+                "channel_key": str(channel_key or ""),
+                "message": ("Prompt tokens resolve inside Context-chip fields, not "
+                            "in authored prose. This text will be sent literally."),
+            })
+
+    warn_authored_prompt_tokens("global", global_docs)
+    for section in selected_sections:
+        warn_authored_prompt_tokens(
+            section.get("prompt_id", ""), section.get("channel_docs") or {})
+
+    # Speaker ordering is selected-window chronological, then document order.
+    vocal_events = []
+    raw_index_by_id = {str(value.get("prompt_id") or ""): index
+                       for index, value in enumerate(raw_sections)}
+    for section in selected_sections:
+        section_index = raw_index_by_id.get(
+            str(section.get("prompt_id") or ""), 0)
+        by_id = _attachment_map(section.get("attachments"))
+        node_order = {}
+        cursor = 0
+        for key in keys:
+            for node in section["channel_docs"].get(key, {}).get("nodes", []):
+                if node.get("type") == "attachment":
+                    node_order.setdefault(node.get("attachment_id"), cursor)
+                    cursor += 1
+        for attachment in by_id.values():
+            if attachment["kind"] == "vocal_event" and attachment["enabled"]:
+                vocal_events.append({"attachment": attachment,
+                                     "section_index": section_index,
+                                     "node_order": node_order.get(attachment["attachment_id"], 10**9)})
+    vocal_events.sort(key=lambda event: (
+        int(raw_sections[event["section_index"]].get("start_frame", 0)),
+        event["node_order"], event["attachment"]["attachment_id"]))
+    speaker_order = _speaker_bindings(vocal_events)
+    context["speaker_order"] = speaker_order
+    speakers_by_attachment = {
+        event["attachment"]["attachment_id"]: event.get("speaker_numbers", [])
+        for event in vocal_events
+    }
+
+    # Managed and literal speaker ids cannot safely share one numbering domain.
+    authored_text = " ".join(global_mirror.values()) + " " + " ".join(
+        value for section in selected_sections
+        for value in channel_document_mirrors(section["channel_docs"]).values())
+    if vocal_events and _MANUAL_SPEAKER_RE.search(authored_text):
+        errors.append({"code": "managed_manual_speaker_conflict", "message":
+                       "Managed Vocal Events cannot be mixed with literal (Sx) speaker ids."})
+    for event in vocal_events:
+        attachment = event["attachment"]
+        source = attachment.get("source") or {}
+        bound = [str(value) for value in source.get("subject_ids") or []
+                 if str(value)] or ([str(source.get("voice_id"))]
+                                    if str(source.get("voice_id") or "") else [])
+        if not bound:
+            # `_speaker_bindings` would otherwise invent `event:<attachment_id>`,
+            # producing an (Sx) number that names nothing in the scene.
+            errors.append({
+                "code": "missing_vocal_binding",
+                "attachment_id": attachment["attachment_id"],
+                "message": ("A Vocal Event must name at least one Subject or a "
+                            "stable voice; this one is unbound."),
+            })
+        language = str(attachment.get("config", {}).get("language") or "English")
+        if language not in DIALOGUE_LANGUAGES:
+            errors.append({
+                "code": "invalid_vocal_event_language",
+                "attachment_id": attachment["attachment_id"],
+                "message": f"Managed Vocal Event language {language!r} is not in the bounded language list.",
+            })
+        if (str(resolved_template.get("id") or "").startswith("minimax_h3_")
+                and str(attachment.get("config", {}).get("event_type") or "")
+                == "voiceover"
+                and not str(attachment.get("config", {}).get(
+                    "subject_phrase") or "").strip()):
+            errors.append({
+                "code": "missing_voiceover_subject_phrase",
+                "attachment_id": attachment["attachment_id"],
+                "message": ("MiniMax H3 voiceover needs an authored on-screen "
+                            "subject phrase; the fixed lips-closed clause is emitted automatically."),
+            })
+
+    for attachment in all_attachments:
+        if not attachment["enabled"]:
+            continue
+        provider_id = str(attachment.get("provider_id") or "")
+        provider_version = str(attachment.get("provider_version") or "")
+        supported = SUPPORTED_PROVIDERS.get(provider_id)
+        if supported is None or provider_version not in supported:
+            errors.append({
+                "code": "unsupported_attachment_provider",
+                "attachment_id": attachment["attachment_id"],
+                "message": (f"Context chip provider {provider_id or '<blank>'}@"
+                            f"{provider_version or '<blank>'} is not supported by "
+                            "this build."),
+            })
+        if attachment["kind"] == "custom":
+            for capability in _enabled_capabilities(attachment, resolved_profile):
+                errors.extend(custom_capability_errors(
+                    attachment, capability, resolved_profile))
+
+    context["semantic_units_by_id"] = {
+        unit["semantic_unit_id"]: unit
+        for unit in (normalize_semantic_unit(value)
+                     for value in context.get("semantic_units") or [])
+    }
+    context["references_by_id"] = {
+        str(value.get("reference_id") or ""): value
+        for value in context.get("references") or [] if isinstance(value, dict)
+        and str(value.get("reference_id") or "")
+    }
+    template_id = str(resolved_template.get("id") or "")
+    ordinal_manifest = context.get("ordinal_manifest") or {}
+    if template_id == "minimax_h3_ref":
+        seen_diagnostics = set()
+
+        def reference_diagnostic(target, code, message, attachment_id=""):
+            key = (code, message, attachment_id)
+            if key in seen_diagnostics:
+                return
+            seen_diagnostics.add(key)
+            target.append({"code": code, "message": message,
+                           **({"attachment_id": attachment_id}
+                              if attachment_id else {})})
+
+        def reference_error(code, message, attachment_id=""):
+            reference_diagnostic(errors, code, message, attachment_id)
+
+        def reference_warning(code, message, attachment_id=""):
+            reference_diagnostic(warnings, code, message, attachment_id)
+
+        for attachment in all_attachments:
+            if not attachment["enabled"] or attachment["kind"] != "reference":
+                continue
+            source = attachment.get("source") or {}
+            unit_ids = [str(value) for value in
+                        source.get("semantic_unit_ids") or [] if str(value)]
+            physical_ids = []
+            for population in ("picture_ids", "video_ids", "audio_ids"):
+                physical_ids.extend(str(value) for value in source.get(population) or []
+                                    if str(value))
+            if not unit_ids and not physical_ids:
+                reference_error(
+                    "missing_reference_source",
+                    "A MiniMax H3 Reference Context chip has no semantic or physical source.",
+                    attachment["attachment_id"])
+            config = dict(attachment.get("config") or {})
+            # Capability editors may own authored fields; validate the same
+            # merged configuration the formatter resolves.
+            for capability in _enabled_capabilities(attachment, resolved_profile):
+                if isinstance(capability.get("config"), dict):
+                    config.update(capability["config"])
+            for unit_id in unit_ids:
+                unit = context["semantic_units_by_id"].get(unit_id)
+                if unit is None:
+                    reference_error(
+                        "broken_reference_source",
+                        f"Reference Subject {unit_id!r} no longer exists; rebind the visible chip.",
+                        attachment["attachment_id"])
+                    continue
+                if unit_id not in (ordinal_manifest.get("subjects") or {}):
+                    reference_error(
+                        "reference_source_not_applicable",
+                        f"Reference Subject {unit.get('name') or unit_id!r} has no winning setup member in this window.",
+                        attachment["attachment_id"])
+                if not _subject_definition(config, unit, context)[0]:
+                    reference_warning(
+                        "missing_h3_subject_definition",
+                        f"Reference Subject {unit.get('name') or unit_id!r} needs an authored definition.",
+                        attachment["attachment_id"])
+                if (any(str(value).startswith("<Audio ") for value in
+                        context.get("unit_source_labels", {}).get(unit_id) or [])
+                        and not str(config.get("audio_definition") or "").strip()):
+                    reference_warning(
+                        "missing_h3_audio_definition",
+                        f"Reference Subject {unit.get('name') or unit_id!r} includes audio and needs an authored Audio definition.",
+                        attachment["attachment_id"])
+                speaker_subject_id = str(config.get("audio_speaker_subject_id") or "")
+                if speaker_subject_id and speaker_subject_id not in speaker_order:
+                    reference_error(
+                        "unresolved_audio_speaker_binding",
+                        "An Audio definition can reuse only a Subject that has an actual managed Vocal Event in this window.",
+                        attachment["attachment_id"])
+                member_ids = {str(value.get("member_id") or "")
+                              for value in unit.get("source_members") or []
+                              if isinstance(value, dict)}
+                applicable = [row for row in (
+                    (context.get("setup_manifest", {}).get("pictures") or [])
+                    + (context.get("setup_manifest", {}).get("videos") or [])
+                    + (context.get("setup_manifest", {}).get("standalone_audios") or []))
+                              if str(row.get("member_id") or
+                                     row.get("video_member_id") or "") in member_ids]
+                for field in ("visual_intent", "audio_intent"):
+                    staged = {str(row.get(field) or "") for row in applicable
+                              if str(row.get(field) or "")}
+                    if not str(config.get(field) or "").strip() and len(staged) > 1:
+                        reference_error(
+                            "conflicting_reference_intent",
+                            f"Reference Subject {unit.get('name') or unit_id!r} has conflicting staged {field.replace('_', ' ')} values.",
+                            attachment["attachment_id"])
+            for population, manifest_key in (
+                    ("picture_ids", "pictures"), ("video_ids", "videos"),
+                    ("audio_ids", "audios")):
+                known = ordinal_manifest.get(manifest_key) or {}
+                for source_id in source.get(population) or []:
+                    if str(source_id) not in known:
+                        reference_error(
+                            "reference_source_not_applicable",
+                            f"Reference source {source_id!r} is not a winning physical setup slot in this window.",
+                            attachment["attachment_id"])
+                        continue
+                    definitions = (config.get("physical_definitions")
+                                   if isinstance(config.get(
+                                       "physical_definitions"), dict) else {})
+                    authored = str(definitions.get(str(source_id)) or (
+                        config.get("audio_definition")
+                        if population == "audio_ids" else
+                        config.get("definition")) or "").strip()
+                    if not authored:
+                        reference_warning(
+                            "missing_h3_physical_definition",
+                            f"Reference source {source_id!r} needs an authored definition.",
+                            attachment["attachment_id"])
+    for attachment in all_attachments:
+        if not attachment["enabled"] or attachment["kind"] != "reference":
+            continue
+        item_id = str(attachment.get("source", {}).get("reference_item_id") or "")
+        generic_reference = (context.get("generic_references") or {}).get(item_id)
+        if item_id and generic_reference is None:
+            errors.append({
+                "code": "reference_source_not_applicable",
+                "attachment_id": attachment["attachment_id"],
+                "message": (f"Reference item {item_id!r} is deleted, muted, superseded, "
+                            "hidden, or outside this generation window; rebind the visible chip."),
+            })
+        elif item_id:
+            profile_key = f"{resolved_profile.get('profile_id')}@{resolved_profile.get('version')}"
+            compatible = generic_reference.get("compatible_profiles") or ["generic@1"]
+            if profile_key not in compatible:
+                errors.append({"code": "reference_profile_incompatible",
+                               "attachment_id": attachment["attachment_id"],
+                               "message": f"This Reference recipe does not expose Context to {profile_key}."})
+            exposed = set(generic_reference.get("exposed_capabilities") or [])
+            requested = {str(value.get("kind") or "") for value in
+                         _enabled_capabilities(attachment, resolved_profile)}
+            if not requested.issubset(exposed):
+                errors.append({"code": "reference_capability_incompatible",
+                               "attachment_id": attachment["attachment_id"],
+                               "message": "The Reference chip requests capabilities its recipe does not expose."})
+    if template_id in {"minimax_h3_base", "minimax_h3_ref"}:
+        setup_guides = {str(value.get("role") or "")
+                        for value in (context.get("setup_manifest", {}).get("guides") or [])}
+        for attachment in all_attachments:
+            if (not attachment["enabled"]
+                    or attachment["kind"] not in {"guide", "custom"}):
+                continue
+            config = attachment.get("config") or {}
+            role = str(config.get("setup_role") or "")
+            claims_picture = "<Picture" in str(config.get("text") or "")
+            if attachment["kind"] == "custom" and not role and not claims_picture:
+                continue
+            if role and role not in {"first", "last"}:
+                errors.append({"code": "invalid_h3_guide_role",
+                               "attachment_id": attachment["attachment_id"],
+                               "message": "H3 Guide binding must be first or last."})
+            elif role and role not in setup_guides:
+                errors.append({"code": "missing_h3_guide_binding",
+                               "attachment_id": attachment["attachment_id"],
+                               "message": f"The active H3 setup has no {role}-frame Guide for this chip."})
+            elif claims_picture and not role:
+                errors.append({"code": "unbound_h3_picture_guidance",
+                               "attachment_id": attachment["attachment_id"],
+                               "message": "Picture guidance must bind to the active H3 first- or last-frame Guide."})
+    # Retention appearance lists are semantic aggregates over the selected
+    # window. Split-derived Reference clones share an emission group, so a
+    # combined render produces one definition/retention line while either half
+    # remains self-contained when rendered alone.
+    reference_group_shots = defaultdict(list)
+    reference_unit_shots = defaultdict(list)
+    shot_number = 0
+    for section in selected_sections:
+        section_attachments = normalize_attachments(section.get("attachments"))
+        if any(value["enabled"] and value["kind"] == "shot"
+               for value in section_attachments):
+            shot_number += 1
+        if shot_number:
+            for value in section_attachments:
+                if value["enabled"] and value["kind"] == "reference":
+                    group = value["emission_group_id"]
+                    if shot_number not in reference_group_shots[group]:
+                        reference_group_shots[group].append(shot_number)
+                    for unit_id in value.get("source", {}).get(
+                            "semantic_unit_ids") or []:
+                        if shot_number not in reference_unit_shots[str(unit_id)]:
+                            reference_unit_shots[str(unit_id)].append(shot_number)
+    if shot_number:
+        for value in normalize_attachments(global_attachments):
+            if value["enabled"] and value["kind"] == "reference":
+                reference_group_shots[value["emission_group_id"]] = list(
+                    range(1, shot_number + 1))
+                for unit_id in value.get("source", {}).get(
+                        "semantic_unit_ids") or []:
+                    reference_unit_shots[str(unit_id)] = list(
+                        range(1, shot_number + 1))
+    context["reference_group_shots"] = dict(reference_group_shots)
+    context["reference_unit_shots"] = dict(reference_unit_shots)
+    emitted_groups = {}
+    unresolved_prompt_tokens = set()
+
+    def resolve_attachment_tokens(value, attachment):
+        resolved, unresolved_ids = prompt_tokens.resolve(
+            value, context.get("ordinal_manifest") or {},
+            context.get("unit_source_labels") or {})
+        for source_id in unresolved_ids:
+            diagnostic_key = (attachment["attachment_id"], source_id)
+            if diagnostic_key in unresolved_prompt_tokens:
+                continue
+            unresolved_prompt_tokens.add(diagnostic_key)
+            errors.append({
+                "code": "unresolved_prompt_token",
+                "attachment_id": attachment["attachment_id"],
+                "prompt_token_id": source_id,
+                "message": (f"Prompt token source {source_id!r} has no ordinal "
+                            "in the effective conditioning setup; rebind it."),
+            })
+        return resolved
+
+    def set_projection_state(projection, state, text="", reason=""):
+        if projection is None:
+            return
+        projection["state"] = state
+        projection["text"] = str(text or "")
+        if projection.get("_scope_inline") and state in {"emitted", "empty"}:
+            projection["state_reason"] = (
+                "Section-scope chips have no caret anchor; this is placed after "
+                "section-prefix contributions and before authored text.")
+        elif reason:
+            projection["state_reason"] = reason
+
+    def render(attachment, capability, *, origin, channel, projection=None):
+        capability = capability or _default_capability(attachment, resolved_profile)
+        capability_kind = capability.get("kind") or capability.get("capability_id")
+        # Mentions are authored placements and therefore emit at each placement;
+        # definitions/summary/retention remain semantic once-per-owner output.
+        if capability_kind == "mentions":
+            identity_owner = attachment["attachment_id"]
+        elif capability_kind == "derived_prompt" and attachment.get(
+                "source", {}).get("reference_item_id"):
+            identity_owner = ("reference_item", str(
+                attachment["source"]["reference_item_id"]))
+        elif template_id == "minimax_h3_ref" and capability_kind == "summary":
+            identity_owner = "minimax_h3_summary"
+        else:
+            identity_owner = attachment["emission_group_id"]
+        render_context = {**context, "origin": origin, "channel_key": channel,
+                          "profile": resolved_profile}
+        if (attachment["kind"] == "reference"
+                and capability_kind in {"definitions", "retention"}):
+            # Definition and retention output is deduped one semantic unit or
+            # physical slot at a time, so overlapping chip selections neither
+            # repeat a line nor hide a contradiction behind a differing tuple.
+            kept = []
+            resolved_lines = []
+            for owner, line in reference_capability_lines(
+                    attachment, capability, render_context):
+                # Resolve before owner-level dedupe so stable-id aliases that
+                # name the same Subject/slot compare as the same emission.
+                line = resolve_attachment_tokens(line, attachment)
+                resolved_lines.append(line)
+                line_identity = (capability_kind, owner, channel)
+                previous = emitted_groups.get(line_identity)
+                if previous is not None:
+                    if previous != line:
+                        errors.append({
+                            "code": "conflicting_emission",
+                            "attachment_id": attachment["attachment_id"],
+                            "message": ("The same semantic emission resolved to "
+                                        "conflicting text."),
+                        })
+                    continue
+                emitted_groups[line_identity] = line
+                kept.append(line)
+            value = "\n".join(kept)
+            if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
+                errors.append({"code": "attachment_output_limit",
+                               "attachment_id": attachment["attachment_id"],
+                               "message": "An attachment emitted more than 16 KiB."})
+                set_projection_state(
+                    projection, "output_limit", reason=
+                    "This capability exceeded the 16 KiB attachment output limit.")
+                return ""
+            if value:
+                emissions.append({"attachment_id": attachment["attachment_id"],
+                                  "emission_group_id": attachment["emission_group_id"],
+                                  "capability_id": capability["capability_id"],
+                                  "kind": attachment["kind"], "channel_key": channel,
+                                  "origin": origin,
+                                  "placement": capability.get("placement") or "inline",
+                                  "text": value})
+                set_projection_state(projection, "emitted", value,
+                                     "This capability emitted resolved text.")
+            elif resolved_lines:
+                set_projection_state(
+                    projection, "deduplicated", "\n".join(resolved_lines),
+                    "Equivalent output already emitted for this channel.")
+            else:
+                set_projection_state(projection, "empty", reason=
+                                     "This capability resolved to no text.")
+            return value
+        identity = (identity_owner, capability["capability_id"],
+                    capability.get("kind"), channel)
+        value = _render_generic(
+            attachment, capability, render_context,
+            speakers_by_attachment.get(attachment["attachment_id"], []))
+        if attachment["kind"] in {"reference", "custom"}:
+            # Custom enum substitution is already complete here. The token pass
+            # remains a separate stable-id-only operation and cannot expose a
+            # general formatter or arbitrary field interpolation path.
+            value = resolve_attachment_tokens(value, attachment)
+        if len(value.encode("utf-8")) > MAX_ATTACHMENT_OUTPUT:
+            errors.append({"code": "attachment_output_limit",
+                           "attachment_id": attachment["attachment_id"],
+                           "message": "An attachment emitted more than 16 KiB."})
+            set_projection_state(
+                projection, "output_limit", reason=
+                "This capability exceeded the 16 KiB attachment output limit.")
+            return ""
+        prior = emitted_groups.get(identity)
+        if prior is not None:
+            if prior != value:
+                errors.append({"code": "conflicting_emission",
+                               "attachment_id": attachment["attachment_id"],
+                               "message": "The same semantic emission resolved to conflicting text."})
+            set_projection_state(
+                projection, "deduplicated", value,
+                "Equivalent output already emitted for this channel.")
+            return ""
+        emitted_groups[identity] = value
+        if value:
+            emissions.append({"attachment_id": attachment["attachment_id"],
+                              "emission_group_id": attachment["emission_group_id"],
+                              "capability_id": capability["capability_id"],
+                              "kind": attachment["kind"], "channel_key": channel,
+                              "origin": origin,
+                              "placement": capability.get("placement") or "inline",
+                              "text": value})
+            set_projection_state(projection, "emitted", value,
+                                 "This capability emitted resolved text.")
+        else:
+            set_projection_state(projection, "empty", reason=
+                                 "This capability resolved to no text.")
+        return value
+
+    # Prompt links read local authored content and are resolved before other
+    # attachment emission.  Earlier-only edges form a DAG by construction.
+    by_prompt_id = {str(section.get("prompt_id") or ""): section
+                    for section in raw_sections}
+    ordered_sections = sorted(raw_sections, key=lambda value: (
+        int(value.get("start_frame", 0)), str(value.get("prompt_id") or "")))
+    section_positions = {str(section.get("prompt_id") or ""): index
+                         for index, section in enumerate(ordered_sections)}
+    link_cache = {}
+    empty_link_diagnostics = set()
+    # Build presence from the actual expanded output, in chronological order.
+    # Earlier-only Prompt Links guarantee that every possible source has been
+    # rendered before its consumer.  Pre-seeding this from plain-text mirrors
+    # missed attachment-only sources (the private selection sentinel is not
+    # authored output), so a link-exportable anchor was emitted once in its
+    # source section and again as the consumer fallback.
+    present_origins = set()
+    link_fallbacks_emitted = set()
+
+    def warn_empty_link(prompt_id, channel_key, attachment_id):
+        diagnostic_key = (prompt_id, channel_key, attachment_id)
+        if diagnostic_key in empty_link_diagnostics:
+            return
+        empty_link_diagnostics.add(diagnostic_key)
+        warnings.append({"code": "empty_prompt_link",
+                         "attachment_id": attachment_id,
+                         "message":
+                         f"Prompt Link source {prompt_id!r}/{channel_key!r} is empty."})
+
+    def local_link_text(prompt_id, channel_key, consumer_index, trail=(),
+                        diagnostic_attachment_id=""):
+        cache_key = (prompt_id, channel_key)
+        source = by_prompt_id.get(prompt_id)
+        if source is None:
+            errors.append({"code": "broken_prompt_link",
+                           "attachment_id": diagnostic_attachment_id,
+                           "message":
+                           f"Prompt Link source {prompt_id!r} no longer exists."})
+            return ""
+        source_index = section_positions.get(prompt_id, -1)
+        if source_index >= consumer_index or cache_key in trail:
+            errors.append({"code": "invalid_prompt_link_order",
+                           "attachment_id": diagnostic_attachment_id,
+                           "message":
+                           "Prompt Links must target an earlier section in the same scene."})
+            return ""
+        origin_key = (prompt_id, channel_key)
+        if origin_key in present_origins or origin_key in link_fallbacks_emitted:
+            return ""
+        if cache_key in link_cache:
+            value = link_cache[cache_key]
+            if not value:
+                warn_empty_link(prompt_id, channel_key, diagnostic_attachment_id)
+            return value
+        if source.get("muted"):
+            return ""
+        attachment_by_id = _attachment_map(source.get("attachments"))
+
+        def render_link_anchor(attachment, capability_id, _anchor_node_id=None):
+            if attachment["kind"] == "prompt_link" and attachment.get("link_exportable"):
+                target = str(attachment["source"].get("prompt_id") or "")
+                target_channel = str(attachment["source"].get("channel_key") or channel_key)
+                return local_link_text(
+                    target, target_channel, source_index, trail + (cache_key,),
+                    attachment["attachment_id"])
+            if attachment.get("link_exportable"):
+                capability = next((cap for cap in _capabilities(attachment, resolved_profile)
+                                   if cap["capability_id"] == capability_id), None)
+                return _render_generic(attachment, capability or _default_capability(
+                    attachment, resolved_profile), context,
+                    speakers_by_attachment.get(attachment["attachment_id"], []))
+            return ""
+
+        value = _document_render(source["channel_docs"].get(channel_key),
+                                 attachment_by_id, render_link_anchor)
+        if not value:
+            warn_empty_link(prompt_id, channel_key, diagnostic_attachment_id)
+        link_cache[cache_key] = value
+        if value:
+            link_fallbacks_emitted.add(origin_key)
+        return value
+
+    expanded_sections = []
+    attachment_channel_routes = defaultdict(dict)
+    attachment_capability_projections = []
+    projection_rows = {}
+    projection_discovery = 0
+
+    def record_attachment_route(attachment, channel, placement):
+        attachment_id = str(attachment.get("attachment_id") or "")
+        channel = str(channel or "")
+        if attachment_id and channel:
+            routes = attachment_channel_routes[attachment_id].setdefault(channel, [])
+            placement = str(placement or "section_prefix")
+            if placement not in routes:
+                routes.append(placement)
+
+    def record_capability_projection(attachment, capability, channel, origin,
+                                     anchor_node_id="scope"):
+        nonlocal projection_discovery
+        attachment_id = str(attachment.get("attachment_id") or "")
+        channel = str(channel or "")
+        capability_id = str(capability.get("capability_id") or "")
+        anchor_identity = str(anchor_node_id or "scope")
+        identity = (str(origin or ""), attachment_id, capability_id,
+                    channel, anchor_identity)
+        if not attachment_id or not capability_id or not channel:
+            return None
+        if identity in projection_rows:
+            return projection_rows[identity]
+        declared = str(capability.get("placement") or "section_prefix")
+        effective = declared if declared in PLACEMENT_PHASES else "section_prefix"
+        disabled = (not attachment.get("enabled", True)
+                    or not capability.get("enabled", True))
+        reason = ("This capability is disabled and contributes no text."
+                  if disabled else "This capability resolved to no text.")
+        if anchor_identity == "scope" and declared == "inline" and not disabled:
+            reason = ("Section-scope chips have no caret anchor; this is placed after "
+                      "section-prefix contributions and before authored text.")
+        row = {
+            "attachment_id": attachment_id,
+            "emission_group_id": str(attachment.get("emission_group_id") or attachment_id),
+            "attachment_kind": str(attachment.get("kind") or "custom"),
+            "capability_id": capability_id,
+            "capability_kind": str(capability.get("kind") or capability_id),
+            "channel_key": channel,
+            "declared_placement": declared,
+            "effective_phase": effective,
+            "region": ("after" if PLACEMENT_PHASES.index(effective)
+                       > PLACEMENT_PHASES.index("inline") else "before"),
+            "origin": str(origin or ""),
+            "order": 0,
+            "state": "disabled" if disabled else "empty",
+            "state_reason": reason,
+            "text": "",
+            "rendered_at_anchor": False,
+            "_anchor_node_id": anchor_identity,
+            "_discovery": projection_discovery,
+            "_scope_inline": anchor_identity == "scope" and declared == "inline",
+        }
+        projection_discovery += 1
+        projection_rows[identity] = row
+        attachment_capability_projections.append(row)
+        return row
+
+    for section in selected_sections:
+        section_index = section_positions.get(
+            str(section.get("prompt_id") or ""), 0)
+        attachment_by_id = _attachment_map(section.get("attachments"))
+        mirrors = {}
+        phase_parts = defaultdict(lambda: defaultdict(list))
+
+        def anchor_renderer(attachment, capability_id, channel_key, anchor_node_id):
+            if attachment["kind"] == "prompt_link":
+                capabilities = _capabilities(attachment, resolved_profile)
+                if capability_id:
+                    capabilities = [cap for cap in capabilities
+                                    if cap["capability_id"] == capability_id]
+                capability = capabilities[0] if capabilities else _default_capability(
+                    attachment, resolved_profile)
+                route = _route_for(
+                    attachment, capability, resolved_profile, channel_key)
+                projection = record_capability_projection(
+                    attachment, capability, route,
+                    section.get("prompt_id", ""), anchor_node_id)
+                if projection is not None:
+                    projection["rendered_at_anchor"] = anchor_node_id != "scope"
+                if not capability.get("enabled", True):
+                    return ""
+                target = str(attachment["source"].get("prompt_id") or "")
+                target_channel = str(attachment["source"].get("channel_key") or channel_key)
+                value = local_link_text(
+                    target, target_channel, section_index,
+                    diagnostic_attachment_id=attachment["attachment_id"])
+                set_projection_state(
+                    projection, "emitted" if value else "empty", value,
+                    "Prompt Link emitted its earlier source." if value else
+                    "Prompt Link resolved to no source text.")
+                return value
+            capabilities = _capabilities(attachment, resolved_profile)
+            if capability_id:
+                capabilities = [cap for cap in capabilities
+                                if cap["capability_id"] == capability_id]
+            if not capabilities:
+                capabilities = [_default_capability(attachment, resolved_profile)]
+            inline_values = []
+            for capability in capabilities:
+                route = _route_for(attachment, capability, resolved_profile, channel_key)
+                projection = record_capability_projection(
+                    attachment, capability, route,
+                    section.get("prompt_id", ""), anchor_node_id)
+                if not capability.get("enabled", True):
+                    continue
+                record_attachment_route(attachment, route, capability["placement"])
+                if route == channel_key and capability["placement"] == "inline":
+                    if projection is not None:
+                        projection["rendered_at_anchor"] = anchor_node_id != "scope"
+                    inline_values.append(render(
+                        attachment, capability, origin=section.get("prompt_id", ""),
+                        channel=channel_key, projection=projection))
+                else:
+                    phase_parts[route][capability["placement"]].append(
+                        (attachment, capability, projection))
+            return _join_emissions(inline_values,
+                                   resolved_profile.get("separators", {}).get(
+                                       "attachment", " "))
+
+        for key in keys:
+            mirrors[key] = _document_render(
+                section["channel_docs"].get(key), attachment_by_id,
+                lambda attachment, capability_id, anchor_node_id, key=key:
+                    anchor_renderer(attachment, capability_id, key, anchor_node_id))
+
+        # Scope attachments are emitted by placement. Inline attachment nodes
+        # already emitted above and are not emitted again here.
+        anchored = {node.get("attachment_id")
+                    for document in section["channel_docs"].values()
+                    for node in document.get("nodes", [])
+                    if node.get("type") == "attachment"}
+        shot = any(a["enabled"] and a["kind"] == "shot"
+                   for a in attachment_by_id.values())
+        timestamp = any(
+            a["enabled"] and (
+                (a["kind"] == "shot"
+                 and bool((a.get("config") or {}).get("timestamp")))
+                or (a["kind"] == "timestamp"
+                    and bool((a.get("config") or {}).get("standalone"))))
+            for a in attachment_by_id.values())
+        for attachment in attachment_by_id.values():
+            if (not attachment["enabled"]
+                    or attachment["kind"] not in INLINE_ONLY_KINDS
+                    or attachment["attachment_id"] in anchored):
+                continue
+            # A scope-row Prompt Link resolves nothing (only inline anchors do)
+            # and a scope-row Vocal Event compiles as a prefix, losing its place
+            # in the spoken order.  Legacy rows stay visible and block instead.
+            errors.append({
+                "code": "unanchored_inline_attachment",
+                "attachment_id": attachment["attachment_id"],
+                "message": (f"A {attachment['kind'].replace('_', ' ')} chip must be "
+                            "inserted inline in the prompt text; this one has no "
+                            "inline anchor. Re-insert or remove it."),
+            })
+        for attachment in attachment_by_id.values():
+            if attachment["enabled"] and attachment["kind"] == "shot":
+                for capability in _capabilities(attachment, resolved_profile):
+                    route = _route_for(
+                        attachment, capability, resolved_profile,
+                        keys[0] if keys else "visual")
+                    projection = record_capability_projection(
+                        attachment, capability, route,
+                        section.get("prompt_id", ""))
+                    set_projection_state(
+                        projection, "marker", reason=
+                        "This marker is composed by the prompt section composer.")
+            if (attachment["enabled"] and attachment["kind"] == "timestamp"
+                    and bool((attachment.get("config") or {}).get("standalone"))):
+                for capability in _capabilities(attachment, resolved_profile):
+                    route = _route_for(
+                        attachment, capability, resolved_profile,
+                        keys[0] if keys else "visual")
+                    projection = record_capability_projection(
+                        attachment, capability, route,
+                        section.get("prompt_id", ""))
+                    if capability["enabled"]:
+                        record_attachment_route(
+                            attachment, route, capability["placement"])
+                    set_projection_state(
+                        projection, "marker", reason=
+                        "This marker is composed by the prompt section composer.")
+            if (not attachment["enabled"] or attachment["attachment_id"] in anchored
+                    or attachment["kind"] in {"shot", "timestamp"}
+                    or attachment["kind"] in INLINE_ONLY_KINDS):
+                continue
+            for capability in _capabilities(attachment, resolved_profile):
+                route = _route_for(attachment, capability, resolved_profile,
+                                   keys[0] if keys else "visual")
+                projection = record_capability_projection(
+                    attachment, capability, route, section.get("prompt_id", ""))
+                if not capability["enabled"]:
+                    continue
+                record_attachment_route(attachment, route, capability["placement"])
+                phase_parts[route][capability["placement"]].append(
+                    (attachment, capability, projection))
+        for key, phases in phase_parts.items():
+            if key not in mirrors:
+                attachment_ids = {a["attachment_id"]
+                                  for values in phases.values()
+                                  for a, _capability, _projection in values}
+                for values in phases.values():
+                    for _attachment, _capability, projection in values:
+                        set_projection_state(
+                            projection, "invalid_route", reason=
+                            f"Route {key!r} is not in the active channel template.")
+                for attachment_id in sorted(attachment_ids):
+                    errors.append({"code": "invalid_attachment_route",
+                                   "attachment_id": attachment_id,
+                                   "message":
+                                   f"Attachment route {key!r} is not in the active template."})
+                continue
+            prefixes = []
+            suffixes = []
+            for phase in PLACEMENT_PHASES[:PLACEMENT_PHASES.index("inline") + 1]:
+                prefixes.extend(render(
+                    a, c, origin=section.get("prompt_id", ""), channel=key,
+                    projection=projection)
+                    for a, c, projection in phases.get(phase, []))
+            for phase in PLACEMENT_PHASES[PLACEMENT_PHASES.index("inline") + 1:]:
+                suffixes.extend(render(
+                    a, c, origin=section.get("prompt_id", ""), channel=key,
+                    projection=projection)
+                    for a, c, projection in phases.get(phase, []))
+            mirrors[key] = _join_emissions(prefixes + [mirrors[key]] + suffixes,
+                                           resolved_profile.get("separators", {}).get(
+                                               "attachment", " "))
+        prompt_id = str(section.get("prompt_id") or "")
+        for key, value in mirrors.items():
+            if str(value or "").strip():
+                present_origins.add((prompt_id, str(key)))
+        expanded_sections.append({
+            "prompt_id": section.get("prompt_id", ""),
+            "start_frame": section.get("start_frame", 0),
+            "end_frame": section.get("end_frame", 0),
+            "muted": bool(section.get("muted", False)),
+            "channels": mirrors,
+            "starts_new_shot": shot,
+            "shot_timestamp": timestamp,
+            "global_channel_exceptions": section.get("global_channel_exceptions", []),
+        })
+
+    # Global scope emissions prepend to their routed channel documents.
+    global_by_id = _attachment_map(global_attachments)
+    global_anchored = {node.get("attachment_id")
+                       for document in global_docs.values()
+                       for node in document.get("nodes", [])
+                       if node.get("type") == "attachment"}
+    global_phase_parts = defaultdict(lambda: defaultdict(list))
+
+    def global_anchor_renderer(attachment, capability_id, channel_key, anchor_node_id):
+        capabilities = _capabilities(attachment, resolved_profile)
+        if capability_id:
+            capabilities = [cap for cap in capabilities
+                            if cap["capability_id"] == capability_id]
+        if not capabilities:
+            capabilities = [_default_capability(attachment, resolved_profile)]
+        inline_values = []
+        for capability in capabilities:
+            route = _route_for(attachment, capability, resolved_profile, channel_key)
+            projection = record_capability_projection(
+                attachment, capability, route, "global", anchor_node_id)
+            if not capability.get("enabled", True):
+                continue
+            record_attachment_route(attachment, route, capability["placement"])
+            if route == channel_key and capability["placement"] == "inline":
+                inline_values.append(render(attachment, capability,
+                                            origin="global", channel=channel_key,
+                                            projection=projection))
+            else:
+                global_phase_parts[route][capability["placement"]].append(
+                    (attachment, capability, projection))
+        return _join_emissions(inline_values,
+                               resolved_profile.get("separators", {}).get(
+                                   "attachment", " "))
+
+    for key in keys:
+        global_mirror[key] = _document_render(
+            global_docs.get(key), global_by_id,
+            lambda attachment, capability_id, anchor_node_id, key=key:
+                global_anchor_renderer(
+                    attachment, capability_id, key, anchor_node_id))
+    for attachment in global_by_id.values():
+        if not attachment["enabled"] or attachment["attachment_id"] in global_anchored:
+            continue
+        if attachment["kind"] in {"shot", "timestamp", "prompt_link"}:
+            warnings.append({"code": "invalid_global_attachment",
+                             "attachment_id": attachment["attachment_id"], "message":
+                             f"{attachment['kind']} is section-scoped and was ignored globally."})
+            continue
+        for capability in _capabilities(attachment, resolved_profile):
+            route = _route_for(attachment, capability, resolved_profile,
+                               keys[0] if keys else "visual")
+            projection = record_capability_projection(
+                attachment, capability, route, "global")
+            if not capability.get("enabled", True):
+                continue
+            record_attachment_route(attachment, route, capability["placement"])
+            if route not in global_mirror:
+                set_projection_state(
+                    projection, "invalid_route", reason=
+                    f"Route {route!r} is not in the active channel template.")
+                errors.append({"code": "invalid_attachment_route",
+                               "attachment_id": attachment["attachment_id"], "message":
+                               f"Attachment route {route!r} is not in the active template."})
+                continue
+            global_phase_parts[route][capability["placement"]].append(
+                (attachment, capability, projection))
+    for route, phases in global_phase_parts.items():
+        if route not in global_mirror:
+            attachment_ids = {a["attachment_id"]
+                              for values in phases.values()
+                              for a, _capability, _projection in values}
+            for values in phases.values():
+                for _attachment, _capability, projection in values:
+                    set_projection_state(
+                        projection, "invalid_route", reason=
+                        f"Route {route!r} is not in the active channel template.")
+            for attachment_id in sorted(attachment_ids):
+                errors.append({"code": "invalid_attachment_route",
+                               "attachment_id": attachment_id,
+                               "message":
+                               f"Attachment route {route!r} is not in the active template."})
+            continue
+        prefixes, suffixes = [], []
+        for phase in ("document_preamble", "channel_prefix", "global_document",
+                      "section_prefix", "inline"):
+            prefixes.extend(render(
+                a, c, origin="global", channel=route, projection=projection)
+                for a, c, projection in phases.get(phase, []))
+        for phase in ("section_suffix", "channel_suffix"):
+            suffixes.extend(render(
+                a, c, origin="global", channel=route, projection=projection)
+                for a, c, projection in phases.get(phase, []))
+        global_mirror[route] = _join_emissions(
+            prefixes + [global_mirror[route]] + suffixes,
+            resolved_profile.get("separators", {}).get("attachment", " "))
+
+    final_prompt = prompt_payload.compose_range_prompt(
+        prompt_payload.compose_section_text(global_mirror, labels_on=False),
+        expanded_sections, window_start, window_end, labels_on=labels_on,
+        delimiter=delimiter, boundary_threshold_pct=boundary_threshold_pct,
+        template=resolved_template, fps=fps, global_channels=global_mirror)
+    segments = prompt_payload.resolve_segments(
+        expanded_sections, window_start, window_end,
+        prompt_channel_templates.template_labels_on(resolved_template, labels_on),
+        boundary_threshold_pct, resolved_template)
+    shot_markers = prompt_payload.resolve_shot_markers(segments, fps)
+    channel_outputs = {
+        key: prompt_payload.join_segment_texts(
+            [segment.get("channels", {}).get(key, "") for segment in segments],
+            delimiter)
+        for key in keys
+    }
+
+    setup_manifest = context.get("setup_manifest") or {}
+    setup_value = setup_manifest.get("setup") or {}
+    if template_id == "minimax_h3_base":
+        task_mode = str(setup_value.get("task_mode") or "T2VA").upper()
+        try:
+            duration = max(0.0, (float(window_end) - float(window_start)) / float(fps))
+        except (TypeError, ValueError, ZeroDivisionError):
+            duration = 0.0
+        shot_count = sum(1 for value in segments if value.get("starts_new_shot"))
+        final_shot = max(1, shot_count)
+        instruction = ""
+        if task_mode in {"I2VA", "FL2VA", "L2VA"} and shot_count == 0:
+            warnings.append({"code": "missing_h3_shot_identity", "message":
+                             f"{task_mode} Picture alignment is clearer with at least one authored Shot chip."})
+        if task_mode == "I2VA":
+            instruction = ("For the target video, at 0.00 seconds into the target video, "
+                           "<Picture 1> (from [Shot 1]) is fully referenced.")
+        elif task_mode == "FL2VA":
+            instruction = ("How the reference pictures align with the target video — "
+                           "Picture 1 (from Shot 1) aligns with the 0.00-second mark of the "
+                           f"target video; Picture 2 (from Shot {final_shot}) aligns with the "
+                           f"{duration:.2f}-second mark of the target video.")
+        elif task_mode == "L2VA":
+            instruction = ("How the reference pictures align with the target video — "
+                           f"<Picture 1> (from [Shot {final_shot}]) aligns with the "
+                           f"{duration:.2f}-second mark of the target video.")
+        if instruction:
+            final_prompt = f"{instruction}\n\n{final_prompt}" if final_prompt else instruction
+        if task_mode not in {"T2VA", "I2VA", "FL2VA", "L2VA"}:
+            errors.append({"code": "invalid_h3_task_mode",
+                           "message": "MiniMax H3 task mode is invalid."})
+
+    effective_values = {}
+    for key in keys:
+        values = []
+        global_value = str(global_mirror.get(key) or "").strip()
+        if global_value:
+            values.append(global_value)
+        values.extend(str(segment.get("channels", {}).get(key) or "").strip()
+                      for segment in segments
+                      if str(segment.get("channels", {}).get(key) or "").strip())
+        effective_values[key] = _join_emissions(values, delimiter)
+
+    # Empty authored channels are thin content, not unresolved state. Preserve
+    # the MiniMax-specific code for its established UI copy; every other
+    # template receives the general advisory.
+    is_full_reference = (template_id == "minimax_h3_ref"
+                         and setup_value.get("mode") == "reference")
+    for key in keys:
+        if effective_values.get(key):
+            continue
+        if is_full_reference:
+            warnings.append({"code": "missing_h3_reference_field",
+                             "channel_key": key,
+                             "message": f"MiniMax H3 Full Reference has no authored {key}."})
+        else:
+            warnings.append({"code": "empty_channel", "channel_key": key,
+                             "message": f"Prompt channel {key} is empty and will be omitted."})
+
+    # New Full Reference setups validate canonical form without turning thin
+    # but fully resolved prose into a queue blocker. Legacy frozen envelopes
+    # without setup authority stay readable through the compatibility path.
+    if is_full_reference:
+        summary = effective_values.get("summary", "")
+        if summary and not re.match(r"^\[(?:" + "|".join(
+                re.escape(value) for value in MINIMAX_TASK_TYPES) +
+                r")(?: \+ (?:" + "|".join(
+                    re.escape(value) for value in MINIMAX_TASK_TYPES) + r"))*\]", summary):
+            warnings.append({"code": "invalid_h3_task_prefix", "message":
+                             "Full Reference summary should begin with canonical task types."})
+        retention_emissions = [value for value in emissions
+                               if value.get("kind") == "reference"
+                               and value.get("capability_id") == "retention"]
+        for emission in retention_emissions:
+            for line in str(emission.get("text") or "").splitlines():
+                if line.strip() and " - " not in line:
+                    warnings.append({
+                        "code": "missing_h3_retention_detail",
+                        "attachment_id": emission.get("attachment_id", ""),
+                        "message": "MiniMax H3 retention markers require authored detail after ' - '.",
+                    })
+                    break
+
+    for validator in resolved_profile.get("validators") or []:
+        if not isinstance(validator, dict):
+            continue
+        kind = validator.get("kind")
+        severity = validator.get("severity") or "error"
+        target = warnings if severity == "warning" else errors
+        channel_key = str(validator.get("channel_key") or "")
+        channel_value = _join_emissions(
+            [global_mirror.get(channel_key, ""), channel_outputs.get(channel_key, "")],
+            delimiter)
+        failed = False
+        default_message = "Prompt Context profile validation failed."
+        if kind == "required_channel":
+            failed = not channel_value.strip()
+            default_message = f"Profile requires authored content in {channel_key}."
+        elif kind == "max_channel_chars":
+            failed = len(channel_value) > int(validator.get("limit") or 0)
+            default_message = (f"Profile limits {channel_key} to "
+                               f"{validator.get('limit')} characters.")
+        elif kind == "max_final_chars":
+            failed = len(final_prompt) > int(validator.get("limit") or 0)
+            default_message = (f"Profile limits the compiled prompt to "
+                               f"{validator.get('limit')} characters.")
+        elif kind == "require_attachment_kind":
+            attachment_kind = str(validator.get("attachment_kind") or "")
+            failed = not any(value["enabled"] and value["kind"] == attachment_kind
+                             for value in all_attachments)
+            default_message = f"Profile requires a {attachment_kind} Context chip."
+        if failed:
+            target.append({"code": f"profile_{kind}",
+                           "message": validator.get("message") or default_message})
+
+    if len(final_prompt.encode("utf-8")) > MAX_COMPILED_PROMPT:
+        errors.append({"code": "compiled_prompt_limit", "message":
+                       "The compiled prompt exceeds 256 KiB."})
+    # Prompt Relay's global input is a raw always-on prefix, historically
+    # label-free even when local segments use labelled channels.
+    relay_global = prompt_payload.compose_section_text(
+        global_mirror, labels_on=False, template=resolved_template)
+    relay_manifest = prompt_payload.build_relay_payload(relay_global, segments)
+    previews = defaultdict(list)
+    channel_previews = defaultdict(lambda: defaultdict(list))
+    for emission in emissions:
+        previews[emission["attachment_id"]].append(emission["text"])
+        channel_previews[emission["attachment_id"]][emission["channel_key"]].append(
+            emission["text"])
+    # Shot/Time markers are composed by prompt_payload after channel attachment
+    # emissions, so a standalone Time has no ordinary emission to preview. Give
+    # its durable chip the exact window-local marker the composer resolved.
+    segments_by_prompt_id = {
+        str(segment.get("prompt_id") or ""): segment for segment in segments
+    }
+    markers_by_prompt_id = {
+        str(segment.get("prompt_id") or ""): marker
+        for segment, marker in zip(segments, shot_markers)
+    }
+    for section in selected_sections:
+        segment = segments_by_prompt_id.get(str(section.get("prompt_id") or ""))
+        if segment is None:
+            continue
+        timecode = prompt_channel_templates.format_shot_timecode(
+            segment.get("start", 0), fps)
+        if not timecode:
+            continue
+        for attachment in section.get("attachments") or []:
+            if (not attachment.get("enabled", True)
+                    or attachment.get("kind") != "timestamp"
+                    or not bool((attachment.get("config") or {}).get("standalone"))):
+                continue
+            attachment_id = str(attachment.get("attachment_id") or "")
+            routes = attachment_channel_routes.get(attachment_id) or {}
+            marker = f"At {timecode},"
+            previews[attachment_id].append(marker)
+            for channel_key in routes:
+                channel_previews[attachment_id][channel_key].append(marker)
+
+    for section in selected_sections:
+        origin = str(section.get("prompt_id") or "")
+        marker = markers_by_prompt_id.get(origin, "")
+        if not marker:
+            continue
+        for attachment in section.get("attachments") or []:
+            kind = str(attachment.get("kind") or "")
+            if kind not in {"shot", "timestamp"}:
+                continue
+            if (kind == "timestamp"
+                    and not bool((attachment.get("config") or {}).get("standalone"))):
+                continue
+            marker_text = marker
+            if kind == "timestamp" and " At " in marker:
+                marker_text = f"At {marker.split(' At ', 1)[1]}"
+            for projection in attachment_capability_projections:
+                if (projection["origin"] == origin
+                        and projection["attachment_id"]
+                        == str(attachment.get("attachment_id") or "")
+                        and projection["state"] == "marker"):
+                    set_projection_state(
+                        projection, "marker", marker_text,
+                        "This marker is composed by the prompt section composer.")
+
+    emitted_by_group_channel = defaultdict(set)
+    for emission in emissions:
+        emitted_by_group_channel[
+            (str(emission.get("emission_group_id") or ""),
+             str(emission.get("channel_key") or ""))
+        ].add(str(emission.get("attachment_id") or ""))
+    error_attachment_ids = {
+        str(error.get("attachment_id") or "") for error in errors
+        if str(error.get("attachment_id") or "")
+    }
+    for projection in attachment_capability_projections:
+        if (projection["state"] in {"empty", "deduplicated"}
+                and projection["attachment_id"] in error_attachment_ids):
+            set_projection_state(
+                projection, "unresolved", projection.get("text", ""),
+                "A blocking diagnostic prevented this capability from resolving.")
+            continue
+        linked_emitters = emitted_by_group_channel.get((
+            projection["emission_group_id"], projection["channel_key"]), set())
+        if (projection["state"] in {"empty", "deduplicated"}
+                and any(value != projection["attachment_id"]
+                        for value in linked_emitters)):
+            set_projection_state(
+                projection, "linked_elsewhere", projection.get("text", ""),
+                "Equivalent output was emitted by a linked chip elsewhere.")
+
+    projection_orders = defaultdict(int)
+    for projection in sorted(
+            attachment_capability_projections,
+            key=lambda value: value.get("_discovery", 0)):
+        order_key = (projection["origin"], projection["channel_key"])
+        projection["order"] = projection_orders[order_key]
+        projection_orders[order_key] += 1
+        projection.pop("_anchor_node_id", None)
+        projection.pop("_discovery", None)
+        projection.pop("_scope_inline", None)
+    result = {
+        "format": FORMAT_VERSION,
+        "prompt": final_prompt,
+        "channels": channel_outputs,
+        "segments": segments,
+        "relay": relay_manifest,
+        "window": {"start_frame": int(window_start), "end_frame": int(window_end),
+                   "fps": float(fps)},
+        "emissions": emissions,
+        "attachment_previews": {key: "\n".join(value)
+                                for key, value in previews.items()},
+        "attachment_channel_previews": {
+            attachment_id: {channel_key: "\n".join(values)
+                            for channel_key, values in channels.items()}
+            for attachment_id, channels in channel_previews.items()
+        },
+        "attachment_channel_routes": {
+            attachment_id: {
+                channel_key: (ordered[0] if len(ordered) == 1 else ordered)
+                for channel_key, values in routes.items()
+                for ordered in [[phase for phase in PLACEMENT_PHASES if phase in values]]
+            }
+            for attachment_id, routes in attachment_channel_routes.items()
+        },
+        "attachment_capability_projections": copy.deepcopy(
+            attachment_capability_projections),
+        # This is the compiler's effective-window speaker domain after section
+        # holding, overlap resolution, clipping and boundary threshold. The UI
+        # consumes it rather than approximating eligibility from authored bars.
+        "managed_speaker_subject_ids": list(speaker_order),
+        "setup_manifest": copy.deepcopy(context.get("setup_manifest") or {}),
+        "ordinal_manifest": copy.deepcopy(context.get("ordinal_manifest") or {}),
+        "profile": copy.deepcopy(resolved_profile),
+        "profile_hash": resolved_profile["content_hash"],
+        "warnings": warnings,
+        "errors": errors,
+    }
+    result["content_hash"] = content_hash({
+        "prompt": result["prompt"], "channels": result["channels"],
+        "segments": result["segments"], "window": result["window"],
+        "profile_hash": result["profile_hash"],
+        "setup_manifest": result["setup_manifest"],
+    })
+    return result

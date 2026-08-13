@@ -252,3 +252,57 @@ def test_dormant_live_preview_prompt_over_context_window():
     scene.prompt_track_config.hidden = True
     summary = _build_dormant_summary(project, scene_id="scene-1")
     assert summary["active_scene"]["preview_prompt"] == "global"
+
+
+def test_dormant_live_preview_uses_execution_compile_and_reports_degradation(monkeypatch):
+    project = _make_project()
+    scene = project.scenes[0]
+    scene.global_attachments = [{"attachment_id": "context", "kind": "custom"}]
+    calls = []
+
+    def compile_for_execution(self, compile_project, start, end, **kwargs):
+        calls.append((compile_project, start, end, kwargs))
+        return {
+            "prompt": "execution-resolved",
+            "warnings": [],
+            "errors": [{"code": "broken_reference_source"}],
+        }
+
+    monkeypatch.setattr(Scene, "compile_for_execution", compile_for_execution)
+
+    summary = _build_dormant_summary(
+        project,
+        scene_id="scene-1",
+        selection_start=10,
+        selection_end=20,
+    )
+
+    assert calls and calls[0][0] is project
+    assert summary["active_scene"]["preview_prompt"] == ""
+    assert summary["active_scene"]["preview_prompt_degraded"] is True
+    assert summary["active_scene"]["preview_prompt_error_code"] == "broken_reference_source"
+
+
+def test_dormant_live_preview_matches_candidate_execution_path(monkeypatch):
+    project = _make_project()
+    scene = project.scenes[0]
+    scene.global_attachments = [{"attachment_id": "context", "kind": "custom"}]
+
+    def compile_for_execution(self, compile_project, start, end, **kwargs):
+        assert compile_project is project
+        return {"prompt": f"resolved:{start}-{end}", "warnings": [], "errors": []}
+
+    monkeypatch.setattr(Scene, "compile_for_execution", compile_for_execution)
+    summary = _build_dormant_summary(
+        project,
+        scene_id="scene-1",
+        selection_start=30,
+        selection_end=50,
+        pre_context_frames=10,
+        post_context_frames=10,
+    )
+    direct = scene.get_prompt_for_range(20, 60, project=project)
+
+    assert summary["active_scene"]["preview_prompt"] == direct == "resolved:20-60"
+    assert summary["active_scene"]["preview_prompt_degraded"] is False
+    assert summary["active_scene"]["preview_prompt_error_code"] == ""

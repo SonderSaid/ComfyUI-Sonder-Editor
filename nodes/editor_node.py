@@ -781,6 +781,8 @@ class SonderEditor:
             & set(demanded_output_slots)
         )
         audio_needed = demand_unknown or self.OUTPUT_SLOTS["audio"] in demanded_output_slots
+        prompt_needed = (not demand_unknown
+                         and self.OUTPUT_SLOTS["prompt"] in demanded_output_slots)
         color_correcting_save_reached = self._execution_reaches_color_correcting_save_video(
             prompt, unique_id
         )
@@ -1249,6 +1251,7 @@ class SonderEditor:
             prompt_labels_on = False
             prompt_delimiter = "."
             prompt_threshold = 10.0
+            reference_threshold = 0.0
             proj_metadata = getattr(proj, "metadata", None)
             if isinstance(proj_metadata, dict):
                 prompt_delimiter = str(proj_metadata.get("prompt_section_delimiter", ".") or "")
@@ -1256,6 +1259,11 @@ class SonderEditor:
                     prompt_threshold = float(proj_metadata.get("prompt_frame_threshold", 10.0) or 0.0)
                 except (TypeError, ValueError):
                     prompt_threshold = 10.0
+                try:
+                    reference_threshold = float(
+                        proj_metadata.get("reference_frame_threshold", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    reference_threshold = 0.0
             # A frozen job's params win, so an un-composed snapshot still uses
             # the channel template it was enqueued under.
             prompt_template = prompt_channel_templates.resolve_channel_template(
@@ -1276,11 +1284,34 @@ class SonderEditor:
                         boundary_threshold_pct=prompt_threshold,
                         template=prompt_template, fps=prompt_fps)
             else:
-                prompt_text = scene.get_prompt_for_range(
-                    render_start, render_end,
-                    labels_on=prompt_labels_on, delimiter=prompt_delimiter,
-                    boundary_threshold_pct=prompt_threshold,
-                    template=prompt_template, fps=prompt_fps)
+                compile_for_execution = getattr(scene, "compile_for_execution", None)
+                if callable(compile_for_execution):
+                    compiled_prompt = compile_for_execution(
+                        proj, render_start, render_end,
+                        labels_on=prompt_labels_on, delimiter=prompt_delimiter,
+                        boundary_threshold_pct=prompt_threshold,
+                        reference_threshold_pct=reference_threshold,
+                        template=prompt_template, fps=prompt_fps)
+                else:
+                    # Compatibility for lightweight third-party/test scene
+                    # adapters; persisted Scene always owns the shared compiler.
+                    compiled_prompt = {"prompt": scene.get_prompt_for_range(
+                        render_start, render_end,
+                        labels_on=prompt_labels_on, delimiter=prompt_delimiter,
+                        boundary_threshold_pct=prompt_threshold,
+                        template=prompt_template, fps=prompt_fps), "errors": []}
+                prompt_text = compiled_prompt.get("prompt", "")
+                prompt_errors = list(compiled_prompt.get("errors") or [])
+                if prompt_errors:
+                    first = prompt_errors[0]
+                    detail = f"{first.get('code', 'prompt_context_error')}: {first.get('message', 'Prompt Context compilation failed.')}"
+                    if prompt_needed:
+                        raise RuntimeError(f"Sonder live prompt refused — {detail}")
+                    if demand_unknown:
+                        logger.warning(
+                            "Sonder live Prompt Context has blocking diagnostics; "
+                            "output demand is unknown, so execution keeps the legacy "
+                            "fail-open prompt string: %s", detail)
 
             # --- Load audio from scene's audio tracks for the render range ---
             if audio_needed:

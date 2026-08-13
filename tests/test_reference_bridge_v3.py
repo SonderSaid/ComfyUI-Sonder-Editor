@@ -7,7 +7,9 @@ import cv2
 import numpy as np
 import pytest
 
+from server import minimax_h3, prompt_context
 from server.timeline_state import (
+    MINIMAX_H3_REFERENCE_RECIPE_PRESETS,
     REFERENCE_RECIPE_PRESETS,
     Asset,
     GenerationJob,
@@ -17,6 +19,7 @@ from server.timeline_state import (
     ReferenceLaneRecipe,
     ReferenceMember,
     Scene,
+    PromptSection,
     TimelineProject,
 )
 
@@ -118,6 +121,18 @@ def _preset(recipe_id: str) -> ReferenceLaneRecipe:
         media_kind=definition["media_kind"],
         recipe_id=definition["id"],
         recipe={"name": definition["name"], "hard": dict(definition["hard"]), "soft": dict(definition["soft"])},
+    )
+
+
+def _h3_preset(recipe_id: str) -> ReferenceLaneRecipe:
+    definition = next(
+        row for row in MINIMAX_H3_REFERENCE_RECIPE_PRESETS
+        if row["id"] == recipe_id)
+    return ReferenceLaneRecipe(
+        media_kind=definition["media_kind"],
+        recipe_id=definition["id"],
+        recipe={"name": definition["name"], "hard": dict(definition["hard"]),
+                "soft": dict(definition["soft"])},
     )
 
 
@@ -228,6 +243,46 @@ def test_best_face_id_uses_the_bust_size_for_a_lone_member(monkeypatch):
     assert core._member_geometry(frame, hard, 64, 48, 4) == (1536, 1024)
 
 
+def test_h3_generic_recipe_geometry_and_frame_grid_match_model_contract(monkeypatch):
+    core = _import_module(monkeypatch, "reference_core")
+    picture = _h3_preset("sonder:minimax_h3_picture").recipe["hard"]
+    assert core._member_geometry(
+        np.zeros((1080, 1920, 3), dtype=np.uint8), picture, 64, 48,
+    ) == (1920, 1056)
+    assert core._member_geometry(
+        np.zeros((4000, 3000, 3), dtype=np.uint8), picture, 64, 48,
+    ) == (2048, 2720)
+
+    video = _h3_preset("sonder:minimax_h3_video").recipe["hard"]
+    assert [core._snap_span_frame_count(count, video) for count in (5, 24, 120)] == [5, 22, 107]
+
+
+def test_h3_video_recipe_is_served_by_generic_image_bridge(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = _h3_preset("sonder:minimax_h3_video")
+    assert recipe.media_kind == "image"
+    project = _project(tmp_path, recipe)
+    asset = project.assets[0]
+    asset.asset_type = "video"
+    asset.fps = 30.0
+    asset.frame_count = 30
+    asset.duration_sec = 1.0
+    project.references[0].members[0].source_end_sec = 1.0
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
+    monkeypatch.setattr(core, "resolve_source_color_interpretation",
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(core, "decode_video_range", lambda _path, start, end, **_kwargs: (
+        np.full((24, 40, 3), index % 255, dtype=np.uint8)
+        for index in range(start, end)))
+
+    slots = core.decode_reference_images(core.resolve_reference_set(project, 0))
+    assert len(slots) == 16
+    assert tuple(slots[0].shape) == (22, 32, 32, 3)
+    assert float(slots[1].abs().max()) == 0.0
+
+
 def test_homogeneous_bridges_emit_assembled_and_per_member_payloads(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     monkeypatch.setattr(core, "resolve_existing_project_path", lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
@@ -300,6 +355,43 @@ def test_selector_uses_frozen_explicit_snapshot_end_after_scene_shrinks(monkeypa
     assert core._reference_frame_rate(core._reference_decode_context(selected, "image")) == 30.0
 
 
+def test_snapshot_selector_uses_frozen_library_catalog_after_live_edits(monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    monkeypatch.setattr(core, "resolve_existing_project_path",
+                        lambda project, path, **_kwargs: str(Path(project.project_dir) / path))
+    recipe = _preset("sonder:ltx_msr")
+    project = _project(tmp_path, recipe)
+    project.references[0].members[0].name = "portrait"
+    frozen_reference = project.references[0].to_dict()
+    frozen_asset = project.assets[0].to_dict()
+    project.generation_queue = [GenerationJob(
+        job_id="queued", scene_id="scene", params={"snapshot_version": 1},
+        reference_lane_count=1,
+        reference_lane_configs=[LaneConfig().to_dict()],
+        reference_lane_recipes=[recipe.to_dict()],
+        reference_item_snapshots=[project.scenes[0].reference_items[0].to_dict()],
+        reference_input_snapshots=[
+            {"kind": "reference", "value": frozen_reference},
+            {"kind": "asset", "value": frozen_asset},
+        ],
+    )]
+    project._execution_context["queue_job_ref_id"] = "queued"
+
+    project.references[0].name = "CHANGED"
+    project.references[0].members[0].name = "changed"
+    project.references[0].members[0].prompt = "changed prompt"
+    project.assets[0].path = "media/missing.png"
+
+    selected = core.resolve_reference_set(project, 0)
+    context = core._reference_decode_context(selected, "image")
+    assert context["records"][0]["reference"].name == "Hero"
+    assert context["records"][0]["member"].name == "portrait"
+    assert context["records"][0]["member"].prompt == "red subject"
+    assert context["records"][0]["asset"].path == "media/subject.png"
+    assert core.decode_reference_prompts(selected)[1] == "Hero_portrait"
+    assert float(core.decode_reference_images(selected)[0].abs().max()) > 0.0
+
+
 def test_selector_excludes_hidden_lane(monkeypatch, tmp_path):
     core = _import_module(monkeypatch, "reference_core")
     project = _project(tmp_path, ReferenceLaneRecipe(), hidden=True)
@@ -329,6 +421,56 @@ def test_bridge_absent_fallback_and_present_slot_assembly(monkeypatch, tmp_path)
     assert prompts[1] == "Hero"
     assert present[0].shape[0] == 1
     assert tuple(present[1].shape) == (1, 48, 64, 3)
+
+
+def test_prompt_bridge_member_slot_agrees_with_h3_subject_definition(
+        monkeypatch, tmp_path):
+    core = _import_module(monkeypatch, "reference_core")
+    recipe = ReferenceLaneRecipe(
+        lane_id="pictures", media_kind="image", recipe={
+            "soft": {
+                "compatible_profiles": ["minimax_h3_ref@1"],
+                "physical_population": "pictures",
+                "exposed_capabilities": ["definitions"],
+                "prompt_tokens": (
+                    "<Subject {subject_n}> is {prompt} from <Picture {picture_n}>"),
+            },
+            "hard": {"assembly": "slots", "max_members": 9},
+        })
+    project = _project(tmp_path, recipe)
+    unit = prompt_context.normalize_semantic_unit({
+        "semantic_unit_id": "subject", "name": "Hero", "definition": "",
+        "source_members": [{"entity_id": "entity", "member_id": "member"}],
+    })
+    project.prompt_semantic_units = [unit]
+
+    reference_set = core.resolve_reference_set(project, 0)
+    p01 = core.decode_reference_prompts(reference_set)[2]
+    setup = minimax_h3.resolve_setup(
+        setup={"mode": "reference", "picture_lane_ids": ["pictures"]},
+        reference_items=project.scenes[0].reference_items,
+        lane_recipes=project.scenes[0].reference_lane_recipes,
+        lane_configs=project.scenes[0].reference_lane_configs,
+        lane_count=1, scene_duration=60, window_start=12, window_end=30,
+        references=project.references, assets=project.assets,
+        semantic_units=[unit])
+    attachment = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"semantic_unit_ids": ["subject"]},
+        "capabilities": [{
+            "capability_id": "definitions", "kind": "definitions",
+            "channel_key": "subject_definitions", "placement": "section_prefix",
+        }],
+    })
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[PromptSection(
+            start_frame=0, end_frame=60,
+            channels={"detailed_description": "move"},
+            attachments=[attachment])],
+        window_start=12, window_end=30, fps=24, template="minimax_h3_ref",
+        context={**setup, "semantic_units": [unit]})
+
+    assert p01 == "<Subject 1> is red subject from <Picture 1>"
+    assert compiled["channels"]["subject_definitions"] == p01
 
 
 def test_sheet_assembly_preserves_recipe_background_padding(monkeypatch):

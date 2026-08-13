@@ -35,10 +35,30 @@ export const PROJECT_SCOPED_PROMPT_TOKENS = Object.freeze([
     "{subject_n}", "{picture_n}", "{audio_n}", "{speaker_n}",
 ]);
 
-export function memberPromptFragment(pattern, index, prompt, name, registryNumbers = null) {
+export function promptLabelToken(value) {
+    return String(value || "").normalize("NFKC").trim()
+        .replace(/[^\p{L}\p{N}_-]+/gu, "_")
+        .replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+export function referenceMemberLabels(entityName, memberName = "") {
+    const entityDisplay = String(entityName || "").trim();
+    const memberDisplay = String(memberName || "").trim();
+    const entityToken = promptLabelToken(entityDisplay);
+    const memberToken = promptLabelToken(memberDisplay);
+    return {
+        entity_name: entityToken,
+        member_name: memberToken,
+        name: [entityToken, memberToken].filter(Boolean).join("_"),
+        display_name: [entityDisplay, memberDisplay].filter(Boolean).join(" · "),
+    };
+}
+
+export function memberPromptFragment(pattern, index, prompt, name, registryNumbers = null, memberName = "") {
     const memberPrompt = String(prompt || "").trim();
-    const entityName = String(name || "").trim();
-    const label = memberPrompt || entityName;
+    const labels = referenceMemberLabels(name, memberName);
+    const compositeName = labels.name;
+    const label = memberPrompt || compositeName;
     if (!pattern) return label;
     const numbers = registryNumbers && typeof registryNumbers === "object" ? registryNumbers : {};
     // split/join, not String.replace: a string-literal replace substitutes only
@@ -53,14 +73,17 @@ export function memberPromptFragment(pattern, index, prompt, name, registryNumbe
         .split("{n}").join(String(index + 1))
         .split("{index}").join(String(index))
         .split("{prompt}").join(promptValue)
-        .split("{name}").join(entityName);
-    if (pattern.includes("{prompt}") || pattern.includes("{name}")) {
+        .split("{entity_name}").join(labels.entity_name)
+        .split("{member_name}").join(labels.member_name)
+        .split("{name}").join(compositeName);
+    if (["{prompt}", "{name}", "{entity_name}", "{member_name}"].some(
+        (token) => pattern.includes(token))) {
         // An empty member prompt inside a `{prompt}` pattern would otherwise
         // leave a dangling clause; fall back to the entity name rather than
         // dropping the fragment, which would hide a member whose image still
         // reaches the model.
-        const useName = !memberPrompt && entityName && pattern.includes("{prompt}");
-        return expand(useName ? entityName : memberPrompt).trim();
+        const useName = !memberPrompt && compositeName && pattern.includes("{prompt}");
+        return expand(useName ? compositeName : memberPrompt).trim();
     }
     return label ? `${expand(memberPrompt)}: ${label}` : expand(memberPrompt);
 }
@@ -71,7 +94,12 @@ export function deriveReferencePrompt({ promptOverride = "", members = [], soft 
     const tokenPattern = String(soft?.prompt_tokens || "");
     const values = [];
     (Array.isArray(members) ? members : []).forEach((entry, index) => {
-        const fragment = memberPromptFragment(tokenPattern, index, entry?.prompt, entry?.name);
+        const fragment = memberPromptFragment(
+            tokenPattern, index, entry?.prompt,
+            entry?.entity_name || entry?.name,
+            entry?.registry_numbers || null,
+            entry?.member_name || "",
+        );
         if (fragment) values.push(fragment);
     });
     const prefix = String(soft?.prompt_prefix || "").trim();

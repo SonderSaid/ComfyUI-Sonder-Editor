@@ -71,55 +71,6 @@ def normalize_channels(raw=None, legacy_prompt="", keys=None) -> dict:
     return channels
 
 
-# Retention markers from the MiniMax full-reference guide (section 4.1). These
-# are fixed English values in the output format, not free text.
-SUBJECT_RETENTIONS = ("fully_preserved", "partially_preserved",
-                      "attribute_transfer", "weak_reference")
-DEFAULT_SUBJECT_RETENTION = "fully_preserved"
-
-
-def normalize_subject_ids(raw) -> list:
-    """Coerce a section's subject bindings to `[{entity_id, retention}, ...]`.
-
-    The ONE normalizer used by the model, the routes and the identity check.
-    Duplicates collapse (first wins) and authored order is preserved, because
-    order is the tie-break when one section binds several subjects. Unknown
-    retention markers fall back to the default rather than reaching the model.
-
-    Non-list in, empty out. This is reached straight from request bodies, and
-    `raw or []` alone was not a guard: an int raised TypeError out of a route,
-    and a bare dict iterated its KEYS, minting a binding to "entity_id".
-
-    A binding is an OBJECT. `retention` shipped in the same commit as
-    `subject_ids`, so a bare-string form never existed in any release or any
-    stored project, and accepting one would only resurrect junk — including the
-    "[object Object]" strings the pre-fix browser settings normalizer left
-    behind, which are dropped here for free because they are not objects.
-    """
-    if not isinstance(raw, list):
-        return []
-    normalized = []
-    seen = set()
-    for entry in raw:
-        # Ids and markers are always strings. Coercing anything else with str()
-        # also diverged from the JS mirror, which uses `??` and turned 0 into
-        # the id "0" where this returned "".
-        if not isinstance(entry, dict):
-            continue
-        raw_id, raw_retention = entry.get("entity_id"), entry.get("retention")
-        entity_id = raw_id.strip() if isinstance(raw_id, str) else ""
-        retention = raw_retention.strip() if isinstance(raw_retention, str) else ""
-        if not entity_id or entity_id in seen:
-            continue
-        seen.add(entity_id)
-        normalized.append({
-            "entity_id": entity_id,
-            "retention": retention if retention in SUBJECT_RETENTIONS
-            else DEFAULT_SUBJECT_RETENTION,
-        })
-    return normalized
-
-
 def normalize_channel_exceptions(raw) -> list:
     """Coerce a section's global-channel opt-outs to a sorted key list.
 
@@ -147,16 +98,6 @@ def section_inherits_global(section, key) -> bool:
     else:
         raw = getattr(section, "global_channel_exceptions", None)
     return str(key) not in set(raw or ())
-
-
-def subject_ids_identity(raw) -> list:
-    """Order-insensitive projection of subject bindings, for 409 comparison.
-
-    Storage keeps authored order (it is the within-section numbering tie-break)
-    but a client that merely reordered or duplicated bindings has not changed
-    the section, so identity validation must not reject it.
-    """
-    return sorted(normalize_subject_ids(raw), key=lambda entry: entry["entity_id"])
 
 
 def merge_channels(existing, incoming) -> dict:
@@ -318,9 +259,9 @@ def _section_entries(sections, keys=None):
             )
             starts_new_shot = bool(section.get("starts_new_shot", False))
             shot_timestamp = bool(section.get("shot_timestamp", False))
-            subject_ids = normalize_subject_ids(section.get("subject_ids"))
             exceptions = normalize_channel_exceptions(
                 section.get("global_channel_exceptions"))
+            prompt_id = str(section.get("prompt_id") or "")
         else:
             try:
                 start = int(getattr(section, "start_frame", 0))
@@ -334,13 +275,13 @@ def _section_entries(sections, keys=None):
                                           keys=keys)
             starts_new_shot = bool(getattr(section, "starts_new_shot", False))
             shot_timestamp = bool(getattr(section, "shot_timestamp", False))
-            subject_ids = normalize_subject_ids(getattr(section, "subject_ids", None))
             exceptions = normalize_channel_exceptions(
                 getattr(section, "global_channel_exceptions", None))
+            prompt_id = str(getattr(section, "prompt_id", "") or "")
         entries.append({"start": start, "end": end, "channels": channels,
+                        "prompt_id": prompt_id,
                         "starts_new_shot": starts_new_shot,
                         "shot_timestamp": shot_timestamp,
-                        "subject_ids": subject_ids,
                         "global_channel_exceptions": exceptions})
     return entries
 
@@ -401,9 +342,9 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
             continue  # fully shadowed by an earlier section
         survivors.append({"start": eff_start, "text": entry["text"],
                           "channels": entry["channels"],
+                          "prompt_id": entry.get("prompt_id", ""),
                           "starts_new_shot": entry.get("starts_new_shot", False),
                           "shot_timestamp": entry.get("shot_timestamp", False),
-                          "subject_ids": entry.get("subject_ids", []),
                           "global_channel_exceptions":
                               entry.get("global_channel_exceptions", []),
                           "authored_start": entry["start"],
@@ -425,9 +366,9 @@ def resolve_segments(sections, window_start, window_end, labels_on=True,
         segments.append({
             "text": entry["text"],
             "channels": entry["channels"],
+            "prompt_id": entry.get("prompt_id", ""),
             "starts_new_shot": entry.get("starts_new_shot", False),
             "shot_timestamp": entry.get("shot_timestamp", False),
-            "subject_ids": entry.get("subject_ids", []),
             "global_channel_exceptions": entry.get("global_channel_exceptions", []),
             "section_start": entry["authored_start"],
             "authored_start": entry["authored_start"],
@@ -479,34 +420,11 @@ def join_segment_texts(texts, delimiter=DEFAULT_SECTION_DELIMITER) -> str:
     return joiner.join(parts)
 
 
-def _shot_marked_texts(segments, key, fps) -> list:
-    """Per-segment texts for the shot-marker channel, with markers inserted.
-
-    Opening a shot and stamping a cut time are FULLY independent choices, and a
-    section may do either, both or neither:
-
-        starts_new_shot  shot_timestamp   prefix
-        off              off              (none)
-        on               off              `[Shot N] `
-        off              on               `At MM:SS.mmm, `
-        on               on               `[Shot N] At MM:SS.mmm, `
-
-    Nothing is forced on the first segment: if no section opens a shot, no
-    `[Shot N]` is emitted at all, and a first section that explicitly asks for a
-    cut time gets `At 00:00.000,`. Numbering is dense over the EFFECTIVE set and
-    starts at whichever segment first opens a shot.
-
-    Timestamps are window-local, so the same section reads correctly whether the
-    whole scene or one slice of it is rendered.
-
-    Markers are interleaved into ONE channel's join because a labels-on compose
-    groups every segment of a channel under a single label, so a marker cannot
-    prefix the whole output.
-    """
-    texts = []
+def resolve_shot_markers(segments, fps) -> list[str]:
+    """Return the exact per-segment marker strings used by prompt composition."""
+    markers = []
     shot_number = 0
     for segment in segments or []:
-        text = str((segment.get("channels") or {}).get(key) or "").strip()
         marker = ""
         if bool(segment.get("starts_new_shot")):
             shot_number += 1
@@ -516,6 +434,30 @@ def _shot_marked_texts(segments, key, fps) -> list:
                 segment.get("start", 0), fps)
             if timecode:
                 marker = f"{marker} At {timecode},".strip()
+        markers.append(marker)
+    return markers
+
+
+def _shot_marked_texts(segments, key, fps) -> list:
+    """Per-segment texts for the shot-marker channel, with markers inserted.
+
+    Canonical authoring makes cut time an option on Shot. This lower-level
+    composer still accepts a timestamp-only legacy segment so frozen/older
+    payloads remain readable; `prompt_context` migrates current project state to
+    `[Shot N] At MM:SS.mmm,`. Numbering is dense over the EFFECTIVE set.
+
+    Timestamps are window-local, so the same section reads correctly whether the
+    whole scene or one slice of it is rendered.
+
+    Markers are interleaved into ONE channel's join because a labels-on compose
+    groups every segment of a channel under a single label, so a marker cannot
+    prefix the whole output.
+    """
+    texts = []
+    markers = resolve_shot_markers(segments, fps)
+    for index, segment in enumerate(segments or []):
+        text = str((segment.get("channels") or {}).get(key) or "").strip()
+        marker = markers[index]
         if marker:
             text = f"{marker} {text}".strip() if text else marker
         if text:
@@ -627,7 +569,31 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
             parts.append(f"{label}{label_separator}{body}" if label else body)
         section_text = str(resolved.get("field_separator", " ")).join(parts)
     else:
-        texts = [s["text"] for s in segments]
+        if shot_channel:
+            texts = []
+            shot_number = 0
+            for segment in segments:
+                channels = dict(segment.get("channels") or {})
+                marker = ""
+                if bool(segment.get("starts_new_shot")):
+                    shot_number += 1
+                    marker = f"[Shot {shot_number}]"
+                if bool(segment.get("shot_timestamp")):
+                    timecode = channel_templates.format_shot_timecode(
+                        segment.get("start", 0), fps)
+                    if timecode:
+                        marker = f"{marker} At {timecode},".strip()
+                if marker:
+                    channels[shot_channel] = " ".join(
+                        value for value in
+                        (marker, str(channels.get(shot_channel) or "").strip())
+                        if value)
+                text = compose_section_text(channels, labels_on=False,
+                                            template=resolved)
+                if text:
+                    texts.append(text)
+        else:
+            texts = [s["text"] for s in segments]
         if per_channel_global and global_part and _any_segment_inherits(lead_key):
             texts = [global_part] + texts
         section_text = join_segment_texts(texts, delimiter)

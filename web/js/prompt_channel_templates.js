@@ -86,6 +86,7 @@ function template(id, name, description, channels, options = {}) {
         shot_marker_channel: options.shotMarkerChannel ?? "",
         global_merge: options.globalMerge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: options.globalChannelsOn !== false,
+        default_context_profile: options.defaultContextProfile ?? "generic@1",
         builtin: true,
     };
 }
@@ -94,13 +95,13 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
     standard: template("standard", "Standard",
         "One plain prompt channel, with no field names.",
         [channel("visual", "", "The whole prompt for this section.")],
-        { labels: LABELS_NEVER }),
+        { labels: LABELS_NEVER, shotMarkerChannel: "visual" }),
     // Display name only — the id stays `sonder` so existing projects and frozen
     // jobs keep resolving. This channel split is not ours to claim.
     sonder: template(DEFAULT_CHANNEL_TEMPLATE_ID, "Visual + Speech + Sound",
         "The editor's three-field format: separate visual, speech and sound channels, "
         + "always labelled in composed prompt output.",
-        SONDER_CHANNELS, { labels: LABELS_ALWAYS }),
+        SONDER_CHANNELS, { labels: LABELS_ALWAYS, shotMarkerChannel: "visual" }),
     minimax_h3_base: template("minimax_h3_base", "MiniMax H3",
         "MiniMax H3's three core fields for text- and keyframe-driven "
         + "generation (T2VA / I2VA / FL2VA / L2VA).",
@@ -109,6 +110,7 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
             fieldSeparator: "\n\n", labelSeparator: ": ", labels: LABELS_ALWAYS,
             shotMarkerChannel: "integrated_multimodal_description",
             globalMerge: GLOBAL_MERGE_PER_CHANNEL,
+            defaultContextProfile: "minimax_h3_base@1",
         }),
     minimax_h3_ref: template("minimax_h3_ref", "MiniMax H3 (full reference)",
         "MiniMax H3's six full-reference sections, for prompts that carry "
@@ -118,6 +120,7 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
             fieldSeparator: "\n\n", labelSeparator: ":\n", labels: LABELS_ALWAYS,
             shotMarkerChannel: "detailed_description",
             globalMerge: GLOBAL_MERGE_PER_CHANNEL,
+            defaultContextProfile: "minimax_h3_ref@1",
         }),
 };
 
@@ -201,6 +204,7 @@ export function strictNormalizeChannelTemplate(raw) {
         // Absent means on: a hand-edited or pre-flag template keeps the
         // per-channel global it was authored with.
         global_channels_enabled: raw.global_channels_enabled !== false,
+        default_context_profile: String(raw.default_context_profile ?? "generic@1"),
         builtin: false,
     };
 }
@@ -248,6 +252,7 @@ function templateDict(resolved) {
         shot_marker_channel: resolved.shot_marker_channel ?? "",
         global_merge: resolved.global_merge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: globalChannelsEnabled(resolved),
+        default_context_profile: resolved.default_context_profile ?? "generic@1",
     };
 }
 

@@ -12,6 +12,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 from aiohttp import web
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,9 +21,14 @@ TEST_PACKAGE = "video_editor_testpkg"
 sys.path.insert(0, str(ROOT))
 
 from server.timeline_state import (  # noqa: E402
+    Asset,
     GenerationJob,
     LaneConfig,
     PromptSection,
+    ReferenceEntity,
+    ReferenceItem,
+    ReferenceLaneRecipe,
+    ReferenceMember,
     Scene,
     TimelineProject,
 )
@@ -61,6 +67,68 @@ def test_bridge_live_resolution_with_ctx_window():
     assert payload["smart_prompt"] == "[VISUAL]: walks [0-10] | [VISUAL]: runs [10-40]"
     assert payload["local_prompts"] == "[VISUAL]: walks | [VISUAL]: runs"
     assert payload["segment_lengths"] == "10,30"
+
+
+def test_bridge_live_reference_formatting_matches_shared_execution_compile():
+    prompt_bridge = _import_prompt_bridge()
+    attachment = {
+        "attachment_id": "reference",
+        "kind": "reference",
+        "source": {"reference_item_id": "item"},
+        "capabilities": [{
+            "capability_id": "derived_prompt", "kind": "derived_prompt",
+            "placement": "section_prefix", "channel_key": "visual",
+        }],
+    }
+    project, scene = _project_with_scene(
+        prompt="", prompt_sections=[PromptSection(
+            0, 24, channels={"visual": "walks"}, attachments=[attachment])])
+    project.assets = [Asset(asset_id="portrait", asset_type="image")]
+    project.references = [ReferenceEntity(
+        reference_id="granny", name="Granny", members=[ReferenceMember(
+            member_id="portrait-member", asset_id="portrait",
+            prompt="an older woman in a red coat")])]
+    scene.reference_lane_count = 1
+    scene.reference_lane_recipes = [ReferenceLaneRecipe(
+        lane_id="reference", media_kind="image", recipe={"soft": {
+            "compatible_profiles": ["generic@1"],
+            "physical_population": "none",
+            "exposed_capabilities": ["derived_prompt"],
+        }})]
+    scene.reference_items = [ReferenceItem(
+        reference_item_id="item", lane_index=0, start_frame=0, end_frame=24,
+        members=[{"entity_id": "granny", "member_id": "portrait-member"}])]
+    project._execution_context = {
+        "scene_id": "scene-1", "context_start": 0, "context_end": 24,
+    }
+
+    payload = prompt_bridge.build_window_relay_payload(project)
+    compiled = scene.compile_for_execution(
+        project, 0, 24, template="sonder", fps=project.fps,
+        labels_on=True)
+
+    for key in ("global_prompt", "smart_prompt", "local_prompts",
+                "segment_lengths", "segments"):
+        assert payload[key] == compiled["relay"][key]
+    assert "an older woman in a red coat" in payload["smart_prompt"]
+
+
+def test_bridge_live_refuses_blocking_prompt_context_diagnostics():
+    prompt_bridge = _import_prompt_bridge()
+    attachment = {
+        "attachment_id": "broken-reference-item",
+        "kind": "reference",
+        "source": {"reference_item_id": "missing-item"},
+    }
+    project, _scene = _project_with_scene(
+        prompt_sections=[PromptSection(
+            0, 24, channels={"visual": "walks"}, attachments=[attachment])])
+    project._execution_context = {
+        "scene_id": "scene-1", "context_start": 0, "context_end": 24,
+    }
+
+    with pytest.raises(RuntimeError, match="reference_source_not_applicable"):
+        prompt_bridge.build_window_relay_payload(project)
 
 
 def test_bridge_window_fallback_without_editor_ctx():

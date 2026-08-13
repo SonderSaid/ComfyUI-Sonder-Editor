@@ -346,6 +346,15 @@ def test_empty_channels_are_omitted_not_written_as_na():
     assert "N/A" not in composed
     assert "overall_soundscape" not in composed
 
+    generic = _compose([
+        PromptSection(0, 24, channels={
+            "visual": "A woman enters the room", "motion": "", "audio": "",
+        }),
+    ], 0, 24, _template("sonder"))
+    assert "A woman enters the room" in generic
+    assert "motion:" not in generic
+    assert "audio:" not in generic
+
 
 # --- section model ------------------------------------------------------------
 
@@ -366,54 +375,25 @@ def test_six_channel_section_round_trips_without_truncation():
     assert restored == section
 
 
-def test_starts_new_shot_and_subject_ids_round_trip():
+def test_starts_new_shot_round_trips_and_legacy_subject_ids_are_dropped():
     section = PromptSection(0, 120, channels={"detailed_description": "x"})
     setattr(section, "starts_new_shot", True)
-    setattr(section, "subject_ids", [{"entity_id": "abc123", "retention": "fully_preserved"}])
 
     data = section.to_dict()
     assert data["starts_new_shot"] is True
-    assert data["subject_ids"] == [{"entity_id": "abc123", "retention": "fully_preserved"}]
+    assert "subject_ids" not in data
 
+    data["subject_ids"] = [{"entity_id": "abc123", "retention": "fully_preserved"}]
     restored = PromptSection.from_dict(data)
     assert getattr(restored, "starts_new_shot") is True
-    assert getattr(restored, "subject_ids") == [
-        {"entity_id": "abc123", "retention": "fully_preserved"}]
-    assert restored == section
+    assert not hasattr(restored, "subject_ids")
+    assert "subject_ids" not in restored.to_dict()
 
 
-def test_pre_upgrade_section_dict_defaults_both_new_fields():
+def test_pre_upgrade_section_dict_defaults_shot_off():
     restored = PromptSection.from_dict({
         "start_frame": 0, "end_frame": 120,
         "channels": {"visual": "old", "speech": "", "sounds": ""},
     })
     assert getattr(restored, "starts_new_shot") is False
-    assert getattr(restored, "subject_ids") == []
-
-
-def test_subject_ids_normalizer_dedupes_and_keeps_authored_order():
-    # One normalizer shared by the model, the routes and the identity check.
-    # Authored order survives because it is the tie-break when one section
-    # binds several subjects; duplicates collapse to the first occurrence.
-    normalize = getattr(pp, "normalize_subject_ids")
-    assert normalize(None) == []
-    assert [entry["entity_id"] for entry in
-            normalize([{"entity_id": "b"}, {"entity_id": "a"}, {"entity_id": "b"}])] == ["b", "a"]
-    # A binding is an OBJECT. There is no bare-string form to accept: retention
-    # shipped in the same commit as subject_ids, so accepting one would only
-    # revive junk such as the "[object Object]" left in dev browser storage.
-    assert normalize(["a", "[object Object]"]) == []
-    assert normalize([{"entity_id": "a", "retention": "bogus"}])[0]["retention"] == (
-        getattr(pp, "DEFAULT_SUBJECT_RETENTION"))
-    # Malformed containers reach this straight from request bodies; never raise.
-    for malformed in ({}, {"entity_id": "a"}, 5, "abc", True):
-        assert normalize(malformed) == []
-
-
-def test_subject_ids_identity_ignores_order_and_duplicates():
-    # Identity validation compares an order-insensitive projection, so a client
-    # that merely reordered bindings cannot provoke a spurious 409.
-    identity = getattr(pp, "subject_ids_identity")
-    assert identity([{"entity_id": "b"}, {"entity_id": "a"}, {"entity_id": "b"}]) == (
-        identity([{"entity_id": "a"}, {"entity_id": "b"}])
-    )
+    assert not hasattr(restored, "subject_ids")

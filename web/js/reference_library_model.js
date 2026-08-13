@@ -273,14 +273,20 @@ export function createReferenceDraft(source = null) {
             ? source.reference_class
             : defaultReferenceClass(kind),
         description: source?.description || "",
+        visual_intent: ["preserve", "partial", "transfer_attributes", "reference_loosely"]
+            .includes(source?.visual_intent) ? source.visual_intent : "preserve",
+        audio_intent: ["copy_full", "copy_partial", "reference_characteristics", "reference_loosely"]
+            .includes(source?.audio_intent) ? source.audio_intent : "reference_characteristics",
     };
 }
 
 export function createMemberDraft(source = null, asset = null) {
     const crop = source?.crop && typeof source.crop === "object" ? source.crop : null;
+    const suggestedName = String(asset?.name || "").replace(/\.[^.]+$/, "").trim();
     return {
         member_id: source?.member_id || "",
         asset_id: source?.asset_id || asset?.asset_id || "",
+        name: source?.name || (!source ? suggestedName : ""),
         asset_type: asset?.asset_type || "",
         tags: Array.isArray(source?.tags) ? [...source.tags] : [],
         prompt: source?.prompt || "",
@@ -299,6 +305,9 @@ export function replaceMemberDraftAsset(draft, asset) {
         tags: Array.isArray(draft?.tags) ? [...draft.tags] : [],
         asset_id: asset?.asset_id || "",
         asset_type: nextType,
+        name: draft?.name || (!draft?.member_id
+            ? String(asset?.name || "").replace(/\.[^.]+$/, "").trim()
+            : ""),
     };
     const notices = [];
     const priorVisual = priorType === "image" || priorType === "video";
@@ -360,6 +369,8 @@ export function serializeReferenceDraft(draft) {
         kind: draft.kind,
         reference_class: draft.reference_class,
         description: String(draft.description ?? "").trim(),
+        visual_intent: draft.visual_intent,
+        audio_intent: draft.audio_intent,
     };
 }
 
@@ -368,6 +379,7 @@ export function serializeMemberDraft(draft, catalog = []) {
     const end = draft.source_end_sec === "" || draft.source_end_sec == null ? null : Number(draft.source_end_sec);
     return {
         asset_id: text(draft.asset_id),
+        name: text(draft.name),
         tags,
         prompt: String(draft.prompt ?? "").trim(),
         crop: draft.crop == null ? null : {

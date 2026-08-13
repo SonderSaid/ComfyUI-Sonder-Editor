@@ -67,8 +67,12 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
 - **Multi-lane timeline** — video/audio lanes with drag, trim, split, snapping,
   lock/hide, lane management, multi-layer compositing, and per-item fit modes.
 - **Scenes** — each with its own duration, resolution, and FPS.
-- **Prompt sections** — two prompt lanes with Visual/Speech/Sounds channels,
-  templates, and history.
+- **Prompt sections** — channel-template fields, history, and reusable **Context
+  chips** in timeline bars plus the Prompt tool's Structured and Writing modes.
+  Shot (with an optional relative time), Reference, Vocal Event, Prompt Link,
+  and Custom chips resolve against the selected render window; Custom text can
+  carry an H3 physical Guide binding, and fixed provider syntax stays available
+  as profile-owned Writing aids.
 - **Guide frames** — per-frame reference images for conditioning, with an
   animatic preview mode. For LTX-style workflows, Settings > Guides exposes a
   project-durable **Guide collision auto-offset** toggle (default on): single-
@@ -85,11 +89,23 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
   compare mode, trash/restore, favorites, reference-aware deletes, and tracked
   generation metadata.
 - **Reference Library** — project-durable character, location, prop, and outfit
-  collections with image/audio/video members, hybrid tags, prompts, visual
+  collections with image/audio/video members, optional `Reference · Member`
+  suffix labels, hybrid tags, prompts, provider-neutral preservation defaults, visual
   crop/trim editing, and conflict-safe authoring in fullscreen or mounted mode.
 - **Reference lanes** — scope ordered Library members over scene ranges, choose
   durable model-specific assembly recipes, and freeze the effective sets into
   queued generations.
+- **Context chips** — add dynamic Shot, Reference, Custom, Vocal Event, or
+  Prompt Link intent without writing provider ordinals by hand. Shot owns its
+  optional relative time, and H3 Custom text can bind to a physical Guide.
+  Timeline bars show one remembered channel at a time while keeping every
+  channel editor and undo history mounted; the Prompt tool exposes the same chip
+  documents in Structured and Writing modes.
+- **Progressive Reference setup** — staged thumbnails, ranges, applicability,
+  recipe lifecycle, and errors stay visible; assembly internals and per-member
+  role/preservation controls expand when needed. Recipe Prompt Context choices
+  use guided prompt-format, model-input, prompt-part, and per-member-option
+  catalogs while preserving custom recipes.
 - **Timeline export** — export video/audio with a frame-streaming CPU
   compositing path; practical duration is bounded by disk space rather than RAM.
 - **Color-managed exports** — video presets encode and tag BT.709, and timeline
@@ -112,7 +128,7 @@ ComfyUI.
 | **Sonder Driver Selector** | Resolves a selected Driver lane *without* decoding media and exposes a `has_driver` presence flag for lazy routing; pass its reference to the Driver Bridge. |
 | **Sonder Driver Bridge** | Decodes the selected Driver lane's frames from a Driver Selector reference, emitting driver images, local start index, and conditioning strength for the render window. |
 | **Sonder Reference Selector** | Resolves one Reference lane for the active editor window without decoding media and exposes `has_reference` for lazy branch routing plus the item's authored conditioning strength. |
-| **Sonder Reference Image Bridge** | Decodes image references according to the lane recipe. Slot recipes grow as `r01`–`r16`; assembled batches, sheets, and temporal sequences use `r01`. |
+| **Sonder Reference Image Bridge** | Decodes image-serving references according to the lane recipe. Slot recipes grow as `r01`–`r16`; assembled batches, sheets, and temporal sequences use `r01`. MiniMax H3 Video lanes also use this bridge and emit 24 fps IMAGE sequences on the `17n+5` frame grid. |
 | **Sonder Reference Audio Bridge** | Decodes up to 16 trimmed audio members as homogeneous `a01`–`a16` outputs. |
 | **Sonder Reference Prompt Bridge** | Exports `reference_prompt`, `reference_names`, and per-member `p01`–`p16` strings. |
 | **Sonder Masks Bridge** | Exposes the editor's generation-mask window as separate video/audio mask-time pairs, each gated by an Edit/Freeze toggle (a frozen channel emits a zero-width window, so nothing is generated for it). Feed a downstream temporal mask node. |
@@ -136,7 +152,8 @@ ComfyUI.
 | **Sonder Cluster** | Routes a shared branch selection across multiple lanes, each lane carrying its own type (lazy). |
 
 > **Sonder Switch**, **Sonder Cluster**, **Sonder Reference Selector**, the three
-> **Sonder Reference Bridges**, and **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
+> **Sonder Reference Bridges**, and
+> **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
 > newer V3 node API and load only on recent ComfyUI builds.
 > V3 registration is schema-validated before it changes discovery:
 > older or incompatible builds keep the complete V1 node set under the

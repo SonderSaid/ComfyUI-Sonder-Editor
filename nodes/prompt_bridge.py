@@ -23,6 +23,8 @@ import logging
 
 from ..server import prompt_channel_templates
 from ..server import prompt_payload
+from ..server.prompt_live_context import compile_live_scene_prompt_context
+from ..server.timeline_state import effective_scene_fps
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,15 @@ def _threshold_from(source, default: float = 10.0) -> float:
         return default
 
 
+def _reference_threshold_from(source, default: float = 0.0) -> float:
+    if not isinstance(source, dict):
+        return default
+    try:
+        return float(source.get("reference_frame_threshold", default) or 0.0)
+    except (TypeError, ValueError):
+        return default
+
+
 def resolve_window_prompt_state(project):
     """Resolve (global_text, sections, labels_on, window, source, threshold, template).
 
@@ -122,15 +133,58 @@ def resolve_window_prompt_state(project):
 
 def build_window_relay_payload(project) -> dict:
     """Window-resolved PromptRelay payload (the bridge's testable core)."""
+    queue_job = _find_ref_job(project)
+    frozen = (getattr(queue_job, "compiled_prompt_context", {})
+              if queue_job is not None and _snapshot_version(queue_job) > 0 else {})
+    if isinstance(frozen, dict) and frozen.get("format") == "prompt_context_v1":
+        payload = dict(frozen.get("relay") or {})
+        window = frozen.get("window") or {}
+        profile = frozen.get("profile") or {}
+        template = prompt_channel_templates.get_channel_template(
+            profile.get("template_id"))
+        payload["labels_on"] = prompt_channel_templates.template_labels_on(
+            template, False)
+        payload["window_start"] = int(window.get("start_frame", 0))
+        payload["window_end"] = int(window.get("end_frame", 0))
+        payload["source"] = "snapshot"
+        payload.setdefault("global_prompt", "")
+        payload.setdefault("smart_prompt", "")
+        payload.setdefault("local_prompts", "")
+        payload.setdefault("segment_lengths", "")
+        payload.setdefault("segments", [])
+        return payload
     (global_text, sections, labels_on, window_start, window_end, source,
      threshold, template) = resolve_window_prompt_state(project)
-    segments = prompt_payload.resolve_segments(
-        sections, window_start, window_end, labels_on, threshold, template)
-    payload = prompt_payload.build_relay_payload(global_text, segments)
+    scene = _resolve_active_scene(project)
+    if source == "live" and scene is not None:
+        metadata = getattr(project, "metadata", None)
+        compiled = compile_live_scene_prompt_context(
+            project, scene, template=template, window_start=window_start,
+            window_end=window_end, fps=effective_scene_fps(project, scene),
+            labels_on=labels_on,
+            delimiter=str((metadata or {}).get("prompt_section_delimiter", ".") or ""),
+            prompt_threshold=threshold,
+            reference_threshold=_reference_threshold_from(metadata))
+        errors = list(compiled.get("errors") or [])
+        if errors:
+            first = errors[0]
+            detail = (f"{first.get('code', 'prompt_context_error')}: "
+                      f"{first.get('message', 'Prompt Context compilation failed.')}")
+            raise RuntimeError(f"Sonder live prompt refused — {detail}")
+        payload = dict(compiled.get("relay") or {})
+    else:
+        segments = prompt_payload.resolve_segments(
+            sections, window_start, window_end, labels_on, threshold, template)
+        payload = prompt_payload.build_relay_payload(global_text, segments)
     payload["labels_on"] = labels_on
     payload["window_start"] = window_start
     payload["window_end"] = window_end
     payload["source"] = source
+    payload.setdefault("global_prompt", "")
+    payload.setdefault("smart_prompt", "")
+    payload.setdefault("local_prompts", "")
+    payload.setdefault("segment_lengths", "")
+    payload.setdefault("segments", [])
     return payload
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -47,7 +48,13 @@ from .path_security import (
     sanitize_filename_component,
 )
 from .atomic_io import atomic_replace
-from .reference_resolution import migrate_live_outputs, reference_live_outputs
+from .reference_resolution import (
+    migrate_live_outputs, reference_live_outputs, resolve_effective_references,
+)
+from .prompt_live_context import (
+    compile_live_scene_prompt_context,
+    resolve_scene_prompt_context,
+)
 from .render_cache import (
     RenderCacheActiveError,
     RenderCacheError,
@@ -97,10 +104,10 @@ from .timeline_state import (
     ReferenceItem, ReferenceLaneRecipe,
     REFERENCE_CLASSES, REFERENCE_KINDS, REFERENCE_TAG_NAMESPACE, REFERENCE_TAG_PRESETS,
     REFERENCE_RECIPE_FIELDS,
-    REFERENCE_RECIPE_PRESETS,
+    REFERENCE_RECIPE_PRESETS, ALL_REFERENCE_RECIPE_PRESETS,
     apply_color_metadata, classify_asset_path, default_reference_class,
     effective_scene_fps, media_timeline_frames, normalize_reference_tags,
-    retime_scene_geometry,
+    retime_scene_geometry, ensure_default_prompt_semantic_units,
 )
 from .lane_registry import (
     LANE_DESCRIPTORS,
@@ -120,6 +127,8 @@ from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, gener
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 from . import external_links
 from . import prompt_channel_templates
+from . import prompt_context
+from . import minimax_h3
 from . import prompt_payload
 from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
@@ -646,6 +655,49 @@ def _mutation_json_error(exc: ProjectMutationRequestError) -> web.Response:
     return web.json_response({"error": exc.message, "code": exc.code}, status=exc.status)
 
 
+def _scene_attachment_total(scene, *, exclude_section=None, exclude_global=False) -> int:
+    """Attachments a scene already holds outside the list being written."""
+    total = 0 if exclude_global else len(
+        getattr(scene, "global_attachments", []) or [])
+    for section in getattr(scene, "prompt_sections", []) or []:
+        if exclude_section is not None and section is exclude_section:
+            continue
+        total += len(getattr(section, "attachments", []) or [])
+    return total
+
+
+def _validated_attachments(raw, *, scene=None, exclude_section=None,
+                           exclude_global=False) -> list:
+    """Normalize authored Context attachments, refusing over-cap writes.
+
+    Normalization deliberately preserves overflow so deserialization never
+    destroys stored data; an authoring mutation must refuse it instead, or the
+    client believes work it can no longer see was saved.
+
+    The cap the compiler enforces is per SCENE, so when the caller can supply
+    the scene this counts the rest of it too. Otherwise authoring accepts a set
+    of individually legal writes that no longer compiles.
+    """
+    # Bound the work before normalizing: the raw list is attacker/client sized,
+    # and normalizing it first would build every object just to reject them.
+    if isinstance(raw, list) and len(raw) > prompt_context.MAX_ATTACHMENTS_PER_SCENE:
+        _mutation_error(
+            f"A scene may contain at most {prompt_context.MAX_ATTACHMENTS_PER_SCENE} "
+            "Context attachments.", 400, "attachment_limit")
+    normalized = prompt_context.normalize_attachments(raw)
+    invalid = prompt_context.attachment_limit_errors(normalized)
+    if invalid:
+        _mutation_error(str(invalid[0]["message"]), 400, str(invalid[0]["code"]))
+    if scene is not None:
+        existing = _scene_attachment_total(
+            scene, exclude_section=exclude_section, exclude_global=exclude_global)
+        if existing + len(normalized) > prompt_context.MAX_ATTACHMENTS_PER_SCENE:
+            _mutation_error(
+                f"A scene may contain at most {prompt_context.MAX_ATTACHMENTS_PER_SCENE} "
+                "Context attachments.", 400, "attachment_limit")
+    return normalized
+
+
 def _require_scene_queue_idle(project: TimelineProject, scene_id: str) -> None:
     for job in getattr(project, "generation_queue", []) or []:
         if str(getattr(job, "scene_id", "") or "") != str(scene_id or ""):
@@ -718,9 +770,17 @@ def _set_scene_lane_count(scene: Scene, lane_type: str, count: int) -> None:
         configs.pop()
     if descriptor.recipe_attr:
         recipes = getattr(scene, descriptor.recipe_attr)
+        removed_lane_ids = [
+            str(getattr(recipe, "lane_id", "") or "")
+            for recipe in recipes[count:]
+        ]
         while len(recipes) > count:
             recipes.pop()
         pad_lane_recipes(scene, ReferenceLaneRecipe)
+        scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
+            scene.minimax_h3_conditioning_setups,
+            {lane_id: "" for lane_id in removed_lane_ids if lane_id},
+        )
 
 
 def _lane_config(scene: Scene, lane_type: str, lane_index: int) -> LaneConfig:
@@ -915,18 +975,30 @@ def _validate_prompt_identity(section: PromptSection, expected: dict | None) -> 
         expected_channels = prompt_payload.normalize_channels(expected.get("channels"))
         if expected_channels != getattr(section, "channels", None):
             _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    if "channel_docs" in expected:
+        expected_docs = prompt_context.normalize_channel_documents(
+            expected.get("channel_docs"), expected.get("channels") or {},
+            getattr(section, "channel_docs", {}).keys())
+        current_docs = prompt_context.normalize_channel_documents(
+            getattr(section, "channel_docs", {}), getattr(section, "channels", {}),
+            getattr(section, "channel_docs", {}).keys())
+        if prompt_context.content_hash(expected_docs) != prompt_context.content_hash(current_docs):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    if "attachments" in expected:
+        if prompt_context.content_hash(prompt_context.normalize_attachments(
+                expected.get("attachments"))) != prompt_context.content_hash(
+                    prompt_context.normalize_attachments(
+                        getattr(section, "attachments", []))):
+            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
     if "starts_new_shot" in expected:
         if bool(expected["starts_new_shot"]) != bool(getattr(section, "starts_new_shot", False)):
             _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
     if "shot_timestamp" in expected:
         if bool(expected["shot_timestamp"]) != bool(getattr(section, "shot_timestamp", False)):
             _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
-    if "subject_ids" in expected:
-        # Order-insensitive: a client that merely reordered bindings has not
-        # changed the section, and must not be told it conflicts.
-        if (prompt_payload.subject_ids_identity(expected["subject_ids"])
-                != prompt_payload.subject_ids_identity(getattr(section, "subject_ids", None))):
-            _mutation_error("Prompt section identity mismatch", 409, "identity_mismatch")
+    # `subject_ids` was never shipped as active UI state and is retired by
+    # prompt_context_v1.  Old clients may still echo it; it is ignored rather
+    # than converted into a different semantic model or causing a false 409.
     if "global_channel_exceptions" in expected:
         # A set, so the normalizer's sort makes this order-insensitive too.
         if (prompt_payload.normalize_channel_exceptions(expected["global_channel_exceptions"])
@@ -1314,13 +1386,19 @@ def _apply_linked_bounds_update(
                 setattr(guide, field, bool(fields[field]) if field == "muted" else fields[field])
     elif item_type == "prompt":
         section = _find_prompt_section_by_id(scene, item_id)
-        if isinstance(fields.get("channels"), dict):
-            section.channels = prompt_payload.merge_channels(
-                section.channels, fields["channels"])
+        if "channel_docs" in fields:
+            section.set_channel_documents(fields["channel_docs"])
+        elif isinstance(fields.get("channels"), dict):
+            section.set_channels(prompt_payload.merge_channels(
+                section.channels, fields["channels"]))
         elif "prompt" in fields:
             section.prompt = str(fields["prompt"])
         if "muted" in fields:
             section.muted = bool(fields["muted"])
+        if "attachments" in fields:
+            section.attachments = _validated_attachments(
+                fields["attachments"], scene=scene, exclude_section=section)
+            section.refresh_marker_mirrors()
 
 
 def _split_clip_object(scene: Scene, clip: ClipReference, split_frame: int) -> ClipReference:
@@ -1391,6 +1469,8 @@ def _split_audio_object(scene: Scene, track: AudioTrack, split_frame: int) -> Au
 def _split_prompt_object(scene: Scene, section: PromptSection, split_frame: int) -> PromptSection:
     if split_frame <= section.start_frame or split_frame >= section.end_frame:
         _mutation_error("Split frame must be within prompt section range", 400, "invalid_range")
+    right_documents, right_attachments = prompt_context.clone_for_split(
+        getattr(section, "channel_docs", {}), getattr(section, "attachments", []))
     right = PromptSection(
         start_frame=split_frame,
         end_frame=section.end_frame,
@@ -1399,11 +1479,12 @@ def _split_prompt_object(scene: Scene, section: PromptSection, split_frame: int)
         # Neither shot flag is inherited: a split is a range operation, and
         # inheriting would turn one shot into two and shift every later
         # [Shot N], or stamp a cut time at a frame the user never marked.
-        # subject_ids IS copied (a fresh list, never an alias) — both halves
-        # still show the same subjects.
         starts_new_shot=False,
         shot_timestamp=False,
-        subject_ids=[dict(entry) for entry in getattr(section, "subject_ids", []) or []],
+        channel_docs=right_documents,
+        attachments=right_attachments,
+        global_channel_exceptions=list(
+            getattr(section, "global_channel_exceptions", []) or []),
     )
     section.end_frame = split_frame
     scene.prompt_sections.append(right)
@@ -1487,9 +1568,53 @@ def _apply_scene_fields(project: TimelineProject, scene: Scene, fields: dict) ->
     if "prompt" in fields:
         _require_lane_unlocked(scene, "prompt_global")
         scene.set_global_prompt(fields["prompt"])
-    if "global_channels" in fields:
+    if "global_channel_docs" in fields:
         _require_lane_unlocked(scene, "prompt_global")
-        scene.set_global_channels(fields["global_channels"])
+        scene.set_global_channel_documents(fields["global_channel_docs"])
+    elif "global_channels" in fields:
+        _require_lane_unlocked(scene, "prompt_global")
+        try:
+            scene.set_global_channels(fields["global_channels"])
+        except ValueError as exc:
+            if str(exc) == "structured_edit_conflict":
+                _mutation_error(
+                    "This prompt contains Context chips and requires a structured edit",
+                    409,
+                    "structured_edit_conflict",
+                )
+            raise
+    if "global_attachments" in fields:
+        _require_lane_unlocked(scene, "prompt_global")
+        scene.global_attachments = _validated_attachments(
+            fields["global_attachments"], scene=scene, exclude_global=True)
+    if "prompt_context_profile_id" in fields:
+        scene.prompt_context_profile_id = str(fields["prompt_context_profile_id"] or "")
+    if "prompt_context_profile_config" in fields:
+        scene.prompt_context_profile_config = (
+            dict(fields["prompt_context_profile_config"])
+            if isinstance(fields["prompt_context_profile_config"], dict) else {})
+    if ("minimax_h3_conditioning_setups" in fields
+            or "active_minimax_h3_setup_id" in fields):
+        raw_setups = fields.get(
+            "minimax_h3_conditioning_setups",
+            scene.minimax_h3_conditioning_setups,
+        )
+        setups = []
+        for raw_setup in (raw_setups if isinstance(raw_setups, list) else []):
+            if not isinstance(raw_setup, dict):
+                continue
+            normalized_setup = minimax_h3.normalize_setup(raw_setup)
+            invalid_setup = minimax_h3.setup_validation_errors(normalized_setup)
+            if invalid_setup:
+                _mutation_error(str(invalid_setup[0]["message"]), 400,
+                                str(invalid_setup[0]["code"]))
+            setups.append(normalized_setup)
+        active_setup_id = str(fields.get(
+            "active_minimax_h3_setup_id",
+            scene.active_minimax_h3_setup_id,
+        ) or "")
+        scene.minimax_h3_conditioning_setups = setups
+        scene.active_minimax_h3_setup_id = active_setup_id
     if "generation_params" in fields:
         scene.generation_params = fields["generation_params"] if isinstance(fields["generation_params"], dict) else {}
     if "width" in fields:
@@ -1528,12 +1653,36 @@ def _apply_lane_configs(scene: Scene, fields: dict) -> None:
             else:
                 setattr(scene, attr, LaneConfig.from_dict(fields[attr]))
         if descriptor.variable and descriptor.recipe_attr and descriptor.recipe_attr in fields:
-            setattr(
-                scene,
-                descriptor.recipe_attr,
-                [ReferenceLaneRecipe.from_dict(recipe) for recipe in fields[descriptor.recipe_attr]],
-            )
+            _replace_reference_lane_recipes(
+                scene, fields[descriptor.recipe_attr])
     _ensure_scene_lane_config_lengths(scene)
+
+
+def _replace_reference_lane_recipes(scene: Scene, raw_recipes) -> None:
+    """Replace aligned recipes without losing or orphaning lane identity."""
+    previous = list(scene.reference_lane_recipes)
+    incoming = []
+    replacements = {}
+    for index, raw_recipe in enumerate(
+            raw_recipes if isinstance(raw_recipes, list) else []):
+        raw_value = dict(raw_recipe) if isinstance(raw_recipe, dict) else {}
+        old_lane_id = str(getattr(previous[index], "lane_id", "") or "") \
+            if index < len(previous) else ""
+        if not str(raw_value.get("lane_id") or "") and old_lane_id:
+            raw_value["lane_id"] = old_lane_id
+        next_recipe = ReferenceLaneRecipe.from_dict(raw_value)
+        incoming.append(next_recipe)
+        if old_lane_id and old_lane_id != next_recipe.lane_id:
+            replacements[old_lane_id] = next_recipe.lane_id
+    for old_recipe in previous[len(incoming):]:
+        old_lane_id = str(getattr(old_recipe, "lane_id", "") or "")
+        if old_lane_id:
+            replacements[old_lane_id] = ""
+    scene.reference_lane_recipes = incoming
+    scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
+        scene.minimax_h3_conditioning_setups,
+        replacements,
+    )
 
 
 def _apply_lane_config(scene: Scene, op: dict) -> dict:
@@ -1575,7 +1724,13 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
         recipes = getattr(scene, descriptor.recipe_attr)
         while len(recipes) <= lane_index:
             recipes.append(ReferenceLaneRecipe())
-        next_recipe = ReferenceLaneRecipe.from_dict(fields["reference_recipe"])
+        previous_recipe = recipes[lane_index]
+        previous_lane_id = str(previous_recipe.lane_id or "")
+        raw_recipe = (dict(fields["reference_recipe"])
+                      if isinstance(fields["reference_recipe"], dict) else {})
+        if not str(raw_recipe.get("lane_id") or ""):
+            raw_recipe["lane_id"] = previous_lane_id
+        next_recipe = ReferenceLaneRecipe.from_dict(raw_recipe)
         if (
             next_recipe.media_kind != recipes[lane_index].media_kind
             and _media_lane_items(scene, lane_type, lane_index)
@@ -1586,6 +1741,11 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
                 "reference_media_kind_mismatch",
             )
         recipes[lane_index] = next_recipe
+        if previous_lane_id and previous_lane_id != next_recipe.lane_id:
+            scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
+                scene.minimax_h3_conditioning_setups,
+                {previous_lane_id: next_recipe.lane_id},
+            )
     return {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
 
 
@@ -1756,6 +1916,11 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
     _require_lane_unlocked(scene, lane_type, lane_index)
 
     lane_items = _media_lane_items(scene, lane_type, lane_index)
+    removed_lane_id = ""
+    if descriptor.recipe_attr:
+        recipes = getattr(scene, descriptor.recipe_attr)
+        if lane_index < len(recipes):
+            removed_lane_id = str(getattr(recipes[lane_index], "lane_id", "") or "")
 
     item_policy = str(item_policy or "require_empty")
     if lane_items and item_policy == "require_empty":
@@ -1805,6 +1970,11 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
     next_count = current_count - 1
     setattr(scene, descriptor.count_attr, next_count)
     _trim_lane_configs(scene, descriptor, lane_index, next_count)
+    if removed_lane_id:
+        scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
+            scene.minimax_h3_conditioning_setups,
+            {removed_lane_id: ""},
+        )
     if descriptor.max_items_per_lane == 1:
         _validate_single_driver_per_lane(scene)
 
@@ -2254,6 +2424,31 @@ def _apply_create_guide(scene: Scene, fields: dict) -> GuideFrame:
     return guide
 
 
+def _next_prompt_section_content(section: PromptSection, fields: dict) -> tuple[dict, dict]:
+    """Apply one content patch on a copy and translate anchor conflicts.
+
+    The copy makes a multi-channel flat patch atomic: an unanchored first
+    channel cannot mutate the live section before a later anchored channel is
+    rejected.
+    """
+    trial = copy.deepcopy(section)
+    raw_channels = fields.get("channels")
+    try:
+        if "channel_docs" in fields:
+            trial.set_channel_documents(fields["channel_docs"])
+        elif isinstance(raw_channels, dict):
+            trial.set_channels(prompt_payload.merge_channels(trial.channels, raw_channels))
+        elif "prompt" in fields:
+            trial.prompt = str(fields["prompt"])
+    except ValueError as exc:
+        if str(exc) == "structured_edit_conflict":
+            _mutation_error(
+                "This prompt contains Context chips and requires a structured edit",
+                409, "structured_edit_conflict")
+        raise
+    return trial.channel_docs, trial.channels
+
+
 def _apply_update_prompt_section(scene: Scene, index: int, fields: dict, expected: dict | None = None) -> PromptSection:
     _require_lane_unlocked(scene, "prompt")
     section = _find_prompt_section(scene, index)
@@ -2265,21 +2460,25 @@ def _apply_update_prompt_section(scene: Scene, index: int, fields: dict, expecte
         # Text-only updates skip the overlap check so legacy stored overlaps
         # stay editable; only a range change may not create a NEW overlap.
         _require_no_prompt_overlap(scene, new_start, new_end, ignore=section)
+    next_docs, next_channels = _next_prompt_section_content(section, fields)
     section.start_frame = new_start
     section.end_frame = new_end
-    raw_channels = fields.get("channels")
-    if isinstance(raw_channels, dict):
-        section.channels = prompt_payload.merge_channels(section.channels, raw_channels)
-    elif "prompt" in fields:
-        section.prompt = str(fields["prompt"])
+    section.channel_docs = next_docs
+    section.channels = next_channels
     if "muted" in fields:
         section.muted = bool(fields["muted"])
     if "starts_new_shot" in fields:
-        section.starts_new_shot = bool(fields["starts_new_shot"])
+        section.attachments = prompt_context.set_marker_attachment(
+            section.attachments, "shot", bool(fields["starts_new_shot"]))
+        section.refresh_marker_mirrors()
     if "shot_timestamp" in fields:
-        section.shot_timestamp = bool(fields["shot_timestamp"])
-    if "subject_ids" in fields:
-        section.subject_ids = prompt_payload.normalize_subject_ids(fields["subject_ids"])
+        section.attachments = prompt_context.set_marker_attachment(
+            section.attachments, "timestamp", bool(fields["shot_timestamp"]))
+        section.refresh_marker_mirrors()
+    if "attachments" in fields:
+        section.attachments = _validated_attachments(
+            fields["attachments"], scene=scene, exclude_section=section)
+        section.refresh_marker_mirrors()
     if "global_channel_exceptions" in fields:
         section.global_channel_exceptions = prompt_payload.normalize_channel_exceptions(
             fields["global_channel_exceptions"])
@@ -2310,14 +2509,121 @@ def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
         muted=bool(fields.get("muted", False)),
         starts_new_shot=bool(fields.get("starts_new_shot", False)),
         shot_timestamp=bool(fields.get("shot_timestamp", False)),
-        subject_ids=fields.get("subject_ids"),
         global_channel_exceptions=fields.get("global_channel_exceptions"),
+        channel_docs=(fields.get("channel_docs")
+                      if isinstance(fields.get("channel_docs"), dict) else None),
+        attachments=_validated_attachments(fields.get("attachments"), scene=scene),
     )
     if fields.get("prompt_id"):
         section.prompt_id = str(fields.get("prompt_id"))
     scene.prompt_sections.append(section)
     scene.prompt_sections.sort(key=lambda s: s.start_frame)
     return section
+
+
+def _apply_replace_prompt_sections(scene: Scene, values) -> list[PromptSection]:
+    """Atomic Writing-mode reconciliation with stable prompt identities."""
+    _require_lane_unlocked(scene, "prompt")
+    if not isinstance(values, list):
+        _mutation_error("replace_prompt_sections requires a sections list", 400,
+                        "invalid_prompt_reconciliation")
+    sections = []
+    seen_ids = set()
+    previous_end = -1
+    for raw in sorted((value for value in values if isinstance(value, dict)),
+                      key=lambda value: int(value.get("start_frame", 0) or 0)):
+        section = PromptSection.from_dict(raw)
+        prompt_id = str(section.prompt_id or "")
+        if not prompt_id or prompt_id in seen_ids:
+            _mutation_error("Writing reconciliation contains duplicate prompt ids",
+                            409, "invalid_prompt_reconciliation")
+        if section.end_frame <= section.start_frame or section.start_frame < previous_end:
+            _mutation_error("Writing reconciliation contains overlapping sections",
+                            409, "invalid_prompt_reconciliation")
+        seen_ids.add(prompt_id)
+        previous_end = section.end_frame
+        sections.append(section)
+    # Writing-mode Apply replaces every section at once, so the scene cap is
+    # checked against the incoming set as a whole rather than section by
+    # section. This is the highest-volume attachment write in the product.
+    total_attachments = sum(len(value.attachments or []) for value in sections)
+    total_attachments += len(getattr(scene, "global_attachments", []) or [])
+    if total_attachments > prompt_context.MAX_ATTACHMENTS_PER_SCENE:
+        _mutation_error(
+            f"A scene may contain at most {prompt_context.MAX_ATTACHMENTS_PER_SCENE} "
+            "Context attachments.", 400, "attachment_limit")
+    for value in sections:
+        capability_overflow = prompt_context.attachment_limit_errors(
+            value.attachments)
+        if capability_overflow:
+            _mutation_error(str(capability_overflow[0]["message"]), 400,
+                            str(capability_overflow[0]["code"]))
+    scene.prompt_sections = sections
+    scene._ensure_stable_link_item_ids()
+    # Broken external consumers remain visible; link compilation reports the
+    # deleted source and blocks enqueue instead of retargeting it silently.
+    return sections
+
+
+def _apply_prompt_context_dependencies(project: TimelineProject, op: dict) -> dict:
+    """Import a browser-template dependency closure without overwriting ids.
+
+    The operation shares the scene mutation's version check and single project
+    save. Existing identical definitions are harmless; an id collision with a
+    different immutable profile or semantic unit is a rebind problem and must
+    never be resolved by choosing one side silently.
+    """
+    raw_profiles = op.get("profiles", [])
+    raw_units = op.get("semantic_units", [])
+    if not isinstance(raw_profiles, list) or not isinstance(raw_units, list):
+        _mutation_error("Prompt Context dependencies must be lists", 400,
+                        "invalid_prompt_context_dependencies")
+
+    profiles = []
+    try:
+        profiles = [prompt_context.normalize_profile(value)
+                    for value in raw_profiles if isinstance(value, dict)]
+    except ValueError as exc:
+        _mutation_error(f"Invalid Prompt Context profile dependency: {exc}", 400,
+                        "invalid_prompt_context_dependencies")
+    units = [prompt_context.normalize_semantic_unit(value)
+             for value in raw_units if isinstance(value, dict)]
+
+    profile_by_key = {
+        f"{value.get('profile_id')}@{value.get('version')}": value
+        for value in project.prompt_context_profiles if isinstance(value, dict)
+    }
+    imported_profiles = 0
+    for profile in profiles:
+        key = f"{profile.get('profile_id')}@{profile.get('version')}"
+        current = profile_by_key.get(key)
+        if current is not None and current != profile:
+            _mutation_error(
+                f"Prompt Context profile {key!r} already has a different definition; rebind it.",
+                409, "prompt_context_dependency_conflict")
+        if current is None:
+            project.prompt_context_profiles.append(profile)
+            profile_by_key[key] = profile
+            imported_profiles += 1
+
+    unit_by_id = {
+        str(value.get("semantic_unit_id") or ""): value
+        for value in project.prompt_semantic_units if isinstance(value, dict)
+    }
+    imported_units = 0
+    for unit in units:
+        unit_id = unit["semantic_unit_id"]
+        current = unit_by_id.get(unit_id)
+        if current is not None and current != unit:
+            _mutation_error(
+                f"Prompt Subject {unit_id!r} already has a different definition; rebind it.",
+                409, "prompt_context_dependency_conflict")
+        if current is None:
+            project.prompt_semantic_units.append(unit)
+            unit_by_id[unit_id] = unit
+            imported_units += 1
+    return {"type": "import_prompt_context_dependencies",
+            "profiles": imported_profiles, "semantic_units": imported_units}
 
 
 _REFERENCE_ITEM_FIELDS = {
@@ -2347,13 +2653,27 @@ def _reference_item_expected(item: ReferenceItem, expected, keys) -> None:
             _mutation_error("Reference item identity mismatch", 409, "identity_mismatch")
 
 
-def _canonical_reference_member_refs(project: TimelineProject, raw_members, media_kind: str) -> list[dict]:
+def _canonical_reference_member_refs(
+    project: TimelineProject,
+    raw_members,
+    media_kind: str,
+    recipe: dict | None = None,
+    active_profile: str = "",
+    legacy_members=None,
+) -> list[dict]:
     if not isinstance(raw_members, list) or not raw_members:
         _mutation_error("Reference items require at least one Library member", 400, "invalid_reference_item")
     by_member_id = {
         member.member_id: (reference, member)
         for reference in project.references
         for member in reference.members
+    }
+    soft = recipe.get("soft") if isinstance(recipe, dict) else {}
+    soft = soft if isinstance(soft, dict) else {}
+    role_fields = {str(value) for value in soft.get("role_fields", [])}
+    legacy_by_member = {
+        str(value.get("member_id") or ""): value
+        for value in (legacy_members or []) if isinstance(value, dict)
     }
     result = []
     seen = set()
@@ -2371,18 +2691,74 @@ def _canonical_reference_member_refs(project: TimelineProject, raw_members, medi
         if asset is None:
             _mutation_error(f"Reference member asset not found: {member.asset_id}", 404, "asset_not_found")
         asset_type = str(getattr(asset, "asset_type", "") or "")
-        compatible = (
-            asset_type in {"image", "video"}
-            if media_kind == "image"
-            else asset_type == "audio" or (asset_type == "video" and bool(getattr(asset, "has_audio", False)))
-        )
+        if media_kind == "image":
+            population = str(soft.get("physical_population") or "")
+            if population == "pictures":
+                compatible = asset_type == "image"
+            elif population == "videos":
+                compatible = asset_type == "video"
+            else:
+                compatible = asset_type in {"image", "video"}
+        elif media_kind == "video":
+            compatible = asset_type == "video"
+        else:
+            compatible = asset_type == "audio" or (
+                asset_type == "video" and bool(getattr(asset, "has_audio", False)))
         if not compatible:
             _mutation_error(
                 f"Reference member {member_id} is incompatible with the {media_kind} lane",
                 409,
                 "reference_media_kind_mismatch",
             )
-        result.append({"entity_id": reference.reference_id, "member_id": member_id})
+        normalized = {"entity_id": reference.reference_id, "member_id": member_id}
+        legacy = legacy_by_member.get(member_id, {})
+        unchanged = lambda field, value: str(legacy.get(field) or "") == str(value or "")
+        visual_intent = str(raw.get("visual_intent") or "")
+        if visual_intent:
+            if "visual_intent" not in role_fields and not unchanged(
+                    "visual_intent", visual_intent):
+                _mutation_error("This recipe does not expose visual preservation",
+                                409, "unsupported_reference_member_field")
+            if media_kind not in {"image", "video"} and not unchanged(
+                    "visual_intent", visual_intent):
+                _mutation_error("Visual preservation requires an Image or Video member",
+                                409, "reference_media_kind_mismatch")
+            if (visual_intent not in prompt_context.VISUAL_INTENTS
+                    and not unchanged("visual_intent", visual_intent)):
+                _mutation_error("Invalid staged visual role", 400,
+                                "invalid_reference_item")
+            normalized["visual_intent"] = visual_intent
+        audio_intent = str(raw.get("audio_intent") or "")
+        if audio_intent:
+            if "audio_intent" not in role_fields and not unchanged(
+                    "audio_intent", audio_intent):
+                _mutation_error("This recipe does not expose audio preservation",
+                                409, "unsupported_reference_member_field")
+            if (media_kind not in {"audio", "video"}
+                    and str(soft.get("physical_population") or "") != "videos"
+                    and not unchanged(
+                    "audio_intent", audio_intent)):
+                _mutation_error("Audio preservation requires an Audio or Video member",
+                                409, "reference_media_kind_mismatch")
+            if (audio_intent not in prompt_context.AUDIO_INTENTS
+                    and not unchanged("audio_intent", audio_intent)):
+                _mutation_error("Invalid staged audio role", 400,
+                                "invalid_reference_item")
+            normalized["audio_intent"] = audio_intent
+        role = str(raw.get("role") or "").strip()
+        if role:
+            if "role" not in role_fields and not unchanged("role", role):
+                _mutation_error("This recipe does not expose a per-member role",
+                                409, "unsupported_reference_member_field")
+            try:
+                role = prompt_context.normalize_reference_role(
+                    role, recipe or {}, profiles=project.prompt_context_profiles,
+                    active_profile=active_profile)
+            except ValueError as exc:
+                if not unchanged("role", role):
+                    _mutation_error(str(exc), 409, "unsupported_reference_role")
+            normalized["role"] = role
+        result.append(normalized)
         seen.add(member_id)
     return result
 
@@ -2444,6 +2820,76 @@ def _reference_lane_recipe(scene: Scene, lane_index: int) -> ReferenceLaneRecipe
     return scene.reference_lane_recipes[lane_index]
 
 
+def _scene_prompt_context_profile_key(project: TimelineProject, scene: Scene) -> str:
+    selected = str(getattr(scene, "prompt_context_profile_id", "") or "").strip()
+    if selected:
+        return selected if "@" in selected else f"{selected}@1"
+    template = prompt_channel_templates.resolve_channel_template(project.metadata)
+    return str(template.get("default_context_profile") or "generic@1")
+
+
+def _prompt_context_profile_usages(project: TimelineProject, profile_key: str) -> list[dict]:
+    usages = []
+    template = prompt_channel_templates.resolve_channel_template(project.metadata)
+    if str(template.get("default_context_profile") or "") == profile_key:
+        usages.append({"type": "channel_template", "name": template.get("name") or template.get("id")})
+    for scene in project.scenes:
+        if _scene_prompt_context_profile_key(project, scene) == profile_key:
+            usages.append({"type": "scene", "scene_id": scene.scene_id,
+                           "scene_name": scene.name})
+        for lane_index, recipe in enumerate(scene.reference_lane_recipes or []):
+            raw_recipe = recipe.recipe if isinstance(recipe, ReferenceLaneRecipe) else {}
+            soft = raw_recipe.get("soft") if isinstance(raw_recipe, dict) else {}
+            if profile_key in (soft.get("compatible_profiles") or []):
+                usages.append({"type": "reference_recipe", "scene_id": scene.scene_id,
+                               "lane_index": lane_index})
+    return usages
+
+
+def _normalize_prompt_context_profile_update(project: TimelineProject, raw_profiles) -> list[dict]:
+    if not isinstance(raw_profiles, list):
+        _mutation_error("prompt_context_profiles must be a list", 400,
+                        "invalid_prompt_context_profiles")
+    normalized_profiles = []
+    seen_profiles = set()
+    try:
+        for raw_profile in raw_profiles:
+            value = prompt_context.normalize_profile(raw_profile)
+            key = f"{value['profile_id']}@{value['version']}"
+            if key in prompt_context.BUILTIN_PROFILES or key in seen_profiles:
+                raise ValueError("duplicate_or_builtin_profile")
+            seen_profiles.add(key)
+            normalized_profiles.append(value)
+    except ValueError as exc:
+        _mutation_error(f"Invalid prompt context profile: {exc}", 400,
+                        "invalid_prompt_context_profile")
+
+    existing = {
+        f"{value.get('profile_id')}@{value.get('version', '1')}":
+            prompt_context.normalize_profile(value)
+        for value in project.prompt_context_profiles or []
+        if isinstance(value, dict)
+    }
+    proposed = {
+        f"{value['profile_id']}@{value['version']}": value
+        for value in normalized_profiles
+    }
+    for key in existing.keys() & proposed.keys():
+        if prompt_context.content_hash(existing[key]) != prompt_context.content_hash(proposed[key]):
+            _mutation_error(
+                f"Prompt format {key} is immutable; save the edit under a new version.",
+                409, "immutable_prompt_context_profile")
+    for key in existing.keys() - proposed.keys():
+        usages = _prompt_context_profile_usages(project, key)
+        if usages:
+            exc = ProjectMutationRequestError(
+                f"Prompt format {key} is still in use", 409,
+                "prompt_context_profile_in_use")
+            exc.usages = usages
+            raise exc
+    return normalized_profiles
+
+
 def _apply_create_reference_item(project: TimelineProject, scene: Scene, fields: dict) -> ReferenceItem:
     if not isinstance(fields, dict):
         _mutation_error("create_reference_item requires fields", 400)
@@ -2456,7 +2902,9 @@ def _apply_create_reference_item(project: TimelineProject, scene: Scene, fields:
     _require_lane_unlocked(scene, "reference", lane_index)
     recipe = _reference_lane_recipe(scene, lane_index)
     start_frame, end_frame = _reference_item_bounds(scene, fields.get("start_frame", 0), fields.get("end_frame", -1))
-    members = _canonical_reference_member_refs(project, fields.get("members"), recipe.media_kind)
+    members = _canonical_reference_member_refs(
+        project, fields.get("members"), recipe.media_kind, recipe.recipe,
+        _scene_prompt_context_profile_key(project, scene))
     _require_no_reference_overlap(scene, lane_index, start_frame, end_frame)
     item = ReferenceItem(
         reference_item_id=str(fields.get("reference_item_id", "") or uuid.uuid4().hex),
@@ -2501,6 +2949,9 @@ def _apply_update_reference_item(project: TimelineProject, scene: Scene, operati
         project,
         fields.get("members", item.members),
         recipe.media_kind,
+        recipe.recipe,
+        _scene_prompt_context_profile_key(project, scene),
+        item.members,
     )
     _require_no_reference_overlap(scene, lane_index, start_frame, end_frame, ignore=item)
     item.lane_index = lane_index
@@ -2780,6 +3231,11 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     if op_type == "create_prompt_section":
         section = _apply_create_prompt_section(scene, op.get("fields", {}))
         return {"type": op_type, "start_frame": section.start_frame, "end_frame": section.end_frame}
+    if op_type == "replace_prompt_sections":
+        sections = _apply_replace_prompt_sections(scene, op.get("sections", []))
+        return {"type": op_type, "count": len(sections)}
+    if op_type == "import_prompt_context_dependencies":
+        return _apply_prompt_context_dependencies(project, op)
     if op_type == "swap_prompt_sections":
         section_a, section_b = _apply_swap_prompt_sections(scene, op)
         return {
@@ -2796,6 +3252,16 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
     if not scene:
         _mutation_error(f"Scene not found: {scene_id}", 404, "item_not_found")
 
+    # Linked Context edits intentionally update several prompt sections in one
+    # batch. Validate every prior identity before mutating the first member, so
+    # a stale later snapshot cannot leave an in-memory half-propagated group.
+    for operation in operations:
+        if (isinstance(operation, dict)
+                and str(operation.get("type") or "") == "update_prompt_section"):
+            index = _mutation_int(operation.get("index"), "index")
+            _validate_prompt_identity(
+                _find_prompt_section(scene, index), operation.get("expected"))
+
     results = [
         _apply_scene_mutation_operation(project, scene, operation)
         for operation in operations
@@ -2803,13 +3269,20 @@ def _apply_scene_mutations_sync(request: web.Request, scene_id: str, operations:
     _validate_single_driver_per_lane(scene)
 
     save_project(project)
-    return project, {
+    payload = {
         "status": "ok",
         "scene_id": scene_id,
         "operation_count": len(operations),
         "results": results,
         "scene": scene.to_dict(),
     }
+    if any(str(operation.get("type") or "") == "import_prompt_context_dependencies"
+           for operation in operations if isinstance(operation, dict)):
+        payload["prompt_context_profiles"] = [
+            dict(value) for value in project.prompt_context_profiles]
+        payload["prompt_semantic_units"] = [
+            dict(value) for value in project.prompt_semantic_units]
+    return project, payload
 
 
 def _queue_job_from_body(body: dict) -> GenerationJob:
@@ -2843,6 +3316,14 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
     raw_global_channels = body.get("scene_global_channels")
     if isinstance(raw_global_channels, dict):
         params["scene_global_channels"] = prompt_payload.normalize_channels(raw_global_channels)
+    raw_global_docs = body.get("scene_global_channel_docs")
+    if isinstance(raw_global_docs, dict):
+        params["scene_global_channel_docs"] = prompt_context.normalize_channel_documents(
+            raw_global_docs, params.get("scene_global_channels") or {})
+    raw_global_attachments = body.get("scene_global_attachments")
+    if isinstance(raw_global_attachments, list):
+        params["scene_global_attachments"] = prompt_context.normalize_attachments(
+            raw_global_attachments)
 
     raw_take_placement_mode = body.get("take_placement_mode", "trimmed")
     take_placement_mode = raw_take_placement_mode if raw_take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
@@ -2879,6 +3360,11 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         reference_lane_configs=list(body.get("reference_lane_configs", []) or []),
         reference_lane_recipes=list(body.get("reference_lane_recipes", []) or []),
         prompt_sections=list(body.get("prompt_sections", []) or []),
+        compiled_prompt_context=(dict(body.get("compiled_prompt_context"))
+                                 if isinstance(body.get("compiled_prompt_context"), dict) else {}),
+        reference_input_snapshots=list(body.get("reference_input_snapshots", []) or []),
+        minimax_h3_setup_snapshot=(dict(body.get("minimax_h3_setup_snapshot"))
+                                  if isinstance(body.get("minimax_h3_setup_snapshot"), dict) else {}),
         scene_width=int(body.get("scene_width", 0)),
         scene_height=int(body.get("scene_height", 0)),
         scene_fps=float(body.get("scene_fps", 0.0) or 0.0),
@@ -2891,6 +3377,87 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
 
 
 PROMPT_HISTORY_CAP = 200  # conscious hard-code; revisit if projects bloat
+
+
+# Compatibility aliases for tests and older internal call sites. The shared
+# leaf module is authoritative for preview, execution, and Prompt Relay.
+_resolve_scene_prompt_context = resolve_scene_prompt_context
+_compile_live_scene_prompt_context = compile_live_scene_prompt_context
+
+
+def _freeze_reference_input_snapshots(
+    project: TimelineProject,
+    job: GenerationJob,
+    setup_result: dict,
+    template_id: str,
+) -> None:
+    """Freeze every Reference Library record used by this queued envelope.
+
+    Generic Reference bridges consume the same queued item/recipe snapshots as
+    MiniMax adapters.  Their entity/member names, intents, crops, tags and media
+    metadata therefore must come from the job too, never from the Library state
+    that happens to exist when execution begins.
+    """
+    setup_manifest = (setup_result.get("setup_manifest", {})
+                      if isinstance(setup_result, dict) else {})
+    presentation = setup_manifest.get("presentation", []) or []
+    presentation_member_ids = {
+        str(value.get("member_id") or "")
+        for value in presentation if isinstance(value, dict)
+    }
+    member_ids = set(presentation_member_ids)
+    for item in getattr(job, "reference_item_snapshots", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for member_ref in item.get("members", []) or []:
+            if isinstance(member_ref, dict):
+                member_ids.add(str(member_ref.get("member_id") or ""))
+    member_ids.discard("")
+
+    member_lookup = {
+        str(member.member_id): (reference, member)
+        for reference in project.references
+        for member in reference.members
+    }
+    entity_ids = {
+        str(value.get("entity_id") or "")
+        for value in presentation if isinstance(value, dict)
+    }
+    asset_ids = {
+        str(value.get("asset_id") or "")
+        for value in presentation if isinstance(value, dict)
+    }
+    for member_id in member_ids:
+        resolved = member_lookup.get(member_id)
+        if resolved is None:
+            continue
+        reference, member = resolved
+        entity_ids.add(str(reference.reference_id or ""))
+        asset_ids.add(str(member.asset_id or ""))
+    asset_ids.update(
+        str(value.get("asset_id") or "")
+        for value in (setup_manifest.get("guides", []) or [])
+        if isinstance(value, dict)
+    )
+    entity_ids.discard("")
+    asset_ids.discard("")
+
+    snapshots = [
+        {"kind": "reference", "value": reference.to_dict()}
+        for reference in project.references
+        if reference.reference_id in entity_ids
+    ] + [
+        {"kind": "asset", "value": asset.to_dict()}
+        for asset in project.assets if asset.asset_id in asset_ids
+    ]
+    if template_id in {"minimax_h3_base", "minimax_h3_ref"}:
+        snapshots.extend({
+            "kind": "semantic_unit", "value": copy.deepcopy(unit),
+        } for unit in project.prompt_semantic_units
+            if any(str(member.get("member_id") or "") in presentation_member_ids
+                   for member in unit.get("source_members", [])
+                   if isinstance(member, dict)))
+    job.reference_input_snapshots = snapshots
 
 
 def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> None:
@@ -2956,17 +3523,208 @@ def _compose_frozen_job_prompt(project: TimelineProject, job: GenerationJob) -> 
             job_fps = 24.0
     params["prompt_effective_fps"] = job_fps  # frozen for reproducibility
     job.params = params
-    frozen_global = params.get("scene_global_channels")
-    job.prompt = prompt_payload.compose_range_prompt(
-        getattr(job, "scene_prompt", "") or "",
-        getattr(job, "prompt_sections", []) or [],
-        window_start, window_end,
-        labels_on=params.get("prompt_channel_labels", False) is True,
-        delimiter=delimiter,
-        boundary_threshold_pct=threshold, template=template,
-        fps=job_fps,
-        global_channels=frozen_global if isinstance(frozen_global, dict) else None,
+    scene = project.get_scene(getattr(job, "scene_id", ""))
+    if scene is None:
+        # Compatibility path for snapshot envelopes created by older clients
+        # and for tests/importers that enqueue an already-frozen scene without
+        # first materializing that scene in this process.  The envelope remains
+        # authoritative; prompt_context_v1 clients send documents/attachments
+        # in these same fields, so this path still compiles rather than trusting
+        # the client display string.
+        template_keys = prompt_channel_templates.template_channel_keys(template)
+        raw_global_channels = params.get("scene_global_channels")
+        if not isinstance(raw_global_channels, dict):
+            raw_global_channels = {
+                (template_keys[0] if template_keys else "visual"):
+                    str(getattr(job, "scene_prompt", "") or "")
+            }
+        raw_global_docs = params.get("scene_global_channel_docs")
+        if not isinstance(raw_global_docs, dict):
+            raw_global_docs = None
+        raw_global_attachments = params.get("scene_global_attachments")
+        if not isinstance(raw_global_attachments, list):
+            raw_global_attachments = []
+        window_start = max(0, int(getattr(job, "selection_start", 0) or 0)
+                           - int(getattr(job, "pre_context_frames", 0) or 0))
+        window_end = (int(getattr(job, "selection_end", 0) or 0)
+                      + int(getattr(job, "post_context_frames", 0) or 0))
+        params["prompt_execution_window"] = {
+            "render_start": window_start, "render_end": window_end,
+            "frame_count": max(0, window_end - window_start),
+            "legacy_frozen_envelope": True,
+        }
+        try:
+            compiled = prompt_context.compile_prompt_context(
+                global_documents=raw_global_docs,
+                global_channels=raw_global_channels,
+                global_attachments=raw_global_attachments,
+                sections=getattr(job, "prompt_sections", []) or [],
+                window_start=window_start, window_end=window_end, fps=job_fps,
+                template=template,
+                profile=params.get("prompt_context_profile_id") or None,
+                custom_profiles=getattr(project, "prompt_context_profiles", []),
+                context={"semantic_units": getattr(project, "prompt_semantic_units", [])},
+                labels_on=params.get("prompt_channel_labels", False) is True,
+                delimiter=delimiter, boundary_threshold_pct=threshold)
+        except prompt_context.ProfileResolutionError as exc:
+            compiled = prompt_context.profile_error_result(
+                exc, window_start=window_start, window_end=window_end,
+                fps=job_fps)
+        if compiled["errors"]:
+            first = compiled["errors"][0]
+            _mutation_error(str(first.get("message") or "Prompt context is invalid"),
+                            409, str(first.get("code") or "prompt_context_invalid"))
+        job.prompt = compiled["prompt"]
+        job.compiled_prompt_context = {
+            key: value for key, value in compiled.items()
+                    if key not in {"attachment_channel_routes",
+                                   "attachment_capability_projections"}
+        }
+        params["scene_global_channels"] = dict(raw_global_channels)
+        params["scene_global_channel_docs"] = copy.deepcopy(
+            compiled.get("global_documents") or raw_global_docs or {})
+        params["scene_global_attachments"] = copy.deepcopy(raw_global_attachments)
+        params["prompt_context_format"] = prompt_context.FORMAT_VERSION
+        params["prompt_context_profile_hash"] = compiled["profile_hash"]
+        params["prompt_context_content_hash"] = compiled["content_hash"]
+        job.params = params
+        return
+
+    # Resolve the same constraint-aware window execution will use.  Prompt
+    # timestamps, duration, Guides and physical Reference slots all bind here.
+    execution_window = resolve_execution_window(
+        scene_duration=getattr(scene, "duration_frames", 0),
+        selection_start=getattr(job, "selection_start", 0),
+        selection_end=getattr(job, "selection_end", 0),
+        pre_context_frames=getattr(job, "pre_context_frames", 0),
+        post_context_frames=getattr(job, "post_context_frames", 0),
+        mask_pre_offset=getattr(job, "mask_pre_offset", 0),
+        mask_post_offset=getattr(job, "mask_post_offset", 0),
+        frame_constraint=getattr(job, "frame_constraint", None),
     )
+    window_start = execution_window["render_start"]
+    window_end = execution_window["render_end"]
+    params["prompt_execution_window"] = dict(execution_window)
+
+    setup_result = {"setup_manifest": {}, "ordinal_manifest": {},
+                    "unit_picture_ordinals": {}, "unit_source_labels": {},
+                    "generic_references": {}, "errors": [], "warnings": []}
+    template_id = str(template.get("id") or "")
+    profile_id = str(getattr(scene, "prompt_context_profile_id", "") or "") or None
+    setup = minimax_h3.active_setup(scene)
+    if template_id == "minimax_h3_base":
+        if setup is None:
+            config = getattr(scene, "prompt_context_profile_config", {}) or {}
+            setup = minimax_h3.implicit_base_setup(config.get("task_mode", "T2VA"))
+        if setup["mode"] != "base":
+            setup_result["errors"].append({"code": "setup_mode_mismatch",
+                                           "message": "MiniMax H3 Base requires a Base conditioning setup."})
+        else:
+            setup_result = minimax_h3.resolve_setup(
+                setup=setup, guide_frames=scene.guide_frames,
+                scene_duration=scene.duration_frames,
+                window_start=window_start, window_end=window_end)
+    elif template_id == "minimax_h3_ref":
+        if setup is None or setup["mode"] != "reference":
+            setup_result["errors"].append({"code": "missing_reference_setup",
+                                           "message": "MiniMax H3 Full Reference requires an active Reference setup."})
+        else:
+            setup_result = minimax_h3.resolve_setup(
+                setup=setup, guide_frames=scene.guide_frames,
+                reference_items=scene.reference_items,
+                lane_recipes=scene.reference_lane_recipes,
+                lane_configs=scene.reference_lane_configs,
+                lane_count=scene.reference_lane_count,
+                scene_duration=scene.duration_frames,
+                window_start=window_start, window_end=window_end,
+                references=project.references, assets=project.assets,
+                semantic_units=project.prompt_semantic_units,
+                frame_threshold_pct=reference_threshold)
+    else:
+        setup_result = _resolve_scene_prompt_context(
+            project, scene, template, window_start, window_end,
+            reference_threshold)
+
+    global_hidden = bool(getattr(scene.global_prompt_track_config, "hidden", False))
+    sections_hidden = bool(getattr(scene.prompt_track_config, "hidden", False))
+    compile_context = {
+        "setup_manifest": setup_result.get("setup_manifest", {}),
+        "ordinal_manifest": setup_result.get("ordinal_manifest", {}),
+        "unit_picture_ordinals": setup_result.get("unit_picture_ordinals", {}),
+        "unit_source_labels": setup_result.get("unit_source_labels", {}),
+        "semantic_units": project.prompt_semantic_units,
+        "references": [value.to_dict() for value in project.references],
+        "generic_references": setup_result.get("generic_references", {}),
+    }
+    try:
+        compiled = prompt_context.compile_prompt_context(
+            global_documents={} if global_hidden else scene.global_channel_docs,
+            global_channels={} if global_hidden else scene.global_channels,
+            global_attachments=[] if global_hidden else scene.global_attachments,
+            sections=[] if sections_hidden else scene.prompt_sections,
+            window_start=window_start, window_end=window_end, fps=job_fps,
+            template=template, profile=profile_id,
+            custom_profiles=project.prompt_context_profiles,
+            context=compile_context,
+            labels_on=params.get("prompt_channel_labels", False) is True,
+            delimiter=delimiter, boundary_threshold_pct=threshold)
+    except prompt_context.ProfileResolutionError as exc:
+        compiled = prompt_context.profile_error_result(
+            exc, window_start=window_start, window_end=window_end, fps=job_fps)
+    compiled["warnings"] = list(setup_result.get("warnings", [])) + compiled["warnings"]
+    compiled["errors"] = list(setup_result.get("errors", [])) + compiled["errors"]
+    if compiled["errors"]:
+        first = compiled["errors"][0]
+        _mutation_error(str(first.get("message") or "Prompt context is invalid"),
+                        409, str(first.get("code") or "prompt_context_invalid"))
+
+    # The frozen result is the only prompt authority from this point forward.
+    job.prompt = compiled["prompt"]
+    job.compiled_prompt_context = {
+        key: value for key, value in compiled.items()
+                    if key not in {"attachment_channel_routes",
+                                   "attachment_capability_projections"}
+    }
+    job.minimax_h3_setup_snapshot = copy.deepcopy(
+        setup_result.get("setup_manifest", {}))
+    job.scene_prompt = "" if global_hidden else scene.prompt
+    job.prompt_sections = ([] if sections_hidden else
+                           [section.to_dict() for section in scene.prompt_sections])
+    params["scene_global_channels"] = ({} if global_hidden
+                                        else dict(scene.global_channels))
+    params["scene_global_channel_docs"] = ({} if global_hidden else
+                                            copy.deepcopy(scene.global_channel_docs))
+    params["scene_global_attachments"] = ([] if global_hidden else
+                                           copy.deepcopy(scene.global_attachments))
+    params["prompt_context_format"] = prompt_context.FORMAT_VERSION
+    params["prompt_context_profile_hash"] = compiled["profile_hash"]
+    params["prompt_context_content_hash"] = compiled["content_hash"]
+    params["prompt_context_profile_id"] = str(
+        scene.prompt_context_profile_id
+        or template.get("default_context_profile") or "generic@1")
+    params["prompt_context_profile_config"] = copy.deepcopy(
+        scene.prompt_context_profile_config)
+    job.params = params
+
+    # The request body is never an authority for queued Reference execution.
+    # Freeze the same scene lane/item state that prompt/setup compilation just
+    # resolved, so generic Bridges cannot serve a stale client envelope while
+    # the compiled prompt describes the current staged Reference.
+    job.reference_lane_count = max(1, int(scene.reference_lane_count or 1))
+    job.reference_lane_configs = [
+        value.to_dict() if hasattr(value, "to_dict") else copy.deepcopy(value)
+        for value in (scene.reference_lane_configs or [])
+    ]
+    job.reference_lane_recipes = [
+        value.to_dict() if hasattr(value, "to_dict") else copy.deepcopy(value)
+        for value in (scene.reference_lane_recipes or [])
+    ]
+    job.reference_item_snapshots = [
+        value.to_dict() if hasattr(value, "to_dict") else copy.deepcopy(value)
+        for value in (scene.reference_items or [])
+    ]
+
+    _freeze_reference_input_snapshots(project, job, setup_result, template_id)
 
 
 def _freeze_guide_collision_param(project: TimelineProject, job: GenerationJob) -> None:
@@ -3115,9 +3873,12 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
                 "channels": prompt_payload.normalize_channels(
                     s.get("channels"), legacy_prompt=s.get("prompt", "")
                 ),
+                "prompt_id": str(s.get("prompt_id") or ""),
+                "channel_docs": copy.deepcopy(s.get("channel_docs") or {}),
+                "attachments": copy.deepcopy(s.get("attachments") or []),
+                "muted": bool(s.get("muted", False)),
                 "starts_new_shot": bool(s.get("starts_new_shot", False)),
                 "shot_timestamp": bool(s.get("shot_timestamp", False)),
-                "subject_ids": prompt_payload.normalize_subject_ids(s.get("subject_ids")),
                 "global_channel_exceptions": prompt_payload.normalize_channel_exceptions(
                     s.get("global_channel_exceptions")),
             }
@@ -3125,15 +3886,74 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
             if isinstance(s, dict)
         ]
         global_text = str(getattr(job, "scene_prompt", "") or "")
-        if not global_text and not sections:
-            continue
         params = getattr(job, "params", {}) or {}
+        global_channels = copy.deepcopy(params.get("scene_global_channels") or {})
+        global_channel_docs = copy.deepcopy(params.get("scene_global_channel_docs") or {})
+        global_attachments = copy.deepcopy(params.get("scene_global_attachments") or [])
+        compiled_context = getattr(job, "compiled_prompt_context", {}) or {}
+        frozen_profile = compiled_context.get("profile") or {}
+        frozen_profile_key = (
+            f"{frozen_profile.get('profile_id')}@{frozen_profile.get('version')}"
+            if frozen_profile.get("profile_id") else "")
+        dependency_profiles = ([copy.deepcopy(frozen_profile)]
+                               if frozen_profile_key
+                               and frozen_profile_key not in prompt_context.BUILTIN_PROFILES
+                               else [])
+        dependency_attachments = [
+            *global_attachments,
+            *(attachment for section in sections
+              for attachment in section.get("attachments", [])),
+        ]
+        semantic_unit_ids = {
+            str(unit_id)
+            for attachment in dependency_attachments if isinstance(attachment, dict)
+            for unit_id in (attachment.get("source") or {}).get(
+                "semantic_unit_ids", [])
+            if str(unit_id)
+        }
+        frozen_units = {
+            str(entry.get("value", {}).get("semantic_unit_id") or ""):
+                copy.deepcopy(entry.get("value"))
+            for entry in (getattr(job, "reference_input_snapshots", []) or [])
+            if isinstance(entry, dict) and entry.get("kind") == "semantic_unit"
+            and isinstance(entry.get("value"), dict)
+        }
+        project_units = {
+            str(value.get("semantic_unit_id") or ""): copy.deepcopy(value)
+            for value in (project.prompt_semantic_units or [])
+            if isinstance(value, dict)
+        }
+        dependency_units = [
+            frozen_units.get(unit_id) or project_units.get(unit_id)
+            for unit_id in sorted(semantic_unit_ids)
+            if frozen_units.get(unit_id) or project_units.get(unit_id)
+        ]
+        setup_manifest = getattr(job, "minimax_h3_setup_snapshot", {}) or {}
+        active_setup = copy.deepcopy(setup_manifest.get("setup") or {})
+        if (not global_text and not global_channels and not global_channel_docs
+                and not global_attachments and not sections):
+            continue
         source_template = prompt_channel_templates.resolve_channel_template(
             project.metadata, params if isinstance(params, dict) else None)
         source_template_value = prompt_channel_templates.template_freeze_value(
             source_template)
+        profile_config = copy.deepcopy(
+            params.get("prompt_context_profile_config") or {})
+        # Profile selection, its configuration, and the active H3 setup all
+        # change the model-facing prompt.  Leaving them out of the digest
+        # collapsed two genuinely different runs — identical authored text
+        # under different task modes — into one history entry.
         digest = hashlib.sha256(json.dumps(
-            {"global": global_text, "sections": sections,
+            {"global": global_text, "global_channels": global_channels,
+             "global_channel_docs": global_channel_docs,
+             "global_attachments": global_attachments, "sections": sections,
+             "prompt_context_profile_id": frozen_profile_key,
+             "prompt_context_profile_config": profile_config,
+             "prompt_context_profiles": dependency_profiles,
+             "prompt_semantic_units": dependency_units,
+             "minimax_h3_conditioning_setups": ([active_setup] if active_setup
+                                                else []),
+             "active_minimax_h3_setup_id": str(active_setup.get("setup_id") or ""),
              "source_channel_template": source_template_value}, sort_keys=True
         ).encode("utf-8")).hexdigest()[:16]
         timestamp = _dt.now().isoformat()
@@ -3149,6 +3969,16 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
             "window": [int(getattr(job, "selection_start", 0) or 0),
                        int(getattr(job, "selection_end", 0) or 0)],
             "global": global_text,
+            "global_channels": global_channels,
+            "global_channel_docs": global_channel_docs,
+            "global_attachments": global_attachments,
+            "prompt_context_profile_id": (
+                frozen_profile_key),
+            "prompt_context_profile_config": profile_config,
+            "prompt_context_profiles": dependency_profiles,
+            "prompt_semantic_units": dependency_units,
+            "minimax_h3_conditioning_setups": [active_setup] if active_setup else [],
+            "active_minimax_h3_setup_id": str(active_setup.get("setup_id") or ""),
             "source_channel_template_id": source_template.get("id", ""),
             "source_channel_template": source_template_value,
             "sections": sections,
@@ -3248,9 +4078,13 @@ _REFERENCE_PRESET_BY_ID = {
     str(preset["id"]).casefold(): preset
     for preset in REFERENCE_TAG_PRESETS
 }
-_REFERENCE_ENTITY_FIELDS = {"name", "kind", "reference_class", "description"}
+_REFERENCE_ENTITY_FIELDS = {
+    "name", "kind", "reference_class", "description",
+    "visual_intent", "audio_intent",
+}
 _REFERENCE_MEMBER_FIELDS = {
-    "asset_id", "tags", "prompt", "crop", "source_start_sec", "source_end_sec",
+    "asset_id", "name", "tags", "prompt", "crop",
+    "source_start_sec", "source_end_sec",
 }
 
 
@@ -3277,11 +4111,33 @@ def _reference_recipe_catalog_payload() -> list[dict]:
             "hard": dict(preset.get("hard", {})),
             "soft": dict(preset.get("soft", {})),
         }
-        for preset in REFERENCE_RECIPE_PRESETS
+        for preset in ALL_REFERENCE_RECIPE_PRESETS
     ]
 
 
 def _references_payload(project: TimelineProject) -> dict:
+    reference_ids = {
+        str(getattr(reference, "reference_id", "") or "")
+        for reference in project.references
+    }
+    semantic_units = []
+    for value in project.prompt_semantic_units:
+        if not isinstance(value, dict):
+            continue
+        unit = dict(value)
+        unit_id = str(unit.get("semantic_unit_id") or "")
+        entity_id = unit_id[5:] if unit_id.startswith("unit:") else ""
+        # Presentation-only provenance. normalize_semantic_unit deliberately
+        # drops this key, so imports and persisted project state stay unchanged.
+        unit["generated"] = entity_id in reference_ids
+        if unit["generated"]:
+            owner = next((reference for reference in project.references
+                          if str(getattr(reference, "reference_id", "") or "")
+                          == entity_id), None)
+            unit["generated_reference_id"] = entity_id
+            unit["generated_reference_name"] = str(
+                getattr(owner, "name", "") or entity_id)
+        semantic_units.append(unit)
     return {
         "project_id": project.project_id,
         "modified_at": project.modified_at,
@@ -3290,6 +4146,37 @@ def _references_payload(project: TimelineProject) -> dict:
         "recipe_presets": _reference_recipe_catalog_payload(),
         "recipe_field_schema": [dict(field) for field in REFERENCE_RECIPE_FIELDS],
         "reference_recipes": [dict(recipe) for recipe in project.reference_recipes if isinstance(recipe, dict)],
+        "prompt_context_profiles": [dict(value) for value in project.prompt_context_profiles],
+        "prompt_semantic_units": semantic_units,
+        "prompt_context_catalog": {
+            "capabilities": [
+                "derived_prompt", "definitions", "summary", "retention",
+                "mentions", "audio_relationship",
+            ],
+            "role_catalogs": copy.deepcopy(prompt_context.MINIMAX_H3_ROLE_CATALOGS),
+            "role_aliases": dict(prompt_context.REFERENCE_ROLE_ALIASES),
+            "minimax_task_types": list(prompt_context.MINIMAX_TASK_TYPES),
+            "writing_aids": {
+                key: copy.deepcopy(value.get("writing_aids", []))
+                for key, value in prompt_context.BUILTIN_PROFILES.items()
+            },
+            # Which channel templates each prompt format may be selected under.
+            # `*` means universal; the frontend disables the rest so an
+            # incompatible pairing cannot be authored in the first place.
+            # Project customs are published from the same rule as the builtins:
+            # a surface reconstructing compatibility from `template_id` alone
+            # would miss an explicit `compatible_templates` list and disable a
+            # pairing the compiler accepts.
+            "profile_templates": {
+                **{key: sorted(prompt_context.profile_compatible_templates(value))
+                   for key, value in prompt_context.BUILTIN_PROFILES.items()},
+                **{prompt_context.profile_key(value):
+                   sorted(prompt_context.profile_compatible_templates(value))
+                   for value in project.prompt_context_profiles
+                   if isinstance(value, dict)},
+            },
+            "universal_template": prompt_context.UNIVERSAL_PROFILE_TEMPLATE,
+        },
     }
 
 
@@ -3360,6 +4247,20 @@ def _validated_reference_class(value) -> str:
     if reference_class not in REFERENCE_CLASSES:
         _mutation_error("Invalid reference class", 400, "invalid_reference")
     return reference_class
+
+
+def _validated_visual_intent(value) -> str:
+    intent = str(value or "")
+    if intent not in prompt_context.VISUAL_INTENTS:
+        _mutation_error("Invalid default visual role", 400, "invalid_reference")
+    return intent
+
+
+def _validated_audio_intent(value) -> str:
+    intent = str(value or "")
+    if intent not in prompt_context.AUDIO_INTENTS:
+        _mutation_error("Invalid default audio role", 400, "invalid_reference")
+    return intent
 
 
 def _validated_reference_tags(raw_tags, asset: Asset) -> list[str]:
@@ -3474,6 +4375,7 @@ def _member_from_fields(project: TimelineProject, fields: dict, *, member_id: st
     return ReferenceMember(
         member_id=member_id or _new_reference_id(project, member=True),
         asset_id=asset.asset_id,
+        name=str(fields.get("name", "") or "").strip(),
         tags=tags,
         prompt=str(fields.get("prompt", "") or ""),
         crop=crop,
@@ -3498,6 +4400,12 @@ def _apply_create_reference(project: TimelineProject, fields: dict) -> Reference
             fields.get("reference_class", default_reference_class(kind))
         ),
         description=str(fields.get("description", "") or ""),
+        visual_intent=_validated_visual_intent(
+            fields.get("visual_intent", "preserve")
+        ),
+        audio_intent=_validated_audio_intent(
+            fields.get("audio_intent", "reference_characteristics")
+        ),
         members=[],
     )
     project.references.append(reference)
@@ -3522,6 +4430,10 @@ def _apply_update_reference(project: TimelineProject, operation: dict) -> Refere
         reference.reference_class = _validated_reference_class(fields["reference_class"])
     if "description" in fields:
         reference.description = str(fields["description"] or "")
+    if "visual_intent" in fields:
+        reference.visual_intent = _validated_visual_intent(fields["visual_intent"])
+    if "audio_intent" in fields:
+        reference.audio_intent = _validated_audio_intent(fields["audio_intent"])
     return reference
 
 
@@ -3533,8 +4445,17 @@ def _apply_delete_reference(project: TimelineProject, operation: dict) -> Refere
     # stale browser tab's delete fails loudly, which is the correct outcome
     # for a client acting on stale Library state.
     required = {"name", "kind", "reference_class", "description", "member_ids"}
+    # The intents are model-facing too, so a delete must confirm them whenever
+    # the stored value has moved off its schema default; otherwise a tab that
+    # loaded before someone changed conditioning intent deletes work it never
+    # saw. Defaults stay optional so pre-intent clients keep working.
+    for field, default in (("visual_intent", "preserve"),
+                           ("audio_intent", "reference_characteristics")):
+        if str(getattr(reference, field, default) or default) != default:
+            required.add(field)
     expected = _require_expected(operation.get("expected"), required, "delete_reference")
-    _validate_reference_expected(reference, expected, required)
+    guarded = required | ({"visual_intent", "audio_intent"} & set(expected))
+    _validate_reference_expected(reference, expected, guarded)
     removed_member_ids = {member.member_id for member in reference.members}
     project.references = [candidate for candidate in project.references if candidate is not reference]
     _reconcile_staged_reference_members(project, removed_member_ids,
@@ -3571,6 +4492,7 @@ def _apply_update_reference_member(project: TimelineProject, operation: dict) ->
         order=member.order,
     )
     member.asset_id = replacement.asset_id
+    member.name = replacement.name
     member.tags = replacement.tags
     member.prompt = replacement.prompt
     member.crop = replacement.crop
@@ -3583,6 +4505,11 @@ def _apply_delete_reference_member(project: TimelineProject, operation: dict) ->
     reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
     member = _find_reference_member(reference, str(operation.get("member_id", "") or ""))
     required = set(member.to_dict())
+    # `name` is an additive suffix field.  Older clients may legitimately hold
+    # an expected snapshot from before it existed; retain that compatibility
+    # only while the stored suffix is still blank.
+    if not member.name:
+        required.discard("name")
     expected = _require_expected(operation.get("expected"), required, "delete_member")
     _validate_reference_member_expected(member, expected, required)
     reference.members = [candidate for candidate in reference.members if candidate is not member]
@@ -3693,8 +4620,8 @@ def _normalize_custom_reference_recipe(fields: dict, *, recipe_id: str = "") -> 
     if not name:
         _mutation_error("Reference recipe name is required", 400, "invalid_reference_recipe")
     media_kind = str(fields.get("media_kind", "image") or "image")
-    if media_kind not in {"image", "audio"}:
-        _mutation_error("Reference recipe media_kind must be image or audio", 400, "invalid_reference_recipe")
+    if media_kind not in {"image", "audio", "video"}:
+        _mutation_error("Reference recipe media_kind must be image, video, or audio", 400, "invalid_reference_recipe")
     candidate_id = recipe_id or str(fields.get("id", "") or "").strip()
     if not candidate_id:
         candidate_id = f"custom:{uuid.uuid4().hex}"
@@ -3712,6 +4639,56 @@ def _normalize_custom_reference_recipe(fields: dict, *, recipe_id: str = "") -> 
         "hard": _normalize_reference_recipe_section(hard, "hard"),
         "soft": _normalize_reference_recipe_section(soft, "soft"),
     }
+
+
+_REFERENCE_CONTEXT_CAPABILITIES = {
+    "derived_prompt", "definitions", "summary", "retention", "mentions",
+    "audio_relationship",
+}
+_REFERENCE_ROLE_FIELDS = {
+    "role", "visual_intent", "audio_intent",
+}
+
+
+def _validate_reference_recipe_context(project: TimelineProject, recipe: dict) -> None:
+    """Refuse unsupported authored Prompt Context declarations on save.
+
+    Loaded legacy/custom recipes remain byte-for-byte visible in the editor.  A
+    user must remove or rebind unsupported values before the next recipe save;
+    this is intentionally validation, not a load-time migration.
+    """
+    soft = recipe.get("soft") if isinstance(recipe.get("soft"), dict) else {}
+    profile_keys = set(prompt_context.BUILTIN_PROFILES)
+    capability_keys = set(_REFERENCE_CONTEXT_CAPABILITIES)
+    for profile in project.prompt_context_profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_keys.add(
+            f"{profile.get('profile_id', '')}@{profile.get('version', '1')}")
+        capabilities = profile.get("capabilities")
+        if isinstance(capabilities, dict):
+            capability_keys.update(str(value) for value in capabilities)
+
+    unknown_profiles = [str(value) for value in soft.get("compatible_profiles", [])
+                        if str(value) not in profile_keys]
+    if unknown_profiles:
+        _mutation_error(
+            f"Unsupported prompt formats: {', '.join(sorted(unknown_profiles))}",
+            409, "unsupported_reference_recipe_context")
+    unknown_capabilities = [
+        str(value) for value in soft.get("exposed_capabilities", [])
+        if str(value) not in capability_keys
+    ]
+    if unknown_capabilities:
+        _mutation_error(
+            f"Unsupported prompt parts: {', '.join(sorted(unknown_capabilities))}",
+            409, "unsupported_reference_recipe_context")
+    unknown_fields = [str(value) for value in soft.get("role_fields", [])
+                      if str(value) not in _REFERENCE_ROLE_FIELDS]
+    if unknown_fields:
+        _mutation_error(
+            f"Unsupported per-member options: {', '.join(sorted(unknown_fields))}",
+            409, "unsupported_reference_recipe_context")
 
 
 def _find_custom_reference_recipe(project: TimelineProject, recipe_id: str) -> tuple[int, dict]:
@@ -3738,16 +4715,16 @@ def _recollapse_prompt_channels(project: TimelineProject, from_template: dict,
     sections rewritten, for logging.
     """
     rewritten = 0
+    from_keys = prompt_channel_templates.template_channel_keys(from_template)
+    to_keys = prompt_channel_templates.template_channel_keys(to_template)
     for scene in getattr(project, "scenes", None) or []:
         for section in getattr(scene, "prompt_sections", None) or []:
-            patch = prompt_payload.collapse_channels_for_template(
-                getattr(section, "channels", None), from_template, to_template)
-            updated = prompt_payload.merge_channels(section.channels, patch)
-            # Compare only channels that carry text: merge_channels normalizes,
-            # so an all-empty section would otherwise "change" by gaining keys
-            # and be counted as a rewrite.
-            if _populated_channels(updated) != _populated_channels(section.channels):
-                section.channels = updated
+            updated_docs = prompt_context.retarget_channel_documents(
+                getattr(section, "channel_docs", {}), from_keys, to_keys)
+            if prompt_context.content_hash(updated_docs) != prompt_context.content_hash(
+                    getattr(section, "channel_docs", {})):
+                section.channel_docs = updated_docs
+                section._refresh_channel_mirrors()
                 rewritten += 1
     return rewritten
 
@@ -3764,47 +4741,55 @@ def _recollapse_scene_globals(project: TimelineProject, from_template: dict,
     """
     from_view = prompt_channel_templates.global_template_view(from_template)
     to_view = prompt_channel_templates.global_template_view(to_template)
+    from_keys = prompt_channel_templates.template_channel_keys(from_view)
+    to_keys = prompt_channel_templates.template_channel_keys(to_view)
     rewritten = 0
     for scene in getattr(project, "scenes", None) or []:
-        patch = prompt_payload.collapse_channels_for_template(
-            getattr(scene, "global_channels", None), from_view, to_view)
-        updated = prompt_payload.merge_channels(scene.global_channels, patch)
-        if _populated_channels(updated) != _populated_channels(scene.global_channels):
-            scene.global_channels = updated
+        updated_docs = prompt_context.retarget_channel_documents(
+            getattr(scene, "global_channel_docs", {}), from_keys, to_keys)
+        if prompt_context.content_hash(updated_docs) != prompt_context.content_hash(
+                getattr(scene, "global_channel_docs", {})):
+            scene.global_channel_docs = updated_docs
+            scene.global_channels = prompt_context.channel_document_mirrors(updated_docs)
             scene._refresh_global_mirror()
             rewritten += 1
     return rewritten
+
+
+def _release_incompatible_scene_profiles(project: TimelineProject,
+                                         to_template: dict) -> int:
+    """Drop a scene's explicit prompt format when the new template rejects it.
+
+    A prompt format is only valid alongside a channel template it targets, so a
+    template switch can strand an explicitly selected format. Leaving the stale
+    pointer blocks every compile and enqueue for that scene with no in-product
+    way back, since the picker renders the stranded option disabled. Falling
+    back to the template default is the same thing an untouched scene does, and
+    it happens inside the switch's single save so the pointer and the text can
+    never disagree.
+    """
+    released = 0
+    for scene in getattr(project, "scenes", None) or []:
+        selected = str(getattr(scene, "prompt_context_profile_id", "") or "")
+        if not selected:
+            continue
+        try:
+            profile = prompt_context.resolve_profile(
+                selected, template=to_template,
+                custom_profiles=getattr(project, "prompt_context_profiles", []))
+        except prompt_context.ProfileResolutionError:
+            scene.prompt_context_profile_id = ""
+            released += 1
+            continue
+        # An unrelated resolution problem is not this transaction's to repair.
+        del profile
+    return released
 
 
 def _populated_channels(channels) -> dict:
     if not isinstance(channels, dict):
         return {}
     return {key: value for key, value in channels.items() if str(value or "").strip()}
-
-
-def _prune_prompt_subject_ids(project: TimelineProject, removed_entity_ids: set[str]) -> list[str]:
-    """Drop deleted Reference entities from every scene's prompt sections.
-
-    `PromptSection.subject_ids` is a durable reference from scene state into a
-    PROJECT entity, and nothing else walks prompt_sections — so without this a
-    deleted entity leaves orphan bindings that compose to a silently missing
-    `<Subject N>` and shift the numbering of every later subject.
-    """
-    if not removed_entity_ids:
-        return []
-    affected_scene_ids = []
-    for scene in project.scenes:
-        changed = False
-        for section in getattr(scene, "prompt_sections", []) or []:
-            bindings = getattr(section, "subject_ids", None) or []
-            kept = [entry for entry in bindings
-                    if entry.get("entity_id") not in removed_entity_ids]
-            if len(kept) != len(bindings):
-                section.subject_ids = kept
-                changed = True
-        if changed:
-            affected_scene_ids.append(scene.scene_id)
-    return affected_scene_ids
 
 
 def _reconcile_staged_reference_members(project: TimelineProject, removed_member_ids: set[str],
@@ -3830,11 +4815,6 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
         if changed:
             scene.reference_items = next_items
             affected_scene_ids.append(scene.scene_id)
-    # Same atomic batch as the delete: an orphan binding would otherwise
-    # survive to the next compose.
-    for scene_id in _prune_prompt_subject_ids(project, removed_entity_ids or set()):
-        if scene_id not in affected_scene_ids:
-            affected_scene_ids.append(scene_id)
     return {
         "affected_scene_ids": affected_scene_ids,
         "removed_reference_item_ids": removed_item_ids,
@@ -3875,11 +4855,12 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             results.append({"type": op_type, "reference_id": reference.reference_id})
         elif op_type == "create_recipe":
             recipe = _normalize_custom_reference_recipe(operation.get("fields"))
+            _validate_reference_recipe_context(project, recipe)
             existing_ids = {
                 str(candidate.get("id", "") or "")
                 for candidate in project.reference_recipes if isinstance(candidate, dict)
             }
-            existing_ids.update(str(preset["id"]) for preset in REFERENCE_RECIPE_PRESETS)
+            existing_ids.update(str(preset["id"]) for preset in ALL_REFERENCE_RECIPE_PRESETS)
             if recipe["id"] in existing_ids:
                 recipe["id"] = f"custom:{uuid.uuid4().hex}"
             project.reference_recipes.append(recipe)
@@ -3893,6 +4874,7 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             fields.update(operation.get("fields") if isinstance(operation.get("fields"), dict) else {})
             fields["id"] = recipe_id
             recipe = _normalize_custom_reference_recipe(fields, recipe_id=recipe_id)
+            _validate_reference_recipe_context(project, recipe)
             project.reference_recipes[index] = recipe
             results.append({"type": op_type, "recipe_id": recipe_id})
         elif op_type == "delete_recipe":
@@ -3914,6 +4896,7 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
 def _apply_reference_mutations_sync(request: web.Request, operations: list) -> tuple[TimelineProject, dict]:
     project = _load_project_from_request(request)
     payload = _apply_reference_mutation_operations(project, operations)
+    ensure_default_prompt_semantic_units(project)
     save_project(project)
     payload.update(_references_payload(project))
     return project, payload
@@ -5248,6 +6231,12 @@ def _build_dormant_summary(
             threshold = float(metadata.get("prompt_frame_threshold", 10.0) or 0.0)
         except (TypeError, ValueError):
             threshold = 10.0
+        try:
+            reference_threshold = float(
+                metadata.get("reference_frame_threshold", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            reference_threshold = 0.0
+        preview_compile = {}
         preview_prompt = active_scene.get_prompt_for_range(
             selection["context_start_frame"],
             selection["context_end_frame"],
@@ -5256,6 +6245,9 @@ def _build_dormant_summary(
             boundary_threshold_pct=threshold,
             template=prompt_channel_templates.resolve_channel_template(metadata),
             fps=effective_scene_fps(project, active_scene),
+            project=project,
+            reference_threshold_pct=reference_threshold,
+            compile_result_out=preview_compile,
         )
         active_scene_payload = {
             "scene_id": active_scene.scene_id,
@@ -5270,6 +6262,9 @@ def _build_dormant_summary(
             "prompt_section_count": len(active_scene.prompt_sections),
             "selection": selection,
             "preview_prompt": preview_prompt,
+            "preview_prompt_degraded": bool(preview_compile.get("errors")),
+            "preview_prompt_error_code": str(
+                (preview_compile.get("errors") or [{}])[0].get("code") or ""),
         }
     else:
         active_scene_payload = None
@@ -5599,6 +6594,25 @@ def _find_asset_usages(project: TimelineProject, asset: Asset) -> dict:
                 "job_id": job.job_id,
                 "status": job.status,
             })
+        status = str(getattr(job, "status", "pending") or "pending").lower()
+        snapshots = (getattr(job, "reference_input_snapshots", [])
+                     if isinstance(getattr(job, "reference_input_snapshots", []), list)
+                     else [])
+        frozen_asset_ids = {
+            str(entry.get("value", {}).get("asset_id") or "")
+            for entry in snapshots
+            if isinstance(entry, dict) and entry.get("kind") == "asset"
+            and isinstance(entry.get("value"), dict)
+        }
+        if status in {"pending", "running"} and asset.asset_id in frozen_asset_ids:
+            usages.append({
+                "asset_id": asset.asset_id,
+                "type": "queued_reference_input",
+                "scene_id": job.scene_id,
+                "scene_name": job.scene_name or "Project Queue",
+                "job_id": job.job_id,
+                "status": job.status,
+            })
 
     usages.sort(key=lambda usage: _usage_sort_key(project, usage))
     return {
@@ -5606,6 +6620,11 @@ def _find_asset_usages(project: TimelineProject, asset: Asset) -> dict:
         "usages": usages,
         "usage_count": len(usages),
     }
+
+
+def _has_pending_frozen_input_usage(usage: dict) -> bool:
+    return any(value.get("type") == "queued_reference_input"
+               for value in usage.get("usages", []))
 
 
 def _aggregate_asset_usages(project: TimelineProject, assets: list[Asset]) -> dict:
@@ -6106,6 +7125,9 @@ def _streamed_replace_commit(
         asset = current.get_asset(asset_id)
         if asset is None:
             raise _StreamedAssetChanged("The asset was removed while its replacement uploaded")
+        if _has_pending_frozen_input_usage(_find_asset_usages(current, asset)):
+            raise _StreamedAssetChanged(
+                "The asset is frozen by a pending Reference generation; wait for it to finish")
         current_abs = _require_asset_media_source(current, asset, operation="Asset replace")
         if (
             asset.asset_type != initial_type
@@ -6752,6 +7774,110 @@ if routes is not None:
             return _json_error(str(e), 404)
         return web.json_response(_references_payload(project))
 
+    @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/prompt-context/compile")
+    async def api_compile_prompt_context_candidate(request: web.Request) -> web.Response:
+        """Compile versioned candidate authoring state without mutating disk.
+
+        All prompt surfaces use this endpoint for authoritative previews. The
+        same pure compiler is called again at enqueue, where its result is
+        frozen for Relay, queued preview and execution.
+        """
+        try:
+            project = await asyncio.to_thread(
+                _load_project_from_request, request, repair_missing_frames=False)
+        except FileNotFoundError as exc:
+            return _json_error(str(exc), 404)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON body", 400)
+        if not isinstance(body, dict):
+            return _json_error("Prompt Context candidate must be an object", 400)
+        scene = project.get_scene(request.match_info["scene_id"])
+        if scene is None:
+            return _json_error("Scene not found", 404)
+        expected = str(body.get("base_modified_at") or
+                       body.get("project_version") or "")
+        actual = str(getattr(project, "modified_at", "") or "")
+        if expected and expected != actual:
+            return web.json_response({
+                "error": "Prompt Context candidate is stale.",
+                "code": "project_version_conflict",
+                "expected_modified_at": expected,
+                "actual_modified_at": actual,
+            }, status=409)
+
+        candidate_data = copy.deepcopy(scene.to_dict())
+        source = body.get("scene") if isinstance(body.get("scene"), dict) else body
+        aliases = {"sections": "prompt_sections",
+                   "global_documents": "global_channel_docs",
+                   "global_attachments": "global_attachments"}
+        allowed = {
+            "prompt_sections", "global_channels", "global_channel_docs",
+            "global_attachments", "prompt_context_profile_id",
+            "prompt_context_profile_config", "minimax_h3_conditioning_setups",
+            "active_minimax_h3_setup_id", "guide_frames", "reference_items",
+            "reference_lane_recipes", "reference_lane_configs",
+            "reference_lane_count", "duration_frames", "fps",
+        }
+        for raw_key, value in source.items():
+            key = aliases.get(raw_key, raw_key)
+            if key in allowed:
+                candidate_data[key] = copy.deepcopy(value)
+        candidate = Scene.from_dict(candidate_data)
+
+        raw_template = body.get("channel_template")
+        if raw_template is None:
+            raw_template = body.get(prompt_channel_templates.PROJECT_TEMPLATE_KEY)
+        template = (prompt_channel_templates.get_channel_template(raw_template)
+                    if raw_template is not None else
+                    prompt_channel_templates.resolve_channel_template(project.metadata))
+        try:
+            raw_window_start = max(0, int(body.get("window_start", 0) or 0))
+            raw_window_end = int(body.get(
+                "window_end", candidate.duration_frames) or candidate.duration_frames)
+            execution_window = resolve_execution_window(
+                scene_duration=candidate.duration_frames,
+                selection_start=int(body.get(
+                    "selection_start", raw_window_start) or 0),
+                selection_end=int(body.get(
+                    "selection_end", raw_window_end) or raw_window_end),
+                pre_context_frames=int(body.get("pre_context_frames", 0) or 0),
+                post_context_frames=int(body.get("post_context_frames", 0) or 0),
+                mask_pre_offset=int(body.get("mask_pre_offset", 0) or 0),
+                mask_post_offset=int(body.get("mask_post_offset", 0) or 0),
+                frame_constraint=(body.get("frame_constraint")
+                                  if isinstance(body.get("frame_constraint"), dict)
+                                  else None),
+            )
+            window_start = execution_window["render_start"]
+            window_end = execution_window["render_end"]
+        except (TypeError, ValueError):
+            return _json_error("Invalid Prompt Context preview window", 400)
+        try:
+            fps = float(body.get("fps") or effective_scene_fps(project, candidate))
+            prompt_threshold = float(body.get(
+                "prompt_frame_threshold",
+                (project.metadata or {}).get("prompt_frame_threshold", 10.0)) or 0.0)
+            reference_threshold = float(body.get(
+                "reference_frame_threshold",
+                (project.metadata or {}).get("reference_frame_threshold", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            return _json_error("Invalid Prompt Context preview parameters", 400)
+        delimiter = str(body.get(
+            "delimiter", (project.metadata or {}).get(
+                "prompt_section_delimiter",
+                prompt_payload.DEFAULT_SECTION_DELIMITER)) or "")
+        compiled = _compile_live_scene_prompt_context(
+            project, candidate, template=template,
+            window_start=window_start, window_end=window_end, fps=fps,
+            labels_on=body.get("labels_on", False) is True,
+            delimiter=delimiter, prompt_threshold=prompt_threshold,
+            reference_threshold=reference_threshold)
+        compiled["execution_window"] = execution_window
+        compiled["candidate_base_modified_at"] = actual
+        return web.json_response(compiled)
+
     @routes.post("/sonder-editor/project/{project_id}/references/mutations")
     async def api_apply_reference_mutations(request: web.Request) -> web.Response:
         try:
@@ -6783,8 +7909,8 @@ if routes is not None:
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
 
-        summary = _build_dormant_summary(
-            project,
+        summary = await asyncio.to_thread(
+            _build_dormant_summary, project,
             scene_id=request.query.get("scene_id", ""),
             selection_start=request.query.get("selection_start", 0),
             selection_end=request.query.get("selection_end", 0),
@@ -6862,6 +7988,19 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
+        normalized_profile_update = None
+        if "prompt_context_profiles" in body:
+            try:
+                normalized_profile_update = _normalize_prompt_context_profile_update(
+                    project, body.get("prompt_context_profiles"))
+            except ProjectMutationRequestError as exc:
+                response = _mutation_json_error(exc)
+                if hasattr(exc, "usages"):
+                    payload = json.loads(response.body.decode("utf-8"))
+                    payload["usages"] = exc.usages
+                    response = web.json_response(payload, status=exc.status)
+                return response
+
         if "name" in body:
             project.name = body["name"]
         if "fps" in body:
@@ -6876,6 +8015,19 @@ if routes is not None:
         if "dimension_constraint" in body:
             raw = body.get("dimension_constraint")
             project.dimension_constraint = raw if isinstance(raw, dict) and raw else None
+        if normalized_profile_update is not None:
+            project.prompt_context_profiles = normalized_profile_update
+        if "prompt_semantic_units" in body:
+            raw_units = body.get("prompt_semantic_units")
+            if not isinstance(raw_units, list):
+                return _json_error("prompt_semantic_units must be a list", 400)
+            units = [prompt_context.normalize_semantic_unit(value)
+                     for value in raw_units if isinstance(value, dict)]
+            ids = [value["semantic_unit_id"] for value in units]
+            if len(ids) != len(set(ids)):
+                return _json_error("Duplicate prompt semantic unit id", 400)
+            project.prompt_semantic_units = units
+            ensure_default_prompt_semantic_units(project)
         if "metadata" in body:
             incoming = body["metadata"]
             # A channel-template switch rewrites every section in every scene,
@@ -6907,6 +8059,7 @@ if routes is not None:
                 if (prompt_channel_templates.global_channel_keys(previous)
                         != prompt_channel_templates.global_channel_keys(nxt)):
                     _recollapse_scene_globals(project, previous, nxt)
+                _release_incompatible_scene_profiles(project, nxt)
             project.metadata.update(incoming)
 
         save_project(project)
@@ -7383,6 +8536,14 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
+        queued_usage = _aggregate_asset_usages(project, assets_to_delete)
+        if _has_pending_frozen_input_usage(queued_usage):
+            return web.json_response({
+                "error": "One or more assets are frozen by a pending Reference generation",
+                "code": "queued_reference_input",
+                "usages": queued_usage["usages"],
+                "usage_count": queued_usage["usage_count"],
+            }, status=409)
         force = bool(body.get("force", False))
         if not force and assets_to_delete:
             protection = _asset_trash_protection(project, assets_to_delete)
@@ -7660,6 +8821,14 @@ if routes is not None:
         except ValueError as e:
             return _json_error(str(e), 400)
 
+        queued_usage = _aggregate_asset_usages(project, assets)
+        if _has_pending_frozen_input_usage(queued_usage):
+            return web.json_response({
+                "error": "One or more assets are frozen by a pending Reference generation",
+                "code": "queued_reference_input",
+                "usages": queued_usage["usages"],
+                "usage_count": queued_usage["usage_count"],
+            }, status=409)
         force = bool(body.get("force", False))
         if not force:
             protection = _asset_trash_protection(project, assets)
@@ -7757,6 +8926,13 @@ if routes is not None:
             return _json_error(f"Asset not found: {asset_id}", 404)
 
         usage = _find_asset_usages(project, asset)
+        if _has_pending_frozen_input_usage(usage):
+            return web.json_response({
+                "error": "Asset is frozen by a pending Reference generation",
+                "code": "queued_reference_input",
+                "usages": usage["usages"],
+                "usage_count": usage["usage_count"],
+            }, status=409)
         force = bool(body.get("force", False))
         if usage["usage_count"] > 0 and not force:
             return web.json_response({
@@ -7797,6 +8973,13 @@ if routes is not None:
             return _json_error(str(e), 400)
 
         usage = _aggregate_asset_usages(project, assets)
+        if _has_pending_frozen_input_usage(usage):
+            return web.json_response({
+                "error": "One or more assets are frozen by a pending Reference generation",
+                "code": "queued_reference_input",
+                "usages": usage["usages"],
+                "usage_count": usage["usage_count"],
+            }, status=409)
         force = bool(body.get("force", False))
         if usage["usage_count"] > 0 and not force:
             return web.json_response({
@@ -7837,6 +9020,14 @@ if routes is not None:
         deleted_ids = []
         try:
             trashed_assets = list(_project_trashed_assets(project))
+            queued_usage = _aggregate_asset_usages(project, trashed_assets)
+            if _has_pending_frozen_input_usage(queued_usage):
+                return web.json_response({
+                    "error": "Trash contains an asset frozen by a pending Reference generation",
+                    "code": "queued_reference_input",
+                    "usages": queued_usage["usages"],
+                    "usage_count": queued_usage["usage_count"],
+                }, status=409)
             _require_asset_media_sources(project, trashed_assets, operation="Asset empty trash")
             reference_cleanup = _remove_reference_members_for_assets(
                 project,
@@ -7937,6 +9128,14 @@ if routes is not None:
         except Exception:
             pass
         force = bool(body.get("force", False))
+        queued_usage = _find_asset_usages(project, asset)
+        if _has_pending_frozen_input_usage(queued_usage):
+            return web.json_response({
+                "error": "Asset is frozen by a pending Reference generation",
+                "code": "queued_reference_input",
+                "usages": queued_usage["usages"],
+                "usage_count": queued_usage["usage_count"],
+            }, status=409)
         if not force:
             protection = _asset_trash_protection(project, [asset])
             if protection["protected"]:
@@ -7964,6 +9163,10 @@ if routes is not None:
             initial_asset = initial_project.get_asset(asset_id)
             if not initial_asset:
                 return _json_error(f"Asset not found: {asset_id}", 404)
+            if _has_pending_frozen_input_usage(
+                    _find_asset_usages(initial_project, initial_asset)):
+                return _json_error(
+                    "Asset is frozen by a pending Reference generation", 409)
             try:
                 initial_abs_path = await asyncio.to_thread(
                     _require_asset_media_source,
@@ -8051,6 +9254,9 @@ if routes is not None:
         asset = project.get_asset(asset_id)
         if not asset:
             return _json_error(f"Asset not found: {asset_id}", 404)
+        if _has_pending_frozen_input_usage(_find_asset_usages(project, asset)):
+            return _json_error(
+                "Asset is frozen by a pending Reference generation", 409)
 
         try:
             body = await request.json()
@@ -8281,9 +9487,35 @@ if routes is not None:
         for track_payload in payload.get("audio_tracks", []) or []:
             if isinstance(track_payload, dict):
                 track_payload.pop("track_id", None)
+        reference_item_id_map = {}
         for item_payload in payload.get("reference_items", []) or []:
             if isinstance(item_payload, dict):
-                item_payload.pop("reference_item_id", None)
+                previous_id = str(item_payload.get("reference_item_id") or "")
+                next_id = uuid.uuid4().hex
+                item_payload["reference_item_id"] = next_id
+                if previous_id:
+                    reference_item_id_map[previous_id] = next_id
+
+        def remap_reference_attachment_sources(attachments):
+            for attachment in attachments or []:
+                if not isinstance(attachment, dict):
+                    continue
+                source = attachment.get("source")
+                if not isinstance(source, dict):
+                    continue
+                source_id = str(source.get("reference_item_id") or "")
+                if source_id in reference_item_id_map:
+                    source["reference_item_id"] = reference_item_id_map[source_id]
+                if isinstance(source.get("reference_item_ids"), list):
+                    source["reference_item_ids"] = [
+                        reference_item_id_map.get(str(value), str(value))
+                        for value in source["reference_item_ids"]
+                    ]
+
+        remap_reference_attachment_sources(payload.get("global_attachments"))
+        for section_payload in payload.get("prompt_sections", []) or []:
+            if isinstance(section_payload, dict):
+                remap_reference_attachment_sources(section_payload.get("attachments"))
 
         existing_names = {scene.name for scene in project.scenes}
         copy_base = f"{source_scene.name} (copy)"
@@ -8350,7 +9582,11 @@ if routes is not None:
             scene.generation_params = body["generation_params"]
         for descriptor in VARIABLE_LANE_DESCRIPTORS:
             if descriptor.count_attr in body:
-                setattr(scene, descriptor.count_attr, max(1, int(body[descriptor.count_attr])))
+                _set_scene_lane_count(
+                    scene,
+                    descriptor.lane_type,
+                    max(1, int(body[descriptor.count_attr])),
+                )
             if descriptor.configs_attr in body:
                 setattr(
                     scene,
@@ -8358,11 +9594,18 @@ if routes is not None:
                     [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
                 )
             if descriptor.recipe_attr and descriptor.recipe_attr in body:
-                setattr(
-                    scene,
-                    descriptor.recipe_attr,
-                    [ReferenceLaneRecipe.from_dict(recipe) for recipe in body[descriptor.recipe_attr]],
-                )
+                _replace_reference_lane_recipes(scene, body[descriptor.recipe_attr])
+        setup_fields = {
+            key: body[key] for key in (
+                "minimax_h3_conditioning_setups",
+                "active_minimax_h3_setup_id",
+            ) if key in body
+        }
+        if setup_fields:
+            try:
+                _apply_scene_fields(project, scene, setup_fields)
+            except ProjectMutationRequestError as exc:
+                return _mutation_json_error(exc)
         if "guide_track_config" in body:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
         if "prompt_track_config" in body:
@@ -8488,7 +9731,11 @@ if routes is not None:
             ]
         for descriptor in VARIABLE_LANE_DESCRIPTORS:
             if descriptor.count_attr in body:
-                setattr(scene, descriptor.count_attr, max(1, int(body[descriptor.count_attr])))
+                _set_scene_lane_count(
+                    scene,
+                    descriptor.lane_type,
+                    max(1, int(body[descriptor.count_attr])),
+                )
             if descriptor.configs_attr in body:
                 setattr(
                     scene,
@@ -8496,11 +9743,18 @@ if routes is not None:
                     [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
                 )
             if descriptor.recipe_attr and descriptor.recipe_attr in body:
-                setattr(
-                    scene,
-                    descriptor.recipe_attr,
-                    [ReferenceLaneRecipe.from_dict(recipe) for recipe in body[descriptor.recipe_attr]],
-                )
+                _replace_reference_lane_recipes(scene, body[descriptor.recipe_attr])
+        setup_fields = {
+            key: body[key] for key in (
+                "minimax_h3_conditioning_setups",
+                "active_minimax_h3_setup_id",
+            ) if key in body
+        }
+        if setup_fields:
+            try:
+                _apply_scene_fields(project, scene, setup_fields)
+            except ProjectMutationRequestError as exc:
+                return _mutation_json_error(exc)
         if "guide_track_config" in body:
             scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
         if "prompt_track_config" in body:
@@ -8748,7 +10002,12 @@ if routes is not None:
 
     @routes.get("/sonder-editor/project/{project_id}/scenes/{scene_id}/bridge-references")
     async def api_bridge_references(request: web.Request) -> web.Response:
-        """Return informational Reference lane shape for selector/bridge UI."""
+        """Return the effective Reference lane shape for selector/bridge UI.
+
+        Live requests use the editor selection plus context. A running snapshot
+        uses its frozen compiled window and Reference rows, so socket shape and
+        labels cannot drift while a job is executing.
+        """
         try:
             project = await asyncio.to_thread(_load_project_from_request, request)
         except FileNotFoundError as e:
@@ -8757,6 +10016,24 @@ if routes is not None:
         scene = project.get_scene(scene_id)
         if not scene:
             return _json_error(f"Scene not found: {scene_id}", 404)
+        duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+
+        def _query_int(name, default):
+            raw = request.query.get(name)
+            if raw in (None, ""):
+                return default
+            try:
+                return int(raw)
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        def _threshold(source) -> float:
+            if not isinstance(source, dict):
+                return 0.0
+            try:
+                return float(source.get("reference_frame_threshold", 0.0) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
 
         active_job = None
         for job in getattr(project, "generation_queue", []) or []:
@@ -8777,63 +10054,144 @@ if routes is not None:
             configs = [LaneConfig.from_dict(value) if isinstance(value, dict) else value for value in (active_job.reference_lane_configs or [])]
             recipes = [ReferenceLaneRecipe.from_dict(value) if isinstance(value, dict) else value for value in (active_job.reference_lane_recipes or [])]
             reference_items = [ReferenceItem.from_dict(value) for value in (active_job.reference_item_snapshots or []) if isinstance(value, dict)]
+            params = getattr(active_job, "params", {}) or {}
+            threshold = _threshold(params)
+            frozen_context = getattr(active_job, "compiled_prompt_context", {}) or {}
+            frozen_window = (frozen_context.get("window") or {}) \
+                if isinstance(frozen_context, dict) else {}
+            try:
+                window_start = int(frozen_window.get("start_frame"))
+                window_end = int(frozen_window.get("end_frame"))
+            except (TypeError, ValueError, OverflowError):
+                execution_window = resolve_execution_window(
+                    scene_duration=duration,
+                    selection_start=getattr(active_job, "selection_start", 0),
+                    selection_end=getattr(active_job, "selection_end", 0),
+                    pre_context_frames=getattr(active_job, "pre_context_frames", 0),
+                    post_context_frames=getattr(active_job, "post_context_frames", 0),
+                    mask_pre_offset=getattr(active_job, "mask_pre_offset", 0),
+                    mask_post_offset=getattr(active_job, "mask_post_offset", 0),
+                    frame_constraint=getattr(active_job, "frame_constraint", None),
+                )
+                window_start = int(execution_window["render_start"])
+                window_end = int(execution_window["render_end"])
+            setup_manifest = getattr(active_job, "minimax_h3_setup_snapshot", {}) or {}
+            frozen_references = [
+                ReferenceEntity.from_dict(value.get("value") or {})
+                for value in (getattr(active_job, "reference_input_snapshots", []) or [])
+                if isinstance(value, dict) and value.get("kind") == "reference"
+            ]
+            catalog_references = frozen_references or list(project.references)
             source_label = "snapshot"
         else:
             lane_count = max(1, int(getattr(scene, "reference_lane_count", 1) or 1))
             configs = list(getattr(scene, "reference_lane_configs", []) or [])
             recipes = list(getattr(scene, "reference_lane_recipes", []) or [])
             reference_items = list(getattr(scene, "reference_items", []) or [])
+            metadata = getattr(project, "metadata", {}) or {}
+            threshold = _threshold(metadata)
+            selection_start = max(0, min(duration, _query_int("selection_start", 0)))
+            selection_end = max(0, min(duration, _query_int("selection_end", duration)))
+            if selection_end <= selection_start:
+                selection_start, selection_end = 0, duration
+            pre_context = max(0, _query_int("pre_context_frames", 0))
+            post_context = max(0, _query_int("post_context_frames", 0))
+            window_start = max(0, selection_start - pre_context)
+            window_end = min(duration, selection_end + post_context)
+            setup_manifest = {}
+            setup = minimax_h3.active_setup(scene)
+            if setup is not None and setup.get("mode") == "reference":
+                setup_result = minimax_h3.resolve_setup(
+                    setup=setup,
+                    guide_frames=scene.guide_frames,
+                    reference_items=reference_items,
+                    lane_recipes=recipes,
+                    lane_configs=configs,
+                    lane_count=lane_count,
+                    scene_duration=duration,
+                    window_start=window_start,
+                    window_end=window_end,
+                    references=project.references,
+                    assets=project.assets,
+                    semantic_units=project.prompt_semantic_units,
+                    frame_threshold_pct=threshold,
+                )
+                setup_manifest = setup_result.get("setup_manifest", {}) or {}
+            catalog_references = list(project.references)
             source_label = "live"
         pad_config_list(configs, lane_count, LaneConfig)
         while len(recipes) < lane_count:
             recipes.append(ReferenceLaneRecipe())
 
+        winners = resolve_effective_references(
+            reference_items=reference_items,
+            lane_count=lane_count,
+            scene_duration=duration,
+            window_start=window_start,
+            window_end=window_end,
+            lane_configs=configs,
+            frame_threshold_pct=threshold,
+        )
+
         members_by_id = {
             member.member_id: member
-            for reference in project.references
+            for reference in catalog_references
             for member in reference.members
         }
         references_by_member_id = {
             member.member_id: reference
-            for reference in project.references
+            for reference in catalog_references
             for member in reference.members
         }
+        physical_labels = {}
+        for population, ordinal_key, label in (
+                ("pictures", "picture_ordinal", "Picture"),
+                ("videos", "video_ordinal", "Video"),
+                ("standalone_audios", "audio_ordinal", "Audio")):
+            for slot in setup_manifest.get(population, []) or []:
+                if not isinstance(slot, dict):
+                    continue
+                lane_id = str(slot.get("lane_id") or "")
+                member_id = str(slot.get("member_id") or "")
+                try:
+                    ordinal = int(slot.get(ordinal_key) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    ordinal = 0
+                if lane_id and member_id and ordinal > 0:
+                    physical_labels[(lane_id, member_id)] = f"{label} {ordinal}"
         rows = []
         for lane_index in range(lane_count):
             lane_items = [item for item in reference_items if int(getattr(item, "lane_index", 0) or 0) == lane_index]
-            member_count = max((len(getattr(item, "members", []) or []) for item in lane_items), default=0)
-            # Distinct tags across everything staged on the lane, so the selector
-            # panel can say WHICH references it is carrying, not just how many.
+            winner = winners[lane_index] if lane_index < len(winners) else None
+            effective_item = winner.get("item") if winner else None
+            member_refs = list(getattr(effective_item, "members", []) or [])
+            member_count = len(member_refs)
+            # Tags and labels describe only the winner for this render window.
             lane_tags: list[str] = []
-            for item in lane_items:
-                for ref in getattr(item, "members", []) or []:
-                    member = members_by_id.get(str((ref or {}).get("member_id", "") or ""))
-                    for tag in (getattr(member, "tags", []) or []):
-                        if tag not in lane_tags:
-                            lane_tags.append(str(tag))
+            for ref in member_refs:
+                member = members_by_id.get(str((ref or {}).get("member_id", "") or ""))
+                for tag in (getattr(member, "tags", []) or []):
+                    if tag not in lane_tags:
+                        lane_tags.append(str(tag))
             recipe = recipes[lane_index]
             materialized = getattr(recipe, "recipe", {}) or {}
             hard = materialized.get("hard") if isinstance(materialized.get("hard"), dict) else {}
             live = reference_live_outputs(hard)
             media_kind = getattr(recipe, "media_kind", "image")
             assembly = str(hard.get("assembly", "batch") or "batch")
+            lane_id = str(getattr(recipe, "lane_id", "") or "")
             slot_labels = []
             for slot_index in range(min(16, member_count)):
-                values = []
-                for item in lane_items:
-                    member_refs = getattr(item, "members", []) or []
-                    if slot_index >= len(member_refs):
-                        continue
-                    member_id = str((member_refs[slot_index] or {}).get("member_id", "") or "")
-                    reference = references_by_member_id.get(member_id)
-                    if reference is None:
-                        continue
+                member_id = str((member_refs[slot_index] or {}).get("member_id", "") or "")
+                reference = references_by_member_id.get(member_id)
+                if reference is None:
+                    display = f"Reference {slot_index + 1}"
+                else:
                     name = str(getattr(reference, "name", "") or "Reference")
                     role = str(getattr(reference, "reference_class", "") or "subject")
-                    label = f"{name} ({role})"
-                    if label not in values:
-                        values.append(label)
-                slot_labels.append(" / ".join(values) if values else f"Reference {slot_index + 1}")
+                    display = f"{name} ({role})"
+                physical = physical_labels.get((lane_id, member_id), "")
+                slot_labels.append(f"{physical} · {display}" if physical else display)
             rows.append({
                 "lane_index": lane_index,
                 "lane_name": getattr(configs[lane_index], "name", "") or f"Reference {lane_index + 1}",
@@ -8841,7 +10199,8 @@ if routes is not None:
                 "media_kind": media_kind,
                 "recipe_id": getattr(recipe, "recipe_id", ""),
                 "recipe_name": str(materialized.get("name", "") or "Detached / Custom"),
-                "item_count": len(lane_items),
+                "item_count": int(effective_item is not None),
+                "authored_item_count": len(lane_items),
                 "member_count": min(16, member_count),
                 # Non-slot image assemblies produce one assembled payload on
                 # r01. Slot recipes and audio/prompt bridges grow per member.
@@ -8861,6 +10220,8 @@ if routes is not None:
                 "slot_labels": slot_labels,
             })
         return web.json_response({
+            "window_start": window_start,
+            "window_end": window_end,
             "scene_name": getattr(scene, "name", "") or scene_id,
             "source": source_label,
             "reference_lane_count": lane_count,
@@ -8951,8 +10312,81 @@ if routes is not None:
         window_end = min(duration, _q_int("window_end", duration))
         if window_end <= window_start:
             window_start, window_end = 0, duration
-
         labels_on = prompt_channel_templates.template_labels_on(template, labels_on)
+
+        frozen_context = (getattr(active_job, "compiled_prompt_context", {})
+                          if active_job is not None else {})
+        if isinstance(frozen_context, dict) and frozen_context.get("format") == prompt_context.FORMAT_VERSION:
+            frozen_window = frozen_context.get("window") or {}
+            frozen_segments = list(frozen_context.get("segments") or [])
+            frozen_relay = dict(frozen_context.get("relay") or {})
+            used_sections = sorted({int(value["section_start"])
+                                    for value in frozen_segments
+                                    if "section_start" in value})
+            return web.json_response({
+                "window_start": int(frozen_window.get("start_frame", window_start)),
+                "window_end": int(frozen_window.get("end_frame", window_end)),
+                "scene_name": getattr(scene, "name", "") or scene_id,
+                "source": "snapshot", "labels_on": labels_on,
+                "global_prompt": frozen_relay.get("global_prompt", ""),
+                "segments": frozen_relay.get("segments", []),
+                "used_sections": used_sections, "dropped_sections": [],
+                "relay": {key: frozen_relay.get(key, "")
+                          for key in ("global_prompt", "smart_prompt",
+                                      "local_prompts", "segment_lengths")},
+                "compiled_prompt": frozen_context.get("prompt", ""),
+                "compiled_channels": frozen_context.get("channels", {}),
+                "attachment_previews": frozen_context.get("attachment_previews", {}),
+                "setup_manifest": frozen_context.get("setup_manifest", {}),
+                "ordinal_manifest": frozen_context.get("ordinal_manifest", {}),
+                "profile_hash": frozen_context.get("profile_hash", ""),
+                "warnings": frozen_context.get("warnings", []),
+                "errors": frozen_context.get("errors", []),
+            })
+
+        if active_job is None:
+            metadata = project.metadata if isinstance(project.metadata, dict) else {}
+            try:
+                reference_threshold = float(metadata.get("reference_frame_threshold", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                reference_threshold = 0.0
+            delimiter = str(metadata.get("prompt_section_delimiter",
+                                         prompt_payload.DEFAULT_SECTION_DELIMITER) or "")
+            compiled = _compile_live_scene_prompt_context(
+                project, scene, template=template,
+                window_start=window_start, window_end=window_end,
+                fps=effective_scene_fps(project, scene), labels_on=labels_on,
+                delimiter=delimiter, prompt_threshold=threshold,
+                reference_threshold=reference_threshold)
+            compiled_relay = compiled.get("relay", {})
+            used_sections = sorted({int(value["section_start"])
+                                    for value in compiled.get("segments", [])
+                                    if "section_start" in value})
+            candidates = prompt_payload.resolve_segments(
+                sections, window_start, window_end, labels_on, 0.0, template)
+            candidate_keys = {int(value["section_start"]) for value in candidates
+                              if "section_start" in value}
+            return web.json_response({
+                "window_start": window_start, "window_end": window_end,
+                "scene_name": getattr(scene, "name", "") or scene_id,
+                "source": "live", "labels_on": labels_on,
+                "global_prompt": compiled_relay.get("global_prompt", ""),
+                "segments": compiled_relay.get("segments", []),
+                "used_sections": used_sections,
+                "dropped_sections": sorted(candidate_keys.difference(used_sections)),
+                "relay": {key: compiled_relay.get(key, "")
+                          for key in ("global_prompt", "smart_prompt",
+                                      "local_prompts", "segment_lengths")},
+                "compiled_prompt": compiled.get("prompt", ""),
+                "compiled_channels": compiled.get("channels", {}),
+                "attachment_previews": compiled.get("attachment_previews", {}),
+                "setup_manifest": compiled.get("setup_manifest", {}),
+                "ordinal_manifest": compiled.get("ordinal_manifest", {}),
+                "profile_hash": compiled.get("profile_hash", ""),
+                "warnings": compiled.get("warnings", []),
+                "errors": compiled.get("errors", []),
+            })
+
         segments = prompt_payload.resolve_segments(
             sections, window_start, window_end, labels_on, threshold, template)
         relay = prompt_payload.build_relay_payload(global_text, segments)
@@ -9576,21 +11010,28 @@ if routes is not None:
             )
             if overlapping:
                 return _json_error("Prompt sections cannot overlap", 409)
+        try:
+            next_docs, next_channels = _next_prompt_section_content(section, body)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
         section.start_frame = new_start
         section.end_frame = new_end
-        raw_channels = body.get("channels")
-        if isinstance(raw_channels, dict):
-            section.channels = prompt_payload.merge_channels(section.channels, raw_channels)
-        elif "prompt" in body:
-            section.prompt = body["prompt"]
+        section.channel_docs = next_docs
+        section.channels = next_channels
         if "muted" in body:
             section.muted = bool(body["muted"])
         if "starts_new_shot" in body:
-            section.starts_new_shot = bool(body["starts_new_shot"])
+            section.attachments = prompt_context.set_marker_attachment(
+                section.attachments, "shot", bool(body["starts_new_shot"]))
+            section.refresh_marker_mirrors()
         if "shot_timestamp" in body:
-            section.shot_timestamp = bool(body["shot_timestamp"])
-        if "subject_ids" in body:
-            section.subject_ids = prompt_payload.normalize_subject_ids(body["subject_ids"])
+            section.attachments = prompt_context.set_marker_attachment(
+                section.attachments, "timestamp", bool(body["shot_timestamp"]))
+            section.refresh_marker_mirrors()
+        if "attachments" in body:
+            section.attachments = _validated_attachments(
+                body["attachments"], scene=scene, exclude_section=section)
+            section.refresh_marker_mirrors()
         if "global_channel_exceptions" in body:
             section.global_channel_exceptions = prompt_payload.normalize_channel_exceptions(
                 body["global_channel_exceptions"])
@@ -9767,6 +11208,8 @@ if routes is not None:
             project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, add_one)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         _remember_request_project(request, project)
         return web.json_response(payload)
@@ -9806,6 +11249,8 @@ if routes is not None:
             project, payload = await asyncio.to_thread(_apply_queue_versioned_sync, request, add_batch)
         except FileNotFoundError as e:
             return _json_error(str(e), 404)
+        except ProjectMutationRequestError as e:
+            return _mutation_json_error(e)
 
         _remember_request_project(request, project)
         return web.json_response(payload, status=201)

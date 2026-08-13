@@ -829,6 +829,24 @@ def test_scene_get_prompt_for_range():
     assert scene.get_prompt_for_range(200, 300) == "global style [VISUAL]: section B"
 
 
+def test_live_prompt_path_returns_text_for_warnings_but_not_integrity_errors(monkeypatch):
+    scene = Scene(global_attachments=[{"kind": "custom"}])
+
+    monkeypatch.setattr(Scene, "compile_prompt_context", lambda self, *args, **kwargs: {
+        "prompt": "resolved live prompt",
+        "warnings": [{"code": "empty_channel"}],
+        "errors": [],
+    })
+    assert scene.get_prompt_for_range(0, 24) == "resolved live prompt"
+
+    monkeypatch.setattr(Scene, "compile_prompt_context", lambda self, *args, **kwargs: {
+        "prompt": "must not escape",
+        "warnings": [],
+        "errors": [{"code": "broken_reference_source"}],
+    })
+    assert scene.get_prompt_for_range(0, 24) == ""
+
+
 def test_scene_prompt_hidden_matrix():
     def build():
         return Scene(

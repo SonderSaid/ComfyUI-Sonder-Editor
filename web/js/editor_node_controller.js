@@ -8,6 +8,10 @@ import {
 } from "./editor_settings.js";
 import { installProjectVersionFetchPatch, getProjectVersion } from "./api_client.js";
 import {
+    emitEditorRenderWindowChanged,
+    isEditorRenderWindowField,
+} from "./editor_render_window_events.js";
+import {
     allocateAssetRefreshWave,
     buildAssetRefreshPolicy,
     getProjectAssetMutationEpoch,
@@ -1708,6 +1712,14 @@ export class EditorNodeController {
         if (name === "mask_pre_offset") this.state.maskPreOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "mask_post_offset") this.state.maskPostOffset = Math.max(0, parseInt(value, 10) || 0);
         if (name === "render_queue_active") this.state.renderQueueActive = coerceBoolean(value, true);
+        if (isEditorRenderWindowField(name)) {
+            emitEditorRenderWindowChanged({
+                sourceNodeId: String(this.node?.id ?? ""),
+                projectDir: String(this.state.projectDir || ""),
+                sceneId: String(this.state.sceneId || ""),
+                field: name,
+            });
+        }
         if (publish) this._seedWidgetState({ [name]: value }, { seed: false });
         const previewKeys = this._previewInvalidationKeysForWidget(name);
         if (refreshPreview && previewKeys.length) {

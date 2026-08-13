@@ -7,6 +7,7 @@ actually evaluated.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -27,9 +28,15 @@ from ..server.media_helpers import (
     resolve_source_color_interpretation,
 )
 from ..server.path_security import resolve_existing_project_path
+from ..server.reference_prompt_formatter import (
+    member_prompt_fragment as _shared_member_prompt_fragment,
+    reference_member_labels,
+)
 from ..server.reference_resolution import reference_live_outputs, resolve_effective_references
 from ..server.timeline_state import (
+    Asset,
     LaneConfig,
+    ReferenceEntity,
     ReferenceItem,
     ReferenceLaneRecipe,
     effective_scene_fps,
@@ -70,6 +77,26 @@ def _find_queue_job(project):
     )
 
 
+def _snapshot_catalog_project(project, job):
+    """Return a shallow project view backed by the job's frozen References."""
+    raw = getattr(job, "reference_input_snapshots", []) or []
+    catalog_entries = [value for value in raw if isinstance(value, dict)
+                       and value.get("kind") in {"reference", "asset"}]
+    if not catalog_entries:
+        # Compatibility for jobs queued before Reference input freezing shipped.
+        return project
+    frozen = copy.copy(project)
+    frozen.references = [
+        ReferenceEntity.from_dict(value.get("value") or {})
+        for value in catalog_entries if value.get("kind") == "reference"
+    ]
+    frozen.assets = [
+        Asset.from_dict(value.get("value") or {})
+        for value in catalog_entries if value.get("kind") == "asset"
+    ]
+    return frozen
+
+
 def _active_scene(project):
     context = getattr(project, "_execution_context", None) or {}
     scene_id = str(context.get("scene_id", "") or "")
@@ -95,6 +122,7 @@ def _render_window(project, scene) -> tuple[int, int, int, int]:
 def _source(project, scene) -> dict[str, Any]:
     job = _find_queue_job(project)
     if job is not None and _snapshot_version(job) > 0:
+        catalog_project = _snapshot_catalog_project(project, job)
         lane_count = max(1, _int(getattr(job, "reference_lane_count", 1), 1))
         configs = [
             LaneConfig.from_dict(value) if isinstance(value, dict) else value
@@ -120,6 +148,7 @@ def _source(project, scene) -> dict[str, Any]:
         }
         source_name = "snapshot"
     else:
+        catalog_project = project
         lane_count = max(1, _int(getattr(scene, "reference_lane_count", 1), 1)) if scene else 1
         configs = list(getattr(scene, "reference_lane_configs", []) or []) if scene else []
         recipes = list(getattr(scene, "reference_lane_recipes", []) or []) if scene else []
@@ -143,6 +172,7 @@ def _source(project, scene) -> dict[str, Any]:
         "items": items,
         "frame_threshold_pct": threshold,
         "pegs": pegs,
+        "catalog_project": catalog_project,
     }
 
 
@@ -150,7 +180,7 @@ def _staged_entity_order(project, resolved_lanes) -> list:
     """Every staged entity id, in lane, then item, then member order.
 
     That staging order IS the numbering rule for `<Subject N>` — plan decision
-    8. Prompt sections do not participate: a section's `subject_ids` bindings
+    8. Prompt sections do not participate: semantic Context-unit bindings
     are durable but no longer feed composition, so seeding from them would make
     the Bridge prompt sockets depend on prompt-lane state they cannot see.
     """
@@ -273,12 +303,12 @@ def resolve_reference_set(project, reference_lane_index=0) -> dict[str, Any]:
         # Over ALL lanes, not just this one: resolve_effective_references
         # already returns every lane, and the registry must be cross-lane so an
         # image lane and an audio lane staging the same entity agree.
-        registry = build_reference_registry(project, resolved)
+        registry = build_reference_registry(source["catalog_project"], resolved)
     recipe = source["recipes"][lane_index] if lane_index < len(source["recipes"]) else ReferenceLaneRecipe()
     item_dict = selected.to_dict() if hasattr(selected, "to_dict") else dict(selected or {})
     recipe_dict = recipe.to_dict() if hasattr(recipe, "to_dict") else dict(recipe or {})
     return {
-        "project": project,
+        "project": source["catalog_project"],
         "source": source["source"],
         "lane_index": lane_index,
         "has_reference": int(bool(item_dict)),
@@ -371,6 +401,19 @@ def _asset_video_fps(asset) -> float:
     return value if value > 0 else 24.0
 
 
+def _snap_span_frame_count(target_count: int, hard: dict | None = None) -> int:
+    """Apply a recipe's temporal grid without ever extending the source span."""
+    hard = hard if isinstance(hard, dict) else {}
+    target = max(1, _int(target_count, 1))
+    if str(hard.get("frame_count_snap") or "nearest") != "floor_grid":
+        return target
+    step = max(1, _int(hard.get("frame_step"), 1))
+    offset = max(0, _int(hard.get("frame_offset"), 0))
+    minimum = max(1, _int(hard.get("minimum_frames"), 1))
+    span = max(minimum, target)
+    return max(minimum, offset + max(0, (span - offset) // step) * step)
+
+
 def _load_member_image(record: dict[str, Any]) -> np.ndarray:
     asset, member, path = record["asset"], record["member"], record["path"]
     if getattr(asset, "asset_type", "") == "video":
@@ -394,6 +437,7 @@ def _load_member_images(
     *,
     decode_span: bool,
     target_fps: float,
+    hard: dict | None = None,
 ) -> list[np.ndarray]:
     """Decode one still or a resampled video span without buffering raw ffmpeg output."""
     asset, member = record["asset"], record["member"]
@@ -422,6 +466,7 @@ def _load_member_images(
     served_fps = max(0.001, _float(target_fps, source_fps))
     source_count = source_end - source_start
     target_count = max(1, int(math.floor((source_count / source_fps) * served_fps + 0.5)))
+    target_count = _snap_span_frame_count(target_count, hard)
     rate_ratio = source_fps / served_fps
     requested = [
         min(source_count - 1, max(0, int(math.floor((index + 0.5) * rate_ratio))))
@@ -509,6 +554,7 @@ def _member_geometry(
             width_value *= scale
             height_value *= scale
             floor = True
+        floor = floor or str(hard.get("size_rounding") or "nearest") == "floor"
         return (
             _snap_dimension(width_value, multiple, floor=floor, ceiling=ceiling),
             _snap_dimension(height_value, multiple, floor=floor, ceiling=ceiling),
@@ -518,9 +564,14 @@ def _member_geometry(
     multiple = max(1, _int(hard.get("size_multiple"), 1))
     if mode == "native":
         height, width = frame.shape[:2]
-        long_edge = min(max(width, height), max(16, _int(hard.get("long_edge_max"), 848)))
-        scale = long_edge / max(1, max(width, height))
-        return bounded(width * scale, height * scale, ceiling=long_edge)
+        # A short-edge contract and the generic long-edge default are mutually
+        # exclusive. Only apply the 848 fallback when no explicit short-edge
+        # model contract exists.
+        if max(0, _int(hard.get("short_edge_max"), 0)) <= 0:
+            long_edge = min(max(width, height), max(16, _int(hard.get("long_edge_max"), 848)))
+            scale = long_edge / max(1, max(width, height))
+            return bounded(width * scale, height * scale, ceiling=long_edge)
+        return bounded(width, height)
     # A lone member may have its own canonical size (Best Face ID's bust crop is
     # ~460x406 where its 4-panel sheet is exactly 1536x1024).
     single = hard.get("single_member_size")
@@ -607,7 +658,8 @@ PROJECT_SCOPED_PROMPT_TOKENS = ("{subject_n}", "{picture_n}", "{audio_n}", "{spe
 
 
 def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str,
-                           registry_numbers: dict | None = None) -> str:
+                           registry_numbers: dict | None = None,
+                           member_name: str = "") -> str:
     """Expand one member's slice of the derived prompt.
 
     A pattern may use `{n}` (1-based), `{index}` (0-based), `{prompt}` and
@@ -624,42 +676,8 @@ def member_prompt_fragment(pattern: str, index: int, prompt: str, name: str,
     collision-free against `{n}` under both the Python `.replace` chain and the
     JS `.split/.join` chain because each is a distinct whole token.
     """
-    member_prompt = str(prompt or "").strip()
-    entity_name = str(name or "").strip()
-    label = member_prompt or entity_name
-    if not pattern:
-        return label
-    numbers = registry_numbers if isinstance(registry_numbers, dict) else {}
-    expanded = (
-        pattern.replace("{subject_n}", str(numbers.get("subject_n", 0) or 0))
-        .replace("{picture_n}", str(numbers.get("picture_n", 0) or 0))
-        .replace("{audio_n}", str(numbers.get("audio_n", 0) or 0))
-        .replace("{speaker_n}", str(numbers.get("speaker_n", 0) or 0))
-        .replace("{n}", str(index + 1))
-        .replace("{index}", str(index))
-        .replace("{prompt}", member_prompt)
-        .replace("{name}", entity_name)
-    )
-    if "{prompt}" in pattern or "{name}" in pattern:
-        # An empty member prompt inside a `{prompt}` pattern used to leave a
-        # dangling clause ("<Subject 2> is the  from <Picture 2>") because the
-        # entity-name fallback only existed on the no-placeholder branch.
-        # Falling back to the name is required rather than dropping the
-        # fragment: omission would remove a staged member from the prompt while
-        # its image still reaches the model.
-        if not member_prompt and entity_name and "{prompt}" in pattern:
-            expanded = (
-                pattern.replace("{subject_n}", str(numbers.get("subject_n", 0) or 0))
-                .replace("{picture_n}", str(numbers.get("picture_n", 0) or 0))
-                .replace("{audio_n}", str(numbers.get("audio_n", 0) or 0))
-                .replace("{speaker_n}", str(numbers.get("speaker_n", 0) or 0))
-                .replace("{n}", str(index + 1))
-                .replace("{index}", str(index))
-                .replace("{prompt}", entity_name)
-                .replace("{name}", entity_name)
-            )
-        return expanded.strip()
-    return f"{expanded}: {label}" if label else expanded
+    return _shared_member_prompt_fragment(
+        pattern, index, prompt, name, registry_numbers, member_name)
 
 
 def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict,
@@ -677,6 +695,7 @@ def _assemble_prompt(item: dict, records: list[dict[str, Any]], recipe: dict,
             getattr(record["member"], "prompt", ""),
             getattr(record["reference"], "name", ""),
             registry_numbers_for(registry, record["reference"], record["member"]),
+            getattr(record["member"], "name", ""),
         )
         if fragment:
             values.append(fragment)
@@ -696,6 +715,7 @@ def _member_prompts(records: list[dict[str, Any]], recipe: dict,
             getattr(record["member"], "prompt", ""),
             getattr(record["reference"], "name", ""),
             registry_numbers_for(registry, record["reference"], record["member"]),
+            getattr(record["member"], "name", ""),
         )
         for index, record in enumerate(records)
     ]
@@ -803,7 +823,7 @@ def decode_reference_images(reference_set) -> tuple:
     decode_span = assembly in {"batch", "slots"}
     target_fps = _reference_frame_rate(context)
     member_frames = [
-        _load_member_images(record, decode_span=decode_span, target_fps=target_fps)
+        _load_member_images(record, decode_span=decode_span, target_fps=target_fps, hard=hard)
         for record in records
     ]
     member_tensors = [
@@ -896,7 +916,10 @@ def decode_reference_prompts(reference_set) -> tuple:
     ref = context["ref"]
     registry = ref.get("registry") if isinstance(ref.get("registry"), dict) else None
     prompt = _assemble_prompt(context["item"], records, context["recipe"], registry)
-    names = ", ".join(str(getattr(record["reference"], "name", "") or "") for record in records)
+    names = ", ".join(reference_member_labels(
+        getattr(record["reference"], "name", ""),
+        getattr(record["member"], "name", ""),
+    )["name"] for record in records)
     slot_prompts = _member_prompts(records, context["recipe"], registry)
     return (
         prompt if "reference_prompt" in live else "",

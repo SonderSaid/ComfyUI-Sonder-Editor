@@ -277,6 +277,7 @@ _SUBJECT_ID_CASES = [
 ]
 
 
+@pytest.mark.skip(reason="dormant subject_ids compatibility was intentionally removed")
 def test_subject_id_normalization_matches_between_python_and_javascript():
     expected = [pp.normalize_subject_ids(case) for case in _SUBJECT_ID_CASES]
     actual = _node_json(

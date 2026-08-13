@@ -611,6 +611,15 @@ function shouldSuppressComfyGraphUndo() {
     return getActiveEditorNodes().some((node) => node._sonderController?.state?.isFullscreenOpen);
 }
 
+function isPromptTextEditorFocused() {
+    if (typeof document === "undefined") return false;
+    const active = document.activeElement;
+    return !!(active?.closest?.("[data-sonder-prompt-box='1']")
+        || active?.isContentEditable
+        || active?.closest?.("[contenteditable]:not([contenteditable='false'])")
+        || active?.closest?.("input, textarea, select"));
+}
+
 const sonderGraphUndoSuppression = {
     untilMs: 0,
     reason: "",
@@ -656,9 +665,16 @@ function installGraphLoadGuard() {
     if (!originalLoadGraphData) return;
 
     app.loadGraphData = async function (...args) {
-        if (sonderGraphLoadBypassDepth <= 0 && isGraphUndoSuppressed() && shouldSuppressComfyGraphUndo()) {
+        // ComfyUI's window-capture undo listener is registered before custom
+        // extensions. It can therefore start loadGraphData before our higher-
+        // level KeyboardOwnership consumer sees Ctrl/Cmd-Z. A focused prompt
+        // document is an authoritative text-editing boundary: graph history
+        // must not replace the mounted node while that editor owns the key.
+        const promptTextEditing = isPromptTextEditorFocused();
+        if (sonderGraphLoadBypassDepth <= 0 && shouldSuppressComfyGraphUndo()
+                && (isGraphUndoSuppressed() || promptTextEditing)) {
             sonderKeyboardDebug("blocked app.loadGraphData during fullscreen editor undo window", {
-                reason: sonderGraphUndoSuppression.reason,
+                reason: promptTextEditing ? "prompt-text-editor" : sonderGraphUndoSuppression.reason,
                 nodeIds: sonderGraphUndoSuppression.nodeIds,
             });
             return false;

@@ -224,7 +224,6 @@ import {
     normalizeChannelExceptions,
     globalChannelLines,
     normalizeChannels,
-    normalizeSubjectIds,
 } from "./prompt_composition.js";
 import {
     DEFAULT_CHANNEL_TEMPLATE_ID,
@@ -250,6 +249,26 @@ import {
 } from "./thumbnail_repair_manager.js";
 import { mountTimelineExportPanel } from "./editor_timeline_export_panel.js";
 import { mountPromptManagementPanel } from "./editor_prompt_panel.js";
+import {
+    configurePromptAttachment,
+    createAttachmentChannelProjections,
+    createPromptProjectionBox,
+    createPromptDocumentEditor,
+    createScopeChipRow,
+    installPromptContextMenu,
+    normalizePromptAttachments,
+    normalizePromptDocument,
+    promptAttachmentAnchoredChannels,
+    propagateLinkedPromptAttachment,
+    promptDocumentText,
+    resolveReferenceAttachmentIdentity,
+    retargetChannelDocuments,
+    sceneWithDraftGlobal,
+    sceneWithDraftSection,
+    setPromptAttachmentCapabilityEnabled,
+} from "./prompt_context_chips.js";
+import { resolvePromptCandidateSelection } from "./prompt_context_diagnostics.js";
+import { openContextMenu } from "./editor_context_menu.js";
 import { mountChannelTemplateEditor } from "./editor_channel_template_editor.js";
 import { evalNumericExpression } from "./editor_numeric_input.js";
 import * as TimelineCanvas from "./editor_timeline_canvas.js";
@@ -280,6 +299,7 @@ import {
     FONT,
     LANE_PALETTE,
     applyNativeControlTheme,
+    chromeSelectCss,
     lightenColor,
     scaleColor,
 } from "./editor_theme.js";
@@ -632,10 +652,13 @@ export class EditorWidget {
         // Asset state
         this.assets = { video: [], image: [], audio: [], artifact: [] };
         this._references = [];
+        this._promptContextProfiles = [];
+        this._promptSemanticUnits = [];
         this._referenceTagPresets = [];
         this._referenceRecipePresets = [];
         this._customReferenceRecipes = [];
         this._referenceRecipeFieldSchema = [];
+        this._promptContextCatalog = {};
         this._referencesLoaded = false;
         this._referencesDirty = false;
         this._referencesLoading = false;
@@ -908,6 +931,9 @@ export class EditorWidget {
         this._updateToolbar();
         this._renderTimeline();
         this._renderQueuePanel();
+        if (this._promptContextConsumersMounted()) {
+            this._previewPromptContextCandidate({}, 0);
+        }
     }
 
     _flushDeferredDragState(commitPromise = null) {
@@ -926,6 +952,7 @@ export class EditorWidget {
             if (pendingScenesRefresh) {
                 this._fetchScenes({ reason: "deferred_drag_replay" });
             }
+            this._replayDeferredProjectBackedRefresh();
         };
 
         if (commitPromise && typeof commitPromise.then === "function") {
@@ -968,6 +995,9 @@ export class EditorWidget {
                 kind,
                 mutation_depth: this._timelineMutationDepth,
             });
+            if (this._timelineMutationDepth === 0) {
+                this._replayDeferredProjectBackedRefresh();
+            }
         }
     }
 
@@ -1309,6 +1339,10 @@ export class EditorWidget {
             : null;
 
         if (!isSameScene) {
+            this._promptContextCandidateCache = null;
+            this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
+            if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
+            this._promptContextPreviewTimer = null;
             this._selectionDraftAnchor = null;
             this._animaticMode = false;
             this._stopPlayback();
@@ -1374,6 +1408,9 @@ export class EditorWidget {
         this._renderViewportFrame();
         this._updateToolbar();
         this._assetGallery?.refreshCurrentScene?.();
+        if (this._promptContextConsumersMounted()) {
+            this._previewPromptContextCandidate({}, 0);
+        }
     }
 
     _refreshDurationInput() {
@@ -1772,9 +1809,56 @@ export class EditorWidget {
             recipePresets: this._referenceRecipePresets,
             customRecipes: this._customReferenceRecipes,
             assets: this._allProjectAssetsForGallery(),
+            scenes: this.scenes || [],
+            semanticUnits: this._promptSemanticUnits || [],
             loading: this._referencesLoading,
             error: this._referencesError,
         };
+    }
+
+    async _savePromptContextProfiles(profiles) {
+        if (!this.projectDir) return null;
+        const before = this._captureProjectDependencies();
+        const dirName = this._projectDirName();
+        const { payload } = await fetchProjectJson(
+            api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
+            { method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt_context_profiles: profiles }) },
+            { projectId: dirName },
+        );
+        this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
+            ? payload.prompt_context_profiles : [];
+        this._pushProjectDependencyUndo("edit prompt formats", before);
+        await this._fetchReferences({ ignoreMutationGate: true,
+            reason: "prompt_context_profiles", force: true });
+        return this._promptContextProfiles;
+    }
+
+    _promptContextWritingAids(profileKey = "") {
+        const key = String(profileKey || this.activeScene?.prompt_context_profile_id
+            || this._channelTemplate?.()?.default_context_profile || "generic@1");
+        const custom = (this._promptContextProfiles || []).find((value) =>
+            `${value.profile_id}@${value.version || "1"}` === key);
+        return custom?.writing_aids
+            || this._promptContextCatalog?.writing_aids?.[key] || [];
+    }
+
+    async _savePromptSemanticUnits(units) {
+        if (!this.projectDir) return null;
+        const before = this._captureProjectDependencies();
+        const dirName = this._projectDirName();
+        const { payload } = await fetchProjectJson(
+            api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
+            { method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt_semantic_units: units }) },
+            { projectId: dirName },
+        );
+        this._promptSemanticUnits = Array.isArray(payload?.prompt_semantic_units)
+            ? payload.prompt_semantic_units : [];
+        this._pushProjectDependencyUndo("edit prompt Subjects", before);
+        await this._fetchReferences({ ignoreMutationGate: true,
+            reason: "prompt_semantic_units", force: true });
+        return this._promptSemanticUnits;
     }
 
     _applyReferencePayload(payload, { projectDir = this.projectDir, requestSeq = this._referenceFetchSeq } = {}) {
@@ -1788,14 +1872,42 @@ export class EditorWidget {
         this._referenceTagPresets = Array.isArray(payload?.tag_presets) ? payload.tag_presets : [];
         this._referenceRecipePresets = Array.isArray(payload?.recipe_presets) ? payload.recipe_presets : [];
         this._customReferenceRecipes = Array.isArray(payload?.reference_recipes) ? payload.reference_recipes : [];
+        this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
+            ? payload.prompt_context_profiles : [];
+        this._promptSemanticUnits = Array.isArray(payload?.prompt_semantic_units)
+            ? payload.prompt_semantic_units : [];
         this._referenceRecipeFieldSchema = Array.isArray(payload?.recipe_field_schema) ? payload.recipe_field_schema : [];
+        this._promptContextCatalog = payload?.prompt_context_catalog
+            && typeof payload.prompt_context_catalog === "object"
+            ? payload.prompt_context_catalog : {};
         this._referencesLoaded = true;
         this._referencesDirty = false;
         this._referencesLoading = false;
         this._referencesError = "";
         this._referenceLibraryHandle?.render?.();
         this._referencePanelHandle?.refresh?.();
+        this._refreshPromptContextDependencyConsumers();
         return true;
+    }
+
+    _promptContextConsumersMounted() {
+        return !!(this._promptPanelHandle?.isMounted?.()
+            || this._promptEditorEl || this._refreshInlinePromptProjections);
+    }
+
+    _refreshPromptContextDependencyConsumers({ ignoreGates = false } = {}) {
+        if (!ignoreGates && (this._hasPendingProjectMutations()
+                || this.isDragging || this._timelineMutationDepth > 0)) {
+            this._deferProjectBackedRefresh(
+                ["prompt_context"], "prompt_context_dependency");
+            return;
+        }
+        this._promptPanelHandle?.refresh?.();
+        this._refreshInlinePromptProjections?.();
+        this._renderTimeline();
+        if (this._promptContextConsumersMounted()) {
+            this._previewPromptContextCandidate({}, 0);
+        }
     }
 
     async _fetchReferences({ ignoreMutationGate = false, reason = "references", force = false } = {}) {
@@ -2473,6 +2585,12 @@ export class EditorWidget {
             this._projectMutationQueue?.drain?.("deferred_replay_rearm").then(() => this._replayDeferredProjectBackedRefresh());
             return;
         }
+        if (this.isDragging || this._timelineMutationDepth > 0) {
+            // Gesture-owned state is not safe to repaint. Keep the keys queued;
+            // mouse-up and the outermost timeline mutation replay them.
+            this._pendingProjectRefreshDrain = false;
+            return;
+        }
         const keys = this._pendingProjectRefreshKeys;
         this._pendingProjectRefreshKeys = null;
         this._pendingProjectRefreshDrain = false;
@@ -2484,6 +2602,7 @@ export class EditorWidget {
         const wantsScenes = keys.has("scenes");
         const wantsQueue = keys.has("queue");
         const wantsReferences = keys.has("references");
+        const wantsPromptContext = keys.has("prompt_context");
         if (wantsAssets && wantsScenes) {
             this._fetchAssets({ ignoreMutationGate: true }).then(() => {
                 if (!this._destroyed) {
@@ -2507,6 +2626,9 @@ export class EditorWidget {
             } else {
                 this._referencesDirty = true;
             }
+        }
+        if (wantsPromptContext) {
+            this._refreshPromptContextDependencyConsumers({ ignoreGates: true });
         }
     }
 
@@ -2541,6 +2663,7 @@ export class EditorWidget {
         failureMessage = null,
         failureDetail = null,
         failureTier = "error",
+        retryOnConflict = true,
         invalidateQueueFetch = false,
     }) {
         // Invalidate any in-flight scenes GET when a mutation is enqueued.
@@ -2603,6 +2726,8 @@ export class EditorWidget {
         failureMessage = null,
         failureDetail = null,
         failureTier = "error",
+        retryOnConflict = true,
+        expectedModifiedAt = "",
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -2631,10 +2756,13 @@ export class EditorWidget {
                     `/sonder-editor/project/${encodeURIComponent(queuedIntent.projectId)}/scenes/${encodeURIComponent(queuedIntent.sceneId)}/mutations`,
                     {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
+                        headers: { "Content-Type": "application/json",
+                            ...(expectedModifiedAt
+                                ? { "If-Match": expectedModifiedAt } : {}) },
                         body: JSON.stringify({ operations: queuedIntent.operations }),
                     },
-                    { projectId: queuedIntent.projectId }
+                    { projectId: queuedIntent.projectId,
+                        retryOnConflict, maxAttempts: retryOnConflict ? 2 : 1 }
                 );
             },
         });
@@ -3004,6 +3132,8 @@ export class EditorWidget {
             start_frame: parseInt(fields.start_frame, 10) || 0,
             end_frame: parseInt(fields.end_frame, 10) || 0,
             channels,
+            channel_docs: structuredClone(fields.channel_docs || {}),
+            attachments: normalizePromptAttachments(fields.attachments),
             // Label-free composed mirror, matching backend to_dict. Deliberately
             // template-LESS: PromptSection.prompt has no project metadata to
             // consult, so the mirror stays on the legacy three channels and the
@@ -3012,7 +3142,6 @@ export class EditorWidget {
             muted: !!fields.muted,
             starts_new_shot: !!fields.starts_new_shot,
             shot_timestamp: fields.shot_timestamp === true,
-            subject_ids: normalizeSubjectIds(fields.subject_ids),
             global_channel_exceptions: normalizeChannelExceptions(
                 fields.global_channel_exceptions),
         };
@@ -4204,6 +4333,9 @@ export class EditorWidget {
         this._updateToolbar();
         // Context frames widen the highlight window (selection + context).
         this._refreshPromptUsageHighlight();
+        if (this._promptContextConsumersMounted()) {
+            this._previewPromptContextCandidate({}, 0);
+        }
         this._renderTimeline();
         this._updateGenReadout();
     }
@@ -4399,6 +4531,9 @@ export class EditorWidget {
         if (persist) this._persistActiveTimelineSelection();
         this._refreshSelectionInputs();
         this._refreshPromptUsageHighlight();
+        if (this._promptContextConsumersMounted()) {
+            this._previewPromptContextCandidate({}, 0);
+        }
         if (render) {
             this._renderTimeline();
             this._updateToolbar();
@@ -4591,7 +4726,10 @@ export class EditorWidget {
     }
 
     _defaultReferenceLaneRecipe(overrides = {}) {
-        return { media_kind: "image", recipe_id: "", recipe: {}, ...overrides };
+        const laneId = String(overrides?.lane_id || "").trim()
+            || globalThis.crypto?.randomUUID?.().replaceAll("-", "")
+            || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+        return { media_kind: "image", recipe_id: "", recipe: {}, ...overrides, lane_id: laneId };
     }
 
     // media_kind is a hard lane property: a staging drop may adopt a kind only
@@ -9344,15 +9482,102 @@ export class EditorWidget {
 
     /** `keys` narrows the template's channels — the global bar uses it so a
      *  template with per-channel globals off renders one box, not n. */
-    _buildChannelInputs(initialChannels, onEnter, onEscape, { keys: keyOverride = null } = {}) {
+    _buildChannelInputs(initialChannels, onEnter, onEscape, {
+        keys: keyOverride = null,
+        documents: initialDocuments = null,
+        attachments: initialAttachments = [],
+        previews = {},
+        consumerSection = null,
+        globalScope = false,
+    } = {}) {
         const template = this._channelTemplate();
         const keys = keyOverride || templateChannelKeys(template);
         const channels = normalizeChannels(initialChannels, "", keys);
         const wrap = document.createElement("div");
-        // Wraps so a six-field template stays usable in the inline bar instead
-        // of squeezing every field below a readable width.
-        wrap.style.cssText = "display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; align-items: flex-start;";
+        wrap.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;flex:1;min-width:0;align-items:flex-start;max-height:min(42vh,420px);overflow-y:auto;";
         const inputs = {};
+        const columns = {};
+        const projectionHosts = {};
+        let sharedAttachments = normalizePromptAttachments(initialAttachments);
+        const draftSceneSnapshot = () => {
+            const draftChannels = Object.fromEntries(keys.map((key) => [
+                key, inputs[key] ? inputs[key].value.trim() : (channels[key] || ""),
+            ]));
+            const draftDocuments = Object.fromEntries(keys.map((key) => [
+                key, inputs[key]?.promptDocument
+                    || normalizePromptDocument(initialDocuments?.[key], channels[key] || ""),
+            ]));
+            if (globalScope) {
+                return sceneWithDraftGlobal(this.activeScene, {
+                    attachments: sharedAttachments,
+                    channelDocs: draftDocuments,
+                    channels: draftChannels,
+                });
+            }
+            return sceneWithDraftSection(this.activeScene, {
+                promptId: consumerSection?.prompt_id || "",
+                startFrame: consumerSection?.start_frame ?? 0,
+                endFrame: consumerSection?.end_frame
+                    ?? this.activeScene?.duration_frames ?? 1,
+                section: consumerSection,
+                attachments: sharedAttachments,
+                channelDocs: draftDocuments,
+                channels: draftChannels,
+            });
+        };
+        const allSceneAttachments = () => {
+            const snapshot = draftSceneSnapshot();
+            if (globalScope) {
+                return normalizePromptAttachments(snapshot.global_attachments);
+            }
+            return (snapshot.prompt_sections || [])
+                .flatMap((section) => normalizePromptAttachments(section.attachments));
+        };
+        const isLinkedAttachment = (attachment) => allSceneAttachments().filter((value) =>
+            value.emission_group_id === attachment.emission_group_id).length > 1;
+        const anchoredChannelsFor = (attachmentId) => promptAttachmentAnchoredChannels(
+            Object.fromEntries(Object.entries(inputs).map(([key, input]) =>
+                [key, input.promptDocument])), attachmentId);
+        const attachmentLabelFor = (attachment) => resolveReferenceAttachmentIdentity(attachment, {
+            scene: this.activeScene,
+            references: this._references || [],
+            semanticUnits: this._promptSemanticUnits || [],
+        });
+        const managedSpeakerSubjectIds = () => (
+            this._promptContextCandidateCache?._candidate_scene_id === this.activeSceneId
+                ? this._promptContextCandidateCache.managed_speaker_subject_ids || []
+                : []);
+        let scheduleCandidatePreview = () => {};
+        let composingChannel = "";
+        const storageKey = `sonder.prompt.channelView.v2.${template.id || template.name || "default"}`;
+        let remembered = "";
+        try { remembered = globalThis.localStorage?.getItem(storageKey) || ""; }
+        catch (_error) { remembered = ""; }
+        let activeKey = remembered === "__all__" || keys.includes(remembered)
+            ? remembered : "__all__";
+        const toolbar = document.createElement("div");
+        toolbar.style.cssText = "display:flex;align-items:center;gap:6px;flex:1 0 100%;min-width:0;";
+        const channelCaption = document.createElement("span");
+        channelCaption.textContent = "Channel";
+        channelCaption.style.cssText = `font-size:10px;color:${COLORS.textMuted};`;
+        const channelSelect = document.createElement("select");
+        channelSelect.style.cssText = chromeSelectCss({ padding: "2px 5px", fontSize: "10px" });
+        const allOption = document.createElement("option");
+        allOption.value = "__all__";
+        allOption.textContent = "All channels";
+        channelSelect.appendChild(allOption);
+        for (const key of keys) {
+            const entry = (template.channels || []).find((value) => value.key === key) || { key, label: key };
+            const option = document.createElement("option");
+            option.value = key;
+            option.textContent = String(entry.label || key).replace(/^\[|\]:?$|:$/g, "");
+            channelSelect.appendChild(option);
+        }
+        channelSelect.value = activeKey;
+        const hiddenSummary = document.createElement("span");
+        hiddenSummary.style.cssText = `font-size:9px;color:${COLORS.textDim};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
+        toolbar.append(channelCaption, channelSelect, hiddenSummary);
+        wrap.appendChild(toolbar);
         // The channel carrying shot markers is the body field and gets the room;
         // with no marker channel the first channel does, which is `visual` for
         // the default template.
@@ -9361,16 +9586,310 @@ export class EditorWidget {
             : keys[0];
         for (const key of keys) {
             const entry = (template.channels || []).find((c) => c.key === key) || { key };
-            const input = this._makePromptTextarea({
-                value: channels[key] || "",
-                placeholder: this._channelPlaceholder(key),
-                title: entry.description || `${this._channelPlaceholder(key).slice(0, -1)} channel`,
-                flex: key === wideKey ? 2 : 1,
-            }, onEnter, onEscape);
-            input.style.minWidth = keys.length > 3 ? "140px" : "40px";
+            const column = document.createElement("div");
+            column.style.cssText = "display:none;flex-direction:column;gap:3px;flex:1 1 220px;min-width:220px;";
+            const activeName = document.createElement("div");
+            activeName.textContent = String(entry.label || key).replace(/:$/, "");
+            activeName.style.cssText = `font-size:10px;font-weight:600;color:${COLORS.text};`;
+            const contextScene = {
+                ...(this.activeScene || {}),
+                _context_channel_keys: keys,
+                _context_consumer_start: consumerSection?.start_frame ?? Infinity,
+                _context_consumer_end: consumerSection?.end_frame
+                    ?? this.activeScene?.duration_frames ?? 0,
+                _context_reference_frame_threshold: this._referenceFrameThreshold || 0,
+            };
+            const configure = (attachment) => configurePromptAttachment(attachment, {
+                scene: contextScene,
+                references: this._references || [],
+                semanticUnits: this._promptSemanticUnits || [],
+                channelKey: key,
+                profileId: this.activeScene?.prompt_context_profile_id
+                    || template.default_context_profile || "generic@1",
+                templateId: template.id || "",
+                scope: consumerSection ? "section" : "global",
+                anchoredChannels: [key],
+                taskTypes: this._promptContextCatalog?.minimax_task_types || [],
+                managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
+                ordinalManifest: this._promptContextCandidateCache?._candidate_scene_id
+                    === this.activeSceneId
+                    ? (this._promptContextCandidateCache.ordinal_manifest || {}) : {},
+                candidate: this._promptContextCandidateCache?._candidate_scene_id
+                    === this.activeSceneId ? this._promptContextCandidateCache : null,
+            });
+            const input = createPromptDocumentEditor({
+                document: normalizePromptDocument(initialDocuments?.[key], channels[key] || ""),
+                attachments: sharedAttachments,
+                previews,
+                attachmentLabelFor,
+                attachmentContext: { scene: this.activeScene, template },
+                compact: true,
+                ariaLabel: entry.description || `${this._channelPlaceholder(key).slice(0, -1)} channel`,
+                onChange: ({ attachments, reason }) => {
+                    sharedAttachments = attachments;
+                    for (const sibling of Object.values(inputs)) {
+                        if (sibling === input) continue;
+                        if (reason === "attachment") {
+                            sibling.recordSharedAttachmentTransaction?.(sharedAttachments);
+                        } else {
+                            sibling.syncPromptAttachments?.(sharedAttachments);
+                        }
+                    }
+                    queueMicrotask(() => {
+                        updateHiddenSummary();
+                        renderScope();
+                        scheduleCandidatePreview();
+                    });
+                },
+                onActivateAttachment: async (attachment) => {
+                    const configured = await configure(attachment);
+                    if (configured) {
+                        if (consumerSection && isLinkedAttachment(attachment)) {
+                            await this._updateLinkedPromptAttachment(
+                                attachment.attachment_id, configured);
+                            return;
+                        }
+                        input.replaceAttachment(configured);
+                        await onEnter?.({ close: false });
+                    }
+                },
+            });
+            input.title = entry.description || `${this._channelPlaceholder(key).slice(0, -1)} channel`;
+            input.addEventListener("compositionstart", () => { composingChannel = key; });
+            input.addEventListener("compositionend", () => {
+                if (composingChannel === key) composingChannel = "";
+            });
+            input.addOwnedKeyHandler?.((e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    onEnter();
+                    return true;
+                } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    onEscape();
+                    return true;
+                }
+                return false;
+            });
             inputs[key] = input;
-            wrap.appendChild(input);
+            columns[key] = column;
+            installPromptContextMenu({
+                editor: input,
+                // Global scope offers the same kinds as the Structured tool.
+                // Shot/Timestamp/Prompt Link/Vocal Event are section-scoped and
+                // the compiler rejects them globally, so offering them here only
+                // produced a chip that blocks the job.
+                allowedKinds: globalScope
+                    ? ["reference", "guide", "custom"]
+                    : undefined,
+                onCreate: configure,
+                onInserted: async () => { await onEnter?.({ close: false }); },
+                writingAids: this._promptContextWritingAids(
+                    this.activeScene?.prompt_context_profile_id
+                        || template.default_context_profile || "generic@1"),
+            });
+            const beforeProjectionHost = document.createElement("div");
+            const afterProjectionHost = document.createElement("div");
+            projectionHosts[key] = {
+                beforeHost: beforeProjectionHost,
+                afterHost: afterProjectionHost,
+            };
+            column.append(activeName, createPromptProjectionBox(
+                input, beforeProjectionHost, afterProjectionHost));
+            if (key === keys[0] && !this._settings?.prompts?.contextMenuHintDismissed) {
+                const hint = document.createElement("div");
+                hint.style.cssText = `display:flex;gap:6px;align-items:center;font-size:9px;color:${COLORS.textDim};`;
+                const hintText = document.createElement("span");
+                hintText.textContent = "Right-click a prompt box, or press Shift+F10, to insert Context and Writing aids.";
+                const dismiss = this._makeBtn("Got it", "Dismiss this prompt-authoring hint");
+                dismiss.addEventListener("mousedown", (event) => event.preventDefault());
+                dismiss.addEventListener("click", () => {
+                    this._updateSettings({ prompts: { contextMenuHintDismissed: true } });
+                    hint.remove();
+                });
+                hint.append(hintText, dismiss);
+                column.appendChild(hint);
+            }
+            wrap.appendChild(column);
         }
+        const renderChannelProjections = (candidate = this._promptContextCandidateCache) => {
+            if (candidate?._candidate_scene_id !== this.activeSceneId) candidate = null;
+            for (const key of keys) {
+                const next = createAttachmentChannelProjections({
+                    channelKey: key,
+                    attachments: sharedAttachments,
+                    candidate,
+                    attachmentLabelFor,
+                    onActivate: async (attachment) => {
+                        const configured = await configurePromptAttachment(attachment, {
+                            scene: { ...(this.activeScene || {}), _context_channel_keys: keys,
+                                _context_consumer_start: consumerSection?.start_frame ?? Infinity,
+                                _context_consumer_end: consumerSection?.end_frame
+                                    ?? this.activeScene?.duration_frames ?? 0,
+                                _context_reference_frame_threshold: this._referenceFrameThreshold || 0 },
+                            references: this._references || [], semanticUnits: this._promptSemanticUnits || [],
+                            channelKey: key,
+                            profileId: this.activeScene?.prompt_context_profile_id
+                                || template.default_context_profile || "generic@1",
+                            templateId: template.id || "",
+                            scope: consumerSection ? "section" : "global",
+                            anchoredChannels: anchoredChannelsFor(
+                                attachment.attachment_id),
+                            taskTypes: this._promptContextCatalog?.minimax_task_types || [],
+                            managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
+                            ordinalManifest: candidate?.ordinal_manifest || {},
+                            candidate,
+                        });
+                        if (!configured) return;
+                        if (consumerSection && isLinkedAttachment(attachment)) {
+                            await this._updateLinkedPromptAttachment(
+                                attachment.attachment_id, configured);
+                            return;
+                        }
+                        inputs[key].replaceAttachment(configured);
+                        await onEnter?.({ close: false });
+                    },
+                    onSetCapabilityEnabled: async (attachment, projection, enabled) => {
+                        inputs[key].replaceAttachment(setPromptAttachmentCapabilityEnabled(
+                            attachment, projection, enabled));
+                        await onEnter?.({ close: false });
+                    },
+                    onLinkedSuppressionWarning: ({ linkedCount }) => {
+                        notifyWarning(
+                            `Suppressed here; ${linkedCount} linked chip${linkedCount === 1 ? " can" : "s can"} still emit. Suppress there too, or Unlink first.`,
+                            { source: "prompt-linked-suppression" });
+                    },
+                });
+                projectionHosts[key].beforeHost.replaceWith(next.beforeHost);
+                projectionHosts[key].afterHost.replaceWith(next.afterHost);
+                projectionHosts[key] = next;
+            }
+        };
+        this._refreshInlinePromptProjections = renderChannelProjections;
+        renderChannelProjections();
+        const updateHiddenSummary = () => {
+            if (activeKey === "__all__") {
+                hiddenSummary.textContent = "";
+                hiddenSummary.title = "";
+                return;
+            }
+            const populated = keys.filter((key) => key !== activeKey && inputs[key]?.value.trim());
+            hiddenSummary.textContent = populated.length
+                ? `${populated.length} hidden with text: ${populated.map((key) => {
+                    const entry = (template.channels || []).find((value) => value.key === key) || { label: key };
+                    return `${String(entry.label || key).replace(/:$/, "")} (${inputs[key].value.trim().length})`;
+                }).join(", ")}`
+                : "Other channels empty";
+            hiddenSummary.title = hiddenSummary.textContent;
+        };
+        const activateChannel = (key, { focus = false } = {}) => {
+            if (key !== "__all__" && !keys.includes(key)) return;
+            activeKey = key;
+            channelSelect.value = key;
+            const showAll = key === "__all__";
+            for (const value of keys) {
+                columns[value].style.display = showAll || value === key ? "flex" : "none";
+                columns[value].style.flex = showAll ? "1 1 220px" : "1 0 100%";
+                columns[value].style.minWidth = showAll ? "220px" : "80px";
+            }
+            try { globalThis.localStorage?.setItem(storageKey, key); } catch (_error) { /* local preference only */ }
+            updateHiddenSummary();
+            if (focus) inputs[key]?.focus();
+        };
+        channelSelect.addEventListener("change", () => {
+            if (composingChannel) {
+                channelSelect.value = activeKey;
+                notifyWarning("Finish composing text before switching prompt channels.", {
+                    source: "prompt-channel-ime",
+                });
+                return;
+            }
+            activateChannel(channelSelect.value, { focus: true });
+        });
+        activateChannel(activeKey);
+        const scopeHost = document.createElement("div");
+        scopeHost.style.cssText = "flex:1 0 100%;min-width:0;";
+        const configureScope = (attachment) => configurePromptAttachment(attachment, {
+            scene: { ...(this.activeScene || {}), _context_channel_keys: keys,
+                _context_consumer_start: consumerSection?.start_frame ?? Infinity,
+                _context_consumer_end: consumerSection?.end_frame
+                    ?? this.activeScene?.duration_frames ?? 0,
+                _context_reference_frame_threshold: this._referenceFrameThreshold || 0 },
+            references: this._references || [],
+            semanticUnits: this._promptSemanticUnits || [],
+            channelKey: wideKey,
+            profileId: this.activeScene?.prompt_context_profile_id
+                || template.default_context_profile || "generic@1",
+            templateId: template.id || "",
+            scope: consumerSection ? "section" : "global",
+            anchoredChannels: [],
+            taskTypes: this._promptContextCatalog?.minimax_task_types || [],
+            managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
+            ordinalManifest: this._promptContextCandidateCache?._candidate_scene_id
+                === this.activeSceneId
+                ? (this._promptContextCandidateCache.ordinal_manifest || {}) : {},
+            candidate: this._promptContextCandidateCache?._candidate_scene_id
+                === this.activeSceneId ? this._promptContextCandidateCache : null,
+        });
+        const anchoredIds = () => new Set(Object.values(inputs)
+            .flatMap((input) => input.promptDocument?.nodes || [])
+            .filter((node) => node.type === "attachment")
+            .map((node) => node.attachment_id));
+        const renderScope = () => {
+            const anchored = anchoredIds();
+            scopeHost.replaceChildren(createScopeChipRow({
+                attachments: sharedAttachments.filter((value) => !anchored.has(value.attachment_id)),
+                previews,
+                attachmentLabelFor,
+                allowedKinds: globalScope
+                    ? ["reference", "guide", "custom"]
+                    : (template.shot_marker_channel
+                        ? ["shot", "timestamp", "reference", "custom"]
+                        : ["reference", "custom"]),
+                reusableAttachments: globalScope ? [] : allSceneAttachments(),
+                allSceneAttachments: allSceneAttachments(),
+                reuseContext: { scene: draftSceneSnapshot(), template },
+                onReuse: globalScope ? null : async (configured) => {
+                    inputs[keys.includes(activeKey) ? activeKey : wideKey]
+                        ?.transactPromptAttachments?.([...sharedAttachments, configured]);
+                    await onEnter?.({ close: false });
+                },
+                onAdd: async (kind) => {
+                    const configured = await configureScope({ kind });
+                    if (!configured) return;
+                    inputs[keys.includes(activeKey) ? activeKey : wideKey]?.transactPromptAttachments?.(
+                        [...sharedAttachments, configured]);
+                    await onEnter?.({ close: false });
+                },
+                onActivate: async (attachment) => {
+                    const configured = await configureScope(attachment);
+                    if (!configured) return;
+                    if (consumerSection && isLinkedAttachment(attachment)) {
+                        await this._updateLinkedPromptAttachment(
+                            attachment.attachment_id, configured);
+                        return;
+                    }
+                    inputs[keys.includes(activeKey) ? activeKey : wideKey]?.transactPromptAttachments?.(
+                        sharedAttachments.map((value) =>
+                            value.attachment_id === configured.attachment_id ? configured : value));
+                    await onEnter?.({ close: false });
+                },
+                onUnlink: globalScope ? null : async (configured) => {
+                    inputs[keys.includes(activeKey) ? activeKey : wideKey]?.transactPromptAttachments?.(
+                        sharedAttachments.map((value) =>
+                            value.attachment_id === configured.attachment_id ? configured : value));
+                    await onEnter?.({ close: false });
+                },
+                onRemove: (attachment) => {
+                    inputs[keys.includes(activeKey) ? activeKey : wideKey]?.transactPromptAttachments?.(
+                        sharedAttachments.filter((value) =>
+                            value.attachment_id !== attachment.attachment_id));
+                    void onEnter?.({ close: false });
+                },
+            }));
+        };
+        renderScope();
+        wrap.appendChild(scopeHost);
         const read = () => {
             const out = {};
             for (const key of keys) {
@@ -9381,8 +9900,27 @@ export class EditorWidget {
         // Named rather than reached for by key: the first channel is `visual`
         // only under the default template, and a hard-coded key throws on every
         // named-field template that does not happen to define it.
-        const focusFirst = () => { inputs[keys[0]]?.focus(); };
-        return { wrap, inputs, read, keys, template, focusFirst };
+        const focusFirst = () => { inputs[keys.includes(activeKey) ? activeKey : keys[0]]?.focus(); };
+        const readDocuments = () => Object.fromEntries(
+            keys.map((key) => [key, inputs[key].promptDocument]));
+        const readAttachments = () => normalizePromptAttachments(sharedAttachments);
+        scheduleCandidatePreview = () => {
+            const snapshot = draftSceneSnapshot();
+            if (globalScope) {
+                this._previewPromptContextCandidate({
+                    global_channels: snapshot.global_channels,
+                    global_channel_docs: snapshot.global_channel_docs,
+                    global_attachments: snapshot.global_attachments,
+                });
+                return;
+            }
+            this._previewPromptContextCandidate({
+                prompt_sections: snapshot.prompt_sections,
+            });
+        };
+        scheduleCandidatePreview();
+        return { wrap, inputs, read, readDocuments, readAttachments,
+            keys, template, focusFirst };
     }
 
     _showPromptCreator(startFrame, endFrame) {
@@ -9405,18 +9943,34 @@ export class EditorWidget {
         // save-then-hide flush from creating a second copy.
         let created = false;
         let discard = false;
-        const commit = () => {
+        const commit = ({ close = true } = {}) => {
             // Teardown fires a final focusout; only the mounted bar may write,
             // so Cancel and Esc cannot be reversed by their own removal.
             if (this._promptEditorEl !== editor) return;
             if (created || discard) return;
+            // Context-chip transactions update the in-memory draft and candidate
+            // preview, but a new section does not exist durably until Create,
+            // Enter, or focus loss explicitly commits the bar.
+            if (!close) return;
             const channels = channelInputs.read();
-            if (hasChannelText(channels, this._channelTemplate())) {
+            const attachments = channelInputs.readAttachments();
+            const documents = channelInputs.readDocuments();
+            const hasAnchors = Object.values(documents).some((documentValue) =>
+                (documentValue?.nodes || []).some((node) => node?.type === "attachment"));
+            if (hasChannelText(channels, this._channelTemplate())
+                    || attachments.length > 0 || hasAnchors) {
                 created = true;
-                this._saveNewPromptSection(startFrame, endFrame, channels);
+                this._saveNewPromptSection(
+                    startFrame, endFrame, channels,
+                    documents, attachments);
             }
         };
-        const channelInputs = this._buildChannelInputs(null, commit, () => this._hidePromptEditor({ commit: false }));
+        const channelInputs = this._buildChannelInputs(
+            null,
+            commit,
+            () => this._hidePromptEditor({ commit: false }),
+            { consumerSection: { start_frame: startFrame, end_frame: endFrame } },
+        );
 
         const createBtn = this._makeBtn("Create", "Create prompt section");
         setButtonVariant(createBtn, "primary");
@@ -9436,6 +9990,7 @@ export class EditorWidget {
         editor.addEventListener("focusin", () => { discard = false; });
         editor.addEventListener("focusout", (e) => {
             if (e.relatedTarget && editor.contains(e.relatedTarget)) return;
+            if (e.relatedTarget?.closest?.("[data-sonder-prompt-context-modal='1'],[data-sonder-prompt-context-menu='1']")) return;
             commit();
         });
 
@@ -9449,7 +10004,7 @@ export class EditorWidget {
         setTimeout(() => channelInputs.focusFirst(), 50);
     }
 
-    async _saveNewPromptSection(startFrame, endFrame, channels) {
+    async _saveNewPromptSection(startFrame, endFrame, channels, channelDocs = {}, attachments = []) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked()) return;
         const undoLabel = "add prompt";
@@ -9458,6 +10013,8 @@ export class EditorWidget {
             start_frame: startFrame,
             end_frame: endFrame,
             channels: normalizeChannels(channels),
+            channel_docs: channelDocs,
+            attachments,
             muted: false,
         };
         this._pushUndo(undoLabel);
@@ -9501,15 +10058,27 @@ export class EditorWidget {
         // through here, so the comparison is what keeps repeated focus changes
         // from stacking no-op mutations and undo entries.
         let committed = normalizeChannels(section.channels, section.prompt, this._channelKeys());
+        let committedDocuments = JSON.stringify(section.channel_docs || {});
+        let committedAttachments = JSON.stringify(section.attachments || []);
         let discard = false;
         const commit = ({ close = true } = {}) => {
             // Teardown fires a final focusout; only the mounted bar may write,
             // so Esc and Delete cannot be reversed by their own removal.
             if (this._promptEditorEl !== editor) return;
             const next = channelInputs.read();
-            if (Object.keys(next).some((key) => next[key] !== (committed[key] ?? ""))) {
+            const nextDocuments = channelInputs.readDocuments();
+            const nextAttachments = channelInputs.readAttachments();
+            const documentsChanged = JSON.stringify(nextDocuments) !== committedDocuments;
+            const attachmentsChanged = JSON.stringify(nextAttachments) !== committedAttachments;
+            if (documentsChanged || attachmentsChanged
+                || Object.keys(next).some((key) => next[key] !== (committed[key] ?? ""))) {
                 committed = next;
-                this._updatePromptSection(idx, { channels: next });
+                committedDocuments = JSON.stringify(nextDocuments);
+                committedAttachments = JSON.stringify(nextAttachments);
+                this._updatePromptSection(idx, {
+                    channels: next, channel_docs: nextDocuments,
+                    attachments: nextAttachments,
+                });
                 // The mutation clears the lane highlight; an open bar should
                 // keep pointing at the section its Save/Delete still target.
                 if (!close) {
@@ -9526,6 +10095,13 @@ export class EditorWidget {
                 this._hidePromptEditor({ commit: false });
                 this._selectedPromptIdx = null;
                 this._renderTimeline();
+            },
+            {
+                documents: section.channel_docs || {},
+                attachments: section.attachments || [],
+                previews: this._promptContextCandidateCache?._candidate_scene_id === this.activeSceneId
+                    ? this._promptContextCandidateCache.attachment_previews || {} : {},
+                consumerSection: section,
             }
         );
 
@@ -9536,6 +10112,8 @@ export class EditorWidget {
 
         const deleteBtn = this._makeBtn("Delete", "Delete this prompt section");
         setButtonVariant(deleteBtn, "danger");
+        deleteBtn.textContent = "✕";
+        deleteBtn.style.cssText += "min-width:22px;min-height:22px;padding:1px 5px;font-size:10px;font-weight:500;";
         deleteBtn.dataset.sonderHoverVariant = "danger";
         // Arm before the textarea's focusout: deleting must not first write
         // the edit it is about to discard (see the Cancel note in the creator).
@@ -9552,6 +10130,7 @@ export class EditorWidget {
         editor.addEventListener("focusout", (e) => {
             if (discard) return;
             if (e.relatedTarget && editor.contains(e.relatedTarget)) return;
+            if (e.relatedTarget?.closest?.("[data-sonder-prompt-context-modal='1'],[data-sonder-prompt-context-menu='1']")) return;
             // Keep the bar open: it still owns Save/Delete, and the close paths
             // (clicking the timeline, switching scenes) flush through the hook.
             commit({ close: false });
@@ -9597,24 +10176,40 @@ export class EditorWidget {
         const keys = this._globalChannelKeys();
         let committed = normalizeChannels(
             this.activeScene.global_channels, this.activeScene.prompt, keys);
+        let committedDocuments = JSON.stringify(this.activeScene.global_channel_docs || {});
+        let committedAttachments = JSON.stringify(this.activeScene.global_attachments || []);
         let suppressBlurCommit = false;
         const commit = () => {
             if (suppressBlurCommit) return;
             if (this._promptEditorEl !== editor) return;
             const next = channelInputs.read();
-            if (Object.keys(next).every((key) => next[key] === (committed[key] ?? ""))) return;
+            const nextDocuments = channelInputs.readDocuments();
+            const nextAttachments = channelInputs.readAttachments();
+            if (Object.keys(next).every((key) => next[key] === (committed[key] ?? ""))
+                && JSON.stringify(nextDocuments) === committedDocuments
+                && JSON.stringify(nextAttachments) === committedAttachments) return;
             committed = next;
-            this._updateSceneGlobalChannels(next);
+            committedDocuments = JSON.stringify(nextDocuments);
+            committedAttachments = JSON.stringify(nextAttachments);
+            this._updateSceneGlobalContext(next, nextDocuments, nextAttachments);
         };
-        const channelInputs = this._buildChannelInputs(committed, () => {
+        const channelInputs = this._buildChannelInputs(committed, ({ close = true } = {}) => {
             commit();
-            this._hidePromptEditor();
+            if (close) this._hidePromptEditor();
         }, () => {
             suppressBlurCommit = true;
             this._hidePromptEditor({ commit: false });
-        }, { keys });
+        }, {
+            keys,
+            documents: this.activeScene.global_channel_docs || {},
+            attachments: this.activeScene.global_attachments || [],
+            previews: this._promptContextCandidateCache?._candidate_scene_id === this.activeSceneId
+                ? this._promptContextCandidateCache.attachment_previews || {} : {},
+            globalScope: true,
+        });
         editor.addEventListener("focusout", (e) => {
             if (e.relatedTarget && editor.contains(e.relatedTarget)) return;
+            if (e.relatedTarget?.closest?.("[data-sonder-prompt-context-modal='1'],[data-sonder-prompt-context-menu='1']")) return;
             commit();
             // Blur from clicking elsewhere closes the bar; the hide itself
             // re-triggers no commit because the element is already detached
@@ -9668,6 +10263,41 @@ export class EditorWidget {
                 sceneRef.prompt = composeSectionText(previous, false);
             }
             notifyWarning(e?.message || "Global prompt edit was refused.", { source: "prompt-global-refused" });
+            this._renderTimeline();
+        }
+    }
+
+    async _updateSceneGlobalContext(channels, channelDocs, attachments) {
+        if (!this.activeScene || !this.projectDir || this._isGlobalPromptTrackLocked()) return;
+        const sceneRef = this.activeScene;
+        const previous = {
+            global_channels: structuredClone(sceneRef.global_channels || {}),
+            global_channel_docs: structuredClone(sceneRef.global_channel_docs || {}),
+            global_attachments: structuredClone(sceneRef.global_attachments || []),
+        };
+        const next = normalizeChannels(channels);
+        const undoLabel = "edit global prompt context";
+        this._pushUndo(undoLabel);
+        sceneRef.global_channels = next;
+        sceneRef.global_channel_docs = structuredClone(channelDocs || {});
+        sceneRef.global_attachments = structuredClone(attachments || []);
+        sceneRef.prompt = composeSectionText(next, false);
+        this._renderSceneAfterLocalMutation({ viewport: false });
+        try {
+            await this._runSceneMutation(
+                [{ type: "update_scene_fields", fields: {
+                    global_channels: next,
+                    global_channel_docs: channelDocs,
+                    global_attachments: attachments,
+                } }],
+                { key: `scene:${this.activeSceneId}:global_prompt_context`,
+                    label: "global prompt context", coalesce: true,
+                    refreshScenes: false });
+        } catch (error) {
+            this._discardLastUndo(undoLabel);
+            Object.assign(sceneRef, previous);
+            notifyWarning(error?.message || "Global Context edit was refused.",
+                { source: "prompt-global-context-refused" });
             this._renderTimeline();
         }
     }
@@ -9729,11 +10359,16 @@ export class EditorWidget {
 
     /** Open (or refresh) the Prompt Management panel. */
     _showPromptManagementPanel() {
+        this._fetchReferences({ force: true, reason: "prompt_context" })
+            .then(() => this._promptPanelHandle?.refresh?.())
+            .catch(() => {});
         if (this._promptPanelHandle?.isMounted?.()) {
             this._promptPanelHandle.refresh();
+            this._previewPromptContextCandidate({}, 0);
             return;
         }
         this._promptPanelHandle = mountPromptManagementPanel(this);
+        this._previewPromptContextCandidate({}, 0);
     }
 
     /** How much authored text a template switch would strand: the channels the
@@ -10102,6 +10737,93 @@ export class EditorWidget {
         }
     }
 
+    /** Debounced, non-mutating preview over the exact structured candidate the
+     *  user is editing. Enqueue invokes the same backend compiler again and
+     *  freezes that result; hover merely reads this versioned cache. */
+    _previewPromptContextCandidate(scenePatch = {}, delay = 180) {
+        const dirName = this._projectDirName();
+        const sceneId = this.activeSceneId;
+        if (!dirName || !sceneId || !this.activeScene) return;
+        if (this._promptContextPreviewTimer) clearTimeout(this._promptContextPreviewTimer);
+        const token = (this._promptContextPreviewToken || 0) + 1;
+        this._promptContextPreviewToken = token;
+        const candidate = { ...structuredClone(this.activeScene),
+            ...structuredClone(scenePatch || {}) };
+        const range = this._selectionContextRange?.();
+        const windowStart = Math.max(0, Math.round(range?.contextStart ?? 0));
+        const windowEnd = Math.max(windowStart + 1, Math.round(
+            range?.contextEnd ?? candidate.duration_frames ?? this.totalFrames ?? 1));
+        const candidateSelection = resolvePromptCandidateSelection(
+            this.selectionStart, this.selectionEnd,
+            candidate.duration_frames ?? this.totalFrames ?? 0);
+        if (this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
+            this._promptContextCandidateCache = {
+                ...this._promptContextCandidateCache,
+                _stale: true,
+            };
+            this._promptPanelHandle?.refreshDiagnostics?.(
+                this._promptContextCandidateCache);
+            this._refreshInlinePromptProjections?.(
+                this._promptContextCandidateCache);
+        }
+        this._promptContextPreviewTimer = setTimeout(async () => {
+            try {
+                const response = await fetch(api.apiURL(
+                    `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
+                ), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        base_modified_at: getProjectVersion(dirName),
+                        scene: candidate,
+                        channel_template: templateFreezeValue(this._channelTemplate()),
+                        window_start: windowStart,
+                        window_end: windowEnd,
+                        selection_start: candidateSelection.selectionStart,
+                        selection_end: candidateSelection.selectionEnd,
+                        pre_context_frames: this._contextFrameValue("pre_context_frames"),
+                        post_context_frames: this._contextFrameValue("post_context_frames"),
+                        mask_pre_offset: this._contextFrameValue("mask_pre_offset"),
+                        mask_post_offset: this._contextFrameValue("mask_post_offset"),
+                        frame_constraint: this._getActiveFrameConstraint(),
+                        fps: this._effectiveFps || 24,
+                    }),
+                });
+                const payload = await response.json().catch(() => null);
+                if (token !== this._promptContextPreviewToken || !payload) return;
+                const candidatePayload = response.ok ? payload : {
+                    errors: [{
+                        code: payload?.code || `preview_http_${response.status}`,
+                        message: payload?.error || "Prompt Context candidate preview failed.",
+                    }],
+                    warnings: [],
+                    attachment_previews: {},
+                };
+                this._promptContextCandidateCache = {
+                    ...candidatePayload,
+                    _candidate_scene_id: sceneId,
+                    _stale: false,
+                };
+                this._promptPanelHandle?.refreshDiagnostics?.(
+                    this._promptContextCandidateCache);
+                this._refreshInlinePromptProjections?.(this._promptContextCandidateCache);
+            } catch (error) {
+                if (token === this._promptContextPreviewToken) {
+                    console.warn("[Sonder] Prompt Context candidate preview failed:", error);
+                    this._promptContextCandidateCache = {
+                        errors: [{ code: "preview_request_failed",
+                            message: error?.message || "Prompt Context candidate preview failed." }],
+                        warnings: [], attachment_previews: {},
+                        _candidate_scene_id: sceneId,
+                        _stale: false,
+                    };
+                    this._promptPanelHandle?.refreshDiagnostics?.(
+                        this._promptContextCandidateCache);
+                }
+            }
+        }, Math.max(0, Number(delay) || 0));
+    }
+
     /** Refresh the timeline "used / ignored-at-boundary" prompt highlight for
      *  the live selection window. Resolves over the same raw selection+context
      *  window the dormant preview uses (the render's grid-snap drift is an
@@ -10369,13 +11091,26 @@ export class EditorWidget {
      *  ONE mutation request (deletes high-index-first, then creates, then the
      *  global text) so the apply is a single save and a single undo step. */
     async _applyPromptSetup({ global: globalText, global_channels: globalChannels = null,
+                              global_channel_docs: globalChannelDocs = null,
+                              global_attachments: globalAttachments = null,
                               sections, extendDurationTo = 0, source_fps: sourceFps = 0,
                               source_channel_template: sourceChannelTemplate = null,
-                              source_channel_template_id: sourceChannelTemplateId = null } = {}) {
+                              source_channel_template_id: sourceChannelTemplateId = null,
+                              base_modified_at: baseModifiedAt = "",
+                              prompt_context_profile_id: promptContextProfileId = null,
+                              prompt_context_profile_config: promptContextProfileConfig = null,
+                              minimax_h3_conditioning_setups: minimaxSetups = null,
+                              active_minimax_h3_setup_id: activeMinimaxSetupId = null,
+                              prompt_context_profiles: promptContextProfiles = null,
+                              prompt_semantic_units: promptSemanticUnits = null } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
             notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
             return;
+        }
+        const currentVersion = getProjectVersion(this._projectDirName());
+        if (baseModifiedAt && currentVersion && baseModifiedAt !== currentVersion) {
+            throw new Error("Writing draft is stale. Reset or reconstruct it from the current scene before applying.");
         }
         // New entries carry the whole authored definition. Legacy entries carry
         // only an id, which must resolve through the browser-local catalog so a
@@ -10391,22 +11126,29 @@ export class EditorWidget {
         // key. Both are correct when retargeting across templates and wrong when
         // there is nothing to retarget. Still emit every key explicitly, because
         // channel updates MERGE server-side — a key left out keeps its old text.
-        const retargetChannels = (channels) => (
-            channelTemplateKeySetsEqual(
-                resolvedSourceChannelTemplate, activeChannelTemplate)
-                ? normalizeChannels(channels, "", templateChannelKeys(activeChannelTemplate))
-                : collapseChannelsForTemplate(
-                    channels, resolvedSourceChannelTemplate, activeChannelTemplate));
+        const sourceKeys = templateChannelKeys(resolvedSourceChannelTemplate);
+        const targetKeys = templateChannelKeys(activeChannelTemplate);
+        const sameChannelTemplate = channelTemplateKeySetsEqual(
+            resolvedSourceChannelTemplate, activeChannelTemplate);
+        const retargetDocuments = (documents, channels) => {
+            if (!sameChannelTemplate) {
+                return retargetChannelDocuments(
+                    documents || {}, sourceKeys, targetKeys, channels || {});
+            }
+            const keys = [...new Set([...sourceKeys, ...targetKeys,
+                ...Object.keys(documents || {}), ...Object.keys(channels || {})])];
+            return Object.fromEntries(keys.map((key) => [key,
+                normalizePromptDocument(documents?.[key], channels?.[key] || "")]));
+        };
         const sceneRef = this.activeScene;
         const undoLabel = "apply prompt setup";
         this._pushUndo(undoLabel);
-        const current = sceneRef.prompt_sections || [];
         const operations = [];
-        for (let i = current.length - 1; i >= 0; i--) {
+        if (Array.isArray(promptContextProfiles) || Array.isArray(promptSemanticUnits)) {
             operations.push({
-                type: "delete_prompt_section",
-                index: i,
-                expected: { start_frame: current[i].start_frame, end_frame: current[i].end_frame },
+                type: "import_prompt_context_dependencies",
+                profiles: structuredClone(promptContextProfiles || []),
+                semantic_units: structuredClone(promptSemanticUnits || []),
             });
         }
         const capturedFps = Number(sourceFps);
@@ -10424,8 +11166,11 @@ export class EditorWidget {
                 // the same collapse-then-re-split a template switch uses, from
                 // the recorded source template to the current one — otherwise a
                 // Standard-authored entry lands invisibly in `visual` here.
-                const channels = retargetChannels(
-                    normalizeChannels(s.channels, s.prompt));
+                const sourceChannels = normalizeChannels(s.channels, s.prompt);
+                const channelDocs = retargetDocuments(s.channel_docs, sourceChannels);
+                const channels = Object.fromEntries(targetKeys.map((key) => [
+                    key, promptDocumentText(channelDocs[key]).trim(),
+                ]));
                 const startFrame = Math.max(previousEnd, Math.round((s.start_frame || 0) * timeScale));
                 const endFrame = Math.max(startFrame + 1, Math.round((s.end_frame || 0) * timeScale));
                 previousEnd = endFrame;
@@ -10434,6 +11179,8 @@ export class EditorWidget {
                     start_frame: startFrame,
                     end_frame: endFrame,
                     channels,
+                    channel_docs: channelDocs,
+                    attachments: normalizePromptAttachments(s.attachments),
                     prompt: composeSectionText(channels, false),
                     muted: !!s.muted,
                     // Carried through history entries and browser templates —
@@ -10441,23 +11188,11 @@ export class EditorWidget {
                     // every Apply.
                     starts_new_shot: !!s.starts_new_shot,
                     shot_timestamp: s.shot_timestamp === true,
-                    subject_ids: normalizeSubjectIds(s.subject_ids),
                     global_channel_exceptions: normalizeChannelExceptions(
                         s.global_channel_exceptions),
                 };
             });
-        for (const s of nextSections) {
-            operations.push({
-                type: "create_prompt_section",
-                fields: {
-                    prompt_id: s.prompt_id, start_frame: s.start_frame, end_frame: s.end_frame,
-                    channels: s.channels, muted: !!s.muted,
-                    starts_new_shot: s.starts_new_shot, shot_timestamp: s.shot_timestamp,
-                    subject_ids: s.subject_ids,
-                    global_channel_exceptions: s.global_channel_exceptions,
-                },
-            });
-        }
+        operations.push({ type: "replace_prompt_sections", sections: nextSections });
         // Optionally grow the scene to fit the new sections (writing-mode
         // "Apply & Extend"). Merge into the SAME scene-fields op so it stays
         // one mutation + one undo — the undo snapshot is a full scene clone,
@@ -10470,16 +11205,54 @@ export class EditorWidget {
         // restore for them. Newer entries re-split their channels the same way
         // sections do.
         const sceneFields = globalChannels
-            ? { global_channels: retargetChannels(globalChannels) }
+            ? {
+                global_channel_docs: retargetDocuments(globalChannelDocs, globalChannels),
+                ...(globalAttachments ? { global_attachments: globalAttachments } : {}),
+            }
             : { prompt: String(globalText ?? "") };
+        if (sceneFields.global_channel_docs) {
+            sceneFields.global_channels = Object.fromEntries(targetKeys.map((key) => [
+                key, promptDocumentText(sceneFields.global_channel_docs[key]).trim(),
+            ]));
+        }
+        if (promptContextProfileId !== null) {
+            sceneFields.prompt_context_profile_id = String(promptContextProfileId || "");
+        }
+        if (promptContextProfileConfig !== null) {
+            sceneFields.prompt_context_profile_config = structuredClone(promptContextProfileConfig || {});
+        }
+        if (minimaxSetups !== null) {
+            sceneFields.minimax_h3_conditioning_setups = structuredClone(minimaxSetups || []);
+        }
+        if (activeMinimaxSetupId !== null) {
+            sceneFields.active_minimax_h3_setup_id = String(activeMinimaxSetupId || "");
+        }
         if (willExtend) sceneFields.duration_frames = nextDuration;
         operations.push({ type: "update_scene_fields", fields: sceneFields });
 
         if (sceneFields.global_channels) {
             sceneRef.global_channels = normalizeChannels(sceneFields.global_channels);
+            if (sceneFields.global_channel_docs) {
+                sceneRef.global_channel_docs = structuredClone(sceneFields.global_channel_docs);
+            }
+            if (sceneFields.global_attachments) {
+                sceneRef.global_attachments = structuredClone(sceneFields.global_attachments);
+            }
             sceneRef.prompt = composeSectionText(sceneRef.global_channels, false);
         } else {
             sceneRef.prompt = String(globalText ?? "");
+        }
+        if (promptContextProfileId !== null) {
+            sceneRef.prompt_context_profile_id = String(promptContextProfileId || "");
+        }
+        if (promptContextProfileConfig !== null) {
+            sceneRef.prompt_context_profile_config = structuredClone(promptContextProfileConfig || {});
+        }
+        if (minimaxSetups !== null) {
+            sceneRef.minimax_h3_conditioning_setups = structuredClone(minimaxSetups || []);
+        }
+        if (activeMinimaxSetupId !== null) {
+            sceneRef.active_minimax_h3_setup_id = String(activeMinimaxSetupId || "");
         }
         sceneRef.prompt_sections = [...nextSections].sort((a, b) => (a.start_frame || 0) - (b.start_frame || 0));
         if (willExtend) {
@@ -10494,11 +11267,19 @@ export class EditorWidget {
             this._updateTransportUI();
         }
         try {
-            await this._runSceneMutation(operations, {
+            const result = await this._runSceneMutation(operations, {
                 key: `prompt:${this.activeSceneId}:apply:${Date.now()}`,
                 label: "apply prompt setup",
                 coalesce: false,
+                retryOnConflict: false,
+                expectedModifiedAt: baseModifiedAt,
             });
+            if (Array.isArray(result?.payload?.prompt_context_profiles)) {
+                this._promptContextProfiles = result.payload.prompt_context_profiles;
+            }
+            if (Array.isArray(result?.payload?.prompt_semantic_units)) {
+                this._promptSemanticUnits = result.payload.prompt_semantic_units;
+            }
         } catch (e) {
             this._discardLastUndo(undoLabel);
             notifyWarning(e?.message || "Apply prompt setup was refused.", { source: "prompt-apply-refused" });
@@ -10516,11 +11297,33 @@ export class EditorWidget {
         const scene = this.activeScene;
         const trimmed = String(name || "").trim();
         if (!scene || !trimmed) return;
+        const sceneAttachments = [
+            ...(scene.global_attachments || []),
+            ...(scene.prompt_sections || []).flatMap((section) => section.attachments || []),
+        ];
+        const semanticUnitIds = new Set(sceneAttachments.flatMap((attachment) =>
+            attachment?.source?.semantic_unit_ids || []).map(String));
+        const profileId = String(scene.prompt_context_profile_id || "");
         const template = {
             id: `pt-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 6)}`,
             name: trimmed,
             global: scene.prompt || "",
             global_channels: { ...(scene.global_channels || {}) },
+            global_channel_docs: structuredClone(scene.global_channel_docs || {}),
+            global_attachments: structuredClone(scene.global_attachments || []),
+            prompt_context_profile_id: scene.prompt_context_profile_id || "",
+            prompt_context_profile_config: structuredClone(scene.prompt_context_profile_config || {}),
+            minimax_h3_conditioning_setups: structuredClone(scene.minimax_h3_conditioning_setups || []),
+            active_minimax_h3_setup_id: scene.active_minimax_h3_setup_id || "",
+            // Browser templates are cross-project. Carry the dependency closure
+            // needed to resolve stable semantic ids, then import it in the same
+            // version-checked transaction as the scene content. Physical
+            // Reference/Guide ids remain project-owned and visibly block until
+            // rebound when the target project does not contain them.
+            prompt_context_profiles: structuredClone((this._promptContextProfiles || [])
+                .filter((value) => `${value.profile_id}@${value.version}` === profileId)),
+            prompt_semantic_units: structuredClone((this._promptSemanticUnits || [])
+                .filter((value) => semanticUnitIds.has(String(value.semantic_unit_id || "")))),
             source_fps: Math.max(0.001, Number(this._effectiveFps) || 24),
             // Authoring channel template, stored for the same reason as
             // source_fps: these templates are browser-local and CROSS-PROJECT,
@@ -10530,12 +11333,15 @@ export class EditorWidget {
             source_channel_template_id: this._channelTemplate().id,
             source_channel_template: templateFreezeValue(this._channelTemplate()),
             sections: (scene.prompt_sections || []).map((s) => ({
+                prompt_id: s.prompt_id || "",
                 start_frame: s.start_frame || 0,
                 end_frame: s.end_frame || 0,
                 channels: normalizeChannels(s.channels, s.prompt),
+                channel_docs: structuredClone(s.channel_docs || {}),
+                attachments: structuredClone(s.attachments || []),
+                muted: !!s.muted,
                 starts_new_shot: !!s.starts_new_shot,
                 shot_timestamp: s.shot_timestamp === true,
-                subject_ids: normalizeSubjectIds(s.subject_ids),
                 global_channel_exceptions: normalizeChannelExceptions(
                     s.global_channel_exceptions),
             })),
@@ -10566,8 +11372,12 @@ export class EditorWidget {
         if (commit && pendingCommit) pendingCommit();
         const editorEl = this._promptEditorEl;
         this._promptEditorEl = null;
+        this._refreshInlinePromptProjections = null;
         this._disconnectInlinePromptEditorObserver();
         if (editorEl) {
+            for (const input of editorEl.querySelectorAll("[data-sonder-prompt-box='1']")) {
+                input._sonderPromptContextMenuCleanup?.();
+            }
             editorEl.remove();
             this._refreshTimelineLayout();
         }
@@ -10649,6 +11459,74 @@ export class EditorWidget {
             notifyWarning(e?.message || "Prompt edit was refused.", { source: "prompt-edit-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "edit_prompt_error" });
             console.warn("[Sonder] Failed to update prompt section:", e);
+        }
+    }
+
+    async _updateLinkedPromptAttachment(attachmentId, configured) {
+        if (!this.activeScene || !this.projectDir || this._isPromptTrackLocked()) return false;
+        const sections = this.activeScene.prompt_sections || [];
+        const source = sections.flatMap((section) => section.attachments || [])
+            .find((value) => value.attachment_id === attachmentId);
+        const groupId = source?.emission_group_id;
+        if (!groupId) return false;
+        const snapshots = structuredClone(sections);
+        const operations = [];
+        snapshots.forEach((section, index) => {
+            if (!(section.attachments || []).some((value) =>
+                value.emission_group_id === groupId)) return;
+            const attachments = (section.attachments || []).map((value) => {
+                if (value.emission_group_id !== groupId) return value;
+                return propagateLinkedPromptAttachment(
+                    configured, value, attachmentId);
+            });
+            operations.push({
+                type: "update_prompt_section",
+                index,
+                expected: {
+                    prompt_id: section.prompt_id,
+                    start_frame: section.start_frame,
+                    end_frame: section.end_frame,
+                    prompt: section.prompt,
+                    muted: Boolean(section.muted),
+                    channels: structuredClone(section.channels || {}),
+                    channel_docs: structuredClone(section.channel_docs || {}),
+                    attachments: structuredClone(section.attachments || []),
+                    starts_new_shot: Boolean(section.starts_new_shot),
+                    shot_timestamp: Boolean(section.shot_timestamp),
+                    global_channel_exceptions: structuredClone(
+                        section.global_channel_exceptions || []),
+                },
+                fields: { attachments },
+            });
+        });
+        if (!operations.length) return false;
+        const undoLabel = "edit linked Context chip";
+        this._pushUndo(undoLabel);
+        for (const operation of operations) {
+            this._applyLocalPromptUpdate(operation.index, {
+                attachments: structuredClone(operation.fields.attachments),
+            });
+        }
+        this._renderSceneAfterLocalMutation({ viewport: false });
+        try {
+            await this._runSceneMutation(operations, {
+                key: `prompt:${this.activeSceneId}:linked:${groupId}`,
+                label: undoLabel,
+                coalesce: false,
+                // Exact identity snapshots are a compare-and-swap batch. Never
+                // replay the stale attachment edit onto freshly fetched state.
+                retryOnConflict: false,
+            });
+            return true;
+        } catch (error) {
+            this._discardLastUndo(undoLabel);
+            notifyWarning(error?.message || "Linked Context edit conflicted with newer state.", {
+                source: "prompt-linked-edit-refused",
+            });
+            await this._fetchScenes({ ignoreMutationGate: true,
+                reason: "edit_linked_prompt_error" });
+            console.warn("[Sonder] Failed to update linked Context group:", error);
+            return false;
         }
     }
 
@@ -12704,96 +13582,15 @@ export class EditorWidget {
 
     _showContextMenu(x, y, items) {
         this._hideContextMenu();
-
-        const menu = document.createElement("div");
-        menu.style.cssText = `
-            position: fixed; left: ${x}px; top: ${y}px; z-index: 10000;
-            ${chromeMenuCss(150)}
-        `;
-
-        for (const item of items) {
-            if (item?.type === "separator") {
-                const separator = document.createElement("div");
-                separator.style.cssText = `height: 1px; margin: 4px 8px; background: ${COLORS.borderSoft};`;
-                menu.appendChild(separator);
-                continue;
-            }
-            const row = document.createElement("div");
-            row.textContent = item.label;
-            const isDisabled = item.disabled;
-            row.style.cssText = `
-                padding: 6px 14px; cursor: ${isDisabled ? "default" : "pointer"};
-                color: ${isDisabled ? COLORS.textMuted : (item.danger ? COLORS.dangerText : COLORS.text)};
-            `;
-            if (!isDisabled) {
-                row.addEventListener("mouseenter", () => row.style.background = COLORS.panelRaisedHover);
-                row.addEventListener("mouseleave", () => row.style.background = "transparent");
-                row.addEventListener("click", () => {
-                    this._hideContextMenu();
-                    item.action();
-                });
-                // A row may expose its own right-click submenu (e.g. per-scene actions in the
-                // scene switcher list). Opening it replaces this menu via _showContextMenu's
-                // own _hideContextMenu(), so the native browser menu never appears.
-                if (typeof item.onContextMenu === "function") {
-                    row.addEventListener("contextmenu", (event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        item.onContextMenu(event);
-                    });
-                }
-            }
-            menu.appendChild(row);
-        }
-
-        document.body.appendChild(menu);
-        this._contextMenuEl = menu;
-
-        // Clamp into the viewport after mount (shortest distance back inside)
-        // — same rAF pattern as the gallery's showContextMenu. Fixes menus
-        // opened near the right/bottom screen edges getting cropped.
-        requestAnimationFrame(() => {
-            if (this._contextMenuEl !== menu) return;
-            const rect = menu.getBoundingClientRect();
-            const clampedX = Math.max(4, Math.min(x, window.innerWidth - rect.width - 4));
-            const clampedY = Math.max(4, Math.min(y, window.innerHeight - rect.height - 4));
-            menu.style.left = `${clampedX}px`;
-            menu.style.top = `${clampedY}px`;
-        });
-
-        // Close on outside click or Escape (Escape is owned by KeyboardOwnership
-        // OVERLAY consumer so it beats LiteGraph and the EDITOR consumer).
-        const closeHandler = (e) => {
-            if (!menu.contains(e.target)) this._hideContextMenu();
-        };
-        this._contextMenuKeyOff = registerKeyboardConsumer({
-            id: this._keyboardConsumerId("ctxmenu"),
-            priority: KEY_PRIORITY.OVERLAY,
-            keydown: (e) => {
-                if (e.key === "Escape") { this._hideContextMenu(); return true; }
-                return false;
-            },
-        });
-        this._contextMenuMouseOff = () => document.removeEventListener("mousedown", closeHandler);
-        // Delay listener registration to avoid catching the current right-click
-        setTimeout(() => {
-            document.addEventListener("mousedown", closeHandler);
-        }, 10);
+        this._contextMenuClose = openContextMenu({ x, y, items });
+        this._contextMenuEl = this._contextMenuClose.element;
     }
 
+
     _hideContextMenu() {
-        if (this._contextMenuEl) {
-            this._contextMenuEl.remove();
-            this._contextMenuEl = null;
-        }
-        if (this._contextMenuKeyOff) {
-            this._contextMenuKeyOff();
-            this._contextMenuKeyOff = null;
-        }
-        if (this._contextMenuMouseOff) {
-            this._contextMenuMouseOff();
-            this._contextMenuMouseOff = null;
-        }
+        this._contextMenuClose?.();
+        this._contextMenuClose = null;
+        this._contextMenuEl = null;
     }
 
     // ── Keyboard Shortcut Overlay ────────────────────────────────────
@@ -12832,6 +13629,12 @@ export class EditorWidget {
                 ["Ctrl+Z", "Undo"],
                 ["Ctrl+Y", "Redo"],
                 ["Ctrl+Shift+Z", "Redo"],
+            ]) +
+            this._shortcutSection("Prompt", [
+                ["Right-click prompt", "Open Context and Writing-aid menu at the clicked caret"],
+                ["Shift+F10 / Menu", "Open prompt authoring menu at the current caret"],
+                ["Arrow keys / Enter", "Navigate and choose nested prompt-menu actions"],
+                ["Ctrl+V", "Paste into the active field; fullscreen background paste is ignored"],
             ]) +
             this._shortcutSection("Asset Gallery", [
                 ["Arrow keys", "Move asset focus / selection"],
@@ -14058,18 +14861,24 @@ export class EditorWidget {
             const shift = e.shiftKey;
 
             // Guard: don't fire when typing in inputs (except Ctrl+Z/Y for undo/redo)
-            const tag = document.activeElement?.tagName;
+            const activeTarget = e.target instanceof Element ? e.target : document.activeElement;
+            const activeElement = document.activeElement;
+            const tag = activeTarget?.tagName || activeElement?.tagName;
             const isUndo = ctrl && (normalizedKey === "z" || normalizedKey === "y");
-            const isInspectOverlayInput = !!document.activeElement?.closest?.("[data-sonder-inspect-overlay='1']");
+            const isInspectOverlayInput = !!(activeTarget?.closest?.("[data-sonder-inspect-overlay='1']")
+                || activeElement?.closest?.("[data-sonder-inspect-overlay='1']"));
             // Prompt-editing fields (panel boxes + inline section/global/draft
             // bars) own their own native Ctrl+Z; never route it to timeline undo.
-            const isPromptPanelInput = !!document.activeElement?.closest?.("[data-sonder-prompt-box='1']");
+            const isPromptPanelInput = !!(activeTarget?.closest?.("[data-sonder-prompt-box='1']")
+                || activeElement?.closest?.("[data-sonder-prompt-box='1']"));
+            const isContentEditor = !!(activeTarget?.isContentEditable || activeElement?.isContentEditable);
+            const isOrdinaryField = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(tag);
             const debugUndoRouting = (message, extra = {}) => {
                 if (!ctrl || (normalizedKey !== "z" && normalizedKey !== "y")) return;
                 this._keyboardDebug(message, this._keyboardDebugSnapshot(e, extra));
             };
             if (isInspectOverlayInput) return false;
-            if ((tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") && (!isUndo || isPromptPanelInput)) return false;
+            if (isPromptPanelInput || isContentEditor || isOrdinaryField) return false;
 
             // Guard: only handle keys when our editor is focused
             // (fullscreen always focused, node mode only when user clicked inside)
@@ -14222,6 +15031,23 @@ export class EditorWidget {
             id: this._keyboardConsumerId("editor"),
             priority: KEY_PRIORITY.EDITOR,
             keydown: this._editorKeyConsumer,
+            paste: (event) => {
+                if (!this.isFullscreen) return false;
+                const candidates = [event?.target, document.activeElement].filter(Boolean);
+                const editable = candidates.some((candidate) => {
+                    const tag = String(candidate?.tagName || "").toUpperCase();
+                    return candidate?.isContentEditable
+                        || !!candidate?.closest?.("[contenteditable='true'],[data-sonder-prompt-box='1']")
+                        || ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
+                });
+                if (editable) return false;
+                const galleryImagePaste = candidates.some((candidate) =>
+                    !!candidate?.closest?.("[data-sonder-asset-gallery='1']"))
+                    && Array.from(event?.clipboardData?.items || []).some((item) =>
+                        item?.kind === "file" && String(item?.type || "").startsWith("image/"));
+                if (galleryImagePaste) return false;
+                return true;
+            },
         });
 
         // Track editor focus: set when clicking inside editor, clear when clicking outside
@@ -14998,13 +15824,14 @@ export class EditorWidget {
                     start_frame: s.start_frame,
                     end_frame: s.end_frame,
                     channels: normalizeChannels(s.channels, s.prompt, this._channelKeys()),
+                    channel_docs: structuredClone(s.channel_docs || {}),
+                    attachments: structuredClone(s.attachments || []),
                     muted: !!s.muted,
-                    // Shot grouping, subject bindings and the global opt-outs
+                    // Shot grouping, Context chips and the global opt-outs
                     // are model-visible, so they must ride the frozen envelope
                     // like the channels do.
                     starts_new_shot: !!s.starts_new_shot,
                     shot_timestamp: s.shot_timestamp === true,
-                    subject_ids: normalizeSubjectIds(s.subject_ids),
                     global_channel_exceptions: normalizeChannelExceptions(
                         s.global_channel_exceptions),
                     prompt: s.prompt || "",
@@ -15130,6 +15957,10 @@ export class EditorWidget {
             // Per-channel global text rides beside the flat mirror so a frozen
             // job merges each global channel into its own field.
             scene_global_channels: globalHidden ? {} : (this.activeScene.global_channels || {}),
+            scene_global_channel_docs: globalHidden ? {}
+                : structuredClone(this.activeScene.global_channel_docs || {}),
+            scene_global_attachments: globalHidden ? []
+                : structuredClone(this.activeScene.global_attachments || []),
             context_frames: Math.max(preContextFrames, postContextFrames),
             pre_context_frames: preContextFrames,
             post_context_frames: postContextFrames,
@@ -15268,6 +16099,8 @@ export class EditorWidget {
                 refreshScenes: false,
                 refreshKeysOnError: ["queue"],
                 failureMessage: "Add to render queue failed — queue restored.",
+                failureDetail: (error) => [error?.payload?.code || error?.code, error?.message]
+                    .filter(Boolean).join(": "),
                 invalidateQueueFetch: true,
                 run: async (queuedIntent) => {
                     return await this._runVersionedProjectMutation(
@@ -15371,6 +16204,8 @@ export class EditorWidget {
                 refreshScenes: false,
                 refreshKeysOnError: ["queue"],
                 failureMessage: "Add render batch failed — queue restored.",
+                failureDetail: (error) => [error?.payload?.code || error?.code, error?.message]
+                    .filter(Boolean).join(": "),
                 invalidateQueueFetch: true,
                 run: async (queuedIntent) => {
                     return await this._runVersionedProjectMutation(
@@ -15665,6 +16500,45 @@ export class EditorWidget {
         this._redoStack = [];
     }
 
+    _captureProjectDependencies() {
+        return {
+            prompt_context_profiles: structuredClone(this._promptContextProfiles || []),
+            prompt_semantic_units: structuredClone(this._promptSemanticUnits || []),
+        };
+    }
+
+    _pushProjectDependencyUndo(label, snapshot) {
+        this._undoStack.push({
+            kind: "project_dependencies",
+            sceneId: this.activeSceneId || "",
+            snapshot: structuredClone(snapshot || this._captureProjectDependencies()),
+            label,
+        });
+        if (this._undoStack.length > this._maxUndoSteps) this._undoStack.shift();
+        this._redoStack = [];
+    }
+
+    async _restoreProjectDependencies(snapshot) {
+        if (!this.projectDir) return;
+        const dirName = this._projectDirName();
+        const { payload } = await fetchProjectJson(
+            api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
+            { method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    prompt_context_profiles: snapshot?.prompt_context_profiles || [],
+                    prompt_semantic_units: snapshot?.prompt_semantic_units || [],
+                }) },
+            { projectId: dirName },
+        );
+        this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
+            ? payload.prompt_context_profiles : [];
+        this._promptSemanticUnits = Array.isArray(payload?.prompt_semantic_units)
+            ? payload.prompt_semantic_units : [];
+        await this._fetchReferences({ ignoreMutationGate: true,
+            reason: "prompt_dependencies_history", force: true });
+        this._renderTimeline();
+    }
+
     async _undo() {
         if (this._undoStack.length === 0) {
             this._keyboardDebug("undo skipped: empty stack", {
@@ -15684,6 +16558,15 @@ export class EditorWidget {
             editorFocused: !!this._editorFocused,
             activeElement: describeKeyboardDebugElement(document.activeElement),
         });
+
+        if (entry.kind === "project_dependencies") {
+            this._redoStack.push({
+                kind: "project_dependencies", sceneId: this.activeSceneId || "",
+                snapshot: this._captureProjectDependencies(), label: entry.label,
+            });
+            await this._restoreProjectDependencies(entry.snapshot);
+            return;
+        }
 
         // Save current state to redo stack before restoring
         if (this.activeScene && this.activeSceneId === entry.sceneId) {
@@ -15723,6 +16606,15 @@ export class EditorWidget {
             editorFocused: !!this._editorFocused,
             activeElement: describeKeyboardDebugElement(document.activeElement),
         });
+
+        if (entry.kind === "project_dependencies") {
+            this._undoStack.push({
+                kind: "project_dependencies", sceneId: this.activeSceneId || "",
+                snapshot: this._captureProjectDependencies(), label: entry.label,
+            });
+            await this._restoreProjectDependencies(entry.snapshot);
+            return;
+        }
 
         // Save current state to undo stack before restoring
         if (this.activeScene && this.activeSceneId === entry.sceneId) {
@@ -15833,7 +16725,10 @@ export class EditorWidget {
         this._referenceTagPresets = [];
         this._referenceRecipePresets = [];
         this._customReferenceRecipes = [];
+        this._promptContextProfiles = [];
+        this._promptSemanticUnits = [];
         this._referenceRecipeFieldSchema = [];
+        this._promptContextCatalog = {};
         this._referencesLoaded = false;
         this._referencesDirty = false;
         this._referencesLoading = false;
@@ -15862,9 +16757,7 @@ export class EditorWidget {
             mode: "sync",
             reason: "editor_surface_entry",
         }).then(() => this._fetchScenes());
-        if (this.isFullscreen && this._settings?.layout?.fullscreenSidebarContent === "references") {
-            void this._fetchReferences({ reason: "load_project", force: true });
-        }
+        void this._fetchReferences({ reason: "load_project", force: true });
         if (this._queueExpanded) {
             this._fetchRenderQueue({ reason: "load_project" });
         }

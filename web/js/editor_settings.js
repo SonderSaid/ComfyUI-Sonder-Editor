@@ -4,11 +4,10 @@ import {
     getChannelTemplate,
     strictNormalizeChannelTemplate,
 } from "./prompt_channel_templates.js";
-// Subject bindings are `{entity_id, retention}` objects, so they need the
-// canonical normalizer rather than the local string-list one. Both modules are
-// browser-free and the graph stays acyclic (prompt_channel_templates.js is a
-// leaf), so the node-subprocess settings harness still loads this file alone.
-import { normalizeSubjectIds } from "./prompt_composition.js";
+import {
+    normalizePromptAttachments,
+    normalizePromptDocument,
+} from "./prompt_context_chips.js";
 
 // Renamed during the Sonder pivot. No fallback read by design.
 const SETTINGS_STORAGE_KEY = "sonder-editor-settings";
@@ -184,7 +183,7 @@ export const BUILTIN_MODEL_TEMPLATES = [
             minDimension: 64,
             recommendedRes: [[1344, 768], [768, 1344], [1024, 1024], [864, 480]],
             maxRes: [1344, 768],
-            recommendedDuration: { minSec: 4, maxSec: 15 },
+            recommendedDuration: { minSec: 5, maxSec: 15 },
         },
     },
     {
@@ -400,6 +399,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         panelChannelBoxHeight: 0,
         panelGlobalBoxHeight: 0,
         panelDraftBoxHeight: 0,
+        contextMenuHintDismissed: false,
         writingDraftByProjectScene: {},
     },
     projectDefaults: {
@@ -761,6 +761,8 @@ function normalizePromptsSettings(stored, defaults) {
         panelChannelBoxHeight: clampHeight(raw.panelChannelBoxHeight),
         panelGlobalBoxHeight: clampHeight(raw.panelGlobalBoxHeight),
         panelDraftBoxHeight: clampHeight(raw.panelDraftBoxHeight),
+        contextMenuHintDismissed: raw.contextMenuHintDismissed == null
+            ? defaults.contextMenuHintDismissed : !!raw.contextMenuHintDismissed,
         writingDraftByProjectScene: normalizeWritingDrafts(raw.writingDraftByProjectScene),
     };
 }
@@ -839,6 +841,20 @@ function normalizeIdList(value) {
     return ids;
 }
 
+function normalizePromptDocumentBag(raw, channels = {}) {
+    const source = raw && typeof raw === "object" ? raw : {};
+    const keys = new Set([...Object.keys(source), ...Object.keys(channels || {})]);
+    return Object.fromEntries([...keys].map((key) => [
+        key, normalizePromptDocument(source[key], channels?.[key] || ""),
+    ]));
+}
+
+function cloneRecordArray(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((value) => value && typeof value === "object")
+        .map((value) => structuredClone(value));
+}
+
 function normalizePromptTemplates(templates) {
     if (!Array.isArray(templates)) return [];
     const normalized = [];
@@ -850,19 +866,22 @@ function normalizePromptTemplates(templates) {
         const sections = Array.isArray(raw.sections)
             ? raw.sections
                 .filter((s) => s && typeof s === "object")
-                .map((s) => ({
-                    start_frame: Math.max(0, parseInt(s.start_frame, 10) || 0),
-                    end_frame: Math.max(0, parseInt(s.end_frame, 10) || 0),
-                    channels: normalizeChannelBag(s.channels, s.prompt),
-                    starts_new_shot: s.starts_new_shot === true,
-                    shot_timestamp: s.shot_timestamp === true,
-                    // Binding OBJECTS — normalizeIdList would String() each one
-                    // into "[object Object]" and then dedupe them all into one.
-                    // global_channel_exceptions below genuinely is a string list.
-                    subject_ids: normalizeSubjectIds(s.subject_ids),
-                    global_channel_exceptions: normalizeIdList(
-                        s.global_channel_exceptions),
-                }))
+                .map((s) => {
+                    const channels = normalizeChannelBag(s.channels, s.prompt);
+                    return {
+                        prompt_id: String(s.prompt_id || ""),
+                        start_frame: Math.max(0, parseInt(s.start_frame, 10) || 0),
+                        end_frame: Math.max(0, parseInt(s.end_frame, 10) || 0),
+                        channels,
+                        channel_docs: normalizePromptDocumentBag(s.channel_docs, channels),
+                        attachments: normalizePromptAttachments(s.attachments),
+                        muted: s.muted === true,
+                        starts_new_shot: s.starts_new_shot === true,
+                        shot_timestamp: s.shot_timestamp === true,
+                        global_channel_exceptions: normalizeIdList(
+                            s.global_channel_exceptions),
+                    };
+                })
             : [];
         const rawSourceTemplate = raw.source_channel_template;
         const sourceTemplate = (rawSourceTemplate && typeof rawSourceTemplate === "object")
@@ -871,6 +890,7 @@ function normalizePromptTemplates(templates) {
         const legacySourceId = typeof rawSourceTemplate === "string"
             ? rawSourceTemplate
             : "";
+        const globalChannels = nullIfBlank(normalizeChannelBag(raw.global_channels, raw.global));
         normalized.push({
             id: String(raw.id || `prompt-template-${index}-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`),
             name,
@@ -879,7 +899,19 @@ function normalizePromptTemplates(templates) {
             // channel bag MERGES server-side, so an empty bag would silently
             // keep the target scene's global instead of replacing it. The null
             // keeps those entries on the flat-text path, which does replace.
-            global_channels: nullIfBlank(normalizeChannelBag(raw.global_channels, raw.global)),
+            global_channels: globalChannels,
+            global_channel_docs: normalizePromptDocumentBag(
+                raw.global_channel_docs, globalChannels || {}),
+            global_attachments: normalizePromptAttachments(raw.global_attachments),
+            prompt_context_profile_id: String(raw.prompt_context_profile_id || ""),
+            prompt_context_profile_config: raw.prompt_context_profile_config
+                && typeof raw.prompt_context_profile_config === "object"
+                ? structuredClone(raw.prompt_context_profile_config) : {},
+            minimax_h3_conditioning_setups: cloneRecordArray(
+                raw.minimax_h3_conditioning_setups),
+            active_minimax_h3_setup_id: String(raw.active_minimax_h3_setup_id || ""),
+            prompt_context_profiles: cloneRecordArray(raw.prompt_context_profiles),
+            prompt_semantic_units: cloneRecordArray(raw.prompt_semantic_units),
             // Records which channel set the text was AUTHORED under, so applying
             // it to a project on another template can collapse and re-split
             // rather than dropping the fields the target does not name.

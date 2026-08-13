@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
+from server import prompt_context
 from server.timeline_state import (
     Asset,
     AudioTrack,
@@ -24,6 +25,8 @@ from server.timeline_state import (
     GuideFrame,
     LaneConfig,
     PromptSection,
+    ReferenceItem,
+    ReferenceLaneRecipe,
     Scene,
     TimelineProject,
 )
@@ -923,6 +926,136 @@ def test_scene_restore_accepts_guide_and_prompt_track_config(tmp_path, monkeypat
     assert payload["prompt_track_config"]["hidden"] is True
 
 
+def test_scene_restore_atomically_restores_reference_lane_ids_and_h3_setup(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(
+        scene_id="scene-1", name="Scene", reference_lane_count=1,
+        reference_lane_configs=[LaneConfig()],
+        reference_lane_recipes=[ReferenceLaneRecipe(
+            lane_id="current", recipe={"soft": {"physical_population": "pictures"}})],
+        minimax_h3_conditioning_setups=[{
+            "schema": "minimax_h3_setup_v1", "setup_id": "setup",
+            "name": "Setup", "mode": "reference", "task_mode": "T2VA",
+            "picture_lane_ids": ["current"], "video_lane_ids": [],
+            "audio_lane_ids": [],
+        }],
+        active_minimax_h3_setup_id="setup",
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    restore_scene = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}/restore")
+
+    response = asyncio.run(restore_scene(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={
+            "reference_lane_count": 2,
+            "reference_lane_configs": [{}, {}],
+            "reference_lane_recipes": [
+                {"lane_id": "old-a", "media_kind": "image", "recipe": {
+                    "soft": {"physical_population": "pictures"}}},
+                {"lane_id": "old-b", "media_kind": "image", "recipe": {
+                    "soft": {"physical_population": "pictures"}}},
+            ],
+            "minimax_h3_conditioning_setups": [{
+                "schema": "minimax_h3_setup_v1", "setup_id": "setup",
+                "name": "Setup", "mode": "reference", "task_mode": "T2VA",
+                "picture_lane_ids": ["old-a", "old-b"],
+                "video_lane_ids": [], "audio_lane_ids": [],
+            }],
+            "active_minimax_h3_setup_id": "setup",
+        },
+    )))
+    payload = _response_json(response)
+    assert response.status == 200
+    assert [value["lane_id"] for value in payload["reference_lane_recipes"]] == [
+        "old-a", "old-b"]
+    assert payload["minimax_h3_conditioning_setups"][0]["picture_lane_ids"] == [
+        "old-a", "old-b"]
+
+
+def test_scene_put_preserves_omitted_reference_lane_id_and_setup_binding(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    scene = Scene(
+        scene_id="scene-1", reference_lane_count=1,
+        reference_lane_configs=[LaneConfig()],
+        reference_lane_recipes=[ReferenceLaneRecipe(
+            lane_id="stable", recipe={"soft": {"physical_population": "pictures"}})],
+        minimax_h3_conditioning_setups=[{
+            "schema": "minimax_h3_setup_v1", "setup_id": "setup",
+            "name": "Setup", "mode": "reference", "task_mode": "T2VA",
+            "picture_lane_ids": ["stable"], "video_lane_ids": [],
+            "audio_lane_ids": [],
+        }], active_minimax_h3_setup_id="setup",
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    update_scene = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}")
+    response = asyncio.run(update_scene(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"reference_lane_recipes": [{
+            "media_kind": "image", "recipe_id": "edited",
+            "recipe": {"soft": {"physical_population": "pictures"}},
+        }]},
+    )))
+    payload = _response_json(response)
+    assert response.status == 200
+    assert payload["reference_lane_recipes"][0]["lane_id"] == "stable"
+    assert payload["minimax_h3_conditioning_setups"][0]["picture_lane_ids"] == [
+        "stable"]
+
+
+def test_scene_put_count_only_shrink_prunes_removed_h3_setup_lane(tmp_path, monkeypatch):
+    route_module = _load_route_module(monkeypatch)
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    recipes = [ReferenceLaneRecipe(
+        lane_id=lane_id,
+        recipe={"soft": {
+            "compatible_profiles": ["minimax_h3_ref@1"],
+            "physical_population": "pictures",
+        }},
+    ) for lane_id in ("keep", "remove")]
+    scene = Scene(
+        scene_id="scene-1", duration_frames=24,
+        reference_lane_count=2,
+        reference_lane_configs=[LaneConfig(), LaneConfig()],
+        reference_lane_recipes=recipes,
+        minimax_h3_conditioning_setups=[{
+            "schema": "minimax_h3_setup_v1", "setup_id": "setup",
+            "name": "Setup", "mode": "reference", "task_mode": "T2VA",
+            "picture_lane_ids": ["keep", "remove"],
+            "video_lane_ids": [], "audio_lane_ids": [],
+        }], active_minimax_h3_setup_id="setup",
+    )
+    project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
+    monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(route_module, "save_project", lambda project: None)
+    update_scene = _route_handler(
+        route_module, "PUT",
+        "/sonder-editor/project/{project_id}/scenes/{scene_id}")
+
+    response = asyncio.run(update_scene(DummyRequest(
+        match_info={"scene_id": "scene-1"},
+        body={"reference_lane_count": 1},
+    )))
+    payload = _response_json(response)
+    assert response.status == 200
+    assert [value["lane_id"] for value in payload["reference_lane_recipes"]] == [
+        "keep"]
+    assert payload["minimax_h3_conditioning_setups"][0]["picture_lane_ids"] == [
+        "keep"]
+
+
 def test_scene_restore_rejects_duplicate_driver_clip_snapshot(tmp_path, monkeypatch):
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
@@ -977,7 +1110,22 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
         height=720,
         fps=30.0,
     )
-    source.prompt_sections = [PromptSection(start_frame=0, end_frame=24, prompt="section")]
+    reference_attachment = prompt_context.normalize_attachment({
+        "kind": "reference", "source": {"reference_item_id": "reference-item"},
+    })
+    linked_reference_attachment = prompt_context.normalize_attachment({
+        **reference_attachment, "attachment_id": "linked-copy",
+        "emission_group_id": reference_attachment["emission_group_id"],
+    })
+    source.prompt_sections = [
+        PromptSection(start_frame=0, end_frame=24, prompt="section",
+                      attachments=[reference_attachment]),
+        PromptSection(start_frame=24, end_frame=48, prompt="section two",
+                      attachments=[linked_reference_attachment]),
+    ]
+    source.reference_items = [ReferenceItem(
+        reference_item_id="reference-item", lane_index=0,
+        start_frame=0, end_frame=24, members=[])]
     source.guide_frames = [GuideFrame(frame_index=8, asset_id="guide-1", source="asset", strength=0.75)]
     source.clips = [
         ClipReference(
@@ -1056,10 +1204,18 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
     assert len(payload["audio_tracks"]) == len(source.audio_tracks)
     assert source_track_ids.isdisjoint(duplicate_track_ids)
 
+    assert payload["reference_items"][0]["reference_item_id"] != "reference-item"
+    duplicated_references = [section["attachments"][0]
+                             for section in payload["prompt_sections"]]
+    assert all(value["source"]["reference_item_id"]
+               == payload["reference_items"][0]["reference_item_id"]
+               for value in duplicated_references)
+    assert duplicated_references[0]["attachment_id"] != duplicated_references[1]["attachment_id"]
+    assert duplicated_references[0]["emission_group_id"] == duplicated_references[1]["emission_group_id"]
+
     for key in [
         "duration_frames",
         "prompt",
-        "prompt_sections",
         "generation_params",
         "batch_config",
         "guide_frames",

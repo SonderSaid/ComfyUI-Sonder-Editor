@@ -16,6 +16,7 @@ import pytest
 from server import prompt_channel_templates as pct
 from server import prompt_payload as pp
 import server.routes as routes
+from server import prompt_context
 from server.timeline_state import LaneConfig, PromptSection, Scene, TimelineProject
 
 
@@ -62,6 +63,55 @@ def test_channel_updates_merge_rather_than_replace():
     scene.set_global_channels({"visual": "changed"})
     assert scene.global_channels["visual"] == "changed"
     assert scene.global_channels["detailed_description"] == "also keep"
+
+
+def test_structured_global_documents_win_over_derived_flat_mirrors():
+    scene = _scene()
+    document = prompt_context.text_document("structured")
+    routes._apply_scene_fields(None, scene, {
+        "global_channels": {"visual": "stale mirror"},
+        "global_channel_docs": {"visual": document},
+    })
+    assert scene.global_channels["visual"] == "structured"
+    assert scene.global_channel_docs["visual"] == document
+
+
+def test_flat_global_replacement_of_anchored_document_is_controlled_conflict():
+    scene = _scene()
+    attachment = prompt_context.normalize_attachment({"kind": "shot"})
+    scene.global_attachments = [attachment]
+    scene.set_global_channel_documents({"visual": {"nodes": [
+        {"type": "text", "node_id": "text", "text": "hello"},
+        {"type": "attachment", "node_id": "anchor",
+         "attachment_id": attachment["attachment_id"]},
+    ]}})
+    with pytest.raises(routes.ProjectMutationRequestError) as conflict:
+        routes._apply_scene_fields(None, scene, {
+            "global_channels": {"visual": "flat replacement"},
+        })
+    assert (conflict.value.status, conflict.value.code) == (
+        409, "structured_edit_conflict")
+
+
+def test_flat_section_replacement_of_anchor_is_controlled_and_atomic():
+    attachment = prompt_context.normalize_attachment({"kind": "guide"})
+    section = PromptSection(
+        0, 20, channels={"visual": "before"}, attachments=[attachment],
+        channel_docs={"visual": {"nodes": [
+            {"type": "text", "node_id": "text", "text": "before"},
+            {"type": "attachment", "node_id": "anchor",
+             "attachment_id": attachment["attachment_id"]},
+        ]}},
+    )
+    scene = _scene()
+    scene.prompt_sections = [section]
+    before = section.to_dict()
+    with pytest.raises(routes.ProjectMutationRequestError) as conflict:
+        routes._apply_update_prompt_section(
+            scene, 0, {"channels": {"visual": "flat replacement"}})
+    assert (conflict.value.status, conflict.value.code) == (
+        409, "structured_edit_conflict")
+    assert section.to_dict() == before
 
 
 def test_round_trip_preserves_channels_and_section_exceptions():
@@ -306,7 +356,9 @@ def test_writing_tool_apply_carries_global_channels_not_the_flat_mirror():
     # label, which is right when retargeting and lossy when there is nothing to
     # retarget.
     assert "channelTemplateKeySetsEqual(" in widget
-    assert "? normalizeChannels(channels, \"\", templateChannelKeys(activeChannelTemplate))" in widget
+    same_template_branch = widget.split("if (!sameChannelTemplate)", 1)[1].split("};", 1)[0]
+    assert "retargetChannelDocuments(" in same_template_branch
+    assert "normalizePromptDocument(" in same_template_branch
 
 
 def test_set_global_prompt_is_still_destructive_so_the_flat_path_stays_correct():

@@ -636,6 +636,54 @@ def test_find_asset_usages_returns_unified_usage_list(tmp_path):
     assert usage["usages"][3]["job_id"] == "job-1"
 
 
+def test_pending_reference_snapshot_is_an_authoritative_asset_usage(tmp_path):
+    project = _make_project(tmp_path)
+    asset = Asset(asset_id="asset-1", asset_type="image", path="media/ref.png", name="Ref")
+    project.assets = [asset]
+    project.generation_queue = [GenerationJob(
+        job_id="job-1", scene_id="scene-1", scene_name="Opening", status="pending",
+        reference_input_snapshots=[{"kind": "asset", "value": asset.to_dict()}],
+    )]
+
+    usage = routes._find_asset_usages(project, asset)
+
+    assert [entry["type"] for entry in usage["usages"]] == ["queued_reference_input"]
+    assert routes._has_pending_frozen_input_usage(usage) is True
+
+
+def test_pending_reference_snapshot_blocks_delete_and_replace_even_with_force(tmp_path, monkeypatch):
+    module = _load_route_module(monkeypatch)
+    project = _make_project(tmp_path)
+    asset = Asset(asset_id="asset-1", asset_type="image", path="media/ref.png", name="Ref")
+    project.assets = [asset]
+    project.generation_queue = [GenerationJob(
+        job_id="job-1", scene_id="scene-1", scene_name="Opening", status="running",
+        reference_input_snapshots=[{"kind": "asset", "value": asset.to_dict()}],
+    )]
+    _write_project_file(project, asset.path, b"original")
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    monkeypatch.setattr(module, "save_project", lambda project: None)
+
+    delete_request = DummyRequest(
+        match_info={"project_id": "phase-2", "asset_id": "asset-1"},
+        body={"force": True},
+    )
+    delete_response = asyncio.run(module.api_delete_asset(delete_request))
+    replace_request = DummyRequest(
+        match_info={"project_id": "phase-2", "asset_id": "asset-1"},
+        body={"source_path": "replacement.png"},
+    )
+    replace_response = asyncio.run(module.api_replace_asset(replace_request))
+
+    assert delete_response.status == 409
+    assert _response_json(delete_response)["code"] == "queued_reference_input"
+    assert replace_response.status == 409
+    assert _response_json(replace_response)["error"] == "Asset is frozen by a pending Reference generation"
+    assert project.get_asset("asset-1") is asset
+    assert asset.trashed_at == ""
+    assert (tmp_path / "project" / "media" / "ref.png").read_bytes() == b"original"
+
+
 def test_rename_project_asset_folder_updates_assets_and_returns_assets_moved(tmp_path):
     project = _make_project(tmp_path)
     project.assets = [

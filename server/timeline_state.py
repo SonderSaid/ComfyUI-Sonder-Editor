@@ -6,7 +6,7 @@ from datetime import datetime
 import os
 from typing import Any
 
-from . import prompt_payload
+from . import minimax_h3, prompt_context, prompt_live_context, prompt_payload
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs, pad_lane_recipes
 from .reference_resolution import REFERENCE_OUTPUT_NAMES, migrate_live_outputs
 
@@ -48,6 +48,21 @@ REFERENCE_TAG_PRESETS = (
     {"id": "sonder:location", "label": "Location", "asset_types": ["image", "video"], "suggested_kinds": ["location"]},
     {"id": "sonder:first_frame", "label": "First Frame", "asset_types": ["image"], "suggested_kinds": ["location"]},
     {"id": "sonder:voice_identity", "label": "Voice Identity", "asset_types": ["audio", "video"], "suggested_kinds": ["character"], "requires_audio": True},
+    {"id": "sonder:h3_last_frame", "label": "Last Frame", "asset_types": ["image"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_keyframe", "label": "Keyframe", "asset_types": ["image"], "suggested_kinds": ["location", "character"]},
+    {"id": "sonder:h3_storyboard", "label": "Storyboard", "asset_types": ["image"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_composition_anchor", "label": "Composition Anchor", "asset_types": ["image"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_identity", "label": "Identity Reference", "asset_types": ["image", "video"], "suggested_kinds": ["character", "prop", "outfit"]},
+    {"id": "sonder:h3_environment", "label": "Environment Reference", "asset_types": ["image", "video"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_style", "label": "Style Reference", "asset_types": ["image", "video"], "suggested_kinds": ["location", "outfit"]},
+    {"id": "sonder:h3_motion", "label": "Motion Reference", "asset_types": ["image", "video"], "suggested_kinds": ["character", "prop", "outfit"]},
+    {"id": "sonder:h3_edit", "label": "Video Edit", "asset_types": ["video"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_continuation", "label": "Video Continuation", "asset_types": ["video"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_temporal_structure", "label": "Temporal Structure", "asset_types": ["video"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_audio_copy", "label": "Audio Copy", "asset_types": ["audio", "video"], "suggested_kinds": ["character"]},
+    {"id": "sonder:h3_audio_reference", "label": "Audio Characteristics", "asset_types": ["audio", "video"], "suggested_kinds": ["character", "location"]},
+    {"id": "sonder:h3_music_rhythm", "label": "Music / Rhythm", "asset_types": ["audio", "video"], "suggested_kinds": ["location"]},
+    {"id": "sonder:h3_sound_texture", "label": "Sound Texture", "asset_types": ["audio", "video"], "suggested_kinds": ["location"]},
 )
 
 # Backend-owned recipe catalog. Lane state stores a materialized copy of the
@@ -144,6 +159,68 @@ REFERENCE_RECIPE_PRESETS = (
     },
 )
 
+# H3's three coordinated populations are setup-owned rather than ordinary
+# interchangeable Reference recipes. Keep them in a distinct catalog so the
+# legacy eight-recipe compatibility surface remains stable while the API can
+# still present every built-in to new authoring clients.
+MINIMAX_H3_REFERENCE_RECIPE_PRESETS = (
+    {
+        "id": "sonder:minimax_h3_picture",
+        "name": "MiniMax H3 Pictures",
+        "media_kind": "image",
+        "hard": {"assembly": "slots", "max_members": 9, "output_size": "native",
+                 "short_edge_max": 2048, "size_multiple": 32,
+                 "size_rounding": "floor",
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
+        "soft": {"suggested_tags": ["sonder:h3_identity", "sonder:h3_environment",
+                                     "sonder:h3_style", "sonder:h3_motion"],
+                 "compatible_profiles": ["minimax_h3_ref@1"],
+                 "physical_population": "pictures",
+                 "exposed_capabilities": ["definitions", "retention", "mentions"],
+                 "role_fields": ["role", "visual_intent"]},
+    },
+    {
+        "id": "sonder:minimax_h3_video",
+        "name": "MiniMax H3 Videos (IMAGE sequences)",
+        # Video is an IMAGE-serving bridge lane. The physical population keeps
+        # authoring video-only without inventing a fourth bridge media type.
+        "media_kind": "image",
+        "hard": {"assembly": "slots", "max_members": 3, "output_size": "native",
+                 "short_edge_max": 2048, "size_multiple": 32,
+                 "size_rounding": "floor",
+                 "frame_rate": 24.0, "frame_rate_source": "custom",
+                 "frame_count_snap": "floor_grid", "minimum_frames": 5,
+                 "frame_step": 17, "frame_offset": 5,
+                 "live_outputs": ["image_slots", "reference_prompt", "reference_names"]},
+        "soft": {"suggested_tags": ["sonder:h3_edit", "sonder:h3_continuation",
+                                     "sonder:h3_temporal_structure"],
+                 "recommended_duration_min_sec": 2.0,
+                 "recommended_duration_max_sec": 15.0,
+                 "compatible_profiles": ["minimax_h3_ref@1"],
+                 "physical_population": "videos",
+                 "exposed_capabilities": ["definitions", "retention", "mentions", "audio_relationship"],
+                 "role_fields": ["role", "visual_intent", "audio_intent"]},
+    },
+    {
+        "id": "sonder:minimax_h3_audio",
+        "name": "MiniMax H3 Standalone Audio",
+        "media_kind": "audio",
+        "hard": {"assembly": "audio", "max_members": 3,
+                 "live_outputs": ["audio_slots", "reference_prompt", "reference_names"]},
+        "soft": {"suggested_tags": ["sonder:h3_audio_copy", "sonder:h3_music_rhythm",
+                                     "sonder:h3_sound_texture", "sonder:h3_audio_reference"],
+                 "compatible_profiles": ["minimax_h3_ref@1"],
+                 "physical_population": "standalone_audios",
+                 "exposed_capabilities": ["definitions", "retention", "mentions", "audio_relationship"],
+                 "role_fields": ["role", "audio_intent"]},
+    },
+)
+
+ALL_REFERENCE_RECIPE_PRESETS = (
+    *REFERENCE_RECIPE_PRESETS,
+    *MINIMAX_H3_REFERENCE_RECIPE_PRESETS,
+)
+
 
 IMAGE_ASSEMBLIES = ("batch", "sheet", "temporal", "slots")
 
@@ -215,6 +292,14 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "int", "min": 1, "max": 64, "default": 1,
      "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
      "help": "Both sides snap to this multiple. 1 leaves the size alone."},
+    {"key": "size_rounding", "section": "hard", "group": "Geometry", "label": "Side rounding",
+     "type": "enum", "values": ["nearest", "floor"], "default": "nearest",
+     "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
+     "help": "Round dimensions to the nearest multiple, or always floor them so a model limit is never exceeded.",
+     "value_help": {
+         "nearest": "Snap each side to the closest valid multiple.",
+         "floor": "Always snap down so the decoded reference never exceeds its model limit.",
+     }},
     {"key": "size_multiple_source", "section": "hard", "group": "Geometry", "label": "Multiple taken from",
      "type": "enum", "values": ["custom", "template"], "default": "custom",
      "applies_to": list(IMAGE_ASSEMBLIES), "requires": "", "requires_value": "",
@@ -238,12 +323,24 @@ REFERENCE_RECIPE_FIELDS = (
      }},
     {"key": "frame_step", "section": "hard", "group": "Frame grid", "label": "Frame step",
      "type": "int", "min": 1, "max": 64, "default": 8,
-     "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
+     "applies_to": ["batch", "sheet", "temporal", "slots"], "requires": "", "requires_value": "",
      "help": "Temporal VAE stride of the assembled reference sequence."},
     {"key": "frame_offset", "section": "hard", "group": "Frame grid", "label": "Frame offset",
      "type": "int", "min": 0, "max": 64, "default": 1,
-     "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
+     "applies_to": ["batch", "sheet", "temporal", "slots"], "requires": "", "requires_value": "",
      "help": "Grid offset, so valid lengths are step x k + offset."},
+    {"key": "frame_count_snap", "section": "hard", "group": "Frame grid", "label": "Video span snapping",
+     "type": "enum", "values": ["nearest", "floor_grid"], "default": "nearest",
+     "applies_to": ["batch", "slots"], "requires": "", "requires_value": "",
+     "help": "Nearest keeps the resampled source length. Floor grid chooses the largest valid step x k + offset length that fits.",
+     "value_help": {
+         "nearest": "Keep the nearest whole-frame resampled source length.",
+         "floor_grid": "Use the largest valid step x k + offset length that fits without extending the source.",
+     }},
+    {"key": "minimum_frames", "section": "hard", "group": "Frame grid", "label": "Minimum video frames",
+     "type": "int", "min": 1, "max": 4096, "default": 1,
+     "applies_to": ["batch", "slots"], "requires": "frame_count_snap", "requires_value": "floor_grid",
+     "help": "Smallest IMAGE-sequence length emitted when a video span is snapped down."},
     {"key": "frame_grid_source", "section": "hard", "group": "Frame grid", "label": "Frame grid taken from",
      "type": "enum", "values": ["custom", "template"], "default": "custom",
      "applies_to": ["sheet", "temporal"], "requires": "", "requires_value": "",
@@ -300,7 +397,8 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "string", "default": "",
      "applies_to": [], "requires": "", "requires_value": "",
      "help": "Repeated once per staged member. Placeholders: {n} member number from 1, {index} from 0, "
-             "{prompt} the member's own text, {name} its Library name. Use as many as you like, e.g. "
+             "{prompt} the member's own text, {name} its prompt-safe Entity_Member label, "
+             "{entity_name} and {member_name} the explicit normalized pieces. Use as many as you like, e.g. "
              "'<Subject {n}> is {prompt}, from <Picture {n}>'. With no {prompt}/{name} the member text is "
              "appended after the pattern. Each expansion is also emitted on its own p01-p16 output."},
     {"key": "suggested_tags", "section": "soft", "group": "Advisories", "label": "Suggested member tags",
@@ -315,6 +413,34 @@ REFERENCE_RECIPE_FIELDS = (
      "type": "number", "min": 0, "max": 3600, "default": 0,
      "applies_to": [], "requires": "", "requires_value": "",
      "help": "Suggests a longer take when the staged audio is shorter than this."},
+    {"key": "recommended_duration_min_sec", "section": "soft", "group": "Advisories", "label": "Recommended minimum seconds",
+     "type": "number", "min": 0, "max": 3600, "default": 0,
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Advisory lower duration bound; it never changes or blocks the render window."},
+    {"key": "recommended_duration_max_sec", "section": "soft", "group": "Advisories", "label": "Recommended maximum seconds",
+     "type": "number", "min": 0, "max": 3600, "default": 0,
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Advisory upper duration bound; it never changes or blocks the render window."},
+    {"key": "compatible_profiles", "section": "soft", "group": "Prompt Context", "label": "Works with prompt formats",
+     "type": "string_list", "default": ["generic@1"],
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Immutable prompt-format ids this recipe may feed. Custom formats use profile_id@version."},
+    {"key": "physical_population", "section": "soft", "group": "Prompt Context", "label": "Model input",
+     "type": "enum", "values": ["none", "pictures", "videos", "standalone_audios"], "default": "none",
+     "applies_to": [], "requires": "", "requires_value": "",
+     "value_help": {"none": "Prompt-only recipe; it claims no provider input population.",
+                    "pictures": "Contributes ordered Picture input slots.",
+                    "videos": "Contributes ordered Video input slots.",
+                    "standalone_audios": "Contributes ordered standalone Audio input slots."},
+     "help": "Which provider-neutral setup population this recipe contributes."},
+    {"key": "exposed_capabilities", "section": "soft", "group": "Prompt Context", "label": "Prompt parts added",
+     "type": "string_list", "default": ["derived_prompt"],
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Prompt parts a staged item exposes to compatible prompt formats."},
+    {"key": "role_fields", "section": "soft", "group": "Prompt Context", "label": "Per-member options",
+     "type": "string_list", "default": [],
+     "applies_to": [], "requires": "", "requires_value": "",
+     "help": "Provider-neutral staged-member options this recipe lets the user author. Allowed roles come from the prompt-format/model-input catalog."},
     {"key": "silent_single_input", "section": "soft", "group": "Advisories", "label": "Model reads one image",
      "type": "bool", "default": False,
      "applies_to": [], "requires": "", "requires_value": "",
@@ -523,6 +649,10 @@ class Asset:
 class ReferenceMember:
     member_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     asset_id: str = ""
+    # Optional human-authored suffix.  Entity identity remains separate and
+    # stable; prompt-facing composite labels are derived by the shared
+    # Reference formatter rather than persisted here.
+    name: str = ""
     tags: list[str] = field(default_factory=list)
     prompt: str = ""
     crop: dict | None = None
@@ -534,6 +664,7 @@ class ReferenceMember:
         return {
             "member_id": self.member_id,
             "asset_id": self.asset_id,
+            "name": self.name,
             "tags": list(self.tags),
             "prompt": self.prompt,
             "crop": dict(self.crop) if isinstance(self.crop, dict) else None,
@@ -557,6 +688,7 @@ class ReferenceMember:
         return cls(
             member_id=str(data.get("member_id", "") or ""),
             asset_id=str(data.get("asset_id", "") or ""),
+            name=str(data.get("name", "") or "").strip(),
             tags=normalize_reference_tags(data.get("tags")),
             prompt=str(data.get("prompt", "") or ""),
             crop=normalize_reference_crop(data.get("crop")),
@@ -578,6 +710,8 @@ class ReferenceEntity:
     # model. It replaced a longer free-form `notes` field, which is dropped on
     # load rather than migrated: the two overlapped, and neither had shipped.
     description: str = ""
+    visual_intent: str = "preserve"
+    audio_intent: str = "reference_characteristics"
     members: list[ReferenceMember] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -587,6 +721,8 @@ class ReferenceEntity:
             "kind": self.kind,
             "reference_class": self.reference_class,
             "description": self.description,
+            "visual_intent": self.visual_intent,
+            "audio_intent": self.audio_intent,
             "members": [member.to_dict() for member in self.members],
         }
 
@@ -620,25 +756,35 @@ class ReferenceEntity:
         for order, member in enumerate(members):
             member.order = order
 
+        visual_intent = str(data.get("visual_intent") or "preserve")
+        if visual_intent not in prompt_context.VISUAL_INTENTS:
+            visual_intent = "preserve"
+        audio_intent = str(data.get("audio_intent") or "reference_characteristics")
+        if audio_intent not in prompt_context.AUDIO_INTENTS:
+            audio_intent = "reference_characteristics"
         return cls(
             reference_id=str(data.get("reference_id", "") or ""),
             name=name,
             kind=kind,
             reference_class=reference_class,
             description=str(data.get("description", "") or ""),
+            visual_intent=visual_intent,
+            audio_intent=audio_intent,
             members=members,
         )
 
 
 @dataclass
 class ReferenceLaneRecipe:
+    lane_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     media_kind: str = "image"
     recipe_id: str = ""
     recipe: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
-            "media_kind": "audio" if self.media_kind == "audio" else "image",
+            "lane_id": self.lane_id,
+            "media_kind": self.media_kind if self.media_kind in {"image", "audio", "video"} else "image",
             "recipe_id": str(self.recipe_id or ""),
             "recipe": dict(self.recipe) if isinstance(self.recipe, dict) else {},
         }
@@ -647,13 +793,35 @@ class ReferenceLaneRecipe:
     def from_dict(cls, data: dict) -> "ReferenceLaneRecipe":
         if not isinstance(data, dict):
             data = {}
+        recipe_id = str(data.get("recipe_id", "") or "")
         media_kind = str(data.get("media_kind", "image") or "image")
-        if media_kind not in {"image", "audio"}:
+        if media_kind not in {"image", "audio", "video"}:
             media_kind = "image"
         recipe = migrate_reference_recipe(data.get("recipe", {}))
+        if recipe_id in {"sonder:minimax_h3_picture", "sonder:minimax_h3_video"}:
+            recipe = dict(recipe)
+            hard = dict(recipe.get("hard") or {})
+            hard.update({"short_edge_max": 2048, "size_multiple": 32,
+                         "size_rounding": "floor"})
+            if recipe_id == "sonder:minimax_h3_video":
+                media_kind = "image"
+                hard.update({"assembly": "slots", "max_members": 3,
+                             "output_size": "native", "frame_rate": 24.0,
+                             "frame_rate_source": "custom",
+                             "frame_count_snap": "floor_grid",
+                             "minimum_frames": 5, "frame_step": 17,
+                             "frame_offset": 5})
+                soft = dict(recipe.get("soft") or {})
+                soft["physical_population"] = "videos"
+                soft["role_fields"] = [value for value in
+                                       soft.get("role_fields", [])
+                                       if value != "paired_audio_asset_id"]
+                recipe["soft"] = soft
+            recipe["hard"] = hard
         return cls(
+            lane_id=str(data.get("lane_id") or "").strip() or uuid.uuid4().hex,
             media_kind=media_kind,
-            recipe_id=str(data.get("recipe_id", "") or ""),
+            recipe_id=recipe_id,
             recipe=dict(recipe) if isinstance(recipe, dict) else {},
         )
 
@@ -697,6 +865,12 @@ class ReferenceItem:
             members.append({
                 "entity_id": str(raw_member.get("entity_id", "") or ""),
                 "member_id": member_id,
+                **({"visual_intent": str(raw_member.get("visual_intent"))}
+                   if raw_member.get("visual_intent") in prompt_context.VISUAL_INTENTS else {}),
+                **({"audio_intent": str(raw_member.get("audio_intent"))}
+                   if raw_member.get("audio_intent") in prompt_context.AUDIO_INTENTS else {}),
+                **({"role": str(raw_member.get("role"))}
+                   if str(raw_member.get("role") or "").strip() else {}),
             })
         try:
             lane_index = max(0, int(data.get("lane_index", 0) or 0))
@@ -775,6 +949,86 @@ def repair_reference_ids(project: "TimelineProject") -> None:
                 )
                 member.member_id = member_id
             seen_members.add(member_id)
+
+
+def ensure_default_prompt_semantic_units(project: "TimelineProject") -> None:
+    """Give each Reference entity its provider-neutral default Subject unit."""
+    normalized = [prompt_context.normalize_semantic_unit(value)
+                  for value in getattr(project, "prompt_semantic_units", []) or []
+                  if isinstance(value, dict)]
+    references = list(getattr(project, "references", []) or [])
+    reference_ids = {str(getattr(reference, "reference_id", "") or "")
+                     for reference in references}
+
+    # Older UI entity/member mutations could create the empty default first,
+    # then append a second unit with the same stable id when the first member
+    # arrived.  Coalesce only provider-generated default ids; custom Subjects
+    # retain their authored identity and membership.
+    default_by_entity = {}
+    retained = []
+    for unit in normalized:
+        unit_id = str(unit.get("semantic_unit_id") or "")
+        entity_id = unit_id[5:] if unit_id.startswith("unit:") else ""
+        if entity_id not in reference_ids:
+            retained.append(unit)
+            continue
+        primary = default_by_entity.get(entity_id)
+        if primary is None:
+            default_by_entity[entity_id] = unit
+            retained.append(unit)
+            continue
+        if not primary.get("definition") and unit.get("definition"):
+            primary["definition"] = unit["definition"]
+        primary["intent_overrides"] = {
+            **(unit.get("intent_overrides") or {}),
+            **(primary.get("intent_overrides") or {}),
+        }
+
+    covered_entities = {
+        str(member.get("entity_id") or "")
+        for unit in retained for member in unit.get("source_members", [])
+        if isinstance(member, dict)
+    }
+    for order, reference in enumerate(references):
+        entity_id = str(getattr(reference, "reference_id", "") or "")
+        if not entity_id:
+            continue
+        default_unit = default_by_entity.get(entity_id)
+        if default_unit is not None:
+            default_unit.update({
+                "name": getattr(reference, "name", "Subject") or "Subject",
+                "source_members": [
+                    {"entity_id": entity_id, "member_id": member.member_id}
+                    for member in getattr(reference, "members", []) or []
+                ],
+                "visual_intent": getattr(reference, "visual_intent", "preserve"),
+                "audio_intent": getattr(
+                    reference, "audio_intent", "reference_characteristics"),
+            })
+            continue
+        if str(getattr(reference, "reference_class", "context") or "context") != "subject":
+            continue
+        if entity_id in covered_entities:
+            # A custom Subject already owns this entity and the generated
+            # default was explicitly removed; do not recreate it.
+            continue
+        default_unit = prompt_context.normalize_semantic_unit({
+            "semantic_unit_id": f"unit:{entity_id}",
+            "name": getattr(reference, "name", "Subject") or "Subject",
+            "order": order,
+            "source_members": [
+                {"entity_id": entity_id, "member_id": member.member_id}
+                for member in getattr(reference, "members", []) or []
+            ],
+            "visual_intent": getattr(reference, "visual_intent", "preserve"),
+            "audio_intent": getattr(reference, "audio_intent", "reference_characteristics"),
+            # Creative definition is intentionally blank. Attachments expose
+            # it as a blocking authored field rather than inventing prose.
+            "definition": "",
+        })
+        retained.append(default_unit)
+        default_by_entity[entity_id] = default_unit
+    project.prompt_semantic_units = retained
 
 
 def effective_scene_fps(project, scene) -> float:
@@ -1034,17 +1288,8 @@ class LaneConfig:
 # ---------------------------------------------------------------------------
 
 def _migrated_shot_timestamp(data: dict) -> bool:
-    """`shot_timestamp` for a stored section, migrated to the ungated rule.
-
-    The flag used to be gated behind `starts_new_shot` and defaulted True, so a
-    section that opened no shot could carry a meaningless `True` that emitted
-    nothing. Ungated, that stored value would suddenly stamp the section. Drop
-    it: under the old rule the combination was unobservable, so this migration
-    cannot change any existing project's output.
-    """
-    if not bool(data.get("shot_timestamp", False)):
-        return False
-    return bool(data.get("starts_new_shot", False))
+    """Read the legacy boolean mirror before attachment canonicalization."""
+    return bool(data.get("shot_timestamp", False))
 
 
 class PromptSection:
@@ -1062,8 +1307,10 @@ class PromptSection:
     def __init__(self, start_frame: int = 0, end_frame: int = 0,
                  prompt: str = "", channels: dict | None = None,
                  muted: bool = False, starts_new_shot: bool = False,
-                 subject_ids: list | None = None, shot_timestamp: bool = False,
-                 global_channel_exceptions: list | None = None):
+                 shot_timestamp: bool = False,
+                 global_channel_exceptions: list | None = None,
+                 channel_docs: dict | None = None,
+                 attachments: list | None = None):
         self.prompt_id = uuid.uuid4().hex[:8]
         self.start_frame = start_frame
         self.end_frame = end_frame
@@ -1072,25 +1319,45 @@ class PromptSection:
         # split: a split is a range operation, and inheriting would open two
         # shots from one and shift every later [Shot N].
         self.starts_new_shot = bool(starts_new_shot)
-        # Whether this section stamps its cut time. FULLY independent of
-        # `starts_new_shot`: all four combinations are legal, including a bare
-        # `At 00:07.000,` on a section that continues the current shot. Defaults
-        # OFF — ungated, an on-by-default would stamp every section.
+        # Legacy mirror for Shot.config.timestamp. Constructor migration turns
+        # a timestamp-only input into a timed Shot before the object is exposed.
         self.shot_timestamp = bool(shot_timestamp)
-        # Reference entities appearing in this section, as
-        # [{entity_id, retention}, ...] — retention is a per-BINDING attribute,
-        # which is why this is not a flat list of ids.
-        self.subject_ids = prompt_payload.normalize_subject_ids(subject_ids)
         # Scene-global channels this section does NOT inherit. An EXCEPTIONS
         # set, not an inherit map: the default is to inherit everything, so a
         # channel added to the template later is inherited without touching a
         # single section, and an untouched project stores nothing.
         self.global_channel_exceptions = prompt_payload.normalize_channel_exceptions(
             global_channel_exceptions)
-        if isinstance(channels, dict):
-            self.channels = prompt_payload.normalize_channels(channels)
-        else:
-            self.channels = prompt_payload.normalize_channels(None, legacy_prompt=prompt)
+        mirrors = (prompt_payload.normalize_channels(channels)
+                   if isinstance(channels, dict)
+                   else prompt_payload.normalize_channels(None, legacy_prompt=prompt))
+        self.channel_docs = prompt_context.normalize_channel_documents(
+            channel_docs, mirrors, mirrors.keys())
+        self.channels = prompt_context.channel_document_mirrors(self.channel_docs)
+        legacy_timestamp_ids = {
+            value["attachment_id"]
+            for value in prompt_context.normalize_attachments(attachments)
+            if (value["kind"] == "timestamp"
+                and not bool((value.get("config") or {}).get("standalone")))
+        }
+        self.attachments = prompt_context.migrate_legacy_markers(
+            attachments, self.starts_new_shot, self.shot_timestamp)
+        if legacy_timestamp_ids:
+            # Marker placement was always section-level even when the old
+            # inline picker allowed a Timestamp anchor. The canonical Shot
+            # option replaces that record, so remove its now-meaningless anchor
+            # instead of persisting a dangling document node.
+            self.channel_docs = {
+                key: prompt_context.normalize_prompt_document({
+                    "nodes": [node for node in document.get("nodes", [])
+                              if not (node.get("type") == "attachment"
+                                      and node.get("attachment_id")
+                                      in legacy_timestamp_ids)]
+                })
+                for key, document in self.channel_docs.items()
+            }
+            self._refresh_channel_mirrors()
+        self.refresh_marker_mirrors()
 
     @property
     def prompt(self) -> str:
@@ -1098,7 +1365,43 @@ class PromptSection:
 
     @prompt.setter
     def prompt(self, value):
-        self.channels = prompt_payload.normalize_channels(None, legacy_prompt=value)
+        self.set_channels(prompt_payload.normalize_channels(
+            None, legacy_prompt=value), replace=True)
+
+    def _refresh_channel_mirrors(self) -> None:
+        self.channels = prompt_context.channel_document_mirrors(self.channel_docs)
+
+    def set_channels(self, patch, *, replace=False) -> None:
+        """Apply flat text without ever deleting an inline Context chip."""
+        incoming = prompt_payload.normalize_channels(patch)
+        keys = ((set(self.channel_docs) | set(incoming)) if replace
+                else set(incoming))
+        updated = dict(self.channel_docs)
+        for key in keys:
+            updated[key] = prompt_context.replace_document_text(
+                updated.get(key, prompt_context.text_document()),
+                incoming.get(key, ""))
+        self.channel_docs = updated
+        self._refresh_channel_mirrors()
+
+    def set_channel_documents(self, documents) -> None:
+        keys = set(self.channels) | set(documents or {})
+        self.channel_docs = prompt_context.normalize_channel_documents(
+            documents, self.channels, keys)
+        self._refresh_channel_mirrors()
+
+    def refresh_marker_mirrors(self) -> None:
+        self.attachments = prompt_context.migrate_legacy_markers(self.attachments)
+        self.starts_new_shot = any(
+            value.get("enabled", True) and value.get("kind") == "shot"
+            for value in self.attachments)
+        self.shot_timestamp = any(
+            value.get("enabled", True) and (
+                (value.get("kind") == "shot"
+                 and bool((value.get("config") or {}).get("timestamp")))
+                or (value.get("kind") == "timestamp"
+                    and bool((value.get("config") or {}).get("standalone"))))
+            for value in self.attachments)
 
     def __eq__(self, other):
         if not isinstance(other, PromptSection):
@@ -1108,7 +1411,6 @@ class PromptSection:
                 and self.channels == other.channels
                 and self.starts_new_shot == other.starts_new_shot
                 and self.shot_timestamp == other.shot_timestamp
-                and self.subject_ids == other.subject_ids
                 and self.global_channel_exceptions == other.global_channel_exceptions)
 
     def __repr__(self):
@@ -1121,10 +1423,14 @@ class PromptSection:
             "start_frame": self.start_frame,
             "end_frame": self.end_frame,
             "channels": dict(self.channels),
+            "channel_docs": {
+                key: prompt_context.normalize_prompt_document(value)
+                for key, value in self.channel_docs.items()
+            },
+            "attachments": [dict(value) for value in self.attachments],
             "muted": self.muted,
             "starts_new_shot": self.starts_new_shot,
             "shot_timestamp": self.shot_timestamp,
-            "subject_ids": [dict(entry) for entry in self.subject_ids],
             "global_channel_exceptions": list(self.global_channel_exceptions),
             # Label-free composed mirror for older readers / downgrades.
             "prompt": self.prompt,
@@ -1145,8 +1451,10 @@ class PromptSection:
             # off/empty. See the migration note below for stored `True`s.
             starts_new_shot=bool(data.get("starts_new_shot", False)),
             shot_timestamp=_migrated_shot_timestamp(data),
-            subject_ids=data.get("subject_ids"),
             global_channel_exceptions=data.get("global_channel_exceptions"),
+            channel_docs=(data.get("channel_docs")
+                          if isinstance(data.get("channel_docs"), dict) else None),
+            attachments=data.get("attachments"),
         )
         section.prompt_id = data.get("prompt_id", uuid.uuid4().hex[:8])
         return section
@@ -1161,7 +1469,13 @@ class Scene:
     duration_frames: int = 0                # desired total length (0 = empty/placeholder)
     prompt: str = ""                        # DERIVED label-free mirror of global_channels; see set_global_prompt
     global_channels: dict = field(default_factory=dict)  # scene-global prompt, per channel (source of truth)
+    global_channel_docs: dict = field(default_factory=dict)
+    global_attachments: list = field(default_factory=list)
     prompt_sections: list = field(default_factory=list)  # list[PromptSection]
+    prompt_context_profile_id: str = ""
+    prompt_context_profile_config: dict = field(default_factory=dict)
+    minimax_h3_conditioning_setups: list = field(default_factory=list)
+    active_minimax_h3_setup_id: str = ""
     generation_params: dict = field(default_factory=dict)  # seed, cfg, sampler, model, etc.
     batch_config: BatchConfig = field(default_factory=BatchConfig)
     guide_frames: list = field(default_factory=list)    # list[GuideFrame]
@@ -1194,6 +1508,13 @@ class Scene:
         if not isinstance(self.global_channels, dict) or not self.global_channels:
             self.global_channels = prompt_payload.normalize_channels(
                 None, legacy_prompt=self.prompt or "")
+        self.global_channel_docs = prompt_context.normalize_channel_documents(
+            self.global_channel_docs, self.global_channels,
+            self.global_channels.keys())
+        self.global_channels = prompt_context.channel_document_mirrors(
+            self.global_channel_docs)
+        self.global_attachments = prompt_context.normalize_attachments(
+            self.global_attachments)
         self._refresh_global_mirror()
 
     def _refresh_global_mirror(self) -> None:
@@ -1209,8 +1530,15 @@ class Scene:
         route that writes `body["prompt"]` must come through here, or an
         ordinary scene update would silently wipe global channels 2..n.
         """
-        self.global_channels = prompt_payload.normalize_channels(
+        incoming = prompt_payload.normalize_channels(
             None, legacy_prompt=str(value or ""))
+        updated = dict(self.global_channel_docs)
+        for key in set(updated) | set(incoming):
+            updated[key] = prompt_context.replace_document_text(
+                updated.get(key, prompt_context.text_document()),
+                incoming.get(key, ""))
+        self.global_channel_docs = updated
+        self.global_channels = prompt_context.channel_document_mirrors(updated)
         self._refresh_global_mirror()
 
     def set_global_channels(self, patch) -> None:
@@ -1219,8 +1547,55 @@ class Scene:
         Merges rather than replaces for the same reason section channels do:
         a client only sends the channels of the template it is authoring under.
         """
-        self.global_channels = prompt_payload.merge_channels(self.global_channels, patch)
+        incoming = patch if isinstance(patch, dict) else {}
+        updated = dict(self.global_channel_docs)
+        for key, value in incoming.items():
+            key = str(key)
+            updated[key] = prompt_context.replace_document_text(
+                updated.get(key, prompt_context.text_document()), value)
+        self.global_channel_docs = updated
+        self.global_channels = prompt_context.channel_document_mirrors(updated)
         self._refresh_global_mirror()
+
+    def set_global_channel_documents(self, documents) -> None:
+        keys = set(self.global_channels) | set(documents or {})
+        self.global_channel_docs = prompt_context.normalize_channel_documents(
+            documents, self.global_channels, keys)
+        self.global_channels = prompt_context.channel_document_mirrors(
+            self.global_channel_docs)
+        self._refresh_global_mirror()
+
+    def compile_prompt_context(self, start, end, *, labels_on=True,
+                               delimiter=prompt_payload.DEFAULT_SECTION_DELIMITER,
+                               boundary_threshold_pct=0.0, template=None,
+                               fps=24.0, profile=None, custom_profiles=None,
+                               context=None) -> dict:
+        global_hidden = bool(getattr(self.global_prompt_track_config, "hidden", False))
+        sections_hidden = bool(getattr(self.prompt_track_config, "hidden", False))
+        return prompt_context.compile_prompt_context(
+            global_documents={} if global_hidden else self.global_channel_docs,
+            global_channels={} if global_hidden else self.global_channels,
+            global_attachments=[] if global_hidden else self.global_attachments,
+            sections=[] if sections_hidden else self.prompt_sections,
+            window_start=start, window_end=end, fps=fps,
+            template=template,
+            profile=profile or self.prompt_context_profile_id or None,
+            custom_profiles=custom_profiles,
+            context=context,
+            labels_on=labels_on, delimiter=delimiter,
+            boundary_threshold_pct=boundary_threshold_pct,
+        )
+
+    def compile_for_execution(self, project, start, end, *, labels_on=True,
+                              delimiter=prompt_payload.DEFAULT_SECTION_DELIMITER,
+                              boundary_threshold_pct=0.0, reference_threshold_pct=0.0,
+                              template=None, fps=24.0) -> dict:
+        """Compile the complete live execution envelope with project context."""
+        return prompt_live_context.compile_live_scene_prompt_context(
+            project, self, template=template, window_start=start, window_end=end,
+            fps=fps, labels_on=labels_on, delimiter=delimiter,
+            prompt_threshold=boundary_threshold_pct,
+            reference_threshold=reference_threshold_pct)
 
 
     @property
@@ -1243,17 +1618,21 @@ class Scene:
     def get_prompt_at_frame(self, frame: int, labels_on: bool = True,
                             delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER,
                             boundary_threshold_pct: float = 0.0,
-                            template=None, fps: float = 0.0) -> str:
+                            template=None, fps: float = 0.0, project=None,
+                            reference_threshold_pct: float = 0.0) -> str:
         """Composed prompt (global + covering section) for a single frame."""
         return self.get_prompt_for_range(frame, frame + 1, labels_on=labels_on,
                                          delimiter=delimiter,
                                          boundary_threshold_pct=boundary_threshold_pct,
-                                         template=template, fps=fps)
+                                         template=template, fps=fps, project=project,
+                                         reference_threshold_pct=reference_threshold_pct)
 
     def get_prompt_for_range(self, start: int, end: int, labels_on: bool = True,
                              delimiter: str = prompt_payload.DEFAULT_SECTION_DELIMITER,
                              boundary_threshold_pct: float = 0.0,
-                             template=None, fps: float = 0.0) -> str:
+                             template=None, fps: float = 0.0, project=None,
+                             reference_threshold_pct: float = 0.0,
+                             compile_result_out: dict | None = None) -> str:
         """Composed single-string prompt for a frame range.
 
         Global lane text + ALL segments overlapping the window in temporal
@@ -1272,6 +1651,25 @@ class Scene:
         # actually reaches.
         global_channels = None if global_hidden else dict(self.global_channels or {})
         sections = [] if sections_hidden else self.prompt_sections
+        has_context = bool(self.global_attachments or any(
+            getattr(section, "attachments", None)
+            or any(prompt_context.document_has_anchors(document)
+                   for document in getattr(section, "channel_docs", {}).values())
+            for section in sections))
+        if has_context:
+            compiled = (self.compile_for_execution(
+                project, start, end, labels_on=labels_on, delimiter=delimiter,
+                boundary_threshold_pct=boundary_threshold_pct,
+                reference_threshold_pct=reference_threshold_pct,
+                template=template, fps=fps) if project is not None else
+                self.compile_prompt_context(
+                    start, end, labels_on=labels_on, delimiter=delimiter,
+                    boundary_threshold_pct=boundary_threshold_pct,
+                    template=template, fps=fps))
+            if isinstance(compile_result_out, dict):
+                compile_result_out.clear()
+                compile_result_out.update(compiled)
+            return compiled["prompt"] if not compiled["errors"] else ""
         return prompt_payload.compose_range_prompt(
             global_text, sections, start, end,
             labels_on=labels_on, delimiter=delimiter,
@@ -1311,7 +1709,16 @@ class Scene:
             "prompt": prompt_payload.compose_section_text(
                 self.global_channels, labels_on=False),
             "global_channels": dict(self.global_channels),
+            "global_channel_docs": {
+                key: prompt_context.normalize_prompt_document(value)
+                for key, value in self.global_channel_docs.items()
+            },
+            "global_attachments": [dict(value) for value in self.global_attachments],
             "prompt_sections": [p.to_dict() for p in self.prompt_sections],
+            "prompt_context_profile_id": self.prompt_context_profile_id,
+            "prompt_context_profile_config": dict(self.prompt_context_profile_config),
+            "minimax_h3_conditioning_setups": [dict(value) for value in self.minimax_h3_conditioning_setups],
+            "active_minimax_h3_setup_id": self.active_minimax_h3_setup_id,
             "generation_params": self.generation_params,
             "batch_config": self.batch_config.to_dict(),
             "guide_frames": [g.to_dict() for g in self.guide_frames],
@@ -1357,6 +1764,15 @@ class Scene:
             # channels from the flat prompt above.
             global_channels=(data.get("global_channels")
                              if isinstance(data.get("global_channels"), dict) else {}),
+            global_channel_docs=(data.get("global_channel_docs")
+                                 if isinstance(data.get("global_channel_docs"), dict) else {}),
+            global_attachments=data.get("global_attachments", []),
+            prompt_context_profile_id=str(data.get("prompt_context_profile_id") or ""),
+            prompt_context_profile_config=(dict(data.get("prompt_context_profile_config"))
+                                           if isinstance(data.get("prompt_context_profile_config"), dict) else {}),
+            minimax_h3_conditioning_setups=[dict(value) for value in data.get("minimax_h3_conditioning_setups", [])
+                                            if isinstance(value, dict)],
+            active_minimax_h3_setup_id=str(data.get("active_minimax_h3_setup_id") or ""),
             generation_params=data.get("generation_params", {}),
             batch_config=BatchConfig.from_dict(data.get("batch_config", {})),
             asset_ids=data.get("asset_ids", []),
@@ -1418,6 +1834,22 @@ class Scene:
         ]
         pad_lane_configs(scene, LaneConfig)
         pad_lane_recipes(scene, ReferenceLaneRecipe)
+        (
+            scene.minimax_h3_conditioning_setups,
+            setup_repair_warnings,
+        ) = minimax_h3.repair_setup_lane_bindings(
+            scene.minimax_h3_conditioning_setups,
+            scene.reference_lane_recipes,
+        )
+        for warning in setup_repair_warnings:
+            logger.warning(
+                "MiniMax H3 setup lane repair: code=%s setup_id=%s population=%s old_lane_id=%s lane_id=%s",
+                warning.get("code", ""),
+                warning.get("setup_id", ""),
+                warning.get("population", ""),
+                warning.get("old_lane_id", ""),
+                warning.get("lane_id", ""),
+            )
         scene.guide_track_config = LaneConfig.from_dict(data.get("guide_track_config", {}))
         scene.prompt_track_config = LaneConfig.from_dict(data.get("prompt_track_config", {}))
         raw_global_config = data.get("global_prompt_track_config")
@@ -1761,6 +2193,9 @@ class GenerationJob:
     reference_lane_configs: list = field(default_factory=list)
     reference_lane_recipes: list = field(default_factory=list)
     prompt_sections: list = field(default_factory=list)
+    compiled_prompt_context: dict = field(default_factory=dict)
+    reference_input_snapshots: list = field(default_factory=list)
+    minimax_h3_setup_snapshot: dict = field(default_factory=dict)
     scene_width: int = 0
     scene_height: int = 0
     scene_fps: float = 0.0
@@ -1806,6 +2241,9 @@ class GenerationJob:
             "reference_lane_configs": list(self.reference_lane_configs),
             "reference_lane_recipes": list(self.reference_lane_recipes),
             "prompt_sections": list(self.prompt_sections),
+            "compiled_prompt_context": dict(self.compiled_prompt_context),
+            "reference_input_snapshots": list(self.reference_input_snapshots),
+            "minimax_h3_setup_snapshot": dict(self.minimax_h3_setup_snapshot),
             "scene_width": self.scene_width,
             "scene_height": self.scene_height,
             "scene_fps": self.scene_fps,
@@ -1862,6 +2300,11 @@ class GenerationJob:
                 if isinstance(value, dict)
             ],
             prompt_sections=list(data.get("prompt_sections", []) or []),
+            compiled_prompt_context=(dict(data.get("compiled_prompt_context"))
+                                     if isinstance(data.get("compiled_prompt_context"), dict) else {}),
+            reference_input_snapshots=list(data.get("reference_input_snapshots", []) or []),
+            minimax_h3_setup_snapshot=(dict(data.get("minimax_h3_setup_snapshot"))
+                                      if isinstance(data.get("minimax_h3_setup_snapshot"), dict) else {}),
             scene_width=data.get("scene_width", 0),
             scene_height=data.get("scene_height", 0),
             scene_fps=data.get("scene_fps", 0.0),
@@ -1896,6 +2339,8 @@ class TimelineProject:
     assets: list = field(default_factory=list)           # list[Asset] — project media registry
     references: list = field(default_factory=list)       # list[ReferenceEntity] — project Reference Library
     reference_recipes: list = field(default_factory=list)  # project-durable custom Reference recipes
+    prompt_context_profiles: list = field(default_factory=list)
+    prompt_semantic_units: list = field(default_factory=list)
     generation_queue: list = field(default_factory=list)  # list[GenerationJob]
     metadata: dict = field(default_factory=dict)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -2034,6 +2479,8 @@ class TimelineProject:
             "assets": [a.to_dict() for a in self.assets],
             "references": [reference.to_dict() for reference in self.references],
             "reference_recipes": [dict(recipe) for recipe in self.reference_recipes if isinstance(recipe, dict)],
+            "prompt_context_profiles": [dict(profile) for profile in self.prompt_context_profiles],
+            "prompt_semantic_units": [dict(unit) for unit in self.prompt_semantic_units],
             "generation_queue": [j.to_dict() for j in self.generation_queue],
             "metadata": self.metadata,
             "created_at": self.created_at,
@@ -2073,7 +2520,25 @@ class TimelineProject:
         project.reference_recipes = [
             migrate_reference_recipe(recipe) for recipe in raw_reference_recipes if isinstance(recipe, dict)
         ]
+        raw_profiles = data.get("prompt_context_profiles", [])
+        if not isinstance(raw_profiles, list):
+            raw_profiles = []
+        project.prompt_context_profiles = []
+        for profile in raw_profiles:
+            try:
+                project.prompt_context_profiles.append(
+                    prompt_context.normalize_profile(profile))
+            except ValueError:
+                logger.warning("Dropped invalid custom prompt context profile")
+        raw_units = data.get("prompt_semantic_units", [])
+        if not isinstance(raw_units, list):
+            raw_units = []
+        project.prompt_semantic_units = [
+            prompt_context.normalize_semantic_unit(unit)
+            for unit in raw_units if isinstance(unit, dict)
+        ]
         repair_reference_ids(project)
+        ensure_default_prompt_semantic_units(project)
         project.generation_queue = [
             GenerationJob.from_dict(j) for j in data.get("generation_queue", [])
         ]

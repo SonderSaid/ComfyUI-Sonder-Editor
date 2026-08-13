@@ -165,6 +165,76 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     assert "render_cache_enabled" not in optional_fields
 
 
+@pytest.mark.parametrize("demand", ["prompt", "frames", "unknown"])
+def test_live_prompt_blockers_follow_output_demand_gate(
+    tmp_path, monkeypatch, caplog, demand
+):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+
+    class BlockingScene:
+        scene_id = "scene-1"
+        name = "Scene 1"
+        duration_frames = 8
+        width = 0
+        height = 0
+        fps = 0
+        guide_frames = []
+
+        @staticmethod
+        def compile_for_execution(*_args, **_kwargs):
+            return {"prompt": "legacy fail-open text", "errors": [{
+                "code": "broken_reference_source", "message": "Rebind it.",
+            }]}
+
+    class BlockingProject:
+        fps = 24.0
+        resolution = (4, 4)
+        project_dir = str(tmp_path)
+        metadata = {}
+        template_id = "free"
+        frame_constraint = None
+        _execution_context = None
+        _scene = BlockingScene()
+
+        def get_scene(self, scene_id):
+            return self._scene if scene_id == self._scene.scene_id else None
+
+        @staticmethod
+        def get_asset(_asset_id):
+            return None
+
+    project = BlockingProject()
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames",
+        lambda self, proj, scene, start, end, **_kwargs:
+            torch.zeros(max(1, end - start), 2, 2, 3))
+    monkeypatch.setattr(editor_node.SonderEditor, "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0))
+    graph = None if demand == "unknown" else _prompt_graph({
+        "editor": _prompt_node("SonderEditor"),
+        "consumer": _prompt_node("Consumer", {
+            "input": ["editor", 5 if demand == "prompt" else 1],
+        }),
+    })
+    kwargs = dict(project="Existing Project", project_name="Ignored", fps=24.0,
+                  width=4, height=4, scene_id="scene-1", selection_start=0,
+                  selection_end=8, prompt=graph,
+                  unique_id=None if demand == "unknown" else "editor")
+
+    if demand == "prompt":
+        with pytest.raises(RuntimeError, match="broken_reference_source"):
+            editor_node.SonderEditor().execute(**kwargs)
+        return
+    caplog.set_level("WARNING", logger="sonder_editor")
+    result = editor_node.SonderEditor().execute(**kwargs)
+    assert result[5] == "legacy fail-open text"
+    if demand == "unknown":
+        assert "output demand is unknown" in caplog.text
+    else:
+        assert "output demand is unknown" not in caplog.text
+
+
 class _FrameConstraintScene:
     scene_id = "scene-1"
     name = "Scene 1"

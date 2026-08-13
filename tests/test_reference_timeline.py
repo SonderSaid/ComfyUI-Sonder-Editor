@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from server import routes
+from server import minimax_h3, routes
 from server.reference_resolution import resolve_effective_references
 from server.timeline_state import (
     Asset,
@@ -75,6 +75,36 @@ def test_reference_scene_and_queue_round_trip_preserves_sentinel_and_recipe():
     assert (healed.strength, healed.sequence_frames) == (1.0, 0)
 
 
+def test_generic_queue_freezes_reference_entity_member_and_asset_catalog():
+    project, scene = _project_with_reference("image")
+    project.references[0].members[0].name = "portrait"
+    scene.reference_items = [ReferenceItem(
+        reference_item_id="item", lane_index=0, start_frame=0, end_frame=-1,
+        members=[{"entity_id": "entity-1", "member_id": "member-1"}],
+    )]
+    job = GenerationJob(
+        scene_id=scene.scene_id, selection_start=0, selection_end=20,
+        params={"snapshot_version": 1}, reference_lane_count=3,
+        reference_lane_configs=[LaneConfig(hidden=True).to_dict()],
+        reference_lane_recipes=[ReferenceLaneRecipe(media_kind="audio").to_dict()],
+        reference_item_snapshots=[],
+    )
+
+    routes._compose_frozen_job_prompt(project, job)
+
+    by_kind = {entry["kind"]: entry["value"]
+               for entry in job.reference_input_snapshots}
+    assert job.reference_lane_count == scene.reference_lane_count
+    assert job.reference_lane_configs == [value.to_dict()
+                                           for value in scene.reference_lane_configs]
+    assert job.reference_lane_recipes == [value.to_dict()
+                                           for value in scene.reference_lane_recipes]
+    assert job.reference_item_snapshots == [scene.reference_items[0].to_dict()]
+    assert by_kind["reference"]["name"] == "Subject"
+    assert by_kind["reference"]["members"][0]["name"] == "portrait"
+    assert by_kind["asset"]["path"] == "media/one.image"
+
+
 def test_reference_item_crud_enforces_exact_expected_overlap_and_media_kind():
     project, scene = _project_with_reference("image")
     first = routes._apply_create_reference_item(project, scene, {
@@ -136,6 +166,66 @@ def test_reference_item_crud_enforces_exact_expected_overlap_and_media_kind():
     assert lane_mismatch.value.code == "reference_media_kind_mismatch"
 
 
+def test_reference_item_preserves_and_validates_staged_role_overrides():
+    project, scene = _project_with_reference("image")
+    scene.prompt_context_profile_id = "minimax_h3_ref@1"
+    scene.reference_lane_recipes[0] = ReferenceLaneRecipe(
+        media_kind="image", recipe_id="custom-h3-picture", recipe={
+            "soft": {"compatible_profiles": ["minimax_h3_ref@1"],
+                     "physical_population": "pictures",
+                     "role_fields": ["role", "visual_intent"]},
+        })
+    item = routes._apply_create_reference_item(project, scene, {
+        "lane_index": 0, "members": [{
+            "member_id": "member-1", "role": "identity",
+            "visual_intent": "partial",
+        }],
+    })
+    assert item.members == [{
+        "entity_id": "entity-1", "member_id": "member-1",
+        "visual_intent": "partial", "role": "identity",
+    }]
+    routes._apply_update_reference_item(project, scene, {
+        "reference_item_id": item.reference_item_id,
+        "expected": {"members": item.to_dict()["members"]},
+        "fields": {"members": [{
+            "member_id": "member-1", "role": "keyframe",
+            "visual_intent": "preserve",
+        }]},
+    })
+    assert item.members[0]["role"] == "keyframe"
+    with pytest.raises(routes.ProjectMutationRequestError) as invalid:
+        routes._apply_update_reference_item(project, scene, {
+            "reference_item_id": item.reference_item_id,
+            "expected": {"members": item.to_dict()["members"]},
+            "fields": {"members": [{"member_id": "member-1",
+                                     "role": "unsupported"}]},
+        })
+    assert invalid.value.code == "unsupported_reference_role"
+
+
+def test_h3_picture_population_rejects_video_while_generic_image_lane_keeps_compatibility():
+    project, scene = _project_with_reference("image")
+    project.assets[0].asset_type = "video"
+    generic = routes._apply_create_reference_item(project, scene, {
+        "lane_index": 0, "members": [{"member_id": "member-1"}],
+    })
+    assert generic.members[0]["member_id"] == "member-1"
+
+    scene.prompt_context_profile_id = "minimax_h3_ref@1"
+    scene.reference_lane_recipes[1] = ReferenceLaneRecipe(
+        media_kind="image", recipe={"soft": {
+            "compatible_profiles": ["minimax_h3_ref@1"],
+            "physical_population": "pictures",
+            "role_fields": [],
+        }})
+    with pytest.raises(routes.ProjectMutationRequestError) as mismatch:
+        routes._apply_create_reference_item(project, scene, {
+            "lane_index": 1, "members": [{"member_id": "member-1"}],
+        })
+    assert mismatch.value.code == "reference_media_kind_mismatch"
+
+
 def test_reference_lane_removal_keeps_recipe_array_aligned():
     _, scene = _project_with_reference("image")
     scene.reference_lane_count = 3
@@ -183,6 +273,169 @@ def test_populated_reference_lane_refuses_media_kind_change():
             "fields": {"reference_recipe": ReferenceLaneRecipe(media_kind="audio").to_dict()},
         })
     assert mismatch.value.code == "reference_media_kind_mismatch"
+
+
+def _h3_lane_recipe(lane_id, population="pictures"):
+    return ReferenceLaneRecipe(
+        lane_id=lane_id,
+        media_kind="audio" if population == "standalone_audios" else "image",
+        recipe={"soft": {
+            "compatible_profiles": ["minimax_h3_ref@1"],
+            "physical_population": population,
+        }},
+    )
+
+
+def _h3_reference_setup(**lane_ids):
+    return minimax_h3.normalize_setup({
+        "setup_id": "setup",
+        "mode": "reference",
+        "task_mode": "T2VA",
+        **lane_ids,
+    })
+
+
+def test_reference_lane_config_save_preserves_lane_id_and_setup_resolution():
+    lane = _h3_lane_recipe("pictures")
+    scene = Scene(
+        scene_id="scene", duration_frames=24,
+        reference_lane_count=1,
+        reference_lane_configs=[LaneConfig()],
+        reference_lane_recipes=[lane],
+        minimax_h3_conditioning_setups=[_h3_reference_setup(
+            picture_lane_ids=["pictures"])],
+        active_minimax_h3_setup_id="setup",
+    )
+
+    incoming = lane.to_dict()
+    incoming.pop("lane_id")
+    incoming["recipe"]["name"] = "Edited"
+    routes._apply_lane_config(scene, {
+        "lane_type": "reference", "lane_index": 0,
+        "fields": {"reference_recipe": incoming},
+    })
+
+    assert scene.reference_lane_recipes[0].lane_id == "pictures"
+    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == ["pictures"]
+    resolved = minimax_h3.resolve_setup(
+        setup=scene.minimax_h3_conditioning_setups[0],
+        reference_items=scene.reference_items,
+        lane_recipes=scene.reference_lane_recipes,
+        lane_configs=scene.reference_lane_configs,
+        lane_count=scene.reference_lane_count,
+        scene_duration=scene.duration_frames,
+        window_start=0, window_end=scene.duration_frames,
+    )
+    assert not any(error["code"] == "missing_setup_lane"
+                   for error in resolved["errors"])
+
+
+def test_reference_lane_id_change_and_removal_reconcile_setup_in_same_mutation():
+    scene = Scene(
+        scene_id="scene", duration_frames=24,
+        reference_lane_count=2,
+        reference_lane_configs=[LaneConfig(), LaneConfig()],
+        reference_lane_recipes=[
+            _h3_lane_recipe("pictures-a"),
+            _h3_lane_recipe("pictures-b"),
+        ],
+        minimax_h3_conditioning_setups=[_h3_reference_setup(
+            picture_lane_ids=["pictures-a", "pictures-b"])],
+        active_minimax_h3_setup_id="setup",
+    )
+
+    routes._apply_lane_config(scene, {
+        "lane_type": "reference", "lane_index": 0,
+        "fields": {"reference_recipe": _h3_lane_recipe("pictures-new").to_dict()},
+    })
+    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
+        "pictures-new", "pictures-b"]
+
+    routes._set_scene_lane_count(scene, "reference", 1)
+    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
+        "pictures-new"]
+
+
+def test_reference_lane_removal_prunes_setup_binding_without_retargeting_shifted_lane():
+    scene = Scene(
+        scene_id="scene", duration_frames=24,
+        reference_lane_count=3,
+        reference_lane_configs=[LaneConfig(), LaneConfig(), LaneConfig()],
+        reference_lane_recipes=[
+            _h3_lane_recipe("pictures-a"),
+            _h3_lane_recipe("pictures-b"),
+            _h3_lane_recipe("pictures-c"),
+        ],
+        minimax_h3_conditioning_setups=[_h3_reference_setup(
+            picture_lane_ids=["pictures-a", "pictures-b", "pictures-c"])],
+        active_minimax_h3_setup_id="setup",
+    )
+
+    routes._remove_media_lane(scene, "reference", 1, "require_empty")
+    assert [recipe.lane_id for recipe in scene.reference_lane_recipes] == [
+        "pictures-a", "pictures-c"]
+    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
+        "pictures-a", "pictures-c"]
+
+
+def test_scene_load_repairs_unambiguous_stale_setup_lane_and_drops_ambiguous_one():
+    raw_recipe = _h3_lane_recipe("discarded").to_dict()
+    raw_recipe.pop("lane_id")
+    base = {
+        "scene_id": "scene", "duration_frames": 24,
+        "reference_lane_count": 1,
+        "reference_lane_configs": [{}],
+        "reference_lane_recipes": [raw_recipe],
+        "minimax_h3_conditioning_setups": [_h3_reference_setup(
+            picture_lane_ids=["dead-lane"])],
+        "active_minimax_h3_setup_id": "setup",
+    }
+    repaired = Scene.from_dict(base)
+    minted_lane_id = repaired.reference_lane_recipes[0].lane_id
+    assert minted_lane_id and minted_lane_id != "dead-lane"
+    assert repaired.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
+        minted_lane_id]
+
+    ambiguous = dict(base)
+    ambiguous["reference_lane_count"] = 2
+    ambiguous["reference_lane_configs"] = [{}, {}]
+    ambiguous["reference_lane_recipes"] = [dict(raw_recipe), dict(raw_recipe)]
+    loaded = Scene.from_dict(ambiguous)
+    assert loaded.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == []
+
+
+def test_scene_load_does_not_retarget_lane_that_still_exists_on_wrong_population():
+    scene = Scene.from_dict({
+        "scene_id": "scene", "duration_frames": 24,
+        "reference_lane_count": 2,
+        "reference_lane_configs": [{}, {}],
+        "reference_lane_recipes": [
+            _h3_lane_recipe("lane-p", "videos").to_dict(),
+            _h3_lane_recipe("lane-q", "pictures").to_dict(),
+        ],
+        "minimax_h3_conditioning_setups": [_h3_reference_setup(
+            picture_lane_ids=["lane-p"])],
+        "active_minimax_h3_setup_id": "setup",
+    })
+    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
+        "lane-p"]
+    resolved = minimax_h3.resolve_setup(
+        setup=scene.minimax_h3_conditioning_setups[0],
+        reference_items=[], lane_recipes=scene.reference_lane_recipes,
+        lane_configs=scene.reference_lane_configs,
+        lane_count=scene.reference_lane_count,
+        scene_duration=scene.duration_frames, window_start=0, window_end=24,
+    )
+    assert any(error["code"] == "setup_lane_population_mismatch"
+               for error in resolved["errors"])
+
+
+def test_frontend_default_reference_recipe_mints_lane_identity():
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    method = source.split("_defaultReferenceLaneRecipe(overrides = {}) {", 1)[1].split(
+        "\n    }", 1)[0]
+    assert "randomUUID" in method
+    assert "lane_id: laneId" in method
 
 
 def test_python_and_browser_reference_resolvers_share_most_specific_semantics():
@@ -252,11 +505,18 @@ def test_wrong_media_drop_cannot_repurpose_a_configured_reference_lane():
 
 
 def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
-    """Library/timeline mutations move the durable version; slots follow it."""
+    """Durable writes and browser-local render-window changes refresh slots."""
     bridge = (ROOT / "web" / "js" / "reference_bridge.js").read_text(encoding="utf-8")
     client = (ROOT / "web" / "js" / "api_client.js").read_text(encoding="utf-8")
+    controller = (ROOT / "web" / "js" / "editor_node_controller.js").read_text(encoding="utf-8")
+    window_events = (ROOT / "web" / "js" / "editor_render_window_events.js").read_text(encoding="utf-8")
     assert 'import { onProjectVersionChanged } from "./api_client.js";' in bridge
     assert "onProjectVersionChanged(refreshAllBridges);" in bridge
+    assert "onEditorRenderWindowChanged(refreshAllBridges);" in bridge
+    assert "emitEditorRenderWindowChanged({" in controller
+    for field in ("scene_id", "selection_start", "selection_end",
+                  "pre_context_frames", "post_context_frames"):
+        assert f'"{field}"' in window_events
     assert "lane.image_slot_count" in bridge
     assert "lane.audio_slot_count" in bridge
     assert "lane.prompt_slot_count" in bridge
@@ -269,6 +529,48 @@ def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():
     assert "applyReferenceBridgeShape(node, FULL_SHAPE)" in bridge
     assert "export function onProjectVersionChanged(callback)" in client
     assert "if (next !== current) emitProjectVersionChanged(normalizedProjectId, next);" in client
+
+
+def test_editor_render_window_event_channel_is_browser_local_and_unsubscribable():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for render-window event coverage")
+    module_url = (ROOT / "web" / "js" / "editor_render_window_events.js").as_uri()
+    script = f"""
+const target = new EventTarget();
+globalThis.window = {{
+  addEventListener: (...args) => target.addEventListener(...args),
+  removeEventListener: (...args) => target.removeEventListener(...args),
+  dispatchEvent: (...args) => target.dispatchEvent(...args),
+}};
+if (typeof globalThis.CustomEvent === 'undefined') {{
+  globalThis.CustomEvent = class extends Event {{
+    constructor(type, options = {{}}) {{ super(type); this.detail = options.detail; }}
+  }};
+}}
+const mod = await import({json.dumps(module_url)});
+const calls = [];
+const off = mod.onEditorRenderWindowChanged((detail) => calls.push(detail.field));
+mod.emitEditorRenderWindowChanged({{field: 'selection_start'}});
+off();
+mod.emitEditorRenderWindowChanged({{field: 'selection_end'}});
+console.log(JSON.stringify({{
+  calls,
+  selection: mod.isEditorRenderWindowField('selection_start'),
+  context: mod.isEditorRenderWindowField('post_context_frames'),
+  mask: mod.isEditorRenderWindowField('mask_post_offset'),
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    ).stdout)
+    assert result == {
+        "calls": ["selection_start"],
+        "selection": True,
+        "context": True,
+        "mask": False,
+    }
 
 
 def test_recipe_output_liveness_mirrors_across_backend_and_frontend():
@@ -432,3 +734,110 @@ def test_bridge_references_gates_the_prompt_block_apart_from_the_r_block(monkeyp
     assert audio["media_kind"] == "audio"
     assert "reference_prompt" in audio["live_outputs"]
     assert audio["slot_count"] == 0 and audio["prompt_slot_count"] == 0
+
+
+def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monkeypatch):
+    import importlib
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+
+    import server
+    import server.routes as routes_module
+    from server.timeline_state import MINIMAX_H3_REFERENCE_RECIPE_PRESETS
+
+    monkeypatch.setattr(
+        server, "PromptServer",
+        SimpleNamespace(instance=SimpleNamespace(routes=web.RouteTableDef())),
+        raising=False)
+    module = importlib.reload(routes_module)
+    definition = next(
+        row for row in MINIMAX_H3_REFERENCE_RECIPE_PRESETS
+        if row["id"] == "sonder:minimax_h3_video")
+    recipe = ReferenceLaneRecipe(
+        lane_id="video-lane", media_kind=definition["media_kind"],
+        recipe_id=definition["id"],
+        recipe={"name": definition["name"], "hard": dict(definition["hard"]),
+                "soft": dict(definition["soft"])})
+    assets = [
+        Asset(asset_id="early-asset", asset_type="video", duration_sec=2),
+        Asset(asset_id="late-asset", asset_type="video", duration_sec=2),
+    ]
+    references = [
+        ReferenceEntity(reference_id="early", name="Early", members=[
+            ReferenceMember(member_id="early-member", asset_id="early-asset")]),
+        ReferenceEntity(reference_id="late", name="Late", members=[
+            ReferenceMember(member_id="late-member", asset_id="late-asset")]),
+    ]
+    scene = Scene(
+        scene_id="scene-1", duration_frames=100,
+        reference_lane_count=1, reference_lane_configs=[LaneConfig()],
+        reference_lane_recipes=[recipe],
+        reference_items=[
+            ReferenceItem(reference_item_id="early-item", lane_index=0,
+                          start_frame=0, end_frame=30,
+                          members=[{"entity_id": "early", "member_id": "early-member"}]),
+            ReferenceItem(reference_item_id="late-item", lane_index=0,
+                          start_frame=60, end_frame=90,
+                          members=[{"entity_id": "late", "member_id": "late-member"}]),
+        ],
+        minimax_h3_conditioning_setups=[{
+            "setup_id": "setup", "mode": "reference",
+            "video_lane_ids": ["video-lane"],
+        }],
+        active_minimax_h3_setup_id="setup",
+    )
+    project = TimelineProject(
+        project_id="project-1", assets=assets, references=references,
+        scenes=[scene])
+    monkeypatch.setattr(module, "_load_project_from_request", lambda request: project)
+    handler = next(r.handler for r in module.routes
+                   if r.method == "GET" and r.path.endswith("/bridge-references"))
+
+    def payload(start, end):
+        request = make_mocked_request(
+            "GET", ("/sonder-editor/project/project-1/scenes/scene-1/bridge-references"
+                    f"?selection_start={start}&selection_end={end}"))
+        request.match_info.update({"project_id": "project-1", "scene_id": "scene-1"})
+        response = asyncio.run(handler(request))
+        assert response.status == 200
+        return json.loads(response.text)
+
+    early = payload(5, 20)
+    early_lane = early["references"][0]
+    assert (early["window_start"], early["window_end"]) == (5, 20)
+    assert early_lane["media_kind"] == "image"
+    assert early_lane["image_slot_count"] == 1
+    assert early_lane["slot_labels"] == ["Video 1 · Early (subject)"]
+
+    late = payload(65, 80)["references"][0]
+    assert late["slot_labels"] == ["Video 1 · Late (subject)"]
+
+    absent = payload(40, 50)["references"][0]
+    assert absent["member_count"] == 0
+    assert absent["image_slot_count"] == 0
+    assert absent["slot_labels"] == []
+
+    project.generation_queue = [GenerationJob(
+        job_id="running", scene_id="scene-1", status="running",
+        params={"snapshot_version": 1},
+        reference_lane_count=1,
+        reference_lane_configs=[LaneConfig().to_dict()],
+        reference_lane_recipes=[recipe.to_dict()],
+        reference_item_snapshots=[scene.reference_items[0].to_dict()],
+        compiled_prompt_context={"window": {"start_frame": 0, "end_frame": 20}},
+        reference_input_snapshots=[{
+            "kind": "reference", "value": references[0].to_dict(),
+        }],
+        minimax_h3_setup_snapshot={"videos": [{
+            "lane_id": "video-lane", "member_id": "early-member",
+            "video_ordinal": 1,
+        }]},
+    )]
+    references[0].name = "Changed Live Name"
+    frozen = payload(65, 80)
+    assert frozen["source"] == "snapshot"
+    assert (frozen["window_start"], frozen["window_end"]) == (0, 20)
+    assert frozen["references"][0]["slot_labels"] == [
+        "Video 1 · Early (subject)"]

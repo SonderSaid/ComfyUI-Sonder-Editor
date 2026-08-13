@@ -1,6 +1,7 @@
 /**
- * KeyboardOwnership — single window-capture root that beats LiteGraph's
- * document-capture handlers regardless of registration order.
+ * KeyboardOwnership — single window-capture root for keydown, keyup and paste
+ * that beats LiteGraph's document-capture handlers regardless of registration
+ * order.
  *
  * Consumers register with a priority. On each event, consumers are dispatched
  * highest priority first; same priority dispatches LIFO (last-registered wins).
@@ -17,9 +18,14 @@
 
 export const PRIORITY = Object.freeze({
     OVERLAY: 100,
+    TEXT_EDITOR: 75,
     GALLERY: 50,
     EDITOR: 10,
 });
+
+// Consume propagation at the window root while preserving the browser's native
+// editing default (`beforeinput`/`input`, selection movement, button clicks).
+export const PRESERVE_DEFAULT = Symbol("keyboard-preserve-default");
 
 const MODULE_VERSION = "2026-04-23-debug-probe";
 const consumers = [];
@@ -104,8 +110,14 @@ function dispatch(eventName, event) {
         }
         debugLog(`consumer ${consumer.id} ${eventName}`, {
             event: eventSummary(event),
-            result: result === true ? "consume" : (result === false ? "pass" : String(result)),
+            result: result === true ? "consume"
+                : (result === PRESERVE_DEFAULT ? "preserve-default"
+                    : (result === false ? "pass" : String(result))),
         });
+        if (result === PRESERVE_DEFAULT) {
+            event.stopImmediatePropagation();
+            return;
+        }
         if (result === true) {
             debugLog(`consumed ${eventName}`, {
                 consumerId: consumer.id,
@@ -123,11 +135,13 @@ function dispatch(eventName, event) {
 
 function onKeydown(event) { dispatch("keydown", event); }
 function onKeyup(event) { dispatch("keyup", event); }
+function onPaste(event) { dispatch("paste", event); }
 
 function attachIfNeeded() {
     if (attached) return;
     window.addEventListener("keydown", onKeydown, true);
     window.addEventListener("keyup", onKeyup, true);
+    window.addEventListener("paste", onPaste, true);
     attached = true;
     debugLog("attached window listeners");
 }
@@ -136,6 +150,7 @@ function detachIfIdle() {
     if (!attached || consumers.length) return;
     window.removeEventListener("keydown", onKeydown, true);
     window.removeEventListener("keyup", onKeyup, true);
+    window.removeEventListener("paste", onPaste, true);
     attached = false;
     debugLog("detached window listeners");
 }
@@ -152,9 +167,12 @@ let registrationCounter = 0;
  * @param {(event: KeyboardEvent) => boolean} [options.keydown] - Return true
  *   to consume; false to let dispatch continue.
  * @param {(event: KeyboardEvent) => boolean} [options.keyup] - Same contract.
+ * @param {(event: ClipboardEvent) => boolean} [options.paste] - Return false
+ *   to let target paste handlers run. PRESERVE_DEFAULT stops propagation and
+ *   therefore must not be used when an element-level paste handler owns input.
  * @returns {() => void} unregister closure (idempotent).
  */
-export function register({ id, priority, keydown, keyup }) {
+export function register({ id, priority, keydown, keyup, paste }) {
     if (typeof id !== "string" || !id) {
         throw new Error("[KeyboardOwnership] register requires a string id");
     }
@@ -166,6 +184,7 @@ export function register({ id, priority, keydown, keyup }) {
         priority,
         keydown: typeof keydown === "function" ? keydown : null,
         keyup: typeof keyup === "function" ? keyup : null,
+        paste: typeof paste === "function" ? paste : null,
         registeredAt: ++registrationCounter,
     };
     consumers.push(consumer);
@@ -175,6 +194,7 @@ export function register({ id, priority, keydown, keyup }) {
         priority: consumer.priority,
         keydown: !!consumer.keydown,
         keyup: !!consumer.keyup,
+        paste: !!consumer.paste,
         totalConsumers: consumers.length,
     });
 
