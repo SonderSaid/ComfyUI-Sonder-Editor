@@ -815,6 +815,9 @@ class TimelineExportManager:
                     custom_options=custom_options,
                     timeout=export_timeout,
                     cancel_event=job.cancel_event,
+                    # Frames stream from a generator, so encode_video cannot measure the
+                    # length itself; declare it so the audio mux is bounded by the video.
+                    expected_frame_count=int(frame_count),
                     progress_callback=lambda done: (
                         setattr(job, "frames_done", min(int(done), int(frame_count))),
                         setattr(job, "message", f"Encoding frame {min(int(done), int(frame_count))} / {frame_count}..."),

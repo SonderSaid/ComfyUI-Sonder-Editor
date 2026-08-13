@@ -11,6 +11,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1677,3 +1678,153 @@ def test_guide_extraction_and_loader_paths_are_measured(tmp_path, monkeypatch):
     assert summary["ffmpeg_extract_png"]["available"] is True
     assert summary["editor_video_opencv"]["available"] is True
     assert summary["bridge_video_opencv"]["available"] is True
+
+
+def _write_silent_wav(path: Path, seconds: float, *, rate: int = 48000, channels: int = 2) -> Path:
+    """Exact-length silent PCM WAV, written without invoking ffmpeg so the audio
+    duration under test is precise rather than encoder-rounded."""
+    import wave
+
+    frames = max(0, int(round(seconds * rate)))
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(b"\x00" * (frames * channels * 2))
+    return path
+
+
+def _count_video_frames(ffmpeg: str, path: Path) -> int:
+    """Decoded video frame count. Uses ffmpeg rather than ffprobe because
+    imageio-ffmpeg ships no ffprobe binary."""
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(path), "-map", "0:v", "-f", "null", "-"],
+        capture_output=True,
+        timeout=180,
+    )
+    matches = re.findall(rb"frame=\s*(\d+)", result.stderr)
+    return int(matches[-1]) if matches else -1
+
+
+def _decoded_audio_seconds(ffmpeg: str, path: Path) -> float:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-v", "error", "-i", str(path),
+         "-map", "0:a", "-f", "s16le", "-ac", "2", "-ar", "48000", "-"],
+        capture_output=True,
+        timeout=180,
+    )
+    return len(result.stdout) / 4 / 48000.0
+
+
+def test_encode_video_audio_mux_is_bounded_by_video_not_audio(tmp_path, monkeypatch):
+    """Command-shape guard for the chained-context corruption: a muxed encode must
+    bound the output by the VIDEO duration and pad the audio, never let `-shortest`
+    end the file at a short audio stream. See encode_video for why."""
+    _ensure_test_package()
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    np = pytest.importorskip("numpy")
+
+    frames = np.zeros((121, 4, 4, 3), dtype=np.uint8)
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"fake")
+
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: "ffmpeg")
+    captured = _install_fake_streaming_popen(media_helpers, monkeypatch)
+
+    for preset in media_helpers.SAVE_VIDEO_PRESET_ORDER:
+        if preset == media_helpers.CUSTOM_SAVE_VIDEO_PRESET:
+            continue
+        media_helpers.encode_video(
+            frames,
+            preset_id=preset,
+            output_path=str(tmp_path / "out.mp4"),
+            fps=24,
+            audio_path=str(audio_path),
+        )
+        cmd = captured["cmds"][-1]
+        assert "-shortest" not in cmd, preset
+        assert cmd[cmd.index("-af") + 1] == "apad", preset
+        # 121 frames at 24 fps — the exact case that lost its final frame.
+        assert cmd[cmd.index("-t") + 1] == f"{121 / 24.0:.6f}", preset
+
+    # No audio: no pad, no duration bound, no -shortest.
+    media_helpers.encode_video(
+        frames,
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "silent.mp4"),
+        fps=24,
+    )
+    cmd = captured["cmds"][-1]
+    assert "-af" not in cmd and "-t" not in cmd and "-shortest" not in cmd
+
+    # Streaming caller that declares its length gets the same bound as an array.
+    media_helpers.encode_video(
+        iter(list(frames)),
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "declared.mp4"),
+        fps=24,
+        audio_path=str(audio_path),
+        expected_frame_count=121,
+    )
+    cmd = captured["cmds"][-1]
+    assert "-shortest" not in cmd
+    assert cmd[cmd.index("-t") + 1] == f"{121 / 24.0:.6f}"
+
+    # Undeclared streaming length still has to terminate.
+    media_helpers.encode_video(
+        iter(list(frames)),
+        preset_id="Compatible MP4",
+        output_path=str(tmp_path / "undeclared.mp4"),
+        fps=24,
+        audio_path=str(audio_path),
+    )
+    cmd = captured["cmds"][-1]
+    assert "-shortest" in cmd
+    assert "-t" not in cmd
+
+
+def test_encode_video_keeps_every_frame_against_short_and_long_audio(tmp_path, monkeypatch):
+    """End-to-end: the written file must contain exactly the frames it was fed,
+    whichever side the audio lands on. Short audio previously truncated the video
+    (121 -> 120), and the dropped frame read as black in the next chunk's
+    pre-context."""
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    ffmpeg = _require_ffmpeg(io_nodes)
+    np = pytest.importorskip("numpy")
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    monkeypatch.setattr(media_helpers, "get_ffmpeg_path", lambda: ffmpeg)
+
+    frame_count = 121
+    fps = 24.0
+    video_seconds = frame_count / fps
+    rng = np.random.default_rng(7)
+    frames = rng.integers(0, 255, size=(frame_count, 64, 64, 3), dtype=np.uint8)
+
+    cases = {
+        # Real LTX shape: audio a few hundredths under the video window.
+        "short": video_seconds - 0.0283,
+        # Far under, to prove the bound is not a fixed-size pad.
+        "tiny": 1.0,
+        "long": video_seconds + 1.5,
+    }
+    results = {}
+    for label, seconds in cases.items():
+        audio_path = _write_silent_wav(tmp_path / f"{label}.wav", seconds)
+        out_path = tmp_path / f"{label}.mp4"
+        media_helpers.encode_video(
+            frames,
+            preset_id="Compatible MP4",
+            output_path=str(out_path),
+            fps=fps,
+            audio_path=str(audio_path),
+        )
+        results[label] = {
+            "frames": _count_video_frames(ffmpeg, out_path),
+            "audio_seconds": round(_decoded_audio_seconds(ffmpeg, out_path), 4),
+        }
+
+    print("ENCODE_AUDIO_BOUND=" + json.dumps(results, sort_keys=True))
+    for label, measured in results.items():
+        assert measured["frames"] == frame_count, f"{label}: {measured}"
+        # Audio still lands on the video, within one AAC frame (1024 samples).
+        assert abs(measured["audio_seconds"] - video_seconds) <= 0.05, f"{label}: {measured}"

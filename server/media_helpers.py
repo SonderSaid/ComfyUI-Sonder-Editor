@@ -2010,6 +2010,7 @@ def encode_video(
     cancel_event=None,
     embed_metadata: dict[str, str] | None = None,
     progress_callback=None,
+    expected_frame_count: int | None = None,
 ) -> dict:
     preset_id = normalize_save_preset(preset_id)
     if preset_id == CUSTOM_SAVE_VIDEO_PRESET:
@@ -2018,6 +2019,10 @@ def encode_video(
             raise ValueError("Custom PNG Sequence must be saved through the PNG sequence path")
     audio_args = _preset_audio_args(preset_id, custom_options)
     frames, frame_count, h, w = _prepare_frame_stream(frames_iter)
+    # `_prepare_frame_stream` only knows the length of an in-memory array. Streaming
+    # callers (timeline export) pass a generator and must declare the count so the
+    # audio mux below can still bound the output by the video's own duration.
+    total_frames = frame_count if frame_count is not None else _finite_positive_int(expected_frame_count)
     fps_value = max(0.001, float(fps or 24.0))
     cmd = [
         get_ffmpeg_path(),
@@ -2060,7 +2065,29 @@ def encode_video(
     if embed_metadata:
         cmd += ["-map_metadata", str(metadata_input_index)]
     if has_audio:
-        cmd += ["-map", "0:v:0", "-map", "1:a:0", *audio_args, "-shortest"]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", *audio_args]
+        # The video's frame count is the contract: the project records it as the take's
+        # source length, and the next chained render reads pre-context right up to the
+        # final frame. `-shortest` cannot carry that contract — it ends the mux at the
+        # SHORTER stream, and generated audio routinely lands a few hundredths of a
+        # second under the video window, so ffmpeg silently dropped trailing frames.
+        # (ffmpeg <7 applied `-shortest` loosely and usually wrote them anyway, which
+        # is why this only began corrupting chained context on ffmpeg 7.x.) A dropped
+        # frame is not a cosmetic tail: the next chunk composites it as black, and that
+        # black frame is the last thing the model sees before the generation boundary.
+        #
+        # So bound the output by the video's own duration instead, and `apad` the audio
+        # to fill it. Padding without a bound would run forever; bounding without
+        # padding would leave a short-audio tail. Both directions are then exact:
+        # short audio is padded with silence, long audio is cut at the video end.
+        if total_frames > 0:
+            cmd += ["-af", "apad", "-t", f"{total_frames / fps_value:.6f}"]
+        else:
+            # Length is genuinely unknown (streaming caller that declared nothing).
+            # Retain `-shortest` so the mux still terminates; it can be removed once
+            # every audio-bearing caller passes frames as an array or declares
+            # `expected_frame_count`.
+            cmd += ["-shortest"]
     elif embed_metadata:
         cmd += ["-map", "0:v:0"]
     cmd += [str(output_path), "-y"]
