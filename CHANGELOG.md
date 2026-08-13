@@ -11,6 +11,15 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-13
+
+### Fixed
+- Saved videos keep every rendered frame when the workflow also supplies audio.
+  Generated audio is often a fraction of a second shorter than the video, and
+  ffmpeg was ending the file at the audio instead — dropping the last frame or
+  two. Chained renders then read that missing frame as black at the start of
+  each new segment, which showed up as a hard seam between clips.
+
 ## [0.2.1] - 2026-08-03
 
 ### Added
