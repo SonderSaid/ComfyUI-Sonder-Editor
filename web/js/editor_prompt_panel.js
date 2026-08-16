@@ -27,6 +27,7 @@ import {
     chromeButtonCss,
     chromeInputCss,
     chromeOverlayPanelCss,
+    setButtonDisabled,
     setButtonVariant,
 } from "./editor_theme.js";
 import {
@@ -60,11 +61,19 @@ import {
     splitPromptDocumentChannels,
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
-    subjectSourceEligibility,
 } from "./prompt_context_chips.js";
-import { resolveReferenceVerdicts } from "./reference_resolution.js";
 import { getProjectVersion } from "./api_client.js";
 import { notifySuccess, notifyWarning } from "./editor_notifications.js";
+import { resolvedPromptProfile } from "./prompt_profile_declarations.js";
+import { mountPromptFormatDeclarationEditor } from "./prompt_format_editor.js";
+import { createModalDraftGuard } from "./modal_draft_guard.js";
+import {
+    applyPromptIdentityChange,
+    createModalRefreshGate,
+    mountPromptIdentityPanel,
+    promptReferenceAttachment,
+    promptIdentityDependents,
+} from "./prompt_identity_panel.js";
 import {
     buildPromptContextDiagnostics,
     promptContextDiagnosticTitle,
@@ -73,31 +82,7 @@ import {
 const WRITING_BREAK = "---";
 const WRITING_DRAFT_TEXT_CAP = 20000;
 
-/** Find every persisted authoring seam that names a Reference-backed Subject. */
-export function referenceBackedSubjectDependents(subjectId, scenes = []) {
-    const counts = { reference_chips: 0, vocal_events: 0, audio_speaker_bindings: 0 };
-    const visit = (value) => {
-        if (Array.isArray(value)) {
-            value.forEach(visit);
-            return;
-        }
-        if (!value || typeof value !== "object") return;
-        if (Array.isArray(value.semantic_unit_ids)
-                && value.semantic_unit_ids.map(String).includes(String(subjectId))) {
-            counts.reference_chips += 1;
-        }
-        if (Array.isArray(value.subject_ids)
-                && value.subject_ids.map(String).includes(String(subjectId))) {
-            counts.vocal_events += 1;
-        }
-        if (String(value.audio_speaker_subject_id || "") === String(subjectId)) {
-            counts.audio_speaker_bindings += 1;
-        }
-        Object.values(value).forEach(visit);
-    };
-    visit(Array.isArray(scenes) ? scenes : []);
-    return counts;
-}
+export { promptIdentityDependents as referenceBackedSubjectDependents };
 
 /** Split a writing-mode draft into blocks on `---` marker lines. */
 export function splitWritingDraft(draft) {
@@ -144,13 +129,85 @@ export function allocateWritingBlocks(blocks, total, minLen, existing = []) {
     return result;
 }
 
-function makeBtn(label, title, variant = "secondary") {
+/** Minimal project-durable definition for the Prompt Format "New" action. */
+export function freshPromptFormatDefinition(template = {}) {
+    const channelKey = templateChannelKeys(template)[0] || "visual";
+    return {
+        template_id: String(template?.id || "standard"),
+        capabilities: { custom: { channel_key: channelKey, placement: "inline",
+            formatter: "{text}" } },
+        writing_aids: [],
+        separators: { attachment: " ", line: "\n" },
+        validators: [],
+        role_catalogs: {},
+        physical_populations: [],
+        identity_kinds: [],
+    };
+}
+
+/** Suggest a distinct immutable version while keeping non-numeric ids usable. */
+export function nextPromptFormatVersion(version) {
+    const value = String(version || "1").trim() || "1";
+    return /^\d+$/.test(value) ? String(Number(value) + 1) : `${value}.1`;
+}
+
+/** Which prompt-format actions a catalog descriptor allows.
+ *
+ *  Exported so the gating is a testable predicate rather than a grep over the
+ *  menu wiring. Built-ins are immutable, so neither action applies to them.
+ */
+export function promptFormatMenuActions(descriptor) {
+    const custom = Boolean(descriptor) && descriptor.builtin === false;
+    return { edit: custom, remove: custom };
+}
+
+/** Preserve the source format's channel-template contract when forking. */
+export function promptFormatTemplateBinding(descriptor = {}, definition = {},
+    universalToken = "*") {
+    const sourceTemplates = descriptor?.compatible_templates
+        || (Array.isArray(definition?.compatible_templates)
+            ? definition.compatible_templates : null)
+        || [String(definition?.template_id || "standard")];
+    return sourceTemplates.includes(String(universalToken || "*"))
+        ? { template_id: "standard" }
+        : { template_id: String(sourceTemplates[0] || "standard"),
+            ...(sourceTemplates.length > 1
+                ? { compatible_templates: [...sourceTemplates] } : {}) };
+}
+
+function makeBtn(label, title, variant = "secondary", ariaLabel = "") {
     const btn = document.createElement("button");
     btn.textContent = label;
     btn.title = title || label;
     btn.style.cssText = chromeButtonCss();
     setButtonVariant(btn, variant);
+    if (ariaLabel) btn.setAttribute("aria-label", ariaLabel);
     return btn;
+}
+
+const PROMPT_SECTION_CONTROL_COLUMNS = Object.freeze([
+    "58px", "58px", "1fr", "auto", "auto", "auto", "auto",
+]);
+
+/** Shared metrics for the section `+`/`×` pair; see buildPromptSectionControlRow. */
+export const SECTION_GLYPH_BUTTON_CSS =
+    "min-width:22px;min-height:22px;padding:1px 5px;font-size:10px;font-weight:500;";
+
+export function buildPromptSectionControlRow(cells, actions) {
+    if (!Array.isArray(cells) || cells.length !== 6
+            || !Array.isArray(actions) || actions.length !== 2) {
+        throw new Error("Prompt section controls require six cells and two actions.");
+    }
+    const row = document.createElement("div");
+    row.dataset.promptSectionControlRow = "1";
+    row.dataset.promptSectionColumnCount = String(PROMPT_SECTION_CONTROL_COLUMNS.length);
+    row.style.cssText = `display:grid;grid-template-columns:${PROMPT_SECTION_CONTROL_COLUMNS.join(" ")};gap:6px;align-items:center;`;
+    const sectionActions = document.createElement("div");
+    sectionActions.dataset.promptSectionActions = "1";
+    sectionActions.style.cssText = "display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;white-space:nowrap;";
+    sectionActions.append(...actions);
+    row.append(...cells, sectionActions);
+    return row;
 }
 
 function smallInput({ value = "", placeholder = "", width = "", numeric = false } = {}) {
@@ -253,6 +310,10 @@ export function mountPromptManagementPanel(host) {
     backdrop.appendChild(panel);
 
     let mounted = true;
+    let identityPanelCleanup = () => {};
+    let renderNow = () => {};
+    const identityRefreshGate = createModalRefreshGate(() => renderNow());
+    const render = () => identityRefreshGate.request();
     // Esc/blur-commit guard (audit F1): the OVERLAY consumer fires on the
     // window-CAPTURE root BEFORE textarea handlers, and closing removes
     // focused boxes whose blur would otherwise COMMIT a cancelled edit.
@@ -277,8 +338,10 @@ export function mountPromptManagementPanel(host) {
     const close = () => {
         if (!mounted) return;
         mounted = false;
+        identityRefreshGate.clear();
         // Closing mid-edit must never commit via the removal-triggered blur
         guard.suppressBlurCommit = true;
+        identityPanelCleanup();
         for (const editor of backdrop.querySelectorAll("[data-sonder-prompt-box='1']")) {
             editor._sonderPromptContextMenuCleanup?.();
         }
@@ -292,6 +355,7 @@ export function mountPromptManagementPanel(host) {
         id: `sonder-prompt-panel-${Date.now().toString(36)}`,
         priority: KEY_PRIORITY.OVERLAY,
         keydown: (e) => {
+            if (e.isComposing === true || e.keyCode === 229) return false;
             if (e.key !== "Escape") return false;
             const focused = guard.focusedBox;
             if (focused && document.activeElement === focused.el) {
@@ -589,8 +653,63 @@ export function mountPromptManagementPanel(host) {
         const payload = host._promptContextCandidateCache;
         return payload?._candidate_scene_id === host.activeSceneId ? payload : null;
     };
+    const currentPromptProfile = (profileId = "") => resolvedPromptProfile({
+        profileId: String(profileId || host.activeScene?.prompt_context_profile_id
+            || host._channelTemplate?.()?.default_context_profile || "generic@1"),
+        candidate: currentCandidatePayload(),
+        catalog: host._promptContextCatalog,
+        customProfiles: host._promptContextProfiles,
+    });
+    const promptPlacementPhases = () =>
+        host._promptContextCatalog?.placement_phases || [];
     const currentManagedSpeakerSubjectIds = () =>
         currentCandidatePayload()?.managed_speaker_subject_ids || [];
+    const refreshWritingCompiled = (payload = currentCandidatePayload()) => {
+        const output = panel.querySelector("[data-sonder-writing-compiled]");
+        if (!output) return;
+        output.textContent = "";
+        const status = document.createElement("div");
+        status.style.cssText = `font-size:10px;color:${COLORS.textDim};`;
+        if (!payload) {
+            status.textContent = "Compiling the current Writing draft…";
+            output.appendChild(status);
+            return;
+        }
+        if (payload._stale) {
+            status.textContent = "Updating compiled output from the current Writing draft…";
+            output.appendChild(status);
+        } else {
+            status.textContent = "Read-only compiler output for the current render window.";
+            output.appendChild(status);
+        }
+        const prompt = document.createElement("pre");
+        prompt.dataset.sonderWritingCompiledPrompt = "1";
+        prompt.style.cssText = `margin:0;padding:9px;border:1px solid ${COLORS.promptBorder};border-radius:5px;`
+            + `background:${COLORS.panelMuted};color:${COLORS.text};font:11px/1.45 ${FONT.mono || "monospace"};`
+            + "white-space:pre-wrap;overflow-wrap:anywhere;min-height:90px;";
+        prompt.textContent = String(payload.compiled_prompt || "");
+        output.appendChild(prompt);
+        const channels = payload.compiled_channels && typeof payload.compiled_channels === "object"
+            ? payload.compiled_channels : {};
+        const orderedKeys = [...new Set([
+            ...templateChannelKeys(host._channelTemplate()), ...Object.keys(channels),
+        ])].filter((key) => Object.prototype.hasOwnProperty.call(channels, key));
+        if (orderedKeys.length) {
+            const details = document.createElement("details");
+            const summary = document.createElement("summary");
+            summary.textContent = `Compiled channels (${orderedKeys.length})`;
+            summary.style.cssText = `cursor:pointer;font-size:10px;color:${COLORS.textMuted};`;
+            details.appendChild(summary);
+            for (const key of orderedKeys) {
+                const row = document.createElement("pre");
+                row.style.cssText = `margin:5px 0 0;padding:6px;border-left:2px solid ${COLORS.promptBorder};`
+                    + `color:${COLORS.text};font:10px/1.4 ${FONT.mono || "monospace"};white-space:pre-wrap;`;
+                row.textContent = `${key}:\n${String(channels[key] || "")}`;
+                details.appendChild(row);
+            }
+            output.appendChild(details);
+        }
+    };
     const renderDiagnostics = (payload = currentCandidatePayload()) => {
         const state = buildPromptContextDiagnostics(payload);
         diagnostics.style.opacity = state.stale ? "0.62" : "1";
@@ -662,6 +781,7 @@ export function mountPromptManagementPanel(host) {
             if (hasError) chip.setAttribute("aria-invalid", "true");
             chip.title = `${chip.title}\n\n${promptContextDiagnosticTitle(rows)}`;
         }
+        refreshWritingCompiled(payload);
     };
 
     const sectionTitle = (text) => {
@@ -686,6 +806,90 @@ export function mountPromptManagementPanel(host) {
         hint.style.cssText = `font-size:10px; color:${COLORS.textDim};`;
         hint.textContent = `Write freely; a line containing only ${WRITING_BREAK} splits sections, and a line like "${templateChannelKeys(host._channelTemplate())[0]}:" starts that channel. Unlabelled text goes to the first channel. Apply replaces the lane's sections (undoable).`;
         bodyEl.appendChild(hint);
+
+        const writingBlockDocuments = () => reconcileWritingBlockMeta(
+            splitWritingPromptDocument(writingState.document, {
+                keepEmpty: writingState.blockMeta.length > 0,
+            }));
+        const buildWritingCandidatePatch = (blockDocuments) => {
+            const attachmentById = new Map(writingState.attachments
+                .map((attachment) => [attachment.attachment_id, attachment]));
+            const channelKeys = templateChannelKeys(host._channelTemplate());
+            let cursor = 0;
+            const promptSections = blockDocuments.map((blockDocument, index) => {
+                const length = Math.max(
+                    minLen, writingState.allocations[index]?.length ?? minLen);
+                const channelDocs = splitPromptDocumentChannels(blockDocument, channelKeys);
+                const anchorIds = new Set(Object.values(channelDocs)
+                    .flatMap((documentValue) => documentValue.nodes)
+                    .filter((node) => node.type === "attachment")
+                    .map((node) => node.attachment_id));
+                const attachments = coalesceScopedAttachments([
+                    ...normalizePromptAttachments(writingState.blockMeta[index]?.attachments)
+                        .filter((value) => !anchorIds.has(value.attachment_id)),
+                    ...[...anchorIds].map((id) => attachmentById.get(id)).filter(Boolean),
+                ]);
+                const value = {
+                    prompt_id: writingState.blockMeta[index]?.source_prompt_id
+                        || `preview:${index}`,
+                    start_frame: cursor,
+                    end_frame: cursor + length,
+                    channels: Object.fromEntries(channelKeys.map((key) => [
+                        key, promptDocumentText(channelDocs[key]).trim(),
+                    ])),
+                    channel_docs: channelDocs,
+                    attachments,
+                    muted: writingState.blockMeta[index]?.muted === true,
+                    global_channel_exceptions: [...new Set(
+                        (writingState.blockMeta[index]?.global_channel_exceptions || [])
+                            .map(String))],
+                };
+                cursor += length;
+                return value;
+            });
+            return { prompt_sections: promptSections,
+                duration_frames: Math.max(totalFrames, cursor) };
+        };
+        const previewWritingBlocks = (blockDocuments) => {
+            host._previewPromptContextCandidate?.(
+                buildWritingCandidatePatch(blockDocuments));
+        };
+
+        // This is a browser-local presentation preference. Both tabs read the
+        // same canonical draft; Compiled never becomes an authoring authority.
+        const writingView = host._settings?.prompts?.writingView === "compiled"
+            ? "compiled" : "source";
+        const viewRow = document.createElement("div");
+        viewRow.style.cssText = "display:flex;gap:4px;align-items:center;";
+        for (const [value, label] of [["source", "Source"], ["compiled", "Compiled"]]) {
+            const button = makeBtn(label, value === "source"
+                ? "Edit the reversible channel-heading and directive projection"
+                : "Inspect read-only output from the canonical compiler",
+            writingView === value ? "primary" : "subtle");
+            button.addEventListener("click", () => {
+                if (writingView === value) return;
+                if (writingView === "source") saveWritingState();
+                host._updateSettings({ prompts: { writingView: value } });
+                render();
+            });
+            viewRow.appendChild(button);
+        }
+        bodyEl.appendChild(viewRow);
+        if (writingView === "compiled") {
+            const compiled = document.createElement("div");
+            compiled.dataset.sonderWritingCompiled = "1";
+            compiled.style.cssText = "display:flex;flex-direction:column;gap:7px;";
+            bodyEl.appendChild(compiled);
+            const blockDocuments = writingBlockDocuments();
+            const blocks = blockDocuments.map(promptDocumentText);
+            if (blocks.length !== writingState.allocations.length) {
+                writingState.allocations = allocateWritingBlocks(
+                    blocks, totalFrames, minLen, writingState.allocations);
+            }
+            previewWritingBlocks(blockDocuments);
+            refreshWritingCompiled();
+            return;
+        }
 
         let draftTimer = null;
         let draftArea = null;
@@ -732,10 +936,10 @@ export function mountPromptManagementPanel(host) {
                 semanticUnits: host._promptSemanticUnits || [],
                 profileId: scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1",
-                templateId: host._channelTemplate().id || "",
                 scope: "section",
                 anchoredChannels: [context.scene?._context_channel_keys?.[0]].filter(Boolean),
-                taskTypes: host._promptContextCatalog?.minimax_task_types || [],
+                profile: currentPromptProfile(),
+                placementPhases: promptPlacementPhases(),
                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
                 candidate: currentCandidatePayload(),
@@ -835,48 +1039,6 @@ export function mountPromptManagementPanel(host) {
             blocks.reduce((sum, _t, i) =>
                 sum + Math.max(minLen, writingState.allocations[i]?.length ?? minLen), 0);
 
-        const previewWritingBlocks = (blockDocuments) => {
-            const attachmentById = new Map(writingState.attachments
-                .map((attachment) => [attachment.attachment_id, attachment]));
-            const channelKeys = templateChannelKeys(host._channelTemplate());
-            let cursor = 0;
-            const promptSections = blockDocuments.map((blockDocument, index) => {
-                const length = Math.max(
-                    minLen, writingState.allocations[index]?.length ?? minLen);
-                const channelDocs = splitPromptDocumentChannels(blockDocument, channelKeys);
-                const anchorIds = new Set(Object.values(channelDocs)
-                    .flatMap((documentValue) => documentValue.nodes)
-                    .filter((node) => node.type === "attachment")
-                    .map((node) => node.attachment_id));
-                const attachments = coalesceScopedAttachments([
-                    ...normalizePromptAttachments(writingState.blockMeta[index]?.attachments)
-                        .filter((value) => !anchorIds.has(value.attachment_id)),
-                    ...[...anchorIds].map((id) => attachmentById.get(id)).filter(Boolean),
-                ]);
-                const value = {
-                    prompt_id: writingState.blockMeta[index]?.source_prompt_id
-                        || `preview:${index}`,
-                    start_frame: cursor,
-                    end_frame: cursor + length,
-                    channels: Object.fromEntries(channelKeys.map((key) => [
-                        key, promptDocumentText(channelDocs[key]).trim(),
-                    ])),
-                    channel_docs: channelDocs,
-                    attachments,
-                    muted: writingState.blockMeta[index]?.muted === true,
-                    global_channel_exceptions: [...new Set(
-                        (writingState.blockMeta[index]?.global_channel_exceptions || [])
-                            .map(String))],
-                };
-                cursor += length;
-                return value;
-            });
-            host._previewPromptContextCandidate?.({
-                prompt_sections: promptSections,
-                duration_frames: Math.max(totalFrames, cursor),
-            });
-        };
-
         const updateReadout = (blocks) => {
             const total = chipLengths();
             const requiredTotal = laidOutTotal(blocks);
@@ -964,8 +1126,8 @@ export function mountPromptManagementPanel(host) {
                         attachmentLabelFor,
                         disabled: applyBlocked,
                         allowedKinds: host._channelTemplate().shot_marker_channel
-                            ? ["shot", "timestamp", "reference", "custom"]
-                            : ["reference", "custom"],
+                            ? ["shot", "timestamp", "prompt_link_scope", "reference", "custom"]
+                            : ["prompt_link_scope", "reference", "custom"],
                         reusableAttachments: writingState.attachments,
                         allSceneAttachments: writingState.attachments,
                         reuseContext: { scene: attachmentScene,
@@ -986,10 +1148,10 @@ export function mountPromptManagementPanel(host) {
                                 semanticUnits: host._promptSemanticUnits || [],
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
-                                templateId: host._channelTemplate().id || "",
                                 scope: "section",
                                 anchoredChannels: [],
-                                taskTypes: host._promptContextCatalog?.minimax_task_types || [],
+                                profile: currentPromptProfile(),
+                                placementPhases: promptPlacementPhases(),
                                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
                                 candidate: currentCandidatePayload(),
@@ -1010,10 +1172,10 @@ export function mountPromptManagementPanel(host) {
                                 semanticUnits: host._promptSemanticUnits || [],
                                 profileId: scene?.prompt_context_profile_id
                                     || host._channelTemplate().default_context_profile || "generic@1",
-                                templateId: host._channelTemplate().id || "",
                                 scope: "section",
                                 anchoredChannels: [],
-                                taskTypes: host._promptContextCatalog?.minimax_task_types || [],
+                                profile: currentPromptProfile(),
+                                placementPhases: promptPlacementPhases(),
                                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                                 candidate: currentCandidatePayload(),
                                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
@@ -1138,7 +1300,9 @@ export function mountPromptManagementPanel(host) {
             });
             for (const section of sections) {
                 section.attachments = section.attachments.map((attachment) => {
-                    if (attachment.kind !== "prompt_link") return attachment;
+                    if (!["prompt_link", "prompt_link_scope"].includes(attachment.kind)) {
+                        return attachment;
+                    }
                     const sourceId = String(attachment.source?.prompt_id || "");
                     const rebound = promptIdRemap.get(sourceId);
                     return rebound ? { ...attachment,
@@ -1222,13 +1386,16 @@ export function mountPromptManagementPanel(host) {
             option.textContent = compatible(value) ? label
                 : `${label} — not available for this channel template`;
             option.disabled = !compatible(value);
+            option.title = value || defaultProfile;
             profile.appendChild(option);
             return option;
         };
-        addProfileOption("", `Template default (${defaultProfile})`);
+        const defaultDescriptor = catalogByKey.get(defaultProfile);
+        addProfileOption("", `Template default · ${defaultDescriptor?.name || defaultProfile} · ${defaultProfile}`);
         for (const value of catalogProfiles) {
             const key = String(value?.key || "");
-            if (key) addProfileOption(key, value.name || key);
+            const name = String(value?.name || key);
+            if (key) addProfileOption(key, name === key ? key : `${name} · ${key}`);
         }
         const selectedProfileKey = String(scene.prompt_context_profile_id || "");
         if (selectedProfileKey && !catalogByKey.has(selectedProfileKey)) {
@@ -1248,34 +1415,75 @@ export function mountPromptManagementPanel(host) {
                 : "Loading the authoritative prompt format catalog...";
             card.appendChild(state);
         }
-        const fork = makeBtn("Fork prompt format", "Create a bounded declarative project prompt format");
-        fork.disabled = !catalogReady;
-        fork.addEventListener("click", () => {
-            if (card.querySelector("[data-profile-editor]")) return;
-            const selectedKey = profile.value || defaultProfile;
-            const descriptor = catalogByKey.get(selectedKey);
-            if (!descriptor?.fork_seed) return;
-            const selected = structuredClone(descriptor.fork_seed);
-            const editor = document.createElement("div"); editor.dataset.profileEditor = "1";
-            editor.style.cssText = "display:grid;grid-template-columns:110px minmax(0,1fr);gap:5px;align-items:center;font-size:10px;";
+        const currentDescriptor = () => catalogByKey.get(profile.value || defaultProfile);
+        const openProfileEditor = ({ descriptor = null, fresh = false,
+            editAsVersion = false } = {}) => {
+            if (!catalogReady || (!fresh && !descriptor?.fork_seed)) return;
+            const selected = fresh
+                ? freshPromptFormatDefinition(activeTemplate)
+                : structuredClone(descriptor.fork_seed);
+            const backdrop = document.createElement("div");
+            backdrop.dataset.sonderPromptContextModal = "1";
+            backdrop.style.cssText = "position:fixed;inset:0;z-index:12000;background:rgba(5,8,12,.72);display:flex;align-items:center;justify-content:center;padding:20px;";
+            const editor = document.createElement("div");
+            editor.dataset.profileEditor = "1";
+            editor.style.cssText = "width:min(720px,94vw);max-height:84vh;overflow:auto;padding:14px;border:1px solid #465266;border-radius:8px;background:#1a202a;box-shadow:0 18px 60px rgba(0,0,0,.55);display:grid;grid-template-columns:130px minmax(0,1fr);gap:7px;align-items:center;font:10px system-ui;color:#d8dee8;";
+            const heading = document.createElement("strong");
+            heading.style.cssText = "grid-column:1/-1;font-size:13px;color:#eef2f8;";
+            heading.textContent = fresh ? "New prompt format"
+                : editAsVersion ? "Edit as new version" : "Save as custom";
+            editor.appendChild(heading);
             const addField = (label, value = "") => {
                 const title = document.createElement("span"); title.textContent = label;
                 const input = document.createElement("input"); input.value = value;
                 input.style.cssText = chromeInputCss(); editor.append(title, input); return input;
             };
-            const name = addField("Name", `Custom ${host._channelTemplate().name || "Prompt"}`);
-            const id = addField("Stable ID", `custom_${Date.now().toString(36)}`);
-            const version = addField("Version", "1");
-            const formatter = addField("Custom-chip format", "{text}");
-            const route = addField("Default channel", templateChannelKeys(host._channelTemplate())[0] || "visual");
+            const sourceKey = String(descriptor?.key || "");
+            const [sourceId = "", sourceVersion = "1"] = sourceKey.split("@");
+            const name = addField("Name", editAsVersion
+                ? String(descriptor?.name || sourceId) : fresh
+                    ? `New ${activeTemplate.name || "prompt"} format`
+                    : `Custom ${descriptor?.name || activeTemplate.name || "Prompt"}`);
+            const id = addField("Stable ID", editAsVersion
+                ? sourceId : `custom_${Date.now().toString(36)}`);
+            id.title = "Durable secondary identity. Name is the user-facing label.";
+            const version = addField("Version", editAsVersion
+                ? nextPromptFormatVersion(sourceVersion) : "1");
+            const customCapability = selected.capabilities?.custom || {};
+            const formatter = addField("Custom-chip format",
+                customCapability.formatter ?? "{text}");
+            const route = addField("Default channel", customCapability.channel_key
+                || templateChannelKeys(activeTemplate)[0] || "visual");
+            const rawValidators = structuredClone(selected.validators || []);
+            const requiredValues = rawValidators.filter((value) =>
+                value?.kind === "required_channel" && value?.severity !== "warning");
+            const maxValue = rawValidators.find((value) =>
+                value?.kind === "max_final_chars" && value?.severity !== "warning");
+            const validatorsBase = rawValidators.filter((value) =>
+                !requiredValues.includes(value) && value !== maxValue);
+            const requiredChannels = addField("Required channels", requiredValues
+                .map((value) => value.channel_key).filter(Boolean).join(", "));
+            requiredChannels.placeholder = "visual, sound";
+            const maxChars = addField("Max prompt chars", maxValue?.limit || "");
+            maxChars.type = "number"; maxChars.min = "1"; maxChars.max = "262144";
+
             const writingAids = structuredClone(selected.writing_aids || []);
             const aidEditor = document.createElement("div");
-            aidEditor.style.cssText = "grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:5px;border:1px solid #343d4b;border-radius:5px;";
+            aidEditor.style.cssText = "grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:7px;border:1px solid #343d4b;border-radius:5px;";
             const renderWritingAids = () => {
                 aidEditor.replaceChildren();
                 const title = document.createElement("strong");
-                title.textContent = `Writing aids preserved (${writingAids.length})`;
+                title.textContent = `Writing aids (${writingAids.length})`;
                 aidEditor.appendChild(title);
+                // The format owns two guidance surfaces and they must not be
+                // collapsed into one: a writing aid is prose the author inserts
+                // and the model reads, while a capability's description,
+                // example, and help only describe what that part emits.
+                const division = document.createElement("p");
+                division.dataset.promptFormatGuidanceDivision = "1";
+                division.style.cssText = `margin:0;font-size:9px;line-height:1.5;color:${COLORS.textDim};`;
+                division.textContent = "Writing aids are insertable prose: they land at the cursor and reach the prompt. Reference prompt part help and examples are shown beside the controls only and are never inserted or compiled.";
+                aidEditor.appendChild(division);
                 writingAids.forEach((aid, index) => {
                     const row = document.createElement("div");
                     row.style.cssText = "display:grid;grid-template-columns:120px minmax(0,1fr) auto;gap:4px;";
@@ -1289,7 +1497,7 @@ export function mountPromptManagementPanel(host) {
                     textInput.setAttribute("aria-label", "Writing aid text");
                     labelInput.addEventListener("input", () => { writingAids[index].label = labelInput.value; });
                     textInput.addEventListener("input", () => { writingAids[index].text = textInput.value; });
-                    const remove = makeBtn("Remove", "Remove this writing aid from the fork", "danger");
+                    const remove = makeBtn("Remove", "Remove this writing aid", "danger");
                     remove.addEventListener("click", () => {
                         writingAids.splice(index, 1); renderWritingAids();
                     });
@@ -1302,7 +1510,7 @@ export function mountPromptManagementPanel(host) {
             const aidText = addField("New aid text", "");
             const aidChoices = addField("New aid choices", "");
             aidChoices.placeholder = "language=English|Spanish; motion=pans left|pans right";
-            const addAid = makeBtn("Add writing aid", "Add this bounded writing aid to the fork");
+            const addAid = makeBtn("Add writing aid", "Add this bounded writing aid");
             addAid.addEventListener("click", () => {
                 if (!aidLabel.value.trim() || !aidText.value) return;
                 const declaredChoices = new Map(aidChoices.value.split(";")
@@ -1322,27 +1530,66 @@ export function mountPromptManagementPanel(host) {
                 renderWritingAids();
             });
             editor.append(document.createElement("span"), addAid);
-            const requiredChannels = addField("Required channels", "");
-            requiredChannels.placeholder = "visual,sound";
-            const maxChars = addField("Max prompt chars", "");
-            maxChars.type = "number"; maxChars.min = "1"; maxChars.max = "262144";
-            const roleValues = (population) => (selected.role_catalogs?.[population] || [])
-                .map((value) => typeof value === "string" ? value : value?.value).filter(Boolean).join(", ");
-            const pictureRoles = addField("Picture roles", roleValues("pictures"));
-            const videoRoles = addField("Video roles", roleValues("videos"));
-            const audioRoles = addField("Audio roles", roleValues("standalone_audios"));
-            for (const input of [pictureRoles, videoRoles, audioRoles]) {
-                input.placeholder = "identity, style, motion";
-                input.title = "Bounded per-member role choices exposed to compatible Reference recipes.";
-            }
-            const save = makeBtn("Save prompt format", "Validate and save this immutable project prompt format version", "primary");
+
+            // Everything the format declares beyond identity and the custom
+            // chip lives in its own module. Forking previously read only the
+            // `value` half of each role pair and rebuilt bare strings, so the
+            // server's `label = value` fallback collapsed "First frame" to
+            // "first_frame"; the declaration editor round-trips both halves.
+            const declarations = mountPromptFormatDeclarationEditor({
+                definition: selected, template: activeTemplate, catalog,
+            });
+            editor.appendChild(declarations.element);
+
+            const footer = document.createElement("div");
+            footer.style.cssText = "grid-column:1/-1;display:flex;justify-content:flex-end;gap:6px;margin-top:4px;";
+            const cancel = makeBtn("Cancel", "Close without saving", "subtle");
+            const save = makeBtn("Save prompt format", "Validate and save this immutable version", "primary");
+            let closed = false;
+            const close = () => {
+                if (closed) return;
+                closed = true;
+                document.removeEventListener("keydown", onKeyDown, true);
+                declarations.cleanup();
+                backdrop.remove();
+            };
+            // The format editor now holds every declaration group, so an
+            // accidental dismissal costs far more than it used to. Cancel is
+            // explicit intent and stays unguarded.
+            const draftGuard = createModalDraftGuard({
+                controls: () => [name, id, version, formatter, route,
+                    requiredChannels, maxChars,
+                    ...editor.querySelectorAll?.("input, textarea, select") || []],
+                message: "Discard this prompt format draft? Your unsaved changes will be lost.",
+            });
+            const onKeyDown = (event) => {
+                if (event.key !== "Escape") return;
+                event.preventDefault(); event.stopPropagation();
+                if (draftGuard.confirmDismiss()) close();
+            };
+            cancel.addEventListener("click", close);
+            backdrop.addEventListener("click", (event) => {
+                if (event.target === backdrop && draftGuard.confirmDismiss()) close();
+            });
+            document.addEventListener("keydown", onKeyDown, true);
             save.addEventListener("click", async () => {
                 const profileId = id.value.trim().replace(/[^A-Za-z0-9_.-]+/g, "_");
-                if (!profileId || !version.value.trim()) return;
-                const capabilities = structuredClone(selected.capabilities || {});
-                capabilities.custom = { channel_key: route.value.trim(), placement: "inline",
-                    formatter: formatter.value };
-                const validators = structuredClone(selected.validators || []);
+                const versionId = version.value.trim();
+                if (!profileId || !versionId) {
+                    notifyWarning("Stable ID and version are required.",
+                        { source: "prompt-profile-invalid" });
+                    return;
+                }
+                const collisionKey = `${profileId}@${versionId}`;
+                const collision = (host._promptContextProfiles || []).some((value) =>
+                    `${value.profile_id}@${value.version || "1"}` === collisionKey)
+                    || Boolean(catalogByKey.get(collisionKey)?.builtin);
+                if (collision) {
+                    notifyWarning(`A saved format already uses stable ID and version ${collisionKey}.`,
+                        { source: "prompt-profile-immutable" });
+                    return;
+                }
+                const validators = structuredClone(validatorsBase);
                 for (const channelKey of requiredChannels.value.split(",")
                     .map((value) => value.trim()).filter(Boolean)) {
                     validators.push({ kind: "required_channel", channel_key: channelKey,
@@ -1350,315 +1597,131 @@ export function mountPromptManagementPanel(host) {
                 }
                 if (maxChars.value) validators.push({ kind: "max_final_chars",
                     limit: Number(maxChars.value), severity: "error" });
-                const role_catalogs = {};
-                for (const [population, input] of [["pictures", pictureRoles],
-                    ["videos", videoRoles], ["standalone_audios", audioRoles]]) {
-                    const values = [...new Set(input.value.split(",")
-                        .map((value) => value.trim()).filter(Boolean))];
-                    if (values.length) role_catalogs[population] = values;
-                }
                 // Inherit the SOURCE format's template binding, not whichever
                 // template happened to be active while forking. Writing the
                 // active id would silently lock a fork made under, say, Visual +
                 // Speech + Sound to that one template forever; a fork of a
                 // MiniMax format must still stay bound to its own template.
-                const sourceTemplates = descriptor.compatible_templates
-                    || (Array.isArray(selected.compatible_templates)
-                        ? selected.compatible_templates : null)
-                    || [String(selected.template_id || "standard")];
                 const universalToken = String(
                     host._promptContextCatalog?.universal_template || "*");
-                const forkBinding = sourceTemplates.includes(universalToken)
-                    ? { template_id: "standard" }
-                    : { template_id: String(sourceTemplates[0] || "standard"),
-                        ...(sourceTemplates.length > 1
-                            ? { compatible_templates: [...sourceTemplates] } : {}) };
-                const definition = { ...forkBinding,
-                    capabilities, writing_aids: structuredClone(writingAids),
-                    separators: structuredClone(selected.separators || { attachment: " ", line: "\n" }),
-                    validators, role_catalogs };
-                const collision = (host._promptContextProfiles || []).find(
-                    (value) => value.profile_id === profileId
-                        && String(value.version) === String(version.value.trim()));
-                if (collision) {
-                    notifyWarning("That prompt format version already exists. Choose a new version or stable ID.",
-                        { source: "prompt-profile-immutable" });
-                    return;
-                }
+                const forkBinding = promptFormatTemplateBinding(
+                    descriptor, selected, universalToken);
+                const definition = declarations.collect();
+                delete definition.template_id;
+                delete definition.compatible_templates;
+                Object.assign(definition, forkBinding, {
+                    capabilities: {
+                        ...definition.capabilities,
+                        custom: { channel_key: route.value.trim(),
+                            placement: "inline", formatter: formatter.value },
+                    },
+                    writing_aids: structuredClone(writingAids), validators,
+                });
+                save.disabled = true;
                 try {
                     await host._createPromptContextProfile?.({
-                        profile_id: profileId,
-                        version: version.value.trim(),
-                        name: name.value.trim() || profileId,
-                        definition,
+                        profile_id: profileId, version: versionId,
+                        name: name.value.trim() || profileId, definition,
                     });
                     await commit([{ type: "update_scene_fields", fields: {
-                        prompt_context_profile_id: `${profileId}@${version.value.trim()}`,
+                        prompt_context_profile_id: collisionKey,
                     } }], "select custom prompt profile");
+                    close();
                 } catch (error) {
+                    save.disabled = false;
                     notifyWarning(error?.message || "Custom profile was rejected.",
                         { source: "prompt-profile-invalid" });
                 }
             });
-            editor.append(document.createElement("span"), save); card.appendChild(editor);
-        });
-        card.appendChild(fork);
-        const activeSubjectScene = host.activeScene || scene;
-        const subjectCandidate = currentCandidatePayload();
-        const subjectWindowStart = Number(subjectCandidate?.window?.start_frame ?? 0);
-        const subjectWindowEnd = Number(subjectCandidate?.window?.end_frame
-            ?? activeSubjectScene?.duration_frames ?? 0);
-        const subjectItems = activeSubjectScene?.reference_items || [];
-        const subjectRecipes = activeSubjectScene?.reference_lane_recipes || [];
-        const subjectVerdicts = resolveReferenceVerdicts({
-            referenceItems: subjectItems,
-            laneCount: activeSubjectScene?.reference_lane_count || 1,
-            sceneDuration: activeSubjectScene?.duration_frames || 0,
-            windowStart: subjectWindowStart,
-            windowEnd: subjectWindowEnd,
-            laneConfigs: activeSubjectScene?.reference_lane_configs || [],
-            frameThresholdPct: Number(host._referenceFrameThreshold || 0),
-        }).verdicts;
-        const subjectSetup = (activeSubjectScene?.minimax_h3_conditioning_setups || [])
-            .find((value) => value?.setup_id
-                === activeSubjectScene?.active_minimax_h3_setup_id);
-        const subjectSetupPopulations = new Map();
-        for (const [key, population] of [["picture_lane_ids", "picture"],
-            ["video_lane_ids", "video"], ["audio_lane_ids", "audio"]]) {
-            for (const laneId of subjectSetup?.[key] || []) {
-                subjectSetupPopulations.set(String(laneId), population);
-            }
-        }
-        const subjectProfileId = activeSubjectScene?.prompt_context_profile_id
-            || host._channelTemplate().default_context_profile || "generic@1";
-        const subjectEligibility = (unit) => subjectSourceEligibility({
-            sources: unit?.source_members || [], referenceItems: subjectItems,
-            laneRecipes: subjectRecipes, verdicts: subjectVerdicts,
-            profileId: subjectProfileId, setupPopulations: subjectSetupPopulations,
-            isMiniMax: String(subjectProfileId).startsWith("minimax_h3_"),
-            scope: { globalScope: false, hasSelection: true },
-        });
-        const subjectList = document.createElement("div");
-        subjectList.dataset.sonderSubjectList = "1";
-        subjectList.style.cssText = "display:flex;flex-direction:column;gap:4px;padding-top:5px;border-top:1px solid #343d4b;";
-        const activeSubjectHeading = document.createElement("div");
-        activeSubjectHeading.textContent = "Subjects in this setup and window";
-        activeSubjectHeading.style.cssText = `font:600 10px system-ui;color:${COLORS.text};`;
-        const activeSubjectRows = document.createElement("div");
-        activeSubjectRows.style.cssText = "display:flex;flex-direction:column;gap:4px;";
-        const otherSubjectDetails = document.createElement("details");
-        const otherSubjectSummary = document.createElement("summary");
-        otherSubjectSummary.textContent = "Other project Subjects";
-        otherSubjectSummary.style.cssText = `font:600 10px system-ui;color:${COLORS.textDim};cursor:pointer;`;
-        const otherSubjectRows = document.createElement("div");
-        otherSubjectRows.style.cssText = "display:flex;flex-direction:column;gap:4px;padding-top:4px;";
-        otherSubjectDetails.append(otherSubjectSummary, otherSubjectRows);
-        subjectList.append(activeSubjectHeading, activeSubjectRows, otherSubjectDetails);
-        for (const unit of host._promptSemanticUnits || []) {
-            const eligibility = subjectEligibility(unit);
-            const subjectRow = document.createElement("div");
-            subjectRow.dataset.semanticUnitId = unit.semantic_unit_id;
-            subjectRow.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:6px;align-items:center;padding:5px 6px;border:1px solid #343d4b;border-radius:5px;";
-            const subjectName = document.createElement("span");
-            const ownerName = unit.generated_reference_name || "its owning Reference";
-            subjectName.textContent = unit.generated
-                ? `${unit.name || unit.semantic_unit_id} — generated by Reference "${ownerName}"`
-                : (unit.name || unit.semantic_unit_id);
-            subjectName.style.cssText = `font:11px system-ui;color:${COLORS.text};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
-            const badge = document.createElement("span");
-            badge.textContent = unit.generated ? "Reference-generated" : "authored";
-            badge.style.cssText = `font:8px system-ui;color:${unit.generated ? "#9fb9d8" : "#b8a9ef"};text-transform:uppercase;`;
-            const edit = makeBtn("Edit", `Edit ${unit.name || "Subject"}`);
-            edit.dataset.editSubject = unit.semantic_unit_id;
-            const removeRow = makeBtn("Delete", "Delete this Subject", "danger");
-            removeRow.dataset.deleteSubject = unit.semantic_unit_id;
-            if (unit.generated) {
-                removeRow.disabled = true;
-                removeRow.textContent = "Managed by Reference";
-                removeRow.style.opacity = "0.45";
-                removeRow.title = `Generated by Reference “${ownerName}”. Remove that Reference to remove this Subject.`;
-            }
-            subjectRow.append(subjectName, badge, edit, removeRow);
-            if (eligibility.eligible) {
-                activeSubjectRows.appendChild(subjectRow);
-            } else {
-                const reason = document.createElement("span");
-                reason.textContent = eligibility.reason || "not available in this window";
-                reason.style.cssText = `grid-column:1/-1;font:9px system-ui;color:${COLORS.textDim};`;
-                subjectRow.appendChild(reason);
-                otherSubjectRows.appendChild(subjectRow);
-            }
-        }
-        if (!activeSubjectRows.childElementCount) {
-            const emptySubjects = document.createElement("div");
-            emptySubjects.textContent = "No Subjects apply to this setup and window.";
-            emptySubjects.style.cssText = `font:10px system-ui;color:${COLORS.textDim};`;
-            activeSubjectRows.appendChild(emptySubjects);
-        }
-        if (!otherSubjectRows.childElementCount) otherSubjectDetails.style.display = "none";
-        card.appendChild(subjectList);
-        const deleteAuthoredSubject = async (unitId) => {
-            const current = (host._promptSemanticUnits || []).find((value) =>
-                value.semantic_unit_id === unitId);
-            if (!current || current.generated) return false;
-            const dependents = referenceBackedSubjectDependents(
-                current.semantic_unit_id,
-                (host.scenes || []).length ? host.scenes : [host.activeScene].filter(Boolean));
-            const details = [
-                [dependents.reference_chips, "Reference chip"],
-                [dependents.vocal_events, "Vocal Event"],
-                [dependents.audio_speaker_bindings, "audio speaker binding"],
-            ].filter(([count]) => count).map(([count, label]) =>
-                `${count} ${label}${count === 1 ? "" : "s"}`);
-            const dependencyLine = details.length
-                ? `Dependents: ${details.join(", ")}. They will remain visible as broken links so you can repair them.`
-                : "No dependent chips, Vocal Events, or audio speaker bindings were found.";
-            if (!globalThis.confirm?.(
-                `Delete authored Subject "${current.name || current.semantic_unit_id}"?\n\n${dependencyLine}\n\nDeleting a Subject may renumber late-bound subject ordinals in compiled prompts.`)) {
-                return false;
-            }
-            try {
-                await host._savePromptSemanticUnits?.(
-                    (host._promptSemanticUnits || []).filter((value) =>
-                        value.semantic_unit_id !== current.semantic_unit_id));
-                render();
-                return true;
-            } catch (error) {
-                notifyWarning(error?.message || "Subject deletion was rejected.",
-                    { source: "prompt-unit-delete" });
-                return false;
-            }
+            footer.append(cancel, save); editor.appendChild(footer);
+            backdrop.appendChild(editor); document.body.appendChild(backdrop);
+            name.focus(); name.select();
         };
-        const unitsButton = makeBtn("New authored Subject",
-            "Create a project-scoped Subject backed by Reference-library members");
-        unitsButton.addEventListener("click", () => {
-            const editUnitId = unitsButton.dataset.editUnitId || "";
-            delete unitsButton.dataset.editUnitId;
-            const existingEditor = card.querySelector("[data-unit-editor]");
-            if (existingEditor) {
-                if (!editUnitId) {
-                    existingEditor.remove();
-                    return;
-                }
-                const existingSelect = existingEditor.querySelector("[data-unit-select]");
-                existingSelect.value = editUnitId;
-                existingSelect.dispatchEvent(new Event("change"));
-                return;
-            }
-            const editor = document.createElement("div"); editor.dataset.unitEditor = "1";
-            editor.style.cssText = "display:flex;flex-direction:column;gap:5px;padding-top:5px;border-top:1px solid #343d4b;font-size:10px;";
-            const unitSelect = document.createElement("select");
-            unitSelect.dataset.unitSelect = "1";
-            unitSelect.style.cssText = `${chromeInputCss()}display:none;`;
-            const explanation = document.createElement("div");
-            explanation.style.color = COLORS.textDim;
-            explanation.textContent = "Subjects are provider-neutral groupings over referenced media and give stable prompt identities to one or more Reference-library members. Subject-class References create one automatically; context-class References do not. Author your own to combine members into a composite Subject. This does not create Subjects for characters mentioned only in shot prose.";
-            const create = document.createElement("option"); create.value = ""; create.textContent = "New authored Subject";
-            unitSelect.appendChild(create);
-            for (const unit of host._promptSemanticUnits || []) {
-                const option = document.createElement("option"); option.value = unit.semantic_unit_id;
-                option.textContent = `${unit.name || unit.semantic_unit_id}${unit.generated
-                    ? " (Reference-generated)" : " (authored)"}`;
-                unitSelect.appendChild(option);
-            }
-            const name = document.createElement("input"); name.placeholder = "Subject name"; name.style.cssText = chromeInputCss();
-            const definition = document.createElement("textarea"); definition.placeholder = "Describe this Subject for prompt use…";
-            definition.rows = 2; definition.style.cssText = chromeInputCss();
-            const memberList = document.createElement("div");
-            memberList.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;max-height:110px;overflow:auto;";
-            const checks = [];
-            for (const reference of host._references || []) {
-                for (const member of reference.members || []) {
-                    const label = document.createElement("label");
-                    label.style.cssText = "display:flex;gap:3px;align-items:center;padding:2px 5px;border:1px solid #3b4656;border-radius:999px;";
-                    const box = document.createElement("input"); box.type = "checkbox";
-                    checks.push({ box, entity_id: reference.reference_id, member_id: member.member_id });
-                    label.append(box, `${reference.name || "Reference"} / ${member.prompt || member.member_id}`);
-                    memberList.appendChild(label);
-                }
-            }
-            const visual = document.createElement("select"); visual.style.cssText = chromeInputCss();
-            [["preserve", "Fully preserve"], ["partial", "Partially preserve"],
-                ["transfer_attributes", "Transfer attributes"], ["reference_loosely", "Weak reference"]]
-                .forEach(([value, label]) => { const option = document.createElement("option");
-                    option.value = value; option.textContent = label; visual.appendChild(option); });
-            const audio = document.createElement("select"); audio.style.cssText = chromeInputCss();
-            [["copy_full", "Fully copy audio"], ["copy_partial", "Partially copy audio"],
-                ["reference_characteristics", "Reference audio characteristics"], ["reference_loosely", "Weak audio reference"]]
-                .forEach(([value, label]) => { const option = document.createElement("option");
-                    option.value = value; option.textContent = label; audio.appendChild(option); });
-            const membershipReason = document.createElement("div");
-            membershipReason.style.cssText = `color:${COLORS.warningText};display:none;`;
-            membershipReason.textContent = "Select at least one Reference member before saving this Subject.";
-            const generatedNotice = document.createElement("div");
-            generatedNotice.style.cssText = `color:${COLORS.textDim};display:none;`;
-            generatedNotice.textContent = "This Subject is generated from a Reference. Remove the owning Reference to remove this generated Subject.";
-            const save = makeBtn("Save Subject", "One Reference asset may feed several Subjects; one Subject may combine several assets", "primary");
-            const remove = makeBtn("Delete authored Subject", "Delete this authored Subject after reviewing its dependents", "danger");
-            const updateMemberRule = () => {
-                const hasMembers = checks.some((entry) => entry.box.checked);
-                save.disabled = !hasMembers;
-                membershipReason.style.display = hasMembers ? "none" : "block";
-            };
-            const loadUnit = () => {
-                const unit = (host._promptSemanticUnits || []).find(
-                    (value) => value.semantic_unit_id === unitSelect.value);
-                name.value = unit?.name || ""; definition.value = unit?.definition || "";
-                visual.value = unit?.visual_intent || "preserve";
-                audio.value = unit?.audio_intent || "reference_characteristics";
-                const selected = new Set((unit?.source_members || []).map(
-                    (value) => `${value.entity_id}:${value.member_id}`));
-                checks.forEach((entry) => { entry.box.checked = selected.has(`${entry.entity_id}:${entry.member_id}`); });
-                generatedNotice.style.display = unit?.generated ? "block" : "none";
-                remove.style.display = unit && !unit.generated ? "inline-flex" : "none";
-                updateMemberRule();
-            };
-            checks.forEach((entry) => entry.box.addEventListener("change", updateMemberRule));
-            unitSelect.addEventListener("change", loadUnit);
-            unitSelect.value = editUnitId;
-            loadUnit();
-            save.addEventListener("click", async () => {
-                const sourceMembers = checks.filter((entry) => entry.box.checked).map(
-                    (entry) => ({ entity_id: entry.entity_id, member_id: entry.member_id }));
-                if (!name.value.trim() || !sourceMembers.length) return;
-                const current = (host._promptSemanticUnits || []).find(
-                    (value) => value.semantic_unit_id === unitSelect.value);
-                const nextUnit = { ...(current || {}), semantic_unit_id: current?.semantic_unit_id || `unit:${uid()}`,
-                    name: name.value.trim(), order: current?.order ?? (host._promptSemanticUnits || []).length,
-                    source_members: sourceMembers, visual_intent: visual.value, audio_intent: audio.value,
-                    definition: definition.value, intent_overrides: current?.intent_overrides || {} };
-                const next = (host._promptSemanticUnits || []).filter(
-                    (value) => value.semantic_unit_id !== nextUnit.semantic_unit_id);
-                try {
-                    await host._savePromptSemanticUnits?.([...next, nextUnit]); render();
-                } catch (error) {
-                    notifyWarning(error?.message || "Subject unit was rejected.",
-                        { source: "prompt-unit-invalid" });
-                }
-            });
-            remove.addEventListener("click", () => {
-                void deleteAuthoredSubject(unitSelect.value);
-            });
-            editor.append(explanation, unitSelect, name, definition, memberList,
-                membershipReason, visual, audio, generatedNotice, save, remove);
-            card.appendChild(editor);
-        });
-        card.appendChild(unitsButton);
-        subjectList.querySelectorAll("[data-edit-subject]").forEach((button) => {
-            button.addEventListener("click", () => {
-                unitsButton.dataset.editUnitId = button.dataset.editSubject;
-                unitsButton.click();
-            });
-        });
-        subjectList.querySelectorAll("[data-delete-subject]").forEach((button) => {
-            if (button.disabled) return;
-            button.addEventListener("click", () => {
-                void deleteAuthoredSubject(button.dataset.deleteSubject);
-            });
-        });
 
-        const commit = async (operations, label) => {
-            host._pushUndo?.(label);
+        const actionRow = document.createElement("div");
+        actionRow.style.cssText = "display:flex;align-items:center;gap:5px;min-width:0;";
+        profileRow.style.flex = "1 1 auto";
+        profile.style.minWidth = "160px";
+        const saveAs = makeBtn("Save as custom…", "Create an immutable custom format from this format");
+        const createNew = makeBtn("New…", "Start a minimally valid prompt format");
+        const menuWrap = document.createElement("div");
+        menuWrap.style.cssText = "position:relative;flex:0 0 auto;";
+        const menuButton = makeBtn("⋯", "Prompt format actions", "subtle",
+            "Prompt format actions");
+        for (const button of [saveAs, createNew, menuButton]) {
+            button.style.flex = "0 0 auto";
+            button.disabled = !catalogReady;
+        }
+        saveAs.addEventListener("click", () => openProfileEditor({
+            descriptor: currentDescriptor(), fresh: false }));
+        createNew.addEventListener("click", () => openProfileEditor({ fresh: true,
+            descriptor: { compatible_templates: [activeTemplateId] } }));
+        menuButton.addEventListener("click", () => {
+            // Toggle, not rebuild. Removing and immediately re-adding meant the
+            // trigger could never close its own menu, and with every action
+            // disabled (a built-in format) there was no way to dismiss it.
+            const open = menuWrap.querySelector("[data-prompt-format-menu]");
+            open?.remove();
+            if (open) return;
+            const descriptor = currentDescriptor();
+            const menu = document.createElement("div");
+            menu.dataset.promptFormatMenu = "1";
+            menu.dataset.sonderPromptContextMenu = "1";
+            menu.style.cssText = "position:absolute;right:0;top:calc(100% + 4px);z-index:12010;min-width:190px;padding:5px;border:1px solid #465266;border-radius:6px;background:#1a202a;box-shadow:0 12px 30px rgba(0,0,0,.45);display:flex;flex-direction:column;gap:4px;";
+            const edit = makeBtn("Edit as new version…", "Save changes as another immutable version");
+            const remove = makeBtn("Delete custom format", "Delete this unused custom format", "danger");
+            const actions = promptFormatMenuActions(descriptor);
+            const custom = actions.edit;
+            setButtonDisabled(edit, !actions.edit);
+            setButtonDisabled(remove, !actions.remove);
+            // Say WHY an action is unavailable — a built-in is immutable, so
+            // both are off — rather than leaving a dimmed control unexplained.
+            const builtinReason = "Built-in formats are immutable. Use Save as custom… first.";
+            edit.title = actions.edit
+                ? "Save changes as another immutable version" : builtinReason;
+            remove.title = actions.remove
+                ? "Delete this unused custom format" : builtinReason;
+            edit.addEventListener("click", () => {
+                menu.remove(); openProfileEditor({ descriptor, editAsVersion: true });
+            });
+            remove.addEventListener("click", async () => {
+                const key = String(descriptor?.key || "");
+                if (!custom || !key || !window.confirm(
+                    `Delete ${descriptor.name || key} (${key})? The server will refuse if it is in use.`)) return;
+                try {
+                    const remaining = (host._promptContextProfiles || []).filter((value) =>
+                        `${value.profile_id}@${value.version || "1"}` !== key);
+                    await host._savePromptContextProfiles?.(remaining);
+                    menu.remove();
+                    notifySuccess(`Deleted prompt format ${descriptor.name || key}.`,
+                        { source: "prompt-profile-delete" });
+                    render();
+                } catch (error) {
+                    notifyWarning(error?.message || "Prompt format is still in use.",
+                        { source: "prompt-profile-delete-refused" });
+                }
+            });
+            menu.append(edit, remove); menuWrap.appendChild(menu);
+            // Dismiss on outside pointer or Escape. Deferred one tick so the
+            // click that opened the menu does not immediately close it.
+            const dismiss = (event) => {
+                if (event?.type === "pointerdown"
+                        && (menu.contains(event.target) || menuButton === event.target)) return;
+                if (event?.type === "keydown" && event.key !== "Escape") return;
+                menu.remove();
+                document.removeEventListener("pointerdown", dismiss, true);
+                document.removeEventListener("keydown", dismiss, true);
+            };
+            setTimeout(() => {
+                document.addEventListener("pointerdown", dismiss, true);
+                document.addEventListener("keydown", dismiss, true);
+            }, 0);
+        });
+        menuWrap.appendChild(menuButton);
+        actionRow.append(profileRow, saveAs, createNew, menuWrap);
+        card.insertBefore(actionRow, card.firstChild);
+        const commit = async (operations, label, history = {}) => {
+            host._pushUndo?.(label, history);
             try {
                 await host._runSceneMutation(operations, {
                     key: `scene:${host.activeSceneId}:prompt-context:${Date.now()}`,
@@ -1726,74 +1789,112 @@ export function mountPromptManagementPanel(host) {
                 } }], "configure MiniMax H3 Base");
             });
             controls.append(task, first, last, save); card.appendChild(controls);
-        } else if (templateId === "minimax_h3_ref") {
-            const recipes = Array.isArray(scene.reference_lane_recipes)
-                ? structuredClone(scene.reference_lane_recipes) : [];
-            const populationSpecs = [
-                { population: "picture", physical: "pictures", label: "Picture",
-                    setupKey: "picture_lane_ids" },
-                { population: "video", physical: "videos", label: "Video",
-                    setupKey: "video_lane_ids" },
-                { population: "audio", physical: "standalone_audios", label: "Audio",
-                    setupKey: "audio_lane_ids" },
-            ];
-            const definitions = populationSpecs.map((spec) => ({ ...spec,
-                id: (host._referenceRecipePresets || []).find((preset) =>
-                    preset?.soft?.physical_population === spec.physical)?.id || "",
-            })).filter((definition) => definition.id);
-            const linked = (definition) => active?.mode === "reference"
-                && recipes.some((value) => value?.recipe_id === definition.id
-                    && (active[definition.setupKey] || []).map(String).includes(
-                        String(value?.lane_id || "")));
-            const linkedLabels = definitions.filter(linked).map((value) => value.label);
-            const status = document.createElement("div");
-            status.style.cssText = `font-size:10px;color:${COLORS.textDim};`;
-            status.textContent = linkedLabels.length
-                ? `Linked populations: ${linkedLabels.join(", ")}. Add only the lanes this scene needs.`
-                : "No H3 Reference population is linked. Add only the lanes this scene needs.";
-            const actions = document.createElement("div");
-            actions.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;";
-            const populationButtons = [];
-            for (const definition of definitions) {
-                const isLinked = linked(definition);
-                const add = makeBtn(isLinked ? `${definition.label} linked`
-                    : `Add ${definition.label} lane`,
-                isLinked ? `${definition.label} is already part of the active H3 setup.`
-                    : `Create or link only the ${definition.label} Reference population.`,
-                isLinked ? "secondary" : "primary");
-                add.disabled = isLinked;
-                add.addEventListener("click", async () => {
-                    // Each plan must read a coherent scene snapshot. Do not let
-                    // rapid clicks serialize two stale plans for the same lane.
-                    const priorDisabled = populationButtons.map((button) => button.disabled);
-                    populationButtons.forEach((button) => { button.disabled = true; });
-                    try {
-                        const completed = await commit([{
-                            type: "ensure_minimax_h3_reference_population",
-                            population: definition.population,
-                        }], `add MiniMax H3 ${definition.label} Reference lane`);
-                        if (completed) return;
-                    } catch (error) {
-                        notifyWarning(error?.message || "Reference population could not be planned.",
-                            { source: "prompt-context-refused" });
-                    }
-                    populationButtons.forEach((button, index) => {
-                        button.disabled = priorDisabled[index];
-                    });
-                });
-                populationButtons.push(add);
-                actions.appendChild(add);
-            }
-            const roleHint = document.createElement("div");
-            roleHint.style.cssText = `font-size:10px;color:${COLORS.textDim};`;
-            roleHint.textContent = "Roles remain explicit; staging media never implies editing, continuation, or audio reuse.";
-            card.append(status, actions, roleHint);
         }
+        const candidate = currentCandidatePayload() || {};
+        const profileKey = profile.value || defaultProfile;
+        const identityProfile = currentPromptProfile(profileKey);
+        const sameReferenceOwner = (attachment, owner) => {
+            if (attachment?.kind !== "reference") return false;
+            if (owner?.type === "identity") {
+                return (attachment.source?.semantic_unit_ids || []).map(String)
+                    .includes(String(owner.identityId || ""));
+            }
+            const sourceKey = String(owner?.declaration?.source_key || "");
+            return sourceKey && (attachment.source?.[sourceKey] || []).map(String)
+                .includes(String(owner?.memberId || ""));
+        };
+        const attachReference = async (owner, target) => {
+            const sectionIndex = Number(target?.sectionIndex);
+            const section = target?.scope === "section"
+                ? scene.prompt_sections?.[sectionIndex] : null;
+            const current = normalizePromptAttachments(section
+                ? section.attachments : scene.global_attachments);
+            let materializedHandle = "";
+            let history = {};
+            if (owner?.type === "physical" && !owner.storedHandle) {
+                materializedHandle = await host._materializeReferenceMemberHandle?.({
+                    referenceId: owner.referenceId, memberId: owner.memberId,
+                    suggestion: owner.handle, expectedHandle: "",
+                });
+                if (!materializedHandle) {
+                    throw new Error("The physical Reference handle could not be materialized.");
+                }
+                history = {
+                    referenceOperations: [{
+                        type: "update_member", reference_id: owner.referenceId,
+                        member_id: owner.memberId, fields: { handle: "" },
+                        expected: { handle: materializedHandle },
+                    }],
+                    inverseReferenceOperations: [{
+                        type: "update_member", reference_id: owner.referenceId,
+                        member_id: owner.memberId, fields: { handle: materializedHandle },
+                        expected: { handle: "" },
+                    }],
+                };
+            }
+            if (current.some((attachment) => sameReferenceOwner(attachment, owner))) {
+                // The durable handle materialization is still a user-visible
+                // mutation even when the target already owns the attachment.
+                // Record a same-scene snapshot so one Undo removes the handle.
+                if (history.referenceOperations?.length) {
+                    host._pushUndo?.("materialize prompt Reference handle", history);
+                }
+                notifySuccess(`@${materializedHandle || owner.handle || "Reference"} is already attached here.`,
+                    { source: "prompt-reference-reused" });
+                return true;
+            }
+            const attachment = promptReferenceAttachment(owner, identityProfile);
+            const next = [...current, attachment];
+            const operations = section ? [{
+                type: "update_prompt_section", index: sectionIndex,
+                expected: { start_frame: section.start_frame, end_frame: section.end_frame },
+                fields: { attachments: next },
+            }] : [{
+                type: "update_scene_fields", fields: { global_attachments: next },
+            }];
+            const label = "attach prompt Reference";
+            const committed = await commit(operations, label, history);
+            if (!committed && history.referenceOperations?.length) {
+                await host._mutateReferences?.(history.referenceOperations,
+                    "rollback refused prompt Reference attachment");
+            }
+            if (!committed) throw new Error("The prompt Reference attachment was refused.");
+            notifySuccess(`Attached @${materializedHandle || owner.handle || "Reference"}.`,
+                { source: "prompt-reference-attached" });
+            return true;
+        };
+        identityPanelCleanup = mountPromptIdentityPanel(card, {
+            candidate,
+            scene,
+            profile: identityProfile,
+            catalog: host._promptContextCatalog || {},
+            references: host._references || [],
+            assets: host._allProjectAssetsForGallery?.() || [],
+            semanticUnits: host._promptSemanticUnits || [],
+            projectKey: host._projectDirName?.() || host.projectId || "project",
+            scenes: (host.scenes || []).length
+                ? host.scenes : [host.activeScene].filter(Boolean),
+            saveSemanticUnitChange: (change, label) =>
+                host._savePromptSemanticUnits?.(applyPromptIdentityChange(
+                    host._promptSemanticUnits || [], change), label),
+            mutateReferences: (operations, label) =>
+                host._mutateReferences?.(operations, label),
+            attachReference,
+            assetPreviewUrl: (asset) => host._referenceAssetPreviewUrl?.(asset),
+            confirm: (message) => globalThis.confirm?.(message) ?? false,
+            onRefresh: render,
+            onModalStateChange: identityRefreshGate.setOpen,
+            onError: (error) => notifyWarning(
+                error?.message || "Prompt identity change was refused.",
+                { source: "prompt-identity-refused" }),
+        });
         bodyEl.appendChild(card);
     };
 
-    const render = () => {
+    renderNow = () => {
         if (!mounted) return;
+        identityPanelCleanup();
+        identityPanelCleanup = () => {};
         for (const editor of body.querySelectorAll("[data-sonder-prompt-box='1']")) {
             editor._sonderPromptContextMenuCleanup?.();
         }
@@ -1858,10 +1959,10 @@ export function mountPromptManagementPanel(host) {
                 semanticUnits: host._promptSemanticUnits || [],
                 profileId: scene.prompt_context_profile_id
                     || globalTemplate.default_context_profile || "generic@1",
-                templateId: globalTemplate.id || "",
                 scope: "global",
                 anchoredChannels,
-                taskTypes: host._promptContextCatalog?.minimax_task_types || [],
+                profile: currentPromptProfile(),
+                placementPhases: promptPlacementPhases(),
                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
                 candidate: currentCandidatePayload(),
@@ -1982,10 +2083,10 @@ export function mountPromptManagementPanel(host) {
             semanticUnits: host._promptSemanticUnits || [],
             profileId: scene.prompt_context_profile_id
                 || globalTemplate.default_context_profile || "generic@1",
-            templateId: globalTemplate.id || "",
             scope: "global",
             anchoredChannels: [],
-            taskTypes: host._promptContextCatalog?.minimax_task_types || [],
+            profile: currentPromptProfile(),
+            placementPhases: promptPlacementPhases(),
             managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
             ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
             candidate: currentCandidatePayload(),
@@ -2093,11 +2194,6 @@ export function mountPromptManagementPanel(host) {
                 display:flex; flex-direction:column; gap:6px; padding:6px 8px;
                 background:${COLORS.panel}; border:1px solid ${COLORS.promptBorder}; border-radius:4px;
             `;
-            const row = document.createElement("div");
-            row.style.cssText = `
-                display:grid; grid-template-columns: 58px 58px 1fr auto auto auto auto;
-                gap:6px; align-items:center;
-            `;
             // The body field takes twice the width of the rest; at one channel
             // it simply fills the row.
             const wideKey = template.shot_marker_channel || channelKeys[0];
@@ -2153,10 +2249,10 @@ export function mountPromptManagementPanel(host) {
                     semanticUnits: host._promptSemanticUnits || [],
                     profileId: scene.prompt_context_profile_id
                         || template.default_context_profile || "generic@1",
-                    templateId: template.id || "",
                     scope: "section",
                     anchoredChannels,
-                    taskTypes: host._promptContextCatalog?.minimax_task_types || [],
+                    profile: currentPromptProfile(),
+                    placementPhases: promptPlacementPhases(),
                     managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                     ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
                     candidate: currentCandidatePayload(),
@@ -2295,10 +2391,10 @@ export function mountPromptManagementPanel(host) {
                 semanticUnits: host._promptSemanticUnits || [],
                 profileId: scene.prompt_context_profile_id
                     || template.default_context_profile || "generic@1",
-                templateId: template.id || "",
                 scope: "section",
                 anchoredChannels: [],
-                taskTypes: host._promptContextCatalog?.minimax_task_types || [],
+                profile: currentPromptProfile(),
+                placementPhases: promptPlacementPhases(),
                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
                 candidate: currentCandidatePayload(),
@@ -2314,8 +2410,8 @@ export function mountPromptManagementPanel(host) {
                     attachmentLabelFor,
                     disabled: sectionsLocked,
                     allowedKinds: template.shot_marker_channel
-                        ? ["shot", "timestamp", "reference", "custom"]
-                        : ["reference", "custom"],
+                        ? ["shot", "timestamp", "prompt_link_scope", "reference", "custom"]
+                        : ["prompt_link_scope", "reference", "custom"],
                     reusableAttachments: allSectionAttachments(),
                     allSceneAttachments: allSectionAttachments(),
                     reuseContext: { scene: draftSceneSnapshot(), template },
@@ -2346,6 +2442,45 @@ export function mountPromptManagementPanel(host) {
                         channelInputs[wideKey]?.transactPromptAttachments?.(
                             sectionAttachments.map((value) =>
                                 value.attachment_id === configured.attachment_id ? configured : value));
+                    },
+                    onConvertPromptLinkCopy: async (attachment) => {
+                        const source = (scene.prompt_sections || []).find((value) =>
+                            String(value?.prompt_id || "")
+                                === String(attachment?.source?.prompt_id || ""));
+                        if (!source) {
+                            notifyWarning("The linked source section no longer exists.",
+                                { source: "prompt-link-copy-refused" });
+                            return;
+                        }
+                        const selectedChannels = (attachment?.source?.channel_keys || [])
+                            .map(String).filter(Boolean);
+                        const copyChannels = selectedChannels.length
+                            ? selectedChannels : channelKeys;
+                        const nextDocuments = structuredClone(channelDocuments);
+                        for (const channelKey of copyChannels) {
+                            if (!channelKeys.includes(channelKey)) continue;
+                            const sourceDocument = normalizePromptDocument(
+                                source.channel_docs?.[channelKey],
+                                source.channels?.[channelKey] || "");
+                            const text = promptDocumentText(sourceDocument).trim();
+                            if (!text) continue;
+                            const targetDocument = normalizePromptDocument(
+                                nextDocuments[channelKey], channels[channelKey] || "");
+                            targetDocument.nodes.unshift({
+                                type: "text", node_id: uid(), text: `${text} `,
+                            });
+                            nextDocuments[channelKey] = targetDocument;
+                        }
+                        const nextAttachments = sectionAttachments.filter((value) =>
+                            value.attachment_id !== attachment.attachment_id);
+                        await host._updatePromptSection(idx, {
+                            channel_docs: nextDocuments,
+                            channels: Object.fromEntries(channelKeys.map((channelKey) => [
+                                channelKey, promptDocumentText(nextDocuments[channelKey]).trim(),
+                            ])),
+                            attachments: nextAttachments,
+                        });
+                        render();
                     },
                     onRemove: async (attachment) => {
                         channelInputs[wideKey]?.transactPromptAttachments?.(
@@ -2390,16 +2525,22 @@ export function mountPromptManagementPanel(host) {
             const queueAdvisory = document.createElement("span");
             queueAdvisory.dataset.sonderQueueAdvisoryCount = "1";
             queueAdvisory.style.cssText = `display:none;font-size:9px;color:${COLORS.warningText};white-space:nowrap;`;
-            const addAfterBtn = makeBtn("+", "Insert a new section after this one (fills the gap to the next section)");
-            addAfterBtn.disabled = sectionsLocked;
+            const addAfterBtn = makeBtn("+", "Insert a new section after this one (fills the gap to the next section)",
+                "secondary", "Add prompt section after this section");
             addAfterBtn.addEventListener("click", async () => {
                 if (sectionsLocked) return;
                 const created = await host._addPromptSectionAfter(idx).catch(() => false);
                 if (created) render();
             });
-            const deleteBtn = makeBtn("✕", "Delete this section", "danger");
-            deleteBtn.style.cssText += "min-width:22px;min-height:22px;padding:1px 5px;font-size:10px;font-weight:500;";
-            deleteBtn.disabled = sectionsLocked;
+            const deleteBtn = makeBtn("✕", "Delete this section", "danger",
+                "Delete prompt section");
+            // One metric for both glyphs. They sit in a single action cell and
+            // must read as a pair, so the size lives in a shared constant
+            // rather than on whichever button was styled last.
+            for (const glyph of [addAfterBtn, deleteBtn]) {
+                glyph.style.cssText += SECTION_GLYPH_BUTTON_CSS;
+                setButtonDisabled(glyph, sectionsLocked);
+            }
             deleteBtn.addEventListener("click", async () => {
                 if (sectionsLocked) return;
                 if (!confirm("Delete this prompt section?")) return;
@@ -2408,10 +2549,13 @@ export function mountPromptManagementPanel(host) {
             });
 
             // The 1fr spacer keeps the buttons right-aligned now that the
-            // channels no longer occupy the middle of the controls row.
+            // channels no longer occupy the middle of the controls row. The
+            // section actions are one atomic grid cell so advisory visibility
+            // and narrow layouts cannot split + from ×.
             const spacer = document.createElement("div");
-            row.append(startInput, endInput, spacer,
-                       selectBtn, queueBtn, queueAdvisory, addAfterBtn, deleteBtn);
+            const row = buildPromptSectionControlRow(
+                [startInput, endInput, spacer, selectBtn, queueBtn, queueAdvisory],
+                [addAfterBtn, deleteBtn]);
             card.append(row, channelRow, scopeHost);
 
             // Which scene-global channels this section takes. One checkbox per
@@ -2498,7 +2642,8 @@ export function mountPromptManagementPanel(host) {
                     await host._applyPromptSetup(template);
                     render();
                 });
-                const removeBtn = makeBtn("✕", "Delete this template", "danger");
+                const removeBtn = makeBtn("✕", "Delete this template", "danger",
+                    "Delete prompt template");
                 removeBtn.addEventListener("click", () => {
                     host._deletePromptTemplate(template.id);
                     render();

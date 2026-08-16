@@ -12,17 +12,20 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Changed
+- A prompt format now declares what a Reference contributes — its name, destination, placement, guidance, and bounded choices — and the editor reads those declarations instead of carrying its own copy of the provider's vocabulary. Switching formats changes the labels, help, and choices you see.
+- Custom prompt formats can now be authored in full: Reference prompt parts, physical populations, identity kinds, roles, contributions, and speaker policy, each behind its own disclosure. Forking a format keeps its readable role names instead of replacing them with their machine values.
+- Reference and Identity rows now share one layout, prompt section `+` and `×` stay together as one control, glyph buttons have accessible names, and the identity editor opens with only Core identity expanded, adds searchable physical sources, reports missing required fields visibly, and shows a read-only panel of the format's routing defaults.
 - Prompt authoring now compiles, labels, links, and counts reuse from the same live draft; opening one prompt surface no longer initializes another, and late Reference data refreshes every mounted consumer behind mutation guards.
 - Declared inline capability placement is now available without a caret anchor, with truthful effective-phase reporting, resolved-text-first projections, caret-render deduplication, readable Prompt Link targets, responsive routing help, and fixed diagnostics geometry.
 - Prompt Context placement now accounts for every capability independently, shows compiler-resolved in-box projections and non-emitting reasons, and supports per-section capability suppression without deleting the chip.
-- Reference-backed Subjects now mint only from Subject-class References, separate setup/window applicability from the project catalog, and use typed readable labels and deduplicated linked-chip reuse choices.
+- Prompt formats now declare their physical populations, identity kinds, contribution vocabulary, speaker policy, and token grammar; MiniMax behavior no longer depends on duplicated channel-template checks.
 - Unqueued dormant prompt preview now uses the same project-aware compilation path as live candidate/execution/Relay, while queued dormant previews remain frozen snapshots.
 - Live Editor execution and Prompt Relay now share the project-aware Prompt Context compiler used by preview/enqueue, with demand-gated blocking diagnostics instead of silent blank prompts.
 - Prompt diagnostics retain a visibly stale scene-keyed result while recompiling, avoiding per-keystroke placeholder reflow and cross-scene preview leakage.
 - Context projections now follow every compiler placement above/below channel text, including multiple placements in one channel, and keep routed silent or linked-deduped chips visible with an explanation.
 - Shot and standalone section Time chips now have real editors and are the only authored marker state; Time remains window-local and template-gated.
-- Scope rows can reuse configured chips as linked emission groups with atomic propagated edits and Unlink, while Reference-backed Subjects now render as a directly actionable authored/generated list.
-- Prompt authoring now defaults inline bars to an all-channel view, uses a shared caret-aware context menu, shows per-channel Reference-chip projections, supports late-bound stable-id tokens, treats resolvable empty content as advisory, restores persisted box heights, and distinguishes protected generated Subjects from deletable authored composites.
+- Scope rows can reuse configured chips as linked emission groups with atomic propagated edits and Unlink, while the Prompt tool now separates compact Prompt Format, physical Reference Prompting, and explicit Identity Prompting.
+- Prompt authoring now defaults inline bars to an all-channel view, uses a shared caret-aware context menu, shows per-channel Reference-chip projections, supports format-declared stable-id tokens, treats resolvable empty content as advisory, and restores persisted box heights. Semantic identities can now be description-only or combine attributed physical sources and voice.
 - Timestamp is now an option on the Shot Context chip. Guide authoring is folded
   into Custom text with an optional H3 physical Guide binding; unsupported raw
   Guide/unknown kinds remain visible for repair and block while enabled.
@@ -40,6 +43,9 @@ a fresh `[Unreleased]` block.
   jobs replay through an isolated frozen-only composer.
 - Prompt profile, role, recipe, and validator authoring now consumes one
   schema-versioned server catalog, including sanitized built-in fork seeds.
+- Reference chips now inherit identity defaults and store only sparse per-chip
+  deviations; reset and explicit empty values remain distinct, with
+  capability-owned config retaining final precedence.
 - MiniMax H3 Picture, Video, and Audio population creation is one atomic,
   version-checked server mutation that reuses only safe unowned lanes.
 
@@ -49,21 +55,44 @@ a fresh `[Unreleased]` block.
   vocabulary, implicit ordinal/audio text fallbacks, and frozen-to-live
   Reference/template fallbacks.
 - Removed the six provider-shaped MiniMax H3 setup/bridge workflow nodes and
-  setup-owned paired Audio. Base physical keyframe outputs and paired Audio are
-  intentionally unavailable until their dedicated replacement design sessions;
-  Guides and ordinary timeline linked video/audio remain unchanged.
+  setup-owned paired Audio. Paired Audio remains unavailable pending its own
+  replacement design; Base physical keyframes use the existing Guides Bridge
+  with upstream `MiniMaxH3AddGuide`, without a Sonder-specific replacement.
 
 ### Fixed
+- A Reference chip now follows its Prompt Format when the format's declared
+  destination or placement changes, instead of staying where it was first
+  attached; per-part routing is stored only when it genuinely differs, so
+  **Provider default** and Reset work on it like every other field.
+- A refused prompt edit no longer leaves the Prompt tool showing text the server
+  rejected.
+- The identity and prompt format editors now confirm before a stray click or
+  Escape discards an unsaved draft; Cancel still discards immediately.
+- Dragging a Reference onto the timeline ruler creates a lane, matching how
+  clips and audio already behave, and lane highlighting during the drag now
+  matches what the drop will accept. A Reference mixing images and voice audio
+  is refused when the drag starts, with an explanation, rather than after it
+  lands.
+- Subject definitions no longer read `…combat boots. from <Picture 1>`; the
+  source citation is woven into the sentence.
+- The prompt format actions menu now closes from its own button, from an outside
+  click, and with Escape; unavailable actions are visibly dimmed and explain why
+  instead of appearing to do nothing.
+- Disabled editor buttons no longer highlight on hover, and the prompt section
+  `+` and `×` controls are the same size.
 - Prompt Context chips now wrap to two container-bounded lines, scope placement reads **After section prefixes**, routing rows use title-case capability labels and stack cleanly at constrained widths, and fullscreen background paste is ignored without an intrusive warning.
 - Fullscreen now owns background paste through the shared keyboard registry, refusing hidden graph paste while preserving native prompt-field paste; linked suppression uses a warning toast, and composer-owned Shot/Time markers no longer expose inert capability suppression.
 - Prompt editor paste now stays inside the active contenteditable, authored token-like prose gets a literal-text advisory, and deletion is pinned through canonical document, save/reload, candidate, and newly frozen queue state.
-- Subject editing now distinguishes protected generated rows from directly deletable authored rows, toggles the new-Subject form closed, and separates Unlink from the compact remove target.
-- Reference Context chips now derive their visible name from the bound Subject
-  or Library item and show the candidate compile emission. MiniMax Subject
-  definitions inherit from the chip, then Subject, then contributing Library
-  member prompts; the attachment menu identifies that source, disables speaker
-  targets without a Vocal Event in the render window, and exposes explicit
-  Summary task-type overrides while staged Roles remain the default.
+- Reference/member deletion now prunes prompt-identity source and voice bindings,
+  and identities are explicitly authored/deletable instead of auto-minted by
+  the Reference Library.
+- Reference Context chips now derive their visible name from the bound prompt
+  identity or Library item and show the candidate compile emission. MiniMax
+  identity definitions inherit through the effective sparse attachment config,
+  then the authored identity and contributing Library member prompts; the
+  attachment menu identifies that source, disables speaker targets without a
+  Vocal Event in the render window, and exposes explicit Summary task-type
+  overrides while staged Roles remain the default.
 - Queue refusals now show the server diagnostic code and message. The Prompt
   tool reports compile errors for the effective render window, marks the exact
   affected Context chips, and treats no selection as the full-scene queue
@@ -81,9 +110,12 @@ a fresh `[Unreleased]` block.
   now resolve from stable ids and the effective render
   window; profile-owned Writing aids insert fixed syntax without an LLM.
 - Added immutable Prompt Context profiles (`generic@1`, MiniMax H3 Base, and
-  MiniMax H3 Full Reference), project-scoped semantic Subjects, exact live
+  MiniMax H3 Full Reference), project-scoped semantic identities, exact live
   compile diagnostics, collision-safe browser-template dependency closures,
   and enqueue-frozen prompts/Relay/setup manifests.
+- Added project-unique physical/semantic handles, a section-scope live Prompt
+  Link with explicit copy/unlink actions, and a reload-safe Writing Source view
+  paired with read-only compiler output.
 - Added one scene-authoritative MiniMax H3 conditioning setup with typed Picture,
   Video, and standalone Audio recipes and roles. The generic Reference bridges
   follow the same frozen physical slot plan and late-bound ordinals as prompt

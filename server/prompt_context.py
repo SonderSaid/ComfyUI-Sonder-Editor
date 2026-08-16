@@ -27,9 +27,12 @@ MAX_CAPABILITIES = 64
 MAX_ATTACHMENTS_PER_SCENE = 512
 MAX_ATTACHMENT_OUTPUT = 16 * 1024
 MAX_COMPILED_PROMPT = 256 * 1024
+MAX_PHYSICAL_POPULATIONS = 16
+MAX_IDENTITY_KINDS = 16
+MAX_CONTRIBUTION_VALUES = 64
 
 SUPPORTED_ATTACHMENT_KINDS = {
-    "shot", "timestamp", "prompt_link", "reference",
+    "shot", "timestamp", "prompt_link", "prompt_link_scope", "reference",
     "vocal_event", "custom",
 }
 MAX_ATTACHMENT_KIND = 64
@@ -37,20 +40,50 @@ PLACEMENT_PHASES = (
     "document_preamble", "channel_prefix", "global_document",
     "section_prefix", "inline", "section_suffix", "channel_suffix",
 )
+PLACEMENT_PHASE_CATALOG = (
+    {"value": "document_preamble", "label": "Document preamble",
+     "description": "Before every channel and section contribution."},
+    {"value": "channel_prefix", "label": "Channel prefix",
+     "description": "At the beginning of the destination channel."},
+    {"value": "global_document", "label": "Global document",
+     "description": "With the scene-global contribution for the destination channel."},
+    {"value": "section_prefix", "label": "Section prefix",
+     "description": "Before authored text in each effective section."},
+    {"value": "inline", "label": "Inline at cursor",
+     "description": "At its document anchor; unanchored values follow section prefixes."},
+    {"value": "section_suffix", "label": "Section suffix",
+     "description": "After authored text in each effective section."},
+    {"value": "channel_suffix", "label": "Channel suffix",
+     "description": "At the end of the destination channel."},
+)
+PROFILE_DECLARATION_MAX_DEPTH = 16
+FIELD_DECLARATION_TYPES = frozenset({"enum", "enum_multi"})
+FIELD_DEFAULT_SOURCES = frozenset({"roles"})
+# The fixed server renderer allowlist, ordered and paired with a fallback name.
+# It answers "which capability kinds can this build render", not "what does any
+# provider call them": a format relabels every kind it declares, and the
+# built-ins carry their own authored labels. The names here are only what the
+# format editor offers when a kind is first declared, published as
+# `reference_capability_kinds` alongside `placement_phases`.
+REFERENCE_RENDERER_KIND_LABELS = (
+    ("derived_prompt", "Reference prompt"),
+    ("definitions", "Definition"),
+    ("summary", "Summary"),
+    ("retention", "Retention"),
+    ("mentions", "Scene mention"),
+    ("audio_relationship", "Audio relationship"),
+)
+REFERENCE_RENDERER_KINDS = frozenset(
+    kind for kind, _label in REFERENCE_RENDERER_KIND_LABELS)
 SEPARATOR_NAMES = ("attachment", "line")
-# Declarative provider surface.  Every attachment stores `provider_id` and
-# `provider_version`; an unknown pair was authored by a build this one cannot
-# interpret, so an *enabled* chip carrying it blocks rather than rendering under
-# guessed semantics.  Legacy records normalize to generic@1 and stay valid, and
-# a disabled chip is never validated because it emits nothing.
-SUPPORTED_PROVIDERS = {
-    "generic": frozenset({"1"}),
-    "minimax_h3_base": frozenset({"1"}),
-    "minimax_h3_ref": frozenset({"1"}),
-}
+# Every attachment stores `provider_id` and `provider_version`; the declarative
+# profile registry below is the authority for which pairs this build/project can
+# interpret. Legacy records normalize to generic@1 and stay valid, and disabled
+# chips are never validated because they emit nothing.
 # Prompt Links resolve only through inline document anchors, and Vocal Events
 # must stay chronological, so both are inline-only in every authoring surface.
 INLINE_ONLY_KINDS = frozenset({"prompt_link", "vocal_event"})
+SCOPE_ONLY_KINDS = frozenset({"prompt_link_scope"})
 VISUAL_INTENTS = {
     "preserve": "fully_preserved",
     "partial": "partially_preserved",
@@ -75,6 +108,70 @@ MINIMAX_TASK_TYPES = (
     "keyframe completion", "reference generation", "video editing",
     "video continuation", "audio reuse", "audio reference",
 )
+MINIMAX_TASK_TYPE_CHOICES = [
+    {"value": value, "label": value.title()}
+    for value in MINIMAX_TASK_TYPES
+]
+
+DEFAULT_CONTRIBUTION_CATALOG = {
+    "*": [
+        {"value": "appearance", "label": "Appearance"},
+        {"value": "costume", "label": "Costume"},
+        {"value": "motion", "label": "Motion"},
+        {"value": "composition", "label": "Composition"},
+        {"value": "timbre", "label": "Voice timbre"},
+        {"value": "delivery", "label": "Voice delivery"},
+    ],
+}
+VISUAL_INTENT_CHOICES = (
+    {"value": "preserve", "label": "Fully preserve"},
+    {"value": "partial", "label": "Partially preserve"},
+    {"value": "transfer_attributes", "label": "Transfer attributes"},
+    {"value": "reference_loosely", "label": "Reference loosely"},
+)
+AUDIO_INTENT_CHOICES = (
+    {"value": "copy_full", "label": "Fully copy"},
+    {"value": "copy_partial", "label": "Partially copy"},
+    {"value": "reference_characteristics", "label": "Reference audio characteristics"},
+    {"value": "reference_loosely", "label": "Reference loosely"},
+)
+
+MINIMAX_H3_PHYSICAL_POPULATIONS = [
+    {
+        "key": "pictures", "ordinal_key": "pictures",
+        "source_key": "picture_ids", "token_kind": "picture",
+        "label": "Picture", "label_template": "<Picture {n}>",
+        "media_kinds": ["image"], "cap": 9,
+        "description": "Still-image references presented to MiniMax as <Picture N>.",
+    },
+    {
+        "key": "videos", "ordinal_key": "videos",
+        "source_key": "video_ids", "token_kind": "video",
+        "label": "Video", "label_template": "<Video {n}>",
+        "media_kinds": ["video"], "cap": 3,
+        "description": "Video references presented to MiniMax as <Video N>.",
+    },
+    {
+        "key": "standalone_audios", "ordinal_key": "audios",
+        "source_key": "audio_ids", "token_kind": "audio",
+        "label": "Audio", "label_template": "<Audio {n}>",
+        "media_kinds": ["audio", "video"], "cap": 3,
+        "description": "Standalone audio references presented as <Audio N>.",
+    },
+]
+
+MINIMAX_SUBJECT_KIND = {
+    "key": "subject", "label": "Subject", "token_kind": "subject",
+    "referenced_label_template": "<Subject {n}>",
+    "assetless_label_template": "", "speaks": True,
+    "description": ("A semantic person, character, object, or other identity; "
+                    "it may be description-only or attributed to physical references."),
+}
+
+DEFAULT_SPEAKER_POLICY = {
+    "enabled": True, "token_template": "(S{n})",
+    "compound_join": ",", "compound_order": "authored",
+}
 
 # Server-owned staged-member role vocabulary.  Recipes declare which fields
 # they expose; the selected prompt format and physical model input declare the
@@ -142,9 +239,8 @@ def reference_role_catalog(profile_ids=None, population="", *, profiles=None,
         if active_key not in profile_keys:
             return []
         profile_keys = {active_key}
-    if "minimax_h3_ref@1" in profile_keys:
-        return copy.deepcopy(MINIMAX_H3_ROLE_CATALOGS.get(str(population), []))
-    for profile in profiles or []:
+    candidates = [*BUILTIN_PROFILES.values(), *(profiles or [])]
+    for profile in candidates:
         if not isinstance(profile, dict):
             continue
         key = f"{profile.get('profile_id', '')}@{profile.get('version', '1')}"
@@ -152,6 +248,33 @@ def reference_role_catalog(profile_ids=None, population="", *, profiles=None,
             return copy.deepcopy((_normalized_role_catalog(
                 profile.get("role_catalogs"))).get(str(population), []))
     return []
+
+
+def reference_capability_catalog(profile_ids=None, *, profiles=None) -> list[str]:
+    """Union derived capability names from the recipe's compatible formats.
+
+    A Reference recipe may target several prompt formats, so no single active
+    format owns its durable `exposed_capabilities` vocabulary.  The bounded
+    union of those explicitly compatible profiles is the one authoring and
+    validation authority.
+    """
+    profile_keys = {str(value or "") for value in (profile_ids or [])
+                    if str(value or "")}
+    if not profile_keys:
+        profile_keys = {"generic@1"}
+    result = []
+    seen = set()
+    for profile in [*BUILTIN_PROFILES.values(), *(profiles or [])]:
+        if not isinstance(profile, dict):
+            continue
+        key = f"{profile.get('profile_id', '')}@{profile.get('version', '1')}"
+        if key not in profile_keys:
+            continue
+        for capability in _reference_derived_view(profile):
+            if capability and capability not in seen:
+                seen.add(capability)
+                result.append(capability)
+    return result
 
 
 def normalize_reference_role(role, recipe, *, profiles=None,
@@ -178,6 +301,515 @@ def normalize_reference_role(role, recipe, *, profiles=None,
     if role not in {entry["value"] for entry in catalog}:
         raise ValueError(f"Unsupported Reference role: {role}")
     return role
+
+
+_DECLARATION_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+PROMPT_HANDLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
+def normalize_prompt_handle(value) -> str:
+    """Preserve authored spelling; syntax/uniqueness are mutation concerns."""
+    return str(value or "").strip()
+
+
+def prompt_handle_error(value) -> str:
+    handle = normalize_prompt_handle(value)
+    if handle and not PROMPT_HANDLE_RE.fullmatch(handle):
+        return ("Handles must start with a letter and use at most 64 letters, "
+                "numbers, or underscores.")
+    return ""
+
+
+def _declaration_template_valid(value, *, allow_empty=False) -> bool:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 256:
+        return False
+    if not value:
+        return allow_empty
+    fields = set(re.findall(r"\{([^{}]+)\}", value))
+    if fields != {"n"}:
+        return False
+    try:
+        value.format(n=1)
+    except (KeyError, ValueError, IndexError):
+        return False
+    return True
+
+
+def _declared_choice_value(entry) -> str:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return str(entry.get("value") or "")
+    return ""
+
+
+def _declared_choice_label(entry) -> str:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        return str(entry.get("label") or entry.get("value") or "")
+    return ""
+
+
+def _reference_derived_view(profile) -> dict:
+    reference = ((profile or {}).get("capabilities") or {}).get("reference")
+    derived = reference.get("derived") if isinstance(reference, dict) else None
+    return derived if isinstance(derived, dict) else {}
+
+
+def reference_derived_declarations(profile) -> dict:
+    return copy.deepcopy(_reference_derived_view(profile))
+
+
+def declared_reference_field(profile, capability_kind, field_name) -> dict:
+    declaration = _reference_derived_view(profile).get(
+        str(capability_kind or ""))
+    fields = declaration.get("fields") if isinstance(declaration, dict) else None
+    field = fields.get(str(field_name or "")) if isinstance(fields, dict) else None
+    return copy.deepcopy(field) if isinstance(field, dict) else {}
+
+
+def declared_field_choices(field) -> list[dict]:
+    values = field.get("values") if isinstance(field, dict) else None
+    result = []
+    for entry in values if isinstance(values, list) else []:
+        value = _declared_choice_value(entry).strip()
+        label = _declared_choice_label(entry).strip()
+        if not value or not label:
+            continue
+        result.append({
+            "value": value,
+            "label": label,
+            **({"description": str(entry.get("description") or "")}
+               if isinstance(entry, dict)
+               and str(entry.get("description") or "") else {}),
+        })
+    return result
+
+
+def _validate_declared_field(raw, *, field, add):
+    if not isinstance(raw, dict):
+        add("incomplete_capability_declaration",
+            "A capability field declaration must be an object.", field)
+        return
+    field_type = str(raw.get("type") or "")
+    if field_type not in FIELD_DECLARATION_TYPES:
+        add("incomplete_capability_declaration",
+            "Capability fields must use enum or enum_multi.", field)
+    unknown = set(raw).difference({
+        "type", "values", "label", "help", "example", "default_source",
+    })
+    if unknown:
+        add("incomplete_capability_declaration",
+            f"Unsupported capability field keys: {', '.join(sorted(unknown))}.",
+            field)
+    values = raw.get("values")
+    if not isinstance(values, list) or not values or len(values) > 64:
+        add("incomplete_capability_declaration",
+            "Capability field values must be a bounded nonempty list.", field)
+    else:
+        seen = set()
+        for index, entry in enumerate(values):
+            choice_field = f"{field}.values[{index}]"
+            value = _declared_choice_value(entry)
+            label = _declared_choice_label(entry)
+            if (not value or len(value) > 128 or value in seen
+                    or not label or len(label) > 128):
+                add("incomplete_capability_declaration",
+                    "Capability field choices need unique bounded values and labels.",
+                    choice_field)
+            seen.add(value)
+            if isinstance(entry, dict):
+                unknown_choice = set(entry).difference(
+                    {"value", "label", "description"})
+                description = entry.get("description", "")
+                if (unknown_choice or not isinstance(description, str)
+                        or len(description.encode("utf-8")) > FORMATTER_LIMIT_BYTES):
+                    add("incomplete_capability_declaration",
+                        "Capability field choice metadata is invalid.", choice_field)
+            elif not isinstance(entry, str):
+                add("incomplete_capability_declaration",
+                    "Capability field choices must be strings or value-label objects.",
+                    choice_field)
+    for name in ("label", "help", "example"):
+        text = raw.get(name, "")
+        if (not isinstance(text, str)
+                or len(text.encode("utf-8")) > FORMATTER_LIMIT_BYTES):
+            add("incomplete_capability_declaration",
+                f"Capability field {name} is invalid.", field)
+    default_source = raw.get("default_source")
+    if (default_source is not None
+            and (not isinstance(default_source, str)
+                 or default_source not in FIELD_DEFAULT_SOURCES)):
+        add("unknown_field_default_source",
+            f"Unknown capability-field default source: {default_source!r}.", field)
+
+
+def _reference_declaration_errors(value, *, template, add):
+    reference = ((value.get("capabilities") or {}).get("reference"))
+    if not isinstance(reference, dict):
+        return
+    derived = reference.get("derived")
+    if not isinstance(derived, dict) or not derived:
+        add("incomplete_capability_declaration",
+            "Reference capabilities require a nonempty derived declaration.",
+            "capabilities.reference.derived")
+        return
+    if len(derived) > MAX_CAPABILITIES:
+        add("incomplete_capability_declaration",
+            f"A format may declare at most {MAX_CAPABILITIES} derived capabilities.",
+            "capabilities.reference.derived")
+    channel_keys = None
+    template_id = str((template or {}).get("id") or "")
+    declared_template_id = str(value.get("template_id") or "")
+    declared_templates = value.get("compatible_templates")
+    template_is_bound = (
+        not isinstance(template, dict)
+        or template_id == declared_template_id
+        or (isinstance(declared_templates, list)
+            and template_id in {str(entry) for entry in declared_templates})
+        or str((template or {}).get("default_context_profile") or "") in {
+            f"{value.get('profile_id')}@{value.get('version', '1')}",
+            str(value.get("profile_id") or ""),
+        }
+    )
+    if isinstance(template, dict) and template_is_bound:
+        channel_keys = {str(row.get("key") or "")
+                        for row in template.get("channels") or ()
+                        if isinstance(row, dict)}
+    seen_orders = set()
+    for kind, declaration in derived.items():
+        field = f"capabilities.reference.derived.{kind}"
+        if (not isinstance(kind, str) or not _DECLARATION_KEY_RE.fullmatch(kind)
+                or not isinstance(declaration, dict)):
+            add("incomplete_capability_declaration",
+                "Derived capability keys and declarations must be bounded objects.",
+                field)
+            continue
+        if kind not in REFERENCE_RENDERER_KINDS:
+            add("incomplete_capability_declaration",
+                f"Derived capability {kind!r} has no bounded server renderer.",
+                field)
+        unknown = set(declaration).difference({
+            "order", "channel_key", "placement", "label", "description",
+            "example", "help", "fields",
+        })
+        if unknown:
+            add("incomplete_capability_declaration",
+                f"Unsupported derived capability fields: {', '.join(sorted(unknown))}.",
+                field)
+        order = declaration.get("order")
+        if (not isinstance(order, int) or isinstance(order, bool)
+                or not 0 <= order <= MAX_CAPABILITIES or order in seen_orders):
+            add("incomplete_capability_declaration",
+                "Derived capability order must be a unique bounded integer.", field)
+        else:
+            seen_orders.add(order)
+        channel_key = declaration.get("channel_key")
+        label = declaration.get("label")
+        if (not isinstance(channel_key, str) or not channel_key.strip()
+                or len(channel_key) > 128
+                or not isinstance(label, str) or not label.strip()
+                or len(label) > 128):
+            add("incomplete_capability_declaration",
+                "Derived capabilities require bounded channel_key and label values.",
+                field)
+        elif channel_keys is not None and channel_key not in channel_keys:
+            add("incomplete_capability_declaration",
+                f"Derived capability names missing template channel {channel_key!r}.",
+                field)
+        if declaration.get("placement") not in PLACEMENT_PHASES:
+            add("incomplete_capability_declaration",
+                "Derived capability placement is unsupported.", field)
+        for name in ("description", "example", "help"):
+            text = declaration.get(name, "")
+            if (not isinstance(text, str)
+                    or len(text.encode("utf-8")) > FORMATTER_LIMIT_BYTES):
+                add("incomplete_capability_declaration",
+                    f"Derived capability {name} is invalid.", field)
+        fields = declaration.get("fields", {})
+        if not isinstance(fields, dict) or len(fields) > 64:
+            add("incomplete_capability_declaration",
+                "Derived capability fields must be a bounded object.", field)
+            continue
+        for name, field_declaration in fields.items():
+            if not isinstance(name, str) or not _DECLARATION_KEY_RE.fullmatch(name):
+                add("incomplete_capability_declaration",
+                    "Capability field names must be bounded lowercase identifiers.",
+                    f"{field}.fields.{name}")
+                continue
+            _validate_declared_field(
+                field_declaration, field=f"{field}.fields.{name}", add=add)
+
+
+def profile_declaration_errors(profile, *, template=None) -> list[dict]:
+    """Validate format-owned static declarations without rewriting them.
+
+    Project loading preserves unknown and over-cap declarations so the author can
+    repair them. Authoring and profile resolution call this helper and refuse the
+    invalid declaration instead of silently dropping intent.
+    """
+    value = profile if isinstance(profile, dict) else {}
+    errors = []
+
+    def add(code, message, field=""):
+        errors.append({"code": code, "message": message,
+                       **({"field": field} if field else {})})
+
+    _reference_declaration_errors(value, template=template, add=add)
+
+    populations = value.get("physical_populations", [])
+    if not isinstance(populations, list):
+        add("unsupported_population", "Physical populations must be a list.",
+            "physical_populations")
+        populations = []
+    elif len(populations) > MAX_PHYSICAL_POPULATIONS:
+        add("unsupported_population",
+            f"A prompt format may declare at most {MAX_PHYSICAL_POPULATIONS} physical populations.",
+            "physical_populations")
+    seen_population_fields = {name: set() for name in (
+        "key", "ordinal_key", "source_key", "token_kind")}
+    population_keys = set()
+    allowed_population_fields = {
+        "key", "ordinal_key", "source_key", "token_kind", "label",
+        "label_template", "media_kinds", "cap", "description",
+    }
+    for index, raw in enumerate(populations):
+        field = f"physical_populations[{index}]"
+        if not isinstance(raw, dict):
+            add("unsupported_population", "A physical population must be an object.", field)
+            continue
+        unknown = set(raw).difference(allowed_population_fields)
+        if unknown:
+            add("unsupported_population",
+                f"Unsupported physical population fields: {', '.join(sorted(unknown))}.", field)
+        for name in ("key", "ordinal_key", "source_key", "token_kind"):
+            token = raw.get(name)
+            if not isinstance(token, str) or not _DECLARATION_KEY_RE.fullmatch(token):
+                add("unsupported_population", f"{name} must be a bounded lowercase identifier.", field)
+                continue
+            if token in seen_population_fields[name]:
+                add("unsupported_population", f"Duplicate physical population {name}: {token}.", field)
+            seen_population_fields[name].add(token)
+        key = str(raw.get("key") or "")
+        if key:
+            population_keys.add(key)
+        label = raw.get("label")
+        if not isinstance(label, str) or not label.strip() or len(label) > 128:
+            add("unsupported_population", "Physical population label is invalid.", field)
+        description = raw.get("description", "")
+        if (not isinstance(description, str)
+                or len(description.encode("utf-8")) > FORMATTER_LIMIT_BYTES):
+            add("unsupported_population", "Physical population description is invalid.", field)
+        if not _declaration_template_valid(raw.get("label_template")):
+            add("unsupported_population", "Physical label_template must contain only {n}.", field)
+        media_kinds = raw.get("media_kinds")
+        if (not isinstance(media_kinds, list) or not media_kinds
+                or len(media_kinds) > 8
+                or any(not isinstance(kind, str)
+                       or not _DECLARATION_KEY_RE.fullmatch(kind)
+                       for kind in media_kinds)
+                or len(set(media_kinds)) != len(media_kinds)):
+            add("unsupported_population", "Physical media_kinds must be a unique bounded set.", field)
+        cap = raw.get("cap")
+        if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 64:
+            add("unsupported_population", "Physical population cap must be between 1 and 64.", field)
+
+    identity_kinds = value.get("identity_kinds", [])
+    if not isinstance(identity_kinds, list):
+        add("unsupported_identity_kind", "Identity kinds must be a list.", "identity_kinds")
+        identity_kinds = []
+    elif len(identity_kinds) > MAX_IDENTITY_KINDS:
+        add("unsupported_identity_kind",
+            f"A prompt format may declare at most {MAX_IDENTITY_KINDS} identity kinds.",
+            "identity_kinds")
+    seen_identity = {name: set() for name in ("key", "token_kind")}
+    allowed_identity_fields = {
+        "key", "label", "token_kind", "referenced_label_template",
+        "assetless_label_template", "speaks", "description",
+    }
+    for index, raw in enumerate(identity_kinds):
+        field = f"identity_kinds[{index}]"
+        if not isinstance(raw, dict):
+            add("unsupported_identity_kind", "An identity kind must be an object.", field)
+            continue
+        unknown = set(raw).difference(allowed_identity_fields)
+        if unknown:
+            add("unsupported_identity_kind",
+                f"Unsupported identity-kind fields: {', '.join(sorted(unknown))}.", field)
+        for name in ("key", "token_kind"):
+            token = raw.get(name)
+            if not isinstance(token, str) or not _DECLARATION_KEY_RE.fullmatch(token):
+                add("unsupported_identity_kind", f"{name} must be a bounded lowercase identifier.", field)
+                continue
+            if token in seen_identity[name]:
+                add("unsupported_identity_kind", f"Duplicate identity {name}: {token}.", field)
+            seen_identity[name].add(token)
+        label = raw.get("label")
+        if not isinstance(label, str) or not label.strip() or len(label) > 128:
+            add("unsupported_identity_kind", "Identity-kind label is invalid.", field)
+        description = raw.get("description", "")
+        if (not isinstance(description, str)
+                or len(description.encode("utf-8")) > FORMATTER_LIMIT_BYTES):
+            add("unsupported_identity_kind", "Identity-kind description is invalid.", field)
+        if not _declaration_template_valid(raw.get("referenced_label_template"), allow_empty=True):
+            add("unsupported_identity_kind",
+                "referenced_label_template must be empty or contain only {n}.", field)
+        if not _declaration_template_valid(raw.get("assetless_label_template"), allow_empty=True):
+            add("unsupported_identity_kind",
+                "assetless_label_template must be empty or contain only {n}.", field)
+        if not isinstance(raw.get("speaks"), bool):
+            add("unsupported_identity_kind", "Identity-kind speaks must be boolean.", field)
+
+    if "contribution_catalog" in value:
+        catalog = value.get("contribution_catalog")
+        if not isinstance(catalog, dict) or len(catalog) > MAX_PHYSICAL_POPULATIONS + 1:
+            add("unknown_contribution", "Contribution catalog must be a bounded object.",
+                "contribution_catalog")
+            catalog = {}
+        for population, entries in catalog.items():
+            field = f"contribution_catalog.{population}"
+            if population != "*" and population not in population_keys:
+                add("unknown_contribution",
+                    f"Contribution catalog names unknown population {population!r}.", field)
+            if (not isinstance(entries, list)
+                    or len(entries) > MAX_CONTRIBUTION_VALUES):
+                add("unknown_contribution", "Contribution values must be a bounded list.", field)
+                continue
+            seen = set()
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    add("unknown_contribution", "A contribution value must be an object.", field)
+                    continue
+                token = entry.get("value")
+                label = entry.get("label")
+                if (not isinstance(token, str)
+                        or not _DECLARATION_KEY_RE.fullmatch(token)
+                        or token in seen
+                        or not isinstance(label, str) or not label.strip()
+                        or len(label) > 128):
+                    add("unknown_contribution", "Contribution value or label is invalid.", field)
+                    continue
+                seen.add(token)
+
+    policy = value.get("speaker_policy")
+    if policy is not None:
+        if not isinstance(policy, dict):
+            add("invalid_speaker_policy", "Speaker policy must be an object.", "speaker_policy")
+        else:
+            unknown = set(policy).difference({
+                "enabled", "token_template", "compound_join", "compound_order"})
+            if unknown:
+                add("invalid_speaker_policy",
+                    f"Unsupported speaker policy fields: {', '.join(sorted(unknown))}.",
+                    "speaker_policy")
+            if not isinstance(policy.get("enabled"), bool):
+                add("invalid_speaker_policy", "Speaker policy enabled must be boolean.",
+                    "speaker_policy")
+            if not _declaration_template_valid(policy.get("token_template"), allow_empty=True):
+                add("invalid_speaker_policy", "Speaker token_template must contain only {n}.",
+                    "speaker_policy")
+            joiner = policy.get("compound_join")
+            if not isinstance(joiner, str) or len(joiner) > 8:
+                add("invalid_speaker_policy", "Speaker compound_join is invalid.",
+                    "speaker_policy")
+            compound_order = policy.get("compound_order")
+            if (not isinstance(compound_order, str)
+                    or compound_order not in {"authored", "ascending"}):
+                add("invalid_speaker_policy", "Speaker compound_order is invalid.",
+                    "speaker_policy")
+    return errors
+
+
+def physical_population_declarations(profile) -> list[dict]:
+    values = (profile or {}).get("physical_populations")
+    return copy.deepcopy(values) if isinstance(values, list) else []
+
+
+def identity_kind_declarations(profile) -> list[dict]:
+    values = (profile or {}).get("identity_kinds")
+    return copy.deepcopy(values) if isinstance(values, list) else []
+
+
+def effective_contribution_catalog(profile) -> dict:
+    if "contribution_catalog" not in (profile or {}):
+        return copy.deepcopy(DEFAULT_CONTRIBUTION_CATALOG)
+    value = (profile or {}).get("contribution_catalog")
+    return copy.deepcopy(value) if isinstance(value, dict) else {}
+
+
+def effective_speaker_policy(profile) -> dict:
+    value = (profile or {}).get("speaker_policy")
+    if not isinstance(value, dict):
+        return {"enabled": False, "token_template": "",
+                "compound_join": ",", "compound_order": "authored"}
+    return copy.deepcopy(value)
+
+
+def resolved_profile_definition(profile) -> dict:
+    """Catalog projection after server-owned declaration inheritance."""
+    resolved = profile_fork_seed(profile)
+    resolved["contribution_catalog"] = effective_contribution_catalog(profile)
+    resolved["speaker_policy"] = effective_speaker_policy(profile)
+    return resolved
+
+
+def physical_population_by(profile, field, value):
+    target = str(value or "")
+    return next((entry for entry in physical_population_declarations(profile)
+                 if isinstance(entry, dict)
+                 and str(entry.get(field) or "") == target), None)
+
+
+def identity_kind_for(profile, kind="subject") -> dict | None:
+    target = str(kind or "subject")
+    values = identity_kind_declarations(profile)
+    return next((entry for entry in values if isinstance(entry, dict)
+                 and str(entry.get("key") or "") == target), None)
+
+
+def declared_label(declaration, number, field="label_template") -> str:
+    template = str((declaration or {}).get(field) or "")
+    if not template or not number:
+        return ""
+    try:
+        return template.format(n=int(number))
+    except (TypeError, ValueError, KeyError, IndexError):
+        return ""
+
+
+def declared_label_prefix(declaration, field="label_template") -> str:
+    template = str((declaration or {}).get(field) or "")
+    return template.split("{n}", 1)[0] if "{n}" in template else template
+
+
+def identity_ordinal_key(kind) -> str:
+    key = str(kind or "subject")
+    return key if key.endswith("s") else f"{key}s"
+
+
+def prompt_token_declarations(profile) -> dict:
+    """Return the resolved format's stable-token grammar."""
+    result = {}
+    for declaration in identity_kind_declarations(profile):
+        token_kind = str(declaration.get("token_kind") or "")
+        if token_kind:
+            result[token_kind] = {
+                "manifest_key": identity_ordinal_key(declaration.get("key")),
+                "label_template": str(
+                    declaration.get("referenced_label_template") or ""),
+                "physical": False,
+            }
+    for declaration in physical_population_declarations(profile):
+        token_kind = str(declaration.get("token_kind") or "")
+        if token_kind:
+            result[token_kind] = {
+                "manifest_key": str(declaration.get("ordinal_key") or ""),
+                "label_template": str(declaration.get("label_template") or ""),
+                "physical": True,
+                "population": str(declaration.get("key") or ""),
+            }
+    return result
 
 
 def _new_id() -> str:
@@ -372,9 +1004,7 @@ def replace_document_text(document, text) -> dict:
 
 def normalize_capability(raw, *, index=0) -> dict:
     raw = raw if isinstance(raw, dict) else {}
-    placement = str(raw.get("placement") or "section_prefix")
-    if placement not in PLACEMENT_PHASES:
-        placement = "section_prefix"
+    placement = str(raw.get("placement") or "")
     result = {
         "capability_id": str(raw.get("capability_id") or "").strip()
                          or f"capability_{index + 1}",
@@ -386,6 +1016,31 @@ def normalize_capability(raw, *, index=0) -> dict:
                   if isinstance(raw.get("config"), dict) else {},
     }
     return result
+
+
+REFERENCE_OVERRIDE_FIELDS = frozenset({
+    "definition", "summary", "task_types", "retention_detail",
+    "retention_details", "audio_definition", "audio_relationship", "text",
+    "visual_intent", "audio_intent",
+})
+
+
+def _normalize_reference_config(raw) -> dict:
+    """Migrate flat released fields into the sparse override bag on load.
+
+    The old shape is accepted only at this normalization boundary; all compiler
+    paths consume the new bag. A normal project save therefore writes one shape
+    instead of keeping two runtime authorities indefinitely.
+    """
+    config = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+    existing = config.get("overrides")
+    overrides = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    for field in REFERENCE_OVERRIDE_FIELDS:
+        if field in config and field not in overrides:
+            overrides[field] = config[field]
+        config.pop(field, None)
+    config["overrides"] = overrides
+    return config
 
 
 def normalize_attachment(raw) -> dict:
@@ -400,6 +1055,10 @@ def normalize_attachment(raw) -> dict:
     capabilities = [normalize_capability(value, index=index)
                     for index, value in enumerate(raw.get("capabilities") or [])
                     if isinstance(value, dict)]
+    config = (copy.deepcopy(raw.get("config"))
+              if isinstance(raw.get("config"), dict) else {})
+    if kind == "reference":
+        config = _normalize_reference_config(config)
     return {
         "attachment_id": attachment_id,
         "emission_group_id": str(raw.get("emission_group_id") or "").strip()
@@ -410,14 +1069,13 @@ def normalize_attachment(raw) -> dict:
         "enabled": raw.get("enabled") is not False,
         "source": copy.deepcopy(raw.get("source"))
                   if isinstance(raw.get("source"), dict) else {},
-        "config": copy.deepcopy(raw.get("config"))
-                  if isinstance(raw.get("config"), dict) else {},
+        "config": config,
         "capabilities": capabilities,
         # Prompt Links export their own dependency edge by default so a linked
         # source remains transitive. Other inline chips stay excluded unless
         # the author explicitly opts them in.
         "link_exportable": bool(raw.get(
-            "link_exportable", kind == "prompt_link")),
+            "link_exportable", kind in {"prompt_link", "prompt_link_scope"})),
     }
 
 
@@ -509,7 +1167,7 @@ def normalize_semantic_unit(raw) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     contributions = []
     seen = set()
-    for value in raw.get("source_members") or []:
+    for value in raw.get("sources") or []:
         if not isinstance(value, dict):
             continue
         key = (str(value.get("entity_id") or ""),
@@ -517,35 +1175,52 @@ def normalize_semantic_unit(raw) -> dict:
         if not all(key) or key in seen:
             continue
         seen.add(key)
-        contributions.append({"entity_id": key[0], "member_id": key[1]})
-    visual_intent = str(raw.get("visual_intent") or "preserve")
-    if visual_intent not in VISUAL_INTENTS:
-        visual_intent = "preserve"
-    audio_intent = str(raw.get("audio_intent") or "reference_characteristics")
-    if audio_intent not in AUDIO_INTENTS:
-        audio_intent = "reference_characteristics"
+        contributions.append({
+            "entity_id": key[0], "member_id": key[1],
+            "contribution": str(value.get("contribution") or ""),
+            "inherit_description": value.get("inherit_description") is True,
+        })
     try:
         # Authored/API data reaches this normalizer outside any handler, so a
         # non-numeric order must not become a 500.
         order = int(raw.get("order") or 0)
     except (TypeError, ValueError):
         order = 0
-    return {
+    voice = raw.get("voice") if isinstance(raw.get("voice"), dict) else {}
+    voice_member_id = str(voice.get("member_id") or "").strip() or None
+    result = {
         "semantic_unit_id": str(raw.get("semantic_unit_id") or "").strip()
                             or _new_id(),
-        "name": str(raw.get("name") or "Subject"),
+        "handle": normalize_prompt_handle(raw.get("handle")),
+        "name": str(raw.get("name") or "Identity"),
+        "kind": str(raw.get("kind") or "subject").strip() or "subject",
         "order": order,
-        "source_members": contributions,
-        "visual_intent": visual_intent,
-        "audio_intent": audio_intent,
+        "sources": contributions,
         "definition": str(raw.get("definition") or ""),
+        "attachment_defaults": copy.deepcopy(raw.get("attachment_defaults"))
+                               if isinstance(raw.get("attachment_defaults"), dict)
+                               else {},
+        "voice": {"member_id": voice_member_id},
         "intent_overrides": copy.deepcopy(raw.get("intent_overrides"))
                             if isinstance(raw.get("intent_overrides"), dict) else {},
     }
+    # Identity intent vocabulary belongs to the active Prompt Format. Keep the
+    # authored value sparse and preserved—even when a future/other format owns
+    # it—instead of synthesizing MiniMax defaults into every identity. The
+    # renderer applies its existing semantic fallback only when the field is
+    # actually needed.
+    for field in ("visual_intent", "audio_intent"):
+        if field in raw:
+            value = str(raw.get(field) or "").strip()
+            if value:
+                result[field] = value
+    return result
 
 
 def _profile(profile_id, name, template_id, *, capabilities, writing_aids,
-             separators=None, validators=None, role_catalogs=None) -> dict:
+             separators=None, validators=None, role_catalogs=None,
+             physical_populations=None, identity_kinds=None,
+             contribution_catalog=None, speaker_policy=None) -> dict:
     value = {
         "profile_id": profile_id,
         "version": "1",
@@ -556,8 +1231,16 @@ def _profile(profile_id, name, template_id, *, capabilities, writing_aids,
         "separators": separators or {"attachment": " ", "line": "\n"},
         "validators": validators or [],
         "role_catalogs": copy.deepcopy(role_catalogs or {}),
+        "physical_populations": copy.deepcopy(physical_populations or []),
+        "identity_kinds": copy.deepcopy(identity_kinds or []),
+        "speaker_policy": copy.deepcopy(speaker_policy or {
+            "enabled": False, "token_template": "",
+            "compound_join": ",", "compound_order": "authored",
+        }),
         "builtin": True,
     }
+    if contribution_catalog is not None:
+        value["contribution_catalog"] = copy.deepcopy(contribution_catalog)
     value["content_hash"] = content_hash(value)
     return value
 
@@ -604,9 +1287,25 @@ BUILTIN_PROFILES = {
             "shot": {"placement": "section_prefix"},
             "timestamp": {"placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
-            "reference": {"placement": "inline"},
+            "prompt_link_scope": {"placement": "section_prefix"},
+            "reference": {
+                "placement": "inline",
+                "derived": {
+                    "derived_prompt": {
+                        "order": 1,
+                        "channel_key": "visual",
+                        "placement": "inline",
+                        "label": "Reference prompt",
+                        "description": "Prompt text staged by a physical Reference.",
+                        "example": "A weathered brass compass.",
+                        "help": "Emits the staged Reference prompt at the attachment anchor.",
+                        "fields": {},
+                    },
+                },
+            },
             "vocal_event": {"placement": "inline"},
-        }, writing_aids=_GENERIC_AIDS),
+        }, writing_aids=_GENERIC_AIDS,
+        speaker_policy=DEFAULT_SPEAKER_POLICY),
     "minimax_h3_base@1": _profile(
         "minimax_h3_base", "MiniMax H3 Base", "minimax_h3_base",
         capabilities={
@@ -615,10 +1314,14 @@ BUILTIN_PROFILES = {
             "timestamp": {"channel_key": "integrated_multimodal_description",
                           "placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
+            "prompt_link_scope": {"placement": "section_prefix"},
             "vocal_event": {"channel_key": "integrated_multimodal_description",
                             "placement": "inline"},
         }, writing_aids=_MINIMAX_AIDS,
-        validators=["minimax_base_setup", "managed_speakers"]),
+        validators=["minimax_base_setup", "managed_speakers"],
+        identity_kinds=[{**MINIMAX_SUBJECT_KIND,
+                         "referenced_label_template": ""}],
+        speaker_policy=DEFAULT_SPEAKER_POLICY),
     "minimax_h3_ref@1": _profile(
         "minimax_h3_ref", "MiniMax H3 Full Reference", "minimax_h3_ref",
         capabilities={
@@ -627,21 +1330,99 @@ BUILTIN_PROFILES = {
             "timestamp": {"channel_key": "detailed_description",
                           "placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
+            "prompt_link_scope": {"placement": "section_prefix"},
             "reference": {
-                "routes": {"definitions": "subject_definitions",
-                           "summary": "summary", "retention": "retention_analysis",
-                           "mentions": "detailed_description",
-                           "audio_relationship": "summary"}},
+                "derived": {
+                    "definitions": {
+                        "order": 1, "channel_key": "subject_definitions",
+                        "placement": "section_prefix", "label": "Definition",
+                        "description": "Defines semantic identities from authored prose and attributed References.",
+                        "example": "<Subject 1> is a middle-aged man with a robust build.",
+                        "help": "Use identity prose for description-only subjects or inherit it from selected physical References.",
+                        "fields": {},
+                    },
+                    "summary": {
+                        "order": 2, "channel_key": "summary",
+                        "placement": "section_prefix", "label": "Summary",
+                        "description": "States the MiniMax H3 Full Reference task and optional summary prose.",
+                        "example": "[reference generation] The subject crosses the corridor.",
+                        "help": "Task types are MiniMax H3 Full Reference syntax owned by this Prompt Format.",
+                        "fields": {
+                            "task_types": {
+                                "type": "enum_multi",
+                                "values": copy.deepcopy(MINIMAX_TASK_TYPE_CHOICES),
+                                "label": "Summary task types",
+                                "help": "Choose the H3 reference operations represented by staged roles.",
+                                "example": "reference generation + audio reference",
+                                "default_source": "roles",
+                            },
+                        },
+                    },
+                    "retention": {
+                        "order": 3, "channel_key": "retention_analysis",
+                        "placement": "section_prefix", "label": "Retention",
+                        "description": "Describes which visual and audio characteristics should be retained.",
+                        "example": "<Subject 1> is fully preserved.",
+                        "help": "Defaults may be refined on an identity and overridden on an attachment.",
+                        "fields": {
+                            "visual_intent": {
+                                "type": "enum", "values": list(copy.deepcopy(VISUAL_INTENT_CHOICES)),
+                                "label": "Visual handling",
+                                "help": "How strongly the physical visual identity should be retained.",
+                                "example": "Fully preserve",
+                            },
+                            "audio_intent": {
+                                "type": "enum", "values": list(copy.deepcopy(AUDIO_INTENT_CHOICES)),
+                                "label": "Audio handling",
+                                "help": "How the attached voice or audio should influence generation.",
+                                "example": "Reference audio characteristics",
+                            },
+                        },
+                    },
+                    "mentions": {
+                        "order": 4, "channel_key": "detailed_description",
+                        "placement": "inline", "label": "Scene mention",
+                        "description": "Places resolved Reference and identity tokens in scene prose.",
+                        "example": "<Subject 1> picks up <Picture 2>.",
+                        "help": "The editor resolves user handles to this format's canonical tokens.",
+                        "fields": {},
+                    },
+                    "audio_relationship": {
+                        "order": 5, "channel_key": "summary",
+                        "placement": "section_prefix", "label": "Audio relationship",
+                        "description": "Relates an audio Reference to its semantic identity.",
+                        "example": "<Audio 1> is the voice reference for <Subject 1>.",
+                        "help": "Use this when audio is staged as part of an identity relationship.",
+                        "fields": {},
+                    },
+                },
+            },
             "vocal_event": {"channel_key": "detailed_description",
                             "placement": "inline"},
         }, writing_aids=_MINIMAX_AIDS,
         validators=["minimax_reference_setup", "managed_speakers"],
-        role_catalogs=MINIMAX_H3_ROLE_CATALOGS),
+        role_catalogs=MINIMAX_H3_ROLE_CATALOGS,
+        physical_populations=MINIMAX_H3_PHYSICAL_POPULATIONS,
+        identity_kinds=[MINIMAX_SUBJECT_KIND],
+        speaker_policy=DEFAULT_SPEAKER_POLICY),
 }
+
+
+def supported_provider_versions(custom_profiles=None) -> dict[str, frozenset[str]]:
+    result = defaultdict(set)
+    for profile in [*BUILTIN_PROFILES.values(), *(custom_profiles or [])]:
+        if not isinstance(profile, dict):
+            continue
+        provider_id = str(profile.get("profile_id") or "")
+        version = str(profile.get("version") or "")
+        if provider_id and version:
+            result[provider_id].add(version)
+    return {key: frozenset(values) for key, values in result.items()}
 
 PROFILE_DEFINITION_FIELDS = (
     "template_id", "compatible_templates", "capabilities", "writing_aids",
-    "separators", "validators", "role_catalogs",
+    "separators", "validators", "role_catalogs", "physical_populations",
+    "identity_kinds", "contribution_catalog", "speaker_policy",
 )
 PROFILE_RESERVED_DEFINITION_FIELDS = {
     "profile_id", "version", "name", "builtin", "content_hash", "fork_seed",
@@ -662,6 +1443,7 @@ def profile_fork_seed(profile) -> dict:
         if key in source
     }
 
+
 TEMPLATE_DEFAULT_PROFILES = {
     "standard": "generic@1", "sonder": "generic@1",
     "minimax_h3_base": "minimax_h3_base@1",
@@ -680,7 +1462,10 @@ def normalize_profile(raw, *, builtin=False) -> dict:
         raise ValueError("invalid_profile_capabilities")
 
     def assert_declarative(value, depth=0):
-        if depth > 8:
+        # Derived capability metadata nests field choices below the existing
+        # capability object. Sixteen keeps the declaration bounded while
+        # leaving deliberate headroom for value-label-description entries.
+        if depth > PROFILE_DECLARATION_MAX_DEPTH:
             raise ValueError("profile_recursion_limit")
         if isinstance(value, dict):
             for key, child in value.items():
@@ -693,6 +1478,9 @@ def normalize_profile(raw, *, builtin=False) -> dict:
             for child in value:
                 assert_declarative(child, depth + 1)
         elif isinstance(value, str):
+            # Presentation-only help and examples use the same conservative
+            # string screen as formatter text. Custom authors therefore cannot
+            # use these executable-looking sequences in prose.
             lowered = value.lower()
             if any(token in lowered for token in (
                     "<script", "<iframe", "javascript:", "onerror=", "onclick=",
@@ -703,6 +1491,23 @@ def normalize_profile(raw, *, builtin=False) -> dict:
     assert_declarative(raw.get("separators") or {})
     assert_declarative(raw.get("validators") or [])
     assert_declarative(raw.get("role_catalogs") or {})
+    assert_declarative(raw.get("physical_populations") or [])
+    assert_declarative(raw.get("identity_kinds") or [])
+    assert_declarative(raw.get("contribution_catalog") or {})
+    assert_declarative(raw.get("speaker_policy") or {})
+
+    def validate_field_declaration(field, *, owner):
+        problems = []
+        _validate_declared_field(
+            field, field=owner,
+            add=lambda code, message, path="": problems.append(
+                (code, message, path)))
+        if not problems:
+            return
+        if (not isinstance(field, dict)
+                or field.get("type") not in FIELD_DECLARATION_TYPES):
+            raise ValueError(f"{owner}_fields_must_be_enums")
+        raise ValueError(f"invalid_{owner}_enum")
     role_catalogs = _normalized_role_catalog(raw.get("role_catalogs"))
     if raw.get("role_catalogs") and not role_catalogs:
         raise ValueError("invalid_profile_role_catalogs")
@@ -755,13 +1560,7 @@ def normalize_profile(raw, *, builtin=False) -> dict:
                               if isinstance(declaration.get("fields"), dict)
                               else {})
         for field_name, field in field_declarations.items():
-            if not isinstance(field, dict) or field.get("type") != "enum":
-                raise ValueError("capability_fields_must_be_enums")
-            values = field.get("values")
-            if (not isinstance(values, list) or not values or len(values) > 64
-                    or any(not isinstance(value, str) or len(value) > 128
-                           for value in values)):
-                raise ValueError("invalid_capability_enum")
+            validate_field_declaration(field, owner="capability")
         substitutions = set(re.findall(
             r"\{([A-Za-z_][A-Za-z0-9_]*)\}", formatter))
         if not substitutions.issubset(
@@ -777,13 +1576,7 @@ def normalize_profile(raw, *, builtin=False) -> dict:
         assert_declarative(aid)
         fields = aid.get("fields") if isinstance(aid.get("fields"), dict) else {}
         for field_name, declaration in fields.items():
-            if not isinstance(declaration, dict) or declaration.get("type") != "enum":
-                raise ValueError("writing_aid_fields_must_be_enums")
-            values = declaration.get("values")
-            if (not isinstance(values, list) or not values or len(values) > 64
-                    or any(not isinstance(value, str) or len(value) > 128
-                           for value in values)):
-                raise ValueError("invalid_writing_aid_enum")
+            validate_field_declaration(declaration, owner="writing_aid")
         allowed_substitutions = set(fields) | {"text"}
         substitutions = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", text))
         if not substitutions.issubset(allowed_substitutions):
@@ -852,8 +1645,24 @@ def normalize_profile(raw, *, builtin=False) -> dict:
         "separators": copy.deepcopy(separators),
         "validators": validators,
         "role_catalogs": role_catalogs,
+        "physical_populations": copy.deepcopy(
+            raw.get("physical_populations")
+            if isinstance(raw.get("physical_populations"), list) else
+            raw.get("physical_populations", [])),
+        "identity_kinds": copy.deepcopy(
+            raw.get("identity_kinds")
+            if isinstance(raw.get("identity_kinds"), list) else
+            raw.get("identity_kinds", [])),
+        "speaker_policy": copy.deepcopy(
+            raw.get("speaker_policy") if "speaker_policy" in raw else {
+                "enabled": False, "token_template": "",
+                "compound_join": ",", "compound_order": "authored",
+            }),
         "builtin": bool(builtin),
     }
+    if "contribution_catalog" in raw:
+        value["contribution_catalog"] = copy.deepcopy(
+            raw.get("contribution_catalog"))
     value["content_hash"] = content_hash(value)
     return value
 
@@ -923,12 +1732,24 @@ def _require_profile_template(profile, resolved_template) -> dict:
     return profile
 
 
+def _require_profile_declarations(profile, *, template=None) -> dict:
+    declaration_errors = profile_declaration_errors(profile, template=template)
+    if declaration_errors:
+        first = declaration_errors[0]
+        raise ProfileResolutionError(
+            "invalid_profile_declaration",
+            f"{first.get('code', 'invalid')}:{first.get('field', '')}")
+    return profile
+
+
 def resolve_profile(profile=None, *, template=None, custom_profiles=None) -> dict:
     resolved_template = prompt_channel_templates.get_channel_template(template)
     requested = profile
     if isinstance(profile, dict):
-        return _require_profile_template(normalize_profile(profile),
-                                         resolved_template)
+        normalized = _require_profile_template(
+            normalize_profile(profile), resolved_template)
+        return _require_profile_declarations(
+            normalized, template=resolved_template)
     if not requested:
         requested = (resolved_template.get("default_context_profile")
                      or TEMPLATE_DEFAULT_PROFILES.get(
@@ -937,8 +1758,10 @@ def resolve_profile(profile=None, *, template=None, custom_profiles=None) -> dic
     if "@" not in key:
         key = f"{key}@1"
     if key in BUILTIN_PROFILES:
-        return _require_profile_template(
+        normalized = _require_profile_template(
             copy.deepcopy(BUILTIN_PROFILES[key]), resolved_template)
+        return _require_profile_declarations(
+            normalized, template=resolved_template)
     for value in custom_profiles or []:
         try:
             normalized = normalize_profile(value)
@@ -946,7 +1769,9 @@ def resolve_profile(profile=None, *, template=None, custom_profiles=None) -> dic
             continue
         candidate = f"{normalized['profile_id']}@{normalized['version']}"
         if candidate == key:
-            return _require_profile_template(normalized, resolved_template)
+            normalized = _require_profile_template(normalized, resolved_template)
+            return _require_profile_declarations(
+                normalized, template=resolved_template)
     raise ProfileResolutionError("unknown_profile", key)
 
 
@@ -979,15 +1804,30 @@ def _speaker_bindings(events):
     return order
 
 
-def _render_vocal_event(attachment, speaker_numbers):
+def _render_vocal_event(attachment, speaker_numbers, speaker_policy=None):
     config = attachment["config"]
     event_type = str(config.get("event_type") or "dialogue")
     if event_type not in VOCAL_EVENT_TYPES:
         event_type = "dialogue"
     text = str(config.get("text") or "").strip()
     language = str(config.get("language") or "English").strip() or "English"
-    speakers = ",".join(f"S{value}" for value in speaker_numbers)
-    speaker_token = f"({speakers})" if speakers else ""
+    policy = speaker_policy if isinstance(speaker_policy, dict) else {}
+    speaker_tokens = [declared_label(policy, value, "token_template")
+                      for value in speaker_numbers]
+    speaker_tokens = [value for value in speaker_tokens if value]
+    joiner = str(policy.get("compound_join") or ",")
+    if len(speaker_tokens) > 1:
+        # The format declares its intended compound order, but PR-16 deliberately
+        # remains the tracked behavior until its focused fix; preserve authored
+        # selection order here so this declaration migration is byte-identical.
+        speaker_token = joiner.join(
+            value[1:-1] if value.startswith("(") and value.endswith(")") else value
+            for value in speaker_tokens)
+        first = speaker_tokens[0]
+        speaker_token = (f"({speaker_token})" if first.startswith("(")
+                         and first.endswith(")") else speaker_token)
+    else:
+        speaker_token = speaker_tokens[0] if speaker_tokens else ""
     subject_phrase = str(config.get("subject_phrase") or "").strip()
     prefix = " ".join(value for value in (subject_phrase, speaker_token) if value)
     if event_type == "dialogue":
@@ -1006,35 +1846,63 @@ def _render_vocal_event(attachment, speaker_numbers):
 def _reference_labels(attachment, context):
     labels = []
     manifest = context.get("ordinal_manifest") or {}
+    profile = context.get("profile") or {}
+    units = context.get("semantic_units_by_id") or {}
+    audio_prefixes = [
+        declared_label_prefix(declaration)
+        for declaration in physical_population_declarations(profile)
+        if str(declaration.get("token_kind") or "") == "audio"
+        and declared_label_prefix(declaration)
+    ]
     for source_id in attachment["source"].get("semantic_unit_ids") or []:
-        number = (manifest.get("subjects") or {}).get(str(source_id))
-        if number:
-            labels.append(f"<Subject {number}>")
+        unit = units.get(str(source_id)) or {}
+        kind = str(unit.get("kind") or "subject")
+        declaration = identity_kind_for(profile, kind)
+        number = (manifest.get(identity_ordinal_key(kind)) or {}).get(str(source_id))
+        label_field = ("assetless_label_template" if not unit.get("sources")
+                       else "referenced_label_template")
+        label = declared_label(declaration, number, label_field)
+        if label:
+            labels.append(label)
             for label in context.get("unit_source_labels", {}).get(str(source_id)) or []:
-                if str(label).startswith("<Audio ") and label not in labels:
+                if (any(str(label).startswith(prefix) for prefix in audio_prefixes)
+                        and label not in labels):
                     labels.append(str(label))
-    for population, label in (("pictures", "Picture"), ("videos", "Video"),
-                              ("audios", "Audio")):
-        for source_id in attachment["source"].get(f"{population[:-1]}_ids") or []:
-            number = (manifest.get(population) or {}).get(str(source_id))
-            if number:
-                labels.append(f"<{label} {number}>")
+    for declaration in physical_population_declarations(profile):
+        source_key = str(declaration.get("source_key") or "")
+        ordinal_key = str(declaration.get("ordinal_key") or "")
+        for source_id in attachment["source"].get(source_key) or []:
+            number = (manifest.get(ordinal_key) or {}).get(str(source_id))
+            label = declared_label(declaration, number)
+            if label:
+                labels.append(label)
     return labels
 
 
-def _minimax_task_types(context, configured=()):
+def _minimax_task_types(context, configured=(), profile=None):
     """Return guide-ordered, explicit-role-derived H3 task types.
 
     Physical media presence never implies editing, continuation, reuse, or
     reference. An explicit chip selection overrides the staged-role default.
     """
+    resolved_profile = profile or context.get("profile") or {}
+    field = declared_reference_field(resolved_profile, "summary", "task_types")
+    declared = [choice["value"] for choice in declared_field_choices(field)]
     explicit = {str(raw or "").strip().lower() for raw in configured or []}
-    explicit.intersection_update(MINIMAX_TASK_TYPES)
+    explicit.intersection_update(declared)
     if explicit:
-        return [value for value in MINIMAX_TASK_TYPES if value in explicit]
+        return [value for value in declared if value in explicit]
+    if field.get("default_source") != "roles":
+        return []
     found = set()
     manifest = context.get("setup_manifest") or {}
-    for row in manifest.get("pictures") or []:
+    declarations = physical_population_declarations(resolved_profile)
+    rows_by_token = {
+        str(declaration.get("token_kind") or ""): manifest.get(
+            str(declaration.get("key") or "")) or []
+        for declaration in declarations if isinstance(declaration, dict)
+    }
+    for row in rows_by_token.get("picture", []):
         role = str(row.get("role") or "").strip().lower().replace("-", "_")
         if role in {"first_frame", "last_frame", "keyframe", "edited_keyframe",
                     "composition_anchor"}:
@@ -1042,7 +1910,7 @@ def _minimax_task_types(context, configured=()):
         elif role in {"storyboard", "identity", "environment", "style", "motion",
                       "reference_generation"}:
             found.add("reference generation")
-    for row in manifest.get("videos") or []:
+    for row in rows_by_token.get("video", []):
         role = str(row.get("role") or "").strip().lower().replace("-", "_")
         if role == "video_editing":
             found.add("video editing")
@@ -1051,13 +1919,31 @@ def _minimax_task_types(context, configured=()):
         elif role in {"temporal_structure", "motion", "camera", "rhythm",
                       "reference_generation"}:
             found.add("reference generation")
-    for row in manifest.get("standalone_audios") or []:
+    for row in rows_by_token.get("audio", []):
         role = str(row.get("role") or "").strip().lower()
         if role == "audio_reuse":
             found.add("audio reuse")
         elif role in {"audio_reference", "timbre", "rhythm", "sound_texture"}:
             found.add("audio reference")
-    return [value for value in MINIMAX_TASK_TYPES if value in found]
+    return [value for value in declared if value in found]
+
+
+def _definition_before_source(definition: str, source: str) -> str:
+    """Drop a definition's terminal period when a source citation follows it.
+
+    A definition inherited from Library member prose normally ends in a full
+    stop, and the citation is appended after it — producing a fragment the guide
+    never writes: `...combat boots. from <Picture 1>`.  The guide weaves the
+    citation into the sentence instead.
+
+    Only `.` is dropped.  A definition ending in `?` or `!` keeps it, because
+    removing those changes the meaning rather than the punctuation
+    ("Is she the one?" must not become "Is she the one from <Picture 1>").
+    """
+    value = str(definition or "").rstrip()
+    if not source or not value.endswith("."):
+        return value
+    return value[:-1].rstrip()
 
 
 def _subject_definition(config, unit, context) -> tuple[str, str]:
@@ -1069,7 +1955,7 @@ def _subject_definition(config, unit, context) -> tuple[str, str]:
     if unit_definition:
         return unit_definition, "subject"
     member_ids = {str(value.get("member_id") or "")
-                  for value in unit.get("source_members") or []
+                  for value in unit.get("sources") or []
                   if isinstance(value, dict)}
     prompts = []
     for row in (context.get("setup_manifest", {}).get("presentation") or []):
@@ -1080,9 +1966,63 @@ def _subject_definition(config, unit, context) -> tuple[str, str]:
     return "; ".join(prompts), ("member" if prompts else "")
 
 
+def _common_identity_attachment_defaults(attachment, context) -> dict:
+    units = context.get("semantic_units_by_id") or {}
+    selected = [units.get(str(unit_id)) or {} for unit_id in
+                (attachment.get("source") or {}).get("semantic_unit_ids") or []]
+    selected = [unit for unit in selected if unit]
+    if not selected:
+        return {}
+    defaults = [unit.get("attachment_defaults")
+                if isinstance(unit.get("attachment_defaults"), dict) else {}
+                for unit in selected]
+    result = {}
+    for field in REFERENCE_OVERRIDE_FIELDS:
+        values = [value[field] for value in defaults if field in value]
+        if (values and len(values) == len(defaults)
+                and all(value == values[0] for value in values[1:])):
+            result[field] = copy.deepcopy(values[0])
+    return result
+
+
+def effective_reference_config(attachment, capability, context) -> dict:
+    """Resolve Reference config through its one sparse precedence chain.
+
+    Format defaults < common identity attachment defaults < non-inheritable
+    attachment config < chip overrides < capability config. Capability config
+    is sparse and intentionally wins for capability-owned fields.
+    """
+    profile = context.get("profile") or {}
+    declaration = (profile.get("capabilities") or {}).get("reference") or {}
+    kind = str((capability or {}).get("kind")
+               or (capability or {}).get("capability_id") or "")
+    config = (copy.deepcopy(declaration.get("defaults"))
+              if isinstance(declaration.get("defaults"), dict) else {})
+    by_capability = declaration.get("capability_defaults")
+    if isinstance(by_capability, dict) and isinstance(by_capability.get(kind), dict):
+        config.update(copy.deepcopy(by_capability[kind]))
+    config.update(_common_identity_attachment_defaults(attachment, context))
+    attachment_config = (attachment.get("config")
+                         if isinstance(attachment.get("config"), dict) else {})
+    config.update({key: copy.deepcopy(value)
+                   for key, value in attachment_config.items()
+                   if key != "overrides"})
+    overrides = attachment_config.get("overrides")
+    if isinstance(overrides, dict):
+        config.update(copy.deepcopy(overrides))
+    capability_config = (capability or {}).get("config")
+    if isinstance(capability_config, dict):
+        config.update(copy.deepcopy(capability_config))
+    return config
+
+
 def _render_reference_capability(attachment, capability, context):
     kind = capability.get("kind") or capability.get("capability_id")
-    config = {**attachment.get("config", {}), **capability.get("config", {})}
+    if kind not in _reference_derived_view(context.get("profile") or {}):
+        return ""
+    if reference_capability_errors(attachment, capability, context):
+        return ""
+    config = effective_reference_config(attachment, capability, context)
     labels = _reference_labels(attachment, context)
     if kind == "derived_prompt":
         item_id = str(attachment.get("source", {}).get("reference_item_id") or "")
@@ -1094,12 +2034,13 @@ def _render_reference_capability(attachment, capability, context):
     if kind == "mentions":
         return str(config.get("text") or " ".join(labels)).strip()
     if kind == "summary":
-        task_types = _minimax_task_types(context, config.get("task_types") or [])
+        task_types = _minimax_task_types(
+            context, config.get("task_types") or [], context.get("profile"))
         prefix = f"[{' + '.join(task_types)}] " if task_types else ""
         return f"{prefix}{str(config.get('summary') or '').strip()}".strip()
     if kind == "audio_relationship":
         return str(config.get("audio_relationship") or "").strip()
-    return str(config.get("text") or "").strip()
+    return ""
 
 
 def reference_capability_lines(attachment, capability, context) -> list[tuple]:
@@ -1111,42 +2052,82 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
     owner key must be the semantic unit or physical slot, not the chip.
     """
     kind = capability.get("kind") or capability.get("capability_id")
-    config = {**attachment.get("config", {}), **capability.get("config", {})}
+    config = effective_reference_config(attachment, capability, context)
     labels = _reference_labels(attachment, context)
     units = context.get("semantic_units_by_id") or {}
+    profile = context.get("profile") or {}
+    visual_prefixes = [
+        declared_label_prefix(declaration)
+        for declaration in physical_population_declarations(profile)
+        if str(declaration.get("token_kind") or "") in {"picture", "video"}
+        and declared_label_prefix(declaration)
+    ]
+    audio_prefixes = [
+        declared_label_prefix(declaration)
+        for declaration in physical_population_declarations(profile)
+        if str(declaration.get("token_kind") or "") == "audio"
+        and declared_label_prefix(declaration)
+    ]
     if kind == "definitions":
         lines = []
         for unit_id in attachment["source"].get("semantic_unit_ids") or []:
             unit = units.get(str(unit_id)) or {}
-            number = (context.get("ordinal_manifest", {}).get("subjects") or {}).get(str(unit_id))
+            identity_kind = str(unit.get("kind") or "subject")
+            identity_declaration = identity_kind_for(
+                context.get("profile") or {}, identity_kind)
+            number = (context.get("ordinal_manifest", {}).get(
+                identity_ordinal_key(identity_kind)) or {}).get(str(unit_id))
+            assetless = not unit.get("sources")
+            identity_label = declared_label(
+                identity_declaration, number,
+                "assetless_label_template" if assetless
+                else "referenced_label_template")
             definition, _definition_source = _subject_definition(
                 config, unit, context)
             source = ""
             source_labels = context.get("unit_source_labels", {}).get(str(unit_id)) or []
             visual_labels = [str(value) for value in source_labels
-                             if str(value).startswith(("<Picture ", "<Video "))]
+                             if any(str(value).startswith(prefix)
+                                    for prefix in visual_prefixes)]
             if visual_labels:
                 if len(visual_labels) == 1:
                     joined_labels = visual_labels[0]
                 else:
                     joined_labels = ", ".join(visual_labels[:-1]) + f", and {visual_labels[-1]}"
                 source = f" from {joined_labels}"
-            if number and definition:
+            if identity_label and definition:
                 lines.append((("subject_definition", str(unit_id)),
-                              f"<Subject {number}> is {definition}{source}"))
+                              f"{identity_label} is "
+                              f"{_definition_before_source(definition, source)}{source}"))
+            elif assetless and definition:
+                speaker_number = (context.get("speaker_order") or {}).get(
+                    str(unit_id))
+                if not speaker_number:
+                    lines.append((("identity_definition", str(unit_id)),
+                                  definition))
             audio_definition = str(config.get("audio_definition") or "").strip()
             speaker_subject_id = str(config.get("audio_speaker_subject_id") or "")
             speaker_suffix = ""
             if speaker_subject_id:
+                speaker_unit = units.get(speaker_subject_id) or {}
+                speaker_kind = str(speaker_unit.get("kind") or "subject")
+                speaker_declaration = identity_kind_for(
+                    context.get("profile") or {}, speaker_kind)
                 speaker_subject_number = (context.get("ordinal_manifest", {}).get(
-                    "subjects") or {}).get(speaker_subject_id)
+                    identity_ordinal_key(speaker_kind)) or {}).get(speaker_subject_id)
                 speaker_number = (context.get("speaker_order") or {}).get(
                     speaker_subject_id)
-                if speaker_subject_number and speaker_number:
-                    speaker_suffix = (f" for <Subject {speaker_subject_number}> "
-                                      f"(S{speaker_number})")
+                speaker_label = declared_label(
+                    speaker_declaration, speaker_subject_number,
+                    "referenced_label_template")
+                speaker_token = declared_label(
+                    effective_speaker_policy(context.get("profile") or {}),
+                    speaker_number, "token_template")
+                if speaker_label and speaker_token:
+                    speaker_suffix = f" for {speaker_label} {speaker_token}"
             for audio_label in (value for value in source_labels
-                                if str(value).startswith("<Audio ")):
+                                if any(str(value).startswith(prefix)
+                                       for prefix in audio_prefixes)):
                 if audio_definition:
                     lines.append((("audio_definition", str(audio_label)),
                                   f"{audio_label} is {audio_definition}{speaker_suffix}"))
@@ -1154,31 +2135,52 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                                 if isinstance(config.get(
                                     "physical_definitions"), dict) else {})
         manifest = context.get("ordinal_manifest") or {}
-        for source_key, population, label in (
-                ("picture_ids", "pictures", "Picture"),
-                ("video_ids", "videos", "Video"),
-                ("audio_ids", "audios", "Audio")):
+        for declaration in physical_population_declarations(
+                context.get("profile") or {}):
+            source_key = str(declaration.get("source_key") or "")
+            population = str(declaration.get("ordinal_key") or "")
             for source_id in attachment["source"].get(source_key) or []:
                 number = (manifest.get(population) or {}).get(str(source_id))
                 definition = str(physical_definitions.get(str(source_id)) or (
-                    config.get("audio_definition") if source_key == "audio_ids"
+                    config.get("audio_definition")
+                    if str(declaration.get("token_kind") or "") == "audio"
                     else config.get("definition")) or "").strip()
-                if number and definition:
+                label = declared_label(declaration, number)
+                if label and definition:
                     lines.append((("physical_definition", population, str(source_id)),
-                                  f"<{label} {number}> is {definition}"))
+                                  f"{label} is {definition}"))
         return lines
     if kind == "retention":
         lines = []
         visual_intent = str(config.get("visual_intent") or "")
         audio_intent = str(config.get("audio_intent") or "")
+        profile = context.get("profile") or {}
+        identity_prefixes = [
+            (declared_label_prefix(declaration, "referenced_label_template"), declaration)
+            for declaration in identity_kind_declarations(profile)
+            if declared_label_prefix(declaration, "referenced_label_template")
+        ]
+        physical_prefixes = [
+            (declared_label_prefix(declaration), declaration)
+            for declaration in physical_population_declarations(profile)
+            if declared_label_prefix(declaration)
+        ]
         for label in labels:
             unit_id = ""
-            if label.startswith("<Subject"):
+            identity_declaration = next((declaration for prefix, declaration
+                                         in identity_prefixes
+                                         if label.startswith(prefix)), None)
+            physical_declaration = next((declaration for prefix, declaration
+                                         in physical_prefixes
+                                         if label.startswith(prefix)), None)
+            if identity_declaration is not None:
                 number = re.search(r"\d+", label)
+                ordinal_key = identity_ordinal_key(
+                    identity_declaration.get("key") or "subject")
                 unit_id = next((value for value in
                                 attachment["source"].get("semantic_unit_ids") or []
                                 if str((context.get("ordinal_manifest", {}).get(
-                                    "subjects") or {}).get(str(value)))
+                                    ordinal_key) or {}).get(str(value)))
                                 == (number.group(0) if number else "")), "")
                 unit = units.get(str(unit_id)) or {}
                 resolved_visual = visual_intent or str(
@@ -1186,7 +2188,7 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                 resolved_audio = audio_intent or str(
                     unit.get("audio_intent") or "reference_characteristics")
                 member_ids = {str(value.get("member_id") or "")
-                              for value in unit.get("source_members") or []
+                              for value in unit.get("sources") or []
                               if isinstance(value, dict)}
                 applicable = [row for row in (
                     (context.get("setup_manifest", {}).get("pictures") or [])
@@ -1206,32 +2208,25 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                 ordinal_match = re.search(r"\d+", label)
                 ordinal = int(ordinal_match.group(0)) if ordinal_match else 0
                 setup = context.get("setup_manifest") or {}
-                if label.startswith("<Picture"):
-                    staged_row = next((row for row in setup.get("pictures") or []
-                                       if int(row.get("picture_ordinal") or 0)
-                                       == ordinal), {})
-                elif label.startswith("<Video"):
-                    staged_row = next((row for row in setup.get("videos") or []
-                                       if int(row.get("video_ordinal") or 0)
-                                       == ordinal), {})
-                else:
-                    staged_row = next((row for row in (
-                        setup.get("standalone_audios") or [])
-                                       if int(row.get("audio_ordinal") or 0)
-                                       == ordinal), {})
+                population_key = str((physical_declaration or {}).get("key") or "")
+                ordinal_field = (f"{str((physical_declaration or {}).get('token_kind') or '')}"
+                                 "_ordinal")
+                staged_row = next((row for row in setup.get(population_key) or []
+                                   if int(row.get(ordinal_field) or 0) == ordinal), {})
                 resolved_visual = visual_intent or str(
                     staged_row.get("visual_intent") or "preserve")
                 resolved_audio = audio_intent or str(
                     staged_row.get("audio_intent") or
                     "reference_characteristics")
-            marker = AUDIO_INTENTS.get(resolved_audio, "reference") if label.startswith("<Audio") \
+            is_audio = str((physical_declaration or {}).get("token_kind") or "") == "audio"
+            marker = AUDIO_INTENTS.get(resolved_audio, "reference") if is_audio \
                 else VISUAL_INTENTS.get(resolved_visual, "fully_preserved")
             unit_shots = context.get("reference_unit_shots") or {}
-            appearances = (unit_shots.get(str(unit_id)) if label.startswith("<Subject")
+            appearances = (unit_shots.get(str(unit_id)) if identity_declaration is not None
                            else None) or (context.get("reference_group_shots") or {}).get(
                                attachment.get("emission_group_id"), [])
             appearance = ""
-            if label.startswith("<Subject") and appearances:
+            if identity_declaration is not None and appearances:
                 appearance = " (appears in " + ", ".join(
                     f"[Shot {number}]" for number in appearances) + ")"
             details = config.get("retention_details")
@@ -1240,7 +2235,7 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                 detail = str(details.get(label) or "").strip()
             detail = detail or str(config.get("retention_detail") or "").strip()
             owner = (("retention_subject", str(unit_id))
-                     if label.startswith("<Subject")
+                     if identity_declaration is not None
                      else ("retention_physical", str(label)))
             lines.append((owner, f"{label}{appearance}: {marker}"
                           + (f" - {detail}" if detail else "")))
@@ -1250,9 +2245,25 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
 
 def _render_generic(attachment, capability, context, speaker_numbers=None):
     kind = attachment["kind"]
-    config = {**attachment.get("config", {}), **capability.get("config", {})}
+    config = (effective_reference_config(attachment, capability, context)
+              if kind == "reference" else
+              {**attachment.get("config", {}), **capability.get("config", {})})
     if kind == "vocal_event":
-        return _render_vocal_event(attachment, speaker_numbers or [])
+        rendered_attachment = attachment
+        if not str(config.get("subject_phrase") or "").strip():
+            subject_ids = [str(value) for value in
+                           attachment.get("source", {}).get("subject_ids") or []
+                           if str(value)]
+            if len(subject_ids) == 1:
+                unit = (context.get("semantic_units_by_id") or {}).get(
+                    subject_ids[0]) or {}
+                if not unit.get("sources") and str(unit.get("definition") or "").strip():
+                    rendered_attachment = copy.deepcopy(attachment)
+                    rendered_attachment.setdefault("config", {})["subject_phrase"] = str(
+                        unit.get("definition") or "").strip()
+        return _render_vocal_event(
+            rendered_attachment, speaker_numbers or [],
+            effective_speaker_policy(context.get("profile") or {}))
     if kind == "reference":
         return _render_reference_capability(attachment, capability, context)
     if kind == "custom":
@@ -1267,7 +2278,7 @@ def _render_generic(attachment, capability, context, speaker_numbers=None):
             # anything; substituting it unchecked is exactly the bounded-enum
             # bypass this guards, and `custom_capability_errors` reports it.
             for name, field in declared.items():
-                allowed = {str(entry) for entry in field.get("values") or []}
+                allowed = {choice["value"] for choice in declared_field_choices(field)}
                 authored_value = str(authored.get(name) or "")
                 value = value.replace(
                     "{" + name + "}",
@@ -1333,7 +2344,7 @@ def custom_capability_errors(attachment, capability, profile) -> list[dict]:
                 "message": f"Custom Context field {name!r} is not declared by this prompt format.",
             })
             continue
-        allowed = [str(value) for value in field.get("values") or []]
+        allowed = [choice["value"] for choice in declared_field_choices(field)]
         raw_value = authored.get(name)
         if raw_value is None or not str(raw_value).strip():
             if name in substitutions:
@@ -1353,6 +2364,43 @@ def custom_capability_errors(attachment, capability, profile) -> list[dict]:
     return errors
 
 
+def reference_capability_errors(attachment, capability, context) -> list[dict]:
+    """Validate enabled Reference state against its resolved format vocabulary."""
+    profile = context.get("profile") or {}
+    kind = str(capability.get("kind") or capability.get("capability_id") or "")
+    declaration = _reference_derived_view(profile).get(kind)
+    attachment_id = str(attachment.get("attachment_id") or "")
+    if not isinstance(declaration, dict):
+        return [{
+            "code": "undeclared_reference_capability",
+            "attachment_id": attachment_id,
+            "capability_id": str(capability.get("capability_id") or ""),
+            "message": (f"Reference capability {kind!r} is not declared by "
+                        f"{profile.get('name') or 'this prompt format'}."),
+        }]
+    config = effective_reference_config(attachment, capability, context)
+    errors = []
+    for field_name, field in (declaration.get("fields") or {}).items():
+        if field_name not in config:
+            continue
+        allowed = {choice["value"] for choice in declared_field_choices(field)}
+        raw = config.get(field_name)
+        values = raw if field.get("type") == "enum_multi" else [raw]
+        if not isinstance(values, list):
+            values = [values]
+        unknown = [str(value) for value in values if str(value) not in allowed]
+        if unknown:
+            errors.append({
+                "code": "unknown_declared_field_value",
+                "attachment_id": attachment_id,
+                "capability_id": str(capability.get("capability_id") or ""),
+                "field": str(field_name),
+                "message": (f"Reference field {field_name!r} contains values "
+                            f"outside this prompt format: {', '.join(unknown)}."),
+            })
+    return errors
+
+
 def _document_render(document, attachment_by_id, render_anchor):
     parts = []
     for node in normalize_prompt_document(document)["nodes"]:
@@ -1368,16 +2416,46 @@ def _document_render(document, attachment_by_id, render_anchor):
 
 def _default_capability(attachment, profile):
     declaration = (profile.get("capabilities") or {}).get(attachment["kind"], {})
+    capability_kind = attachment["kind"]
+    if attachment["kind"] == "reference":
+        derived = _reference_derived_view(profile)
+        if derived:
+            capability_kind, capability_declaration = min(
+                derived.items(), key=lambda item: (
+                    int(item[1].get("order", MAX_CAPABILITIES))
+                    if isinstance(item[1], dict) else MAX_CAPABILITIES,
+                    item[0]))
+            declaration = capability_declaration
     return normalize_capability({
-        "capability_id": attachment["kind"],
-        "kind": attachment["kind"],
+        "capability_id": capability_kind,
+        "kind": capability_kind,
         "channel_key": declaration.get("channel_key", ""),
         "placement": declaration.get("placement", "section_prefix"),
     })
 
 
+def _resolved_capability(attachment, capability, profile) -> dict:
+    value = copy.deepcopy(capability)
+    if value.get("placement"):
+        return value
+    attachment_declaration = ((profile.get("capabilities") or {}).get(
+        attachment["kind"]) or {})
+    kind = str(value.get("kind") or value.get("capability_id") or "")
+    derived = (attachment_declaration.get("derived")
+               if isinstance(attachment_declaration, dict) else {})
+    kind_declaration = (derived.get(kind) if isinstance(derived, dict) else {})
+    value["placement"] = str(
+        (kind_declaration or {}).get("placement")
+        or attachment_declaration.get("placement")
+        or "section_prefix")
+    return value
+
+
 def _capabilities(attachment, profile):
-    return attachment["capabilities"] or [_default_capability(attachment, profile)]
+    values = attachment["capabilities"] or [_default_capability(attachment, profile)]
+    resolved = [_resolved_capability(attachment, value, profile) for value in values]
+    return [value for value in resolved
+            if value.get("placement") in PLACEMENT_PHASES]
 
 
 def _enabled_capabilities(attachment, profile):
@@ -1395,9 +2473,12 @@ def _route_for(attachment, capability, profile, fallback_channel):
     if capability.get("channel_key"):
         return capability["channel_key"]
     declaration = (profile.get("capabilities") or {}).get(attachment["kind"], {})
-    routes = declaration.get("routes") or {}
     kind = capability.get("kind") or capability.get("capability_id")
-    return str(routes.get(kind) or declaration.get("channel_key") or fallback_channel)
+    derived = declaration.get("derived") if isinstance(declaration, dict) else {}
+    capability_declaration = (derived.get(kind)
+                              if isinstance(derived, dict) else {})
+    return str((capability_declaration or {}).get("channel_key")
+               or declaration.get("channel_key") or fallback_channel)
 
 
 _PROFILE_ERROR_MESSAGES = {
@@ -1458,17 +2539,18 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     resolved_template = prompt_channel_templates.get_channel_template(template)
     resolved_profile = resolve_profile(profile, template=resolved_template,
                                        custom_profiles=custom_profiles)
+    context["profile"] = copy.deepcopy(resolved_profile)
     keys = prompt_channel_templates.template_channel_keys(resolved_template)
     global_docs = normalize_channel_documents(global_documents, global_channels, keys)
     global_mirror = channel_document_mirrors(global_docs)
     errors, warnings, emissions = [], [], []
     setup_manifest = context.get("setup_manifest") or {}
     role_catalogs = resolved_profile.get("role_catalogs") or {}
-    for manifest_key, population in (
-            ("pictures", "pictures"), ("videos", "videos"),
-            ("standalone_audios", "standalone_audios")):
+    for declaration in physical_population_declarations(resolved_profile):
+        manifest_key = str(declaration.get("key") or "")
+        population = manifest_key
         allowed_roles = {str(value.get("value") or "") for value in
-                         role_catalogs.get(population, [])
+                          role_catalogs.get(population, [])
                          if isinstance(value, dict)}
         for row in setup_manifest.get(manifest_key) or []:
             role = str(row.get("role") or "").strip()
@@ -1482,7 +2564,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     raw_sections = []
     global_attachment_values = normalize_attachments(global_attachments)
     for attachment in global_attachment_values:
-        if attachment.get("kind") in {"shot", "timestamp", "prompt_link"}:
+        if attachment.get("kind") in {"shot", "timestamp", "prompt_link",
+                                       "prompt_link_scope"}:
             errors.append({
                 "code": "invalid_global_attachment",
                 "attachment_id": attachment.get("attachment_id", ""),
@@ -1558,6 +2641,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     all_attachments = list(global_attachment_values)
     for value in selected_sections:
         all_attachments.extend(value["attachments"])
+    supported_providers = supported_provider_versions(custom_profiles)
     for attachment in all_attachments:
         if not attachment.get("enabled", True):
             continue
@@ -1594,6 +2678,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     for section in selected_sections:
         warn_authored_prompt_tokens(
             section.get("prompt_id", ""), section.get("channel_docs") or {})
+
+    context["semantic_units_by_id"] = {
+        unit["semantic_unit_id"]: unit
+        for unit in (normalize_semantic_unit(value)
+                     for value in context.get("semantic_units") or [])
+    }
+    profile_validator_ids = {
+        str(value) for value in resolved_profile.get("validators") or []
+        if isinstance(value, str)
+    }
+    is_h3_reference_profile = "minimax_reference_setup" in profile_validator_ids
+    is_h3_base_profile = "minimax_base_setup" in profile_validator_ids
+    is_h3_profile = is_h3_reference_profile or is_h3_base_profile
 
     # Speaker ordering is selected-window chronological, then document order.
     vocal_events = []
@@ -1647,6 +2744,29 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "message": ("A Vocal Event must name at least one Subject or a "
                             "stable voice; this one is unbound."),
             })
+        for unit_id in bound:
+            unit = context["semantic_units_by_id"].get(unit_id)
+            if unit is None:
+                errors.append({
+                    "code": "broken_vocal_identity",
+                    "attachment_id": attachment["attachment_id"],
+                    "message": f"Vocal Event identity {unit_id!r} no longer exists.",
+                })
+                continue
+            declaration = identity_kind_for(
+                resolved_profile, unit.get("kind") or "subject")
+            if declaration is None:
+                errors.append({
+                    "code": "unsupported_identity_kind",
+                    "attachment_id": attachment["attachment_id"],
+                    "message": f"Vocal Event identity kind {unit.get('kind')!r} is not supported by this format.",
+                })
+            elif declaration.get("speaks") is not True:
+                errors.append({
+                    "code": "identity_cannot_speak",
+                    "attachment_id": attachment["attachment_id"],
+                    "message": f"Prompt identity {unit.get('name') or unit_id!r} cannot own a Vocal Event in this format.",
+                })
         language = str(attachment.get("config", {}).get("language") or "English")
         if language not in DIALOGUE_LANGUAGES:
             errors.append({
@@ -1654,7 +2774,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "attachment_id": attachment["attachment_id"],
                 "message": f"Managed Vocal Event language {language!r} is not in the bounded language list.",
             })
-        if (str(resolved_template.get("id") or "").startswith("minimax_h3_")
+        if (is_h3_profile
                 and str(attachment.get("config", {}).get("event_type") or "")
                 == "voiceover"
                 and not str(attachment.get("config", {}).get(
@@ -1671,7 +2791,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             continue
         provider_id = str(attachment.get("provider_id") or "")
         provider_version = str(attachment.get("provider_version") or "")
-        supported = SUPPORTED_PROVIDERS.get(provider_id)
+        supported = supported_providers.get(provider_id)
         if supported is None or provider_version not in supported:
             errors.append({
                 "code": "unsupported_attachment_provider",
@@ -1680,24 +2800,66 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                             f"{provider_version or '<blank>'} is not supported by "
                             "this build."),
             })
+        raw_capabilities = (attachment.get("capabilities")
+                            or [_default_capability(attachment, resolved_profile)])
+        for raw_capability in raw_capabilities:
+            capability = _resolved_capability(
+                attachment, raw_capability, resolved_profile)
+            if not capability.get("enabled", True):
+                continue
+            placement = str(capability.get("placement") or "")
+            if placement not in PLACEMENT_PHASES:
+                errors.append({
+                    "code": "invalid_attachment_placement",
+                    "attachment_id": attachment["attachment_id"],
+                    "capability_id": str(capability.get("capability_id") or ""),
+                    "message": (f"Context capability placement {placement!r} is "
+                                "not declared by this build; choose a supported placement."),
+                })
+                continue
+            if attachment["kind"] == "reference":
+                errors.extend(reference_capability_errors(
+                    attachment, capability, context))
         if attachment["kind"] == "custom":
             for capability in _enabled_capabilities(attachment, resolved_profile):
                 errors.extend(custom_capability_errors(
                     attachment, capability, resolved_profile))
 
-    context["semantic_units_by_id"] = {
-        unit["semantic_unit_id"]: unit
-        for unit in (normalize_semantic_unit(value)
-                     for value in context.get("semantic_units") or [])
-    }
     context["references_by_id"] = {
         str(value.get("reference_id") or ""): value
         for value in context.get("references") or [] if isinstance(value, dict)
         and str(value.get("reference_id") or "")
     }
-    template_id = str(resolved_template.get("id") or "")
+    ordinal_manifest = context.get("ordinal_manifest")
+    if not isinstance(ordinal_manifest, dict):
+        ordinal_manifest = {}
+        context["ordinal_manifest"] = ordinal_manifest
+    for declaration in identity_kind_declarations(resolved_profile):
+        if not str(declaration.get("assetless_label_template") or ""):
+            continue
+        kind = str(declaration.get("key") or "subject")
+        ordinal_key = identity_ordinal_key(kind)
+        target = ordinal_manifest.setdefault(ordinal_key, {})
+        used = {int(value) for value in target.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+                and value > 0}
+        next_number = 1
+        assetless_units = sorted(
+            (unit for unit in context["semantic_units_by_id"].values()
+             if str(unit.get("kind") or "subject") == kind
+             and not unit.get("sources")),
+            key=lambda unit: (int(unit.get("order") or 0),
+                              str(unit.get("semantic_unit_id") or "")))
+        for unit in assetless_units:
+            unit_id = str(unit.get("semantic_unit_id") or "")
+            if not unit_id or unit_id in target:
+                continue
+            while next_number in used:
+                next_number += 1
+            target[unit_id] = next_number
+            used.add(next_number)
     ordinal_manifest = context.get("ordinal_manifest") or {}
-    if template_id == "minimax_h3_ref":
+    if is_h3_reference_profile:
         seen_diagnostics = set()
 
         def reference_diagnostic(target, code, message, attachment_id=""):
@@ -1715,6 +2877,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         def reference_warning(code, message, attachment_id=""):
             reference_diagnostic(warnings, code, message, attachment_id)
 
+        reference_catalog_available = isinstance(context.get("references"), list)
+        known_member_ids = {
+            str(member.get("member_id") or "")
+            for reference in context.get("references") or []
+            if isinstance(reference, dict)
+            for member in reference.get("members") or []
+            if isinstance(member, dict)
+        }
+        member_populations = defaultdict(set)
+        for declaration in physical_population_declarations(resolved_profile):
+            population = str(declaration.get("key") or "")
+            for row in context.get("setup_manifest", {}).get(population) or []:
+                member_id = str(row.get("member_id") or
+                                row.get("video_member_id") or "")
+                if member_id:
+                    member_populations[member_id].add(population)
+        contribution_catalog = effective_contribution_catalog(resolved_profile)
+
         for attachment in all_attachments:
             if not attachment["enabled"] or attachment["kind"] != "reference":
                 continue
@@ -1722,20 +2902,21 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             unit_ids = [str(value) for value in
                         source.get("semantic_unit_ids") or [] if str(value)]
             physical_ids = []
-            for population in ("picture_ids", "video_ids", "audio_ids"):
-                physical_ids.extend(str(value) for value in source.get(population) or []
+            for declaration in physical_population_declarations(resolved_profile):
+                source_key = str(declaration.get("source_key") or "")
+                physical_ids.extend(str(value) for value in source.get(source_key) or []
                                     if str(value))
             if not unit_ids and not physical_ids:
                 reference_error(
                     "missing_reference_source",
                     "A MiniMax H3 Reference Context chip has no semantic or physical source.",
                     attachment["attachment_id"])
-            config = dict(attachment.get("config") or {})
+            config = effective_reference_config(attachment, {}, context)
             # Capability editors may own authored fields; validate the same
             # merged configuration the formatter resolves.
             for capability in _enabled_capabilities(attachment, resolved_profile):
-                if isinstance(capability.get("config"), dict):
-                    config.update(capability["config"])
+                config.update(effective_reference_config(
+                    attachment, capability, context))
             for unit_id in unit_ids:
                 unit = context["semantic_units_by_id"].get(unit_id)
                 if unit is None:
@@ -1744,18 +2925,68 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         f"Reference Subject {unit_id!r} no longer exists; rebind the visible chip.",
                         attachment["attachment_id"])
                     continue
-                if unit_id not in (ordinal_manifest.get("subjects") or {}):
+                identity_kind = str(unit.get("kind") or "subject")
+                identity_declaration = identity_kind_for(
+                    resolved_profile, identity_kind)
+                if identity_declaration is None:
+                    reference_error(
+                        "unsupported_identity_kind",
+                        f"Prompt identity {unit.get('name') or unit_id!r} uses unsupported kind {identity_kind!r}.",
+                        attachment["attachment_id"])
+                    continue
+                sources = [value for value in unit.get("sources") or []
+                           if isinstance(value, dict)]
+                broken_sources = [value for value in sources
+                                  if reference_catalog_available
+                                  and str(value.get("member_id") or "")
+                                  not in known_member_ids]
+                if broken_sources:
+                    reference_error(
+                        "broken_reference_source",
+                        f"Prompt identity {unit.get('name') or unit_id!r} names deleted physical Reference members.",
+                        attachment["attachment_id"])
+                if sources and unit_id not in (ordinal_manifest.get(
+                        identity_ordinal_key(identity_kind)) or {}):
                     reference_error(
                         "reference_source_not_applicable",
-                        f"Reference Subject {unit.get('name') or unit_id!r} has no winning setup member in this window.",
+                        f"Prompt identity {unit.get('name') or unit_id!r} has no winning setup member in this window.",
                         attachment["attachment_id"])
+                elif not sources:
+                    reference_warning(
+                        "assetless_prompt_identity",
+                        f"Prompt identity {unit.get('name') or unit_id!r} has no physical source and will emit descriptive prose only.",
+                        attachment["attachment_id"])
+                for source_row in sources:
+                    contribution = str(source_row.get("contribution") or "")
+                    if not contribution:
+                        continue
+                    member_id = str(source_row.get("member_id") or "")
+                    allowed = {
+                        str(value.get("value") or "")
+                        for population in ["*", *sorted(member_populations.get(
+                                member_id, set()))]
+                        for value in contribution_catalog.get(population) or []
+                        if isinstance(value, dict)
+                    }
+                    if contribution not in allowed:
+                        reference_error(
+                            "unknown_contribution",
+                            f"Prompt identity source contribution {contribution!r} is not declared by this format.",
+                            attachment["attachment_id"])
                 if not _subject_definition(config, unit, context)[0]:
                     reference_warning(
                         "missing_h3_subject_definition",
                         f"Reference Subject {unit.get('name') or unit_id!r} needs an authored definition.",
                         attachment["attachment_id"])
-                if (any(str(value).startswith("<Audio ") for value in
-                        context.get("unit_source_labels", {}).get(unit_id) or [])
+                audio_prefixes = [
+                    declared_label_prefix(declaration)
+                    for declaration in physical_population_declarations(resolved_profile)
+                    if str(declaration.get("token_kind") or "") == "audio"
+                    and declared_label_prefix(declaration)
+                ]
+                if (any(any(str(value).startswith(prefix)
+                            for prefix in audio_prefixes) for value in
+                         context.get("unit_source_labels", {}).get(unit_id) or [])
                         and not str(config.get("audio_definition") or "").strip()):
                     reference_warning(
                         "missing_h3_audio_definition",
@@ -1768,12 +2999,14 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         "An Audio definition can reuse only a Subject that has an actual managed Vocal Event in this window.",
                         attachment["attachment_id"])
                 member_ids = {str(value.get("member_id") or "")
-                              for value in unit.get("source_members") or []
+                              for value in unit.get("sources") or []
                               if isinstance(value, dict)}
-                applicable = [row for row in (
-                    (context.get("setup_manifest", {}).get("pictures") or [])
-                    + (context.get("setup_manifest", {}).get("videos") or [])
-                    + (context.get("setup_manifest", {}).get("standalone_audios") or []))
+                applicable_rows = []
+                for declaration in physical_population_declarations(resolved_profile):
+                    applicable_rows.extend(
+                        context.get("setup_manifest", {}).get(
+                            str(declaration.get("key") or "")) or [])
+                applicable = [row for row in applicable_rows
                               if str(row.get("member_id") or
                                      row.get("video_member_id") or "") in member_ids]
                 for field in ("visual_intent", "audio_intent"):
@@ -1784,11 +3017,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                             "conflicting_reference_intent",
                             f"Reference Subject {unit.get('name') or unit_id!r} has conflicting staged {field.replace('_', ' ')} values.",
                             attachment["attachment_id"])
-            for population, manifest_key in (
-                    ("picture_ids", "pictures"), ("video_ids", "videos"),
-                    ("audio_ids", "audios")):
-                known = ordinal_manifest.get(manifest_key) or {}
-                for source_id in source.get(population) or []:
+            for declaration in physical_population_declarations(resolved_profile):
+                source_key = str(declaration.get("source_key") or "")
+                ordinal_key = str(declaration.get("ordinal_key") or "")
+                known = ordinal_manifest.get(ordinal_key) or {}
+                for source_id in source.get(source_key) or []:
+                    duplicate_slots = [row for row in (
+                        context.get("setup_manifest", {}).get(
+                            "duplicate_member_slots", {}).get(str(source_id)) or [])
+                        if isinstance(row, dict)
+                        and str(row.get("population") or "") == str(
+                            declaration.get("key") or "")]
+                    if len(duplicate_slots) > 1:
+                        reference_error(
+                            "ambiguous_physical_handle",
+                            f"Physical Reference {source_id!r} occupies multiple {declaration.get('label') or 'physical'} slots: "
+                            + ", ".join(str(row.get("label") or row.get("slot_id") or "slot")
+                                        for row in duplicate_slots) + ".",
+                            attachment["attachment_id"])
                     if str(source_id) not in known:
                         reference_error(
                             "reference_source_not_applicable",
@@ -1800,7 +3046,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                        "physical_definitions"), dict) else {})
                     authored = str(definitions.get(str(source_id)) or (
                         config.get("audio_definition")
-                        if population == "audio_ids" else
+                        if str(declaration.get("token_kind") or "") == "audio" else
                         config.get("definition")) or "").strip()
                     if not authored:
                         reference_warning(
@@ -1833,7 +3079,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 errors.append({"code": "reference_capability_incompatible",
                                "attachment_id": attachment["attachment_id"],
                                "message": "The Reference chip requests capabilities its recipe does not expose."})
-    if template_id in {"minimax_h3_base", "minimax_h3_ref"}:
+    if is_h3_profile:
         setup_guides = {str(value.get("role") or "")
                         for value in (context.get("setup_manifest", {}).get("guides") or [])}
         for attachment in all_attachments:
@@ -1842,7 +3088,22 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 continue
             config = attachment.get("config") or {}
             role = str(config.get("setup_role") or "")
-            claims_picture = "<Picture" in str(config.get("text") or "")
+            picture_prefixes = [
+                declared_label_prefix(declaration)
+                for declaration in physical_population_declarations(resolved_profile)
+                if str(declaration.get("token_kind") or "") == "picture"
+            ]
+            if is_h3_base_profile and not picture_prefixes:
+                # Base mode has no staged physical population of its own, but its
+                # first/last-frame guides use the same H3 Picture token grammar.
+                # The validator is format-owned; the shared H3 declaration keeps
+                # that grammar in one server authority.
+                picture_prefixes = [declared_label_prefix(
+                    physical_population_by(
+                        {"physical_populations": MINIMAX_H3_PHYSICAL_POPULATIONS},
+                        "token_kind", "picture"))]
+            claims_picture = any(prefix and prefix in str(config.get("text") or "")
+                                 for prefix in picture_prefixes)
             if attachment["kind"] == "custom" and not role and not claims_picture:
                 continue
             if role and role not in {"first", "last"}:
@@ -1894,9 +3155,34 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     unresolved_prompt_tokens = set()
 
     def resolve_attachment_tokens(value, attachment):
+        declarations = prompt_token_declarations(resolved_profile)
+        duplicate_slots = (context.get("setup_manifest", {}).get(
+            "duplicate_member_slots") or {})
+        for reference in prompt_tokens.references(value, declarations):
+            declaration = declarations.get(reference["kind"]) or {}
+            source_id = reference["source_id"]
+            slots = [slot for slot in duplicate_slots.get(source_id) or []
+                     if isinstance(slot, dict)
+                     and str(slot.get("population") or "") == str(
+                         declaration.get("population") or "")]
+            if declaration.get("physical") is True and len(slots) > 1:
+                labels = [
+                    f"{slot.get('label') or slot.get('slot_id') or 'slot'}"
+                    f" ({slot.get('lane_id')})" if slot.get("lane_id") else
+                    str(slot.get("label") or slot.get("slot_id") or "slot")
+                    for slot in slots if isinstance(slot, dict)
+                ]
+                errors.append({
+                    "code": "ambiguous_physical_handle",
+                    "attachment_id": attachment["attachment_id"],
+                    "source_id": source_id,
+                    "message": (f"Physical reference {source_id!r} occupies multiple "
+                                f"setup slots: {', '.join(labels)}. Choose a specific "
+                                "slot or remove the duplicate staging."),
+                })
         resolved, unresolved_ids = prompt_tokens.resolve(
             value, context.get("ordinal_manifest") or {},
-            context.get("unit_source_labels") or {})
+            context.get("unit_source_labels") or {}, declarations)
         for source_id in unresolved_ids:
             diagnostic_key = (attachment["attachment_id"], source_id)
             if diagnostic_key in unresolved_prompt_tokens:
@@ -1934,12 +3220,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 "source", {}).get("reference_item_id"):
             identity_owner = ("reference_item", str(
                 attachment["source"]["reference_item_id"]))
-        elif template_id == "minimax_h3_ref" and capability_kind == "summary":
+        elif is_h3_reference_profile and capability_kind == "summary":
             identity_owner = "minimax_h3_summary"
         else:
             identity_owner = attachment["emission_group_id"]
         render_context = {**context, "origin": origin, "channel_key": channel,
                           "profile": resolved_profile}
+        if (attachment["kind"] == "reference"
+                and reference_capability_errors(
+                    attachment, capability, render_context)):
+            set_projection_state(
+                projection, "invalid_field",
+                reason="This capability contains a value outside the Prompt Format vocabulary.")
+            return ""
         if (attachment["kind"] == "reference"
                 and capability_kind in {"definitions", "retention"}):
             # Definition and retention output is deduped one semantic unit or
@@ -2105,13 +3398,35 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if attachment.get("link_exportable"):
                 capability = next((cap for cap in _capabilities(attachment, resolved_profile)
                                    if cap["capability_id"] == capability_id), None)
+                if capability is None and attachment.get("capabilities"):
+                    return ""
                 return _render_generic(attachment, capability or _default_capability(
                     attachment, resolved_profile), context,
                     speakers_by_attachment.get(attachment["attachment_id"], []))
             return ""
 
-        value = _document_render(source["channel_docs"].get(channel_key),
-                                 attachment_by_id, render_link_anchor)
+        scope_prefixes = []
+        for attachment in attachment_by_id.values():
+            if (attachment["kind"] != "prompt_link_scope"
+                    or not attachment.get("link_exportable")
+                    or not attachment.get("enabled", True)):
+                continue
+            link_source = attachment.get("source") or {}
+            selected_channels = [str(value) for value in
+                                 link_source.get("channel_keys") or [] if str(value)]
+            if not selected_channels and link_source.get("channel_key"):
+                selected_channels = [str(link_source.get("channel_key"))]
+            if selected_channels and channel_key not in selected_channels:
+                continue
+            scope_prefixes.append(local_link_text(
+                str(link_source.get("prompt_id") or ""), channel_key,
+                source_index, trail + (cache_key,), attachment["attachment_id"]))
+        document_value = _document_render(
+            source["channel_docs"].get(channel_key), attachment_by_id,
+            render_link_anchor)
+        value = _join_emissions(
+            scope_prefixes + [document_value],
+            resolved_profile.get("separators", {}).get("attachment", " "))
         if not value:
             warn_empty_link(prompt_id, channel_key, diagnostic_attachment_id)
         link_cache[cache_key] = value
@@ -2188,6 +3503,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         attachment_by_id = _attachment_map(section.get("attachments"))
         mirrors = {}
         phase_parts = defaultdict(lambda: defaultdict(list))
+        scope_link_prefixes = defaultdict(list)
 
         def anchor_renderer(attachment, capability_id, channel_key, anchor_node_id):
             if attachment["kind"] == "prompt_link":
@@ -2195,6 +3511,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 if capability_id:
                     capabilities = [cap for cap in capabilities
                                     if cap["capability_id"] == capability_id]
+                if not capabilities and attachment.get("capabilities"):
+                    return ""
                 capability = capabilities[0] if capabilities else _default_capability(
                     attachment, resolved_profile)
                 route = _route_for(
@@ -2221,6 +3539,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 capabilities = [cap for cap in capabilities
                                 if cap["capability_id"] == capability_id]
             if not capabilities:
+                if attachment.get("capabilities"):
+                    return ""
                 capabilities = [_default_capability(attachment, resolved_profile)]
             inline_values = []
             for capability in capabilities:
@@ -2244,6 +3564,56 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                    resolved_profile.get("separators", {}).get(
                                        "attachment", " "))
 
+        anchored = {node.get("attachment_id")
+                    for document in section["channel_docs"].values()
+                    for node in document.get("nodes", [])
+                    if node.get("type") == "attachment"}
+        for attachment in attachment_by_id.values():
+            if not attachment["enabled"] or attachment["kind"] != "prompt_link_scope":
+                continue
+            if attachment["attachment_id"] in anchored:
+                errors.append({
+                    "code": "anchored_scope_only_attachment",
+                    "attachment_id": attachment["attachment_id"],
+                    "message": ("A section-scope Prompt Link cannot be anchored in "
+                                "authored text; unlink, copy, or move it to the scope row."),
+                })
+                continue
+            source = attachment.get("source") or {}
+            target = str(source.get("prompt_id") or "")
+            selected_channels = [str(value) for value in
+                                 source.get("channel_keys") or [] if str(value)]
+            if not selected_channels:
+                selected_channels = ([str(source.get("channel_key"))]
+                                     if source.get("channel_key") else list(keys))
+            capability = (_capabilities(attachment, resolved_profile)
+                          or [_default_capability(attachment, resolved_profile)])[0]
+            for target_channel in dict.fromkeys(selected_channels):
+                projection = record_capability_projection(
+                    attachment, capability, target_channel,
+                    section.get("prompt_id", ""), "scope")
+                if target_channel not in keys:
+                    set_projection_state(
+                        projection, "invalid_route", reason=
+                        f"Route {target_channel!r} is not in the active channel template.")
+                    errors.append({
+                        "code": "invalid_attachment_route",
+                        "attachment_id": attachment["attachment_id"],
+                        "message": f"Attachment route {target_channel!r} is not in the active template.",
+                    })
+                    continue
+                if not capability.get("enabled", True):
+                    continue
+                value = local_link_text(
+                    target, target_channel, section_index,
+                    diagnostic_attachment_id=attachment["attachment_id"])
+                set_projection_state(
+                    projection, "emitted" if value else "empty", value,
+                    "Section Prompt Link emitted its earlier source." if value else
+                    "Section Prompt Link resolved to no source text.")
+                if value:
+                    scope_link_prefixes[target_channel].append(value)
+
         for key in keys:
             mirrors[key] = _document_render(
                 section["channel_docs"].get(key), attachment_by_id,
@@ -2252,10 +3622,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
 
         # Scope attachments are emitted by placement. Inline attachment nodes
         # already emitted above and are not emitted again here.
-        anchored = {node.get("attachment_id")
-                    for document in section["channel_docs"].values()
-                    for node in document.get("nodes", [])
-                    if node.get("type") == "attachment"}
         shot = any(a["enabled"] and a["kind"] == "shot"
                    for a in attachment_by_id.values())
         timestamp = any(
@@ -2309,7 +3675,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         "This marker is composed by the prompt section composer.")
             if (not attachment["enabled"] or attachment["attachment_id"] in anchored
                     or attachment["kind"] in {"shot", "timestamp"}
-                    or attachment["kind"] in INLINE_ONLY_KINDS):
+                    or attachment["kind"] in INLINE_ONLY_KINDS
+                    or attachment["kind"] in SCOPE_ONLY_KINDS):
                 continue
             for capability in _capabilities(attachment, resolved_profile):
                 route = _route_for(attachment, capability, resolved_profile,
@@ -2321,7 +3688,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 record_attachment_route(attachment, route, capability["placement"])
                 phase_parts[route][capability["placement"]].append(
                     (attachment, capability, projection))
-        for key, phases in phase_parts.items():
+        for key in dict.fromkeys([*scope_link_prefixes, *phase_parts]):
+            phases = phase_parts[key]
             if key not in mirrors:
                 attachment_ids = {a["attachment_id"]
                                   for values in phases.values()
@@ -2337,7 +3705,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                    "message":
                                    f"Attachment route {key!r} is not in the active template."})
                 continue
-            prefixes = []
+            prefixes = list(scope_link_prefixes.get(key) or [])
             suffixes = []
             for phase in PLACEMENT_PHASES[:PLACEMENT_PHASES.index("inline") + 1]:
                 prefixes.extend(render(
@@ -2381,6 +3749,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             capabilities = [cap for cap in capabilities
                             if cap["capability_id"] == capability_id]
         if not capabilities:
+            if attachment.get("capabilities"):
+                return ""
             capabilities = [_default_capability(attachment, resolved_profile)]
         inline_values = []
         for capability in capabilities:
@@ -2410,7 +3780,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     for attachment in global_by_id.values():
         if not attachment["enabled"] or attachment["attachment_id"] in global_anchored:
             continue
-        if attachment["kind"] in {"shot", "timestamp", "prompt_link"}:
+        if attachment["kind"] in {"shot", "timestamp", "prompt_link",
+                                   "prompt_link_scope"}:
             warnings.append({"code": "invalid_global_attachment",
                              "attachment_id": attachment["attachment_id"], "message":
                              f"{attachment['kind']} is section-scoped and was ignored globally."})
@@ -2450,12 +3821,11 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                f"Attachment route {route!r} is not in the active template."})
             continue
         prefixes, suffixes = [], []
-        for phase in ("document_preamble", "channel_prefix", "global_document",
-                      "section_prefix", "inline"):
+        for phase in PLACEMENT_PHASES[:PLACEMENT_PHASES.index("inline") + 1]:
             prefixes.extend(render(
                 a, c, origin="global", channel=route, projection=projection)
                 for a, c, projection in phases.get(phase, []))
-        for phase in ("section_suffix", "channel_suffix"):
+        for phase in PLACEMENT_PHASES[PLACEMENT_PHASES.index("inline") + 1:]:
             suffixes.extend(render(
                 a, c, origin="global", channel=route, projection=projection)
                 for a, c, projection in phases.get(phase, []))
@@ -2482,7 +3852,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
 
     setup_manifest = context.get("setup_manifest") or {}
     setup_value = setup_manifest.get("setup") or {}
-    if template_id == "minimax_h3_base":
+    if is_h3_base_profile:
         task_mode = str(setup_value.get("task_mode") or "T2VA").upper()
         try:
             duration = max(0.0, (float(window_end) - float(window_start)) / float(fps))
@@ -2526,8 +3896,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # Empty authored channels are thin content, not unresolved state. Preserve
     # the MiniMax-specific code for its established UI copy; every other
     # template receives the general advisory.
-    is_full_reference = (template_id == "minimax_h3_ref"
-                         and setup_value.get("mode") == "reference")
+    is_full_reference = (is_h3_reference_profile
+                          and setup_value.get("mode") == "reference")
     for key in keys:
         if effective_values.get(key):
             continue
@@ -2544,10 +3914,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # without setup authority stay readable through the compatibility path.
     if is_full_reference:
         summary = effective_values.get("summary", "")
-        if summary and not re.match(r"^\[(?:" + "|".join(
-                re.escape(value) for value in MINIMAX_TASK_TYPES) +
-                r")(?: \+ (?:" + "|".join(
-                    re.escape(value) for value in MINIMAX_TASK_TYPES) + r"))*\]", summary):
+        task_type_values = [choice["value"] for choice in declared_field_choices(
+            declared_reference_field(resolved_profile, "summary", "task_types"))]
+        # Declaration values are data, never regex fragments.
+        task_pattern = "|".join(re.escape(value) for value in task_type_values)
+        if (summary and task_pattern and not re.match(
+                rf"^\[(?:{task_pattern})(?: \+ (?:{task_pattern}))*\]", summary)):
             warnings.append({"code": "invalid_h3_task_prefix", "message":
                              "Full Reference summary should begin with canonical task types."})
         retention_emissions = [value for value in emissions

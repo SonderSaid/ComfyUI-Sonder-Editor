@@ -290,17 +290,20 @@ def _member_slots(winner, lane_id, population, member_lookup, asset_lookup):
             "member_name": labels["member_name"],
             "prompt_name": labels["name"],
             "display_name": labels["display_name"],
+            "handle": str(member.get("handle") or ""),
             # Authored Library prose, not either display/prompt-safe name.
-            # Prompt Context consumes this only after chip and Subject-unit
-            # definition overrides are empty.
+            # Prompt Context consumes this only after the effective attachment
+            # configuration and explicit prompt-identity definition are empty.
             "member_prompt": str(member.get("prompt") or "").strip(),
             "population": population,
             "source_start_sec": float(member.get("source_start_sec") or 0.0),
             "source_end_sec": member.get("source_end_sec"),
             "role": str(member_ref.get("role") or ""),
             "visual_intent": str(member_ref.get("visual_intent") or
+                                 member.get("visual_intent") or
                                  reference.get("visual_intent") or "preserve"),
             "audio_intent": str(member_ref.get("audio_intent") or
+                                member.get("audio_intent") or
                                 reference.get("audio_intent") or
                                 "reference_characteristics"),
         })
@@ -344,17 +347,33 @@ def _floor_video_frames(asset, start_sec, end_sec, fps=24.0):
 
 
 def resolve_setup(*, setup, guide_frames=None, reference_items=None,
-                  lane_recipes=None, lane_configs=None, lane_count=1,
-                  scene_duration=0, window_start=0, window_end=0,
-                  references=None, assets=None, semantic_units=None,
-                  frame_threshold_pct=0.0) -> dict:
+                   lane_recipes=None, lane_configs=None, lane_count=1,
+                   scene_duration=0, window_start=0, window_end=0,
+                   references=None, assets=None, semantic_units=None,
+                   frame_threshold_pct=0.0, profile=None) -> dict:
     """Resolve one frozen physical presentation plan and ordinal manifest."""
+    # Import lazily to keep the pure Prompt compiler independent of the physical
+    # resolver at module import time. Production callers pass the resolved
+    # profile; the fallback preserves the direct resolver/test API.
+    from . import prompt_context
+
+    profile = (profile if isinstance(profile, dict) else
+               prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"])
+    population_declarations = prompt_context.physical_population_declarations(profile)
+    populations_by_key = {
+        str(declaration.get("key") or ""): declaration
+        for declaration in population_declarations if isinstance(declaration, dict)
+    }
+    active_profile_key = prompt_context.profile_key(profile)
     value = normalize_setup(setup)
     errors, warnings = [], []
     manifest = {"setup": copy.deepcopy(value), "guides": [], "pictures": [],
-                "videos": [], "standalone_audios": [],
-                "presentation": []}
+                 "videos": [], "standalone_audios": [],
+                 "presentation": []}
     ordinals = {"subjects": {}, "pictures": {}, "videos": {}, "audios": {}}
+    for declaration in population_declarations:
+        manifest.setdefault(str(declaration.get("key") or ""), [])
+        ordinals.setdefault(str(declaration.get("ordinal_key") or ""), {})
     guide_lookup = {str(as_plain_record(g).get("guide_id") or ""): as_plain_record(g)
                     for g in guide_frames or []}
     invalid = setup_validation_errors(value)
@@ -388,7 +407,10 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
     _entities, member_lookup = _entity_lookup(references)
     assets_by_id = _asset_lookup(assets)
 
-    def collect(lane_ids, population, cap, expected_types):
+    def collect(lane_ids, declaration):
+        population = str((declaration or {}).get("key") or "")
+        cap = int((declaration or {}).get("cap") or 0)
+        expected_types = set((declaration or {}).get("media_kinds") or [])
         rows = []
         for lane_id in lane_ids:
             lane_value = recipe_lookup.get(lane_id)
@@ -404,7 +426,7 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
             compatible_profiles = [str(entry) for entry in
                                    soft.get("compatible_profiles", [])]
             physical_population = str(soft.get("physical_population") or "none")
-            if compatible_profiles and "minimax_h3_ref@1" not in compatible_profiles:
+            if compatible_profiles and active_profile_key not in compatible_profiles:
                 errors.append({"code": "setup_lane_profile_incompatible", "lane_id": lane_id,
                                "message": "A conditioning lane recipe is not compatible with MiniMax H3 Full Reference."})
                 continue
@@ -478,29 +500,61 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
                                  "message": f"This source is longer than the recipe's {maximum:g}s recommendation."})
         return rows
 
-    pictures = collect(value["picture_lane_ids"], "pictures", MAX_PICTURES, {"image"})
-    videos = collect(value["video_lane_ids"], "videos", MAX_VIDEOS, {"video"})
-    standalone = collect(value["audio_lane_ids"], "standalone_audios",
-                         MAX_STANDALONE_AUDIO, {"audio", "video"})
+    pictures_decl = populations_by_key.get(SETUP_LANE_POPULATIONS["picture_lane_ids"])
+    videos_decl = populations_by_key.get(SETUP_LANE_POPULATIONS["video_lane_ids"])
+    audio_decl = populations_by_key.get(SETUP_LANE_POPULATIONS["audio_lane_ids"])
+    pictures = collect(value["picture_lane_ids"], pictures_decl) if pictures_decl else []
+    videos = collect(value["video_lane_ids"], videos_decl) if videos_decl else []
+    standalone = collect(value["audio_lane_ids"], audio_decl) if audio_decl else []
     manifest["pictures"] = pictures
     manifest["videos"] = videos
     manifest["standalone_audios"] = standalone
 
     for number, slot in enumerate(pictures, 1):
-        slot["picture_ordinal"] = number
-        _ordinal_aliases(ordinals["pictures"], slot, number)
-        manifest["presentation"].append({"kind": "picture", **slot})
+        ordinal_field = f"{pictures_decl['token_kind']}_ordinal"
+        slot[ordinal_field] = number
+        _ordinal_aliases(ordinals[pictures_decl["ordinal_key"]], slot, number)
+        manifest["presentation"].append({
+            "kind": pictures_decl["key"][:-1], **slot})
     for video_number, slot in enumerate(videos, 1):
-        slot["video_ordinal"] = video_number
+        ordinal_field = f"{videos_decl['token_kind']}_ordinal"
+        slot[ordinal_field] = video_number
         slot["decoded_frames_24fps"] = _floor_video_frames(
             assets_by_id.get(slot["asset_id"], {}),
             slot["source_start_sec"], slot["source_end_sec"])
-        _ordinal_aliases(ordinals["videos"], slot, video_number)
-        manifest["presentation"].append({"kind": "video", **slot})
+        _ordinal_aliases(ordinals[videos_decl["ordinal_key"]], slot, video_number)
+        manifest["presentation"].append({
+            "kind": videos_decl["key"][:-1], **slot})
     for audio_number, slot in enumerate(standalone, 1):
-        slot["audio_ordinal"] = audio_number
-        _ordinal_aliases(ordinals["audios"], slot, audio_number)
-        manifest["presentation"].append({"kind": "standalone_audio", **slot})
+        ordinal_field = f"{audio_decl['token_kind']}_ordinal"
+        slot[ordinal_field] = audio_number
+        _ordinal_aliases(ordinals[audio_decl["ordinal_key"]], slot, audio_number)
+        manifest["presentation"].append({
+            "kind": audio_decl["key"][:-1], **slot})
+
+    slots_by_member = {}
+    for row in manifest["presentation"]:
+        member_id = str(row.get("member_id") or row.get("video_member_id") or "")
+        declaration = populations_by_key.get(str(row.get("population") or ""))
+        if not member_id or declaration is None:
+            continue
+        ordinal_field = f"{declaration['token_kind']}_ordinal"
+        slots_by_member.setdefault(member_id, []).append({
+            "population": str(declaration.get("key") or ""),
+            "slot_id": str(row.get("slot_id") or ""),
+            "lane_id": str(row.get("lane_id") or ""),
+            "ordinal": int(row.get(ordinal_field) or 0),
+            "label": prompt_context.declared_label(
+                declaration, row.get(ordinal_field)),
+        })
+    duplicate_member_slots = {
+        member_id: rows for member_id, rows in slots_by_member.items()
+        if any(sum(1 for candidate in rows
+                   if candidate["population"] == row["population"]) > 1
+               for row in rows)
+    }
+    if duplicate_member_slots:
+        manifest["duplicate_member_slots"] = duplicate_member_slots
 
     # Subject order: first contributing physical slot, then explicit unit order.
     physical_order = {str(row.get("member_id") or
@@ -510,7 +564,7 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
     units = []
     for unit in semantic_units or []:
         unit = as_plain_record(unit)
-        contributions = unit.get("source_members") or []
+        contributions = unit.get("sources") or []
         first = min((physical_order.get(str(value.get("member_id")), 10**9)
                      for value in contributions if isinstance(value, dict)),
                     default=10**9)
@@ -530,10 +584,11 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
             continue
         ordinals["subjects"][unit_id] = subject_number
         member_ids = {str(value.get("member_id") or "")
-                      for value in unit.get("source_members") or []
+                      for value in unit.get("sources") or []
                       if isinstance(value, dict)}
+        picture_ordinal_field = f"{pictures_decl['token_kind']}_ordinal"
         unit_picture_ordinals[unit_id] = [
-            row["picture_ordinal"] for row in pictures
+            row[picture_ordinal_field] for row in pictures
             if row.get("member_id") in member_ids
         ]
         labels = []
@@ -541,15 +596,12 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
             if str(row.get("member_id") or row.get(
                     "video_member_id") or "") not in member_ids:
                 continue
-            kind = str(row.get("kind") or "")
-            if kind == "picture":
-                label = f"<Picture {row['picture_ordinal']}>"
-            elif kind == "video":
-                label = f"<Video {row['video_ordinal']}>"
-            elif kind == "standalone_audio":
-                label = f"<Audio {row['audio_ordinal']}>"
-            else:
+            declaration = populations_by_key.get(str(row.get("population") or ""))
+            if declaration is None:
                 continue
+            ordinal_field = f"{declaration['token_kind']}_ordinal"
+            label = prompt_context.declared_label(
+                declaration, row.get(ordinal_field))
             if label not in labels:
                 labels.append(label)
         unit_source_labels[unit_id] = labels

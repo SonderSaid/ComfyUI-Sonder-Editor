@@ -109,7 +109,7 @@ from .timeline_state import (
     REFERENCE_RECIPE_PRESETS, ALL_REFERENCE_RECIPE_PRESETS,
     apply_color_metadata, classify_asset_path, default_reference_class,
     effective_scene_fps, media_timeline_frames, normalize_reference_tags,
-    retime_scene_geometry, ensure_default_prompt_semantic_units,
+    retime_scene_geometry,
 )
 from .lane_registry import (
     LANE_DESCRIPTORS,
@@ -2819,23 +2819,96 @@ def _prompt_context_profile_usages(project: TimelineProject, profile_key: str) -
                            "scene_name": scene.name})
         for lane_index, recipe in enumerate(scene.reference_lane_recipes or []):
             raw_recipe = recipe.recipe if isinstance(recipe, ReferenceLaneRecipe) else {}
-            soft = raw_recipe.get("soft") if isinstance(raw_recipe, dict) else {}
+            # A blank or unconfigured lane stores `{}`, so `.get("soft")` is
+            # None rather than a dict. Treating that as a dict crashed every
+            # caller with a 500 — deleting a custom format was unreachable in
+            # any project holding one default Reference lane.
+            soft = raw_recipe.get("soft") if isinstance(raw_recipe, dict) else None
+            soft = soft if isinstance(soft, dict) else {}
             if profile_key in (soft.get("compatible_profiles") or []):
                 usages.append({"type": "reference_recipe", "scene_id": scene.scene_id,
                                "lane_index": lane_index})
     return usages
 
 
+def _profile_declaration_templates(project: TimelineProject, profile) -> tuple[list[dict], bool]:
+    """Resolve every concrete channel contract claimed by authored compatibility.
+
+    `compatible_templates` replaces the single `template_id` runtime claim, so
+    validating only the convenient base template can persist a format that is
+    invalid the moment a declared compatible template selects it.  Custom
+    templates are project-owned; only the active materialized custom template
+    can be resolved here.  The boolean reports any declared id that has no
+    concrete contract and therefore cannot be safely accepted for new data.
+    """
+    active = prompt_channel_templates.resolve_channel_template(project.metadata)
+    active_id = str(active.get("id") or "")
+    profile_key = prompt_context.profile_key(profile)
+    profile_id = str((profile or {}).get("profile_id") or "")
+    declared = (profile or {}).get("compatible_templates")
+    if isinstance(declared, list) and declared:
+        claimed_ids = [str(value) for value in declared]
+    else:
+        claimed_ids = [str((profile or {}).get("template_id") or "")]
+
+    templates = []
+    seen = set()
+    unresolved = False
+    for template_id in claimed_ids:
+        resolved = None
+        if template_id == prompt_context.UNIVERSAL_PROFILE_TEMPLATE:
+            # Universal custom formats are authored against their declared base
+            # plus the active project template when it explicitly selects them.
+            template_id = str((profile or {}).get("template_id") or "")
+        if template_id == active_id:
+            resolved = active
+        elif template_id in prompt_channel_templates.PROMPT_CHANNEL_TEMPLATE_PRESETS:
+            resolved = prompt_channel_templates.get_channel_template(template_id)
+        if not isinstance(resolved, dict):
+            unresolved = True
+            continue
+        resolved_id = str(resolved.get("id") or "")
+        if resolved_id not in seen:
+            seen.add(resolved_id)
+            templates.append(resolved)
+
+    active_declares_profile = str(active.get("default_context_profile") or "") in {
+        profile_key, profile_id,
+    }
+    if active_declares_profile and active_id not in seen:
+        templates.append(active)
+    return templates, unresolved
+
+
 def _normalize_prompt_context_profile_update(project: TimelineProject, raw_profiles) -> list[dict]:
     if not isinstance(raw_profiles, list):
         _mutation_error("prompt_context_profiles must be a list", 400,
                         "invalid_prompt_context_profiles")
+    existing = {
+        f"{value.get('profile_id')}@{value.get('version', '1')}":
+            prompt_context.normalize_profile(value)
+        for value in project.prompt_context_profiles or []
+        if isinstance(value, dict)
+    }
     normalized_profiles = []
     seen_profiles = set()
     try:
         for raw_profile in raw_profiles:
             value = prompt_context.normalize_profile(raw_profile)
             key = f"{value['profile_id']}@{value['version']}"
+            unchanged = (key in existing
+                         and prompt_context.content_hash(existing[key])
+                         == prompt_context.content_hash(value))
+            if not unchanged:
+                bound_templates, unresolved = _profile_declaration_templates(
+                    project, value)
+                if unresolved or not bound_templates:
+                    raise ValueError("incomplete_capability_declaration")
+                for bound_template in bound_templates:
+                    declaration_errors = prompt_context.profile_declaration_errors(
+                        value, template=bound_template)
+                    if declaration_errors:
+                        raise ValueError(declaration_errors[0]["code"])
             if key in prompt_context.BUILTIN_PROFILES or key in seen_profiles:
                 raise ValueError("duplicate_or_builtin_profile")
             seen_profiles.add(key)
@@ -2844,12 +2917,6 @@ def _normalize_prompt_context_profile_update(project: TimelineProject, raw_profi
         _mutation_error(f"Invalid prompt context profile: {exc}", 400,
                         "invalid_prompt_context_profile")
 
-    existing = {
-        f"{value.get('profile_id')}@{value.get('version', '1')}":
-            prompt_context.normalize_profile(value)
-        for value in project.prompt_context_profiles or []
-        if isinstance(value, dict)
-    }
     proposed = {
         f"{value['profile_id']}@{value['version']}": value
         for value in normalized_profiles
@@ -2914,6 +2981,14 @@ def _create_prompt_context_profile(project: TimelineProject, raw_create) -> list
                         "invalid_prompt_context_profile")
     try:
         value = prompt_context.normalize_profile(raw_profile)
+        bound_templates, unresolved = _profile_declaration_templates(project, value)
+        if unresolved or not bound_templates:
+            raise ValueError("incomplete_capability_declaration")
+        for bound_template in bound_templates:
+            declaration_errors = prompt_context.profile_declaration_errors(
+                value, template=bound_template)
+            if declaration_errors:
+                raise ValueError(declaration_errors[0]["code"])
     except ValueError as exc:
         _mutation_error(f"Invalid prompt context profile: {exc}", 400,
                         "invalid_prompt_context_profile")
@@ -3666,7 +3741,7 @@ def _freeze_reference_input_snapshots(
         str(unit.get("semantic_unit_id") or "")
         for unit in project.prompt_semantic_units
         if any(str(member.get("member_id") or "") in presentation_member_ids
-               for member in unit.get("source_members", [])
+               for member in unit.get("sources", [])
                if isinstance(member, dict)))
     semantic_unit_ids.discard("")
 
@@ -4201,7 +4276,8 @@ _REFERENCE_ENTITY_FIELDS = {
     "visual_intent", "audio_intent",
 }
 _REFERENCE_MEMBER_FIELDS = {
-    "asset_id", "name", "tags", "prompt", "crop",
+    "asset_id", "name", "handle", "tags", "prompt", "crop",
+    "visual_intent", "audio_intent",
     "source_start_sec", "source_end_sec",
 }
 
@@ -4234,28 +4310,6 @@ def _reference_recipe_catalog_payload() -> list[dict]:
 
 
 def _references_payload(project: TimelineProject) -> dict:
-    reference_ids = {
-        str(getattr(reference, "reference_id", "") or "")
-        for reference in project.references
-    }
-    semantic_units = []
-    for value in project.prompt_semantic_units:
-        if not isinstance(value, dict):
-            continue
-        unit = dict(value)
-        unit_id = str(unit.get("semantic_unit_id") or "")
-        entity_id = unit_id[5:] if unit_id.startswith("unit:") else ""
-        # Presentation-only provenance. normalize_semantic_unit deliberately
-        # drops this key, so imports and persisted project state stay unchanged.
-        unit["generated"] = entity_id in reference_ids
-        if unit["generated"]:
-            owner = next((reference for reference in project.references
-                          if str(getattr(reference, "reference_id", "") or "")
-                          == entity_id), None)
-            unit["generated_reference_id"] = entity_id
-            unit["generated_reference_name"] = str(
-                getattr(owner, "name", "") or entity_id)
-        semantic_units.append(unit)
     return {
         "project_id": project.project_id,
         "modified_at": project.modified_at,
@@ -4265,15 +4319,22 @@ def _references_payload(project: TimelineProject) -> dict:
         "recipe_field_schema": [dict(field) for field in REFERENCE_RECIPE_FIELDS],
         "reference_recipes": [dict(recipe) for recipe in project.reference_recipes if isinstance(recipe, dict)],
         "prompt_context_profiles": [dict(value) for value in project.prompt_context_profiles],
-        "prompt_semantic_units": semantic_units,
+        "prompt_semantic_units": [dict(value) for value in
+                                  project.prompt_semantic_units
+                                  if isinstance(value, dict)],
         "prompt_context_catalog": {
             "schema_version": 1,
-            "capabilities": [
-                "derived_prompt", "definitions", "summary", "retention",
-                "mentions", "audio_relationship",
+            "placement_phases": copy.deepcopy(
+                prompt_context.PLACEMENT_PHASE_CATALOG),
+            # The fixed server renderer allowlist, published like
+            # `placement_phases` and the validator ids: it is which capability
+            # kinds this build can render, not any provider's vocabulary. A
+            # format still owns every label it declares; these are the fallback
+            # names the format editor offers when a kind is first declared.
+            "reference_capability_kinds": [
+                {"value": kind, "label": label}
+                for kind, label in prompt_context.REFERENCE_RENDERER_KIND_LABELS
             ],
-            "role_catalogs": copy.deepcopy(prompt_context.MINIMAX_H3_ROLE_CATALOGS),
-            "minimax_task_types": list(prompt_context.MINIMAX_TASK_TYPES),
             # One server-owned authoring registry.  Fork seeds contain only the
             # editable definition; identity, hashes, and runtime flags never
             # become browser-authored fields.
@@ -4285,6 +4346,7 @@ def _references_payload(project: TimelineProject) -> dict:
                     "compatible_templates": sorted(
                         prompt_context.profile_compatible_templates(value)),
                     "fork_seed": prompt_context.profile_fork_seed(value),
+                    "resolved": prompt_context.resolved_profile_definition(value),
                 }
                 for key, value in prompt_context.BUILTIN_PROFILES.items()
             ] + [
@@ -4296,6 +4358,7 @@ def _references_payload(project: TimelineProject) -> dict:
                     "compatible_templates": sorted(
                         prompt_context.profile_compatible_templates(value)),
                     "fork_seed": prompt_context.profile_fork_seed(value),
+                    "resolved": prompt_context.resolved_profile_definition(value),
                 }
                 for value in project.prompt_context_profiles
                 if isinstance(value, dict)
@@ -4360,6 +4423,77 @@ def _validated_reference_name(value) -> str:
     return name
 
 
+def _validated_prompt_handle(value) -> str:
+    handle = prompt_context.normalize_prompt_handle(value)
+    error = prompt_context.prompt_handle_error(handle)
+    if error:
+        _mutation_error(error, 400, "invalid_prompt_handle")
+    return handle
+
+
+def _prompt_handle_owners(project: TimelineProject, *, semantic_units=None):
+    for reference in project.references:
+        for member in reference.members:
+            handle = prompt_context.normalize_prompt_handle(member.handle)
+            if handle:
+                yield handle, "physical reference", member.member_id
+    units = (project.prompt_semantic_units if semantic_units is None
+             else semantic_units)
+    for unit in units or []:
+        if not isinstance(unit, dict):
+            continue
+        handle = prompt_context.normalize_prompt_handle(unit.get("handle"))
+        if handle:
+            yield handle, "prompt identity", str(
+                unit.get("semantic_unit_id") or "")
+
+
+def _require_prompt_handle_available(project: TimelineProject, handle: str,
+                                     owner_kind: str, owner_id: str,
+                                     *, semantic_units=None) -> None:
+    if not handle:
+        return
+    folded = handle.casefold()
+    for current, current_kind, current_id in _prompt_handle_owners(
+            project, semantic_units=semantic_units):
+        if current.casefold() != folded:
+            continue
+        if current_kind == owner_kind and current_id == owner_id:
+            continue
+        _mutation_error(
+            f"Handle @{handle} is already owned by {current_kind} {current_id!r}; "
+            f"it cannot also name {owner_kind} {owner_id!r}.",
+            409, "handle_collision")
+
+
+def _materialized_prompt_handle(project: TimelineProject, suggestion,
+                                owner_kind: str, owner_id: str) -> str:
+    """Choose and reserve a prompt-safe handle inside the locked mutation.
+
+    Suggestions are presentation-only until first use.  Deduplicating here,
+    against the project loaded for this versioned mutation, prevents two stale
+    clients from materializing the same visible suggestion for different ids.
+    """
+    base = _validated_prompt_handle(suggestion)
+    if not base:
+        _mutation_error("A handle suggestion is required", 400,
+                        "invalid_prompt_handle")
+    occupied = {
+        current.casefold()
+        for current, current_kind, current_id in _prompt_handle_owners(project)
+        if not (current_kind == owner_kind and current_id == owner_id)
+    }
+    if base.casefold() not in occupied:
+        return base
+    for ordinal in range(2, 10000):
+        suffix = str(ordinal)
+        candidate = f"{base[:64 - len(suffix)]}{suffix}"
+        if candidate.casefold() not in occupied:
+            return candidate
+    _mutation_error("Could not derive a unique prompt handle", 409,
+                    "handle_collision")
+
+
 def _validated_reference_kind(value) -> str:
     kind = str(value or "")
     if kind not in REFERENCE_KINDS:
@@ -4386,6 +4520,14 @@ def _validated_audio_intent(value) -> str:
     if intent not in prompt_context.AUDIO_INTENTS:
         _mutation_error("Invalid default audio role", 400, "invalid_reference")
     return intent
+
+
+def _validated_optional_visual_intent(value) -> str:
+    return "" if value in (None, "") else _validated_visual_intent(value)
+
+
+def _validated_optional_audio_intent(value) -> str:
+    return "" if value in (None, "") else _validated_audio_intent(value)
 
 
 def _validated_reference_tags(raw_tags, asset: Asset) -> list[str]:
@@ -4501,6 +4643,11 @@ def _member_from_fields(project: TimelineProject, fields: dict, *, member_id: st
         member_id=member_id or _new_reference_id(project, member=True),
         asset_id=asset.asset_id,
         name=str(fields.get("name", "") or "").strip(),
+        handle=_validated_prompt_handle(fields.get("handle")),
+        visual_intent=_validated_optional_visual_intent(
+            fields.get("visual_intent")),
+        audio_intent=_validated_optional_audio_intent(
+            fields.get("audio_intent")),
         tags=tags,
         prompt=str(fields.get("prompt", "") or ""),
         crop=crop,
@@ -4591,6 +4738,8 @@ def _apply_delete_reference(project: TimelineProject, operation: dict) -> Refere
 def _apply_create_reference_member(project: TimelineProject, operation: dict) -> ReferenceMember:
     reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
     member = _member_from_fields(project, operation.get("fields"), order=len(reference.members))
+    _require_prompt_handle_available(
+        project, member.handle, "physical reference", member.member_id)
     reference.members.append(member)
     return member
 
@@ -4616,13 +4765,33 @@ def _apply_update_reference_member(project: TimelineProject, operation: dict) ->
         member_id=member.member_id,
         order=member.order,
     )
+    _require_prompt_handle_available(
+        project, replacement.handle, "physical reference", member.member_id)
     member.asset_id = replacement.asset_id
     member.name = replacement.name
+    member.handle = replacement.handle
+    member.visual_intent = replacement.visual_intent
+    member.audio_intent = replacement.audio_intent
     member.tags = replacement.tags
     member.prompt = replacement.prompt
     member.crop = replacement.crop
     member.source_start_sec = replacement.source_start_sec
     member.source_end_sec = replacement.source_end_sec
+    return member
+
+
+def _apply_materialize_reference_member_handle(
+        project: TimelineProject, operation: dict) -> ReferenceMember:
+    reference = _find_reference(project, str(operation.get("reference_id", "") or ""))
+    member = _find_reference_member(reference, str(operation.get("member_id", "") or ""))
+    expected = _require_expected(operation.get("expected"), {"handle"},
+                                 "materialize_member_handle")
+    _validate_reference_member_expected(member, expected, {"handle"})
+    if member.handle:
+        return member
+    member.handle = _materialized_prompt_handle(
+        project, operation.get("suggestion"), "physical reference",
+        member.member_id)
     return member
 
 
@@ -4764,10 +4933,6 @@ def _normalize_custom_reference_recipe(fields: dict, *, recipe_id: str = "") -> 
     }
 
 
-_REFERENCE_CONTEXT_CAPABILITIES = {
-    "derived_prompt", "definitions", "summary", "retention", "mentions",
-    "audio_relationship",
-}
 _REFERENCE_ROLE_FIELDS = {
     "role", "visual_intent", "audio_intent",
 }
@@ -4782,15 +4947,11 @@ def _validate_reference_recipe_context(project: TimelineProject, recipe: dict) -
     """
     soft = recipe.get("soft") if isinstance(recipe.get("soft"), dict) else {}
     profile_keys = set(prompt_context.BUILTIN_PROFILES)
-    capability_keys = set(_REFERENCE_CONTEXT_CAPABILITIES)
     for profile in project.prompt_context_profiles:
         if not isinstance(profile, dict):
             continue
         profile_keys.add(
             f"{profile.get('profile_id', '')}@{profile.get('version', '1')}")
-        capabilities = profile.get("capabilities")
-        if isinstance(capabilities, dict):
-            capability_keys.update(str(value) for value in capabilities)
 
     unknown_profiles = [str(value) for value in soft.get("compatible_profiles", [])
                         if str(value) not in profile_keys]
@@ -4798,6 +4959,8 @@ def _validate_reference_recipe_context(project: TimelineProject, recipe: dict) -
         _mutation_error(
             f"Unsupported prompt formats: {', '.join(sorted(unknown_profiles))}",
             409, "unsupported_reference_recipe_context")
+    capability_keys = set(prompt_context.reference_capability_catalog(
+        soft.get("compatible_profiles"), profiles=project.prompt_context_profiles))
     unknown_capabilities = [
         str(value) for value in soft.get("exposed_capabilities", [])
         if str(value) not in capability_keys
@@ -4879,6 +5042,15 @@ def _recollapse_scene_globals(project: TimelineProject, from_template: dict,
     return rewritten
 
 
+# The two resolution failures a template switch legitimately repairs: the new
+# template does not license the format, or the format is gone from the project.
+# Every other failure is an authoring problem the author must be able to see and
+# fix on the format itself.
+_TEMPLATE_RELEASABLE_PROFILE_CODES = frozenset({
+    "profile_template_incompatible", "unknown_profile",
+})
+
+
 def _release_incompatible_scene_profiles(project: TimelineProject,
                                          to_template: dict) -> int:
     """Drop a scene's explicit prompt format when the new template rejects it.
@@ -4900,11 +5072,18 @@ def _release_incompatible_scene_profiles(project: TimelineProject,
             profile = prompt_context.resolve_profile(
                 selected, template=to_template,
                 custom_profiles=getattr(project, "prompt_context_profiles", []))
-        except prompt_context.ProfileResolutionError:
+        except prompt_context.ProfileResolutionError as exc:
+            # An unrelated resolution problem is not this transaction's to
+            # repair, so match on the code rather than the exception type. A
+            # format whose DECLARATION is invalid must KEEP its selection:
+            # clearing it silently detaches every scene from a format the author
+            # can still fix, and hides the authoring error behind a fallback
+            # that looks like it worked.
+            if exc.code not in _TEMPLATE_RELEASABLE_PROFILE_CODES:
+                continue
             scene.prompt_context_profile_id = ""
             released += 1
             continue
-        # An unrelated resolution problem is not this transaction's to repair.
         del profile
     return released
 
@@ -4917,6 +5096,8 @@ def _populated_channels(channels) -> dict:
 
 def _reconcile_staged_reference_members(project: TimelineProject, removed_member_ids: set[str],
                                         removed_entity_ids: set[str] | None = None) -> dict:
+    removed_entity_ids = {str(value) for value in (removed_entity_ids or set())}
+    removed_member_ids = {str(value) for value in (removed_member_ids or set())}
     affected_scene_ids = []
     removed_item_ids = []
     thinned_item_ids = []
@@ -4938,10 +5119,34 @@ def _reconcile_staged_reference_members(project: TimelineProject, removed_member
         if changed:
             scene.reference_items = next_items
             affected_scene_ids.append(scene.scene_id)
+    affected_identity_ids = []
+    pruned_source_count = 0
+    cleared_voice_count = 0
+    for unit in project.prompt_semantic_units or []:
+        if not isinstance(unit, dict):
+            continue
+        sources = unit.get("sources") if isinstance(unit.get("sources"), list) else []
+        kept_sources = [source for source in sources if isinstance(source, dict)
+                        and str(source.get("member_id") or "") not in removed_member_ids
+                        and str(source.get("entity_id") or "") not in removed_entity_ids]
+        changed = len(kept_sources) != len(sources)
+        if changed:
+            pruned_source_count += len(sources) - len(kept_sources)
+            unit["sources"] = kept_sources
+        voice = unit.get("voice") if isinstance(unit.get("voice"), dict) else {}
+        if str(voice.get("member_id") or "") in removed_member_ids:
+            unit["voice"] = {"member_id": None}
+            cleared_voice_count += 1
+            changed = True
+        if changed:
+            affected_identity_ids.append(str(unit.get("semantic_unit_id") or ""))
     return {
         "affected_scene_ids": affected_scene_ids,
         "removed_reference_item_ids": removed_item_ids,
         "thinned_reference_item_ids": thinned_item_ids,
+        "affected_prompt_identity_ids": affected_identity_ids,
+        "pruned_prompt_identity_sources": pruned_source_count,
+        "cleared_prompt_identity_voices": cleared_voice_count,
     }
 
 
@@ -4970,6 +5175,10 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
         elif op_type == "update_member":
             member = _apply_update_reference_member(project, operation)
             results.append({"type": op_type, "member_id": member.member_id})
+        elif op_type == "materialize_member_handle":
+            member = _apply_materialize_reference_member_handle(project, operation)
+            results.append({"type": op_type, "member_id": member.member_id,
+                            "handle": member.handle})
         elif op_type == "delete_member":
             member = _apply_delete_reference_member(project, operation)
             results.append({"type": op_type, "member_id": member.member_id})
@@ -5019,7 +5228,6 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
 def _apply_reference_mutations_sync(request: web.Request, operations: list) -> tuple[TimelineProject, dict]:
     project = _load_project_from_request(request)
     payload = _apply_reference_mutation_operations(project, operations)
-    ensure_default_prompt_semantic_units(project)
     save_project(project)
     payload.update(_references_payload(project))
     return project, payload
@@ -8162,8 +8370,15 @@ if routes is not None:
             ids = [value["semantic_unit_id"] for value in units]
             if len(ids) != len(set(ids)):
                 return _json_error("Duplicate prompt semantic unit id", 400)
+            try:
+                for unit in units:
+                    handle = _validated_prompt_handle(unit.get("handle"))
+                    _require_prompt_handle_available(
+                        project, handle, "prompt identity",
+                        unit["semantic_unit_id"], semantic_units=units)
+            except ProjectMutationRequestError as exc:
+                return _mutation_json_error(exc)
             project.prompt_semantic_units = units
-            ensure_default_prompt_semantic_units(project)
         if "metadata" in body:
             incoming = body["metadata"]
             # A channel-template switch rewrites every section in every scene,
@@ -10557,6 +10772,7 @@ if routes is not None:
                 "attachment_previews": compiled.get("attachment_previews", {}),
                 "setup_manifest": compiled.get("setup_manifest", {}),
                 "ordinal_manifest": compiled.get("ordinal_manifest", {}),
+                "profile": compiled.get("profile", {}),
                 "profile_hash": compiled.get("profile_hash", ""),
                 "warnings": compiled.get("warnings", []),
                 "errors": compiled.get("errors", []),

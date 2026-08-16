@@ -22,6 +22,39 @@ const css = {
 
 let fieldId = 0;
 export const SONDER_REFERENCE_MIME = "application/x-sonder-reference";
+
+/** The one rule for which lane kind a Reference member belongs to.
+ *
+ *  Shared with the timeline's drop path so the two sides cannot drift: a
+ *  voice-tagged video counts as audio, everything non-audio counts as image.
+ *  Returns `""` when the asset is unknown — that means "cannot classify yet",
+ *  never "mixed".
+ */
+export function referenceMemberMediaKind(member, asset) {
+    if (!asset) return "";
+    const voiceTagged = (member?.tags || []).includes("sonder:voice_identity");
+    return asset.asset_type === "audio"
+        || (asset.asset_type === "video" && voiceTagged) ? "audio" : "image";
+}
+
+/** True only when RESOLVABLE members span both lane kinds.
+ *
+ *  Deliberately distinct from "some member is unresolved": a single-kind entity
+ *  holding one trashed member is still draggable, and refusing it as mixed
+ *  would be both wrong and misleading.
+ */
+export function referenceDragIsMixedKind(members, assets = []) {
+    const byId = new Map((assets || []).map((asset) => [
+        String(asset?.asset_id || ""), asset]));
+    const kinds = new Set();
+    for (const member of members || []) {
+        const kind = referenceMemberMediaKind(
+            member, byId.get(String(member?.asset_id || "")));
+        if (kind) kinds.add(kind);
+    }
+    return kinds.size > 1;
+}
+
 let activeReferenceDrag = null;
 
 export function getActiveReferenceDrag() {
@@ -101,9 +134,20 @@ export function mountReferenceLibrary(container, host) {
         })),
     });
 
-    const beginReferenceDrag = (event, payload) => {
+    const beginReferenceDrag = (event, payload, { assets = [], members = [] } = {}) => {
         if (!payload.members.length) {
             event.preventDefault();
+            return;
+        }
+        // Refuse a genuinely mixed-kind entity here rather than after the drop:
+        // a Reference lane's `media_kind` is hard, so no lane can ever accept
+        // one, and carrying it to a lane only to be told no is wasted effort.
+        // Members whose asset is missing or trashed are NOT mixed — they simply
+        // cannot be classified yet, and blocking their drag would strand a
+        // perfectly valid single-kind entity behind a wrong explanation.
+        if (referenceDragIsMixedKind(members, assets)) {
+            event.preventDefault();
+            host.notify?.("Stage image/video references separately from voice-reference audio.");
             return;
         }
         activeReferenceDrag = payload;
@@ -445,7 +489,9 @@ export function mountReferenceLibrary(container, host) {
             const card = el("section", "", "border:1px solid #303841;border-radius:8px;background:#171d23;margin-bottom:8px;overflow:hidden;");
             const header = el("div", "", "display:flex;flex-direction:column;gap:5px;padding:8px;cursor:pointer;");
             header.draggable = (reference.members || []).length > 0;
-            header.addEventListener("dragstart", (event) => beginReferenceDrag(event, dragPayload(reference)));
+            header.addEventListener("dragstart", (event) => beginReferenceDrag(
+                event, dragPayload(reference),
+                { assets: allAssets, members: reference.members || [] }));
             header.addEventListener("dragend", endReferenceDrag);
             header.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference)));
             const memberAssets = (reference.members || []).map((member) => allAssets.find((asset) => asset.asset_id === member.asset_id));
@@ -463,7 +509,7 @@ export function mountReferenceLibrary(container, host) {
                 remove.addEventListener("click", (event) => {
                     event.stopPropagation();
                     const unitIds = new Set((data.semanticUnits || [])
-                        .filter((unit) => (unit.source_members || []).some((value) =>
+                        .filter((unit) => (unit.sources || []).some((value) =>
                             value.entity_id === reference.reference_id))
                         .map((unit) => unit.semantic_unit_id));
                     let staged = 0; let chips = 0;
@@ -521,7 +567,9 @@ export function mountReferenceLibrary(container, host) {
                         const asset = allAssets.find((entry) => entry.asset_id === member.asset_id);
                         const row = el("div", "", "display:grid;grid-template-columns:40px minmax(0,1fr);gap:7px;padding:7px 0;border-top:1px solid #293039;");
                         row.draggable = true;
-                        row.addEventListener("dragstart", (event) => beginReferenceDrag(event, dragPayload(reference, member)));
+                        row.addEventListener("dragstart", (event) => beginReferenceDrag(
+                            event, dragPayload(reference, member),
+                            { assets: allAssets, members: [member] }));
                         row.addEventListener("dragend", endReferenceDrag);
                         row.addEventListener("contextmenu", (event) => openTimelineMenu(event, dragPayload(reference, member)));
                         const preview = el("button", asset?.asset_type === "audio" ? "Audio" : (asset?.asset_type === "video" ? "Video" : ""), "width:40px;height:34px;padding:0;background:#0b0e12;border:1px solid #333b44;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:8px;color:#8995a0;overflow:hidden;cursor:pointer;");
@@ -552,7 +600,7 @@ export function mountReferenceLibrary(container, host) {
                             ["Edit", () => { state.memberDraft = createMemberDraft(member, asset); state.memberDraft.has_audio = asset?.has_audio === true; state.memberNotice = ""; state.memberMode = member.member_id; render(); }],
                             ["Remove", () => {
                                 const unitIds = new Set((data.semanticUnits || [])
-                                    .filter((unit) => (unit.source_members || []).some((value) =>
+                                    .filter((unit) => (unit.sources || []).some((value) =>
                                         value.entity_id === reference.reference_id
                                         && value.member_id === member.member_id))
                                     .map((unit) => unit.semantic_unit_id));

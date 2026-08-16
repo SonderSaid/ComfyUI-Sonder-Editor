@@ -451,7 +451,7 @@ def test_prompt_bridge_member_slot_agrees_with_h3_subject_definition(
     project = _project(tmp_path, recipe)
     unit = prompt_context.normalize_semantic_unit({
         "semantic_unit_id": "subject", "name": "Hero", "definition": "",
-        "source_members": [{"entity_id": "entity", "member_id": "member"}],
+        "sources": [{"entity_id": "entity", "member_id": "member"}],
     })
     project.prompt_semantic_units = [unit]
 

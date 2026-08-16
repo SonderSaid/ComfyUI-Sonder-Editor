@@ -6,16 +6,26 @@ from .reference_resolution import resolve_effective_references
 
 
 def resolve_scene_prompt_context(project, scene, template, window_start,
-                                 window_end, reference_threshold=0.0) -> dict:
+                                 window_end, reference_threshold=0.0,
+                                 profile=None) -> dict:
     """Build the setup/ordinal context shared by every live compile entry point."""
     result = {"setup_manifest": {}, "ordinal_manifest": {},
               "unit_picture_ordinals": {}, "unit_source_labels": {},
               "generic_references": {}, "errors": [], "warnings": []}
     template = (template if isinstance(template, dict)
                 else prompt_channel_templates.get_channel_template(template))
-    template_id = str((template or {}).get("id") or "")
+    profile_request = (prompt_context.profile_key(profile)
+                       if isinstance(profile, dict) else profile)
+    resolved_profile = prompt_context.resolve_profile(
+        profile_request or getattr(scene, "prompt_context_profile_id", "") or None,
+        template=template,
+        custom_profiles=getattr(project, "prompt_context_profiles", []) or [])
+    validator_ids = {
+        str(value) for value in resolved_profile.get("validators") or []
+        if isinstance(value, str)
+    }
     setup = minimax_h3.active_setup(scene)
-    if template_id == "minimax_h3_base":
+    if "minimax_base_setup" in validator_ids:
         if setup is None:
             config = getattr(scene, "prompt_context_profile_config", {}) or {}
             setup = minimax_h3.implicit_base_setup(config.get("task_mode", "T2VA"))
@@ -26,8 +36,9 @@ def resolve_scene_prompt_context(project, scene, template, window_start,
             result = minimax_h3.resolve_setup(
                 setup=setup, guide_frames=scene.guide_frames,
                 scene_duration=scene.duration_frames,
-                window_start=window_start, window_end=window_end)
-    elif template_id == "minimax_h3_ref":
+                window_start=window_start, window_end=window_end,
+                profile=resolved_profile)
+    elif "minimax_reference_setup" in validator_ids:
         if setup is None or setup["mode"] != "reference":
             result["errors"].append({"code": "missing_reference_setup",
                                      "message": "MiniMax H3 Full Reference requires an active Reference setup."})
@@ -42,7 +53,8 @@ def resolve_scene_prompt_context(project, scene, template, window_start,
                 window_start=window_start, window_end=window_end,
                 references=project.references, assets=project.assets,
                 semantic_units=project.prompt_semantic_units,
-                frame_threshold_pct=reference_threshold)
+                frame_threshold_pct=reference_threshold,
+                profile=resolved_profile)
     else:
         winners = resolve_effective_references(
             reference_items=scene.reference_items,
@@ -70,12 +82,17 @@ def compile_live_scene_prompt_context(project, scene, *, template,
     """Compile one live scene with the same complete context used by preview."""
     template = (template if isinstance(template, dict)
                 else prompt_channel_templates.get_channel_template(template))
-    setup_result = resolve_scene_prompt_context(
-        project, scene, template, window_start, window_end,
-        reference_threshold)
+    setup_result = {"errors": [], "warnings": []}
     global_hidden = bool(getattr(scene.global_prompt_track_config, "hidden", False))
     sections_hidden = bool(getattr(scene.prompt_track_config, "hidden", False))
     try:
+        resolved_profile = prompt_context.resolve_profile(
+            getattr(scene, "prompt_context_profile_id", "") or None,
+            template=template,
+            custom_profiles=project.prompt_context_profiles)
+        setup_result = resolve_scene_prompt_context(
+            project, scene, template, window_start, window_end,
+            reference_threshold, profile=resolved_profile)
         compiled = prompt_context.compile_prompt_context(
             global_documents={} if global_hidden else scene.global_channel_docs,
             global_channels={} if global_hidden else scene.global_channels,
@@ -83,7 +100,7 @@ def compile_live_scene_prompt_context(project, scene, *, template,
             sections=[] if sections_hidden else scene.prompt_sections,
             window_start=window_start, window_end=window_end, fps=fps,
             template=template,
-            profile=getattr(scene, "prompt_context_profile_id", "") or None,
+            profile=prompt_context.profile_key(resolved_profile),
             custom_profiles=project.prompt_context_profiles,
             context={
                 "setup_manifest": setup_result.get("setup_manifest", {}),

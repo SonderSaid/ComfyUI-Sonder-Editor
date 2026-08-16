@@ -146,17 +146,35 @@ console.log(JSON.stringify({{
     assert result["cells"] == expected
 
 
-def test_authoritative_drop_keeps_occupancy_and_overlap_checks_out_of_hover():
+def test_authoritative_asset_drop_keeps_occupancy_and_overlap_checks_out_of_hover():
+    """ASSET hover stays advisory; the authoritative asset drop owns occupancy.
+
+    Scoped to the asset path deliberately. The REFERENCE branch of the same
+    hover function does check compatibility, because it previously highlighted
+    every unlocked Reference lane and promised a landing the drop then refused —
+    a reported defect, and the opposite of the zone model's "refuse visibly".
+    Assets have no equivalent complaint, so their hover keeps its cheap advisory
+    behaviour.
+
+    Anchored without the parameter list: this method's signature is expected to
+    grow, and an anchor that breaks on that is a maintenance trap rather than a
+    guard.
+    """
     source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    hover_start = source.index("    _resolveDropHoverTarget(rawY) {")
-    hover_end = source.index("\n    async _handleAssetDrop(", hover_start)
-    drop_start = hover_end
+    hover_start = source.index("    _resolveDropHoverTarget(")
+    # End at the NEXT method, not at `_handleAssetDrop` — everything between
+    # them (`_referencePayloadMediaKind`, `_placeReferencePayload`) is drop-side
+    # code, and including it made this assertion vacuous.
+    hover_end = source.index("\n    _referencePayloadMediaKind(", hover_start)
+    drop_start = source.index("\n    async _handleAssetDrop(", hover_start)
     drop_end = source.index("\n    _firstAvailableLane(", drop_start)
     hover = source[hover_start:hover_end]
     drop = source[drop_start:drop_end]
 
+    # Anti-vacuity: the slice must be the hover function alone.
+    assert "_placeReferencePayload" not in hover
     assert "_driverClipInLane" in drop and "laneHasOverlap" in drop
     assert "_driverClipInLane" not in hover and "laneHasOverlap" not in hover, (
-        "Hover is advisory; only authoritative drop checks occupancy and overlap. "
-        "Unifying those paths would change current drag feedback behavior."
+        "Asset hover is advisory; only the authoritative asset drop checks "
+        "occupancy and overlap."
     )

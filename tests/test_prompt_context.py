@@ -114,6 +114,13 @@ def _link_attachment(source_id):
     })
 
 
+def _scope_link_attachment(source_id, channels=None):
+    return prompt_context.normalize_attachment({
+        "kind": "prompt_link_scope",
+        "source": {"prompt_id": source_id, "channel_keys": channels or ["visual"]},
+    })
+
+
 def test_prompt_link_materializes_only_when_source_is_absent():
     source = _section(0, 10, "creaky footsteps", prompt_id="source")
     link = _link_attachment("source")
@@ -182,6 +189,68 @@ def test_cached_empty_prompt_link_warns_every_consumer_chip():
     assert {value["attachment_id"] for value in compiled["warnings"]
             if value["code"] == "empty_prompt_link"} == {
                 link["attachment_id"] for link in links}
+
+
+def test_section_scope_prompt_link_emits_before_authored_text_and_deduplicates():
+    source = _section(0, 10, "source text", prompt_id="source")
+    link = _scope_link_attachment("source")
+    consumer = _section(10, 20, "consumer text", prompt_id="consumer",
+                        attachments=[link])
+    selected = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[source, consumer], window_start=10,
+        window_end=20, fps=24, template="standard")
+    assert selected["prompt"] == "source text consumer text"
+    combined = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[source, consumer], window_start=0,
+        window_end=20, fps=24, template="standard")
+    assert combined["prompt"] == "source text. consumer text"
+    assert link["link_exportable"] is True
+
+
+def test_scope_prompt_link_refuses_inline_anchor():
+    link = _scope_link_attachment("source")
+    consumer = _section(10, 20, "", prompt_id="consumer",
+                        attachments=[link], document={"nodes": [{
+                            "type": "attachment", "node_id": "bad-anchor",
+                            "attachment_id": link["attachment_id"],
+                        }]})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[_section(
+            0, 10, "source", prompt_id="source"), consumer],
+        window_start=10, window_end=20, fps=24, template="standard")
+    diagnostic = next(value for value in compiled["errors"]
+                      if value["code"] == "anchored_scope_only_attachment")
+    assert diagnostic["attachment_id"] == link["attachment_id"]
+
+
+def test_scope_and_inline_prompt_links_choose_scope_phase_once():
+    source = _section(0, 10, "source text", prompt_id="source")
+    scope_link = _scope_link_attachment("source")
+    inline_link = _link_attachment("source")
+    consumer = _section(10, 20, "", prompt_id="consumer",
+                        attachments=[scope_link, inline_link], document={"nodes": [
+                            {"type": "text", "node_id": "before", "text": "before "},
+                            {"type": "attachment", "node_id": "inline",
+                             "attachment_id": inline_link["attachment_id"]},
+                            {"type": "text", "node_id": "after", "text": " after"},
+                        ]})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[source, consumer], window_start=10,
+        window_end=20, fps=24, template="standard")
+    assert compiled["prompt"].count("source text") == 1
+    assert compiled["prompt"].startswith("source text before")
+
+
+def test_section_scope_prompt_links_resolve_transitively():
+    first = _section(0, 10, "first", prompt_id="first")
+    middle = _section(10, 20, "middle", prompt_id="middle",
+                      attachments=[_scope_link_attachment("first")])
+    consumer = _section(20, 30, "consumer", prompt_id="consumer",
+                        attachments=[_scope_link_attachment("middle")])
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[first, middle, consumer],
+        window_start=20, window_end=30, fps=24, template="standard")
+    assert compiled["prompt"] == "first middle consumer"
 
 
 def test_managed_vocal_event_conflicts_with_literal_speaker_id():
@@ -351,7 +420,7 @@ def test_audio_definition_reuses_but_never_creates_speaker_identity():
     })
     base_context = {
         "semantic_units": [{"semantic_unit_id": "granny", "name": "Granny",
-                            "source_members": [{"member_id": "voice"}]}],
+                            "sources": [{"member_id": "voice"}]}],
         "ordinal_manifest": {"subjects": {"granny": 1}},
         "unit_source_labels": {"granny": ["<Audio 1>"]},
     }
@@ -487,7 +556,7 @@ def test_h3_reference_presentation_order_and_independent_audio_ordinals():
         scene_duration=100, window_start=0, window_end=100,
         references=references, assets=[picture_asset, video_asset, audio_asset],
         semantic_units=[{"semantic_unit_id": "video-subject", "order": 0,
-                         "source_members": [{"member_id": "vm"}]}])
+                         "sources": [{"member_id": "vm"}]}])
     assert result["errors"] == []
     presentation = result["setup_manifest"]["presentation"]
     assert [value["kind"] for value in presentation] == [
@@ -540,7 +609,7 @@ def test_server_prompt_history_freezes_custom_profile_and_subject_dependency_clo
     })
     unit = prompt_context.normalize_semantic_unit({
         "semantic_unit_id": "subject", "name": "Subject",
-        "source_members": [{"entity_id": "entity", "member_id": "member"}],
+        "sources": [{"entity_id": "entity", "member_id": "member"}],
     })
     attachment = prompt_context.normalize_attachment({
         "kind": "reference", "source": {"semantic_unit_ids": ["subject"]},
@@ -646,6 +715,8 @@ def test_prompt_editor_sources_preserve_writing_state_and_prune_deleted_chips():
         encoding="utf-8")
     panel = (root / "web" / "js" / "editor_prompt_panel.js").read_text(
         encoding="utf-8")
+    identity_panel = (root / "web" / "js" / "prompt_identity_panel.js").read_text(
+        encoding="utf-8")
     widget = (root / "web" / "js" / "editor_widget.js").read_text(
         encoding="utf-8")
     assert "removedInline" in editor
@@ -654,8 +725,9 @@ def test_prompt_editor_sources_preserve_writing_state_and_prune_deleted_chips():
     assert "global_channel_exceptions" in panel
     assert "muted: writingState.blockMeta" in panel
     assert "physicalOptions" in editor
-    assert "host._referenceRecipePresets" in panel
-    assert 'type: "ensure_minimax_h3_reference_population"' in panel
+    assert "candidate?.setup_manifest" in identity_panel
+    assert "Staging remains in Reference lanes" in identity_panel
+    assert 'type: "ensure_minimax_h3_reference_population"' not in panel
     assert "pre_context_frames: this._contextFrameValue" in widget
     assert "frame_constraint: this._getActiveFrameConstraint()" in widget
 
@@ -825,8 +897,14 @@ def test_minimax_managed_group_and_voiceover_syntax_matches_guide():
     compiled = prompt_context.compile_prompt_context(
         global_channels={}, sections=[section],
         window_start=0, window_end=10, fps=24, template="minimax_h3_base",
-        context={"setup_manifest": {"setup": {"mode": "base",
-                                                "task_mode": "T2VA"}}})
+            context={"setup_manifest": {"setup": {"mode": "base",
+                                                    "task_mode": "T2VA"}},
+                     "semantic_units": [
+                         {"semantic_unit_id": "one", "name": "Older child",
+                          "kind": "subject", "definition": "the older child"},
+                         {"semantic_unit_id": "two", "name": "Younger child",
+                          "kind": "subject", "definition": "the younger child"},
+                     ]})
     assert "The two children (S1,S2) say together:" in compiled["prompt"]
     assert "says in an off-screen voiceover:" in compiled["prompt"]
     assert "lips remain completely closed." in compiled["prompt"]
@@ -865,8 +943,11 @@ def test_h3_task_types_require_explicit_audio_role_not_preservation_default():
         "member_id": "audio", "role": "audio_reference",
         "audio_intent": "reference_characteristics",
     }]}}
-    assert prompt_context._minimax_task_types(inherited_only) == []
-    assert prompt_context._minimax_task_types(explicit) == ["audio reference"]
+    profile = prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]
+    assert prompt_context._minimax_task_types(
+        inherited_only, profile=profile) == []
+    assert prompt_context._minimax_task_types(
+        explicit, profile=profile) == ["audio reference"]
 
 
 def test_h3_summary_task_type_selection_overrides_role_derived_defaults():
@@ -874,10 +955,11 @@ def test_h3_summary_task_type_selection_overrides_role_derived_defaults():
         "pictures": [{"member_id": "picture", "role": "identity"}],
         "videos": [{"member_id": "video", "role": "video_editing"}],
     }}
-    assert prompt_context._minimax_task_types(context) == [
+    profile = prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]
+    assert prompt_context._minimax_task_types(context, profile=profile) == [
         "reference generation", "video editing"]
     assert prompt_context._minimax_task_types(
-        context, ["video continuation", "keyframe completion"]) == [
+        context, ["video continuation", "keyframe completion"], profile) == [
             "keyframe completion", "video continuation"]
 
 
@@ -907,7 +989,7 @@ def test_h3_subject_definition_inherits_contributing_library_member_prompt():
             "unit_source_labels": {"subject": ["<Picture 1>"]},
             "semantic_units": [{
                 "semantic_unit_id": "subject", "name": "Korean Woman",
-                "definition": "", "source_members": [{
+                "definition": "", "sources": [{
                     "entity_id": "woman", "member_id": "portrait"}],
             }],
         })
@@ -923,7 +1005,7 @@ def test_h3_subject_definition_precedence_is_chip_then_subject_then_member():
     context = {"setup_manifest": {"presentation": [{
         "member_id": "portrait", "member_prompt": "member prose"}]}}
     unit = {"definition": "subject prose",
-            "source_members": [{"member_id": "portrait"}]}
+            "sources": [{"member_id": "portrait"}]}
     assert prompt_context._subject_definition(
         {"definition": "chip prose"}, unit, context) == ("chip prose", "chip")
     assert prompt_context._subject_definition({}, unit, context) == (
@@ -952,7 +1034,7 @@ def test_blank_reference_override_does_not_hide_conflicting_staged_intents():
             "ordinal_manifest": {"subjects": {"subject": 1}},
             "semantic_units": [{
                 "semantic_unit_id": "subject", "name": "Subject",
-                "definition": "a person", "source_members": [
+                "definition": "a person", "sources": [
                     {"entity_id": "entity", "member_id": "one"},
                     {"entity_id": "entity", "member_id": "two"}],
             }],

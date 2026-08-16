@@ -282,21 +282,44 @@ export function setButtonVariant(button, variant = "secondary", options = {}) {
     if (!button?.style) return button;
     const palette = buttonPalette(variant);
     button.style.cssText = chromeButtonCss({ ...options, variant });
+    // Every state handler short-circuits while disabled. Inline styles cannot
+    // express `:disabled`, so without this a disabled control still lights up
+    // on hover and depresses on click — it reads as an enabled button that
+    // silently does nothing, which is exactly how it gets reported as broken.
     button.onmouseenter = () => {
+        if (button.disabled) return;
         button.style.background = palette.hoverBackground;
     };
     button.onmouseleave = () => {
+        if (button.disabled) return;
         button.style.background = palette.background;
         button.style.color = palette.text;
     };
     button.onmousedown = () => {
+        if (button.disabled) return;
         button.style.background = palette.activeBackground;
         button.style.color = palette.activeText;
     };
     button.onmouseup = () => {
+        if (button.disabled) return;
         button.style.background = palette.hoverBackground;
         button.style.color = palette.text;
     };
+    return button;
+}
+
+/** Disable a chrome button so it also LOOKS disabled.
+ *
+ *  `button.disabled` alone stops the click but changes nothing visible, because
+ *  these controls are inline-styled and cannot carry a `:disabled` rule. Pair
+ *  the two here so no caller can set one without the other.
+ */
+export function setButtonDisabled(button, disabled = true) {
+    if (!button?.style) return button;
+    button.disabled = !!disabled;
+    button.style.opacity = disabled ? "0.42" : "";
+    button.style.cursor = disabled ? "not-allowed" : "pointer";
+    button.setAttribute?.("aria-disabled", disabled ? "true" : "false");
     return button;
 }
 

@@ -43,8 +43,11 @@ def test_h3_noncanonical_summary_and_retention_detail_are_advisory():
     }], context={
         "setup_manifest": {"setup": {"mode": "reference"}},
         "ordinal_manifest": {"subjects": {"unit:one": 1}},
+        "unit_source_labels": {"unit:one": ["<Picture 1>"]},
         "semantic_units": [{"semantic_unit_id": "unit:one", "name": "One",
-                            "definition": "a woman", "source_members": []}],
+                            "definition": "a woman", "sources": [{
+                                "entity_id": "reference", "member_id": "portrait",
+                            }]}],
     })
     assert {"invalid_h3_task_prefix", "missing_h3_retention_detail"} <= _codes(
         result, "warnings")
@@ -71,7 +74,7 @@ def test_missing_h3_reference_definitions_are_advisory():
             "subjects": {"unit:one": 1}, "pictures": {"portrait": 1}},
         "unit_source_labels": {"unit:one": ["<Audio 1>"]},
         "semantic_units": [{"semantic_unit_id": "unit:one", "name": "One",
-                            "definition": "", "source_members": []}],
+                            "definition": "", "sources": []}],
     })
     expected = {"missing_h3_subject_definition", "missing_h3_audio_definition",
                 "missing_h3_physical_definition"}

@@ -1917,7 +1917,7 @@ def test_prompt_template_dependencies_import_atomically_with_scene_mutation(monk
     }
     unit = {
         "semantic_unit_id": "unit-1", "name": "Granny", "order": 0,
-        "source_members": [], "definition": "A grandmother",
+        "sources": [], "definition": "A grandmother",
     }
 
     response = _apply_scene_operations(route_module, monkeypatch, project, "scene-1", [
@@ -1942,7 +1942,7 @@ def test_prompt_template_dependency_collision_blocks_instead_of_overwriting(monk
     project.project_id = "proj"
     project.prompt_semantic_units = [{
         "semantic_unit_id": "unit-1", "name": "Existing", "order": 0,
-        "source_members": [], "visual_intent": "preserve",
+        "sources": [], "visual_intent": "preserve",
         "audio_intent": "reference_characteristics", "definition": "",
         "intent_overrides": {},
     }]

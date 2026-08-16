@@ -209,7 +209,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
 }
 
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
-import { getActiveReferenceDrag, mountReferenceLibrary, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
+import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
 import { openReferenceMediaEditor, REFERENCE_MEDIA_EDITOR_SHORTCUTS } from "./reference_media_editor.js";
 import { shouldApplyReferenceResponse } from "./reference_library_model.js";
 import { mountReferenceLanePanel } from "./editor_reference_panel.js";
@@ -269,6 +269,7 @@ import {
     PROMPT_CONTEXT_FORMAT,
 } from "./prompt_context_chips.js";
 import { resolvePromptCandidateSelection } from "./prompt_context_diagnostics.js";
+import { resolvedPromptProfile } from "./prompt_profile_declarations.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { mountChannelTemplateEditor } from "./editor_channel_template_editor.js";
 import { evalNumericExpression } from "./editor_numeric_input.js";
@@ -662,6 +663,9 @@ export class EditorWidget {
         this._promptContextCatalog = {};
         this._referencesLoaded = false;
         this._referencesDirty = false;
+        // A forced references fetch that had to defer. The replay needs the
+        // ORIGINAL caller's intent; see _replayDeferredProjectBackedRefresh.
+        this._deferredReferencesForce = false;
         this._referencesLoading = false;
         this._referencesError = "";
         this._referenceFetchSeq = 0;
@@ -1864,7 +1868,19 @@ export class EditorWidget {
         return descriptor?.fork_seed?.writing_aids || [];
     }
 
-    async _savePromptSemanticUnits(units) {
+    _resolvedPromptContextProfile(profileKey = "", candidate = null) {
+        const key = String(profileKey || this.activeScene?.prompt_context_profile_id
+            || this._channelTemplate?.()?.default_context_profile || "generic@1");
+        return resolvedPromptProfile({
+            profileId: key,
+            candidate: candidate || (this._promptContextCandidateCache?._candidate_scene_id
+                === this.activeSceneId ? this._promptContextCandidateCache : null),
+            catalog: this._promptContextCatalog,
+            customProfiles: this._promptContextProfiles,
+        });
+    }
+
+    async _savePromptSemanticUnits(units, label = "edit prompt identities") {
         if (!this.projectDir) return null;
         const before = this._captureProjectDependencies();
         const dirName = this._projectDirName();
@@ -1876,7 +1892,7 @@ export class EditorWidget {
         );
         this._promptSemanticUnits = Array.isArray(payload?.prompt_semantic_units)
             ? payload.prompt_semantic_units : [];
-        this._pushProjectDependencyUndo("edit prompt Subjects", before);
+        this._pushProjectDependencyUndo(label, before);
         await this._fetchReferences({ ignoreMutationGate: true,
             reason: "prompt_semantic_units", force: true });
         return this._promptSemanticUnits;
@@ -1938,6 +1954,10 @@ export class EditorWidget {
             return null;
         }
         if (!ignoreMutationGate && this._hasPendingProjectMutations()) {
+            // Carry the caller's intent across the defer boundary. `force` means
+            // a consumer other than the sidebar asked, and the replay cannot
+            // rediscover that from UI state after the fact.
+            if (force) this._deferredReferencesForce = true;
             this._deferProjectBackedRefresh(["references"], reason);
             return null;
         }
@@ -1969,14 +1989,14 @@ export class EditorWidget {
         }
     }
 
-    _mutateReferences(operations) {
+    _mutateReferences(operations, label = "Reference Library change") {
         if (!this.projectDir || !Array.isArray(operations) || !operations.length) return Promise.resolve(null);
         const projectDir = this.projectDir;
         const dirName = this._projectDirName();
         const requestSeq = ++this._referenceFetchSeq;
         return this._queueProjectMutation({
             key: `references:${++this._referenceMutationSeq}`,
-            label: "Reference Library change",
+            label,
             coalesce: false,
             intent: operations,
             refreshScenes: false,
@@ -2000,6 +2020,28 @@ export class EditorWidget {
                 return result;
             },
         });
+    }
+
+    async _materializeReferenceMemberHandle({
+        referenceId, memberId, suggestion, expectedHandle = "",
+    } = {}) {
+        const result = await this._mutateReferences([{
+            type: "materialize_member_handle",
+            reference_id: String(referenceId || ""),
+            member_id: String(memberId || ""),
+            suggestion: String(suggestion || ""),
+            // Exact stored state only. A derived suggestion is never an
+            // expected value and therefore cannot create a false mismatch.
+            expected: { handle: String(expectedHandle || "") },
+        }], "materialize physical Reference handle");
+        const responseHandle = result?.payload?.results?.find((value) =>
+            value?.type === "materialize_member_handle"
+                && String(value?.member_id || "") === String(memberId || ""))?.handle;
+        const storedHandle = responseHandle || (this._references || [])
+            .flatMap((reference) => reference?.members || [])
+            .find((member) => String(member?.member_id || "") === String(memberId || ""))?.handle;
+        if (!storedHandle) throw new Error("The Reference handle was not materialized.");
+        return String(storedHandle);
     }
 
     _reconcileReferencesAfterAssetDeletion(payload) {
@@ -2097,6 +2139,12 @@ export class EditorWidget {
             previewMemberMedia: ({ asset, draft, readOnly }) => this._openReferenceMediaEditor({ asset, draft, readOnly }),
             addToTimeline: (payload) => void this._placeReferencePayload(payload, this.playhead, undefined),
             assetPreviewUrl: (asset) => this._referenceAssetPreviewUrl(asset),
+            // A refusal the user cannot see is indistinguishable from a broken
+            // drag. The library reaches the notification bus only through this
+            // seam, and `host.notify?.()` optional-chains into silence when the
+            // host forgets it — so the mixed-kind refusal explained nothing.
+            notify: (message) => notifyWarning(String(message || ""),
+                { source: "reference-drag-refused" }),
         });
     }
 
@@ -2644,7 +2692,16 @@ export class EditorWidget {
             this._fetchRenderQueue({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay" });
         }
         if (wantsReferences) {
-            if (this.isFullscreen && this._settings?.layout?.fullscreenSidebarContent === "references") {
+            // Replay with the intent the request was DEFERRED with. Re-deriving
+            // eligibility from the sidebar here dropped every request whose
+            // consumer was not the sidebar: the Prompt tool asks with `force`
+            // on mount, and on a fresh fullscreen open that fetch defers behind
+            // the initial mutations, then landed here and was discarded — so
+            // Reference Prompting rendered empty until the panel was reopened.
+            const forced = this._deferredReferencesForce === true;
+            this._deferredReferencesForce = false;
+            if (forced || (this.isFullscreen
+                    && this._settings?.layout?.fullscreenSidebarContent === "references")) {
                 this._fetchReferences({ ignoreMutationGate: true, reason: "project_mutation_deferred_replay", force: true });
             } else {
                 this._referencesDirty = true;
@@ -7387,8 +7444,11 @@ export class EditorWidget {
         canvas.addEventListener("dragover", (e) => {
             e.preventDefault();
             e.stopPropagation(); // Prevent ComfyUI from showing its own drop indicator
-            const { rawY } = this._canvasMouseCoords(e);
-            const target = this._resolveDropHoverTarget(rawY);
+            const { x, rawY } = this._canvasMouseCoords(e);
+            // The frame is needed for the Reference branch's overlap check; the
+            // asset branch ignores it.
+            const target = this._resolveDropHoverTarget(
+                rawY, Math.max(0, this._xToFrame(x)));
             e.dataTransfer.dropEffect = target && target.kind !== "invalid" ? "copy" : "none";
             const prev = this._dropHoverTarget;
             if (prev?.kind !== target?.kind || prev?.layoutIdx !== target?.layoutIdx) {
@@ -7856,18 +7916,20 @@ export class EditorWidget {
      *  generic for foreign drags. Returns {kind:"ruler"} | {kind:"lane",
      *  layoutIdx} | {kind:"invalid"} | null. Advisory only — the authoritative
      *  accept/refuse lives in _handleAssetDrop. */
-    _resolveDropHoverTarget(rawY) {
+    _resolveDropHoverTarget(rawY, frame = 0) {
         if (!this.activeScene || rawY === undefined) return null;
         const referenceDrag = getActiveReferenceDrag?.() || null;
         if (referenceDrag) {
-            if (rawY < this._timelineRulerHeight()) return { kind: "invalid" };
+            // The ruler creates a lane, so it is always a valid target.
+            if (rawY < this._timelineRulerHeight()) return { kind: "ruler" };
             const layoutIdx = this._layoutIndexFromRawY(rawY);
             const entry = layoutIdx >= 0 ? this._trackLayout[layoutIdx] : null;
-            return entry?.type === TRACK_TYPE.REFERENCE
-                && !entry.collapsed
-                && !this._isLaneLocked(entry.type, entry.laneIndex || 0)
-                ? { kind: "lane", layoutIdx }
-                : { kind: "invalid" };
+            if (entry?.type !== TRACK_TYPE.REFERENCE) return { kind: "invalid" };
+            // Same predicate the drop uses, so the highlight cannot promise a
+            // landing the drop then refuses on kind, lock, or frame overlap.
+            const mediaKind = this._referencePayloadMediaKind(referenceDrag);
+            const canUse = this._referenceLaneAcceptor(mediaKind, frame);
+            return canUse(entry) ? { kind: "lane", layoutIdx } : { kind: "invalid" };
         }
         const dragAsset = getActiveDragAsset?.() || null;
         const assetType = dragAsset?.asset_type || "";
@@ -7903,14 +7965,59 @@ export class EditorWidget {
             : { kind: "invalid" };
     }
 
+    /** The effective recipe of one Reference lane, detached lanes included.
+     *
+     *  ONE authority, because the acceptor and the placement path must agree on
+     *  what a lane currently is: the acceptor decides a lane is compatible, and
+     *  the placement path then decides whether to retype it. Reading the recipe
+     *  two ways is how a lane gets accepted and retyped in the same drop.
+     */
+    _referenceLaneRecipe(laneIndex) {
+        return this.activeScene?.reference_lane_recipes?.[laneIndex || 0]
+            || this._defaultReferenceLaneRecipe();
+    }
+
+    /** One acceptance rule for Reference lanes, shared by hover and drop.
+     *
+     *  Hover used to check only lane type, collapse and lock, so every unlocked
+     *  Reference lane highlighted and showed `copy` — then the drop refused on
+     *  media kind or frame overlap. Sharing this predicate is what makes the
+     *  drag stop promising a landing the drop will reject.
+     */
+    _referenceLaneAcceptor(mediaKind, startFrame) {
+        const scene = this.activeScene;
+        if (!scene || !mediaKind) return () => false;
+        const duration = Math.max(1, parseInt(scene.duration_frames, 10)
+            || this.totalFrames || 1);
+        const frame = Math.min(duration - 1, Math.max(0, Math.round(Number(startFrame) || 0)));
+        const overlapsFrame = (laneIndex) => (scene.reference_items || []).some((item) => {
+            if ((item.lane_index || 0) !== laneIndex) return false;
+            const end = item.end_frame === -1 ? duration : item.end_frame;
+            return (item.start_frame || 0) <= frame && end > frame;
+        });
+        return (entry) => {
+            if (!entry || entry.collapsed) return false;
+            if (this._isLaneLocked(entry.type, entry.laneIndex || 0)) return false;
+            if (overlapsFrame(entry.laneIndex || 0)) return false;
+            const recipe = this._referenceLaneRecipe(entry.laneIndex || 0);
+            if (recipe.media_kind === mediaKind) return true;
+            const occupied = (scene.reference_items || []).some((item) =>
+                (item.lane_index || 0) === (entry.laneIndex || 0));
+            return !occupied && this._isUnconfiguredReferenceLaneRecipe(recipe);
+        };
+    }
+
     _referencePayloadMediaKind(payload) {
         const kinds = new Set();
         for (const memberRef of payload?.members || []) {
             const resolved = this._referenceMemberForRef(memberRef);
             const asset = resolved ? this._findAssetById(resolved.member.asset_id) : null;
+            // An unresolvable member still blocks placement — the lane cannot be
+            // typed from it — but it is NOT the mixed-kind case, which the
+            // library refuses earlier at `dragstart`. Both sides classify a
+            // member through the same shared rule so they cannot drift.
             if (!resolved || !asset) return "";
-            const voiceTagged = (resolved.member.tags || []).includes("sonder:voice_identity");
-            kinds.add(asset.asset_type === "audio" || (asset.asset_type === "video" && voiceTagged) ? "audio" : "image");
+            kinds.add(referenceMemberMediaKind(resolved.member, asset));
         }
         return kinds.size === 1 ? [...kinds][0] : "";
     }
@@ -7926,32 +8033,30 @@ export class EditorWidget {
         const duration = Math.max(1, parseInt(scene.duration_frames, 10) || this.totalFrames || 1);
         const startFrame = Math.min(duration - 1, Math.max(0, Math.round(Number(frame) || 0)));
         let explicitEntry = null;
+        let forceNewLane = false;
         if (trackRawY !== undefined) {
-            if (trackRawY < this._timelineRulerHeight()) return;
-            const layoutIdx = this._layoutIndexFromRawY(trackRawY);
-            explicitEntry = layoutIdx >= 0 ? this._trackLayout[layoutIdx] : null;
-            if (explicitEntry?.type !== TRACK_TYPE.REFERENCE || explicitEntry.collapsed) return;
+            if (trackRawY < this._timelineRulerHeight()) {
+                // Zone model, matching the asset path: the ruler ALWAYS makes a
+                // new lane. This used to be a silent `return` — no lane, no
+                // placement, and no message explaining why nothing happened.
+                forceNewLane = true;
+            } else {
+                const layoutIdx = this._layoutIndexFromRawY(trackRawY);
+                explicitEntry = layoutIdx >= 0 ? this._trackLayout[layoutIdx] : null;
+                if (explicitEntry?.type !== TRACK_TYPE.REFERENCE || explicitEntry.collapsed) return;
+            }
         }
         const referenceEntries = (this._trackLayout || []).filter((entry) => entry.type === TRACK_TYPE.REFERENCE);
-        const overlapsFrame = (laneIndex) => (scene.reference_items || []).some((item) => {
-            if ((item.lane_index || 0) !== laneIndex) return false;
-            const end = item.end_frame === -1 ? duration : item.end_frame;
-            return (item.start_frame || 0) <= startFrame && end > startFrame;
-        });
-        const recipeFor = (laneIndex) => scene.reference_lane_recipes?.[laneIndex] || this._defaultReferenceLaneRecipe();
-        const canUse = (entry) => {
-            if (!entry || this._isLaneLocked(entry.type, entry.laneIndex || 0) || overlapsFrame(entry.laneIndex || 0)) return false;
-            const recipe = recipeFor(entry.laneIndex || 0);
-            if (recipe.media_kind === mediaKind) return true;
-            const occupied = (scene.reference_items || []).some((item) => (item.lane_index || 0) === (entry.laneIndex || 0));
-            return !occupied && this._isUnconfiguredReferenceLaneRecipe(recipe);
-        };
+        const canUse = this._referenceLaneAcceptor(mediaKind, startFrame);
         let entry = explicitEntry;
         if (entry && !canUse(entry)) {
             notifyWarning("That Reference lane is locked, occupied at this frame, or uses a different media kind.", { source: "reference-stage-refused" });
             return;
         }
-        if (!entry) entry = referenceEntries.find(canUse) || null;
+        // The ruler is the only auto-lane-creation zone, matching the asset drop
+        // rule. Falling through to `find(canUse)` here would silently stage into
+        // an existing compatible lane, which is what the ruler explicitly is not.
+        if (!entry && !forceNewLane) entry = referenceEntries.find(canUse) || null;
 
         const operations = [];
         let laneIndex;
@@ -7961,7 +8066,7 @@ export class EditorWidget {
         } else {
             laneIndex = entry.laneIndex || 0;
         }
-        const existingRecipe = recipeFor(laneIndex);
+        const existingRecipe = this._referenceLaneRecipe(laneIndex);
         if (existingRecipe.media_kind !== mediaKind || !entry) {
             operations.push({
                 type: "update_lane_config",
@@ -8003,6 +8108,9 @@ export class EditorWidget {
             this._discardLastUndo("add reference item");
             notifyWarning(error?.message || "Reference placement was refused.", { source: "reference-stage-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "reference_stage_error" });
+            // Staging changes what the Prompt tool resolves, so a refusal has
+            // to reach its Reference Prompting rows too.
+            this._refreshPromptContextDependencyConsumers();
         }
     }
 
@@ -9627,10 +9735,10 @@ export class EditorWidget {
                 channelKey: key,
                 profileId: this.activeScene?.prompt_context_profile_id
                     || template.default_context_profile || "generic@1",
-                templateId: template.id || "",
                 scope: consumerSection ? "section" : "global",
                 anchoredChannels: [key],
-                taskTypes: this._promptContextCatalog?.minimax_task_types || [],
+                profile: this._resolvedPromptContextProfile(),
+                placementPhases: this._promptContextCatalog?.placement_phases || [],
                 managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
                 ordinalManifest: this._promptContextCandidateCache?._candidate_scene_id
                     === this.activeSceneId
@@ -9752,11 +9860,11 @@ export class EditorWidget {
                             channelKey: key,
                             profileId: this.activeScene?.prompt_context_profile_id
                                 || template.default_context_profile || "generic@1",
-                            templateId: template.id || "",
                             scope: consumerSection ? "section" : "global",
                             anchoredChannels: anchoredChannelsFor(
                                 attachment.attachment_id),
-                            taskTypes: this._promptContextCatalog?.minimax_task_types || [],
+                            profile: this._resolvedPromptContextProfile("", candidate),
+                            placementPhases: this._promptContextCatalog?.placement_phases || [],
                             managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
                             ordinalManifest: candidate?.ordinal_manifest || {},
                             candidate,
@@ -9841,10 +9949,10 @@ export class EditorWidget {
             channelKey: wideKey,
             profileId: this.activeScene?.prompt_context_profile_id
                 || template.default_context_profile || "generic@1",
-            templateId: template.id || "",
             scope: consumerSection ? "section" : "global",
             anchoredChannels: [],
-            taskTypes: this._promptContextCatalog?.minimax_task_types || [],
+            profile: this._resolvedPromptContextProfile(),
+            placementPhases: this._promptContextCatalog?.placement_phases || [],
             managedSpeakerSubjectIds: managedSpeakerSubjectIds(),
             ordinalManifest: this._promptContextCandidateCache?._candidate_scene_id
                 === this.activeSceneId
@@ -9865,8 +9973,8 @@ export class EditorWidget {
                 allowedKinds: globalScope
                     ? ["reference", "custom"]
                     : (template.shot_marker_channel
-                        ? ["shot", "timestamp", "reference", "custom"]
-                        : ["reference", "custom"]),
+                        ? ["shot", "timestamp", "prompt_link_scope", "reference", "custom"]
+                        : ["prompt_link_scope", "reference", "custom"]),
                 reusableAttachments: globalScope ? [] : allSceneAttachments(),
                 allSceneAttachments: allSceneAttachments(),
                 reuseContext: { scene: draftSceneSnapshot(), template },
@@ -10319,7 +10427,14 @@ export class EditorWidget {
             Object.assign(sceneRef, previous);
             notifyWarning(error?.message || "Global Context edit was refused.",
                 { source: "prompt-global-context-refused" });
-            this._renderTimeline();
+            // Reconcile every mounted consumer, not just the timeline. The
+            // Prompt panel owns its own channel editors, so `_renderTimeline`
+            // alone left it displaying text the server had just rejected.
+            // Route through the GATED seam rather than the panel handle
+            // directly: this write coalesces, so a refusal can land after the
+            // user has started typing in another box, and the gate defers
+            // instead of discarding that edit.
+            this._refreshPromptContextDependencyConsumers();
         }
     }
 
@@ -11475,6 +11590,9 @@ export class EditorWidget {
             this._discardLastUndo(undoLabel);
             notifyWarning(e?.message || "Prompt edit was refused.", { source: "prompt-edit-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "edit_prompt_error" });
+            // `_fetchScenes` restores the scene but reaches the Prompt panel
+            // through no seam, so an open panel keeps showing the refused edit.
+            this._refreshPromptContextDependencyConsumers();
             console.warn("[Sonder] Failed to update prompt section:", e);
         }
     }
@@ -16497,7 +16615,9 @@ export class EditorWidget {
     // ── Undo / Redo ──────────────────────────────────────────────────────
 
     /** Capture a snapshot of the active scene BEFORE a mutation. */
-    _pushUndo(label = "edit") {
+    _pushUndo(label = "edit", {
+        referenceOperations = [], inverseReferenceOperations = [],
+    } = {}) {
         if (!this.activeScene || !this.activeSceneId) return;
         // Deep-clone the scene dict as snapshot
         const snapshot = JSON.parse(JSON.stringify(this.activeScene));
@@ -16505,6 +16625,8 @@ export class EditorWidget {
             sceneId: this.activeSceneId,
             snapshot,
             label,
+            referenceOperations: structuredClone(referenceOperations || []),
+            inverseReferenceOperations: structuredClone(inverseReferenceOperations || []),
         });
         // Trim to max size
         if (this._undoStack.length > this._maxUndoSteps) {
@@ -16582,16 +16704,31 @@ export class EditorWidget {
             return;
         }
 
-        // Save current state to redo stack before restoring
-        if (this.activeScene && this.activeSceneId === entry.sceneId) {
-            this._redoStack.push({
-                sceneId: this.activeSceneId,
-                snapshot: JSON.parse(JSON.stringify(this.activeScene)),
-                label: entry.label,
-            });
+        const opposite = (this.activeScene && this.activeSceneId === entry.sceneId) ? {
+            sceneId: this.activeSceneId,
+            snapshot: JSON.parse(JSON.stringify(this.activeScene)),
+            label: entry.label,
+            referenceOperations: structuredClone(entry.inverseReferenceOperations || []),
+            inverseReferenceOperations: structuredClone(entry.referenceOperations || []),
+        } : null;
+        let referencesApplied = false;
+        try {
+            if (entry.referenceOperations?.length) {
+                await this._mutateReferences(entry.referenceOperations,
+                    `undo ${entry.label || "prompt attachment"}`);
+                referencesApplied = true;
+            }
+            await this._restoreScene(entry.sceneId, entry.snapshot);
+            if (opposite) this._redoStack.push(opposite);
+        } catch (error) {
+            if (referencesApplied && entry.inverseReferenceOperations?.length) {
+                await this._mutateReferences(entry.inverseReferenceOperations,
+                    `restore failed undo ${entry.label || "prompt attachment"}`);
+            }
+            this._undoStack.push(entry);
+            notifyWarning(error?.message || "Undo was refused.", { source: "undo-refused" });
+            return;
         }
-
-        await this._restoreScene(entry.sceneId, entry.snapshot);
         this._keyboardDebug("undo complete", {
             activeSceneId: this.activeSceneId || "",
             undoDepth: this._undoStack.length,
@@ -16630,16 +16767,31 @@ export class EditorWidget {
             return;
         }
 
-        // Save current state to undo stack before restoring
-        if (this.activeScene && this.activeSceneId === entry.sceneId) {
-            this._undoStack.push({
-                sceneId: this.activeSceneId,
-                snapshot: JSON.parse(JSON.stringify(this.activeScene)),
-                label: entry.label,
-            });
+        const opposite = (this.activeScene && this.activeSceneId === entry.sceneId) ? {
+            sceneId: this.activeSceneId,
+            snapshot: JSON.parse(JSON.stringify(this.activeScene)),
+            label: entry.label,
+            referenceOperations: structuredClone(entry.inverseReferenceOperations || []),
+            inverseReferenceOperations: structuredClone(entry.referenceOperations || []),
+        } : null;
+        let referencesApplied = false;
+        try {
+            if (entry.referenceOperations?.length) {
+                await this._mutateReferences(entry.referenceOperations,
+                    `redo ${entry.label || "prompt attachment"}`);
+                referencesApplied = true;
+            }
+            await this._restoreScene(entry.sceneId, entry.snapshot);
+            if (opposite) this._undoStack.push(opposite);
+        } catch (error) {
+            if (referencesApplied && entry.inverseReferenceOperations?.length) {
+                await this._mutateReferences(entry.inverseReferenceOperations,
+                    `restore failed redo ${entry.label || "prompt attachment"}`);
+            }
+            this._redoStack.push(entry);
+            notifyWarning(error?.message || "Redo was refused.", { source: "redo-refused" });
+            return;
         }
-
-        await this._restoreScene(entry.sceneId, entry.snapshot);
         this._keyboardDebug("redo complete", {
             activeSceneId: this.activeSceneId || "",
             undoDepth: this._undoStack.length,

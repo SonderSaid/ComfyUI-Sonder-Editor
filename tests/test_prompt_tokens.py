@@ -40,7 +40,7 @@ def _reference_context(subject_ordinal=1, picture_ordinal=1):
         "semantic_units": [{
             "semantic_unit_id": "unit:woman", "name": "Woman",
             "definition": "the person beside @picture(portrait)",
-            "source_members": [{"entity_id": "woman", "member_id": "portrait"}],
+            "sources": [{"entity_id": "woman", "member_id": "portrait"}],
         }],
     }
 
@@ -70,14 +70,74 @@ def test_python_and_javascript_token_vocabularies_match():
         f"const mod = await import({json.dumps(module_url)});\n"
         "console.log(JSON.stringify(Object.fromEntries(Object.entries("
         "mod.PROMPT_TOKEN_KINDS).map(([key,value]) => [key, "
-        "[value.manifestKey,value.label]]))));\n"
+        "{manifest_key:value.manifestKey,label_template:value.labelTemplate,"
+        "physical:value.physical}]))));\n"
     )
     js_vocabulary = json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script], capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
-    py_vocabulary = {key: list(value)
-                     for key, value in prompt_tokens.PROMPT_TOKEN_KINDS.items()}
+    py_vocabulary = prompt_tokens._declarations()
     assert js_vocabulary == py_vocabulary
+
+
+def test_format_declared_token_kind_has_python_javascript_parity():
+    declarations = {
+        "persona": {"manifest_key": "people", "label_template": "[Person {n}]",
+                    "physical": False},
+        "plate": {"manifest_key": "plates", "label_template": "[Plate {n}]",
+                  "physical": True},
+    }
+    py_result = prompt_tokens.resolve(
+        "@persona(hero) with @plate(bg)",
+        {"people": {"hero": 2}, "plates": {"bg": 4}},
+        declarations=declarations,
+    )
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for prompt token grammar parity")
+    module_url = (ROOT / "web" / "js" / "prompt_tokens.js").as_uri()
+    js_declarations = {
+        key: {"manifestKey": value["manifest_key"],
+              "labelTemplate": value["label_template"],
+              "physical": value["physical"]}
+        for key, value in declarations.items()
+    }
+    script = (
+        f"const mod = await import({json.dumps(module_url)});\n"
+        f"const declarations = {json.dumps(js_declarations)};\n"
+        "const value = mod.resolvePromptTokens('@persona(hero) with @plate(bg)', "
+        "{people:{hero:2},plates:{bg:4}}, {}, declarations);\n"
+        "console.log(JSON.stringify([value.resolvedText,value.unresolvedIds]));\n"
+    )
+    js_result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert js_result == [py_result[0], py_result[1]]
+
+
+def test_javascript_builds_token_declarations_from_resolved_profile():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for prompt token grammar parity")
+    module_url = (ROOT / "web" / "js" / "prompt_tokens.js").as_uri()
+    profile = prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]
+    script = (
+        f"const mod = await import({json.dumps(module_url)});\n"
+        f"const profile = {json.dumps(profile)};\n"
+        "console.log(JSON.stringify(mod.promptTokenDeclarationsFromProfile(profile)));\n"
+    )
+    declarations = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    expected = {
+        key: {
+            "manifestKey": value["manifest_key"],
+            "labelTemplate": value["label_template"],
+            "physical": value["physical"],
+        }
+        for key, value in prompt_context.prompt_token_declarations(profile).items()
+    }
+    assert declarations == expected
 
 
 def test_token_resolves_in_summary_definition_and_custom_text_paths():
@@ -100,8 +160,9 @@ def test_token_resolves_in_summary_definition_and_custom_text_paths():
     })
     custom_result = prompt_context.compile_prompt_context(
         global_channels={}, sections=[_section(custom, "")], window_start=0,
-        window_end=24, fps=24, template="standard", context=context)
-    assert custom_result["prompt"] == "Track <Video 2> and <Audio 3>"
+        window_end=24, fps=24, template="minimax_h3_ref", context=context)
+    assert custom_result["prompt"] == (
+        "subject_definitions:\nTrack <Video 2> and <Audio 3>")
 
 
 def test_reordering_setup_renumbers_without_changing_authored_prose():
@@ -117,7 +178,8 @@ def test_reordering_setup_renumbers_without_changing_authored_prose():
         context=_reference_context(subject_ordinal=2))
     assert "<Subject 1>" in first["prompt"]
     assert "<Subject 2>" in second["prompt"]
-    assert attachment["config"]["summary"] == "Follow @subject(unit:woman)"
+    assert attachment["config"]["overrides"]["summary"] == (
+        "Follow @subject(unit:woman)")
 
 
 def test_deleted_token_source_blocks_and_literal_provider_label_is_untouched():
@@ -141,8 +203,9 @@ def test_attachment_limit_is_measured_after_token_resolution():
     })
     compiled = prompt_context.compile_prompt_context(
         global_channels={}, sections=[_section(attachment, "")], window_start=0,
-        window_end=24, fps=24, template="standard",
-        context={"ordinal_manifest": {"subjects": {"x": 123456}}})
+        window_end=24, fps=24, template="minimax_h3_ref",
+        context={"setup_manifest": {"setup": {"mode": "reference"}},
+                 "ordinal_manifest": {"subjects": {"x": 123456}}})
     assert any(value["code"] == "attachment_output_limit"
                for value in compiled["errors"])
 

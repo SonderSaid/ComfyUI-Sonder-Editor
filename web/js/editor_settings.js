@@ -396,6 +396,9 @@ export const DEFAULT_EDITOR_SETTINGS = {
         queueSectionBatch: false,
         hoverPreviewEnabled: true,
         panelMode: "structured",
+        // Browser-local presentation choice inside Writing mode. The authored
+        // PromptDocument remains the sole draft authority in either view.
+        writingView: "source",
         panelChannelBoxHeight: 0,
         panelGlobalBoxHeight: 0,
         panelDraftBoxHeight: 0,
@@ -735,6 +738,15 @@ function normalizeWritingDrafts(raw) {
         entries.push([key, {
             ts: Number(value.ts) || 0,
             draft: String(value.draft ?? "").slice(0, WRITING_DRAFT_TEXT_CAP),
+            // Writing is a reversible projection over PromptDocument nodes.
+            // Keeping only the plain-text mirror drops attachment anchors and
+            // makes a browser reload destructive, so retain the bounded local
+            // projection state exactly as authored.
+            document: value.document && typeof value.document === "object"
+                && !Array.isArray(value.document) ? structuredClone(value.document) : null,
+            attachments: cloneRecordArray(value.attachments),
+            blockMeta: cloneRecordArray(value.blockMeta),
+            baseModifiedAt: String(value.baseModifiedAt || ""),
             allocations: Array.isArray(value.allocations)
                 ? value.allocations.map((a) => ({
                     length: Math.max(0, parseInt(a?.length, 10) || 0),
@@ -758,6 +770,7 @@ function normalizePromptsSettings(stored, defaults) {
         queueSectionBatch: raw.queueSectionBatch == null ? defaults.queueSectionBatch : !!raw.queueSectionBatch,
         hoverPreviewEnabled: raw.hoverPreviewEnabled == null ? defaults.hoverPreviewEnabled : !!raw.hoverPreviewEnabled,
         panelMode: raw.panelMode === "writing" ? "writing" : "structured",
+        writingView: raw.writingView === "compiled" ? "compiled" : "source",
         panelChannelBoxHeight: clampHeight(raw.panelChannelBoxHeight),
         panelGlobalBoxHeight: clampHeight(raw.panelGlobalBoxHeight),
         panelDraftBoxHeight: clampHeight(raw.panelDraftBoxHeight),

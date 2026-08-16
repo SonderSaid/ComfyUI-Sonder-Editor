@@ -84,6 +84,46 @@ def test_switching_templates_releases_a_now_incompatible_scene_format():
     assert [value["code"] for value in compiled["errors"]] == []
 
 
+def test_switching_templates_keeps_a_scene_on_a_format_that_needs_migrating():
+    """A broken DECLARATION is not a template incompatibility.
+
+    `resolve_profile` raises for both, so releasing on the exception type would
+    silently detach every scene from a legacy-`routes` format on an unrelated
+    template switch — and the explicit "Migrate this format" action would then
+    find nothing left to repoint.
+    """
+    legacy = prompt_context.normalize_profile({
+        "profile_id": "legacy", "version": "1", "name": "Legacy",
+        "template_id": "standard", "writing_aids": [],
+        "capabilities": {"reference": {"routes": {"summary": "visual"}}},
+    })
+    scene = _scene_with_text("legacy@1")
+    project = TimelineProject(project_id="project", scenes=[scene], fps=24.0,
+                              prompt_context_profiles=[legacy])
+    # The format really is unresolvable, so this is not a vacuous fixture.
+    with pytest.raises(prompt_context.ProfileResolutionError,
+                       match="invalid_profile_declaration"):
+        prompt_context.resolve_profile(
+            "legacy@1", template=prompt_channel_templates.get_channel_template("sonder"),
+            custom_profiles=[legacy])
+
+    released = routes._release_incompatible_scene_profiles(
+        project, prompt_channel_templates.get_channel_template("sonder"))
+    assert released == 0
+    assert scene.prompt_context_profile_id == "legacy@1"
+    # So the migration still has something to move.
+    assert routes._prompt_context_profile_usages(project, "legacy@1")
+
+
+def test_switching_templates_releases_a_scene_pointing_at_a_deleted_format():
+    scene = _scene_with_text("deleted@1")
+    project = TimelineProject(project_id="project", scenes=[scene], fps=24.0)
+    released = routes._release_incompatible_scene_profiles(
+        project, prompt_channel_templates.get_channel_template("standard"))
+    assert released == 1
+    assert scene.prompt_context_profile_id == ""
+
+
 def test_switching_templates_keeps_a_format_the_new_template_accepts():
     scene = _scene_with_text("minimax_h3_ref@1")
     project = TimelineProject(project_id="project", scenes=[scene], fps=24.0)

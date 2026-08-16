@@ -241,9 +241,133 @@ def test_panel_uses_catalog_controls_and_progressive_disclosure():
     assert 'block.addEventListener("toggle"' in panel
     assert 'select.dataset.sonderInvalid = "1"' in panel
     assert "Unsupported saved value:" in panel
-    assert "role_catalogs?.[population]" in panel
+    assert panel.count("referenceRoleChoices(activeProfile, population)") == 2
     assert "writeMemberAudioIntent" in panel
     assert "role_aliases" not in panel
+
+
+def test_mounted_panel_populates_roles_and_neutralizes_catalog_failure():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for mounted Reference panel coverage")
+    module_url = (ROOT / "web" / "js" / "editor_reference_panel.js").as_uri()
+    schema = [{
+        "key": key, "section": "soft", "group": "Prompt Context",
+        "label": key, "type": "string_list", "default": [],
+        "applies_to": [], "requires": "", "requires_value": "", "help": key,
+    } for key in ("compatible_profiles", "exposed_capabilities")]
+    ready_catalog = {"schema_version": 1, "profiles": [{
+        "key": "format@1", "resolved": {
+            "profile_id": "format", "version": "1",
+            "role_catalogs": {"pictures": [{
+                "value": "identity", "label": "Character identity"}]},
+            "capabilities": {"reference": {"derived": {
+                "definitions": {
+                    "order": 1, "label": "Definitions", "fields": {},
+                    "channel_key": "visual", "placement": "section_prefix",
+                },
+                "retention": {
+                    "order": 2, "label": "Retention", "channel_key": "visual",
+                    "placement": "section_prefix", "fields": {
+                        "visual_intent": {"values": [{
+                            "value": "preserve", "label": "Fully preserve"}]},
+                    },
+                },
+            }}},
+        },
+    }]}
+    script = """
+class N {{
+  constructor(tag) {{ this.tagName=String(tag).toUpperCase(); this.children=[];
+    this.options=[]; this.style={{cssText:""}}; this.dataset={{}}; this.attributes={{}};
+    this.value=""; this.textContent=""; this.title=""; this.disabled=false;
+    this.checked=false; this.open=false; this._handlers={{}}; }}
+  appendChild(c) {{ if(!c?.tagName) return c; this.children.push(c); c.parentElement=this;
+    if(c.tagName==="OPTION") this.options.push(c); return c; }}
+  append(...cs) {{ cs.forEach((c)=>this.appendChild(c)); }}
+  addEventListener(t,h) {{ (this._handlers[t] ||= []).push(h); }}
+  removeEventListener() {{}}
+  setAttribute(k,v) {{ this.attributes[k]=String(v); }}
+  getAttribute(k) {{ return this.attributes[k] ?? null; }}
+  querySelectorAll(sel) {{ const tags=String(sel).split(",").map((v)=>v.trim().toUpperCase());
+    const out=[]; const walk=(n)=>n.children.forEach((c)=>{{
+      if(tags.includes(c.tagName)) out.push(c); walk(c); }}); walk(this); return out; }}
+  querySelector(sel) {{ return this.querySelectorAll(sel)[0] || null; }}
+  focus() {{}}
+  remove() {{ if(this.parentElement) this.parentElement.children=
+    this.parentElement.children.filter((c)=>c!==this); }}
+}}
+globalThis.document={{createElement:(t)=>new N(t),body:new N("body"),activeElement:null}};
+globalThis.window={{addEventListener(){{}},removeEventListener(){{}},localStorage:null}};
+globalThis.localStorage={{getItem(){{return null;}},setItem(){{}}}};
+const mod=await import(__MODULE_URL__);
+const schema=__SCHEMA__;
+const recipe={{id:"custom:one",name:"One",builtIn:false,media_kind:"image",
+  hard:{{assembly:"batch"}},soft:{{
+    compatible_profiles:["format@1"],exposed_capabilities:["definitions"],
+    physical_population:"pictures",role_fields:["role","visual_intent"],
+  }}}};
+const member={{member_id:"member",role:"identity",visual_intent:"preserve"}};
+const baseHost=()=>({{
+  projectId:"project",activeSceneId:"scene",totalFrames:20,playhead:0,
+  _trackLayout:[{{type:"reference",laneIndex:0,customName:"Reference 1"}}],
+  activeScene:{{prompt_context_profile_id:"format@1",reference_lane_count:1,
+    duration_frames:20,reference_lane_configs:[{{}}],
+    reference_lane_recipes:[{{lane_id:"lane",recipe_id:"custom:one",
+      media_kind:"image",recipe}}],reference_items:[{{reference_item_id:"item",
+      lane_index:0,start_frame:0,end_frame:20,members:[member]}}]}},
+  _referenceRecipePresets:[],_customReferenceRecipes:[recipe],
+  _referenceRecipeFieldSchema:schema,_promptContextProfiles:[],
+  _defaultReferenceLaneRecipe:()=>({{lane_id:"lane",recipe}}),
+  _referenceMemberForRef:()=>({{reference:{{name:"Person"}},member:{{
+    member_id:"member",name:"Portrait",prompt:"Person",asset_id:"asset"}}}}),
+  _findAssetById:()=>null,_referenceAssetPreviewUrl:()=>null,
+  _referenceLaneAdvisories:()=>[],_isLaneLocked:()=>false,
+  _channelTemplate:()=>({{default_context_profile:"format@1"}}),
+}});
+const walk=(n,out=[])=>{{out.push(n);n.children.forEach((c)=>walk(c,out));return out;}};
+const ready=baseHost();
+ready._promptContextCatalog=__READY_CATALOG__;
+const readyHandle=mod.mountReferenceLanePanel(ready,{{laneIndex:0}});
+const readyNodes=walk(document.body.children.at(-1));
+const readyRole=readyNodes.find((n)=>n.tagName==="SELECT" &&
+  n.options.some((o)=>o.textContent==="Character identity"));
+readyHandle.close();
+
+const failed=baseHost(); failed._promptContextCatalog={{}};
+failed._referencesError="offline"; failed._referencesLoading=false;
+const failedHandle=mod.mountReferenceLanePanel(failed,{{laneIndex:0}});
+const failedNodes=walk(document.body.children.at(-1));
+const notice=failedNodes.find((n)=>n.dataset.sonderPromptCatalogState);
+const failedRole=failedNodes.find((n)=>n.tagName==="SELECT" &&
+  n.options.some((o)=>o.textContent.includes("Saved: identity")));
+const labels=failedNodes.filter((n)=>n.tagName==="SPAN").map((n)=>n.textContent);
+console.log(JSON.stringify({{
+  readyRole:readyRole?.value||"",readyDisabled:readyRole?.disabled,
+  failedState:notice?.dataset.sonderPromptCatalogState||"",
+  failedRole:failedRole?.value||"",failedDisabled:failedRole?.disabled,
+  hasUnsupported:labels.some((value)=>value.startsWith("Unsupported:")),
+  unsupportedHeading:failedNodes.some((n)=>n.tagName==="SUMMARY"
+    && n.textContent.includes("unsupported")),
+  savedProfiles:labels.includes("Saved: format@1"),
+  savedCapabilities:labels.includes("Saved: definitions"),
+}}));
+failedHandle.close();
+"""
+    script = (script.replace("{{", "{").replace("}}", "}")
+              .replace("__MODULE_URL__", json.dumps(module_url))
+              .replace("__SCHEMA__", json.dumps(schema))
+              .replace("__READY_CATALOG__", json.dumps(ready_catalog)))
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result == {
+        "readyRole": "identity", "readyDisabled": False,
+        "failedState": "error", "failedRole": "identity",
+        "failedDisabled": True, "hasUnsupported": False,
+        "unsupportedHeading": False,
+        "savedProfiles": True, "savedCapabilities": True,
+    }
 
 
 def test_reference_panel_keeps_details_collapsed_and_offers_inspectable_thumbnails():
@@ -366,12 +490,11 @@ console.log(JSON.stringify({{
     }]
 
 
-def test_h3_population_creation_serializes_snapshot_planning_and_refuses_stale_retry():
+def test_prompt_panel_keeps_h3_staging_outside_prompting_and_refuses_stale_retry():
     source = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(encoding="utf-8")
     assert "retryOnConflict: false" in source
-    assert "const populationButtons = []" in source
-    assert "populationButtons.forEach((button) => { button.disabled = true; });" in source
-    assert 'type: "ensure_minimax_h3_reference_population"' in source
+    assert "const populationButtons = []" not in source
+    assert 'type: "ensure_minimax_h3_reference_population"' not in source
     assert "planH3ReferencePopulation" not in source
 
 

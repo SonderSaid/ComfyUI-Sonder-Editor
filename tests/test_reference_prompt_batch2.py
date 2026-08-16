@@ -17,8 +17,26 @@ def _reference_context():
         "unit_source_labels": {"a": ["<Picture 1>"]},
         "semantic_units": [{
             "semantic_unit_id": "a", "name": "A", "definition": "a woman",
+            "sources": [{"entity_id": "reference", "member_id": "am"}],
         }],
     }
+
+
+_REFERENCE_IDENTITY_PROFILE = {
+    "profile_id": "test_identity", "version": "1", "name": "Test identity",
+    "template_id": "standard", "capabilities": {"reference": {"derived": {
+        "definitions": {"order": 1, "channel_key": "visual",
+                        "placement": "section_prefix", "label": "Definition",
+                        "fields": {}},
+        "retention": {"order": 2, "channel_key": "visual",
+                      "placement": "section_prefix", "label": "Retention",
+                      "fields": {}},
+        "mentions": {"order": 3, "channel_key": "visual",
+                     "placement": "inline", "label": "Mention",
+                     "fields": {}},
+    }}}, "writing_aids": [],
+    "identity_kinds": [prompt_context.MINIMAX_SUBJECT_KIND],
+}
 
 
 def _linked_reference(attachment_id, capabilities, *, group="linked", config=None):
@@ -179,6 +197,7 @@ def test_linked_reference_definition_dedupes_but_mentions_emit_per_placement():
                                       _section(10, 20, "two", [second])],
         window_start=0, window_end=20, fps=24,
         template=prompt_channel_templates.DEFAULT_CHANNEL_TEMPLATE_ID,
+        profile=_REFERENCE_IDENTITY_PROFILE,
         context=_reference_context())
 
     emissions = compiled["emissions"]
@@ -224,6 +243,7 @@ def test_linked_reference_routes_different_channels_and_accumulates_shots():
                   _section(10, 20, "two", [speech_definition])],
         window_start=0, window_end=20, fps=24,
         template=prompt_channel_templates.DEFAULT_CHANNEL_TEMPLATE_ID,
+        profile=_REFERENCE_IDENTITY_PROFILE,
         context=_reference_context())
     assert {value["channel_key"] for value in routed["emissions"]} == {
         "visual", "speech"}
@@ -243,6 +263,7 @@ def test_linked_reference_routes_different_channels_and_accumulates_shots():
         sections=[_section(0, 10, "one", [shot_a, visual]),
                   _section(10, 20, "two", [shot_b, second_visual])],
         window_start=0, window_end=20, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE,
         context=_reference_context())
 
     assert "appears in [Shot 1], [Shot 2]" in compiled["prompt"]
@@ -261,6 +282,7 @@ def test_unlinked_divergent_definitions_conflict_and_deleting_one_leaves_other()
         global_channels={}, sections=[_section(0, 10, "one", [red]),
                                       _section(10, 20, "two", [blue])],
         window_start=0, window_end=20, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE,
         context=_reference_context())
     assert any(value["code"] == "conflicting_emission"
                for value in conflicted["errors"])
@@ -269,6 +291,7 @@ def test_unlinked_divergent_definitions_conflict_and_deleting_one_leaves_other()
         global_channels={}, sections=[_section(0, 10, "one", [red]),
                                       _section(10, 20, "two", [])],
         window_start=0, window_end=20, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE,
         context=_reference_context())
     assert not any(value["code"] == "conflicting_emission"
                    for value in remaining["errors"])
@@ -312,15 +335,16 @@ def test_linked_batch_stale_snapshot_refuses_before_any_member_changes(monkeypat
     assert scene.prompt_sections[1].attachments[0]["config"]["text"] == "before"
 
 
-def test_generated_subject_payload_names_its_owning_reference():
+def test_reference_payload_keeps_explicit_identity_without_generated_projection():
     from server.timeline_state import ReferenceEntity
 
     project = TimelineProject(project_id="project")
     project.references = [ReferenceEntity(reference_id="ref", name="Granny")]
     project.prompt_semantic_units = [{
         "semantic_unit_id": "unit:ref", "name": "Granny",
-        "source_members": [],
+        "sources": [{"entity_id": "ref", "member_id": "portrait"}],
     }]
     unit = routes._references_payload(project)["prompt_semantic_units"][0]
-    assert unit["generated"] is True
-    assert unit["generated_reference_name"] == "Granny"
+    assert unit["sources"] == [{"entity_id": "ref", "member_id": "portrait"}]
+    assert "generated" not in unit
+    assert "generated_reference_name" not in unit

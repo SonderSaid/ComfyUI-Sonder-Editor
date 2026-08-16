@@ -498,15 +498,151 @@ def test_reference_bulk_delete_local_path_does_not_leak_state_between_methods():
 
 
 def test_wrong_media_drop_cannot_repurpose_a_configured_reference_lane():
-    """media_kind is a hard lane property: only a never-configured lane adopts it."""
+    """media_kind is a hard lane property: only a never-configured lane adopts it.
+
+    The rule lives in `_referenceLaneAcceptor`, which hover and drop now share
+    so the drag cannot promise a landing the drop refuses.
+    """
     source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    can_use = source.split("const canUse = (entry) => {", 1)[1].split("};", 1)[0]
+    can_use = source.split("_referenceLaneAcceptor(mediaKind, startFrame) {", 1)[1]
+    can_use = can_use.split("\n    }", 1)[0]
     assert "if (recipe.media_kind === mediaKind) return true;" in can_use
     assert "return !occupied && this._isUnconfiguredReferenceLaneRecipe(recipe);" in can_use
+    # Both consumers go through it, so neither can drift from the other.
+    assert "const canUse = this._referenceLaneAcceptor(mediaKind, startFrame);" in source
+    assert "const canUse = this._referenceLaneAcceptor(mediaKind, frame);" in source
     unconfigured = source.split("_isUnconfiguredReferenceLaneRecipe(recipe) {", 1)[1].split("\n    }", 1)[0]
     assert 'value.media_kind || "image") === "image"' in unconfigured
     assert '!String(value.recipe_id || "")' in unconfigured
     assert '!Object.keys(value.recipe || {}).length' in unconfigured
+
+
+def test_mixed_kind_drag_is_refused_but_an_unresolved_member_is_not():
+    """Only a genuinely mixed entity is refused at `dragstart`.
+
+    `""` from the kind rule means two different things — "spans both lane kinds"
+    and "cannot be classified yet". Refusing on both would block a valid
+    single-kind entity holding one trashed member, with a message saying
+    something factually untrue about it.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for reference drag coverage")
+    module_url = (ROOT / "web" / "js" / "editor_reference_library.js").as_uri()
+    assets = [
+        {"asset_id": "img", "asset_type": "image"},
+        {"asset_id": "aud", "asset_type": "audio"},
+        {"asset_id": "vid", "asset_type": "video"},
+    ]
+    members = {
+        "image": {"member_id": "m1", "asset_id": "img"},
+        "audio": {"member_id": "m2", "asset_id": "aud"},
+        "video": {"member_id": "m3", "asset_id": "vid"},
+        "voice_video": {"member_id": "m4", "asset_id": "vid",
+                        "tags": ["sonder:voice_identity"]},
+        "missing": {"member_id": "m5", "asset_id": "gone"},
+    }
+    script = f"""
+const mod = await import({json.dumps(module_url)});
+const assets = {json.dumps(assets)};
+const m = {json.dumps(members)};
+const mixed = (members) => mod.referenceDragIsMixedKind(members, assets);
+console.log(JSON.stringify({{
+  singleImage: mixed([m.image]),
+  multiImage: mixed([m.image, m.video]),
+  singleAudio: mixed([m.audio]),
+  imageAndAudio: mixed([m.image, m.audio]),
+  imageAndVoiceVideo: mixed([m.image, m.voice_video]),
+  imageAndMissing: mixed([m.image, m.missing]),
+  onlyMissing: mixed([m.missing]),
+  empty: mixed([]),
+  kinds: {{
+    image: mod.referenceMemberMediaKind(m.image, assets[0]),
+    audio: mod.referenceMemberMediaKind(m.audio, assets[1]),
+    video: mod.referenceMemberMediaKind(m.video, assets[2]),
+    voiceVideo: mod.referenceMemberMediaKind(m.voice_video, assets[2]),
+    unresolved: mod.referenceMemberMediaKind(m.image, null),
+  }},
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+
+    # A plain video is image-kind; only a voice-tagged one is audio.
+    assert result["kinds"] == {"image": "image", "audio": "audio",
+                               "video": "image", "voiceVideo": "audio",
+                               "unresolved": ""}
+    # Genuinely mixed entities are the only refusals.
+    assert result["imageAndAudio"] is True
+    assert result["imageAndVoiceVideo"] is True
+    # Everything else stays draggable, including the unresolved-member case.
+    for key in ("singleImage", "multiImage", "singleAudio",
+                "imageAndMissing", "onlyMissing", "empty"):
+        assert result[key] is False, key
+
+
+def test_reference_drops_follow_the_zone_model_like_asset_drops():
+    """The ruler ALWAYS creates a lane; it used to be a silent no-op."""
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    place = source.split("async _placeReferencePayload(", 1)[1]
+    place = place.split("\n    async _handleAssetDrop(", 1)[0]
+    # Ruler sets the flag rather than returning.
+    assert "forceNewLane = true;" in place
+    assert "if (trackRawY < this._timelineRulerHeight()) return;" not in place, (
+        "the ruler is a silent no-op again")
+    # And the flag must short-circuit lane REUSE, or the ruler quietly stages
+    # into an existing compatible lane instead of creating one.
+    assert "if (!entry && !forceNewLane) entry = referenceEntries.find(canUse)" in place
+
+    # Anchor on the METHOD, not the dragover call site above it.
+    hover = source.split("\n    _resolveDropHoverTarget(", 1)[1]
+    hover = hover.split("\n    _referencePayloadMediaKind(", 1)[0]
+    assert 'return { kind: "ruler" };' in hover
+    assert "this._referenceLaneAcceptor(mediaKind, frame)" in hover
+    # The kind-blind highlight is what promised landings the drop refused.
+    assert "!this._isLaneLocked(entry.type, entry.laneIndex || 0)\n" not in hover
+
+
+def test_reference_drop_resolves_lane_recipes_through_one_authority():
+    """Regression: `recipeFor` survived only inside the extracted acceptor.
+
+    Extracting `canUse` into `_referenceLaneAcceptor` moved the local
+    `recipeFor` closure with it and left the call in `_placeReferencePayload`
+    unbound, so every Reference drop threw `ReferenceError: recipeFor is not
+    defined` before it could create a lane. The zone-model test above could not
+    see it: string-matching source proves a line exists, never that its
+    identifiers resolve.
+    """
+    source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    # One authority, reachable from both the acceptor and the placement path.
+    assert "_referenceLaneRecipe(laneIndex) {" in source
+    acceptor = source.split("_referenceLaneAcceptor(mediaKind, startFrame) {", 1)[1]
+    acceptor = acceptor.split("\n    }", 1)[0]
+    assert "this._referenceLaneRecipe(entry.laneIndex || 0)" in acceptor
+    place = source.split("async _placeReferencePayload(", 1)[1]
+    place = place.split("\n    async _handleAssetDrop(", 1)[0]
+    assert "const existingRecipe = this._referenceLaneRecipe(laneIndex);" in place
+    # The unbound call must not come back in either direction.
+    assert "recipeFor(" not in place, "unbound recipeFor is back in the drop path"
+    assert "recipeFor(" not in acceptor
+
+
+def test_reference_library_can_explain_a_refused_drag():
+    """A refusal the user cannot see is indistinguishable from a broken drag.
+
+    The library reaches the notification bus only through `host.notify`, and
+    `host.notify?.()` optional-chains into silence when the host omits it — so
+    the mixed-kind refusal explained nothing at all.
+    """
+    library = (ROOT / "web" / "js" / "editor_reference_library.js").read_text(encoding="utf-8")
+    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    assert 'host.notify?.("Stage image/video references separately' in library
+    # The host bag must actually carry the seam the library calls.
+    host_bag = widget.split("mountReferenceLibrary(this._referenceLibraryEl, {", 1)[1]
+    host_bag = host_bag.split("\n        });", 1)[0]
+    assert "notify: (message) => notifyWarning(String(message || \"\")," in host_bag
+    assert 'source: "reference-drag-refused"' in host_bag
 
 
 def test_reference_bridge_shape_tracks_project_writes_and_recipe_liveness():

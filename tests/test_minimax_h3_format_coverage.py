@@ -58,6 +58,7 @@ AUDIO_RECIPE = {"soft": {
     "role_fields": ["role", "audio_intent"]}}
 
 WINDOW_END = 100
+H3_PROFILE = prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]
 
 
 def _assets():
@@ -136,7 +137,7 @@ def scene_single_member_subject():
                                {"entity_id": "e", "member_id": "mp",
                                 "role": "identity", "visual_intent": "preserve"}])]
     units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
-              "source_members": [{"entity_id": "e", "member_id": "mp"}]}]
+              "sources": [{"entity_id": "e", "member_id": "mp"}]}]
     resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
                         entities=[entity], items=items, recipes=recipes,
                         units=units)
@@ -174,7 +175,7 @@ def scene_composite_subject():
     units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
               "definition": "the woman whose appearance comes from the still "
                             "and whose walking motion comes from the clip",
-              "source_members": [{"entity_id": "e", "member_id": "mp"},
+              "sources": [{"entity_id": "e", "member_id": "mp"},
                                  {"entity_id": "e", "member_id": "mv"}]}]
     resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"],
                                "video_lane_ids": ["lv"]},
@@ -214,7 +215,7 @@ def scene_multi_picture_subject():
                                 "role": "identity"} for n in (1, 2, 3)])]
     units = [{"semantic_unit_id": "u", "name": "Dog", "order": 0,
               "definition": "the fluffy white Samoyed",
-              "source_members": [{"entity_id": "e", "member_id": f"m{n}"}
+              "sources": [{"entity_id": "e", "member_id": f"m{n}"}
                                  for n in (1, 2, 3)]}]
     resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
                         entities=[entity], items=items, recipes=recipes,
@@ -239,13 +240,13 @@ def scene_one_asset_many_subjects():
                                 "role": "environment"}])]
     units = [
         {"semantic_unit_id": "room", "name": "Room", "order": 0,
-         "definition": "the room", "source_members": [
+         "definition": "the room", "sources": [
              {"entity_id": "e", "member_id": "mp"}]},
         {"semantic_unit_id": "sofa", "name": "Sofa", "order": 1,
-         "definition": "the sofa", "source_members": [
+         "definition": "the sofa", "sources": [
              {"entity_id": "e", "member_id": "mp"}]},
         {"semantic_unit_id": "art", "name": "Wall art", "order": 2,
-         "definition": "the wall art", "source_members": [
+         "definition": "the wall art", "sources": [
              {"entity_id": "e", "member_id": "mp"}]},
     ]
     resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
@@ -398,11 +399,11 @@ def scene_audio_and_speakers():
     ]
     units = [
         {"semantic_unit_id": "ua", "name": "A", "order": 0,
-         "definition": "the first speaker", "source_members": [
+         "definition": "the first speaker", "sources": [
              {"entity_id": "e", "member_id": "face_a"},
              {"entity_id": "e", "member_id": "voice_a"}]},
         {"semantic_unit_id": "ub", "name": "B", "order": 1,
-         "definition": "the second speaker", "source_members": [
+         "definition": "the second speaker", "sources": [
              {"entity_id": "e", "member_id": "face_b"}]},
     ]
     resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"],
@@ -556,7 +557,7 @@ def test_a2_split_role_staging_needs_an_explicit_chip_retention(compiled):
                            "visual_intent": "reference_loosely"}]),
     ]
     units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
-              "definition": "the woman", "source_members": [
+              "definition": "the woman", "sources": [
                   {"entity_id": "e", "member_id": "mp"},
                   {"entity_id": "e", "member_id": "mv"}]}]
     resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"],
@@ -623,7 +624,8 @@ def test_b3_edited_keyframe_has_no_role_value():
     # The task-type deriver still understands the value, so adding it to the
     # catalog is the only change a fix needs.
     assert prompt_context._minimax_task_types(
-        {"setup_manifest": {"pictures": [{"role": "edited_keyframe"}]}}) == [
+        {"setup_manifest": {"pictures": [{"role": "edited_keyframe"}]}},
+        profile=H3_PROFILE) == [
             "keyframe completion"]
 
 
@@ -790,14 +792,47 @@ ROLE_TASK_TYPES = [
 def test_task_type_is_derived_from_the_staged_role(item, population, role,
                                                    expected):
     assert prompt_context._minimax_task_types(
-        {"setup_manifest": {population: [{"role": role}]}}) == expected
+        {"setup_manifest": {population: [{"role": role}]}},
+        profile=H3_PROFILE) == expected
 
 
 def test_media_presence_alone_creates_no_task_type():
     """ref 3 — the mere presence of an asset never implies a task type."""
     assert prompt_context._minimax_task_types({"setup_manifest": {
         "pictures": [{"role": ""}], "videos": [{"role": ""}],
-        "standalone_audios": [{"role": ""}]}}) == []
+        "standalone_audios": [{"role": ""}]}}, profile=H3_PROFILE) == []
+
+
+def test_identity_task_type_default_overrides_role_derivation_in_compiled_summary():
+    entity = ReferenceEntity(reference_id="task-entity", name="Subject", members=[
+        ReferenceMember(member_id="task-picture", asset_id="img_a")])
+    recipe = ReferenceLaneRecipe(lane_id="task-lane", media_kind="image",
+                                 recipe=PICTURE_RECIPE)
+    item = ReferenceItem(reference_item_id="task-item", lane_index=0,
+                         start_frame=0, end_frame=WINDOW_END, members=[{
+                             "entity_id": "task-entity",
+                             "member_id": "task-picture",
+                             "role": "identity",
+                             "visual_intent": "preserve",
+                         }])
+    units = [{
+        "semantic_unit_id": "task-subject", "name": "Subject", "order": 0,
+        "sources": [{"entity_id": "task-entity", "member_id": "task-picture"}],
+        "attachment_defaults": {"task_types": ["audio reuse"]},
+    }]
+    resolved = _resolve(
+        setup={"mode": "reference", "picture_lane_ids": ["task-lane"]},
+        entities=[entity], items=[item], recipes=[recipe], units=units)
+    summary = _reference_chip(
+        "task-summary", {"semantic_unit_ids": ["task-subject"]},
+        {"summary": "The subject crosses the room."}, capabilities=("summary",))
+    compiled = _compile(resolved, units, [PromptSection(
+        0, WINDOW_END, channels={"detailed_description": "Move."},
+        attachments=[summary])])
+
+    value = compiled["channels"]["summary"]
+    assert value.startswith("[audio reuse] The subject crosses the room.")
+    assert "[reference generation]" not in value
 
 
 COMBINED_TASK_TYPES = [
@@ -811,7 +846,7 @@ COMBINED_TASK_TYPES = [
 @pytest.mark.parametrize("item,selection", COMBINED_TASK_TYPES,
                          ids=[row[0] for row in COMBINED_TASK_TYPES])
 def test_combined_task_types_emit_once_each_in_canonical_order(item, selection):
-    emitted = prompt_context._minimax_task_types({}, selection)
+    emitted = prompt_context._minimax_task_types({}, selection, H3_PROFILE)
     assert set(emitted) == set(selection)
     assert len(emitted) == len(set(emitted))
     canonical = list(prompt_context.MINIMAX_TASK_TYPES)

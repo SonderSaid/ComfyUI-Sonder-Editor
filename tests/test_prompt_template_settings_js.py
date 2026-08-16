@@ -226,7 +226,7 @@ def test_round_trip_keeps_context_documents_attachments_and_dependencies():
         }],
         "prompt_semantic_units": [{
             "semantic_unit_id": "unit-1", "name": "Granny",
-            "source_members": [{"entity_id": "ref-1", "member_id": "member-1"}],
+            "sources": [{"entity_id": "ref-1", "member_id": "member-1"}],
         }],
         "minimax_h3_conditioning_setups": [{
             "setup_id": "setup-1", "mode": "reference",
@@ -327,6 +327,28 @@ def test_new_project_defaults_are_standard_and_model_agnostic():
     settings = _normalize_settings({})
     assert settings["projectDefaults"]["defaultChannelTemplateId"] == "standard"
     assert settings["projectDefaults"]["defaultTemplateId"] == "free"
+
+
+def test_writing_projection_state_survives_settings_normalization():
+    draft = {
+        "ts": 42,
+        "draft": "summary: @subject(unit)\n---\nsummary: next",
+        "document": {"nodes": [
+            {"type": "text", "node_id": "text", "text": "summary: "},
+            {"type": "attachment", "node_id": "chip", "attachment_id": "ref"},
+        ]},
+        "attachments": [{"attachment_id": "ref", "kind": "reference"}],
+        "blockMeta": [{"block_id": "block", "source_prompt_id": "section"}],
+        "baseModifiedAt": "project-version",
+        "allocations": [{"length": 24, "dirty": True}],
+    }
+    settings = _normalize_settings({"prompts": {
+        "writingView": "compiled",
+        "writingDraftByProjectScene": {"project::scene": draft},
+    }})
+    assert settings["prompts"]["writingView"] == "compiled"
+    restored = settings["prompts"]["writingDraftByProjectScene"]["project::scene"]
+    assert restored == draft
 
 
 def test_channel_template_catalog_keeps_builtins_read_only_and_customs_owned():

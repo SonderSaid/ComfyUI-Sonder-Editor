@@ -181,7 +181,10 @@ def test_catalog_publishes_profile_template_compatibility():
         "minimax_h3_base"]
     assert descriptors["generic@1"]["compatible_templates"] == [
         prompt_context.UNIVERSAL_PROFILE_TEMPLATE]
-    assert catalog["minimax_task_types"] == list(prompt_context.MINIMAX_TASK_TYPES)
+    task_types = descriptors["minimax_h3_ref@1"]["resolved"]["capabilities"][
+        "reference"]["derived"]["summary"]["fields"]["task_types"]
+    assert [row["value"] for row in task_types["values"]] == list(
+        prompt_context.MINIMAX_TASK_TYPES)
 
 
 # 5 — disabled capabilities never contribute to validation.
@@ -212,7 +215,8 @@ def test_disabled_reference_capability_neither_renders_nor_blocks():
 
 def test_audio_relationship_reads_the_key_the_chip_editor_writes():
     context = {"ordinal_manifest": {"subjects": {"unit": 1}},
-               "semantic_units_by_id": {}}
+               "semantic_units_by_id": {},
+               "profile": prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]}
     authored = prompt_context.normalize_attachment({
         "kind": "reference", "source": {"semantic_unit_ids": ["unit"]},
         "config": {"audio_relationship": "Voice belongs to <Subject 1>."}})
@@ -234,13 +238,26 @@ def _reference_context():
         "ordinal_manifest": {"subjects": {"a": 1, "b": 2}},
         "unit_source_labels": {"a": ["<Picture 1>"], "b": ["<Picture 2>"]},
         "semantic_units": [
-            {"semantic_unit_id": "a", "name": "A", "definition": "a woman"},
-            {"semantic_unit_id": "b", "name": "B", "definition": "a man"},
+            {"semantic_unit_id": "a", "name": "A", "definition": "a woman",
+             "sources": [{"entity_id": "reference", "member_id": "am"}]},
+            {"semantic_unit_id": "b", "name": "B", "definition": "a man",
+             "sources": [{"entity_id": "reference", "member_id": "bm"}]},
         ],
         "setup_manifest": {"setup": {"mode": "reference"},
                            "pictures": [{"member_id": "am", "picture_ordinal": 1},
                                         {"member_id": "bm", "picture_ordinal": 2}]},
     }
+
+
+_REFERENCE_IDENTITY_PROFILE = {
+    "profile_id": "test_identity", "version": "1", "name": "Test identity",
+    "template_id": "standard", "capabilities": {"reference": {"derived": {
+        "definitions": {"order": 1, "channel_key": "visual",
+                        "placement": "section_prefix", "label": "Definition",
+                        "fields": {}},
+    }}}, "writing_aids": [],
+    "identity_kinds": [prompt_context.MINIMAX_SUBJECT_KIND],
+}
 
 
 def test_overlapping_subject_definitions_emit_once_per_unit():
@@ -258,6 +275,7 @@ def test_overlapping_subject_definitions_emit_once_per_unit():
         global_channels={},
         sections=[_section(0, 10, "scene", attachments=[wide, narrow])],
         window_start=0, window_end=10, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE,
         context=_reference_context())
     assert compiled["prompt"].count("<Subject 1> is a woman") == 1
     assert compiled["prompt"].count("<Subject 2> is a man") == 1
@@ -280,6 +298,7 @@ def test_contradictory_overlapping_definitions_are_reported():
         global_channels={},
         sections=[_section(0, 10, "scene", attachments=[wide, narrow])],
         window_start=0, window_end=10, fps=24, template="standard",
+        profile=_REFERENCE_IDENTITY_PROFILE,
         context=_reference_context())
     assert any(value["code"] == "conflicting_emission"
                for value in compiled["errors"])
@@ -565,7 +584,8 @@ class N {
   constructor(tag){ this.tagName=String(tag).toUpperCase(); this.children=[];
     this.childNodes=this.children; this.style={cssText:"",setProperty(){}};
     this.dataset={}; this.attributes={}; this.options=[]; this.value="";
-    this.textContent=""; this.title=""; this.disabled=false; this._handlers={}; }
+    this.textContent=""; this.title=""; this.disabled=false; this.multiple=false;
+    this._handlers={}; }
   appendChild(c){ this.children.push(c); c.parentElement=this;
     if (c.tagName === "OPTION") this.options.push(c); return c; }
   append(...cs){ for (const c of cs) if (c && c.tagName) this.appendChild(c); }
@@ -583,7 +603,8 @@ class N {
   contains(n){ if (n === this) return true;
     return this.children.some((c) => c.contains && c.contains(n)); }
   get selectedOptions(){ return this.options.filter((o) =>
-    o.selected === true || String(o.value) === String(this.value)); }
+    o.selected === true || (!this.multiple
+      && String(o.value) === String(this.value))); }
   closest(){ return null; }
   focus(){}
   remove(){}
@@ -626,26 +647,46 @@ def test_reference_routing_uses_human_placement_without_rewriting_inline():
                 picture_lane_ids: ["lane-picture"], video_lane_ids: [], audio_lane_ids: [] }],
         };
         const semanticUnits = [{ semantic_unit_id: "unit:woman", name: "Woman",
-            source_members: [{ entity_id: "entity-1", member_id: "member-1" }] }];
+            sources: [{ entity_id: "entity-1", member_id: "member-1" }] }];
         const references = [{ reference_id: "entity-1", name: "Woman",
             members: [{ member_id: "member-1", prompt: "A woman" }] }];
+        const derived = {
+            definitions: {order:1, channel_key:"subject_definitions",
+                placement:"section_prefix", label:"Definition"},
+            summary: {order:2, channel_key:"summary",
+                placement:"section_prefix", label:"Summary"},
+            retention: {order:3, channel_key:"retention_analysis",
+                placement:"section_prefix", label:"Retention"},
+            mentions: {order:4, channel_key:"detailed_description",
+                placement:"inline", label:"Scene mention"},
+            audio_relationship: {order:5, channel_key:"summary",
+                placement:"section_prefix", label:"Audio relationship"},
+        };
         const candidate = {
-            profile: { capabilities: { reference: { routes: {
-                definitions: "subject_definitions", summary: "summary",
-                retention: "retention_analysis", mentions: "detailed_description",
-                audio_relationship: "summary",
-            } } } },
+            profile: { physical_populations:[{key:"pictures"}],
+                identity_kinds:[{key:"subject"}],
+                capabilities: { reference: { derived } } },
             attachment_capability_projections: [{
                 attachment_id: "ref-chip", capability_id: "mentions",
                 channel_key: "detailed_description", effective_phase: "inline",
                 rendered_at_anchor: false, state: "emitted",
                 state_reason: "Placed after section-prefix contributions.",
+                text: "<Subject 1>",
             }],
         };
         const open = (anchoredChannels) => mod.configurePromptAttachment(attachment, {
             scene, references, semanticUnits, channelKey: "detailed_description",
             profileId: "minimax_h3_ref@1", scope: "global", candidate,
-            anchoredChannels,
+            profile: candidate.profile,
+            placementPhases: [
+                {value:"document_preamble",label:"Document preamble",description:"Preamble"},
+                {value:"channel_prefix",label:"Channel prefix",description:"Channel start"},
+                {value:"global_document",label:"Global document",description:"Global"},
+                {value:"section_prefix",label:"Section prefix",description:"Section start"},
+                {value:"inline",label:"Inline",description:"At cursor"},
+                {value:"section_suffix",label:"Section suffix",description:"Section end"},
+                {value:"channel_suffix",label:"Channel suffix",description:"Channel end"},
+            ], anchoredChannels,
         });
         const scopePromise = open([]);
         const rows = document.body.querySelectorAll("div")
@@ -693,6 +734,9 @@ def test_reference_routing_uses_human_placement_without_rewriting_inline():
             routingCss,
             anchoredLabel: anchoredInline.textContent,
             anchoredHelp: anchoredMentions.children[2].textContent,
+            compiledLabel: mentions.children[3].children[0].children[0].textContent,
+            compiledValue: mentions.children[3].children[0].children[1].textContent,
+            compiledSource: mentions.children[3].children[0].children[2].textContent,
         }));
     """)
     assert result["scopeValue"] == "inline"
@@ -703,12 +747,223 @@ def test_reference_routing_uses_human_placement_without_rewriting_inline():
     assert result["providerLabel"] == "Provider default → detailed_description"
     assert result["savedPlacement"] == "inline"
     assert result["capabilityLabels"] == [
-        "Definitions", "Summary", "Retention", "Mentions", "Audio relationship"]
+        "Definition", "Summary", "Retention", "Scene mention", "Audio relationship"]
     assert result["audioLabel"] == "Audio relationship"
     assert result["containerType"] == "inline-size"
     assert "@container (max-width:600px)" in result["routingCss"]
     assert result["anchoredLabel"] == "Inline at cursor"
     assert "rerouted capability appears after section prefixes" in result["anchoredHelp"]
+    assert result["compiledLabel"] == "Last compiled output"
+    assert result["compiledValue"] == "<Subject 1>"
+    assert result["compiledSource"] == "Compiler projection"
+
+
+def test_reference_effective_values_distinguish_authority_and_reset_authored_empty():
+    result = _run_chip_dom_script("""
+        const raw = {
+            attachment_id:"chip",kind:"reference",
+            source:{semantic_unit_ids:["identity"]},
+            config:{overrides:{summary:""}},
+            capabilities:[{capability_id:"summary",kind:"summary",enabled:true,
+                config:{future_value:"preserved"}}],
+        };
+        const options = {
+            scene:{duration_frames:20,_context_channel_keys:["summary"],
+                reference_lane_count:1,reference_lane_configs:[{}],
+                reference_lane_recipes:[{lane_id:"lane",recipe:{soft:{
+                    compatible_profiles:["format_a@1"],physical_population:"pictures"}}}],
+                reference_items:[{reference_item_id:"item",lane_index:0,
+                    start_frame:0,end_frame:20,
+                    members:[{entity_id:"entity",member_id:"member"}]}],
+                active_minimax_h3_setup_id:"setup",
+                minimax_h3_conditioning_setups:[{setup_id:"setup",mode:"reference",
+                    picture_lane_ids:["lane"],video_lane_ids:[],audio_lane_ids:[]}]},
+            references:[{reference_id:"entity",members:[{member_id:"member"}]}],
+            semanticUnits:[{semantic_unit_id:"identity",handle:"Lead",
+                name:"Lead",definition:"Person",
+                sources:[{entity_id:"entity",member_id:"member"}],
+                attachment_defaults:{summary:"Identity summary"}}],
+            profileId:"format_a@1",
+            profile:{name:"Format A",identity_kinds:[{key:"subject"}],
+                physical_populations:[{key:"pictures"}],capabilities:{reference:{
+                defaults:{summary:"Format summary"},
+                capability_defaults:{summary:{task_types:["reference generation"]}},
+                derived:{summary:{order:1,channel_key:"summary",
+                    placement:"section_prefix",label:"Summary",
+                    fields:{summary:{label:"Summary"},
+                        task_types:{type:"enum_multi",label:"Task categories",
+                            values:["reference generation"]}}}},
+            }}},
+            placementPhases:[{value:"section_prefix",label:"Section prefix",
+                description:"Before text"}],
+        };
+        const open = () => mod.configurePromptAttachment(raw, options);
+        const pending = open();
+        const routingRow = document.body.querySelectorAll("div")
+            .find((value) => value.className === "sonder-prompt-routing-row");
+        const effective = routingRow.children[3];
+        // The deliberately tiny DOM does not implement textContent clearing
+        // child nodes, so inspect the latest rendered capability pair.
+        const snapshot = () => effective.children.slice(-2).map((line) => ({
+            label: line.children[0].textContent,
+            value: line.children[1].textContent,
+            source: line.children[2].textContent,
+            tier: line.children[2].dataset.sonderAuthorityTier,
+        }));
+        const before = snapshot();
+        const reset = document.body.querySelectorAll("button").find((button) =>
+            button.textContent === "Reset"
+            && button.parentElement?.children?.[2]?.textContent === "Chip override");
+        const resetEnabled = reset?.disabled === false;
+        reset._handlers.click[0]();
+        const after = snapshot();
+        const resetDisabled = reset.disabled === true;
+        const attach = document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Attach");
+        attach._handlers.click[0]();
+        const saved = await pending;
+        document.body.children = [];
+        const emptyPending = open();
+        const emptyAttach = document.body.querySelectorAll("button")
+            .find((button) => button.textContent === "Attach");
+        emptyAttach._handlers.click[0]();
+        const emptySaved = await emptyPending;
+        console.log(JSON.stringify({before, after, resetEnabled, resetDisabled,
+            savedOverrides:saved.config.overrides,
+            emptySavedOverrides:emptySaved.config.overrides,
+            savedCapabilityConfig:saved.capabilities[0].config,
+            emptySavedCapabilityConfig:emptySaved.capabilities[0].config}));
+    """)
+    assert result["before"] == [
+        {"label": "Input · Summary", "value": "(authored empty)",
+         "source": "Chip override", "tier": "chip"},
+        {"label": "Input · Task categories", "value": "reference generation",
+         "source": "Prompt Format default · Format A", "tier": "format"},
+    ]
+    assert result["after"] == [
+        {"label": "Input · Summary", "value": "Identity summary",
+         "source": "Shared identity default · @Lead", "tier": "shared"},
+        {"label": "Input · Task categories", "value": "reference generation",
+         "source": "Prompt Format default · Format A", "tier": "format"},
+    ]
+    assert result["resetEnabled"] is True
+    assert result["resetDisabled"] is True
+    assert "summary" not in result["savedOverrides"]
+    assert result["emptySavedOverrides"]["summary"] == ""
+    assert result["savedCapabilityConfig"] == {"future_value": "preserved"}
+    assert result["emptySavedCapabilityConfig"] == {"future_value": "preserved"}
+
+
+def test_reference_chip_save_preserves_task_types_without_or_beyond_vocabulary():
+    result = _run_chip_dom_script("""
+        const phases = [
+            {value:"section_prefix",label:"Section prefix",description:"Before text"},
+            {value:"inline",label:"Inline",description:"At cursor"},
+        ];
+        const sceneFor = (profileId, capability) => ({
+            duration_frames: 20, _context_channel_keys: ["visual"],
+            reference_lane_count: 1, reference_lane_configs: [{}],
+            reference_lane_recipes: [{lane_id:"lane", recipe:{soft:{
+                compatible_profiles:[profileId], exposed_capabilities:[capability],
+            }}}],
+            reference_items: [{reference_item_id:"item", lane_index:0,
+                start_frame:0, end_frame:20, members:[]}],
+        });
+        const save = async (attachment, profileId, profile) => {
+            const pending = mod.configurePromptAttachment(attachment, {
+                scene: sceneFor(profileId, attachment.capabilities[0].kind),
+                profileId, profile, placementPhases: phases,
+            });
+            const unsupported = document.body.querySelectorAll("option")
+                .filter((option) => option.textContent.startsWith("Unsupported saved value:"))
+                .map((option) => option.textContent);
+            const attach = document.body.querySelectorAll("button")
+                .find((button) => button.textContent === "Attach");
+            attach._handlers.click[0]();
+            return {saved: await pending, unsupported};
+        };
+        const noVocabulary = await save({
+            attachment_id:"one", kind:"reference",
+            source:{reference_item_id:"item"},
+            config:{overrides:{task_types:["video editing"],summary:"kept"}},
+            capabilities:[{capability_id:"derived_prompt",kind:"derived_prompt",
+                placement:"inline",enabled:true}],
+        }, "generic@1", {capabilities:{reference:{derived:{
+            derived_prompt:{order:1,channel_key:"visual",placement:"inline",
+                label:"Reference prompt",fields:{}},
+        }}}});
+        document.body.children = [];
+        const unknownVocabulary = await save({
+            attachment_id:"two", kind:"reference",
+            source:{reference_item_id:"item"},
+            config:{overrides:{task_types:["future task"]}},
+            capabilities:[{capability_id:"summary",kind:"summary",
+                placement:"section_prefix",enabled:true}],
+        }, "custom@1", {capabilities:{reference:{derived:{
+            summary:{order:1,channel_key:"visual",placement:"section_prefix",
+                label:"Summary",fields:{task_types:{type:"enum_multi",
+                    values:[{value:"known task",label:"Known task"}]}}},
+        }}}});
+        console.log(JSON.stringify({
+            noVocabulary: noVocabulary.saved.config.overrides,
+            unknownVocabulary: unknownVocabulary.saved.config.overrides,
+            unsupported: unknownVocabulary.unsupported,
+        }));
+    """)
+    assert result == {
+        "noVocabulary": {"task_types": ["video editing"], "summary": "kept"},
+        "unknownVocabulary": {"task_types": ["future task"]},
+        "unsupported": ["Unsupported saved value: future task"],
+    }
+
+
+def test_active_chip_intersects_recipe_union_but_keeps_saved_undeclared_parts():
+    result = _run_chip_dom_script("""
+        const scene = {
+            duration_frames:20, _context_channel_keys:["visual"],
+            reference_lane_count:1, reference_lane_configs:[{}],
+            reference_lane_recipes:[{lane_id:"lane",recipe:{soft:{
+                compatible_profiles:["format_a@1","format_b@1"],
+                exposed_capabilities:["definitions","audio_relationship"],
+            }}}],
+            reference_items:[{reference_item_id:"item",lane_index:0,
+                start_frame:0,end_frame:20,members:[]}],
+        };
+        const profile = {capabilities:{reference:{derived:{
+            definitions:{order:1,channel_key:"visual",placement:"section_prefix",
+                label:"Definitions",fields:{}},
+        }}}};
+        const open = (capabilities) => mod.configurePromptAttachment({
+            attachment_id:"chip",kind:"reference",
+            source:{reference_item_id:"item"},config:{overrides:{}},capabilities,
+        }, {scene,profileId:"format_a@1",profile,placementPhases:[
+            {value:"section_prefix",label:"Section prefix",description:"Before text"},
+        ]});
+        const freshPromise = open([]);
+        const freshRows = document.body.querySelectorAll("div")
+            .filter((value) => value.className === "sonder-prompt-routing-row");
+        const freshKinds = freshRows.map((row) => row.children[0].children[1].title);
+        document.body.querySelectorAll("button").find((button) =>
+            button.textContent === "Cancel")._handlers.click[0]();
+        await freshPromise;
+
+        document.body.children = [];
+        const savedPromise = open([{capability_id:"audio_relationship",kind:"audio_relationship",
+            placement:"section_prefix",enabled:true}]);
+        const savedRows = document.body.querySelectorAll("div")
+            .filter((value) => value.className === "sonder-prompt-routing-row");
+        const savedKinds = savedRows.map((row) => row.children[0].children[1].title);
+        const voice = savedRows.find((row) =>
+            row.children[0].children[1].title === "audio_relationship");
+        const warning = voice.children[0].title;
+        document.body.querySelectorAll("button").find((button) =>
+            button.textContent === "Cancel")._handlers.click[0]();
+        await savedPromise;
+        console.log(JSON.stringify({freshKinds,savedKinds,warning}));
+    """)
+    assert result["freshKinds"] == ["definitions"]
+    assert result["savedKinds"] == ["definitions", "audio_relationship"]
+    assert "not declared by the active Prompt Format" in result["warning"]
 
 
 def test_document_and_scope_chips_share_two_line_container_bounded_labels():
@@ -774,8 +1029,9 @@ def test_scope_rows_never_offer_inline_only_kinds():
     result = _run_chip_dom_script("""
         const optionValues = (row) => row.querySelectorAll("select")
             .flatMap((s) => s.options.map((o) => o.value));
-        const explicit = mod.createScopeChipRow({ allowedKinds: [
-            "shot","timestamp","reference","guide","vocal_event","prompt_link","custom"] });
+            const explicit = mod.createScopeChipRow({ allowedKinds: [
+                "shot","timestamp","reference","guide","vocal_event","prompt_link",
+                "prompt_link_scope","custom"] });
         const bare = mod.createScopeChipRow({});
         const legacy = mod.createScopeChipRow({ attachments: [
             { attachment_id: "legacy", kind: "vocal_event", config: {} }] });
@@ -790,10 +1046,60 @@ def test_scope_rows_never_offer_inline_only_kinds():
     """)
     assert result["inlineOnly"] == ["prompt_link", "vocal_event"]
     # Asking for the inline-only kinds explicitly must still not offer them.
-    assert result["explicitlyRequested"] == ["shot", "timestamp", "reference", "custom"]
+    assert result["explicitlyRequested"] == [
+        "shot", "timestamp", "reference", "prompt_link_scope", "custom"]
     assert result["byDefault"] == result["explicitlyRequested"]
     # A legacy scope chip stays visible and reachable so it can be rebound.
     assert result["legacyChipMarked"] is True
+
+
+def test_section_scope_prompt_link_picker_defaults_all_channels_and_separates_actions():
+    result = _run_chip_dom_script("""
+        const attachment = mod.normalizePromptAttachment({
+            kind: "prompt_link_scope", source: {prompt_id: "source"}
+        });
+        let removed = 0, copied = 0;
+        const row = mod.createScopeChipRow({
+            attachments: [attachment], onRemove: () => { removed += 1; },
+            onConvertPromptLinkCopy: () => { copied += 1; },
+        });
+        const actionButtons = row.querySelectorAll("button");
+        actionButtons.find((button) => button.textContent === "Unlink")._handlers.click[0]();
+        actionButtons.find((button) => button.textContent === "Convert to copy")._handlers.click[0]();
+        const configuredPromise = mod.configurePromptAttachment({kind: "prompt_link_scope"}, {
+            scene: {
+                _context_consumer_start: 10,
+                _context_channel_keys: ["visual", "audio"],
+                prompt_sections: [
+                    {prompt_id: "source", start_frame: 0, end_frame: 10, prompt: "source"},
+                    {prompt_id: "consumer", start_frame: 10, end_frame: 20, prompt: "consumer"},
+                ],
+            },
+            channelKey: "visual", profileId: "generic@1",
+        });
+        const modal = document.body.children.at(-1);
+        const selects = modal.querySelectorAll("select");
+        selects[0].value = "source";
+        const channelSelect = selects.find((select) => select.multiple === true);
+        const attach = modal.querySelectorAll("button")
+            .find((button) => button.textContent === "Attach");
+        attach._handlers.click[0]();
+        const configured = await configuredPromise;
+        console.log(JSON.stringify({
+            exportable: attachment.link_exportable,
+            actions: [removed, copied],
+            multiple: channelSelect.multiple,
+            channelKeys: configured.source.channel_keys,
+            sourcePrompt: configured.source.prompt_id,
+        }));
+    """)
+    assert result == {
+        "exportable": True,
+        "actions": [1, 1],
+        "multiple": True,
+        "channelKeys": ["visual", "audio"],
+        "sourcePrompt": "source",
+    }
 
 
 def test_inline_context_menus_still_offer_the_inline_only_kinds():
@@ -986,11 +1292,11 @@ def test_reuse_and_unlink_keep_one_grouping_concept_with_fresh_ids():
             capabilities: [{ capability_id: "definitions", kind: "definitions" }] });
         const reused = mod.reusePromptAttachment(source);
         const unlinked = mod.unlinkPromptAttachment(reused);
-        reused.config.definition = "changed";
+            reused.config.overrides.definition = "changed";
         console.log(JSON.stringify({
             idsFresh: reused.attachment_id !== source.attachment_id,
             groupKept: reused.emission_group_id === source.emission_group_id,
-            deepCopy: source.config.definition,
+                deepCopy: source.config.overrides.definition,
             unlinkKeepsId: unlinked.attachment_id === reused.attachment_id,
             unlinkFreshGroup: unlinked.emission_group_id !== reused.emission_group_id,
         }));
@@ -1221,19 +1527,20 @@ def test_custom_guide_binding_follows_template_not_profile_id_spelling():
         const hasGuideBinding = () => document.body.querySelectorAll("select")
             .some((select) => select.options.some((option) => option.value === "first"));
         mod.configurePromptAttachment({ kind: "custom" }, {
-            profileId: "forked_profile@1", templateId: "minimax_h3_ref" });
+                profileId: "forked_profile@1",
+                profile: { validators: ["minimax_reference_setup"] } });
         const forkedH3 = hasGuideBinding();
         document.body.children = [];
         mod.configurePromptAttachment({ kind: "custom" }, {
-            profileId: "minimax_h3_misleading@1", templateId: "standard" });
+                profileId: "minimax_h3_misleading@1", profile: { validators: [] } });
         console.log(JSON.stringify({ forkedH3, misleadingGeneric: hasGuideBinding() }));
     """)
     assert result == {"forkedH3": True, "misleadingGeneric": False}
 
     panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(encoding="utf-8")
     widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    assert panel.count("templateId:") >= 7
-    assert widget.count("templateId:") >= 2
+    assert panel.count("profile: currentPromptProfile()") >= 7
+    assert widget.count("profile: this._resolvedPromptContextProfile") >= 3
 
 
 def test_chip_editor_defers_owned_keys_during_ime_composition():

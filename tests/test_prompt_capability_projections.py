@@ -32,10 +32,10 @@ def _section(prompt_id, attachment, *, document=None, start=0, end=10):
     }
 
 
-def _compile(sections):
+def _compile(sections, *, profile="generic@1"):
     return prompt_context.compile_prompt_context(
         global_channels={}, sections=sections, window_start=0, window_end=100,
-        fps=24.0, template="standard", profile="generic@1")
+        fps=24.0, template="standard", profile=profile)
 
 
 def test_projection_contract_shape_scope_inline_and_region():
@@ -157,7 +157,11 @@ def test_unresolved_overrides_empty_but_never_emitted():
     assert broken["attachment_capability_projections"][0]["state"] == "unresolved"
 
     literal = _attachment("@subject(missing)", attachment_id="literal")
-    emitted = _compile([_section("literal", literal)])
+    emitted = _compile([_section("literal", literal)], profile={
+        "profile_id": "declared-token", "version": "1", "name": "Declared token",
+        "template_id": "standard", "capabilities": {}, "writing_aids": [],
+        "identity_kinds": [prompt_context.MINIMAX_SUBJECT_KIND],
+    })
     row = emitted["attachment_capability_projections"][0]
     assert row["state"] == "emitted"
     assert any(error["code"] == "unresolved_prompt_token"
@@ -261,7 +265,7 @@ def test_minimax_reference_accounts_for_all_five_capabilities_and_resolved_route
                 "semantic_unit_id": "subject",
                 "name": "Korean Woman",
                 "definition": "a woman in a black coat",
-                "source_members": [],
+                "sources": [],
             }],
         },
     )

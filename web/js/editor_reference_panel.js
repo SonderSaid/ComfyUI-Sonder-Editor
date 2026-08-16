@@ -41,6 +41,7 @@ import {
 import { TRACK_TYPE } from "./editor_timeline_constants.js";
 import { preserveLaneRecipeIdentity } from "./reference_lane_identity.js";
 import { createMemberDraft, moveMember } from "./reference_library_model.js";
+import { createDisclosureMemory } from "./disclosure_memory.js";
 import {
     REFERENCE_VERDICT,
     REFERENCE_VERDICT_LABEL,
@@ -48,6 +49,13 @@ import {
     resolveReferenceVerdicts,
 } from "./reference_resolution.js";
 import { notifySuccess, notifyWarning } from "./editor_notifications.js";
+import {
+    declaredFieldChoices,
+    referenceCapabilityChoicesForProfiles,
+    referenceFieldDeclaration,
+    referenceRoleChoices,
+    resolvedPromptProfile,
+} from "./prompt_profile_declarations.js";
 
 const DETACHED_LABEL = "Detached / Custom";
 const NEW_ITEM = "__new_reference_item__";
@@ -115,6 +123,16 @@ export function groupRecipeFields(fields = []) {
     return ordered.map((name) => ({ group: name, fields: groups.get(name) }));
 }
 
+export function promptCatalogAuthorityState(catalog, { loading = false,
+    error = "" } = {}) {
+    const ready = Number(catalog?.schema_version) === 1;
+    return {
+        ready,
+        loading: !ready && loading === true,
+        error: !ready ? String(error || "") : "",
+    };
+}
+
 const el = (tag, text = "", css = "") => {
     const node = document.createElement(tag);
     if (text) node.textContent = text;
@@ -147,34 +165,18 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
     const disclosureStorageKey = `sonder-reference-panel-disclosure-v1:${String(
         host._projectDirName?.() || host.projectId || "project",
     )}`;
-    const loadDisclosures = () => {
-        try {
-            const parsed = JSON.parse(localStorage.getItem(disclosureStorageKey) || "{}");
-            return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-        } catch (_error) {
-            return {};
-        }
-    };
+    const disclosureMemory = createDisclosureMemory(disclosureStorageKey);
     const state = {
         laneIndex: Math.max(0, parseInt(laneIndex, 10) || 0),
         pickerItemId: "",
         pickerQuery: "",
         busy: false,
-        disclosures: loadDisclosures(),
     };
     const disclosureKey = (kind, value) => `${state.laneIndex}:${kind}:${String(value || "")}`;
-    const disclosureOpen = (kind, value, fallback = false) => {
-        const key = disclosureKey(kind, value);
-        return Object.prototype.hasOwnProperty.call(state.disclosures, key)
-            ? !!state.disclosures[key] : !!fallback;
-    };
+    const disclosureOpen = (kind, value, fallback = false) =>
+        disclosureMemory.isOpen(disclosureKey(kind, value), fallback);
     const rememberDisclosure = (kind, value, open) => {
-        state.disclosures[disclosureKey(kind, value)] = !!open;
-        try {
-            localStorage.setItem(disclosureStorageKey, JSON.stringify(state.disclosures));
-        } catch (_error) {
-            // Browser-local disclosure memory is a convenience, never project authority.
-        }
+        disclosureMemory.remember(disclosureKey(kind, value), open);
     };
     let mounted = true;
 
@@ -457,13 +459,9 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
             })).filter((profile) => profile.value);
         }
         if (field.key === "exposed_capabilities") {
-            const labels = {
-                derived_prompt: "Derived prompt text", definitions: "Definitions",
-                summary: "Task summary", retention: "What to preserve",
-                mentions: "Subject mentions", audio_relationship: "Audio relationship",
-            };
-            return (host._promptContextCatalog?.capabilities || [])
-                .map((value) => ({ value: String(value), label: labels[value] || String(value) }));
+            const compatible = laneRecipe()?.recipe?.soft?.compatible_profiles || [];
+            return referenceCapabilityChoicesForProfiles(
+                host._promptContextCatalog, compatible);
         }
         if (field.key === "role_fields") {
             return [
@@ -475,9 +473,34 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         return [];
     };
 
+    const promptCatalogState = () => promptCatalogAuthorityState(
+        host._promptContextCatalog, {
+            loading: host._referencesLoading,
+            error: host._referencesError,
+        });
+
     const catalogListEditor = (field, values, locked) => {
         const wrap = el("div", "", "display:flex;flex-wrap:wrap;gap:5px 10px;flex:1;min-width:0;");
         const selected = [...new Set((Array.isArray(values) ? values : []).map(String))];
+        const catalogDependent = ["compatible_profiles", "exposed_capabilities"]
+            .includes(String(field?.key || ""));
+        const authority = promptCatalogState();
+        if (catalogDependent && !authority.ready) {
+            wrap.dataset.sonderCatalogUnavailable = "1";
+            for (const value of selected) {
+                const saved = el("span", `Saved: ${value}`, `
+                    display:inline-flex;align-items:center;padding:2px 6px;border-radius:10px;
+                    border:1px solid ${COLORS.border};color:${COLORS.textMuted};font-size:10px;
+                `);
+                saved.title = "Preserved while the Prompt Format catalog is unavailable.";
+                wrap.appendChild(saved);
+            }
+            if (!selected.length) wrap.appendChild(el("span",
+                authority.loading ? "Loading Prompt Format catalog…"
+                    : "Prompt Format catalog unavailable",
+                `font-size:10px;color:${COLORS.textMuted};`));
+            return wrap;
+        }
         const choices = promptContextChoices(field);
         const known = new Set(choices.map((entry) => entry.value));
         for (const entry of choices) {
@@ -732,6 +755,8 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                     return !!selected && !known.has(selected);
                 }
                 if (!["compatible_profiles", "exposed_capabilities", "role_fields"].includes(field.key)) return false;
+                if (["compatible_profiles", "exposed_capabilities"].includes(field.key)
+                        && !promptCatalogState().ready) return false;
                 const known = new Set(promptContextChoices(field).map((entry) => entry.value));
                 return (Array.isArray(value) ? value : []).some((entry) => !known.has(String(entry)));
             });
@@ -951,13 +976,19 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const profileKeys = Array.isArray(soft.compatible_profiles) ? soft.compatible_profiles : [];
         const activeProfileKey = String(host.activeScene?.prompt_context_profile_id
             || host._channelTemplate?.()?.default_context_profile || "generic@1");
-        const customProfile = (host._promptContextProfiles || []).find((profile) =>
-            `${profile.profile_id}@${profile.version || "1"}` === activeProfileKey);
-        const builtInRoleCatalog = host._promptContextCatalog?.role_catalogs?.[population] || [];
+        const activeProfile = resolvedPromptProfile({
+            profileId: activeProfileKey, catalog: host._promptContextCatalog,
+            customProfiles: host._promptContextProfiles,
+        });
+        const catalogReady = promptCatalogState().ready;
         const roleCatalog = profileKeys.includes(activeProfileKey)
-            ? (activeProfileKey === "minimax_h3_ref@1"
-                ? builtInRoleCatalog : (customProfile?.role_catalogs?.[population] || []))
+            ? referenceRoleChoices(activeProfile, population)
             : [];
+        const intentChoices = (field, emptyLabel) => [
+            { value: "", label: emptyLabel },
+            ...declaredFieldChoices(referenceFieldDeclaration(
+                activeProfile, "retention", field)),
+        ];
         const canonicalRole = String(memberRef.role || "");
         if (roleFields.size) {
             row.style.flexWrap = "wrap";
@@ -967,33 +998,55 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 const roleValues = [["", "Role: choose…"], ...roleCatalog.map(
                     (entry) => [entry.value, entry.label || entry.value])];
                 if (memberRef.role && !roleValues.some(([value]) => value === canonicalRole)) {
-                    roleValues.push([memberRef.role, `Unsupported: ${memberRef.role}`]);
-                    role.dataset.unsupported = "true";
-                    role.dataset.sonderInvalid = "1";
-                    role.title = "Choose a role supported by this prompt format before saving.";
+                    roleValues.push([memberRef.role, catalogReady
+                        ? `Unsupported: ${memberRef.role}`
+                        : `Saved: ${memberRef.role} (catalog unavailable)`]);
+                    if (catalogReady) {
+                        role.dataset.unsupported = "true";
+                        role.dataset.sonderInvalid = "1";
+                        role.title = "Choose a role supported by this prompt format before saving.";
+                    }
                 }
                 for (const [value, label] of roleValues) {
                     const option = el("option", label); option.value = value; role.appendChild(option);
                 }
-                role.value = canonicalRole; role.disabled = locked;
+                role.value = canonicalRole; role.disabled = locked || !catalogReady;
                 role.addEventListener("change", () => updateMember({ role: role.value }, "change Reference role"));
                 controls.appendChild(role);
             }
             if (roleFields.has("visual_intent")) {
                 const retention = el("select", "", chromeInputCss({ padding: "2px 4px", fontSize: "10px" }));
-                [["", "Entity default"], ["preserve", "Fully preserve"], ["partial", "Partially preserve"],
-                    ["transfer_attributes", "Transfer attributes"], ["reference_loosely", "Weak reference"]]
-                    .forEach(([value, label]) => { const option = el("option", label); option.value = value; retention.appendChild(option); });
-                retention.value = memberRef.visual_intent || ""; retention.disabled = locked;
+                const choices = intentChoices("visual_intent", "Entity default");
+                if (memberRef.visual_intent && !choices.some((row) =>
+                    row.value === String(memberRef.visual_intent))) {
+                    choices.push({ value: String(memberRef.visual_intent),
+                        label: catalogReady ? `Unsupported: ${memberRef.visual_intent}`
+                            : `Saved: ${memberRef.visual_intent} (catalog unavailable)` });
+                }
+                choices.forEach(({ value, label }) => {
+                    const option = el("option", label);
+                    option.value = value; retention.appendChild(option);
+                });
+                retention.value = memberRef.visual_intent || "";
+                retention.disabled = locked || !catalogReady;
                 retention.addEventListener("change", () => updateMember({ visual_intent: retention.value }, "change visual retention"));
                 controls.appendChild(retention);
             }
             if (roleFields.has("audio_intent")) {
                 const audioIntent = el("select", "", chromeInputCss({ padding: "2px 4px", fontSize: "10px" }));
-                [["", "Audio: entity default"], ["copy_full", "Fully copy"], ["copy_partial", "Partially copy"],
-                    ["reference_characteristics", "Reference"], ["reference_loosely", "Weak reference"]]
-                    .forEach(([value, label]) => { const option = el("option", label); option.value = value; audioIntent.appendChild(option); });
-                audioIntent.value = memberRef.audio_intent || ""; audioIntent.disabled = locked;
+                const choices = intentChoices("audio_intent", "Audio: entity default");
+                if (memberRef.audio_intent && !choices.some((row) =>
+                    row.value === String(memberRef.audio_intent))) {
+                    choices.push({ value: String(memberRef.audio_intent),
+                        label: catalogReady ? `Unsupported: ${memberRef.audio_intent}`
+                            : `Saved: ${memberRef.audio_intent} (catalog unavailable)` });
+                }
+                choices.forEach(({ value, label }) => {
+                    const option = el("option", label);
+                    option.value = value; audioIntent.appendChild(option);
+                });
+                audioIntent.value = memberRef.audio_intent || "";
+                audioIntent.disabled = locked || !catalogReady;
                 audioIntent.addEventListener("change", () => void writeMemberAudioIntent(
                     item, memberRef, audioIntent.value, "change audio retention"));
                 controls.appendChild(audioIntent);
@@ -1207,12 +1260,13 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         const profileKeys = Array.isArray(soft.compatible_profiles) ? soft.compatible_profiles : [];
         const activeProfileKey = String(host.activeScene?.prompt_context_profile_id
             || host._channelTemplate?.()?.default_context_profile || "generic@1");
-        const customProfile = (host._promptContextProfiles || []).find((profile) =>
-            `${profile.profile_id}@${profile.version || "1"}` === activeProfileKey);
-        const builtInItemRoleCatalog = host._promptContextCatalog?.role_catalogs?.[population] || [];
+        const activeProfile = resolvedPromptProfile({
+            profileId: activeProfileKey, catalog: host._promptContextCatalog,
+            customProfiles: host._promptContextProfiles,
+        });
+        const catalogReady = promptCatalogState().ready;
         const itemRoleCatalog = profileKeys.includes(activeProfileKey)
-            ? (activeProfileKey === "minimax_h3_ref@1"
-                ? builtInItemRoleCatalog : (customProfile?.role_catalogs?.[population] || []))
+            ? referenceRoleChoices(activeProfile, population)
             : [];
         const allowedRoles = new Set(itemRoleCatalog.map((entry) => String(entry.value)));
         const canonicalRole = (value) => String(value || "");
@@ -1252,7 +1306,7 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
                 display:flex; flex-direction:column; gap:6px;
             `);
             const invalidMember = (item.members || []).find((member) => {
-                const roleInvalid = !!member.role
+                const roleInvalid = catalogReady && !!member.role
                     && (!allowedRoles.size || !allowedRoles.has(canonicalRole(member.role)));
                 return roleInvalid;
             });
@@ -1495,6 +1549,30 @@ export function mountReferenceLanePanel(host, { laneIndex = 0 } = {}) {
         if (!entries.length) {
             body.appendChild(el("div", "This scene has no Reference lanes.", `font-size:11px;color:${COLORS.textMuted};padding:18px;text-align:center;`));
             return;
+        }
+        const catalogAuthority = promptCatalogState();
+        if (!catalogAuthority.ready) {
+            const notice = el("div", "", `padding:7px 9px;border:1px solid ${
+                catalogAuthority.error ? COLORS.dangerText : COLORS.border
+            };border-radius:6px;color:${catalogAuthority.error
+                ? COLORS.dangerText : COLORS.textMuted};font-size:10px;`);
+            notice.dataset.sonderPromptCatalogState = catalogAuthority.error
+                ? "error" : "loading";
+            notice.appendChild(el("span", catalogAuthority.error
+                ? `Prompt Format catalog unavailable: ${catalogAuthority.error}`
+                : "Loading Prompt Format catalog…"));
+            if (catalogAuthority.error) {
+                const retry = button("Retry", "Reload Reference and Prompt Format catalogs");
+                retry.style.marginLeft = "8px";
+                retry.addEventListener("click", async () => {
+                    retry.disabled = true;
+                    await host._fetchReferences?.({ force: true,
+                        reason: "reference_lane_catalog_retry" });
+                    render();
+                });
+                notice.appendChild(retry);
+            }
+            body.appendChild(notice);
         }
         // Staged items first: this panel is opened to see what is on the lane.
         // The recipe is set once and read rarely.

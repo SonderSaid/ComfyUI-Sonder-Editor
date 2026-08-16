@@ -5,14 +5,20 @@
 import { REFERENCE_VERDICT_LABEL, resolveReferenceVerdicts } from "./reference_resolution.js";
 import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
     register as registerKeyboardConsumer } from "./keyboard_ownership.js";
-import { PROMPT_TOKEN_KINDS, promptToken } from "./prompt_tokens.js";
+import { promptToken, promptTokenDeclarationsFromProfile } from "./prompt_tokens.js";
 import { openContextMenu } from "./editor_context_menu.js";
+import {
+    declaredFieldChoices,
+    orderedReferenceDerived,
+    referenceDerivedDeclarations,
+    referenceFieldDeclaration,
+} from "./prompt_profile_declarations.js";
 
 export const PROMPT_DOCUMENT_SCHEMA = "prompt_document_v1";
 export const PROMPT_CONTEXT_FORMAT = "prompt_context_v1";
 
-const AUTHORING_KINDS = ["shot", "timestamp", "reference", "vocal_event", "prompt_link", "custom"];
-export const SCOPE_ONLY_KINDS = ["timestamp"];
+const AUTHORING_KINDS = ["shot", "timestamp", "reference", "vocal_event", "prompt_link", "prompt_link_scope", "custom"];
+export const SCOPE_ONLY_KINDS = ["timestamp", "prompt_link_scope"];
 // A Prompt Link resolves only through an inline document anchor, and a Vocal
 // Event's document position *is* its place in the spoken order. Authored as
 // scope chips they emit nothing and lose chronology respectively, so no scope
@@ -21,26 +27,44 @@ export const INLINE_ONLY_KINDS = ["prompt_link", "vocal_event"];
 const SCOPE_KINDS = AUTHORING_KINDS.filter((kind) => !INLINE_ONLY_KINDS.includes(kind));
 const LABELS = {
     shot: "Shot", timestamp: "Time", reference: "Reference",
-    vocal_event: "Vocal event", prompt_link: "Prompt link", custom: "Context",
-};
-const CAPABILITY_LABELS = {
-    derived_prompt: "Derived prompt",
-    definitions: "Definitions",
-    summary: "Summary",
-    retention: "Retention",
-    mentions: "Mentions",
-    audio_relationship: "Audio relationship",
-};
-const PLACEMENT_LABELS = {
-    document_preamble: "Document preamble",
-    channel_prefix: "Channel prefix",
-    global_document: "Global document",
-    section_prefix: "Section prefix",
-    section_suffix: "Section suffix",
-    channel_suffix: "Channel suffix",
+    vocal_event: "Vocal event", prompt_link: "Prompt link",
+    prompt_link_scope: "Section Prompt link", custom: "Context",
 };
 const DIALOGUE_LANGUAGES = ["English", "Spanish", "French", "German", "Italian",
     "Japanese", "Korean", "Chinese", "Portuguese", "Hindi"];
+export const REFERENCE_OVERRIDE_FIELDS = Object.freeze([
+    "definition", "summary", "task_types", "retention_detail",
+    "retention_details", "audio_definition", "audio_relationship", "text",
+    "visual_intent", "audio_intent",
+]);
+const REFERENCE_CAPABILITY_VALUE_FIELDS = Object.freeze({
+    definitions: Object.freeze(["definition", "audio_definition"]),
+    summary: Object.freeze(["summary", "task_types"]),
+    retention: Object.freeze(["retention_detail", "visual_intent", "audio_intent"]),
+    mentions: Object.freeze(["text"]),
+    audio_relationship: Object.freeze(["audio_relationship"]),
+    derived_prompt: Object.freeze([]),
+});
+const REFERENCE_VALUE_LABELS = Object.freeze({
+    definition: "Definition", audio_definition: "Audio definition",
+    summary: "Summary", task_types: "Summary task types",
+    retention_detail: "Preservation detail", visual_intent: "Visual handling",
+    audio_intent: "Audio handling", text: "Inline mention",
+    audio_relationship: "Audio relationship",
+});
+const REFERENCE_VALUE_CAPABILITY = Object.freeze(Object.fromEntries(
+    Object.entries(REFERENCE_CAPABILITY_VALUE_FIELDS).flatMap(([kind, fields]) =>
+        fields.map((field) => [field, kind]))));
+
+function referenceCapabilityValueFields(profile, kind) {
+    const declaration = referenceDerivedDeclarations(profile)?.[String(kind || "")] || {};
+    const declared = declaration.fields && typeof declaration.fields === "object"
+        ? Object.keys(declaration.fields) : [];
+    return [...new Set([
+        ...(REFERENCE_CAPABILITY_VALUE_FIELDS[String(kind || "")] || []),
+        ...declared,
+    ])];
+}
 
 let textEditorKeyboardClaimInstalled = false;
 function installTextEditorKeyboardClaim() {
@@ -329,6 +353,19 @@ export function retargetChannelDocuments(channelDocuments, sourceKeys, targetKey
 export function normalizePromptAttachment(raw = {}) {
     const attachmentId = String(raw.attachment_id || "").trim() || uid();
     const kind = (String(raw.kind || "custom").trim() || "custom").slice(0, 64);
+    const config = raw.config && typeof raw.config === "object"
+        ? structuredClone(raw.config) : {};
+    if (kind === "reference") {
+        const overrides = config.overrides && typeof config.overrides === "object"
+            && !Array.isArray(config.overrides) ? structuredClone(config.overrides) : {};
+        for (const field of REFERENCE_OVERRIDE_FIELDS) {
+            if (Object.hasOwn(config, field) && !Object.hasOwn(overrides, field)) {
+                overrides[field] = config[field];
+            }
+            delete config[field];
+        }
+        config.overrides = overrides;
+    }
     return {
         attachment_id: attachmentId,
         emission_group_id: String(raw.emission_group_id || "").trim() || attachmentId,
@@ -337,10 +374,11 @@ export function normalizePromptAttachment(raw = {}) {
         provider_version: String(raw.provider_version || "1"),
         enabled: raw.enabled !== false,
         source: raw.source && typeof raw.source === "object" ? structuredClone(raw.source) : {},
-        config: raw.config && typeof raw.config === "object" ? structuredClone(raw.config) : {},
+        config,
         capabilities: Array.isArray(raw.capabilities) ? structuredClone(raw.capabilities) : [],
         link_exportable: raw.link_exportable === true
-            || (kind === "prompt_link" && raw.link_exportable !== false),
+            || (["prompt_link", "prompt_link_scope"].includes(kind)
+                && raw.link_exportable !== false),
     };
 }
 
@@ -454,7 +492,7 @@ function referenceSelectionMemberIds(selected, { scene = null, semanticUnits = [
         laneConfigs: scene?.reference_lane_configs || [],
         frameThresholdPct: Number(scene?._context_reference_frame_threshold || 0),
     }).verdicts;
-    const sourceIds = new Set((unit.source_members || []).map((row) =>
+    const sourceIds = new Set((unit.sources || []).map((row) =>
         String(row?.member_id || "")).filter(Boolean));
     const result = [];
     for (const laneId of [
@@ -508,9 +546,12 @@ export function resolveReferenceSelectionInheritance(selected, {
 
 export function subjectSourceEligibility({ sources = [], referenceItems = [],
     laneRecipes = [], verdicts = new Map(), profileId = "generic@1",
-    setupPopulations = new Map(), isMiniMax = false, scope = {} } = {}) {
+    setupPopulations = new Map(), requiresSetup = false, scope = {} } = {}) {
     const sourceIds = new Set((sources || []).map((source) =>
         String(source?.member_id || "")).filter(Boolean));
+    if (!sourceIds.size) {
+        return { eligible: true, appliesNow: true, reason: "", suffix: "" };
+    }
     const states = [];
     (referenceItems || []).forEach((item, index) => {
         if (!(item?.members || []).some((member) =>
@@ -537,13 +578,13 @@ export function subjectSourceEligibility({ sources = [], referenceItems = [],
         return { eligible: false, appliesNow: false,
             reason: "incompatible prompt format", suffix: " - incompatible prompt format" };
     }
-    if (isMiniMax && !states.some((state) =>
+    if (requiresSetup && !states.some((state) =>
         state.profileCompatible && state.setupPopulation)) {
         return { eligible: false, appliesNow: false,
             reason: "not in active setup", suffix: " - not in active setup" };
     }
     const compatibleStates = states.filter((state) =>
-        state.profileCompatible && (!isMiniMax || !!state.setupPopulation));
+        state.profileCompatible && (!requiresSetup || !!state.setupPopulation));
     const appliesNow = compatibleStates.some((state) => state.verdict === "winner");
     const globalScope = Boolean(scope?.globalScope);
     const eligible = globalScope ? compatibleStates.length > 0 : appliesNow;
@@ -559,6 +600,155 @@ export function subjectSourceEligibility({ sources = [], referenceItems = [],
     return { eligible: true, appliesNow, reason: "", suffix: "" };
 }
 
+export function referencePromptDefaults(selected, {
+    references = [], semanticUnits = [], profile = {}, capabilityKind = "",
+    setupManifest = {},
+} = {}) {
+    const referenceDeclaration = profile?.capabilities?.reference || {};
+    const formatName = String(profile?.name || profile?.profile_id || "Prompt Format");
+    const formatSource = `Prompt Format default · ${formatName}`;
+    const rendererFallbackSource = `Renderer fallback · ${formatName}`;
+    const formatValues = {
+        ...(referenceDeclaration?.defaults
+            && typeof referenceDeclaration.defaults === "object"
+            ? structuredClone(referenceDeclaration.defaults) : {}),
+        ...(referenceDeclaration?.capability_defaults?.[capabilityKind]
+            && typeof referenceDeclaration.capability_defaults[capabilityKind] === "object"
+            ? structuredClone(referenceDeclaration.capability_defaults[capabilityKind]) : {}),
+    };
+    const formatFieldSources = Object.fromEntries(Object.keys(formatValues).map((field) => [
+        field, { label: formatSource, tier: "format" },
+    ]));
+    const stagedRowsFor = (memberIds) => {
+        const wanted = new Set((memberIds || []).map(String).filter(Boolean));
+        if (!wanted.size) return [];
+        return Object.values(setupManifest || {}).flatMap((rows) =>
+            Array.isArray(rows) ? rows : []).filter((row) => wanted.has(String(
+            row?.member_id || row?.video_member_id || "")));
+    };
+    const commonStagedValue = (rows, field) => {
+        const values = [...new Set((rows || []).map((row) => String(row?.[field] || ""))
+            .filter(Boolean))];
+        return values.length === 1 ? values[0] : "";
+    };
+    const withSemanticFallback = (values, fieldSources, field, value, source) => {
+        if (String(values[field] ?? "") || !String(value ?? "")) return;
+        values[field] = structuredClone(value);
+        fieldSources[field] = source;
+    };
+    const value = String(selected || "");
+    const physical = value.match(/^physical:[a-z][a-z0-9_]*:(.+)$/);
+    if (physical) {
+        const memberId = physical[1];
+        const rows = stagedRowsFor([memberId]);
+        for (const reference of references || []) {
+            const member = (reference?.members || []).find((row) =>
+                String(row?.member_id || "") === memberId);
+            if (!member) continue;
+            const stagedSource = `Staged Reference default · @${
+                member.handle || member.member_id}`;
+            const values = { ...formatValues };
+            const fieldSources = { ...formatFieldSources };
+            withSemanticFallback(values, fieldSources, "visual_intent",
+                commonStagedValue(rows, "visual_intent") || "preserve",
+                rows.length
+                    ? { label: stagedSource, tier: "shared" }
+                    : { label: rendererFallbackSource, tier: "format" });
+            withSemanticFallback(values, fieldSources, "audio_intent",
+                commonStagedValue(rows, "audio_intent") || "reference_characteristics",
+                rows.length
+                    ? { label: stagedSource, tier: "shared" }
+                    : { label: rendererFallbackSource, tier: "format" });
+            return {
+                values, source: stagedSource, formatSource, fieldSources,
+            };
+        }
+    }
+    const unit = (semanticUnits || []).find((row) =>
+        String(row?.semantic_unit_id || "") === value);
+    if (unit) {
+        const sharedValues = unit.attachment_defaults
+            && typeof unit.attachment_defaults === "object"
+            ? structuredClone(unit.attachment_defaults) : {};
+        const sharedSource = `Shared identity default · @${
+            unit.handle || unit.semantic_unit_id}`;
+        const values = { ...formatValues, ...sharedValues };
+        const fieldSources = { ...formatFieldSources,
+            ...Object.fromEntries(Object.keys(sharedValues).map((field) => [
+                field, { label: sharedSource, tier: "shared" },
+            ])) };
+        const stagedRows = stagedRowsFor((unit.sources || []).map((source) =>
+            source?.member_id));
+        const stagedSource = `Staged Reference default · @${
+            unit.handle || unit.semantic_unit_id}`;
+        withSemanticFallback(values, fieldSources, "definition", unit.definition || "",
+            { label: sharedSource, tier: "shared" });
+        const sourceMemberIds = new Set((unit.sources || []).map((source) =>
+            String(source?.member_id || "")).filter(Boolean));
+        const stagedPrompts = [...new Set((setupManifest?.presentation || [])
+            .filter((row) => sourceMemberIds.has(String(
+                row?.member_id || row?.video_member_id || "")))
+            .map((row) => String(row?.member_prompt || "").trim()).filter(Boolean))];
+        withSemanticFallback(values, fieldSources, "definition", stagedPrompts.join("; "),
+            { label: stagedSource, tier: "shared" });
+        withSemanticFallback(values, fieldSources, "visual_intent",
+            commonStagedValue(stagedRows, "visual_intent")
+                || unit.visual_intent || "preserve",
+            commonStagedValue(stagedRows, "visual_intent")
+                ? { label: stagedSource, tier: "shared" }
+                : (unit.visual_intent
+                    ? { label: sharedSource, tier: "shared" }
+                    : { label: rendererFallbackSource, tier: "format" }));
+        withSemanticFallback(values, fieldSources, "audio_intent",
+            commonStagedValue(stagedRows, "audio_intent")
+                || unit.audio_intent || "reference_characteristics",
+            commonStagedValue(stagedRows, "audio_intent")
+                ? { label: stagedSource, tier: "shared" }
+                : (unit.audio_intent
+                    ? { label: sharedSource, tier: "shared" }
+                    : { label: rendererFallbackSource, tier: "format" }));
+        return {
+            values,
+            source: sharedSource, formatSource,
+            fieldSources,
+        };
+    }
+    return { values: formatValues, source: formatSource, formatSource,
+        fieldSources: formatFieldSources };
+}
+
+export function referenceCapabilityInputProjection(capabilityKind, {
+    selected = "", profile = {}, references = [], semanticUnits = [],
+    overrides = {}, capabilityConfig = {}, setupManifest = {},
+} = {}) {
+    const kind = String(capabilityKind || "");
+    const inherited = referencePromptDefaults(selected, {
+        references, semanticUnits, profile, capabilityKind: kind, setupManifest,
+    });
+    return referenceCapabilityValueFields(profile, kind).map((field) => {
+        const declaration = referenceFieldDeclaration(profile, kind, field) || {};
+        const capabilityOwns = Object.hasOwn(capabilityConfig || {}, field);
+        const chipOwns = Object.hasOwn(overrides || {}, field);
+        const source = capabilityOwns || chipOwns
+            ? { label: "Chip override", tier: "chip" }
+            : (inherited.fieldSources?.[field]
+                || { label: inherited.formatSource, tier: "format" });
+        const value = capabilityOwns ? capabilityConfig[field]
+            : (chipOwns ? overrides[field] : inherited.values?.[field]);
+        const storedEmpty = (capabilityOwns || chipOwns)
+            && (Array.isArray(value) ? value.length === 0 : String(value ?? "") === "");
+        return {
+            field,
+            label: String(declaration?.label || REFERENCE_VALUE_LABELS[field] || field),
+            value: structuredClone(value ?? ""),
+            source: String(source?.label || inherited.formatSource),
+            tier: String(source?.tier || "format"),
+            authored_empty: storedEmpty,
+            ...(storedEmpty ? { stored_empty: true } : {}),
+        };
+    });
+}
+
 export function resolveReferenceAttachmentIdentity(attachment, {
     scene = null, references = [], semanticUnits = [],
 } = {}) {
@@ -566,7 +756,9 @@ export function resolveReferenceAttachmentIdentity(attachment, {
     const unitNames = (attachment?.source?.semantic_unit_ids || []).map((id) => {
         const unit = (semanticUnits || []).find((row) =>
             String(row?.semantic_unit_id || "") === String(id));
-        return String(unit?.name || unit?.semantic_unit_id || "").trim();
+        const handle = String(unit?.handle || "").trim();
+        return handle ? `@${handle}`
+            : String(unit?.name || unit?.semantic_unit_id || "").trim();
     }).filter(Boolean);
     if (unitNames.length) return [...new Set(unitNames)].join(" + ");
     const itemId = String(attachment?.source?.reference_item_id || "");
@@ -588,6 +780,8 @@ export function resolveReferenceAttachmentIdentity(attachment, {
     const members = referenceMemberLookup(references);
     const names = physicalIds.map((id) => {
         const row = members.get(id);
+        const handle = String(row?.member?.handle || "").trim();
+        if (handle) return `@${handle}`;
         const entityName = String(row?.reference?.name || row?.reference?.reference_id || "").trim();
         const memberName = String(row?.member?.name || "").trim();
         return memberName && entityName ? `${entityName} · ${memberName}` : (entityName || memberName);
@@ -607,7 +801,7 @@ export function attachmentReuseLabel(attachment, ctx = {}) {
         const text = String(attachment?.config?.text || "").trim().replace(/\s+/g, " ");
         return text ? `Custom: ${text.slice(0, 40)}${text.length > 40 ? "…" : ""}` : "Custom";
     }
-    if (kind === "prompt_link") {
+    if (["prompt_link", "prompt_link_scope"].includes(kind)) {
         if (!ctx.scene || !ctx.template) {
             return attachment?.config?.label || "Linked prompt";
         }
@@ -621,10 +815,13 @@ export function attachmentReuseLabel(attachment, ctx = {}) {
         const sectionLabel = section
             ? `Section ${index + 1} (${section.start_frame}-${section.end_frame})`
             : "Unavailable section";
-        const channelKey = String(attachment?.source?.channel_key || "");
-        const channel = (ctx.template?.channels || []).find((value) =>
-            String(value?.key || "") === channelKey);
-        return `Prompt link → ${sectionLabel} · ${channel?.label || channelKey || "channel"}`;
+        const channelKeys = kind === "prompt_link_scope"
+            ? (attachment?.source?.channel_keys || []).map(String)
+            : [String(attachment?.source?.channel_key || "")].filter(Boolean);
+        const labels = channelKeys.map((channelKey) =>
+            (ctx.template?.channels || []).find((value) =>
+                String(value?.key || "") === channelKey)?.label || channelKey);
+        return `${kind === "prompt_link_scope" ? "Section prompt link" : "Prompt link"} → ${sectionLabel} · ${labels.join(" + ") || "all channels"}`;
     }
     if (kind === "vocal_event") {
         return `Vocal event: ${String(attachment?.config?.event_type || "speech").replaceAll("_", " ")}`;
@@ -687,7 +884,7 @@ export function attachmentLabel(attachment, preview = "", identityLabel = "", co
         const identity = identityLabel || base;
         return preview ? `${identity} — ${preview}` : identity;
     }
-    if (attachment?.kind === "prompt_link") {
+    if (["prompt_link", "prompt_link_scope"].includes(attachment?.kind)) {
         if (context?.scene && context?.template) {
             return attachmentReuseLabel(attachment, context);
         }
@@ -699,13 +896,41 @@ export function attachmentLabel(attachment, preview = "", identityLabel = "", co
     return preview || attachment?.config?.label || base;
 }
 
+/** Project one capability row back onto its stored record.
+ *
+ *  BOTH routing axes are sparse: `channel_key` and `placement` are written only
+ *  when the author picked something other than "Provider default", so a blank
+ *  keeps inheriting the format declaration and a format change re-routes every
+ *  untouched capability. Writing either eagerly froze the routing at attach
+ *  time and made Reset unreachable, because the stored copy was
+ *  indistinguishable from a deliberate override.
+ *
+ *  Exported so this is a tested projection rather than logic buried in a
+ *  save handler that no test can reach.
+ */
+export function sparseCapabilityRecord(current = {}, {
+    capabilityId = "", enabled = true, channelKey = "", placement = "" } = {}) {
+    const capability = {
+        ...current,
+        capability_id: capabilityId,
+        kind: current?.kind || capabilityId,
+        enabled: !!enabled,
+    };
+    if (channelKey) capability.channel_key = channelKey;
+    else delete capability.channel_key;
+    if (placement) capability.placement = placement;
+    else delete capability.placement;
+    return capability;
+}
+
 function placementDisplayLabel(value, { renderedAtAnchor = false,
-    hasAnchor = false } = {}) {
+    hasAnchor = false, phaseCatalog = [] } = {}) {
     const placement = String(value || "section_prefix");
     if (placement === "inline") {
         return renderedAtAnchor || hasAnchor ? "Inline at cursor" : "After section prefixes";
     }
-    return PLACEMENT_LABELS[placement]
+    return String((phaseCatalog || []).find((row) =>
+        String(row?.value || "") === placement)?.label || "")
         || placement.replaceAll("_", " ").replace(/^./, (char) => char.toUpperCase());
 }
 
@@ -1499,10 +1724,13 @@ function selectField(options, value = "") {
 /** Bounded, deterministic attachment configuration. No provider prose is generated. */
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
-    templateId = "", scope = "", taskTypes = [], managedSpeakerSubjectIds = [],
+    scope = "", profile = null, placementPhases = [], managedSpeakerSubjectIds = [],
     ordinalManifest = {}, candidate = null, anchoredChannels = [],
 } = {}) {
     const attachment = normalizePromptAttachment(rawAttachment);
+    const resolvedProfile = profile && typeof profile === "object"
+        ? profile : (candidate?.profile || {});
+    const referenceDerived = referenceDerivedDeclarations(resolvedProfile);
     return new Promise((resolve) => {
         const backdrop = document.createElement("div");
         backdrop.dataset.sonderPromptContextModal = "1";
@@ -1539,7 +1767,9 @@ export function configurePromptAttachment(rawAttachment, {
         } else if (attachment.kind === "custom") {
             controls.text = textField(attachment.config.text, true);
             panel.append(fieldRow("Fixed text", controls.text));
-            if (["minimax_h3_base", "minimax_h3_ref"].includes(templateId)) {
+            const validators = new Set((resolvedProfile?.validators || []).map(String));
+            if (validators.has("minimax_base_setup")
+                    || validators.has("minimax_reference_setup")) {
                 controls.setupRole = selectField([
                     ["", "Text only"],
                     ["first", "Bound to active first-frame Guide"],
@@ -1548,7 +1778,7 @@ export function configurePromptAttachment(rawAttachment, {
                 panel.append(fieldRow("Physical Guide binding", controls.setupRole,
                     "Optional capability for text that refers to the active H3 first- or last-frame Guide."));
             }
-        } else if (attachment.kind === "prompt_link") {
+        } else if (["prompt_link", "prompt_link_scope"].includes(attachment.kind)) {
             const currentStart = Number(scene?._context_consumer_start ?? Infinity);
             const sectionOptions = [["", "Choose an earlier section…"]];
             for (const section of scene?.prompt_sections || []) {
@@ -1567,8 +1797,22 @@ export function configurePromptAttachment(rawAttachment, {
             const channelOptions = (scene?._context_channel_keys || [channelKey || "visual"])
                 .map((key) => [key, key]);
             controls.channel = selectField(channelOptions, attachment.source.channel_key || channelKey);
-            panel.append(fieldRow("Source section", controls.promptId),
-                fieldRow("Source channel", controls.channel));
+            if (attachment.kind === "prompt_link_scope") {
+                controls.channel.multiple = true;
+                controls.channel.size = Math.min(6, Math.max(2, channelOptions.length));
+                const selectedChannels = new Set(
+                    (attachment.source.channel_keys || []).map(String));
+                [...controls.channel.options].forEach((option) => {
+                    option.selected = selectedChannels.size
+                        ? selectedChannels.has(option.value) : true;
+                });
+                panel.append(fieldRow("Source section", controls.promptId),
+                    fieldRow("Channels", controls.channel,
+                        "All channels are linked by default; select a subset for advanced routing."));
+            } else {
+                panel.append(fieldRow("Source section", controls.promptId),
+                    fieldRow("Source channel", controls.channel));
+            }
         } else if (attachment.kind === "vocal_event") {
             controls.eventType = selectField(
                 ["dialogue", "singing", "narration", "voiceover", "group_speech"],
@@ -1605,7 +1849,9 @@ export function configurePromptAttachment(rawAttachment, {
                 controls.bindingNotice,
                 fieldRow("Words", controls.text));
         } else if (attachment.kind === "reference") {
-            const isMiniMax = String(profileId || "").startsWith("minimax_h3_");
+            const usesDeclaredSources = Boolean(
+                resolvedProfile?.physical_populations?.length
+                || resolvedProfile?.identity_kinds?.length);
             const referenceItems = Array.isArray(scene?.reference_items)
                 ? scene.reference_items : [];
             const consumerStart = Number(scene?._context_consumer_start);
@@ -1662,7 +1908,8 @@ export function configurePromptAttachment(rawAttachment, {
                 const eligibility = subjectSourceEligibility({
                     sources, referenceItems, laneRecipes,
                     verdicts: verdictResult.verdicts, profileId, setupPopulations,
-                    isMiniMax, scope: { globalScope, hasSelection },
+                    requiresSetup: usesDeclaredSources,
+                    scope: { globalScope, hasSelection },
                 });
                 return [value.semantic_unit_id,
                     `Subject: ${value.name || value.semantic_unit_id}${eligibility.suffix}`,
@@ -1670,7 +1917,7 @@ export function configurePromptAttachment(rawAttachment, {
             };
             const unitOptions = ((semanticUnits || []).length
                 ? semanticUnits.map((value) =>
-                    makeUnitOption(value, value.source_members || []))
+                    makeUnitOption(value, value.sources || []))
                 : (references || []).map((value) => makeUnitOption({
                         semantic_unit_id: `unit:${value.reference_id}`,
                         name: value.name || value.reference_id,
@@ -1714,7 +1961,7 @@ export function configurePromptAttachment(rawAttachment, {
                 }
             });
             const referenceOptions = [["", "Choose a Reference…", true],
-                ...(isMiniMax ? [...unitOptions, ...physicalOptions] : itemOptions)];
+                ...(usesDeclaredSources ? [...unitOptions, ...physicalOptions] : itemOptions)];
             const selectedPhysical = [
                 ["picture", attachment.source.picture_ids],
                 ["video", attachment.source.video_ids],
@@ -1734,7 +1981,25 @@ export function configurePromptAttachment(rawAttachment, {
                     controls.reference.options[index].disabled = value[2] === false;
                 }
             });
-            controls.definition = textField(attachment.config.definition, true);
+            const overrides = attachment.config.overrides
+                && typeof attachment.config.overrides === "object"
+                ? structuredClone(attachment.config.overrides) : {};
+            const overriddenFields = new Set(Object.keys(overrides));
+            controls.referenceOverrides = overrides;
+            controls.referenceOverriddenFields = overriddenFields;
+            const inherited = (field = "", capabilityKind = "") =>
+                referencePromptDefaults(controls.reference.value, {
+                    references, semanticUnits, profile: resolvedProfile,
+                    setupManifest: candidate?.setup_manifest || {},
+                    capabilityKind: capabilityKind
+                        || REFERENCE_VALUE_CAPABILITY[field] || "",
+                });
+            const effectiveValue = (field, fallback = "") =>
+                overriddenFields.has(field)
+                    ? overrides[field]
+                    : (Object.hasOwn(inherited(field).values, field)
+                        ? inherited(field).values[field] : fallback);
+            controls.definition = textField(effectiveValue("definition"), true);
             const inheritanceNotice = document.createElement("div");
             inheritanceNotice.style.cssText =
                 "grid-column:2;font:10px/1.35 system-ui;color:#9fc8bc;margin-top:-4px;white-space:pre-wrap;";
@@ -1742,14 +2007,17 @@ export function configurePromptAttachment(rawAttachment, {
                 const inherited = resolveReferenceSelectionInheritance(controls.reference.value, {
                     scene, references, semanticUnits,
                 });
+                const isPhysical = /^physical:/.test(controls.reference.value);
                 controls.definition.placeholder = inherited.value ||
                     "Describe this Subject for prompt use…";
                 inheritanceNotice.textContent = inherited.value
-                    ? `Inherited from ${inherited.source}. Leave Definition blank to keep following it.`
+                    ? (isPhysical
+                        ? `Available from ${inherited.source}. Enter or edit Definition to author it for this chip.`
+                        : `Inherited from ${inherited.source}. Leave Definition blank to keep following it.`)
                     : "No inherited definition is available. Add a Definition here or to the Subject/Library member.";
                 inheritanceNotice.style.color = inherited.value ? "#9fc8bc" : "#f2b8a0";
             };
-            controls.audioDefinition = textField(attachment.config.audio_definition, true);
+            controls.audioDefinition = textField(effectiveValue("audio_definition"), true);
             const managedSpeakers = new Set((managedSpeakerSubjectIds || []).map(String));
             const currentSpeaker = String(attachment.config.audio_speaker_subject_id || "");
             const speakerOptions = [["", "No target speaker binding", true],
@@ -1771,7 +2039,7 @@ export function configurePromptAttachment(rawAttachment, {
                     controls.audioSpeaker.options[index].disabled = value[2] === false;
                 }
             });
-            controls.summary = textField(attachment.config.summary, true);
+            controls.summary = textField(effectiveValue("summary"), true);
             const tokenStrip = document.createElement("div");
             tokenStrip.style.cssText = "grid-column:2;display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:-3px;";
             const insertSummaryToken = (value) => {
@@ -1788,16 +2056,20 @@ export function configurePromptAttachment(rawAttachment, {
                 const physical = selected.match(/^physical:(picture|video|audio):(.+)$/);
                 let kind = "subject";
                 let sourceId = selected;
-                let displayName = (semanticUnits || []).find((value) =>
-                    String(value?.semantic_unit_id || "") === sourceId)?.name || sourceId;
+                const selectedUnit = (semanticUnits || []).find((value) =>
+                    String(value?.semantic_unit_id || "") === sourceId);
+                let storedHandle = String(selectedUnit?.handle || "");
                 if (physical) {
                     kind = physical[1];
                     sourceId = physical[2];
-                    const option = referenceOptions.find((value) => value[0] === selected);
-                    displayName = String(option?.[1] || sourceId).split(" - ")[0];
+                    storedHandle = String((references || []).flatMap((reference) =>
+                        reference?.members || []).find((member) =>
+                        String(member?.member_id || "") === sourceId)?.handle || "");
                 }
-                const declaration = PROMPT_TOKEN_KINDS[kind];
-                const authoredToken = promptToken(kind, sourceId);
+                const declarations = promptTokenDeclarationsFromProfile(
+                    candidate?.profile || {});
+                const declaration = declarations[kind];
+                const authoredToken = promptToken(kind, sourceId, declarations);
                 if (!declaration || !authoredToken || selected.startsWith("item:")) {
                     const empty = document.createElement("span");
                     empty.textContent = "Choose a Subject or physical setup source to insert a late-bound token.";
@@ -1808,52 +2080,160 @@ export function configurePromptAttachment(rawAttachment, {
                 const ordinal = Number(ordinalManifest?.[declaration.manifestKey]?.[sourceId] || 0);
                 const button = document.createElement("button");
                 button.type = "button";
-                button.textContent = `${displayName} → ${authoredToken} · ${ordinal > 0
-                    ? `currently <${declaration.label} ${ordinal}>` : "not in the current preview"}`;
-                button.title = "Insert a stable-id token. Its provider ordinal is resolved only during compilation.";
+                const resolvedLabel = ordinal > 0
+                    ? String(declaration.labelTemplate || "").replace("{n}", String(ordinal))
+                    : "not in the current preview";
+                button.textContent = storedHandle
+                    ? `@${storedHandle} · ${resolvedLabel}`
+                    : "Set this handle in Reference Prompting before inserting it";
+                button.title = storedHandle
+                    ? `Insert ${authoredToken}. The stable id is stored; provider ordinals resolve only during compilation.`
+                    : "A suggested handle is presentation-only until the versioned Reference write succeeds.";
+                button.disabled = !storedHandle;
                 button.style.cssText = "padding:3px 6px;border:1px solid #4c5d73;border-radius:999px;background:#1b2531;color:#bdd8ee;font:9px/1.2 system-ui;cursor:pointer;";
                 button.addEventListener("mousedown", (event) => event.preventDefault());
                 button.addEventListener("click", () => insertSummaryToken(authoredToken));
                 tokenStrip.appendChild(button);
             };
-            controls.taskTypes = selectField((taskTypes || []).map((value) => [value, value]), "");
-            controls.taskTypes.multiple = true;
-            controls.taskTypes.size = Math.min(6, Math.max(2, (taskTypes || []).length));
-            const selectedTaskTypes = new Set(attachment.config.task_types || []);
-            [...controls.taskTypes.options].forEach((option) => {
-                option.selected = selectedTaskTypes.has(option.value);
-            });
-            controls.mention = textField(attachment.config.text || "");
+            const declaredSelect = (capabilityKind, fieldName, emptyLabel = "") => {
+                const declaration = referenceFieldDeclaration(
+                    resolvedProfile, capabilityKind, fieldName);
+                if (!declaration) return null;
+                const selected = effectiveValue(fieldName,
+                    declaration.type === "enum_multi" ? [] : "");
+                const choices = declaredFieldChoices(declaration)
+                    .map((entry) => [entry.value, entry.label]);
+                const saved = new Set((Array.isArray(selected)
+                    ? selected : [selected]).map(String).filter(Boolean));
+                for (const value of saved) {
+                    if (!choices.some(([known]) => known === value)) {
+                        choices.push([value, `Unsupported saved value: ${value}`]);
+                    }
+                }
+                if (emptyLabel) choices.unshift(["", emptyLabel]);
+                const control = selectField(choices, Array.isArray(selected) ? "" : selected);
+                if (declaration.type === "enum_multi") {
+                    control.multiple = true;
+                    control.size = Math.min(6, Math.max(2, choices.length));
+                    [...control.options].forEach((option) => {
+                        option.selected = saved.has(option.value);
+                    });
+                }
+                return control;
+            };
+            controls.taskTypes = declaredSelect("summary", "task_types");
+            controls.mention = textField(effectiveValue("text"));
             controls.retentionDetail = textField(
-                attachment.config.retention_detail || "", true);
+                effectiveValue("retention_detail"), true);
             controls.audioRelationship = textField(
-                attachment.config.audio_relationship || "", true);
-            controls.visualIntent = selectField([
-                ["", "Inherit staged/entity default"],
-                ["preserve", "Fully preserved"], ["partial", "Partially preserved"],
-                ["transfer_attributes", "Attribute transfer"],
-                ["reference_loosely", "Weak reference"],
-            ], attachment.config.visual_intent || "");
-            controls.audioIntent = selectField([
-                ["", "Inherit staged/entity default"],
-                ["copy_full", "Fully copy"], ["copy_partial", "Partially copy"],
-                ["reference_characteristics", "Reference characteristics"],
-                ["reference_loosely", "Weak reference"],
-            ], attachment.config.audio_intent || "");
+                effectiveValue("audio_relationship"), true);
+            controls.visualIntent = declaredSelect(
+                "retention", "visual_intent", "Inherit staged/entity default");
+            controls.audioIntent = declaredSelect(
+                "retention", "audio_intent", "Inherit staged/entity default");
             const referenceFieldRow = (label, control, help) =>
                 fieldRow(label, control, help, { visibleHelp: true });
-            const definitionRow = referenceFieldRow("Definition", controls.definition,
-                "Optional chip override. Blank inherits from the Subject, then its contributing Library member prompts.");
+            const overrideControls = new Map([
+                ["definition", controls.definition],
+                ["audio_definition", controls.audioDefinition],
+                ["summary", controls.summary],
+                ["task_types", controls.taskTypes],
+                ["text", controls.mention],
+                ["retention_detail", controls.retentionDetail],
+                ["audio_relationship", controls.audioRelationship],
+                ["visual_intent", controls.visualIntent],
+                ["audio_intent", controls.audioIntent],
+            ].filter(([, control]) => control));
+            const overrideStatus = new Map();
+            const refreshCapabilityEffectiveValues = () => {
+                for (const row of controls.capabilityRows?.values?.() || []) {
+                    row.refreshEffective?.();
+                }
+            };
+            const setControlValue = (field, control, value) => {
+                if (field === "task_types") {
+                    const selected = new Set(Array.isArray(value) ? value.map(String) : []);
+                    [...control.options].forEach((option) => {
+                        option.selected = selected.has(option.value);
+                    });
+                } else {
+                    control.value = String(value ?? "");
+                }
+            };
+            const refreshOverrideStatus = (field) => {
+                const status = overrideStatus.get(field);
+                const control = overrideControls.get(field);
+                if (!status || !control) return;
+                const { state, reset } = status;
+                const isOverride = overriddenFields.has(field);
+                const inheritedState = inherited(field);
+                const source = inheritedState.fieldSources?.[field]
+                    || { label: inheritedState.formatSource, tier: "format" };
+                state.textContent = isOverride ? "Chip override" : source.label;
+                state.dataset.sonderAuthorityTier = isOverride ? "chip" : source.tier;
+                state.style.color = isOverride ? "#e9b77d"
+                    : (source.tier === "shared" ? "#9fc8bc" : "#8792a5");
+                state.style.fontWeight = isOverride ? "600" : "400";
+                control.style.opacity = isOverride ? "1" : ".78";
+                reset.disabled = !isOverride;
+            };
+            const refreshInheritedFields = () => {
+                for (const [field, control] of overrideControls) {
+                    const defaults = inherited(field).values;
+                    if (!overriddenFields.has(field)) {
+                        setControlValue(field, control,
+                            Object.hasOwn(defaults, field) ? defaults[field] : "");
+                    }
+                    refreshOverrideStatus(field);
+                }
+            };
+            const overridableFieldRow = (label, field, help) => {
+                const control = overrideControls.get(field);
+                const wrapper = document.createElement("div");
+                wrapper.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px;align-items:start;";
+                const reset = document.createElement("button");
+                reset.type = "button";
+                reset.textContent = "Reset";
+                reset.title = "Delete this chip override and follow the current default.";
+                reset.style.cssText = "padding:3px 6px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#b7c1cf;font:9px system-ui;cursor:pointer;";
+                const state = document.createElement("span");
+                state.style.cssText = "grid-column:1/-1;font:9px/1.25 system-ui;";
+                overrideStatus.set(field, { state, reset });
+                const markOverride = () => {
+                    overriddenFields.add(field);
+                    refreshOverrideStatus(field);
+                    refreshCapabilityEffectiveValues();
+                };
+                control.addEventListener(field === "task_types" ? "change" : "input", markOverride);
+                if (control.tagName === "SELECT" && field !== "task_types") {
+                    control.addEventListener("change", markOverride);
+                }
+                reset.addEventListener("click", () => {
+                    overriddenFields.delete(field);
+                    delete overrides[field];
+                    const defaults = inherited(field).values;
+                    setControlValue(field, control,
+                        Object.hasOwn(defaults, field) ? defaults[field] : "");
+                    refreshOverrideStatus(field);
+                    refreshCapabilityEffectiveValues();
+                });
+                wrapper.append(control, reset, state);
+                const row = referenceFieldRow(label, wrapper, help);
+                refreshOverrideStatus(field);
+                return row;
+            };
+            const definitionRow = overridableFieldRow("Definition", "definition",
+                "Blank while overridden is deliberately blank; Reset follows the Identity or physical Reference default.");
             controls.reference.title = "Choose a semantic Subject or a physical source from the active conditioning setup.";
             const referenceRows = [referenceFieldRow("Reference", controls.reference,
                 "Choose a semantic Subject or a physical source from the active conditioning setup."),
                 definitionRow,
                 inheritanceNotice,
-                referenceFieldRow("Audio definition", controls.audioDefinition,
+                overridableFieldRow("Audio definition", "audio_definition",
                     "Required when the Subject unit includes an Audio member."),
                 referenceFieldRow("Audio target speaker", controls.audioSpeaker,
                     "Reuses the (Sx) assigned by that Subject's first managed Vocal Event; it never creates speaker order."),
-                referenceFieldRow("Summary", controls.summary,
+                overridableFieldRow("Summary", "summary",
                     "Optional section summary text. Leave blank to use the provider's generated summary shape."),
                 tokenStrip];
             const otherSummaryOwners = [
@@ -1861,28 +2241,40 @@ export function configurePromptAttachment(rawAttachment, {
                 ...(scene?.prompt_sections || []).flatMap((value) => value?.attachments || []),
             ].filter((value) => value?.kind === "reference"
                 && String(value?.attachment_id || "") !== String(attachment.attachment_id || "")
-                && String(value?.config?.summary || "").trim());
-            if (String(attachment.config.summary || "").trim() && otherSummaryOwners.length) {
+                && String(value?.config?.overrides?.summary || "").trim());
+            if (String(effectiveValue("summary") || "").trim() && otherSummaryOwners.length) {
                 const summaryOwnerNotice = document.createElement("div");
                 summaryOwnerNotice.style.cssText = "grid-column:2;font:9px/1.35 system-ui;color:#e9b77d;margin-top:-4px;";
                 summaryOwnerNotice.textContent = "Only one MiniMax Summary owner can emit per compile. Another Reference chip also carries Summary text.";
                 referenceRows.push(summaryOwnerNotice);
             }
-            if (isMiniMax) {
-                referenceRows.push(referenceFieldRow("Summary task types", controls.taskTypes,
-                    "Defaults are derived from staged member Roles. Select values only to explicitly override that default."));
+            if (controls.taskTypes) {
+                const taskDeclaration = referenceFieldDeclaration(
+                    resolvedProfile, "summary", "task_types") || {};
+                referenceRows.push(overridableFieldRow("Summary task types", "task_types",
+                    taskDeclaration.help || "Select values only to explicitly override the format default."));
             }
             referenceRows.push(
-                referenceFieldRow("Inline mention output", controls.mention,
+                overridableFieldRow("Inline mention output", "text",
                     "Leave blank to emit late-bound labels such as <Subject 1>."),
-                referenceFieldRow("Preservation detail", controls.retentionDetail,
+                overridableFieldRow("Preservation detail", "retention_detail",
                     "Required in MiniMax H3 Full Reference; describe exactly what is retained or transferred."),
-                referenceFieldRow("Audio relationship", controls.audioRelationship,
-                    "Optional authored relationship between the referenced audio and target event."),
-                referenceFieldRow("What to preserve (visual)", controls.visualIntent,
-                    "Override the Reference or staged-member visual preservation intent for this chip."),
-                referenceFieldRow("What to preserve (audio)", controls.audioIntent,
-                    "Override the Reference or staged-member audio preservation intent for this chip."));
+                overridableFieldRow("Audio relationship", "audio_relationship",
+                    "Optional authored relationship between the referenced audio and target event."));
+            if (controls.visualIntent) {
+                const declaration = referenceFieldDeclaration(
+                    resolvedProfile, "retention", "visual_intent") || {};
+                referenceRows.push(overridableFieldRow(
+                    declaration.label || "Visual handling", "visual_intent",
+                    declaration.help || "Override the inherited visual handling."));
+            }
+            if (controls.audioIntent) {
+                const declaration = referenceFieldDeclaration(
+                    resolvedProfile, "retention", "audio_intent") || {};
+                referenceRows.push(overridableFieldRow(
+                    declaration.label || "Audio handling", "audio_intent",
+                    declaration.help || "Override the inherited audio handling."));
+            }
             panel.append(...referenceRows);
 
             const capabilityDetails = document.createElement("details");
@@ -1923,6 +2315,13 @@ export function configurePromptAttachment(rawAttachment, {
                     overflow-wrap:anywhere;
                 }
                 .sonder-prompt-routing-help { grid-column:2; }
+                .sonder-prompt-effective-values {
+                    grid-column:2;
+                    display:flex;
+                    flex-direction:column;
+                    gap:3px;
+                    min-width:0;
+                }
                 @container (max-width:600px) {
                     .sonder-prompt-routing-row { grid-template-columns:minmax(0,1fr); }
                     .sonder-prompt-routing-controls {
@@ -1931,29 +2330,16 @@ export function configurePromptAttachment(rawAttachment, {
                     }
                     .sonder-prompt-routing-state { grid-column:1; }
                     .sonder-prompt-routing-help { grid-column:1; }
+                    .sonder-prompt-effective-values { grid-column:1; }
                 }
             `;
             capabilityDetails.appendChild(routingStyle);
             capabilityDetails.appendChild(capabilityHost);
             panel.appendChild(capabilityDetails);
             controls.capabilityRows = new Map();
-            const defaultPlacement = {
-                derived_prompt: "inline", definitions: "section_prefix",
-                summary: "section_prefix", retention: "section_prefix",
-                mentions: "inline", audio_relationship: "section_prefix",
-            };
-            const placementHelp = {
-                document_preamble: "Placed before all authored channel and section content in the compiled document.",
-                channel_prefix: "Placed at the start of its resolved channel, before that channel's section content.",
-                global_document: "Placed with the scene-global document before section-owned contributions.",
-                section_prefix: "Placed before the authored text of the resolved channel in this section.",
-                section_suffix: "Placed after authored text in this section, before the channel-level suffix.",
-                channel_suffix: "Placed after all section content in the resolved channel.",
-            };
+            const declaredCapabilities = orderedReferenceDerived(resolvedProfile);
             const capabilitiesForSelection = (selected) => {
-                if (!selected) return isMiniMax
-                    ? ["definitions", "summary", "retention", "mentions", "audio_relationship"]
-                    : ["derived_prompt"];
+                if (!selected) return declaredCapabilities.map(([kind]) => kind);
                 const itemId = String(selected || "").match(/^item:(.+)$/)?.[1] || "";
                 if (itemId) {
                     const item = referenceItems.find((value) =>
@@ -1961,9 +2347,13 @@ export function configurePromptAttachment(rawAttachment, {
                     const wrapper = laneRecipes[Number(item?.lane_index || 0)] || {};
                     const recipe = wrapper.recipe && typeof wrapper.recipe === "object"
                         ? wrapper.recipe : wrapper;
-                    return (recipe?.soft?.exposed_capabilities || ["derived_prompt"]).map(String);
+                    const exposed = recipe?.soft?.exposed_capabilities;
+                    return (Array.isArray(exposed) && exposed.length
+                        ? exposed.map(String).filter((kind) =>
+                            Object.hasOwn(referenceDerived, kind))
+                        : declaredCapabilities.map(([kind]) => kind));
                 }
-                return ["definitions", "summary", "retention", "mentions", "audio_relationship"];
+                return declaredCapabilities.map(([kind]) => kind);
             };
             const renderCapabilities = () => {
                 capabilityHost.textContent = "";
@@ -1974,9 +2364,12 @@ export function configurePromptAttachment(rawAttachment, {
                 const suggested = capabilitiesForSelection(controls.reference.value);
                 const capabilityIds = [...new Set([...suggested, ...existing.keys()].filter(Boolean))];
                 for (const capabilityId of capabilityIds) {
+                    const capabilityDeclaration = referenceDerived[capabilityId] || {};
+                    // No `placement` here: a capability with no stored record
+                    // inherits the declaration, and seeding it would write the
+                    // format default back as if the author had chosen it.
                     const current = existing.get(capabilityId) || {
                         capability_id: capabilityId, kind: capabilityId,
-                        placement: defaultPlacement[capabilityId] || "section_prefix",
                         enabled: true,
                     };
                     const row = document.createElement("div");
@@ -1987,38 +2380,61 @@ export function configurePromptAttachment(rawAttachment, {
                     checkbox.type = "checkbox";
                     checkbox.checked = current.enabled !== false;
                     const capabilityName = document.createElement("span");
-                    capabilityName.textContent = CAPABILITY_LABELS[capabilityId] || capabilityId;
+                    capabilityName.textContent = String(
+                        capabilityDeclaration?.label || capabilityId);
                     capabilityName.title = capabilityId;
                     capabilityName.style.cssText = "min-width:0;overflow-wrap:anywhere;";
                     enabled.append(checkbox, capabilityName);
                     if (!suggested.includes(capabilityId)) {
-                        enabled.title = "This saved prompt part is not exposed by the selected recipe; disable it or rebind its source.";
+                        enabled.title = Object.hasOwn(referenceDerived, capabilityId)
+                            ? "This saved prompt part is not exposed by the selected recipe; disable it or rebind its source."
+                            : "This saved prompt part is not declared by the active Prompt Format; disable it or switch formats.";
                         enabled.style.color = "#f0b6a8";
                     }
-                    const declaration = candidate?.profile?.capabilities?.[attachment.kind] || {};
                     const routeKey = String(current.kind || capabilityId);
                     const resolvedDefaultChannel = String(
-                        declaration?.routes?.[routeKey]
-                        || declaration?.channel_key || channelKey
+                        referenceDerived?.[routeKey]?.channel_key
+                        || resolvedProfile?.capabilities?.reference?.channel_key
+                        || channelKey
                         || scene?._context_channel_keys?.[0] || "");
                     const channel = selectField([
                         ["", `Provider default → ${resolvedDefaultChannel || "unresolved"}`],
                         ...(scene?._context_channel_keys || [channelKey]).filter(Boolean)
                             .map((key) => [key, key]),
                     ], current.channel_key || "");
-                    let selectedPlacement = current.placement
-                        || defaultPlacement[capabilityId] || "section_prefix";
-                    const placementOptions = Object.entries(PLACEMENT_LABELS);
+                    // NOT `|| capabilityDeclaration?.placement`: falling through
+                    // to the declaration would select a concrete phase, and the
+                    // save would then write the format default back as an
+                    // override. Blank means inherit, and stays selectable.
+                    const selectedPlacement = current.placement || "";
                     const hasAnchor = Array.isArray(anchoredChannels)
                         && anchoredChannels.length > 0;
-                    placementOptions.splice(4, 0, ["inline",
-                        placementDisplayLabel("inline", { hasAnchor })]);
+                    const resolvedDefaultPlacement = placementDisplayLabel(
+                        String(capabilityDeclaration?.placement || ""),
+                        { hasAnchor, phaseCatalog: placementPhases });
+                    const placementOptions = [
+                        ["", `Provider default → ${resolvedDefaultPlacement || "unresolved"}`],
+                        ...(placementPhases || []).map((row) => [
+                            String(row?.value || ""),
+                            String(row?.value || "") === "inline"
+                                ? placementDisplayLabel("inline", {
+                                    hasAnchor, phaseCatalog: placementPhases,
+                                })
+                                : String(row?.label || row?.value || ""),
+                        ]).filter(([value]) => value),
+                    ];
+                    if (selectedPlacement && !placementOptions.some(
+                        ([value]) => value === selectedPlacement)) {
+                        placementOptions.push([selectedPlacement,
+                            `Unsupported saved placement: ${selectedPlacement}`]);
+                    }
                     const placement = selectField(placementOptions, selectedPlacement);
                     const placementHelpFor = (value) => value === "inline"
                         ? (hasAnchor
                             ? "Placed at its caret when this capability resolves to the anchored channel; a rerouted capability appears after section prefixes in its destination channel."
                             : "Placed after section-prefix contributions and before authored text.")
-                        : (placementHelp[value] || "");
+                        : String((placementPhases || []).find((row) =>
+                            String(row?.value || "") === value)?.description || "");
                     for (const option of placement.options) {
                         option.title = placementHelpFor(option.value);
                     }
@@ -2033,6 +2449,7 @@ export function configurePromptAttachment(rawAttachment, {
                         projection?.effective_phase || selectedPlacement, {
                             renderedAtAnchor: projection?.rendered_at_anchor === true,
                             hasAnchor: !projection && hasAnchor,
+                            phaseCatalog: placementPhases,
                         });
                     state.textContent = `→ ${projection?.channel_key || resolvedDefaultChannel || "unresolved"} · ${phase} · ${projectionState}`;
                     state.title = projection?.state_reason || "Compile once to see this capability's live state.";
@@ -2052,20 +2469,97 @@ export function configurePromptAttachment(rawAttachment, {
                     };
                     placement.addEventListener("change", updatePlacementHelp);
                     updatePlacementHelp();
-                    row.append(enabled, routingControls, help);
+                    const effective = document.createElement("div");
+                    effective.className = "sonder-prompt-effective-values";
+                    const controlValue = (field) => {
+                        const control = overrideControls.get(field);
+                        if (!control) return overrides[field];
+                        return field === "task_types"
+                            ? [...(control.selectedOptions || [])]
+                                .map((option) => option.value)
+                            : control.value;
+                    };
+                    const refreshEffective = () => {
+                        effective.textContent = "";
+                        const compiledLine = document.createElement("div");
+                        compiledLine.style.cssText = "display:grid;grid-template-columns:minmax(100px,.55fr) minmax(0,1fr) auto;gap:5px;align-items:baseline;font:9px/1.3 system-ui;";
+                        const compiledLabel = document.createElement("span");
+                        compiledLabel.textContent = "Last compiled output";
+                        compiledLabel.style.color = "#8792a5";
+                        const compiledValue = document.createElement("span");
+                        compiledValue.textContent = projection
+                            ? (String(projection.text || "") || `(${projection.state || "empty"})`)
+                            : "Compile to resolve";
+                        compiledValue.title = String(projection?.text || "");
+                        compiledValue.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd3df;";
+                        const compiledSource = document.createElement("span");
+                        compiledSource.textContent = "Compiler projection";
+                        compiledSource.dataset.sonderAuthorityTier = "compiler";
+                        compiledSource.style.cssText = "white-space:nowrap;color:#9eb8d8;font-weight:600;";
+                        compiledLine.append(compiledLabel, compiledValue, compiledSource);
+                        effective.appendChild(compiledLine);
+                        const draftOverrides = { ...overrides };
+                        for (const field of overriddenFields) {
+                            draftOverrides[field] = controlValue(field);
+                        }
+                        const values = referenceCapabilityInputProjection(
+                            capabilityId, {
+                                selected: controls.reference.value,
+                                profile: resolvedProfile, references, semanticUnits,
+                                overrides: draftOverrides,
+                                capabilityConfig: current.config || {},
+                                setupManifest: candidate?.setup_manifest || {},
+                            });
+                        if (!values.length) {
+                            const note = document.createElement("span");
+                            note.textContent = "No authored input fields for this prompt part.";
+                            note.style.cssText = "font:9px/1.3 system-ui;color:#8792a5;";
+                            effective.appendChild(note);
+                            return;
+                        }
+                        for (const value of values) {
+                            const line = document.createElement("div");
+                            line.style.cssText = "display:grid;grid-template-columns:minmax(100px,.55fr) minmax(0,1fr) auto;gap:5px;align-items:baseline;font:9px/1.3 system-ui;";
+                            const label = document.createElement("span");
+                            label.textContent = `Input · ${value.label}`;
+                            label.style.color = "#8792a5";
+                            const rendered = document.createElement("span");
+                            const renderedValue = Array.isArray(value.value)
+                                ? value.value.join(" + ") : String(value.value || "");
+                            rendered.textContent = value.authored_empty
+                                ? "(authored empty)"
+                                : `${renderedValue || "(empty)"}${value.stored_empty
+                                    ? " · stored empty" : ""}`;
+                            rendered.title = renderedValue;
+                            rendered.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd3df;";
+                            const source = document.createElement("span");
+                            source.textContent = value.source;
+                            source.dataset.sonderAuthorityTier = value.tier;
+                            source.style.cssText = `white-space:nowrap;color:${
+                                value.tier === "chip" ? "#e9b77d"
+                                    : (value.tier === "shared" ? "#9fc8bc" : "#8792a5")
+                            };font-weight:${value.tier === "chip" ? "600" : "400"};`;
+                            line.append(label, rendered, source);
+                            effective.appendChild(line);
+                        }
+                    };
+                    row.append(enabled, routingControls, help, effective);
                     capabilityHost.appendChild(row);
                     controls.capabilityRows.set(capabilityId, {
-                        current, checkbox, channel, placement,
+                        current, checkbox, channel, placement, refreshEffective,
                     });
+                    refreshEffective();
                 }
             };
             controls.reference.addEventListener("change", () => {
                 renderCapabilities();
                 updateInheritance();
+                refreshInheritedFields();
                 renderTokenStrip();
             });
             renderCapabilities();
             updateInheritance();
+            refreshInheritedFields();
             renderTokenStrip();
         }
 
@@ -2104,10 +2598,17 @@ export function configurePromptAttachment(rawAttachment, {
                         delete attachment.config.setup_role;
                     }
                 }
-            } else if (attachment.kind === "prompt_link") {
+            } else if (["prompt_link", "prompt_link_scope"].includes(attachment.kind)) {
                 if (!controls.promptId.value) return;
                 attachment.source.prompt_id = controls.promptId.value;
-                attachment.source.channel_key = controls.channel.value;
+                if (attachment.kind === "prompt_link_scope") {
+                    attachment.source.channel_keys = [...controls.channel.selectedOptions]
+                        .map((option) => option.value).filter(Boolean);
+                    delete attachment.source.channel_key;
+                } else {
+                    attachment.source.channel_key = controls.channel.value;
+                    delete attachment.source.channel_keys;
+                }
             } else if (attachment.kind === "vocal_event") {
                 const subjectIds = [...controls.subjects.selectedOptions]
                     .map((option) => option.value).filter(Boolean);
@@ -2144,51 +2645,39 @@ export function configurePromptAttachment(rawAttachment, {
                     attachment.source.semantic_unit_ids = [controls.reference.value];
                     delete attachment.source.reference_item_id;
                 }
-                attachment.config.definition = controls.definition.value;
-                attachment.config.audio_definition = controls.audioDefinition.value;
                 attachment.config.audio_speaker_subject_id = controls.audioSpeaker.value;
-                attachment.config.summary = controls.summary.value;
-                const selectedTaskTypes = [...controls.taskTypes.selectedOptions]
-                    .map((option) => option.value).filter(Boolean);
-                if (selectedTaskTypes.length) attachment.config.task_types = selectedTaskTypes;
-                else delete attachment.config.task_types;
-                attachment.config.text = controls.mention.value;
-                attachment.config.retention_detail = controls.retentionDetail.value;
-                attachment.config.audio_relationship = controls.audioRelationship.value;
-                if (controls.visualIntent.value) {
-                    attachment.config.visual_intent = controls.visualIntent.value;
-                } else {
-                    delete attachment.config.visual_intent;
+                const values = {
+                    definition: controls.definition.value,
+                    audio_definition: controls.audioDefinition.value,
+                    summary: controls.summary.value,
+                    text: controls.mention.value,
+                    retention_detail: controls.retentionDetail.value,
+                    audio_relationship: controls.audioRelationship.value,
+                };
+                if (controls.taskTypes) {
+                    values.task_types = [...controls.taskTypes.selectedOptions]
+                        .map((option) => option.value).filter(Boolean);
                 }
-                if (controls.audioIntent.value) {
-                    attachment.config.audio_intent = controls.audioIntent.value;
-                } else {
-                    delete attachment.config.audio_intent;
+                if (controls.visualIntent) {
+                    values.visual_intent = controls.visualIntent.value;
                 }
+                if (controls.audioIntent) {
+                    values.audio_intent = controls.audioIntent.value;
+                }
+                const savedOverrides = controls.referenceOverrides || {};
+                const savedFields = controls.referenceOverriddenFields || new Set();
+                for (const [field, value] of Object.entries(values)) {
+                    if (savedFields.has(field)) savedOverrides[field] = value;
+                    else delete savedOverrides[field];
+                }
+                attachment.config.overrides = savedOverrides;
                 attachment.capabilities = [...(controls.capabilityRows?.entries() || [])]
-                    .map(([capabilityId, row]) => {
-                        const capability = {
-                            ...row.current,
-                            capability_id: capabilityId,
-                            kind: row.current.kind || capabilityId,
-                            enabled: row.checkbox.checked,
-                            placement: row.placement.value,
-                        };
-                        if (row.channel.value) capability.channel_key = row.channel.value;
-                        else delete capability.channel_key;
-                        // Written under the capability's own key; `text` stays
-                        // as the compatibility mirror the compiler falls back to
-                        // for documents authored before this key existed.
-                        if (capabilityId === "audio_relationship"
-                                && controls.audioRelationship.value.trim()) {
-                            capability.config = {
-                                ...(row.current.config || {}),
-                                audio_relationship: controls.audioRelationship.value,
-                                text: controls.audioRelationship.value,
-                            };
-                        }
-                        return capability;
-                    });
+                    .map(([capabilityId, row]) => sparseCapabilityRecord(row.current, {
+                        capabilityId,
+                        enabled: row.checkbox.checked,
+                        channelKey: row.channel.value,
+                        placement: row.placement.value,
+                    }));
             }
             finish(attachment);
         });
@@ -2387,6 +2876,7 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
     onAdd = null, onActivate = null, onRemove = null, maxVisible = 6,
     allowedKinds = SCOPE_KINDS, attachmentLabelFor = null,
     reusableAttachments = [], onReuse = null, onUnlink = null,
+    onConvertPromptLinkCopy = null,
     allSceneAttachments = [], reuseContext = {} } = {}) {
     const row = document.createElement("div");
     row.style.cssText = "display:flex;gap:4px;align-items:center;flex-wrap:wrap;min-width:0;";
@@ -2427,6 +2917,26 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
             }
         });
         holder.appendChild(chip);
+        if (attachment.kind === "prompt_link_scope" && onRemove) {
+            const unlinkScope = document.createElement("button");
+            unlinkScope.type = "button";
+            unlinkScope.disabled = disabled;
+            unlinkScope.textContent = "Unlink";
+            unlinkScope.title = "Remove the live section dependency without copying its text.";
+            unlinkScope.style.cssText = "padding:2px 5px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#c9bfff;font:8px system-ui;cursor:pointer;";
+            unlinkScope.addEventListener("click", () => onRemove(attachment));
+            holder.appendChild(unlinkScope);
+            if (onConvertPromptLinkCopy) {
+                const copy = document.createElement("button");
+                copy.type = "button";
+                copy.disabled = disabled;
+                copy.textContent = "Convert to copy";
+                copy.title = "Copy the source's current authored channel text here, then remove the live link.";
+                copy.style.cssText = unlinkScope.style.cssText;
+                copy.addEventListener("click", () => onConvertPromptLinkCopy(attachment));
+                holder.appendChild(copy);
+            }
+        }
         if ((groupCounts.get(attachment.emission_group_id) || 0) > 1) {
             const linked = document.createElement("span");
             linked.dataset.sonderLinkedAttachment = "1";

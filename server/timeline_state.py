@@ -653,6 +653,13 @@ class ReferenceMember:
     # stable; prompt-facing composite labels are derived by the shared
     # Reference formatter rather than persisted here.
     name: str = ""
+    # Prompt-facing authored handle. The stable member_id remains the authored
+    # token authority, so renaming this display handle never breaks prompt text.
+    handle: str = ""
+    # Prompt defaults owned by this physical member. Blank inherits the
+    # Reference entity default; staged item overrides remain the final level.
+    visual_intent: str = ""
+    audio_intent: str = ""
     tags: list[str] = field(default_factory=list)
     prompt: str = ""
     crop: dict | None = None
@@ -665,6 +672,9 @@ class ReferenceMember:
             "member_id": self.member_id,
             "asset_id": self.asset_id,
             "name": self.name,
+            "handle": self.handle,
+            "visual_intent": self.visual_intent,
+            "audio_intent": self.audio_intent,
             "tags": list(self.tags),
             "prompt": self.prompt,
             "crop": dict(self.crop) if isinstance(self.crop, dict) else None,
@@ -685,10 +695,20 @@ class ReferenceMember:
             order = int(data.get("order", 0))
         except (TypeError, ValueError, OverflowError):
             order = 0
+        from . import prompt_context
+        visual_intent = str(data.get("visual_intent") or "")
+        if visual_intent not in {"", *prompt_context.VISUAL_INTENTS}:
+            visual_intent = ""
+        audio_intent = str(data.get("audio_intent") or "")
+        if audio_intent not in {"", *prompt_context.AUDIO_INTENTS}:
+            audio_intent = ""
         return cls(
             member_id=str(data.get("member_id", "") or ""),
             asset_id=str(data.get("asset_id", "") or ""),
             name=str(data.get("name", "") or "").strip(),
+            handle=str(data.get("handle", "") or "").strip(),
+            visual_intent=visual_intent,
+            audio_intent=audio_intent,
             tags=normalize_reference_tags(data.get("tags")),
             prompt=str(data.get("prompt", "") or ""),
             crop=normalize_reference_crop(data.get("crop")),
@@ -948,84 +968,25 @@ def repair_reference_ids(project: "TimelineProject") -> None:
             seen_members.add(member_id)
 
 
-def ensure_default_prompt_semantic_units(project: "TimelineProject") -> None:
-    """Give each Reference entity its provider-neutral default Subject unit."""
-    normalized = [prompt_context.normalize_semantic_unit(value)
-                  for value in getattr(project, "prompt_semantic_units", []) or []
-                  if isinstance(value, dict)]
-    references = list(getattr(project, "references", []) or [])
-    reference_ids = {str(getattr(reference, "reference_id", "") or "")
-                     for reference in references}
+def repair_prompt_semantic_unit_ids(project: "TimelineProject") -> None:
+    """Repair blank/duplicate explicit identity ids without merging authored data.
 
-    # Older UI entity/member mutations could create the empty default first,
-    # then append a second unit with the same stable id when the first member
-    # arrived.  Coalesce only provider-generated default ids; custom Subjects
-    # retain their authored identity and membership.
-    default_by_entity = {}
-    retained = []
-    for unit in normalized:
-        unit_id = str(unit.get("semantic_unit_id") or "")
-        entity_id = unit_id[5:] if unit_id.startswith("unit:") else ""
-        if entity_id not in reference_ids:
-            retained.append(unit)
+    The retired auto-mint path used to coalesce duplicate generated ids and could
+    discard one definition. Explicit identities have no generated owner to merge
+    against, so deterministic re-identification preserves every record while
+    existing bindings continue to resolve to the first serialized identity.
+    """
+    seen: set[str] = set()
+    project_id = str(getattr(project, "project_id", "") or "")
+    for index, unit in enumerate(getattr(project, "prompt_semantic_units", []) or []):
+        if not isinstance(unit, dict):
             continue
-        primary = default_by_entity.get(entity_id)
-        if primary is None:
-            default_by_entity[entity_id] = unit
-            retained.append(unit)
-            continue
-        if not primary.get("definition") and unit.get("definition"):
-            primary["definition"] = unit["definition"]
-        primary["intent_overrides"] = {
-            **(unit.get("intent_overrides") or {}),
-            **(primary.get("intent_overrides") or {}),
-        }
-
-    covered_entities = {
-        str(member.get("entity_id") or "")
-        for unit in retained for member in unit.get("source_members", [])
-        if isinstance(member, dict)
-    }
-    for order, reference in enumerate(references):
-        entity_id = str(getattr(reference, "reference_id", "") or "")
-        if not entity_id:
-            continue
-        default_unit = default_by_entity.get(entity_id)
-        if default_unit is not None:
-            default_unit.update({
-                "name": getattr(reference, "name", "Subject") or "Subject",
-                "source_members": [
-                    {"entity_id": entity_id, "member_id": member.member_id}
-                    for member in getattr(reference, "members", []) or []
-                ],
-                "visual_intent": getattr(reference, "visual_intent", "preserve"),
-                "audio_intent": getattr(
-                    reference, "audio_intent", "reference_characteristics"),
-            })
-            continue
-        if str(getattr(reference, "reference_class", "context") or "context") != "subject":
-            continue
-        if entity_id in covered_entities:
-            # A custom Subject already owns this entity and the generated
-            # default was explicitly removed; do not recreate it.
-            continue
-        default_unit = prompt_context.normalize_semantic_unit({
-            "semantic_unit_id": f"unit:{entity_id}",
-            "name": getattr(reference, "name", "Subject") or "Subject",
-            "order": order,
-            "source_members": [
-                {"entity_id": entity_id, "member_id": member.member_id}
-                for member in getattr(reference, "members", []) or []
-            ],
-            "visual_intent": getattr(reference, "visual_intent", "preserve"),
-            "audio_intent": getattr(reference, "audio_intent", "reference_characteristics"),
-            # Creative definition is intentionally blank. Attachments expose
-            # it as a blocking authored field rather than inventing prose.
-            "definition": "",
-        })
-        retained.append(default_unit)
-        default_by_entity[entity_id] = default_unit
-    project.prompt_semantic_units = retained
+        unit_id = str(unit.get("semantic_unit_id") or "").strip()
+        if not unit_id or unit_id in seen:
+            unit_id = _deterministic_reference_id(
+                project_id, f"prompt-identity/{index}", seen)
+            unit["semantic_unit_id"] = unit_id
+        seen.add(unit_id)
 
 
 def effective_scene_fps(project, scene) -> float:
@@ -2475,12 +2436,28 @@ class TimelineProject:
         raw_units = data.get("prompt_semantic_units", [])
         if not isinstance(raw_units, list):
             raw_units = []
+        # One-time conversion for the unreleased pre-redesign shape. This is
+        # deliberately outside normalize_semantic_unit: after the project takes
+        # its next normal save, `sources` is the only authored authority and no
+        # permanent dual-read compatibility branch remains.
+        converted_units = []
+        for raw_unit in raw_units:
+            if not isinstance(raw_unit, dict):
+                continue
+            unit = dict(raw_unit)
+            if "sources" not in unit and isinstance(unit.get("source_members"), list):
+                unit["sources"] = [
+                    {**source, "contribution": "", "inherit_description": False}
+                    for source in unit["source_members"] if isinstance(source, dict)
+                ]
+            unit.pop("source_members", None)
+            converted_units.append(unit)
         project.prompt_semantic_units = [
             prompt_context.normalize_semantic_unit(unit)
-            for unit in raw_units if isinstance(unit, dict)
+            for unit in converted_units
         ]
+        repair_prompt_semantic_unit_ids(project)
         repair_reference_ids(project)
-        ensure_default_prompt_semantic_units(project)
         project.generation_queue = [
             GenerationJob.from_dict(j) for j in data.get("generation_queue", [])
         ]
