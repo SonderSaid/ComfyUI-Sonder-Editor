@@ -680,6 +680,64 @@ def test_format_menu_actions_are_gated_on_custom_ownership():
     assert "migrate" not in json.dumps(result)
 
 
+def test_delete_targets_list_every_custom_format_with_its_served_reason():
+    """The reachability gate, tested by running it.
+
+    Delete was unreachable by construction: the menu acted on the selected
+    format, and selecting a format is exactly what the server counts as a
+    usage. This predicate is what makes an UNUSED custom format reachable, so
+    it is tested under node rather than by matching menu source.
+
+    Mutation this must not survive: filtering the list down to the active
+    descriptor again, or recomputing "in use" in the browser instead of reading
+    the served usages.
+    """
+    module = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    profiles = [
+        {"key": "generic@1", "name": "Generic", "builtin": True},
+        {"key": "used@1", "name": "Used", "builtin": False,
+         "profile_id": "used", "version": "1",
+         "usages": [{"type": "scene", "scene_id": "s1", "scene_name": "Strut"}]},
+        {"key": "free@1", "name": "Free", "builtin": False,
+         "profile_id": "free", "version": "1", "usages": []},
+        {"key": "tmpl@1", "name": "Templated", "builtin": False,
+         "profile_id": "tmpl", "version": "1",
+         "usages": [{"type": "channel_template", "name": "MiniMax H3"}]},
+        # A custom format whose usages key is absent entirely must not be
+        # treated as deletable-unknown; absent means none were reported.
+        {"key": "bare@1", "name": "Bare", "builtin": False,
+         "profile_id": "bare", "version": "1"},
+    ]
+    result = _run_node("\n".join([
+        f"const mod = await import({json.dumps(module)});",
+        f"const rows = mod.promptFormatDeleteTargets({json.dumps(profiles)});",
+        "console.log(JSON.stringify({",
+        "  keys: rows.map((r) => r.key),",
+        "  deletable: rows.filter((r) => r.deletable).map((r) => r.key),",
+        "  reasons: Object.fromEntries(rows.map((r) => [r.key, r.reason])),",
+        "  expected: Object.fromEntries(rows.map((r) =>",
+        "    [r.key, [r.profile_id, r.version, r.name]])),",
+        "  empty: mod.promptFormatDeleteTargets([]).length,",
+        "  missing: mod.promptFormatDeleteTargets(undefined).length,",
+        "}));",
+    ]))
+
+    # Built-ins never appear: they are undeletable regardless of use.
+    assert "generic@1" not in result["keys"]
+    # Sorted by name so the list is stable between openings.
+    assert result["keys"] == ["bare@1", "free@1", "tmpl@1", "used@1"]
+    assert sorted(result["deletable"]) == ["bare@1", "free@1"]
+    # The reason names the actual blocker rather than saying "in use".
+    assert "Strut" in result["reasons"]["used@1"]
+    assert "MiniMax H3" in result["reasons"]["tmpl@1"]
+    assert result["reasons"]["free@1"] == ""
+    # Exact prior values travel with the row, so the delete never parses the
+    # key — a profile_id may legally contain the separator.
+    assert result["expected"]["used@1"] == ["used", "1", "Used"]
+    # The empty-project case is a real state the menu must render, not a crash.
+    assert result["empty"] == 0 and result["missing"] == 0
+
+
 def test_format_menu_defers_to_that_predicate_and_declares_no_migration():
     """Source-level only, and deliberately narrow.
 
@@ -692,8 +750,15 @@ def test_format_menu_defers_to_that_predicate_and_declares_no_migration():
     assert "const actions = promptFormatMenuActions(descriptor);" in panel
     # Disabled state goes through the theme helper, which dims the control as
     # well as blocking the click — `button.disabled` alone is invisible here.
-    assert "setButtonDisabled(remove, !actions.remove);" in panel
-    assert "menu.append(edit, remove);" in panel
+    assert "setButtonDisabled(edit, !actions.edit);" in panel
+    assert "setButtonDisabled(removeOne, !target.deletable);" in panel
+    # Delete targets the LIST, never the selected descriptor: selecting a format
+    # is what puts it in use, so acting on the selection made Delete reachable
+    # only when the server was guaranteed to refuse it.
+    assert "promptFormatDeleteTargets(host._promptContextCatalog?.profiles)" in panel
+    assert 'type: "delete_prompt_context_profile",' in panel
+    # The whole-list PUT deleted by omission and must not come back here.
+    assert "_savePromptContextProfiles" not in panel
     # The declaration editor replaced the label-flattening role inputs.
     assert "mountPromptFormatDeclarationEditor({" in panel
     assert "declarations.collect()" in panel

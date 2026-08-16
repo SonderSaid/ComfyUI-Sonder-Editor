@@ -161,6 +161,86 @@ export function promptFormatMenuActions(descriptor) {
     return { edit: custom, remove: custom };
 }
 
+/** What Reference Prompting actually derives from in a candidate payload.
+ *
+ *  Those rows come from `candidate.setup_manifest`, NOT from `host._references`
+ *  — so the section renders every population at (0) until a compile lands, and
+ *  the compile's success path only refreshed diagnostics and inline
+ *  projections. The section therefore kept its `candidate = null` output until
+ *  some unrelated full render happened, which is why closing and reopening the
+ *  panel "fixed" it: the cached candidate survives everything except a scene
+ *  switch.
+ *
+ *  Comparing this signature rather than the whole payload is what allows a
+ *  landed candidate to rebuild the section WITHOUT rebuilding on every
+ *  debounced keystroke — typing changes the compiled text constantly but
+ *  leaves the setup and ordinal manifests alone. Rebuilding per keystroke is
+ *  the PR-11 reflow this must not reintroduce.
+ */
+export function identityCandidateSignature(candidate) {
+    if (!candidate || typeof candidate !== "object") return "";
+    return JSON.stringify([
+        String(candidate._candidate_scene_id || ""),
+        candidate.setup_manifest ?? null,
+        candidate.ordinal_manifest ?? null,
+    ]);
+}
+
+/** Plain-language reason a format cannot be deleted, from the served usages.
+ *
+ *  The server owns the usage RULE; this only renders what it reported. Never
+ *  recompute which formats are in use here.
+ */
+function describePromptFormatUsages(usages = []) {
+    const scenes = [];
+    const recipes = [];
+    let template = "";
+    for (const usage of usages || []) {
+        const type = String(usage?.type || "");
+        if (type === "scene") scenes.push(String(usage?.scene_name || usage?.scene_id || "a scene"));
+        else if (type === "reference_recipe") recipes.push(String(usage?.scene_id || "a scene"));
+        else if (type === "channel_template") template = String(usage?.name || "the channel template");
+    }
+    const parts = [];
+    if (scenes.length) parts.push(`${scenes.length === 1 ? "scene" : "scenes"} ${scenes.join(", ")}`);
+    if (template) parts.push(`channel template ${template}`);
+    if (recipes.length) {
+        parts.push(`a Reference recipe in ${[...new Set(recipes)].join(", ")}`);
+    }
+    return parts.join("; ");
+}
+
+/** Every custom format the ⋯ menu can offer to delete, with its state.
+ *
+ *  The menu used to act ONLY on the format the picker had selected, and
+ *  selecting a format is what puts it in use — so Delete was enabled exactly
+ *  when the server was guaranteed to refuse, and no unused format could ever
+ *  be reached. Targeting a list is the fix.
+ *
+ *  Exported and pure because the menu itself needs a whole fullscreen host and
+ *  cannot run under node; this is where the behavior is actually testable.
+ */
+export function promptFormatDeleteTargets(profiles = []) {
+    return (profiles || [])
+        .filter((row) => row && row.builtin === false && row.key)
+        .map((row) => {
+            const usages = Array.isArray(row.usages) ? row.usages : [];
+            const reason = describePromptFormatUsages(usages);
+            return {
+                key: String(row.key),
+                name: String(row.name || row.key),
+                profile_id: String(row.profile_id || ""),
+                version: String(row.version || "1"),
+                deletable: usages.length === 0,
+                usages,
+                reason: usages.length
+                    ? `In use by ${reason || "this project"}. Move it off them first.`
+                    : "",
+            };
+        })
+        .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 /** Preserve the source format's channel-template contract when forking. */
 export function promptFormatTemplateBinding(descriptor = {}, definition = {},
     universalToken = "*") {
@@ -312,6 +392,7 @@ export function mountPromptManagementPanel(host) {
     let mounted = true;
     let identityPanelCleanup = () => {};
     let renderNow = () => {};
+    let lastIdentityCandidateSignature = null;
     const identityRefreshGate = createModalRefreshGate(() => renderNow());
     const render = () => identityRefreshGate.request();
     // Esc/blur-commit guard (audit F1): the OVERLAY consumer fires on the
@@ -1669,39 +1750,76 @@ export function mountPromptManagementPanel(host) {
             menu.dataset.sonderPromptContextMenu = "1";
             menu.style.cssText = "position:absolute;right:0;top:calc(100% + 4px);z-index:12010;min-width:190px;padding:5px;border:1px solid #465266;border-radius:6px;background:#1a202a;box-shadow:0 12px 30px rgba(0,0,0,.45);display:flex;flex-direction:column;gap:4px;";
             const edit = makeBtn("Edit as new version…", "Save changes as another immutable version");
-            const remove = makeBtn("Delete custom format", "Delete this unused custom format", "danger");
             const actions = promptFormatMenuActions(descriptor);
-            const custom = actions.edit;
             setButtonDisabled(edit, !actions.edit);
-            setButtonDisabled(remove, !actions.remove);
-            // Say WHY an action is unavailable — a built-in is immutable, so
-            // both are off — rather than leaving a dimmed control unexplained.
+            // Say WHY an action is unavailable — a built-in is immutable —
+            // rather than leaving a dimmed control unexplained.
             const builtinReason = "Built-in formats are immutable. Use Save as custom… first.";
             edit.title = actions.edit
                 ? "Save changes as another immutable version" : builtinReason;
-            remove.title = actions.remove
-                ? "Delete this unused custom format" : builtinReason;
             edit.addEventListener("click", () => {
                 menu.remove(); openProfileEditor({ descriptor, editAsVersion: true });
             });
-            remove.addEventListener("click", async () => {
-                const key = String(descriptor?.key || "");
-                if (!custom || !key || !window.confirm(
-                    `Delete ${descriptor.name || key} (${key})? The server will refuse if it is in use.`)) return;
-                try {
-                    const remaining = (host._promptContextProfiles || []).filter((value) =>
-                        `${value.profile_id}@${value.version || "1"}` !== key);
-                    await host._savePromptContextProfiles?.(remaining);
-                    menu.remove();
-                    notifySuccess(`Deleted prompt format ${descriptor.name || key}.`,
-                        { source: "prompt-profile-delete" });
-                    render();
-                } catch (error) {
-                    notifyWarning(error?.message || "Prompt format is still in use.",
-                        { source: "prompt-profile-delete-refused" });
-                }
-            });
-            menu.append(edit, remove); menuWrap.appendChild(menu);
+            menu.appendChild(edit);
+
+            // Delete targets EVERY custom format, not the selected one. Acting
+            // on the selection made Delete reachable only while the format was
+            // in use, which is precisely when the server refuses it.
+            const deleteHeading = document.createElement("div");
+            deleteHeading.textContent = "Delete custom format";
+            deleteHeading.style.cssText = `margin-top:2px;padding:2px 2px 0;border-top:1px solid #2c3542;font:9px system-ui;color:${COLORS.textDim};`;
+            menu.appendChild(deleteHeading);
+            const targets = promptFormatDeleteTargets(host._promptContextCatalog?.profiles);
+            if (!targets.length) {
+                const empty = document.createElement("div");
+                // An empty menu section reads as broken; say what is missing.
+                empty.textContent = "This project has no custom formats.";
+                empty.style.cssText = `padding:3px 2px;font:9px system-ui;color:${COLORS.textDim};`;
+                menu.appendChild(empty);
+            }
+            for (const target of targets) {
+                const row = document.createElement("div");
+                row.dataset.promptFormatDeleteRow = target.key;
+                row.style.cssText = "display:flex;align-items:center;gap:6px;min-width:0;";
+                const label = document.createElement("span");
+                label.textContent = target.name;
+                label.style.cssText = `flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:10px system-ui;color:${COLORS.text};`;
+                label.title = `${target.name} (${target.key})`;
+                const removeOne = makeBtn("Delete", "", "danger");
+                removeOne.style.flex = "0 0 auto";
+                setButtonDisabled(removeOne, !target.deletable);
+                removeOne.title = target.deletable
+                    ? `Delete ${target.name} (${target.key})`
+                    : target.reason;
+                removeOne.addEventListener("click", async () => {
+                    if (!window.confirm(`Delete prompt format ${target.name} (${target.key})?`)) return;
+                    try {
+                        // Targeted and identity-checked, like a recipe delete.
+                        // The old whole-list PUT deleted by omission, so a
+                        // format created in another window — absent from this
+                        // browser's copy — was destroyed alongside the target.
+                        await host._mutateReferences?.([{
+                            type: "delete_prompt_context_profile",
+                            profile_key: target.key,
+                            expected: {
+                                profile_id: target.profile_id,
+                                version: target.version,
+                                name: target.name,
+                            },
+                        }], "delete prompt format");
+                        menu.remove();
+                        notifySuccess(`Deleted prompt format ${target.name}.`,
+                            { source: "prompt-profile-delete" });
+                        render();
+                    } catch (error) {
+                        notifyWarning(error?.message || "Prompt format is still in use.",
+                            { source: "prompt-profile-delete-refused" });
+                    }
+                });
+                row.append(label, removeOne);
+                menu.appendChild(row);
+            }
+            menuWrap.appendChild(menu);
             // Dismiss on outside pointer or Escape. Deferred one tick so the
             // click that opened the menu does not immediately close it.
             const dismiss = (event) => {
@@ -1791,6 +1909,7 @@ export function mountPromptManagementPanel(host) {
             controls.append(task, first, last, save); card.appendChild(controls);
         }
         const candidate = currentCandidatePayload() || {};
+        lastIdentityCandidateSignature = identityCandidateSignature(candidate);
         const profileKey = profile.value || defaultProfile;
         const identityProfile = currentPromptProfile(profileKey);
         const sameReferenceOwner = (attachment, owner) => {
@@ -2768,6 +2887,19 @@ export function mountPromptManagementPanel(host) {
         element: backdrop,
         refresh: render,
         refreshDiagnostics: renderDiagnostics,
+        // A landed candidate must reach every consumer that derives from it,
+        // not only diagnostics and inline projections. Routed through `render`
+        // so it passes `identityRefreshGate` — calling the identity section
+        // directly would discard an open identity-editor draft, which is the
+        // loss that gate exists to prevent.
+        applyCandidate: (payload) => {
+            if (!mounted) return false;
+            const next = identityCandidateSignature(payload);
+            if (next === lastIdentityCandidateSignature) return false;
+            lastIdentityCandidateSignature = next;
+            render();
+            return true;
+        },
         cleanup: close,
         isMounted: () => mounted,
     };

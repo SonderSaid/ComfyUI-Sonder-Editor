@@ -300,6 +300,115 @@ def test_profile_usage_scan_tolerates_a_blank_reference_lane_recipe():
         "reference_recipe"]
 
 
+def _custom_profile(profile_id="custom", name="Custom"):
+    return prompt_context.normalize_profile({
+        "profile_id": profile_id, "version": "1", "name": name,
+        **prompt_context.profile_fork_seed(
+            prompt_context.BUILTIN_PROFILES["generic@1"])})
+
+
+def _expected_for(profile):
+    return {"profile_id": profile["profile_id"], "version": profile["version"],
+            "name": profile["name"]}
+
+
+def test_catalog_serves_usages_so_the_author_sees_why_a_format_is_undeletable():
+    """The rule already existed; only the refusal could ever state it.
+
+    `_prompt_context_profile_usages` is a pure read, but it was reachable only
+    by attempting a delete, so the authoring surface could not disable a row and
+    say why. Serving it keeps that function the single authority — the browser
+    must never restate the usage rule.
+    """
+    used = _custom_profile("used", "Used")
+    free = _custom_profile("free", "Free")
+    scene = Scene(scene_id="scene")
+    scene.prompt_context_profile_id = "used@1"
+    project = TimelineProject(project_id="project", scenes=[scene],
+                              prompt_context_profiles=[used, free])
+
+    rows = {row["key"]: row for row in
+            routes._references_payload(project)["prompt_context_catalog"]["profiles"]}
+    assert [row["type"] for row in rows["used@1"]["usages"]] == ["scene"]
+    assert rows["used@1"]["usages"][0]["scene_id"] == "scene"
+    assert rows["free@1"]["usages"] == []
+    # Built-ins are undeletable regardless of use, so they carry no usages.
+    assert "usages" not in rows["generic@1"]
+
+
+def test_targeted_profile_delete_leaves_a_concurrently_created_format_alone():
+    """The decisive test for the write shape.
+
+    Delete used to be OMISSION from a whole-project PUT of the profile list, so
+    a format this browser had never loaded — created in another window, or by a
+    concurrent `Save as custom…` — was silently destroyed by any delete. Naming
+    one victim is what makes the concurrent create survive.
+
+    Mutation this must not survive: route the delete back through
+    `_normalize_prompt_context_profile_update` with the caller's stale list.
+    """
+    doomed = _custom_profile("doomed", "Doomed")
+    concurrent = _custom_profile("concurrent", "Concurrent")
+    project = TimelineProject(project_id="project", scenes=[Scene(scene_id="scene")],
+                              prompt_context_profiles=[doomed, concurrent])
+
+    routes._apply_reference_mutation_operations(project, [{
+        "type": "delete_prompt_context_profile", "profile_key": "doomed@1",
+        "expected": _expected_for(doomed),
+    }])
+
+    remaining = [prompt_context.profile_key(value)
+                 for value in project.prompt_context_profiles]
+    assert remaining == ["concurrent@1"]
+
+
+def test_targeted_profile_delete_refuses_stale_missing_builtin_and_in_use():
+    doomed = _custom_profile("doomed", "Doomed")
+    scene = Scene(scene_id="scene")
+    project = TimelineProject(project_id="project", scenes=[scene],
+                              prompt_context_profiles=[doomed])
+
+    def refuse(operation):
+        with pytest.raises(routes.ProjectMutationRequestError) as exc:
+            routes._apply_reference_mutation_operations(project, [operation])
+        return exc.value
+
+    # A renamed-under-us target is not the format the author chose.
+    stale = {**_expected_for(doomed), "name": "Something Else"}
+    assert refuse({"type": "delete_prompt_context_profile",
+                   "profile_key": "doomed@1", "expected": stale}).code == "identity_mismatch"
+    # Expected prior values are mandatory, as they are for a recipe delete.
+    assert refuse({"type": "delete_prompt_context_profile",
+                   "profile_key": "doomed@1"}).code == "missing_expected_identity"
+    assert refuse({"type": "delete_prompt_context_profile",
+                   "profile_key": "generic@1", "expected": _expected_for(doomed)},
+                  ).code == "immutable_prompt_context_profile"
+    assert refuse({"type": "delete_prompt_context_profile",
+                   "profile_key": "ghost@1", "expected": _expected_for(doomed)},
+                  ).code == "item_not_found"
+    # Every refusal above left the project untouched.
+    assert [prompt_context.profile_key(value)
+            for value in project.prompt_context_profiles] == ["doomed@1"]
+
+    # The in-use refusal is re-checked here, so this route cannot become a way
+    # around it, and it still carries the usages that name the blocker.
+    scene.prompt_context_profile_id = "doomed@1"
+    in_use = refuse({"type": "delete_prompt_context_profile",
+                     "profile_key": "doomed@1", "expected": _expected_for(doomed)})
+    assert in_use.code == "prompt_context_profile_in_use"
+    assert [row["type"] for row in in_use.usages] == ["scene"]
+    assert project.prompt_context_profiles
+
+    # Freeing it makes the same call succeed — the refusal is about use, not
+    # about the format being unreachable.
+    scene.prompt_context_profile_id = ""
+    routes._apply_reference_mutation_operations(project, [{
+        "type": "delete_prompt_context_profile", "profile_key": "doomed@1",
+        "expected": _expected_for(doomed),
+    }])
+    assert project.prompt_context_profiles == []
+
+
 @pytest.mark.parametrize("definition,expected", [
     # The reported defect: inherited Library prose ends in a full stop, so the
     # citation landed after it as a fragment.

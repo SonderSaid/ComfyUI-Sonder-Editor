@@ -78,6 +78,19 @@ a fresh `[Unreleased]` block.
 - The prompt format actions menu now closes from its own button, from an outside
   click, and with Escape; unavailable actions are visibly dimmed and explain why
   instead of appearing to do nothing.
+- Custom prompt formats can now actually be deleted. The actions menu lists every
+  custom format in the project instead of only the one currently selected — which
+  was always the one in use, and so always refused — and a format that cannot be
+  deleted is dimmed and names the scenes, channel template, or Reference recipe
+  still using it. Deleting now names the single format rather than rewriting the
+  whole list, so a format created in another window is no longer destroyed
+  alongside it.
+- Reference Prompting now fills in as soon as the scene compiles, instead of
+  showing every population as empty until the Prompt tool was closed and
+  reopened.
+- A Reference chip opened before its prompt format finishes loading now says that
+  format-declared fields are still loading, and that saved values are untouched,
+  instead of silently showing no task-type or handling rows at all.
 - Disabled editor buttons no longer highlight on hover, and the prompt section
   `+` and `×` controls are the same size.
 - Prompt Context chips now wrap to two container-bounded lines, scope placement reads **After section prefixes**, routing rows use title-case capability labels and stack cleanly at constrained widths, and fullscreen background paste is ignored without an intrusive warning.

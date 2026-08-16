@@ -1821,24 +1821,6 @@ export class EditorWidget {
         };
     }
 
-    async _savePromptContextProfiles(profiles) {
-        if (!this.projectDir) return null;
-        const before = this._captureProjectDependencies();
-        const dirName = this._projectDirName();
-        const { payload } = await fetchProjectJson(
-            api.apiURL(`/sonder-editor/project/${encodeURIComponent(dirName)}`),
-            { method: "PUT", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt_context_profiles: profiles }) },
-            { projectId: dirName },
-        );
-        this._promptContextProfiles = Array.isArray(payload?.prompt_context_profiles)
-            ? payload.prompt_context_profiles : [];
-        this._pushProjectDependencyUndo("edit prompt formats", before);
-        await this._fetchReferences({ ignoreMutationGate: true,
-            reason: "prompt_context_profiles", force: true });
-        return this._promptContextProfiles;
-    }
-
     async _createPromptContextProfile(profile) {
         if (!this.projectDir) return null;
         const before = this._captureProjectDependencies();
@@ -10943,6 +10925,12 @@ export class EditorWidget {
                 this._promptPanelHandle?.refreshDiagnostics?.(
                     this._promptContextCandidateCache);
                 this._refreshInlinePromptProjections?.(this._promptContextCandidateCache);
+                // Reference Prompting reads the setup manifest out of THIS
+                // payload, so diagnostics and inline projections alone left it
+                // showing every population at (0) until an unrelated full
+                // render happened. Cheap when nothing it depends on changed.
+                this._promptPanelHandle?.applyCandidate?.(
+                    this._promptContextCandidateCache);
             } catch (error) {
                 if (token === this._promptContextPreviewToken) {
                     console.warn("[Sonder] Prompt Context candidate preview failed:", error);

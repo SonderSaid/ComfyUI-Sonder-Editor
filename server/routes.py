@@ -4355,10 +4355,23 @@ def _references_payload(project: TimelineProject) -> dict:
                     "name": str(value.get("name")
                                 or prompt_context.profile_key(value)),
                     "builtin": False,
+                    # Served split as well as joined so a targeted delete can
+                    # echo exact prior values without parsing the key — a
+                    # profile_id is author-supplied and must not be recovered
+                    # by splitting on a separator it could contain.
+                    "profile_id": str(value.get("profile_id") or ""),
+                    "version": str(value.get("version") or "1"),
                     "compatible_templates": sorted(
                         prompt_context.profile_compatible_templates(value)),
                     "fork_seed": prompt_context.profile_fork_seed(value),
                     "resolved": prompt_context.resolved_profile_definition(value),
+                    # Served so the authoring surface can show WHY a format is
+                    # undeletable before the user tries, instead of only on the
+                    # refusal.  Same authority the refusal uses, so the browser
+                    # never restates the rule.  Built-ins omit it: they are
+                    # undeletable regardless of use.
+                    "usages": _prompt_context_profile_usages(
+                        project, prompt_context.profile_key(value)),
                 }
                 for value in project.prompt_context_profiles
                 if isinstance(value, dict)
@@ -4992,6 +5005,55 @@ def _validate_recipe_expected(recipe: dict, expected) -> None:
             _mutation_error("Reference recipe identity mismatch", 409, "identity_mismatch")
 
 
+def _apply_delete_prompt_context_profile(project: TimelineProject, operation: dict) -> str:
+    """Targeted, identity-checked delete of one custom prompt format.
+
+    Delete used to happen by OMISSION from a whole-project PUT of the entire
+    profile list, so a format created in another window — or by a concurrent
+    `Save as custom…` — that this browser had never loaded was silently dropped
+    by any delete.  Naming the single victim lets a concurrent create survive,
+    and `expected` refuses a stale target rather than removing a format the
+    author never saw.  Same shape as `delete_recipe`, the sibling
+    project-durable custom catalog.
+
+    The in-use refusal is unchanged and still authoritative: it is re-checked
+    here so this route cannot become a way around it.
+    """
+    key = str(operation.get("profile_key", "") or "").strip()
+    if not key:
+        _mutation_error("delete_prompt_context_profile requires profile_key",
+                        400, "invalid_prompt_context_profile")
+    if key in prompt_context.BUILTIN_PROFILES:
+        _mutation_error("Built-in prompt formats cannot be deleted",
+                        409, "immutable_prompt_context_profile")
+    index = next(
+        (position for position, value in enumerate(project.prompt_context_profiles)
+         if isinstance(value, dict) and prompt_context.profile_key(value) == key),
+        -1)
+    if index < 0:
+        _mutation_error(f"Prompt format not found: {key}", 404, "item_not_found")
+    # Compare against the NORMALIZED profile, which is the shape the catalog
+    # served the author: a stored profile missing `version` reads as "1" there,
+    # and comparing raw would refuse a caller that echoed back exactly what it
+    # was given.
+    current = prompt_context.normalize_profile(project.prompt_context_profiles[index])
+    required = {"profile_id", "version", "name"}
+    expected = _require_expected(operation.get("expected"), required,
+                                 "prompt format deletion")
+    for field in required:
+        if not _expected_matches(current.get(field), expected.get(field)):
+            _mutation_error("Prompt format identity mismatch", 409, "identity_mismatch")
+    usages = _prompt_context_profile_usages(project, key)
+    if usages:
+        exc = ProjectMutationRequestError(
+            f"Prompt format {key} is still in use", 409,
+            "prompt_context_profile_in_use")
+        exc.usages = usages
+        raise exc
+    project.prompt_context_profiles.pop(index)
+    return key
+
+
 def _recollapse_prompt_channels(project: TimelineProject, from_template: dict,
                                 to_template: dict) -> int:
     """Move every section in every scene onto a new channel template.
@@ -5215,6 +5277,9 @@ def _apply_reference_mutation_operations(project: TimelineProject, operations: l
             _validate_recipe_expected(current, operation.get("expected"))
             project.reference_recipes.pop(index)
             results.append({"type": op_type, "recipe_id": recipe_id})
+        elif op_type == "delete_prompt_context_profile":
+            profile_key = _apply_delete_prompt_context_profile(project, operation)
+            results.append({"type": op_type, "profile_key": profile_key})
         else:
             _mutation_error(f"Unsupported reference operation: {op_type}", 400, "unsupported_reference_mutation")
     return {

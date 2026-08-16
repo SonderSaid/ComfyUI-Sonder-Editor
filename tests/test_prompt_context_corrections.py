@@ -917,6 +917,68 @@ def test_reference_chip_save_preserves_task_types_without_or_beyond_vocabulary()
     }
 
 
+def test_reference_chip_says_when_declared_fields_could_not_resolve():
+    """An unresolved format explains itself; a field-less one stays silent.
+
+    Opened before the catalog landed, `resolvedProfile` is `{}`, so every
+    declared control returned null and Summary task types plus both retention
+    intents rendered NO ROW AT ALL with nothing saying why — indistinguishable
+    from a format that genuinely declares none.
+
+    The discrimination is the point: keying this on "the catalog is absent"
+    would show a loading row forever on a legitimate format declaring no such
+    fields. Mutation this must not survive: render the notice whenever a
+    declared control is missing.
+    """
+    result = _run_chip_dom_script("""
+        const scene = {
+            duration_frames: 20, _context_channel_keys: ["visual"],
+            reference_lane_count: 1, reference_lane_configs: [{}],
+            reference_lane_recipes: [{lane_id:"lane", recipe:{soft:{
+                compatible_profiles:["generic@1"],
+                exposed_capabilities:["derived_prompt"],
+            }}}],
+            reference_items: [{reference_item_id:"item", lane_index:0,
+                start_frame:0, end_frame:20, members:[]}],
+        };
+        const attachment = () => ({
+            attachment_id:"one", kind:"reference",
+            source:{reference_item_id:"item"}, config:{overrides:{}},
+            capabilities:[{capability_id:"derived_prompt",kind:"derived_prompt",
+                placement:"inline",enabled:true}],
+        });
+        const notices = () => document.body.querySelectorAll("div")
+            .filter((node) => node.dataset.sonderPromptDeclaredFieldsState)
+            .map((node) => node.textContent);
+        // The catalog has not arrived: the chip receives no profile at all.
+        mod.configurePromptAttachment(attachment(), {scene, profileId:"generic@1"});
+        const unresolved = notices();
+        document.body.children = [];
+        // A REAL format that declares a reference capability but no task types
+        // or intents. Nothing is wrong here, so nothing should be said.
+        mod.configurePromptAttachment(attachment(), {
+            scene, profileId:"generic@1",
+            profile:{profile_id:"generic", capabilities:{reference:{derived:{
+                derived_prompt:{order:1,channel_key:"visual",placement:"inline",
+                    label:"Reference prompt",fields:{}},
+            }}}},
+        });
+        const declaredNone = notices();
+        console.log(JSON.stringify({
+            unresolvedCount: unresolved.length,
+            unresolvedText: unresolved[0] || "",
+            declaredNoneCount: declaredNone.length,
+        }));
+    """)
+    assert result["unresolvedCount"] == 1
+    assert "still loading" in result["unresolvedText"]
+    # It must reassure rather than imply the values were dropped — the stored
+    # overrides really are untouched, because a control that never rendered is
+    # excluded from `overrideControls` and its key never enters the save.
+    assert "untouched" in result["unresolvedText"]
+    assert result["declaredNoneCount"] == 0
+
+
 def test_active_chip_intersects_recipe_union_but_keeps_saved_undeclared_parts():
     result = _run_chip_dom_script("""
         const scene = {

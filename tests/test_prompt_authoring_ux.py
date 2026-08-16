@@ -15,6 +15,16 @@ def _source(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def _run_node(script: str):
+    """Execute an exported predicate under node and return its JSON output."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for this test")
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+
+
 def _method(source: str, name: str, next_name: str) -> str:
     def declaration(method_name: str, offset: int = 0) -> int:
         candidates = [source.find(prefix, offset) for prefix in (
@@ -932,6 +942,59 @@ def test_mounted_prompt_consumers_request_and_reconcile_dependencies():
     assert "if (this._timelineMutationDepth === 0)" in timeline_commit
     project_update = _method(widget, "updateProject", "refresh")
     assert 'this._fetchReferences({ reason: "load_project", force: true })' in project_update
+
+
+def test_landed_candidate_rebuilds_reference_prompting_but_not_on_every_keystroke():
+    """Reference Prompting reads `candidate.setup_manifest`, not `_references`.
+
+    Confirmed live 2026-08-16 against the real editor: four seconds after the
+    panel opened, the candidate cache held a scene-matched, non-stale payload
+    with three `setup_manifest.pictures` rows while the DOM still showed three
+    "no references resolve in this window" messages. A bare `refresh()` — same
+    cached candidate, no refetch — rendered all three `<Picture N>` rows. The
+    compile's success path simply never told that section anything.
+
+    The signature is what keeps the fix from becoming PR-11 again: typing
+    rewrites the compiled text on every debounce but leaves the setup and
+    ordinal manifests alone, so only a genuinely new manifest rebuilds.
+    """
+    module = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    base = {"_candidate_scene_id": "s1",
+            "setup_manifest": {"pictures": [{"slot": 1}]},
+            "ordinal_manifest": {"pictures": {"m1": 1}}}
+    typed = {**base, "channels": {"visual": "text the user just typed"},
+             "emissions": ["changed"], "_stale": False}
+    restaged = {**base, "setup_manifest": {"pictures": [{"slot": 1}, {"slot": 2}]}}
+    result = _run_node("\n".join([
+        f"const mod = await import({json.dumps(module)});",
+        "const sig = mod.identityCandidateSignature;",
+        "console.log(JSON.stringify({",
+        f"  typingIsInert: sig({json.dumps(base)}) === sig({json.dumps(typed)}),",
+        f"  restageRebuilds: sig({json.dumps(base)}) !== sig({json.dumps(restaged)}),",
+        f"  arrivalRebuilds: sig(null) !== sig({json.dumps(base)}),",
+        "  emptyStable: sig(null) === sig(undefined),",
+        "}));",
+    ]))
+    # The whole point: a landed manifest rebuilds, a keystroke does not.
+    assert result["arrivalRebuilds"] is True
+    assert result["restageRebuilds"] is True
+    assert result["typingIsInert"] is True
+    assert result["emptyStable"] is True
+
+    widget = _source("web/js/editor_widget.js")
+    panel = _source("web/js/editor_prompt_panel.js")
+    # The compile success path must reach the seam, not only diagnostics.
+    preview = _method(widget, "_previewPromptContextCandidate",
+                      "_refreshPromptUsageHighlight")
+    assert "this._promptPanelHandle?.applyCandidate?.(" in preview
+    assert preview.index("refreshDiagnostics") < preview.index("applyCandidate")
+    # It must go through `render`, which is gated by `identityRefreshGate`;
+    # touching the identity section directly discards an open modal draft.
+    seam = panel.split("applyCandidate: (payload) => {", 1)[1].split("},", 1)[0]
+    assert "render();" in seam
+    assert "identityCandidateSignature(payload)" in seam
+    assert "if (next === lastIdentityCandidateSignature) return false;" in seam
+    assert "mountPromptIdentityPanel(" not in seam
 
 
 def test_deferred_references_replay_keeps_the_requesting_consumer():

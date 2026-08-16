@@ -1730,6 +1730,14 @@ export function configurePromptAttachment(rawAttachment, {
     const attachment = normalizePromptAttachment(rawAttachment);
     const resolvedProfile = profile && typeof profile === "object"
         ? profile : (candidate?.profile || {});
+    // Did a format actually RESOLVE, or is this the empty object the chip gets
+    // when the catalog has not arrived? The distinction matters: an unresolved
+    // profile must say so, while a resolved format that simply declares no
+    // task types or intents must keep rendering nothing at all. Keying this on
+    // "the catalog is absent" would show a loading row forever on a legitimate
+    // format that declares no such fields.
+    const profileResolved = Boolean(resolvedProfile
+        && (resolvedProfile.profile_id || resolvedProfile.capabilities));
     const referenceDerived = referenceDerivedDeclarations(resolvedProfile);
     return new Promise((resolve) => {
         const backdrop = document.createElement("div");
@@ -2274,6 +2282,23 @@ export function configurePromptAttachment(rawAttachment, {
                 referenceRows.push(overridableFieldRow(
                     declaration.label || "Audio handling", "audio_intent",
                     declaration.help || "Override the inherited audio handling."));
+            }
+            if (!profileResolved) {
+                // Opened before the format catalog landed, every declared field
+                // rendered NO ROW AT ALL and nothing said why — Summary task
+                // types and both retention intents simply vanished. The stored
+                // overrides are safe (a control that never rendered is excluded
+                // from `overrideControls`, so its key never enters the save),
+                // but silence reads as "this format has no such fields".
+                //
+                // Expiry: removable once the prompt format catalog is served
+                // synchronously with the panel mount, so a chip can never open
+                // ahead of it.
+                const notice = document.createElement("div");
+                notice.dataset.sonderPromptDeclaredFieldsState = "unresolved";
+                notice.style.cssText = "grid-column:2;font:9px/1.35 system-ui;color:#e9b77d;";
+                notice.textContent = "Format-declared fields are still loading, so any task types and handling choices this format declares are not shown yet. Close and reopen this chip once the prompt format catalog arrives; your saved values are untouched.";
+                referenceRows.push(notice);
             }
             panel.append(...referenceRows);
 
