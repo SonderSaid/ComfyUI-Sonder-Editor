@@ -78,3 +78,25 @@ def test_all_channels_is_the_new_browser_local_default_and_keeps_every_editor_mo
     assert "contextMenuHintDismissed: raw.contextMenuHintDismissed" in settings
     assert 'this._shortcutSection("Prompt"' in widget
     assert '"Shift+F10 / Menu"' in widget
+
+
+def test_menu_rows_bound_declared_hint_text_and_keep_the_arrow_rightmost():
+    """A hint comes from declared metadata, so the renderer owns its bound."""
+    source = _source("web/js/editor_context_menu.js")
+    # The panel cannot grow without limit just because a declaration is long.
+    assert "max-width:min(440px,92vw);" in source
+    assert "hint.length > 48" in source
+    assert "if (hint.length > 48) secondary.title = hint;" in source
+    # Hint and arrow share one trailing group rather than competing for the
+    # same flex end, so a row carrying both stays readable.
+    assert 'trailing.appendChild(secondary)' in source
+    assert 'trailing.appendChild(arrow)' in source
+
+
+def test_writing_aid_rows_preview_the_text_they_insert():
+    chips = _source("web/js/prompt_context_chips.js")
+    # The preview is the aid's own insertable text. A capability's `example` is
+    # presentation-only and must never be offered as if it were insertable.
+    assert "function writingAidPreview(aid)" in chips
+    assert "hint = writingAidPreview(aid)" in chips
+    assert "example" not in chips.split("function writingAidPreview")[1].split("}")[0]

@@ -62,3 +62,39 @@ def test_paste_dispatch_priority_consumption_pass_and_lifecycle():
     assert result["preserveCalls"] == ["preserve"]
     assert result["preserveStopped"] is True
     assert result["preservePrevented"] is False
+
+
+def test_a_consumer_that_names_no_known_handler_is_refused_at_registration():
+    """A handler-less consumer holds a priority slot it can never act on.
+
+    The Channel Template editor registered `onKeyDown`/`isActive` — neither of
+    which this module reads — so its Escape never ran and fell through to the
+    OVERLAY below it, closing that surface instead. Dispatch skips such a
+    consumer silently, so the refusal has to happen at registration.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for keyboard ownership coverage")
+    module_url = (ROOT / "web" / "js" / "keyboard_ownership.js").as_uri()
+    script = f"""
+        globalThis.window = {{ addEventListener() {{}}, removeEventListener() {{}} }};
+        const mod = await import({json.dumps(module_url)});
+        const attempt = (options) => {{
+            try {{ mod.register(options)(); return "registered"; }}
+            catch (error) {{ return String(error.message); }}
+        }};
+        console.log(JSON.stringify({{
+            misspelled: attempt({{ id:"template-editor", priority:100,
+                isActive: () => true, onKeyDown: () => true }}),
+            handlerless: attempt({{ id:"empty", priority:100 }}),
+            keyupOnly: attempt({{ id:"keyup-only", priority:100, keyup() {{ return false; }} }}),
+        }}));
+    """
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True,
+    ).stdout)
+    assert "could never fire" in result["misspelled"]
+    assert "could never fire" in result["handlerless"]
+    # One handler is enough; this is not a demand for all three.
+    assert result["keyupOnly"] == "registered"

@@ -1142,15 +1142,26 @@ def test_section_scope_prompt_link_picker_defaults_all_channels_and_separates_ac
         const modal = document.body.children.at(-1);
         const selects = modal.querySelectorAll("select");
         selects[0].value = "source";
-        const channelSelect = selects.find((select) => select.multiple === true);
-        const attach = modal.querySelectorAll("button")
-            .find((button) => button.textContent === "Attach");
-        attach._handlers.click[0]();
+        // Channels are checkboxes, not a ctrl-click multi-select.
+        const boxes = modal.querySelectorAll("input")
+            .filter((input) => input.type === "checkbox");
+        const buttons = modal.querySelectorAll("button");
+        const defaulted = boxes.map((box) => [box.value, box.checked]);
+        // "None" then "All" proves both bulk actions reach every row.
+        buttons.find((button) => button.textContent === "None")._handlers.click[0]();
+        const cleared = boxes.every((box) => !box.checked);
+        buttons.find((button) => button.textContent === "All")._handlers.click[0]();
+        const restored = boxes.every((box) => box.checked);
+        // Narrow to one channel and confirm only that one is stored.
+        boxes.find((box) => box.value === "audio").checked = false;
+        buttons.find((button) => button.textContent === "Attach")._handlers.click[0]();
         const configured = await configuredPromise;
         console.log(JSON.stringify({
             exportable: attachment.link_exportable,
             actions: [removed, copied],
-            multiple: channelSelect.multiple,
+            defaulted, cleared, restored,
+            role: modal.querySelectorAll("div")
+                .some((node) => node.attributes.role === "group"),
             channelKeys: configured.source.channel_keys,
             sourcePrompt: configured.source.prompt_id,
         }));
@@ -1158,8 +1169,13 @@ def test_section_scope_prompt_link_picker_defaults_all_channels_and_separates_ac
     assert result == {
         "exportable": True,
         "actions": [1, 1],
-        "multiple": True,
-        "channelKeys": ["visual", "audio"],
+        # No stored selection still means every channel.
+        "defaulted": [["visual", True], ["audio", True]],
+        "cleared": True,
+        "restored": True,
+        # A checkbox group carries its own accessible name.
+        "role": True,
+        "channelKeys": ["visual"],
         "sourcePrompt": "source",
     }
 
@@ -1510,8 +1526,19 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
             bookmark: mod.promptInsertionBookmark(aidEditor),
             writingAids: [{ id: "cancel_aid", label: "Cancel aid", text: "{text}" }],
         });
-        globalThis.prompt = () => null;
-        await aidItems[1].submenu.find((item) => item.writingAidId === "cancel_aid").action();
+        // An aid needing free text opens the bounded dialog rather than a native
+        // prompt. The dialog is built synchronously, so it can be driven before
+        // awaiting the action it belongs to.
+        globalThis.prompt = () => { throw new Error("native prompt must not be used"); };
+        const aidPromise = aidItems[1].submenu
+            .find((item) => item.writingAidId === "cancel_aid").action();
+        const aidBackdrop = document.body.children.at(-1);
+        const aidDialogButtons = aidBackdrop.querySelectorAll("button")
+            .map((button) => button.textContent);
+        aidBackdrop.querySelectorAll("button")
+            .find((button) => button.textContent === "Cancel")
+            ._handlers.click[0]();
+        await aidPromise;
 
         const documentEditor = mod.createPromptDocumentEditor({ text: "hello" });
         const span = documentEditor.children[0];
@@ -1555,6 +1582,7 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
             cancelCalls,
             staleCalls,
             aidCalls,
+            aidDialogButtons,
             realBookmark,
             realRestored,
             detachedRestored,
@@ -1573,6 +1601,9 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
     assert result["cancelCalls"] == ["capture", "configure", "restore"]
     assert result["staleCalls"] == ["capture", "configure", "restore"]
     assert result["aidCalls"] == ["capture", "restore"]
+    # Cancelling the bounded dialog restores the caret and inserts nothing, the
+    # same contract the native prompt used to carry.
+    assert result["aidDialogButtons"] == ["Cancel", "Insert"]
     assert result["realBookmark"]["start"]["node_id"]
     assert result["realBookmark"]["start"]["node_id"] == result["realBookmark"]["end"]["node_id"]
     assert result["realBookmark"]["start"]["offset"] == 3
@@ -1582,27 +1613,6 @@ def test_async_context_menu_restores_caret_bookmark_before_insert():
     assert result["realRestoredOffset"] == 3
     assert result["focusCount"] == 1
     assert result["exposesBookmarkContract"] is True
-
-
-def test_custom_guide_binding_follows_template_not_profile_id_spelling():
-    result = _run_chip_dom_script("""
-        const hasGuideBinding = () => document.body.querySelectorAll("select")
-            .some((select) => select.options.some((option) => option.value === "first"));
-        mod.configurePromptAttachment({ kind: "custom" }, {
-                profileId: "forked_profile@1",
-                profile: { validators: ["minimax_reference_setup"] } });
-        const forkedH3 = hasGuideBinding();
-        document.body.children = [];
-        mod.configurePromptAttachment({ kind: "custom" }, {
-                profileId: "minimax_h3_misleading@1", profile: { validators: [] } });
-        console.log(JSON.stringify({ forkedH3, misleadingGeneric: hasGuideBinding() }));
-    """)
-    assert result == {"forkedH3": True, "misleadingGeneric": False}
-
-    panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(encoding="utf-8")
-    widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    assert panel.count("profile: currentPromptProfile()") >= 7
-    assert widget.count("profile: this._resolvedPromptContextProfile") >= 3
 
 
 def test_chip_editor_defers_owned_keys_during_ime_composition():
@@ -1963,3 +1973,570 @@ def test_collapsed_summary_names_the_most_specific_source_not_a_count():
     assert "sources" not in result["mixed"]
     # With a single source there is nothing to disambiguate and no suffix.
     assert result["single"] == "4 fields following Prompt Format default · Probe Format"
+
+
+_CAMERA_AID = """{
+    id: "camera_motion", label: "Camera motion",
+    text: "The camera {motion} {amplitude} {speed}.",
+    fields: {
+        motion: { type: "enum", values: ["pushes in", "pans right"] },
+        amplitude: { type: "enum", optional: true,
+            values: [{ value: "with small amplitude", label: "Small" }] },
+        speed: { type: "enum", optional: true,
+            values: [{ value: "at slow speed", label: "Slow" }] },
+    },
+}"""
+
+
+def test_writing_aid_menu_shape_follows_what_the_aid_still_needs():
+    """0 fields insert, 1 bounded choice nests, free text or several opens a dialog."""
+    result = _run_chip_dom_script(f"""
+        const editor = {{
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            insertText() {{}},
+        }};
+        const aids = [
+            {{ id: "cutoff", label: "Cutoff", text: "<cutoff>" }},
+            {{ id: "dialogue", label: "Dialogue", text: "<d>[{{language}}] {{text}}</d>",
+              fields: {{ language: {{ type: "enum", values: ["English", "Spanish"] }} }} }},
+            {_CAMERA_AID},
+            {{ id: "tags", label: "Tags", text: "[{{tags}}]",
+              fields: {{ tags: {{ type: "enum_multi", values: ["a", "b"] }} }} }},
+        ];
+        // A live selection satisfies `{{text}}`, which is what turns Dialogue
+        // from a dialog into a one-choice submenu.
+        const withSelection = mod.createPromptContextMenuItems({{
+            editor, writingAids: aids,
+            selection: {{ bookmark: null, text: "Hey, I am over here" }},
+        }})[1].submenu;
+        const withoutSelection = mod.createPromptContextMenuItems({{
+            editor, writingAids: aids,
+        }})[1].submenu;
+        const shape = (rows) => rows.map((row) => ({{
+            label: row.label,
+            kind: row.submenu ? "submenu" : "action",
+            choices: row.submenu ? row.submenu.map((entry) => entry.label) : null,
+            hint: row.hint || "",
+        }}));
+        console.log(JSON.stringify({{
+            withSelection: shape(withSelection),
+            withoutSelection: shape(withoutSelection),
+        }}));
+    """)
+    selected = {row["label"]: row for row in result["withSelection"]}
+    bare = {row["label"]: row for row in result["withoutSelection"]}
+
+    # Nothing left to ask: inserts on the spot in both cases.
+    assert selected["Cutoff"]["kind"] == "action"
+    assert bare["Cutoff"]["kind"] == "action"
+    # The row previews the text it inserts.
+    assert selected["Cutoff"]["hint"] == "<cutoff>"
+
+    # One bounded choice with `{text}` already satisfied nests in the menu...
+    assert selected["Dialogue"]["kind"] == "submenu"
+    assert selected["Dialogue"]["choices"] == ["English", "Spanish"]
+    # ...but with nothing selected it still needs free text, so it opens a dialog.
+    assert bare["Dialogue"]["kind"] == "action"
+
+    # Several choices always earn the dialog, selection or not.
+    assert selected["Camera motion"]["kind"] == "action"
+    assert bare["Camera motion"]["kind"] == "action"
+    # A menu row cannot express picking two of five, so enum_multi does too.
+    assert selected["Tags"]["kind"] == "action"
+
+
+def test_single_optional_choice_offers_not_set_in_the_submenu():
+    result = _run_chip_dom_script("""
+        const editor = {
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            insertText() {},
+        };
+        const rows = mod.createPromptContextMenuItems({
+            editor,
+            writingAids: [
+                { id: "req", label: "Required", text: "a {v}",
+                  fields: { v: { type: "enum", values: ["x"] } } },
+                { id: "opt", label: "Optional", text: "a {v}",
+                  fields: { v: { type: "enum", optional: true, values: ["x"] } } },
+            ],
+        })[1].submenu;
+        console.log(JSON.stringify(Object.fromEntries(
+            rows.map((row) => [row.label, row.submenu.map((e) => e.label)]))));
+    """)
+    # A declared vocabulary cannot carry an empty value, so "leave it out"
+    # belongs to the control and appears only where the format allows omission.
+    assert result["Required"] == ["x"]
+    assert result["Optional"] == ["— not set —", "x"]
+
+
+def test_writing_aid_wraps_a_selection_and_closes_up_omitted_fields():
+    result = _run_chip_dom_script(f"""
+        const inserted = [];
+        let restoredWith = "none";
+        const editor = {{
+            capturePromptSelection: () => null,
+            restorePromptSelection(bookmark) {{
+                restoredWith = bookmark === null ? "null" : "bookmark";
+                return true;
+            }},
+            insertText(value) {{ inserted.push(value); }},
+        }};
+        const wrapRows = mod.createPromptContextMenuItems({{
+            editor,
+            writingAids: [{{ id: "dialogue", label: "Dialogue",
+                text: "<d>[{{language}}] {{text}}</d>",
+                fields: {{ language: {{ type: "enum", values: ["English"] }} }} }}],
+            selection: {{ bookmark: null, text: "Hey, I am over here" }},
+        }})[1].submenu[0];
+        await wrapRows.submenu.find((e) => e.label === "English").action();
+
+        const cameraRows = mod.createPromptContextMenuItems({{
+            editor, writingAids: [{_CAMERA_AID}],
+        }})[1].submenu[0];
+        const cameraPromise = cameraRows.action();
+        const backdrop = document.body.children.at(-1);
+        const selects = backdrop.querySelectorAll("select");
+        selects[0].value = "pushes in";
+        backdrop.querySelectorAll("button")
+            .find((b) => b.textContent === "Insert")._handlers.click[0]();
+        await cameraPromise;
+        console.log(JSON.stringify({{ inserted, restoredWith }}));
+    """)
+    # The selection becomes the `{text}` value, so the aid wraps the words
+    # instead of landing in front of them.
+    assert result["inserted"][0] == "<d>[English] Hey, I am over here</d>"
+    # Optional fields left unset collapse their whitespace and close up the
+    # punctuation rather than emitting "The camera pushes in  ."
+    assert result["inserted"][1] == "The camera pushes in."
+
+
+def test_writing_aid_with_an_undeclared_vocabulary_reports_instead_of_no_op():
+    result = _run_chip_dom_script("""
+        const calls = [];
+        const editor = {
+            capturePromptSelection: () => null,
+            restorePromptSelection() { calls.push("restore"); return true; },
+            insertText() { calls.push("insert"); },
+        };
+        const row = mod.createPromptContextMenuItems({
+            editor,
+            writingAids: [{ id: "broken", label: "Broken", text: "a {v}",
+                fields: { v: { type: "enum", values: [] } } }],
+        })[1].submenu[0];
+        await row.action();
+        console.log(JSON.stringify({ calls, kind: row.submenu ? "submenu" : "action" }));
+    """)
+    # This used to return silently without even restoring the caret, so an aid
+    # a format could legally save simply did nothing.
+    assert result["kind"] == "action"
+    assert result["calls"] == ["restore"]
+    assert "insert" not in result["calls"]
+
+
+def test_writing_aids_are_hidden_outside_the_channels_they_declare():
+    result = _run_chip_dom_script("""
+        const editor = {
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            insertText() {},
+        };
+        const writingAids = [
+            { id: "dialogue", label: "Dialogue", text: "d",
+              channel_keys: ["detailed_description"] },
+            { id: "anywhere", label: "Anywhere", text: "a" },
+        ];
+        const row = (channelKey) => {
+            const entry = mod.createPromptContextMenuItems({
+                editor, writingAids, channelKey })[1];
+            return { labels: entry.submenu.map((e) => e.label),
+                disabled: Boolean(entry.disabled), hint: entry.hint || "" };
+        };
+        console.log(JSON.stringify({
+            description: row("detailed_description"),
+            soundscape: row("overall_soundscape"),
+            unfiltered: row(""),
+        }));
+    """)
+    # An aid declaring a channel is offered only there; one declaring none
+    # reaches every channel, so a format predating the key is unchanged.
+    assert result["description"]["labels"] == ["Dialogue", "Anywhere"]
+    assert result["soundscape"]["labels"] == ["Anywhere"]
+    # No channel of its own — the Writing draft box — sees the whole set.
+    assert result["unfiltered"]["labels"] == ["Dialogue", "Anywhere"]
+
+
+def test_a_channel_with_no_aids_says_so_instead_of_showing_a_dead_row():
+    result = _run_chip_dom_script("""
+        const editor = {
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            insertText() {},
+        };
+        const entry = (writingAids, channelKey) => {
+            const row = mod.createPromptContextMenuItems({
+                editor, writingAids, channelKey })[1];
+            return { disabled: Boolean(row.disabled), hint: row.hint || "" };
+        };
+        console.log(JSON.stringify({
+            filteredOut: entry(
+                [{ id: "d", label: "D", text: "d", channel_keys: ["other"] }],
+                "overall_soundscape"),
+            noneAtAll: entry([], "overall_soundscape"),
+        }));
+    """)
+    # "This channel declares none" and "this format has none" are different
+    # facts, and a dead disabled row looks broken for either reason.
+    assert result["filteredOut"] == {
+        "disabled": True, "hint": "None for overall_soundscape"}
+    assert result["noneAtAll"] == {"disabled": True, "hint": ""}
+
+
+def test_context_kind_is_offered_only_where_the_format_declares_it():
+    result = _run_chip_dom_script("""
+        const declaring = { capabilities: { custom: { formatter: "{text}" },
+            reference: {}, shot: {} } };
+        const notDeclaring = { capabilities: { reference: {}, shot: {} } };
+        const scopeKinds = (profile) => {
+            const row = mod.createScopeChipRow({
+                allowedKinds: ["shot", "reference", "custom"], profile });
+            return row.querySelectorAll("select")[0].options.map((o) => o.value);
+        };
+        console.log(JSON.stringify({
+            menuDeclaring: mod.promptContextAuthoringKinds(
+                ["reference", "custom"], declaring),
+            menuNotDeclaring: mod.promptContextAuthoringKinds(
+                ["reference", "custom"], notDeclaring),
+            menuNoProfile: mod.promptContextAuthoringKinds(["reference", "custom"]),
+            scopeDeclaring: scopeKinds(declaring),
+            scopeNotDeclaring: scopeKinds(notDeclaring),
+        }));
+    """)
+    # `custom` is the model-agnostic escape hatch, so a format that declares one
+    # keeps it and a format that does not never offers it.
+    assert result["menuDeclaring"] == ["reference", "custom"]
+    assert result["menuNotDeclaring"] == ["reference"]
+    # Both authoring routes agree — the caret menu and the scope row.
+    assert result["scopeDeclaring"] == ["shot", "reference", "custom"]
+    assert result["scopeNotDeclaring"] == ["shot", "reference"]
+    # An absent profile is "no opinion", not "declares nothing": the catalog is
+    # async and must not silently drop a kind the format really does declare.
+    assert result["menuNoProfile"] == ["reference", "custom"]
+
+
+def test_no_builtin_format_offers_the_context_kind():
+    """None of the three declares `capabilities.custom`, so none offers it."""
+    from server import prompt_context as pc
+    for key, profile in pc.BUILTIN_PROFILES.items():
+        assert "custom" not in (profile.get("capabilities") or {}), key
+
+
+_ATTACH_SCENE = """{
+    duration_frames: 100, reference_lane_count: 1,
+    reference_lane_configs: [{}],
+    _context_consumer_start: 0, _context_consumer_end: 100,
+    reference_lane_recipes: [
+        { lane_id: "lane0", recipe: { soft: { compatible_profiles: ["generic@1"] } } },
+        { lane_id: "lane1", recipe: { soft: { compatible_profiles: ["other@1"] } } },
+    ],
+    reference_items: [
+        { reference_item_id: "hero", lane_index: 0, start_frame: 0, end_frame: 100,
+          members: [{ member_id: "m1", entity_id: "e1" }] },
+        { reference_item_id: "wrong", lane_index: 1, start_frame: 0, end_frame: 100,
+          members: [{ member_id: "m2", entity_id: "e2" }] },
+    ],
+}"""
+
+
+def test_reference_row_attaches_a_handle_without_the_dialog():
+    result = _run_chip_dom_script(f"""
+        const inserted = [];
+        const editor = {{
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            insertAttachment(value) {{ inserted.push(value); }},
+        }};
+        let dialogOpened = 0;
+        const row = mod.createPromptContextMenuItems({{
+            editor, allowedKinds: ["reference"],
+            onCreate: async (a) => {{ dialogOpened += 1; return a; }},
+            referenceContext: {{
+                scene: {_ATTACH_SCENE},
+                references: [{{ reference_id: "e1", name: "Hero" }},
+                            {{ reference_id: "e2", name: "Wrong" }}],
+                semanticUnits: [], profileId: "generic@1", scope: "section",
+                resolvedProfile: {{ profile_id: "generic" }},
+            }},
+        }})[0].submenu[0];
+        const entries = row.submenu.map((e) => ({{
+            label: e.label || "", disabled: Boolean(e.disabled),
+            separator: e.type === "separator",
+        }}));
+        await row.submenu.find((e) => (e.label || "").includes("Hero")).action();
+        console.log(JSON.stringify({{ entries, inserted, dialogOpened }}));
+    """)
+    labels = [entry["label"] for entry in result["entries"]]
+    # The dialog is one row away, not gone.
+    assert labels[0] == "Configure…"
+    assert result["dialogOpened"] == 0
+
+    hero = next(e for e in result["entries"] if "Hero" in e["label"])
+    wrong = next(e for e in result["entries"] if "Wrong" in e["label"])
+    assert not hero["disabled"]
+    # Ineligible sources stay visible and dimmed, carrying the dialog's reason.
+    assert wrong["disabled"]
+    assert "incompatible prompt format" in wrong["label"]
+
+    # The chip is inserted with no overrides, so it FOLLOWS its Reference
+    # defaults rather than freezing a copy of them at attach time. This stub
+    # profile declares no capabilities at all, so nothing is seeded either —
+    # the mention seed is covered by the test below.
+    assert len(result["inserted"]) == 1
+    chip = result["inserted"][0]
+    assert chip["kind"] == "reference"
+    assert chip["source"]["reference_item_id"] == "hero"
+    assert chip["capabilities"] == []
+    assert not chip["config"].get("overrides")
+
+
+_MENTION_PROFILE = """{
+    profile_id: "mentions_format", version: "1",
+    capabilities: { reference: { derived: {
+        definitions: { order: 1, channel_key: "subject_definitions",
+                       placement: "section_prefix", label: "Definition" },
+        mentions: { order: 4, channel_key: "detailed_description",
+                    placement: "inline", label: "Scene mention" },
+    } } },
+}"""
+_NO_MENTION_PROFILE = """{
+    profile_id: "generic", version: "1",
+    capabilities: { reference: { derived: {
+        derived_prompt: { order: 1, channel_key: "visual",
+                          placement: "inline", label: "Reference prompt" },
+    } } },
+}"""
+
+
+def test_a_handle_attach_seeds_the_declared_mention_capability():
+    """A handle is a MENTION, not a definition block.
+
+    `@KWoman is leaning then @Doggo appears` wants each handle resolved to the
+    format's canonical token inside the sentence. Seeding no capability made
+    the compiler fall back to the LOWEST-`order` declaration instead, which is
+    `definitions` — so a handle emitted a definition line into another channel.
+    """
+    result = _run_chip_dom_script(f"""
+        const inserted = [];
+        const editor = {{
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            insertAttachment(value) {{ inserted.push(value); }},
+        }};
+        const attach = async (resolvedProfile) => {{
+            const row = mod.createPromptContextMenuItems({{
+                editor, allowedKinds: ["reference"],
+                referenceContext: {{
+                    scene: {_ATTACH_SCENE},
+                    references: [{{ reference_id: "e1", name: "Hero" }}],
+                    semanticUnits: [], profileId: "generic@1", scope: "section",
+                    resolvedProfile,
+                }},
+            }})[0].submenu[0];
+            await row.submenu.find((e) => (e.label || "").includes("Hero")).action();
+            return inserted[inserted.length - 1];
+        }};
+        const declaring = await attach({_MENTION_PROFILE});
+        const notDeclaring = await attach({_NO_MENTION_PROFILE});
+        console.log(JSON.stringify({{
+            declaring: declaring.capabilities,
+            notDeclaring: notDeclaring.capabilities,
+        }}));
+    """)
+    # Exact equality is the sparsity assertion: `capability_id` and `kind` and
+    # nothing else. A stored `channel_key`/`placement` would freeze this chip's
+    # routing against a later format change, and a stored `enabled` would turn
+    # the tri-state into an authored deviation from a default that may be off.
+    assert result["declaring"] == [
+        {"capability_id": "mentions", "kind": "mentions"}]
+    # Declaration-driven, so a format without `mentions` seeds nothing and
+    # keeps the compiler's format default — `generic@1` is exactly that case.
+    assert result["notDeclaring"] == []
+
+
+def _mention_seed_compile(capabilities):
+    """Compile one handle-attached chip anchored in the description channel."""
+    return prompt_context.compile_prompt_context(
+        global_channels={},
+        sections=[{
+            "prompt_id": "section", "start_frame": 0, "end_frame": 24,
+            "channel_docs": {"detailed_description": {
+                "schema": "prompt_document_v1",
+                "nodes": [
+                    {"type": "text", "node_id": "before", "text": "Before "},
+                    {"type": "attachment", "node_id": "anchor",
+                     "attachment_id": "handle-chip"},
+                    {"type": "text", "node_id": "after", "text": " leans in."},
+                ],
+            }},
+            "attachments": [prompt_context.normalize_attachment({
+                "attachment_id": "handle-chip",
+                "emission_group_id": "handle-chip",
+                "kind": "reference",
+                "source": {"semantic_unit_ids": ["subject"]},
+                "capabilities": capabilities,
+            })],
+        }],
+        window_start=0, window_end=24, fps=24,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": {
+                "setup": {"mode": "reference", "setup_id": "setup"},
+                "pictures": [{"member_id": "portrait", "role": "identity",
+                              "picture_ordinal": 1}],
+                "videos": [], "standalone_audios": [],
+                "presentation": [{"kind": "picture", "member_id": "portrait",
+                                  "picture_ordinal": 1}],
+            },
+            "ordinal_manifest": {
+                "subjects": {"subject": 1},
+                "pictures": {"portrait": 1}, "videos": {}, "audios": {},
+            },
+            "unit_source_labels": {"subject": ["<Picture 1>"]},
+            "semantic_units": [{
+                "semantic_unit_id": "subject", "name": "KWoman",
+                "definition": "a poised woman",
+                "sources": [{"entity_id": "woman", "member_id": "portrait"}],
+            }],
+        },
+        labels_on=True,
+    )
+
+
+def test_the_seeded_mention_compiles_to_an_inline_token_not_a_definition():
+    seeded = _mention_seed_compile(
+        [{"capability_id": "mentions", "kind": "mentions"}])
+    # The token lands in the sentence the author was writing, and the sparse
+    # record still inherits the declared `detailed_description`/`inline`.
+    assert seeded["channels"]["detailed_description"] == (
+        "Before <Subject 1> leans in.")
+    assert seeded["channels"]["subject_definitions"] == ""
+    assert [(row["capability_id"], row["placement"], row["channel_key"])
+            for row in seeded["emissions"]] == [
+                ("mentions", "inline", "detailed_description")]
+
+    # The same chip WITHOUT the seed is the defect: the compiler's lowest-order
+    # fallback emits a definition into another channel and the sentence keeps a
+    # hole where the handle was.
+    unseeded = _mention_seed_compile([])
+    assert unseeded["channels"]["detailed_description"] == "Before  leans in."
+    assert unseeded["channels"]["subject_definitions"] == (
+        "<Subject 1> is a poised woman from <Picture 1>")
+
+
+def test_the_attachment_dialog_owns_escape_over_the_panel_that_opened_it():
+    """Escape closed the Prompt tool BEHIND this dialog, leaving it open.
+
+    The dialog owned no Escape at all, and `KeyboardOwnership` listens at window
+    CAPTURE — so the Prompt tool's own consumer, registered earlier and closing
+    unconditionally, took the key and stopped it before any element listener on
+    the dialog could run. An element listener is structurally too late here; the
+    dialog has to register, which also makes it the newest OVERLAY consumer.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for Prompt Context JS tests")
+    chips_url = (ROOT / "web" / "js" / "prompt_context_chips.js").as_uri()
+    keyboard_url = (ROOT / "web" / "js" / "keyboard_ownership.js").as_uri()
+    capturing_window = """
+globalThis.__windowKeydown = null;
+globalThis.window = {
+  addEventListener(type, fn) { if (type === "keydown") globalThis.__windowKeydown = fn; },
+  removeEventListener(type, fn) {
+    if (type === "keydown" && globalThis.__windowKeydown === fn) globalThis.__windowKeydown = null; },
+};
+"""
+    dom = _MINIMAL_DOM.replace(
+        "globalThis.window = { addEventListener(){}, removeEventListener(){} };",
+        capturing_window)
+    assert capturing_window in dom, "minimal DOM window stub moved"
+    script = f"""
+        {dom}
+        const mod = await import({json.dumps(chips_url)});
+        const keyboard = await import({json.dumps(keyboard_url)});
+        // The surface behind: registered FIRST, and it closes on any Escape.
+        let panelClosed = false;
+        keyboard.register({{
+            id: "panel-behind", priority: keyboard.PRIORITY.OVERLAY,
+            keydown: (event) => {{
+                if (event.key !== "Escape") return false;
+                panelClosed = true;
+                return true;
+            }},
+        }});
+        const pending = mod.configurePromptAttachment({{ kind: "shot" }}, {{}});
+        const escape = {{ key: "Escape", stopImmediatePropagation() {{}},
+                         preventDefault() {{}} }};
+        globalThis.__windowKeydown(escape);
+        const resolved = await pending;
+        console.log(JSON.stringify({{
+            panelClosed, resolved,
+            consumerIds: keyboard._debugListConsumers().map((value) => value.id),
+        }}));
+    """
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    # Escape cancels the dialog, exactly as its Cancel button does...
+    assert result["resolved"] is None
+    # ...and the surface behind never sees the key.
+    assert result["panelClosed"] is False
+    # The dialog also releases its consumer on close, or the next Escape would
+    # be swallowed by a modal that is no longer on screen.
+    assert not [value for value in result["consumerIds"]
+                if value.startswith("sonder-prompt-modal-")]
+
+
+def test_reference_row_falls_back_to_the_dialog_without_a_context():
+    result = _run_chip_dom_script("""
+        const editor = {
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            insertAttachment() {},
+        };
+        const row = mod.createPromptContextMenuItems({
+            editor, allowedKinds: ["reference"],
+            onCreate: async (a) => a,
+        })[0].submenu[0];
+        console.log(JSON.stringify({
+            hasSubmenu: Boolean(row.submenu),
+            isAction: typeof row.action === "function",
+        }));
+    """)
+    # A surface that cannot describe its window must not guess at eligibility;
+    # it offers the dialog, which resolves everything itself.
+    assert result == {"hasSubmenu": False, "isAction": True}
+
+
+def test_an_unresolvable_caret_appends_instead_of_inserting_at_position_zero():
+    """A null bookmark must never be treated as "insert at the start"."""
+    result = _run_chip_dom_script("""
+        const calls = [];
+        const editor = {
+            capturePromptSelection: () => null,
+            restorePromptSelection: () => true,
+            focusEnd() { calls.push("focusEnd"); },
+            insertText(v) { calls.push("insert:" + v); },
+        };
+        const row = mod.createPromptContextMenuItems({
+            editor, writingAids: [{ id: "c", label: "Cutoff", text: "<cutoff>" }],
+            selection: { bookmark: null, text: "" },
+        })[1].submenu[0];
+        await row.action();
+        console.log(JSON.stringify({ calls }));
+    """)
+    # `insertText` focuses the editor, and a bare focus() collapses to the START
+    # of a contenteditable — so an unknown caret used to insert at position 0 and,
+    # against a stale offset, split authored prose mid-word. It must land at the
+    # end, which can never cut existing text in half.
+    assert result["calls"] == ["focusEnd", "insert:<cutoff>"]

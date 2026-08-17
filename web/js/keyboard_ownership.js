@@ -179,6 +179,15 @@ export function register({ id, priority, keydown, keyup, paste }) {
     if (typeof priority !== "number") {
         throw new Error("[KeyboardOwnership] register requires a numeric priority");
     }
+    // A consumer naming none of the three handlers can never fire, and dispatch
+    // skips it in silence — so the surface that registered it keeps its slot in
+    // the priority order while its key falls through to whatever sits BELOW,
+    // which then acts on it. That misroute is invisible without the debug flag,
+    // so refuse it here the way a bad id or priority is refused.
+    if (![keydown, keyup, paste].some((value) => typeof value === "function")) {
+        throw new Error(`[KeyboardOwnership] consumer ${id} registers no keydown, `
+            + "keyup or paste handler and could never fire");
+    }
     const consumer = {
         id,
         priority,

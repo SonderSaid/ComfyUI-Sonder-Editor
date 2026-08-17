@@ -1701,3 +1701,77 @@ console.log(JSON.stringify(rows.map((row)=>
     # word. No action hint: the button beside it is labelled "+ Identity".
     assert all(status.endswith(" · No prompt identity") for status in statuses)
     assert not any("Create identity" in status for status in statuses)
+
+
+def _run_panel_script(body):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for prompt panel DOM coverage")
+    module_url = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    script = f"""
+class N {{
+  constructor(tag) {{ this.tagName=String(tag).toUpperCase(); this.children=[];
+    this.style={{cssText:""}}; this.dataset={{}}; this.attributes={{}};
+    this.textContent=""; this.title=""; }}
+  appendChild(c) {{ this.children.push(c); c.parentElement=this; return c; }}
+  append(...cs) {{ cs.forEach((c)=>c?.tagName && this.appendChild(c)); }}
+  setAttribute(k,v) {{ this.attributes[k]=String(v); }}
+}}
+globalThis.document={{createElement:(t)=>new N(t),body:new N("body")}};
+globalThis.window={{addEventListener(){{}},removeEventListener(){{}}}};
+const mod=await import({json.dumps(module_url)});
+{body}
+"""
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+
+
+def test_writing_aid_choice_round_trip_preserves_declared_value_labels():
+    """The flat form has one column, so it must carry the other one forward."""
+    result = _run_panel_script("""
+const declared = {
+  motion: { type: "enum", label: "Motion type", optional: false,
+    values: [{ value: "zooms in", label: "Zoom In" },
+             { value: "pushes in", label: "Push In" }] },
+};
+const flat = mod.formatWritingAidChoices(declared);
+// Re-parsing an unchanged edit must not flatten the labels away.
+const unchanged = mod.parseWritingAidChoices(flat, "The camera {motion}.", declared);
+// Dropping a value keeps the metadata of the values that survive.
+const narrowed = mod.parseWritingAidChoices(
+  "motion=zooms in", "The camera {motion}.", declared);
+// A brand-new value with no prior metadata stays a bare string.
+const widened = mod.parseWritingAidChoices(
+  "motion=zooms in|arcs around", "The camera {motion}.", declared);
+console.log(JSON.stringify({ flat, unchanged, narrowed, widened }));
+""")
+    assert result["flat"] == "motion=zooms in|pushes in"
+    # Labels and the field's own metadata survive an untouched round trip.
+    assert result["unchanged"]["motion"]["values"] == [
+        {"value": "zooms in", "label": "Zoom In"},
+        {"value": "pushes in", "label": "Push In"},
+    ]
+    assert result["unchanged"]["motion"]["label"] == "Motion type"
+    assert result["narrowed"]["motion"]["values"] == [
+        {"value": "zooms in", "label": "Zoom In"}]
+    assert result["widened"]["motion"]["values"] == [
+        {"value": "zooms in", "label": "Zoom In"}, "arcs around"]
+
+
+def test_writing_aid_parse_only_declares_placeholders_the_text_uses():
+    result = _run_panel_script("""
+console.log(JSON.stringify({
+  unused: mod.parseWritingAidChoices("ghost=a|b", "no placeholders here"),
+  textIsNotAField: Object.keys(
+    mod.parseWritingAidChoices("", "<d>[{language}] {text}</d>",
+      { language: { type: "enum", values: ["English"] } })),
+  emptyStaysEmpty: mod.parseWritingAidChoices("", "The camera {motion}."),
+}));
+""")
+    # A declaration the text never substitutes is not a question worth asking.
+    assert result["unused"] == {}
+    assert result["textIsNotAField"] == ["language"]
+    # An undeclared placeholder yields an empty vocabulary, which the New-aid
+    # row now refuses by name instead of saving an unsavable format.
+    assert result["emptyStaysEmpty"]["motion"]["values"] == []

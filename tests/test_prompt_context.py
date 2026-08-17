@@ -398,18 +398,6 @@ def test_invalid_attachment_route_diagnostic_targets_the_chip():
     assert diagnostic["attachment_id"] == attachment["attachment_id"]
 
 
-def test_h3_custom_picture_guidance_text_must_bind_to_active_setup_role():
-    guide = prompt_context.normalize_attachment({
-        "kind": "custom", "config": {"text": "Use <Picture 1> as the pose"}})
-    compiled = prompt_context.compile_prompt_context(
-        global_channels={}, sections=[_section(0, 10, "move", attachments=[guide])],
-        window_start=0, window_end=10, fps=24, template="minimax_h3_base",
-        context={"setup_manifest": {"setup": {"mode": "base", "task_mode": "T2VA"},
-                                    "guides": []}})
-    assert any(value["code"] == "unbound_h3_picture_guidance"
-               for value in compiled["errors"])
-
-
 def test_audio_definition_reuses_but_never_creates_speaker_identity():
     reference = prompt_context.normalize_attachment({
         "kind": "reference", "source": {"semantic_unit_ids": ["granny"]},
@@ -1206,3 +1194,223 @@ def test_disabled_capabilities_preserve_ids_from_another_format():
         ["summary", "future_format_part", "summary", "", 5]) == [
             "summary", "future_format_part", "5"]
     assert prompt_context.normalize_disabled_capabilities(None) == []
+
+
+def test_minimax_writing_aids_target_each_profiles_own_description_channel():
+    """Base and Full Reference carry the same aids under different channel keys."""
+    base = prompt_context.BUILTIN_PROFILES["minimax_h3_base@1"]["writing_aids"]
+    ref = prompt_context.BUILTIN_PROFILES["minimax_h3_ref@1"]["writing_aids"]
+    generic = prompt_context.BUILTIN_PROFILES["generic@1"]["writing_aids"]
+
+    assert {key for aid in base for key in aid["channel_keys"]} == {
+        "integrated_multimodal_description"}
+    assert {key for aid in ref for key in aid["channel_keys"]} == {
+        "detailed_description"}
+    # One shared list could not have been right for both, and Generic imposes
+    # no channel at all because its template names only `visual`.
+    assert all("channel_keys" not in aid for aid in generic)
+
+
+def test_h3_camera_motion_follows_its_own_documented_grammar():
+    """Guide 4.3: motion type + amplitude + speed, both modifiers omissible."""
+    base = {aid["id"]: aid for aid in
+            prompt_context.BUILTIN_PROFILES["minimax_h3_base@1"]["writing_aids"]}
+    generic = {aid["id"]: aid for aid in
+               prompt_context.BUILTIN_PROFILES["generic@1"]["writing_aids"]}
+    camera = base["camera_motion"]
+
+    assert camera["text"] == "The camera {motion} {amplitude} {speed}."
+    assert set(camera["fields"]) == {"motion", "amplitude", "speed"}
+    # Twenty documented motion values, including the six the inherited Generic
+    # list never carried.
+    values = {choice["value"] for choice in camera["fields"]["motion"]["values"]}
+    assert len(values) == 20
+    assert {"pedestals up", "arcs around the subject", "tracks the subject",
+            "shakes strongly", "takes the subject's point of view",
+            "rolls clockwise"} <= values
+    # "Add amplitude and speed only when they are meaningful."
+    assert camera["fields"]["amplitude"]["optional"] is True
+    assert camera["fields"]["speed"]["optional"] is True
+    assert "optional" not in camera["fields"]["motion"]
+    # MiniMax no longer inherits the Generic ten-verb list.
+    assert generic["camera_motion"]["text"] == "The camera {motion}."
+    assert len(generic["camera_motion"]["fields"]["motion"]["values"]) == 10
+
+
+def test_framing_vocabulary_is_shared_and_not_claimed_as_provider_declared():
+    """Neither H3 guide tables framing, so it is ours and belongs everywhere."""
+    for key in ("generic@1", "minimax_h3_base@1", "minimax_h3_ref@1"):
+        ids = {aid["id"] for aid
+               in prompt_context.BUILTIN_PROFILES[key]["writing_aids"]}
+        assert {"shot_distance", "shot_composition", "depth_of_field",
+                "field_of_view"} <= ids
+    depth = {aid["id"]: aid for aid in
+             prompt_context.BUILTIN_PROFILES["generic@1"]["writing_aids"]
+             }["depth_of_field"]
+    # The focus change is a modifier, so it omits cleanly.
+    assert depth["fields"]["focus"]["optional"] is True
+    assert "optional" not in depth["fields"]["depth_of_field"]
+
+
+def test_writing_aid_optional_flag_round_trips_and_rejects_a_non_boolean():
+    profile = prompt_context.normalize_profile({
+        "profile_id": "p", "version": "1", "name": "P", "template_id": "standard",
+        "capabilities": {"shot": {"placement": "section_prefix"}},
+        "writing_aids": [{"id": "a", "text": "x {v}", "fields": {
+            "v": {"type": "enum", "optional": True, "values": ["one"]}}}],
+    })
+    assert profile["writing_aids"][0]["fields"]["v"]["optional"] is True
+    # Writing-aid field shape is refused at normalization, the same gate that
+    # already rejects a non-enum type or an empty vocabulary — an unsavable
+    # declaration never reaches rest.
+    with pytest.raises(ValueError, match="invalid_writing_aid_enum"):
+        prompt_context.normalize_profile({
+            "profile_id": "p", "version": "1", "name": "P",
+            "template_id": "standard",
+            "capabilities": {"shot": {"placement": "section_prefix"}},
+            "writing_aids": [{"id": "a", "text": "x {v}", "fields": {
+                "v": {"type": "enum", "optional": "yes", "values": ["one"]}}}],
+        })
+
+
+def test_removing_the_guide_binding_leaves_physical_delivery_intact():
+    """The chip binding is gone; the compiler-composed alignment line is not.
+
+    The binding described what `MiniMaxH3AddGuide` now delivers physically from
+    the Guides Bridge. The picture-alignment instruction was never a chip's
+    output — it is composed from the task mode — so it must survive untouched.
+    """
+    text = prompt_context.normalize_attachment({
+        "kind": "custom", "config": {"text": "Use <Picture 1> as the pose"}})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[_section(0, 10, "move", attachments=[text])],
+        window_start=0, window_end=10, fps=24, template="minimax_h3_base",
+        context={"setup_manifest": {"setup": {"mode": "base", "task_mode": "I2VA"},
+                                    "guides": [{"role": "first"}]}})
+    assert compiled["prompt"].startswith(
+        "For the target video, at 0.00 seconds into the target video, "
+        "<Picture 1> (from [Shot 1]) is fully referenced.")
+    # The three retired validators must not fire under any spelling.
+    assert not {"invalid_h3_guide_role", "missing_h3_guide_binding",
+                "unbound_h3_picture_guidance"} & {
+                    value["code"] for value in compiled["errors"]}
+    # Authored custom text still compiles as ordinary prose.
+    assert "Use <Picture 1> as the pose" in compiled["prompt"]
+
+
+def test_physical_guide_validation_still_belongs_to_the_setup():
+    """`missing_first_guide` is the physical contract and is untouched."""
+    resolved = minimax_h3.resolve_setup(
+        setup={"mode": "base", "task_mode": "I2VA", "first_guide_id": "absent"},
+        guide_frames=[],
+        profile=prompt_context.BUILTIN_PROFILES["minimax_h3_base@1"])
+    assert any(error["code"] == "missing_first_guide"
+               for error in resolved["errors"])
+
+
+def test_no_guide_binding_control_or_config_survives_anywhere():
+    chips = (Path(__file__).resolve().parents[1]
+             / "web" / "js" / "prompt_context_chips.js").read_text(encoding="utf-8")
+    assert "setup_role" not in chips
+    assert "Physical Guide binding" not in chips
+    # Custom keeps its fixed-text control: it is the model-agnostic escape
+    # hatch, not an H3 feature, and removing it would strip a capability from
+    # every other provider on MiniMax's account.
+    assert 'fieldRow("Fixed text", controls.text)' in chips
+
+
+def _scope_scene(scope_attachment):
+    """A source with text in BOTH channels, plus a consumer linking to it.
+
+    Both channels must carry source text or "did not emit" would be ambiguous
+    between "suppressed" and "there was nothing there".
+    """
+    source = PromptSection(
+        start_frame=0, end_frame=10,
+        channels={"visual": "earlier visual", "speech": "earlier speech"})
+    source.prompt_id = "source"
+    consumer = PromptSection(
+        start_frame=10, end_frame=20,
+        channels={"visual": "later text"}, attachments=[scope_attachment])
+    consumer.prompt_id = "consumer"
+    return [source, consumer]
+
+
+def _compile_scope(scope_attachment, sections=None):
+    return prompt_context.compile_prompt_context(
+        global_channels={}, sections=sections or _scope_scene(scope_attachment),
+        window_start=10, window_end=20, fps=24, template="sonder")
+
+
+def test_scope_link_suppression_is_per_channel_not_all_or_nothing():
+    link = prompt_context.normalize_attachment({
+        "kind": "prompt_link_scope",
+        "source": {"prompt_id": "source", "channel_keys": ["visual", "speech"]},
+        "capabilities": [{
+            "capability_id": prompt_context.scope_link_channel_capability_id("speech"),
+            "kind": "prompt_link_scope", "enabled": False,
+        }],
+    })
+    compiled = _compile_scope(link)
+    rows = {row["channel_key"]: row
+            for row in compiled["attachment_capability_projections"]
+            if row["attachment_id"] == link["attachment_id"]}
+    # Each selected channel gets its own row under its own capability id, which
+    # is what the browser's suppression control writes to.
+    assert set(rows) == {"visual", "speech"}
+    assert rows["visual"]["capability_id"] == "prompt_link_scope:visual"
+    assert rows["speech"]["capability_id"] == "prompt_link_scope:speech"
+    # Only the muted channel stops emitting.
+    assert rows["visual"]["state"] == "emitted"
+    assert rows["speech"]["state"] != "emitted"
+
+
+def test_a_legacy_scope_link_keeps_its_single_suppression_across_the_split():
+    """A chip suppressed before per-channel capabilities existed stays off."""
+    legacy = prompt_context.normalize_attachment({
+        "kind": "prompt_link_scope",
+        "source": {"prompt_id": "source", "channel_keys": ["visual", "speech"]},
+        "capabilities": [{"capability_id": "prompt_link_scope",
+                          "kind": "prompt_link_scope", "enabled": False}],
+    })
+    rows = [row for row in _compile_scope(legacy)["attachment_capability_projections"]
+            if row["attachment_id"] == legacy["attachment_id"]]
+    assert rows and not any(row["state"] == "emitted" for row in rows)
+
+    # And an untouched legacy chip still emits every selected channel.
+    plain = prompt_context.normalize_attachment({
+        "kind": "prompt_link_scope",
+        "source": {"prompt_id": "source", "channel_keys": ["visual", "speech"]},
+    })
+    plain_rows = {row["channel_key"]: row["state"] for row
+                  in _compile_scope(plain)["attachment_capability_projections"]
+                  if row["attachment_id"] == plain["attachment_id"]}
+    assert plain_rows == {"visual": "emitted", "speech": "emitted"}
+
+
+def test_per_channel_suppression_survives_a_transitive_link_chain():
+    """Chaining through a muted channel must not resurrect it."""
+    muted = prompt_context.normalize_attachment({
+        "kind": "prompt_link_scope",
+        "source": {"prompt_id": "first", "channel_keys": ["visual"]},
+        "capabilities": [{
+            "capability_id": prompt_context.scope_link_channel_capability_id("visual"),
+            "kind": "prompt_link_scope", "enabled": False,
+        }],
+    })
+    chained = prompt_context.normalize_attachment({
+        "kind": "prompt_link_scope",
+        "source": {"prompt_id": "middle", "channel_keys": ["visual"]},
+    })
+    sections = [
+        _section(0, 10, "origin text", prompt_id="first"),
+        _section(10, 20, "middle text", prompt_id="middle", attachments=[muted]),
+        _section(20, 30, "last text", prompt_id="last", attachments=[chained]),
+    ]
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=sections, window_start=20, window_end=30,
+        fps=24, template="sonder")
+    # The middle section's suppressed visual channel contributes nothing, so
+    # the origin text must not arrive through the chain either.
+    assert "origin text" not in compiled["prompt"]
+    assert "middle text" in compiled["prompt"]

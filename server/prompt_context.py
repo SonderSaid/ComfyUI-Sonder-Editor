@@ -398,6 +398,7 @@ def _validate_declared_field(raw, *, field, add):
             "Capability fields must use enum or enum_multi.", field)
     unknown = set(raw).difference({
         "type", "values", "label", "help", "example", "default_source",
+        "optional",
     })
     if unknown:
         add("incomplete_capability_declaration",
@@ -443,6 +444,70 @@ def _validate_declared_field(raw, *, field, add):
                  or default_source not in FIELD_DEFAULT_SOURCES)):
         add("unknown_field_default_source",
             f"Unknown capability-field default source: {default_source!r}.", field)
+    # A declared vocabulary cannot express "leave this out": every choice needs
+    # a nonempty value, so an empty option is not declarable. `optional` is how
+    # a format says the field may be omitted — the H3 camera grammar omits
+    # amplitude and speed unless they are meaningful — and the authoring surface
+    # offers a not-set choice only for these. Absent means required.
+    optional = raw.get("optional")
+    if optional is not None and not isinstance(optional, bool):
+        add("incomplete_capability_declaration",
+            "Capability field optional must be a boolean.", field)
+
+
+def _bound_template_channel_keys(value, template):
+    """The channel keys a declaration may name, or None when unknowable.
+
+    A format is only measured against a template it is actually bound to: a
+    profile validated beside some other project's template would otherwise
+    report every one of its own channels as missing. `None` means "no opinion",
+    which is what an unbound or absent template earns.
+    """
+    template_id = str((template or {}).get("id") or "")
+    declared_template_id = str(value.get("template_id") or "")
+    declared_templates = value.get("compatible_templates")
+    template_is_bound = (
+        not isinstance(template, dict)
+        or template_id == declared_template_id
+        or (isinstance(declared_templates, list)
+            and template_id in {str(entry) for entry in declared_templates})
+        or str((template or {}).get("default_context_profile") or "") in {
+            f"{value.get('profile_id')}@{value.get('version', '1')}",
+            str(value.get("profile_id") or ""),
+        }
+    )
+    if isinstance(template, dict) and template_is_bound:
+        return {str(row.get("key") or "")
+                for row in template.get("channels") or ()
+                if isinstance(row, dict)}
+    return None
+
+
+def _writing_aid_declaration_errors(value, *, template, add):
+    """Writing-aid channel targeting, measured against the bound template.
+
+    Unlike a capability's `channel_key`, which routes emitted output, this only
+    decides where an aid is OFFERED. A key naming no channel would silently hide
+    the aid everywhere, which is worse than a loud declaration error.
+    """
+    aids = value.get("writing_aids")
+    if not isinstance(aids, list):
+        return
+    channel_keys = _bound_template_channel_keys(value, template)
+    if channel_keys is None:
+        return
+    for index, aid in enumerate(aids):
+        if not isinstance(aid, dict):
+            continue
+        declared = aid.get("channel_keys")
+        if not isinstance(declared, list):
+            continue
+        field = f"writing_aids[{index}].channel_keys"
+        for key in declared:
+            if str(key) not in channel_keys:
+                add("incomplete_capability_declaration",
+                    f"Writing aid names missing template channel {str(key)!r}.",
+                    field)
 
 
 def _reference_declaration_errors(value, *, template, add):
@@ -459,24 +524,7 @@ def _reference_declaration_errors(value, *, template, add):
         add("incomplete_capability_declaration",
             f"A format may declare at most {MAX_CAPABILITIES} derived capabilities.",
             "capabilities.reference.derived")
-    channel_keys = None
-    template_id = str((template or {}).get("id") or "")
-    declared_template_id = str(value.get("template_id") or "")
-    declared_templates = value.get("compatible_templates")
-    template_is_bound = (
-        not isinstance(template, dict)
-        or template_id == declared_template_id
-        or (isinstance(declared_templates, list)
-            and template_id in {str(entry) for entry in declared_templates})
-        or str((template or {}).get("default_context_profile") or "") in {
-            f"{value.get('profile_id')}@{value.get('version', '1')}",
-            str(value.get("profile_id") or ""),
-        }
-    )
-    if isinstance(template, dict) and template_is_bound:
-        channel_keys = {str(row.get("key") or "")
-                        for row in template.get("channels") or ()
-                        if isinstance(row, dict)}
+    channel_keys = _bound_template_channel_keys(value, template)
     seen_orders = set()
     for kind, declaration in derived.items():
         field = f"capabilities.reference.derived.{kind}"
@@ -557,6 +605,7 @@ def profile_declaration_errors(profile, *, template=None) -> list[dict]:
                        **({"field": field} if field else {})})
 
     _reference_declaration_errors(value, template=template, add=add)
+    _writing_aid_declaration_errors(value, template=template, add=add)
 
     populations = value.get("physical_populations", [])
     if not isinstance(populations, list):
@@ -1279,40 +1328,163 @@ def _profile(profile_id, name, template_id, *, capabilities, writing_aids,
     return value
 
 
-_GENERIC_AIDS = [
-    {"id": "dialogue", "label": "Dialogue", "text": "<d>[{language}] {text}</d>",
-     "fields": {"language": {"type": "enum", "values": [
-         "English", "Spanish", "French", "German", "Italian", "Japanese",
-         "Korean", "Chinese", "Portuguese", "Hindi"]}}},
-    {"id": "voiceover", "label": "Voiceover", "text": "Voiceover: {text}"},
-    {"id": "group_speech", "label": "Group speech", "text": "Group says: {text}"},
-    {"id": "singing", "label": "Singing", "text": "Singing: {text}"},
-    {"id": "scene_transition", "label": "Scene transition", "text": "<scenetrans>"},
-    {"id": "cutoff", "label": "Cutoff", "text": "<cutoff>"},
-    {"id": "visible_text", "label": "Visible text", "text": "\"{text}\""},
-    {"id": "camera_motion", "label": "Camera motion", "text": "The camera {motion}.",
-     "fields": {"motion": {"type": "enum", "values": [
-         "pushes in", "pulls out", "pans left", "pans right", "tilts up",
-         "tilts down", "trucks left", "trucks right", "orbits the subject",
-         "remains static"]}}},
+_LANGUAGE_VALUES = [
+    "English", "Spanish", "French", "German", "Italian", "Japanese",
+    "Korean", "Chinese", "Portuguese", "Hindi",
+]
+_LANGUAGE_FIELD = {"language": {"type": "enum", "label": "Language",
+                                "values": list(_LANGUAGE_VALUES)}}
+
+# Shot framing, depth of field and field of view are ORDINARY cinematography
+# vocabulary. Neither MiniMax guide tables them — both only use such phrases in
+# prose examples — so unlike the camera-motion grammar below they are ours to
+# define and are shared by every format rather than presented as a provider
+# contract.
+_FRAMING_AIDS = [
+    {"id": "shot_distance", "label": "Shot distance",
+     "text": "The shot is {distance}.",
+     "fields": {"distance": {"type": "enum", "label": "Distance", "values": [
+         {"value": "an extreme wide shot", "label": "Extreme wide"},
+         {"value": "a wide shot", "label": "Wide"},
+         {"value": "a medium-wide shot", "label": "Medium wide"},
+         {"value": "a medium shot", "label": "Medium"},
+         {"value": "a medium close-up", "label": "Medium close-up"},
+         {"value": "a close-up", "label": "Close-up"},
+         {"value": "an extreme close-up", "label": "Extreme close-up"},
+     ]}}},
+    {"id": "shot_composition", "label": "Shot composition",
+     "text": "The camera frames the subject {composition}.",
+     "fields": {"composition": {"type": "enum", "label": "Composition", "values": [
+         {"value": "at eye level", "label": "Eye level"},
+         {"value": "from a low angle", "label": "Low angle"},
+         {"value": "from a high angle", "label": "High angle"},
+         {"value": "from a bird's-eye view", "label": "Bird's eye"},
+         {"value": "from a worm's-eye view", "label": "Worm's eye"},
+         {"value": "over the shoulder", "label": "Over the shoulder"},
+         {"value": "in a centred symmetrical frame", "label": "Centred"},
+         {"value": "off-centre using the rule of thirds", "label": "Rule of thirds"},
+         {"value": "in a Dutch-angled frame", "label": "Dutch angle"},
+     ]}}},
+    {"id": "depth_of_field", "label": "Depth of field",
+     "text": "The image has {depth_of_field}{focus}.",
+     "fields": {
+         "depth_of_field": {"type": "enum", "label": "Depth of field", "values": [
+             {"value": "a shallow depth of field", "label": "Shallow"},
+             {"value": "a deep depth of field", "label": "Deep"},
+         ]},
+         "focus": {"type": "enum", "label": "Focus change", "optional": True,
+                   "values": [
+                       {"value": ", racking focus to the subject",
+                        "label": "Rack focus to subject"},
+                       {"value": ", racking focus to the background",
+                        "label": "Rack focus to background"},
+                   ]},
+     }},
+    {"id": "field_of_view", "label": "Field of view",
+     "text": "The scene is captured on {lens}.",
+     "fields": {"lens": {"type": "enum", "label": "Lens", "values": [
+         {"value": "an ultra-wide fisheye lens", "label": "Fisheye"},
+         {"value": "a wide-angle lens", "label": "Wide angle"},
+         {"value": "a standard 50mm lens", "label": "Standard 50mm"},
+         {"value": "a short telephoto portrait lens", "label": "Portrait telephoto"},
+         {"value": "a long telephoto lens", "label": "Long telephoto"},
+         {"value": "a macro lens", "label": "Macro"},
+     ]}}},
 ]
 
-_MINIMAX_AIDS = copy.deepcopy(_GENERIC_AIDS)
-_MINIMAX_LANGUAGE_FIELD = {"language": {"type": "enum", "values": [
-    "English", "Spanish", "French", "German", "Italian", "Japanese",
-    "Korean", "Chinese", "Portuguese", "Hindi"]}}
-for _aid in _MINIMAX_AIDS:
-    if _aid["id"] == "voiceover":
-        _aid["text"] = ("The on-screen character says in an off-screen voiceover: "
-                        "<d>[{language}] {text}</d> while the corresponding "
-                        "on-screen character's lips remain completely closed.")
-        _aid["fields"] = copy.deepcopy(_MINIMAX_LANGUAGE_FIELD)
-    elif _aid["id"] == "singing":
-        # H3 sung lyrics use the same bounded-language <d> envelope as speech;
-        # inheriting the Generic bare "Singing: {text}" emitted lyrics the model
-        # reads as description rather than vocal content.
-        _aid["text"] = "Singing: <d>[{language}] {text}</d>"
-        _aid["fields"] = copy.deepcopy(_MINIMAX_LANGUAGE_FIELD)
+
+def _generic_aids() -> list:
+    return copy.deepcopy([
+        {"id": "dialogue", "label": "Dialogue", "text": "<d>[{language}] {text}</d>",
+         "fields": _LANGUAGE_FIELD},
+        {"id": "voiceover", "label": "Voiceover", "text": "Voiceover: {text}"},
+        {"id": "group_speech", "label": "Group speech", "text": "Group says: {text}"},
+        {"id": "singing", "label": "Singing", "text": "Singing: {text}"},
+        {"id": "scene_transition", "label": "Scene transition", "text": "<scenetrans>"},
+        {"id": "cutoff", "label": "Cutoff", "text": "<cutoff>"},
+        {"id": "visible_text", "label": "Visible text", "text": "\"{text}\""},
+        {"id": "camera_motion", "label": "Camera motion", "text": "The camera {motion}.",
+         "fields": {"motion": {"type": "enum", "label": "Motion", "values": [
+             "pushes in", "pulls out", "pans left", "pans right", "tilts up",
+             "tilts down", "trucks left", "trucks right", "orbits the subject",
+             "remains static"]}}},
+        *copy.deepcopy(_FRAMING_AIDS),
+    ])
+
+
+# MiniMax H3 §4.3 states the camera grammar as motion type + amplitude + speed,
+# written as a natural action inside the shot rather than labels appended to a
+# sentence, and says to add amplitude and speed only when they are meaningful —
+# which is what makes those two fields `optional` rather than defaulted. The
+# Generic ten-verb list this used to inherit expressed neither dimension and
+# omitted half the documented motions.
+_MINIMAX_CAMERA_MOTION = {
+    "id": "camera_motion", "label": "Camera motion",
+    "text": "The camera {motion} {amplitude} {speed}.",
+    "fields": {
+        "motion": {"type": "enum", "label": "Motion type", "values": [
+            {"value": "zooms in", "label": "Zoom In"},
+            {"value": "zooms out", "label": "Zoom Out"},
+            {"value": "pushes in", "label": "Push In"},
+            {"value": "pulls out", "label": "Pull Out"},
+            {"value": "pans left", "label": "Pan Left"},
+            {"value": "pans right", "label": "Pan Right"},
+            {"value": "trucks left", "label": "Truck Left"},
+            {"value": "trucks right", "label": "Truck Right"},
+            {"value": "tilts up", "label": "Tilt Up"},
+            {"value": "tilts down", "label": "Tilt Down"},
+            {"value": "pedestals up", "label": "Pedestal Up"},
+            {"value": "pedestals down", "label": "Pedestal Down"},
+            {"value": "arcs around the subject", "label": "Arc Shot"},
+            {"value": "tracks the subject", "label": "Tracking Shot"},
+            {"value": "holds a static shot", "label": "Static Shot"},
+            {"value": "shakes slightly", "label": "Shake Slightly"},
+            {"value": "shakes strongly", "label": "Shake Strongly"},
+            {"value": "takes the subject's point of view", "label": "POV"},
+            {"value": "rolls clockwise", "label": "Roll Clockwise"},
+            {"value": "rolls counterclockwise", "label": "Roll Counterclockwise"},
+        ]},
+        "amplitude": {"type": "enum", "label": "Amplitude", "optional": True,
+                      "help": "Omitted for medium amplitude.", "values": [
+                          {"value": "with small amplitude", "label": "Small"},
+                          {"value": "with large amplitude", "label": "Large"},
+                      ]},
+        "speed": {"type": "enum", "label": "Speed", "optional": True,
+                  "help": "Omitted for normal speed.", "values": [
+                      {"value": "at slow speed", "label": "Slow"},
+                      {"value": "at fast speed", "label": "Fast"},
+                  ]},
+    },
+}
+
+
+def _minimax_aids(description_channel: str) -> list:
+    """MiniMax writing aids bound to the profile's own description channel.
+
+    Base and Full Reference carry the SAME aids but different channel keys —
+    `integrated_multimodal_description` versus `detailed_description` — so this
+    cannot be one shared list. Every aid here is timeline description prose;
+    none belongs in the soundscape, music, definition, summary or retention
+    channels, which is what `channel_keys` says.
+    """
+    aids = _generic_aids()
+    for aid in aids:
+        aid["channel_keys"] = [description_channel]
+        if aid["id"] == "voiceover":
+            aid["text"] = ("The on-screen character says in an off-screen voiceover: "
+                           "<d>[{language}] {text}</d> while the corresponding "
+                           "on-screen character's lips remain completely closed.")
+            aid["fields"] = copy.deepcopy(_LANGUAGE_FIELD)
+        elif aid["id"] == "singing":
+            # H3 sung lyrics use the same bounded-language <d> envelope as speech;
+            # inheriting the Generic bare "Singing: {text}" emitted lyrics the model
+            # reads as description rather than vocal content.
+            aid["text"] = "Singing: <d>[{language}] {text}</d>"
+            aid["fields"] = copy.deepcopy(_LANGUAGE_FIELD)
+        elif aid["id"] == "camera_motion":
+            aid.update(copy.deepcopy(_MINIMAX_CAMERA_MOTION))
+            aid["channel_keys"] = [description_channel]
+    return aids
 
 BUILTIN_PROFILES = {
     "generic@1": _profile(
@@ -1338,7 +1510,7 @@ BUILTIN_PROFILES = {
                 },
             },
             "vocal_event": {"placement": "inline"},
-        }, writing_aids=_GENERIC_AIDS,
+        }, writing_aids=_generic_aids(),
         speaker_policy=DEFAULT_SPEAKER_POLICY),
     "minimax_h3_base@1": _profile(
         "minimax_h3_base", "MiniMax H3 Base", "minimax_h3_base",
@@ -1351,7 +1523,7 @@ BUILTIN_PROFILES = {
             "prompt_link_scope": {"placement": "section_prefix"},
             "vocal_event": {"channel_key": "integrated_multimodal_description",
                             "placement": "inline"},
-        }, writing_aids=_MINIMAX_AIDS,
+        }, writing_aids=_minimax_aids("integrated_multimodal_description"),
         validators=["minimax_base_setup", "managed_speakers"],
         identity_kinds=[{**MINIMAX_SUBJECT_KIND,
                          "referenced_label_template": ""}],
@@ -1433,7 +1605,7 @@ BUILTIN_PROFILES = {
             },
             "vocal_event": {"channel_key": "detailed_description",
                             "placement": "inline"},
-        }, writing_aids=_MINIMAX_AIDS,
+        }, writing_aids=_minimax_aids("detailed_description"),
         validators=["minimax_reference_setup", "managed_speakers"],
         role_catalogs=MINIMAX_H3_ROLE_CATALOGS,
         physical_populations=MINIMAX_H3_PHYSICAL_POPULATIONS,
@@ -1615,6 +1787,18 @@ def normalize_profile(raw, *, builtin=False) -> dict:
         substitutions = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", text))
         if not substitutions.issubset(allowed_substitutions):
             raise ValueError("unknown_formatter_substitution")
+        # Which channels an aid belongs to. Absent or empty means every channel,
+        # so an aid that predates this key keeps its current reach. Normalization
+        # stays tolerant and only screens shape; whether the keys name channels
+        # the bound template actually has is a declaration-level question,
+        # reported by `profile_declaration_errors` rather than raised at rest.
+        channel_keys = aid.get("channel_keys")
+        if channel_keys is not None:
+            if (not isinstance(channel_keys, list)
+                    or len(channel_keys) > MAX_CAPABILITIES
+                    or not all(isinstance(key, str) and 0 < len(key) <= 128
+                               for key in channel_keys)):
+                raise ValueError("invalid_writing_aid_channels")
         aids.append(copy.deepcopy(aid))
     validators = []
     for validator in raw.get("validators") or []:
@@ -2628,6 +2812,45 @@ def _capabilities(attachment, profile):
             if value.get("placement") in PLACEMENT_PHASES]
 
 
+SCOPE_LINK_CHANNEL_CAPABILITY_PREFIX = "prompt_link_scope:"
+
+
+def scope_link_channel_capability_id(channel) -> str:
+    """The capability id a section-scope Prompt Link uses for one channel."""
+    return f"{SCOPE_LINK_CHANNEL_CAPABILITY_PREFIX}{channel}"
+
+
+def _scope_link_capability(attachment, profile, channel):
+    """One capability per selected channel, so suppression can be per channel.
+
+    A scope link used to carry exactly ONE capability reused for every channel,
+    which is why muting it was all-or-nothing while a Reference — many
+    capabilities, each with its own id — could suppress one part and keep the
+    rest. Splitting it per channel lets the existing per-capability `enabled`
+    flag and its projection row do the work, rather than inventing a second,
+    parallel `disabled_channels` list over the same state.
+
+    Records stay sparse: a channel with no stored record inherits, and the
+    single legacy `prompt_link_scope` record is honoured as the inherited value
+    so a chip already suppressed before this split stays suppressed instead of
+    silently coming back on.
+    """
+    capability_id = scope_link_channel_capability_id(channel)
+    stored = attachment.get("capabilities") or []
+    legacy = None
+    for value in stored:
+        current = str(value.get("capability_id") or value.get("kind") or "")
+        if current == capability_id:
+            return _resolved_capability(attachment, value, profile)
+        if current == "prompt_link_scope":
+            legacy = value
+    base = copy.deepcopy(legacy) if legacy else _default_capability(
+        attachment, profile)
+    base["capability_id"] = capability_id
+    base["kind"] = "prompt_link_scope"
+    return _resolved_capability(attachment, base, profile)
+
+
 def _enabled_capabilities(attachment, profile):
     """Capabilities that actually render.
 
@@ -3291,45 +3514,6 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 errors.append({"code": "reference_capability_incompatible",
                                "attachment_id": attachment["attachment_id"],
                                "message": "The Reference chip requests capabilities its recipe does not expose."})
-    if is_h3_profile:
-        setup_guides = {str(value.get("role") or "")
-                        for value in (context.get("setup_manifest", {}).get("guides") or [])}
-        for attachment in all_attachments:
-            if (not attachment["enabled"]
-                    or attachment["kind"] != "custom"):
-                continue
-            config = attachment.get("config") or {}
-            role = str(config.get("setup_role") or "")
-            picture_prefixes = [
-                declared_label_prefix(declaration)
-                for declaration in physical_population_declarations(resolved_profile)
-                if str(declaration.get("token_kind") or "") == "picture"
-            ]
-            if is_h3_base_profile and not picture_prefixes:
-                # Base mode has no staged physical population of its own, but its
-                # first/last-frame guides use the same H3 Picture token grammar.
-                # The validator is format-owned; the shared H3 declaration keeps
-                # that grammar in one server authority.
-                picture_prefixes = [declared_label_prefix(
-                    physical_population_by(
-                        {"physical_populations": MINIMAX_H3_PHYSICAL_POPULATIONS},
-                        "token_kind", "picture"))]
-            claims_picture = any(prefix and prefix in str(config.get("text") or "")
-                                 for prefix in picture_prefixes)
-            if attachment["kind"] == "custom" and not role and not claims_picture:
-                continue
-            if role and role not in {"first", "last"}:
-                errors.append({"code": "invalid_h3_guide_role",
-                               "attachment_id": attachment["attachment_id"],
-                               "message": "H3 Guide binding must be first or last."})
-            elif role and role not in setup_guides:
-                errors.append({"code": "missing_h3_guide_binding",
-                               "attachment_id": attachment["attachment_id"],
-                               "message": f"The active H3 setup has no {role}-frame Guide for this chip."})
-            elif claims_picture and not role:
-                errors.append({"code": "unbound_h3_picture_guidance",
-                               "attachment_id": attachment["attachment_id"],
-                               "message": "Picture guidance must bind to the active H3 first- or last-frame Guide."})
     # Retention appearance lists are semantic aggregates over the selected
     # window. Split-derived Reference clones share an emission group, so a
     # combined render produces one definition/retention line while either half
@@ -3650,6 +3834,14 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                 selected_channels = [str(link_source.get("channel_key"))]
             if selected_channels and channel_key not in selected_channels:
                 continue
+            # The transitive path resolves a link THROUGH another link, and it
+            # reads the same per-channel suppression the direct path does. It
+            # previously consulted only chip-level `enabled`, so a channel muted
+            # on the direct path reappeared the moment a later section chained
+            # through it.
+            if not _scope_link_capability(
+                    attachment, resolved_profile, channel_key).get("enabled", True):
+                continue
             scope_prefixes.append(local_link_text(
                 str(link_source.get("prompt_id") or ""), channel_key,
                 source_index, trail + (cache_key,), attachment["attachment_id"]))
@@ -3818,9 +4010,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
             if not selected_channels:
                 selected_channels = ([str(source.get("channel_key"))]
                                      if source.get("channel_key") else list(keys))
-            capability = (_capabilities(attachment, resolved_profile)
-                          or [_default_capability(attachment, resolved_profile)])[0]
             for target_channel in dict.fromkeys(selected_channels):
+                # Per channel, so one channel can be muted while its siblings
+                # keep emitting; the projection row carries the same per-channel
+                # id, which is what the browser's suppression control writes to.
+                capability = _scope_link_capability(
+                    attachment, resolved_profile, target_channel)
                 projection = record_capability_projection(
                     attachment, capability, target_channel,
                     section.get("prompt_id", ""), "scope")

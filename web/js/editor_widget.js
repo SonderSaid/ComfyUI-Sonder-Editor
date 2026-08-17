@@ -9794,10 +9794,21 @@ export class EditorWidget {
                     ? ["reference", "custom"]
                     : undefined,
                 onCreate: configure,
+                profile: this._resolvedPromptContextProfile(),
+                referenceContext: () => ({
+                    scene: contextScene,
+                    references: this._references || [],
+                    semanticUnits: this._promptSemanticUnits || [],
+                    profileId: this.activeScene?.prompt_context_profile_id
+                        || template.default_context_profile || "generic@1",
+                    scope: consumerSection ? "section" : "global",
+                    resolvedProfile: this._resolvedPromptContextProfile(),
+                }),
                 onInserted: async () => { await onEnter?.({ close: false }); },
                 writingAids: this._promptContextWritingAids(
                     this.activeScene?.prompt_context_profile_id
                         || template.default_context_profile || "generic@1"),
+                channelKey: key,
             });
             const beforeProjectionHost = document.createElement("div");
             const afterProjectionHost = document.createElement("div");
@@ -9952,6 +9963,7 @@ export class EditorWidget {
                 attachments: sharedAttachments.filter((value) => !anchored.has(value.attachment_id)),
                 previews,
                 attachmentLabelFor,
+                profile: this._resolvedPromptContextProfile(),
                 allowedKinds: globalScope
                     ? ["reference", "custom"]
                     : (template.shot_marker_channel
@@ -13750,12 +13762,12 @@ export class EditorWidget {
                 ["Ctrl+Z", "Undo"],
                 ["Ctrl+Y", "Redo"],
                 ["Ctrl+Shift+Z", "Redo"],
+                ["Ctrl+V", "Paste into the focused field; fullscreen background paste is ignored"],
             ]) +
             this._shortcutSection("Prompt", [
-                ["Right-click prompt", "Open Context and Writing-aid menu at the clicked caret"],
-                ["Shift+F10 / Menu", "Open prompt authoring menu at the current caret"],
-                ["Arrow keys / Enter", "Navigate and choose nested prompt-menu actions"],
-                ["Ctrl+V", "Paste into the active field; fullscreen background paste is ignored"],
+                ["Right-click prompt", "Open the insert menu where you clicked"],
+                ["Shift+F10 / Menu", "Open the insert menu at the cursor"],
+                ["Arrow keys / Enter", "Move through the menu and choose"],
             ]) +
             this._shortcutSection("Asset Gallery", [
                 ["Arrow keys", "Move asset focus / selection"],

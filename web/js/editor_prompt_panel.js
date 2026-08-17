@@ -186,6 +186,64 @@ export function identityCandidateSignature(candidate) {
     ]);
 }
 
+/**
+ * Writing-aid choices as the flat `field=a|b; other=c` authoring form.
+ *
+ * One spelling is shared by the New-aid row and the per-aid editors, so the two
+ * paths cannot disagree about what an aid may declare.
+ */
+export function formatWritingAidChoices(fields = {}) {
+    const declared = fields && typeof fields === "object" ? fields : {};
+    return Object.entries(declared)
+        .filter(([, declaration]) => declaration && typeof declaration === "object")
+        .map(([name, declaration]) => {
+            const values = (Array.isArray(declaration.values) ? declaration.values : [])
+                .map((entry) => typeof entry === "string"
+                    ? entry : String(entry?.value || ""))
+                .filter(Boolean);
+            return `${name}=${values.join("|")}`;
+        })
+        .join("; ");
+}
+
+/**
+ * Parse that flat form back into declarations for the placeholders `text` uses.
+ *
+ * The flat form has one column and therefore cannot express a value's `label`,
+ * `description`, or the field's `optional`/`help` — so any of those already
+ * declared are CARRIED FORWARD for values that survive the edit. Without that,
+ * opening a format built on `{value: "zooms in", label: "Zoom In"}` and saving
+ * it unchanged would silently flatten every label to its raw value.
+ */
+export function parseWritingAidChoices(rawText, aidText = "", previousFields = {}) {
+    const previous = previousFields && typeof previousFields === "object"
+        ? previousFields : {};
+    const declaredValues = new Map(String(rawText || "").split(";")
+        .map((entry) => entry.split("="))
+        .filter((parts) => parts.length === 2)
+        .map(([field, values]) => [field.trim(), values.split("|")
+            .map((value) => value.trim()).filter(Boolean)]));
+    const fields = {};
+    for (const match of String(aidText || "")
+        .matchAll(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
+        const name = match[1];
+        if (name === "text" || fields[name]) continue;
+        const prior = previous[name] && typeof previous[name] === "object"
+            ? previous[name] : {};
+        const priorByValue = new Map((Array.isArray(prior.values) ? prior.values : [])
+            .map((entry) => typeof entry === "string"
+                ? [entry, entry] : [String(entry?.value || ""), entry]));
+        const values = (declaredValues.get(name)
+            ?? [...priorByValue.keys()]).map((value) => priorByValue.get(value) ?? value);
+        fields[name] = {
+            ...prior,
+            type: String(prior.type || "") === "enum_multi" ? "enum_multi" : "enum",
+            values,
+        };
+    }
+    return fields;
+}
+
 /** Plain-language reason a format cannot be deleted, from the served usages.
  *
  *  The server owns the usage RULE; this only renders what it reported. Never
@@ -1074,9 +1132,14 @@ export function mountPromptManagementPanel(host) {
                 saveWritingState();
             },
             onCreate: (attachment) => configureDraftAttachment(attachment),
+            profile: host._resolvedPromptContextProfile?.(),
             writingAids: host._promptContextWritingAids?.(
                 scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1") || [],
+            // Deliberately no `channelKey`: Writing Source is one box
+            // projecting every channel, so the caret has no single channel to
+            // filter by and the full aid set stays available. Structured and
+            // the timeline bars are per-channel and do filter.
         });
         bodyEl.appendChild(draftArea);
         bodyEl.appendChild(makeHeightGrip(host, bodyEl, "panelDraftBoxHeight", { min: 120, label: "Drag to resize the draft box (persists)" }));
@@ -1206,6 +1269,7 @@ export function mountPromptManagementPanel(host) {
                         previews: currentCandidatePayload()?.attachment_previews || {},
                         attachmentLabelFor,
                         disabled: applyBlocked,
+                        profile: host._resolvedPromptContextProfile?.(),
                         allowedKinds: host._channelTemplate().shot_marker_channel
                             ? ["shot", "timestamp", "prompt_link_scope", "reference", "custom"]
                             : ["prompt_link_scope", "reference", "custom"],
@@ -1584,6 +1648,46 @@ export function mountPromptManagementPanel(host) {
                         writingAids.splice(index, 1); renderWritingAids();
                     });
                     row.append(labelInput, textInput, remove); aidEditor.appendChild(row);
+
+                    // Choices and channels are the other two halves of an aid's
+                    // declaration and were previously editable only at creation,
+                    // so a built-in forked for one tweak could never have its
+                    // vocabulary or targeting corrected.
+                    const detail = document.createElement("div");
+                    detail.style.cssText = "display:grid;grid-template-columns:120px minmax(0,1fr);gap:4px;";
+                    const choicesInput = document.createElement("input");
+                    choicesInput.value = formatWritingAidChoices(aid.fields);
+                    choicesInput.style.cssText = chromeInputCss();
+                    choicesInput.placeholder = "motion=pans left|pans right";
+                    choicesInput.setAttribute("aria-label", "Writing aid choices");
+                    const choicesLabel = document.createElement("span");
+                    choicesLabel.textContent = "Choices";
+                    choicesLabel.style.cssText = `font-size:9px;color:${COLORS.textDim};align-self:center;`;
+                    const channelsInput = document.createElement("input");
+                    channelsInput.value = (Array.isArray(aid.channel_keys)
+                        ? aid.channel_keys : []).join(", ");
+                    channelsInput.style.cssText = chromeInputCss();
+                    channelsInput.placeholder = "all channels";
+                    channelsInput.setAttribute("aria-label", "Writing aid channels");
+                    const channelsLabel = document.createElement("span");
+                    channelsLabel.textContent = "Channels";
+                    channelsLabel.style.cssText = `font-size:9px;color:${COLORS.textDim};align-self:center;`;
+                    // Reconcile on commit, not per keystroke: a half-typed key
+                    // would otherwise mint a declaration per character.
+                    choicesInput.addEventListener("change", () => {
+                        writingAids[index].fields = parseWritingAidChoices(
+                            choicesInput.value, writingAids[index].text,
+                            writingAids[index].fields);
+                    });
+                    channelsInput.addEventListener("change", () => {
+                        const keys = channelsInput.value.split(",")
+                            .map((value) => value.trim()).filter(Boolean);
+                        if (keys.length) writingAids[index].channel_keys = keys;
+                        else delete writingAids[index].channel_keys;
+                    });
+                    detail.append(choicesLabel, choicesInput,
+                        channelsLabel, channelsInput);
+                    aidEditor.appendChild(detail);
                 });
             };
             renderWritingAids();
@@ -1592,23 +1696,38 @@ export function mountPromptManagementPanel(host) {
             const aidText = addField("New aid text", "");
             const aidChoices = addField("New aid choices", "");
             aidChoices.placeholder = "language=English|Spanish; motion=pans left|pans right";
+            const aidChannels = addField("New aid channels", "");
+            aidChannels.placeholder = "all channels";
+            const aidProblem = document.createElement("span");
+            aidProblem.style.cssText = `grid-column:1/-1;font-size:9px;color:${COLORS.dangerText};`;
+            editor.appendChild(aidProblem);
             const addAid = makeBtn("Add writing aid", "Add this bounded writing aid");
             addAid.addEventListener("click", () => {
-                if (!aidLabel.value.trim() || !aidText.value) return;
-                const declaredChoices = new Map(aidChoices.value.split(";")
-                    .map((entry) => entry.split("="))
-                    .filter((parts) => parts.length === 2)
-                    .map(([field, values]) => [field.trim(), values.split("|")
-                        .map((value) => value.trim()).filter(Boolean)]));
-                const fields = {};
-                for (const match of aidText.value.matchAll(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
-                    if (match[1] !== "text") fields[match[1]] = {
-                        type: "enum", values: declaredChoices.get(match[1]) || [],
-                    };
+                aidProblem.textContent = "";
+                if (!aidLabel.value.trim() || !aidText.value) {
+                    aidProblem.textContent = "A writing aid needs a label and text.";
+                    return;
                 }
+                const fields = parseWritingAidChoices(aidChoices.value, aidText.value);
+                // An enum with no values is refused by the server, so minting one
+                // silently produced a format that could never be saved and said
+                // nothing about why. Name the placeholder instead.
+                const empty = Object.entries(fields)
+                    .filter(([, declaration]) => !declaration.values.length)
+                    .map(([name]) => `{${name}}`);
+                if (empty.length) {
+                    aidProblem.textContent =
+                        `Give ${empty.join(", ")} choices, or remove ${
+                            empty.length === 1 ? "it" : "them"} from the text.`;
+                    return;
+                }
+                const channelKeys = aidChannels.value.split(",")
+                    .map((value) => value.trim()).filter(Boolean);
                 writingAids.push({ id: `custom_${Date.now().toString(36)}`,
-                    label: aidLabel.value.trim(), text: aidText.value, fields });
+                    label: aidLabel.value.trim(), text: aidText.value, fields,
+                    ...(channelKeys.length ? { channel_keys: channelKeys } : {}) });
                 aidLabel.value = ""; aidText.value = ""; aidChoices.value = "";
+                aidChannels.value = "";
                 renderWritingAids();
             });
             editor.append(document.createElement("span"), addAid);
@@ -1628,10 +1747,11 @@ export function mountPromptManagementPanel(host) {
             const cancel = makeBtn("Cancel", "Close without saving", "subtle");
             const save = makeBtn("Save prompt format", "Validate and save this immutable version", "primary");
             let closed = false;
+            let releaseEscape = () => {};
             const close = () => {
                 if (closed) return;
                 closed = true;
-                document.removeEventListener("keydown", onKeyDown, true);
+                releaseEscape();
                 declarations.cleanup();
                 backdrop.remove();
             };
@@ -1644,16 +1764,26 @@ export function mountPromptManagementPanel(host) {
                     ...editor.querySelectorAll?.("input, textarea, select") || []],
                 message: "Discard this prompt format draft? Your unsaved changes will be lost.",
             });
-            const onKeyDown = (event) => {
-                if (event.key !== "Escape") return;
-                event.preventDefault(); event.stopPropagation();
-                if (draftGuard.confirmDismiss()) close();
-            };
+            // Escape goes through keyboard ownership, not a document-capture
+            // listener. Window capture runs FIRST, so this panel's own OVERLAY
+            // consumer — which closes the Prompt tool unconditionally — consumed
+            // Escape and stopped it before a document listener could ever see
+            // it: the format editor stayed open while the tool behind it shut,
+            // and this draft guard never ran.
+            releaseEscape = registerKeyboardConsumer({
+                id: `sonder-prompt-format-editor-${Date.now().toString(36)}`,
+                priority: KEY_PRIORITY.OVERLAY,
+                keydown: (event) => {
+                    if (event.isComposing === true || event.keyCode === 229) return false;
+                    if (event.key !== "Escape") return false;
+                    if (draftGuard.confirmDismiss()) close();
+                    return true;
+                },
+            });
             cancel.addEventListener("click", close);
             backdrop.addEventListener("click", (event) => {
                 if (event.target === backdrop && draftGuard.confirmDismiss()) close();
             });
-            document.addEventListener("keydown", onKeyDown, true);
             save.addEventListener("click", async () => {
                 const profileId = id.value.trim().replace(/[^A-Za-z0-9_.-]+/g, "_");
                 const versionId = version.value.trim();
@@ -1822,18 +1952,29 @@ export function mountPromptManagementPanel(host) {
             }
             menuWrap.appendChild(menu);
             // Dismiss on outside pointer or Escape. Deferred one tick so the
-            // click that opened the menu does not immediately close it.
+            // click that opened the menu does not immediately close it. Escape
+            // goes through keyboard ownership rather than a document listener,
+            // which window capture beats — this panel's own consumer would
+            // otherwise close the whole Prompt tool with the menu still up.
+            let releaseMenuEscape = () => {};
             const dismiss = (event) => {
                 if (event?.type === "pointerdown"
                         && (menu.contains(event.target) || menuButton === event.target)) return;
-                if (event?.type === "keydown" && event.key !== "Escape") return;
                 menu.remove();
+                releaseMenuEscape();
                 document.removeEventListener("pointerdown", dismiss, true);
-                document.removeEventListener("keydown", dismiss, true);
             };
             setTimeout(() => {
                 document.addEventListener("pointerdown", dismiss, true);
-                document.addEventListener("keydown", dismiss, true);
+                releaseMenuEscape = registerKeyboardConsumer({
+                    id: `sonder-prompt-format-menu-${Date.now().toString(36)}`,
+                    priority: KEY_PRIORITY.OVERLAY,
+                    keydown: (event) => {
+                        if (event.key !== "Escape") return false;
+                        dismiss();
+                        return true;
+                    },
+                });
             }, 0);
         });
         menuWrap.appendChild(menuButton);
@@ -2159,9 +2300,22 @@ export function mountPromptManagementPanel(host) {
                 allowedKinds: ["reference", "custom"],
                 onInserted: ({ type }) => type === "writing_aid" ? commitGlobal() : null,
                 onCreate: configureGlobalAttachment,
+                profile: host._resolvedPromptContextProfile?.(),
+                referenceContext: () => ({
+                    scene: { ...(scene || {}),
+                        _context_reference_frame_threshold:
+                            host._referenceFrameThreshold || 0 },
+                    references: host._references || [],
+                    semanticUnits: host._promptSemanticUnits || [],
+                    profileId: scene.prompt_context_profile_id
+                        || globalTemplate.default_context_profile || "generic@1",
+                    scope: "global",
+                    resolvedProfile: currentPromptProfile(),
+                }),
                 writingAids: host._promptContextWritingAids?.(
                     scene.prompt_context_profile_id
                         || globalTemplate.default_context_profile || "generic@1") || [],
+                channelKey: key,
             });
             let projectionHosts = null;
             const refreshProjection = (payload = currentCandidatePayload()) => {
@@ -2232,6 +2386,7 @@ export function mountPromptManagementPanel(host) {
                 previews: currentCandidatePayload()?.attachment_previews || {},
                 attachmentLabelFor,
                 disabled: globalLocked,
+                profile: host._resolvedPromptContextProfile?.(),
                 allowedKinds: ["reference", "custom"],
                 onAdd: async (kind) => {
                     const configured = await configureGlobalScope({ kind });
@@ -2434,9 +2589,24 @@ export function mountPromptManagementPanel(host) {
                     editor: input,
                     onInserted: ({ type }) => type === "writing_aid" ? commitChannels() : null,
                     onCreate: configureChannelAttachment,
+                    profile: host._resolvedPromptContextProfile?.(),
+                    referenceContext: () => ({
+                        scene: { ...(scene || {}),
+                            _context_consumer_start: section.start_frame,
+                            _context_consumer_end: section.end_frame,
+                            _context_reference_frame_threshold:
+                                host._referenceFrameThreshold || 0 },
+                        references: host._references || [],
+                        semanticUnits: host._promptSemanticUnits || [],
+                        profileId: scene.prompt_context_profile_id
+                            || template.default_context_profile || "generic@1",
+                        scope: "section",
+                        resolvedProfile: currentPromptProfile(),
+                    }),
                     writingAids: host._promptContextWritingAids?.(
                         scene.prompt_context_profile_id
                             || template.default_context_profile || "generic@1") || [],
+                    channelKey: key,
                 });
                 let projectionHosts = null;
                 const refreshProjection = (payload = currentCandidatePayload()) => {
@@ -2536,6 +2706,7 @@ export function mountPromptManagementPanel(host) {
                     previews: currentCandidatePayload()?.attachment_previews || {},
                     attachmentLabelFor,
                     disabled: sectionsLocked,
+                    profile: host._resolvedPromptContextProfile?.(),
                     allowedKinds: template.shot_marker_channel
                         ? ["shot", "timestamp", "prompt_link_scope", "reference", "custom"]
                         : ["prompt_link_scope", "reference", "custom"],

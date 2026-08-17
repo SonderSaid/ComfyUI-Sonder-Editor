@@ -12,6 +12,13 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Changed
+- Writing aids now ask for their choices in the menu itself instead of a browser popup: an aid with nothing left to decide inserts straight away, one with a single choice opens a submenu, and one needing several opens a small panel. Select a line first and an aid wraps it — highlight a spoken line, pick Dialogue, and it comes back in the format's own syntax.
+- Writing aids are offered only in the channels their prompt format declares them for, so a soundscape or retention field no longer lists dialogue and camera aids, and each menu row previews the text it inserts.
+- MiniMax H3 camera motion now follows H3's own documented grammar — motion type plus optional amplitude and speed, across all twenty documented moves — instead of inheriting the shorter generic list. Shot distance, composition, depth of field and field of view are available to every format.
+- A Reference or prompt identity can now be mentioned straight from the right-click menu by picking its handle: it lands as an inline mention in the sentence you are writing — `@KWoman is leaning then @Doggo appears barking`, each resolving to the format's own label — using the defaults it already carries. Sources that cannot be attached here stay visible with the reason, and the full configuration dialog is one row away and still opens from the chip.
+- Prompt Link channels and Vocal Event subjects are now checkboxes with All/None rather than a list needing ctrl-click, and a section-scope Prompt Link can have individual channels switched off instead of only the whole chip.
+- Custom prompt formats can now edit an existing writing aid's choices and channels, not only set them when it is first created, and an aid whose placeholder has no choices says so instead of silently producing a format that cannot be saved.
+- The Context chip is now offered only by prompt formats that declare one, so it no longer appears under formats that have no use for it while staying available to any format that does.
 - Physical References now carry the same prompt defaults an Identity does, so a Reference attached anywhere follows its own prompt text, preservation detail, summary and handling instead of needing every field retyped on every chip. Whether a Reference contributes a prompt part at all is now set once on the Reference, while where that part lands stays per-attachment.
 - Attaching a Reference now configures it in the same dialog rather than only asking where to put it, and the chip editor shows the fields you have actually overridden with the rest collapsed behind a line naming what they follow. Both surfaces say which level of defaults they edit.
 - Reference field labels, help and availability now come from the prompt format's own declarations, so a format that declares no preservation or summary no longer shows those fields, and no MiniMax wording appears under an unrelated format.
@@ -34,8 +41,10 @@ a fresh `[Unreleased]` block.
 - Scope rows can reuse configured chips as linked emission groups with atomic propagated edits and Unlink, while the Prompt tool now separates compact Prompt Format, physical Reference Prompting, and explicit Identity Prompting.
 - Prompt authoring now defaults inline bars to an all-channel view, uses a shared caret-aware context menu, shows per-channel Reference-chip projections, supports format-declared stable-id tokens, treats resolvable empty content as advisory, and restores persisted box heights. Semantic identities can now be description-only or combine attributed physical sources and voice.
 - Timestamp is now an option on the Shot Context chip. Guide authoring is folded
-  into Custom text with an optional H3 physical Guide binding; unsupported raw
-  Guide/unknown kinds remain visible for repair and block while enabled.
+  into Custom text; ComfyUI's own Add Guide for MiniMax H3 node takes the first-
+  and last-frame images straight from the Guides Bridge, so no prompt-side
+  binding is involved. Unsupported raw Guide/unknown kinds remain visible for
+  repair and block while enabled.
 - MiniMax H3 Full Reference scenes now add Picture, Video, and Audio lanes
   independently instead of installing an all-three setup. Reference lane Members
   and Advisories start collapsed, remember browser-local disclosure choices, and
@@ -67,6 +76,11 @@ a fresh `[Unreleased]` block.
   with upstream `MiniMaxH3AddGuide`, without a Sonder-specific replacement.
 
 ### Fixed
+- Escape now closes the dialog you are actually in. Pressing it over the
+  Reference attachment dialog, the writing-aid panel, the prompt format editor
+  or the format actions menu closed the Prompt tool behind them instead, leaving
+  the dialog stranded over a shut editor. Escape in the channel template editor
+  did nothing at all for the same reason, and now closes it.
 - A Reference chip now follows its Prompt Format when the format's declared
   destination or placement changes, instead of staying where it was first
   attached; per-part routing is stored only when it genuinely differs, so

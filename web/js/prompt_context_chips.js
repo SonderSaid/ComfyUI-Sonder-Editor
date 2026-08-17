@@ -8,6 +8,7 @@ import { EDITOR_COLORS as COLORS, chromeInputCss, setButtonDisabled,
 import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
     register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import { promptToken, promptTokenDeclarationsFromProfile } from "./prompt_tokens.js";
+import { notifyWarning } from "./editor_notifications.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
 import {
@@ -1731,6 +1732,17 @@ export function createPromptDocumentEditor({
             selection.addRange(range);
         }
     };
+    /** Caret after all content — the safe landing spot for an unknown caret. */
+    editor.focusEnd = () => {
+        editor.focus();
+        const selection = globalThis.getSelection?.();
+        if (!selection) return;
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    };
     render();
     return editor;
 }
@@ -1741,6 +1753,36 @@ export function promptInsertionBookmark(editor) {
     return { start: structuredClone(bookmark.start), end: structuredClone(bookmark.start) };
 }
 
+/**
+ * What a writing aid inserts over, as distinct from where an attachment lands.
+ *
+ * An attachment collapses to a caret because a chip must never swallow authored
+ * prose. A writing aid is the opposite case: selecting a line and applying
+ * Dialogue means "wrap these words", so the live range is kept and its text
+ * pre-fills `{text}`.
+ *
+ * The range is only usable when it stays inside a single text node. A selection
+ * spanning a chip would otherwise contribute that chip's rendered label as
+ * prose and then be replaced by the insert, destroying the attachment; those
+ * fall back to the collapsed caret and insert without wrapping.
+ */
+export function promptSelectionSnapshot(editor) {
+    const bookmark = editor?.capturePromptSelection?.() || null;
+    const selection = globalThis.getSelection?.();
+    if (!bookmark || !selection?.rangeCount || selection.isCollapsed) {
+        return { bookmark: promptInsertionBookmark(editor), text: "" };
+    }
+    const range = selection.getRangeAt(0);
+    const single = range.startContainer === range.endContainer
+        && range.startContainer?.nodeType === Node.TEXT_NODE
+        && editor?.contains?.(range.startContainer);
+    if (!single) return { bookmark: promptInsertionBookmark(editor), text: "" };
+    // Chips are rendered with zero-width markers; they are structure, not prose.
+    const text = String(range.toString() || "").replaceAll("\u200b", "");
+    if (!text) return { bookmark: promptInsertionBookmark(editor), text: "" };
+    return { bookmark, text };
+}
+
 function restorePromptInsertion(editor, bookmark) {
     const restored = editor?.restorePromptSelection?.(bookmark);
     if (bookmark && restored === false) {
@@ -1748,40 +1790,269 @@ function restorePromptInsertion(editor, bookmark) {
             "[Sonder] Prompt changed while configuration was open; insertion was cancelled.");
         return false;
     }
+    // No bookmark means the caret was never resolvable — an empty box, a click
+    // on a chip, or a click in the padding below the text. `insertText` focuses
+    // the editor, and a bare focus() collapses to the START of a contenteditable,
+    // so returning success here silently inserted at position 0 and, against a
+    // stale offset, spliced the text mid-word. Append instead: it is the
+    // intuitive result when the caret is unknown, and it can never cut authored
+    // prose in half.
+    if (!bookmark) editor?.focusEnd?.();
     return true;
 }
 
-function promptWritingAids(writingAids) {
-    return (Array.isArray(writingAids) ? writingAids : [])
+/**
+ * The aids offered in one channel.
+ *
+ * A format declares `channel_keys` to say where an aid belongs: H3 dialogue and
+ * camera prose belong to the timeline description, not to the soundscape,
+ * music, definition, summary or retention channels. An aid that declares
+ * nothing reaches every channel, so a format predating the key is unchanged,
+ * and a caller with no channel of its own — the Writing draft box is one box
+ * projecting all channels — sees the whole set.
+ */
+function promptWritingAids(writingAids, channelKey = "") {
+    const aids = (Array.isArray(writingAids) ? writingAids : [])
         .filter((aid) => aid?.id);
+    const key = String(channelKey || "");
+    if (!key) return aids;
+    return aids.filter((aid) => {
+        const declared = Array.isArray(aid.channel_keys)
+            ? aid.channel_keys.map(String) : [];
+        return !declared.length || declared.includes(key);
+    });
 }
 
-async function insertWritingAid(editor, bookmark, aid, onInserted) {
-    const cancel = () => restorePromptInsertion(editor, bookmark);
+/**
+ * The declared fields an aid's text actually substitutes, in declaration order.
+ *
+ * A declaration the text never references is not a question worth asking, and
+ * `{text}` is handled separately because it is free prose rather than a bounded
+ * vocabulary.
+ */
+function writingAidFields(aid) {
+    const text = String(aid?.text || "");
+    const declared = aid?.fields && typeof aid.fields === "object" ? aid.fields : {};
+    return Object.entries(declared).filter(([name, declaration]) =>
+        declaration && typeof declaration === "object" && text.includes(`{${name}}`));
+}
+
+function writingAidUsesText(aid) {
+    return String(aid?.text || "").includes("{text}");
+}
+
+/**
+ * Writing-aid fields share one declaration shape with `derived[].fields`, so a
+ * declared `label` is authoritative. The raw field name is the last-resort
+ * spelling, not the first choice.
+ */
+function writingAidFieldLabel(name, declaration) {
+    return String(declaration?.label || "").trim() || String(name).replaceAll("_", " ");
+}
+
+function writingAidFieldOptional(declaration) {
+    return declaration?.optional === true;
+}
+
+/**
+ * Substitute declared values into an aid's text.
+ *
+ * An omitted optional field substitutes empty, which would otherwise leave the
+ * doubled spaces and orphaned punctuation of `The camera pushes in  .`, so runs
+ * of horizontal whitespace collapse and space before punctuation closes up.
+ * Only spaces and tabs collapse: an aid may legitimately contain newlines, and
+ * flattening those would rewrite authored prose rather than tidy it.
+ */
+function buildWritingAidText(aid, values = {}, textValue = "") {
     let value = String(aid?.text || "");
-    for (const [fieldName, declaration] of Object.entries(aid?.fields || {})) {
-        if (!value.includes(`{${fieldName}}`)) continue;
-        const allowed = declaration?.type === "enum" && Array.isArray(declaration.values)
-            ? declaration.values.map(String) : [];
-        if (!allowed.length) return;
-        const selected = globalThis.prompt?.(
-            `${String(fieldName).replaceAll("_", " ")} (${allowed.join(", ")})`, allowed[0]);
-        if (selected == null) { cancel(); return; }
-        if (!allowed.includes(selected)) {
-            globalThis.alert?.(`Choose one of: ${allowed.join(", ")}`);
-            cancel();
-            return;
+    for (const [name] of writingAidFields(aid)) {
+        const chosen = values?.[name];
+        const rendered = Array.isArray(chosen)
+            ? chosen.filter(Boolean).join(", ")
+            : String(chosen ?? "");
+        value = value.replaceAll(`{${name}}`, rendered);
+    }
+    if (writingAidUsesText(aid)) {
+        value = value.replaceAll("{text}", String(textValue ?? ""));
+    }
+    return value.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+([.,;:!?])/g, "$1");
+}
+
+/**
+ * Bounded writing-aid configuration.
+ *
+ * A single required enum resolves in the menu itself; this opens only when the
+ * aid needs free text or more than one choice. It deliberately reuses the
+ * backdrop/panel shape of `configurePromptAttachment`, including the modal
+ * marker the prompt boxes' blur guards whitelist, so opening it never commits
+ * the box behind it.
+ */
+function configureWritingAid(aid, fields, { needsText = false, text = "" } = {}) {
+    return new Promise((resolve) => {
+        const backdrop = document.createElement("div");
+        backdrop.dataset.sonderPromptContextModal = "1";
+        backdrop.style.cssText = "position:fixed;inset:0;z-index:12000;background:rgba(5,8,12,.72);display:flex;align-items:center;justify-content:center;padding:20px;";
+        const panel = document.createElement("div");
+        panel.style.cssText = `width:min(420px,92vw);max-height:82vh;overflow:auto;padding:14px;border:1px solid ${COLORS.border};border-radius:8px;background:${COLORS.panelRaised};box-shadow:0 18px 60px rgba(0,0,0,.55);display:flex;flex-direction:column;gap:10px;`;
+        const heading = document.createElement("div");
+        heading.textContent = String(aid?.label || aid?.id || "Writing aid");
+        heading.style.cssText = `font:600 13px system-ui;color:${COLORS.text};`;
+        const hint = document.createElement("div");
+        hint.textContent = "Inserted at the cursor as authored text.";
+        hint.style.cssText = `font:10px system-ui;color:${COLORS.textDim};`;
+        panel.append(heading, hint);
+
+        const controls = new Map();
+        for (const [name, declaration] of fields) {
+            const choices = declaredFieldChoices(declaration);
+            const multiple = String(declaration?.type || "") === "enum_multi";
+            let control;
+            if (multiple) {
+                control = selectField(choices.map((choice) => [choice.value, choice.label]));
+                control.multiple = true;
+                control.size = Math.min(6, Math.max(2, choices.length));
+                for (const option of control.options) option.selected = false;
+            } else {
+                control = selectField([
+                    ...(writingAidFieldOptional(declaration) ? [["", "— not set —"]] : []),
+                    ...choices.map((choice) => [choice.value, choice.label]),
+                ]);
+            }
+            controls.set(name, { control, multiple });
+            panel.appendChild(fieldRow(
+                writingAidFieldLabel(name, declaration), control,
+                String(declaration?.help || "")));
         }
-        value = value.replaceAll(`{${fieldName}}`, selected);
-    }
-    if (value.includes("{text}")) {
-        const text = globalThis.prompt?.("Text", "");
-        if (text == null) { cancel(); return; }
-        value = value.replaceAll("{text}", text);
-    }
+        let textControl = null;
+        if (needsText) {
+            textControl = textField(text, true);
+            panel.appendChild(fieldRow("Text", textControl));
+        }
+
+        const actions = document.createElement("div");
+        actions.style.cssText = "display:flex;justify-content:flex-end;gap:6px;margin-top:4px;";
+        const cancel = chipButton("Cancel", "", { padding: "5px 10px", fontSize: "11px" });
+        const confirm = chipButton("Insert", "",
+            { variant: "accentSoft", padding: "5px 10px", fontSize: "11px" });
+        actions.append(cancel, confirm);
+        panel.appendChild(actions);
+        backdrop.appendChild(panel);
+        document.body.appendChild(backdrop);
+
+        let releaseEscape = () => {};
+        const finish = (value) => {
+            releaseEscape();
+            backdrop.remove();
+            resolve(value);
+        };
+        releaseEscape = ownModalEscape(() => finish(null));
+        const collect = () => {
+            const values = {};
+            for (const [name, entry] of controls) {
+                values[name] = entry.multiple
+                    ? [...entry.control.selectedOptions].map((option) => option.value)
+                    : entry.control.value;
+            }
+            return { values, text: textControl ? textControl.value : text };
+        };
+        cancel.addEventListener("click", () => finish(null));
+        confirm.addEventListener("click", () => finish(collect()));
+        backdrop.addEventListener("mousedown", (event) => {
+            if (event.target === backdrop) finish(null);
+        });
+        // Enter is handled on the panel: every control here is an ordinary form
+        // control, which the timeline guards already treat as an editing target,
+        // and no OVERLAY consumer claims Enter. Propagation still stops so it
+        // does not reach the prompt box or the graph behind. Escape CANNOT live
+        // here — see `ownModalEscape` for why an element listener never sees it.
+        panel.addEventListener("keydown", (event) => {
+            if (event.isComposing || event.keyCode === 229) return;
+            if (event.key === "Enter" && event.target?.tagName !== "TEXTAREA") {
+                event.preventDefault();
+                event.stopPropagation();
+                finish(collect());
+            }
+        });
+        (panel.querySelector("select,textarea,input") || confirm)
+            .focus?.({ preventScroll: true });
+    });
+}
+
+/**
+ * Own Escape for a modal opened OVER another OVERLAY surface.
+ *
+ * An element-level `keydown` on the modal is too late. `KeyboardOwnership`
+ * listens at window CAPTURE, so a consumer already registered by the surface
+ * behind — the Prompt tool, whose Escape closes it unconditionally — consumes
+ * the key and calls `stopImmediatePropagation` before it ever reaches the
+ * modal's own listener. What the user sees is the panel behind vanishing while
+ * the dialog they were actually in stays put. Registering here instead makes
+ * the modal the newest OVERLAY consumer, and same-priority dispatch is LIFO.
+ *
+ * Returns the unregister closure; every close path must call it.
+ */
+function ownModalEscape(onEscape) {
+    return registerKeyboardConsumer({
+        id: `sonder-prompt-modal-${uid()}`,
+        priority: KEY_PRIORITY.OVERLAY,
+        keydown: (event) => {
+            if (event.isComposing === true || event.keyCode === 229) return false;
+            if (event.key !== "Escape") return false;
+            onEscape();
+            return true;
+        },
+    });
+}
+
+/**
+ * Restore the caret, insert the built text, and report it.
+ *
+ * `insertText` routes through `execCommand`, which replaces whatever the
+ * restored range covers — that is what turns a selection plus `{text}` into a
+ * wrap rather than an insertion in front of the words.
+ */
+async function commitWritingAid(editor, bookmark, aid, values, textValue, onInserted) {
+    const value = buildWritingAidText(aid, values, textValue);
     if (!restorePromptInsertion(editor, bookmark)) return;
     editor?.insertText?.(value);
     await onInserted?.({ type: "writing_aid", text: value });
+}
+
+async function insertWritingAid(editor, snapshot, aid, onInserted) {
+    const bookmark = snapshot?.bookmark || null;
+    const fields = writingAidFields(aid);
+    const selected = String(snapshot?.text || "");
+    const needsText = writingAidUsesText(aid) && !selected;
+    const unsupported = fields.filter(([, declaration]) =>
+        !declaredFieldChoices(declaration).length);
+    if (unsupported.length) {
+        // Previously this returned silently and without restoring the caret, so
+        // an aid the format could legally save simply did nothing.
+        notifyWarning(
+            `"${aid?.label || aid?.id}" declares ${unsupported.length === 1
+                ? "a choice" : "choices"} with no values; fix the prompt format to use it.`,
+            { source: "prompt-writing-aid" });
+        restorePromptInsertion(editor, bookmark);
+        return;
+    }
+    const configured = await configureWritingAid(aid, fields,
+        { needsText, text: selected });
+    if (!configured) { restorePromptInsertion(editor, bookmark); return; }
+    await commitWritingAid(editor, bookmark, aid, configured.values,
+        configured.text, onInserted);
+}
+
+/** Does (x, y) fall inside the editor's current non-collapsed selection? */
+function promptPointInSelection(editor, x, y) {
+    const selection = globalThis.getSelection?.();
+    if (!selection?.rangeCount || selection.isCollapsed) return false;
+    const range = selection.getRangeAt(0);
+    if (!editor?.contains?.(range.startContainer)) return false;
+    for (const rect of range.getClientRects?.() || []) {
+        if (x >= rect.left && x <= rect.right
+            && y >= rect.top && y <= rect.bottom) return true;
+    }
+    return false;
 }
 
 function setPromptCaretFromPoint(editor, x, y) {
@@ -1819,55 +2090,252 @@ function promptCaretRect(editor) {
     return { x: rect.left + 8, y: rect.top + 8 };
 }
 
-export function promptContextAuthoringKinds(allowedKinds = AUTHORING_KINDS) {
-    return (Array.isArray(allowedKinds) ? allowedKinds : AUTHORING_KINDS)
-        .filter((kind) => AUTHORING_KINDS.includes(kind)
-            && !SCOPE_ONLY_KINDS.includes(kind));
+/**
+ * Kinds a format actually offers, on top of what the surface allows.
+ *
+ * `custom` is the model-agnostic escape hatch — fixed text plus whatever
+ * bounded fields a format declares for it — so it belongs to formats that
+ * declare `capabilities.custom` and to no others. None of the three built-ins
+ * declares one, so it disappears from Generic and both MiniMax formats while
+ * remaining available to any format that wants it.
+ *
+ * An ABSENT profile is "no opinion", not "declares nothing": the catalog is
+ * async and a surface that has not resolved one yet must not silently drop a
+ * kind the format really does declare. Every real call site passes a profile.
+ *
+ * Only `custom` is gated, deliberately. `reference` is in the same formal
+ * position — H3 Base declares no `capabilities.reference` yet every surface
+ * still offers it — but gating it would hide a kind whose absence is already
+ * reported as `undeclared_reference_capability` at compile time, trading a
+ * legible diagnostic for a silently missing menu row. Custom has no such
+ * diagnostic, which is why the gate is where the gate is.
+ */
+export function promptContextGatedKinds(kinds, profile = null) {
+    const declared = profile && typeof profile === "object"
+        ? profile.capabilities : null;
+    if (!declared || typeof declared !== "object") return kinds;
+    return kinds.filter((kind) => kind !== "custom" || Boolean(declared.custom));
+}
+
+export function promptContextAuthoringKinds(allowedKinds = AUTHORING_KINDS,
+    profile = null) {
+    return promptContextGatedKinds(
+        (Array.isArray(allowedKinds) ? allowedKinds : AUTHORING_KINDS)
+            .filter((kind) => AUTHORING_KINDS.includes(kind)
+                && !SCOPE_ONLY_KINDS.includes(kind)),
+        profile);
+}
+
+/** The literal text an aid inserts, for the menu's secondary column. */
+function writingAidPreview(aid) {
+    const text = String(aid?.text || "").replace(/\s+/g, " ").trim();
+    return text.length > 42 ? `${text.slice(0, 41)}…` : text;
+}
+
+/**
+ * One writing aid as a menu row, shaped by how much it still needs to know.
+ *
+ * Nothing left to ask inserts on the spot; one bounded choice resolves in a
+ * submenu, which is what the values were declared for; free text or several
+ * choices earns the dialog. A single `enum_multi` also takes the dialog — a
+ * menu row cannot express picking two of five.
+ */
+function writingAidMenuItem(editor, selection, aid, onInserted) {
+    const label = String(aid.label || aid.id || "Aid");
+    const writingAidId = String(aid.id || "");
+    const hint = writingAidPreview(aid);
+    const fields = writingAidFields(aid);
+    const text = String(selection?.text || "");
+    const bookmark = selection?.bookmark || null;
+    const needsText = writingAidUsesText(aid) && !text;
+    const multiple = fields.some(([, declaration]) =>
+        String(declaration?.type || "") === "enum_multi");
+    const undeclared = fields.some(([, declaration]) =>
+        !declaredFieldChoices(declaration).length);
+    if (undeclared || needsText || multiple || fields.length > 1) {
+        return { label, writingAidId, hint,
+            action: () => insertWritingAid(editor, selection, aid, onInserted) };
+    }
+    if (!fields.length) {
+        return { label, writingAidId, hint,
+            action: () => commitWritingAid(
+                editor, bookmark, aid, {}, text, onInserted) };
+    }
+    const [name, declaration] = fields[0];
+    const choose = (value) => commitWritingAid(
+        editor, bookmark, aid, { [name]: value }, text, onInserted);
+    return {
+        label, writingAidId, hint,
+        submenu: [
+            ...(writingAidFieldOptional(declaration)
+                ? [{ label: "— not set —", action: () => choose("") }] : []),
+            ...declaredFieldChoices(declaration).map((choice) => ({
+                label: choice.label,
+                hint: String(choice.description || ""),
+                action: () => choose(choice.value),
+            })),
+        ],
+    };
+}
+
+/**
+ * The capability kind a handle attach seeds, or "" when none is declared.
+ *
+ * A handle is a MENTION — `@KWoman is leaning then @Doggo appears` resolves
+ * each to this format's canonical token in flowing prose. Seeding nothing let
+ * the compiler fall back to the lowest-`order` declared capability, which under
+ * MiniMax H3 Full Reference is `definitions`, so a handle emitted a definition
+ * line into the subject-definitions channel instead of a token in the sentence.
+ *
+ * Declaration-driven, so this asks the resolved format rather than assuming the
+ * kind exists: `generic@1` declares only `derived_prompt`, and the empty answer
+ * there is correct — it seeds no capability, which IS the format-default path.
+ */
+const MENTION_CAPABILITY_KIND = "mentions";
+function handleMentionCapabilityKind(profile) {
+    return orderedReferenceDerived(profile)
+        .some(([kind]) => kind === MENTION_CAPABILITY_KIND)
+        ? MENTION_CAPABILITY_KIND : "";
+}
+
+/**
+ * The `Reference` row: attach a handle directly, or open the full dialog.
+ *
+ * Physical References now carry the same prompt defaults an identity does, so a
+ * chip inserted with no overrides resolves to real text — which is what makes a
+ * one-click attach worth offering at all. The dialog stays one row away, and
+ * remains reachable from the chip itself afterwards, so this demotes it from a
+ * toll gate to an edit step rather than removing it.
+ *
+ * Ineligible sources stay visible and dimmed with the reason the Attach dialog
+ * would have given, because "my Reference is missing" is a worse question than
+ * "why is it greyed out".
+ */
+function referenceAttachItem(editor, bookmark, referenceContext, onCreate,
+    onInserted) {
+    const openDialog = async () => {
+        const attachment = normalizePromptAttachment({ kind: "reference" });
+        const configured = onCreate ? await onCreate(attachment) : attachment;
+        if (!restorePromptInsertion(editor, bookmark)) return;
+        if (configured) {
+            editor?.insertAttachment?.(configured);
+            await onInserted?.({ type: "attachment", attachment: configured });
+        }
+    };
+    if (!referenceContext) {
+        return { label: LABELS.reference, kind: "reference", action: openDialog };
+    }
+    const { options, usesDeclaredSources, unitOptions, physicalOptions } =
+        promptReferenceSourceOptions(referenceContext);
+    const mentionKind = handleMentionCapabilityKind(referenceContext.resolvedProfile);
+    const attach = (value) => async () => {
+        const attachment = applyPromptReferenceSource(
+            normalizePromptAttachment({ kind: "reference" }), value);
+        // The seeded record is SPARSE — `capability_id` and `kind` only. Writing
+        // the declared `channel_key`/`placement` beside them would freeze this
+        // chip's routing at attach time, and an absent `enabled` keeps the
+        // tri-state inheriting the shared Reference/identity default. No
+        // overrides either, so the chip follows its Reference or identity
+        // defaults instead of freezing a copy of them.
+        if (mentionKind) {
+            attachment.capabilities = [
+                { capability_id: mentionKind, kind: mentionKind },
+            ];
+        }
+        if (!restorePromptInsertion(editor, bookmark)) return;
+        editor?.insertAttachment?.(attachment);
+        await onInserted?.({ type: "attachment", attachment });
+    };
+    const row = ([value, label, eligible]) => ({
+        label: String(label),
+        disabled: !eligible,
+        action: eligible ? attach(value) : undefined,
+    });
+    // Identities and physical sources stay visibly separate, as they are
+    // everywhere else in the tool.
+    const grouped = usesDeclaredSources
+        ? [...unitOptions.map(row),
+            ...(unitOptions.length && physicalOptions.length
+                ? [{ type: "separator" }] : []),
+            ...physicalOptions.map(row)]
+        : options.map(row);
+    return {
+        label: LABELS.reference,
+        kind: "reference",
+        submenu: [
+            { label: "Configure…", action: openDialog },
+            ...(grouped.length ? [{ type: "separator" }, ...grouped] : []),
+        ],
+    };
 }
 
 export function createPromptContextMenuItems({ editor, bookmark = null,
-    allowedKinds = AUTHORING_KINDS, onCreate = null, writingAids = [],
-    onInserted = null } = {}) {
-    const kinds = promptContextAuthoringKinds(allowedKinds);
-    const aids = promptWritingAids(writingAids);
+    selection = null, allowedKinds = AUTHORING_KINDS, onCreate = null,
+    writingAids = [], channelKey = "", profile = null,
+    referenceContext = null, onInserted = null } = {}) {
+    const kinds = promptContextAuthoringKinds(allowedKinds, profile);
+    const declared = promptWritingAids(writingAids);
+    const aids = promptWritingAids(writingAids, channelKey);
+    // An attachment always lands at a collapsed caret so a chip cannot swallow
+    // authored prose; only a writing aid consults the live range.
+    const aidSelection = selection || { bookmark, text: "" };
     return [{
         label: "Insert at cursor",
-        submenu: kinds.map((kind) => ({
-            label: LABELS[kind] || kind,
-            kind,
-            action: async () => {
-                const attachment = normalizePromptAttachment({ kind });
-                const configured = onCreate ? await onCreate(attachment) : attachment;
-                if (!restorePromptInsertion(editor, bookmark)) return;
-                if (configured) {
-                    editor?.insertAttachment?.(configured);
-                    await onInserted?.({ type: "attachment", attachment: configured });
-                }
-            },
-        })),
+        submenu: kinds.map((kind) => kind === "reference"
+            ? referenceAttachItem(editor, bookmark, referenceContext, onCreate,
+                onInserted)
+            : {
+                label: LABELS[kind] || kind,
+                kind,
+                action: async () => {
+                    const attachment = normalizePromptAttachment({ kind });
+                    const configured = onCreate ? await onCreate(attachment) : attachment;
+                    if (!restorePromptInsertion(editor, bookmark)) return;
+                    if (configured) {
+                        editor?.insertAttachment?.(configured);
+                        await onInserted?.({ type: "attachment", attachment: configured });
+                    }
+                },
+            }),
     }, {
         label: "Writing aid",
         disabled: !aids.length,
-        submenu: aids.map((aid) => ({
-            label: String(aid.label || aid.id || "Aid"),
-            writingAidId: String(aid.id || ""),
-            action: () => insertWritingAid(editor, bookmark, aid, onInserted),
-        })),
+        // A row that is empty because this channel declares no aids is a
+        // different thing from a format with none at all, and saying which
+        // beats a dead disabled row that looks broken either way.
+        hint: aids.length || !declared.length ? ""
+            : `None for ${channelKey}`,
+        submenu: aids.map((aid) =>
+            writingAidMenuItem(editor, aidSelection, aid, onInserted)),
     }];
 }
 
 /** Install right-click and keyboard Context authoring on one prompt box. */
 export function installPromptContextMenu({ editor, allowedKinds = AUTHORING_KINDS,
-    onCreate = null, writingAids = [], onInserted = null } = {}) {
+    onCreate = null, writingAids = [], channelKey = "", profile = null,
+    referenceContext = null, onInserted = null } = {}) {
     if (!editor) return () => {};
     let closeMenu = null;
     const open = ({ x, y, pointCaret = false } = {}) => {
         if (editor.isPromptComposing?.()) return false;
-        if (pointCaret) setPromptCaretFromPoint(editor, x, y);
+        // Right-clicking inside an existing selection must keep it: moving the
+        // caret to the click point first would discard the very range a writing
+        // aid is about to wrap. Clicking anywhere else still repositions.
+        if (pointCaret && !promptPointInSelection(editor, x, y)) {
+            setPromptCaretFromPoint(editor, x, y);
+        }
         const bookmark = promptInsertionBookmark(editor);
+        const selection = promptSelectionSnapshot(editor);
         closeMenu?.();
         closeMenu = openContextMenu({ x, y, items: createPromptContextMenuItems({
-            editor, bookmark, allowedKinds, onCreate, writingAids, onInserted,
+            editor, bookmark, selection, allowedKinds, onCreate, writingAids,
+            channelKey, profile,
+            // Resolved per open, not per install: the window, active setup and
+            // Reference set all change under a mounted editor, and a snapshot
+            // taken at install time would offer last week's verdicts.
+            referenceContext: typeof referenceContext === "function"
+                ? referenceContext() : referenceContext,
+            onInserted,
         }) });
         return true;
     };
@@ -1924,6 +2392,58 @@ function textField(value = "", multiline = false) {
         chromeInputCss({ padding: "5px 7px" })}`;
     if (multiline) control.rows = 3;
     return control;
+}
+
+/**
+ * A bounded multiple choice as checkboxes.
+ *
+ * `<select multiple>` requires ctrl/shift-click to pick more than one and
+ * silently drops the whole selection on a plain click, which is the wrong
+ * affordance for "which of these apply". Exposes the same `.value` /
+ * `.selectedOptions` shape the previous control did, so readers do not care
+ * which one they are holding.
+ */
+function checkboxListField(options, selected = [], { allLabel = "All" } = {}) {
+    const host = document.createElement("div");
+    host.style.cssText = `box-sizing:border-box;width:100%;display:flex;flex-direction:column;gap:3px;max-height:150px;overflow:auto;padding:5px 7px;border:1px solid ${COLORS.border};border-radius:5px;background:${COLORS.panel};`;
+    const chosen = new Set((selected || []).map(String));
+    const boxes = [];
+    const actions = document.createElement("div");
+    actions.style.cssText = "display:flex;gap:6px;";
+    const all = chipButton(allLabel, `Select every ${allLabel.toLowerCase()}`);
+    const none = chipButton("None", "Clear the selection");
+    actions.append(all, none);
+    host.appendChild(actions);
+    for (const option of options) {
+        const pair = Array.isArray(option) ? option : [option, option];
+        const row = document.createElement("label");
+        row.style.cssText = `display:flex;align-items:center;gap:6px;font:11px system-ui;color:${COLORS.text};cursor:pointer;`;
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = String(pair[0]);
+        box.checked = chosen.has(String(pair[0]));
+        const text = document.createElement("span");
+        text.textContent = String(pair[1]);
+        row.append(box, text);
+        host.appendChild(row);
+        boxes.push(box);
+    }
+    all.addEventListener("click", () => {
+        for (const box of boxes) box.checked = true;
+    });
+    none.addEventListener("click", () => {
+        for (const box of boxes) box.checked = false;
+    });
+    Object.defineProperty(host, "selectedOptions", {
+        get: () => boxes.filter((box) => box.checked),
+    });
+    Object.defineProperty(host, "options", { get: () => boxes });
+    // A group of checkboxes needs its own accessible name, and the validation
+    // path focuses this control when the selection is empty — a bare div would
+    // silently swallow both.
+    host.setAttribute("role", "group");
+    host.focus = () => boxes[0]?.focus?.({ preventScroll: true });
+    return host;
 }
 
 function selectField(options, value = "") {
@@ -2246,6 +2766,164 @@ export function createReferenceOverrideFieldset({
     };
 }
 
+/**
+ * Which Reference sources this scene offers, and whether each may be attached.
+ *
+ * The caret menu and the Attach dialog both need this list with the same
+ * verdicts, format compatibility and setup membership behind it. Computing it
+ * once here is what keeps a handle offered in the menu and a handle offered in
+ * the dialog from ever disagreeing.
+ *
+ * Returns `[value, label, eligible]` triples in the dialog's existing shape;
+ * `usesDeclaredSources` says whether the format wants identities and physical
+ * slots rather than whole Reference items.
+ */
+export function promptReferenceSourceOptions({ scene = null, references = [],
+    semanticUnits = [], profileId = "generic@1", scope = "",
+    resolvedProfile = null } = {}) {
+    const usesDeclaredSources = Boolean(
+        resolvedProfile?.physical_populations?.length
+        || resolvedProfile?.identity_kinds?.length);
+    const referenceItems = Array.isArray(scene?.reference_items)
+        ? scene.reference_items : [];
+    const consumerStart = Number(scene?._context_consumer_start);
+    const consumerEnd = Number(scene?._context_consumer_end);
+    const globalScope = scope === "global"
+        || (scope !== "section" && !Number.isFinite(consumerStart));
+    const hasSelection = Number.isFinite(consumerStart)
+        && Number.isFinite(consumerEnd) && consumerEnd > consumerStart;
+    const verdictResult = resolveReferenceVerdicts({
+        referenceItems,
+        laneCount: scene?.reference_lane_count || 1,
+        sceneDuration: scene?.duration_frames || 0,
+        windowStart: hasSelection ? consumerStart : 0,
+        windowEnd: hasSelection ? consumerEnd : (scene?.duration_frames || 0),
+        laneConfigs: scene?.reference_lane_configs || [],
+        frameThresholdPct: Number(scene?._context_reference_frame_threshold || 0),
+    });
+    const referenceNames = new Map((references || []).map((value) => [
+        value.reference_id, value.name || value.reference_id,
+    ]));
+    const laneRecipes = Array.isArray(scene?.reference_lane_recipes)
+        ? scene.reference_lane_recipes : [];
+    const itemOptions = referenceItems.map((item, index) => {
+        const names = [...new Set((item.members || []).map((value) =>
+            referenceNames.get(value.entity_id)).filter(Boolean))];
+        const verdict = verdictResult.verdicts.get(index) || "outside";
+        const wrapper = laneRecipes[Number(item.lane_index || 0)] || {};
+        const recipe = wrapper.recipe && typeof wrapper.recipe === "object"
+            ? wrapper.recipe : wrapper;
+        const compatible = recipe?.soft?.compatible_profiles || ["generic@1"];
+        const profileCompatible = compatible.includes(profileId);
+        const verdictLabel = REFERENCE_VERDICT_LABEL[verdict] || verdict;
+        const eligibility = globalScope ? profileCompatible
+            : verdict === "winner" && profileCompatible;
+        const stateLabel = globalScope
+            ? (hasSelection && verdict === "winner" ? " — applies now" : "")
+            : ` — ${verdictLabel}`;
+        return [`item:${item.reference_item_id}`,
+            `Lane ${Number(item.lane_index || 0) + 1}: ${names.join(" + ") || "Reference"}${stateLabel}${profileCompatible ? "" : " / incompatible prompt format"}`,
+            eligibility];
+    });
+    const activeSetup = (scene?.minimax_h3_conditioning_setups || []).find(
+        (value) => value?.setup_id === scene?.active_minimax_h3_setup_id);
+    const setupPopulations = new Map();
+    for (const [key, population] of [
+        ["picture_lane_ids", "picture"], ["video_lane_ids", "video"],
+        ["audio_lane_ids", "audio"],
+    ]) {
+        for (const laneId of activeSetup?.[key] || []) {
+            setupPopulations.set(String(laneId), population);
+        }
+    }
+    const makeUnitOption = (value, sources) => {
+        const eligibility = subjectSourceEligibility({
+            sources, referenceItems, laneRecipes,
+            verdicts: verdictResult.verdicts, profileId, setupPopulations,
+            requiresSetup: usesDeclaredSources,
+            scope: { globalScope, hasSelection },
+        });
+        return [value.semantic_unit_id,
+            `Subject: ${value.name || value.semantic_unit_id}${eligibility.suffix}`,
+            eligibility.eligible];
+    };
+    const unitOptions = ((semanticUnits || []).length
+        ? semanticUnits.map((value) =>
+            makeUnitOption(value, value.sources || []))
+        : (references || []).map((value) => makeUnitOption({
+                semantic_unit_id: `unit:${value.reference_id}`,
+                name: value.name || value.reference_id,
+            }, referenceItems.flatMap((item) => (item.members || []).filter((member) =>
+                String(member?.entity_id || "") === String(value.reference_id || ""))))));
+    const physicalOptions = [];
+    referenceItems.forEach((item, index) => {
+        const verdict = verdictResult.verdicts.get(index) || "outside";
+        const wrapper = laneRecipes[Number(item.lane_index || 0)] || {};
+        const recipe = wrapper.recipe && typeof wrapper.recipe === "object"
+            ? wrapper.recipe : wrapper;
+        const declaredPopulation = ({
+            pictures: "picture", videos: "video", standalone_audios: "audio",
+        })[String(recipe?.soft?.physical_population || "")] || "";
+        const setupPopulation = setupPopulations.get(String(wrapper.lane_id || "")) || "";
+        const population = setupPopulation || declaredPopulation;
+        if (!population) return;
+        const compatible = recipe?.soft?.compatible_profiles || ["generic@1"];
+        const profileCompatible = compatible.includes(profileId);
+        const setupCompatible = !!setupPopulation
+            && (!declaredPopulation || setupPopulation === declaredPopulation);
+        const eligible = profileCompatible && setupCompatible
+            && (globalScope || verdict === "winner");
+        let stateSuffix = "";
+        if (!profileCompatible) stateSuffix = " - incompatible prompt format";
+        else if (!setupCompatible) stateSuffix = " - not in active setup";
+        else if (globalScope) {
+            // The existing compact label already adds the applies-now badge.
+            stateSuffix = "";
+        } else {
+            stateSuffix = ` - ${REFERENCE_VERDICT_LABEL[verdict] || verdict}`;
+        }
+        for (const member of item.members || []) {
+            const memberId = String(member?.member_id || "");
+            if (!memberId) continue;
+            const name = referenceNames.get(member.entity_id) || memberId;
+            physicalOptions.push([`physical:${population}:${memberId}`,
+                `${population[0].toUpperCase()}${population.slice(1)} source: ${name}${globalScope && hasSelection && verdict === "winner" ? " — applies now" : ""}`, true]);
+            physicalOptions[physicalOptions.length - 1][1] += stateSuffix;
+            physicalOptions[physicalOptions.length - 1][2] = eligible;
+        }
+    });
+    return {
+        usesDeclaredSources,
+        unitOptions,
+        physicalOptions,
+        itemOptions,
+        options: usesDeclaredSources
+            ? [...unitOptions, ...physicalOptions] : itemOptions,
+    };
+}
+
+/** Apply one option value from  to a chip. */
+export function applyPromptReferenceSource(attachment, value) {
+    const raw = String(value || "");
+    const itemMatch = raw.match(/^item:(.+)$/);
+    const physicalMatch = raw.match(/^physical:(picture|video|audio):(.+)$/);
+    delete attachment.source.picture_ids;
+    delete attachment.source.video_ids;
+    delete attachment.source.audio_ids;
+    if (itemMatch) {
+        attachment.source.reference_item_id = itemMatch[1];
+        delete attachment.source.semantic_unit_ids;
+    } else if (physicalMatch) {
+        attachment.source[`${physicalMatch[1]}_ids`] = [physicalMatch[2]];
+        delete attachment.source.reference_item_id;
+        delete attachment.source.semantic_unit_ids;
+    } else {
+        attachment.source.semantic_unit_ids = [raw];
+        delete attachment.source.reference_item_id;
+    }
+    return attachment;
+}
+
 /** Bounded, deterministic attachment configuration. No provider prose is generated. */
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
@@ -2298,19 +2976,15 @@ export function configurePromptAttachment(rawAttachment, {
                 : "Standalone Time resolves from this section's start/cut position at preview and execution time.";
             panel.appendChild(timeNotice);
         } else if (attachment.kind === "custom") {
+            // Custom is the model-agnostic escape hatch: fixed text plus
+            // whatever bounded fields a format declares for it. It carried an
+            // H3-specific Guide binding until the native MiniMaxH3AddGuide node
+            // took over physical keyframe delivery from the Guides Bridge, at
+            // which point the binding described nothing the graph did not
+            // already do; the picture-alignment line is composed by the
+            // compiler from the task mode, never by a chip.
             controls.text = textField(attachment.config.text, true);
             panel.append(fieldRow("Fixed text", controls.text));
-            const validators = new Set((resolvedProfile?.validators || []).map(String));
-            if (validators.has("minimax_base_setup")
-                    || validators.has("minimax_reference_setup")) {
-                controls.setupRole = selectField([
-                    ["", "Text only"],
-                    ["first", "Bound to active first-frame Guide"],
-                    ["last", "Bound to active last-frame Guide"],
-                ], attachment.config.setup_role || "");
-                panel.append(fieldRow("Physical Guide binding", controls.setupRole,
-                    "Optional capability for text that refers to the active H3 first- or last-frame Guide."));
-            }
         } else if (["prompt_link", "prompt_link_scope"].includes(attachment.kind)) {
             const currentStart = Number(scene?._context_consumer_start ?? Infinity);
             const sectionOptions = [["", "Choose an earlier section…"]];
@@ -2331,14 +3005,12 @@ export function configurePromptAttachment(rawAttachment, {
                 .map((key) => [key, key]);
             controls.channel = selectField(channelOptions, attachment.source.channel_key || channelKey);
             if (attachment.kind === "prompt_link_scope") {
-                controls.channel.multiple = true;
-                controls.channel.size = Math.min(6, Math.max(2, channelOptions.length));
-                const selectedChannels = new Set(
-                    (attachment.source.channel_keys || []).map(String));
-                [...controls.channel.options].forEach((option) => {
-                    option.selected = selectedChannels.size
-                        ? selectedChannels.has(option.value) : true;
-                });
+                // No stored selection means every channel, which is the
+                // documented default rather than an empty link.
+                const stored = (attachment.source.channel_keys || []).map(String);
+                controls.channel = checkboxListField(channelOptions,
+                    stored.length ? stored : channelOptions.map(([key]) => key),
+                    { allLabel: "All" });
                 panel.append(fieldRow("Source section", controls.promptId),
                     fieldRow("Channels", controls.channel,
                         "All channels are linked by default; select a subset for advanced routing."));
@@ -2355,15 +3027,12 @@ export function configurePromptAttachment(rawAttachment, {
             controls.subjectPhrase = textField(attachment.config.subject_phrase || "");
             controls.text = textField(attachment.config.text, true);
             controls.voice = textField(attachment.source.voice_id || "");
-            controls.subjects = selectField((semanticUnits || []).map((value) => [
-                value.semantic_unit_id, value.name || value.semantic_unit_id,
-            ]), "");
-            controls.subjects.multiple = true;
-            controls.subjects.size = Math.min(5, Math.max(2, semanticUnits.length));
-            const selectedSubjects = new Set(attachment.source.subject_ids || []);
-            [...controls.subjects.options].forEach((option) => {
-                option.selected = selectedSubjects.has(option.value);
-            });
+            controls.subjects = checkboxListField(
+                (semanticUnits || []).map((value) => [
+                    value.semantic_unit_id, value.name || value.semantic_unit_id,
+                ]),
+                (attachment.source.subject_ids || []).map(String),
+                { allLabel: "All" });
             // A Vocal Event with no Subject and no voice key has nothing to
             // number: the speaker id would be minted from the chip's own id and
             // would name no one in the scene.
@@ -2382,119 +3051,19 @@ export function configurePromptAttachment(rawAttachment, {
                 controls.bindingNotice,
                 fieldRow("Words", controls.text));
         } else if (attachment.kind === "reference") {
-            const usesDeclaredSources = Boolean(
-                resolvedProfile?.physical_populations?.length
-                || resolvedProfile?.identity_kinds?.length);
+            const referenceSources = promptReferenceSourceOptions({
+                scene, references, semanticUnits, profileId, scope,
+                resolvedProfile,
+            });
+            const usesDeclaredSources = referenceSources.usesDeclaredSources;
+            // Still read further down, where a chosen source is mapped back to
+            // its lane recipe for the capability rows.
             const referenceItems = Array.isArray(scene?.reference_items)
                 ? scene.reference_items : [];
-            const consumerStart = Number(scene?._context_consumer_start);
-            const consumerEnd = Number(scene?._context_consumer_end);
-            const globalScope = scope === "global"
-                || (scope !== "section" && !Number.isFinite(consumerStart));
-            const hasSelection = Number.isFinite(consumerStart)
-                && Number.isFinite(consumerEnd) && consumerEnd > consumerStart;
-            const verdictResult = resolveReferenceVerdicts({
-                referenceItems,
-                laneCount: scene?.reference_lane_count || 1,
-                sceneDuration: scene?.duration_frames || 0,
-                windowStart: hasSelection ? consumerStart : 0,
-                windowEnd: hasSelection ? consumerEnd : (scene?.duration_frames || 0),
-                laneConfigs: scene?.reference_lane_configs || [],
-                frameThresholdPct: Number(scene?._context_reference_frame_threshold || 0),
-            });
-            const referenceNames = new Map((references || []).map((value) => [
-                value.reference_id, value.name || value.reference_id,
-            ]));
             const laneRecipes = Array.isArray(scene?.reference_lane_recipes)
                 ? scene.reference_lane_recipes : [];
-            const itemOptions = referenceItems.map((item, index) => {
-                const names = [...new Set((item.members || []).map((value) =>
-                    referenceNames.get(value.entity_id)).filter(Boolean))];
-                const verdict = verdictResult.verdicts.get(index) || "outside";
-                const wrapper = laneRecipes[Number(item.lane_index || 0)] || {};
-                const recipe = wrapper.recipe && typeof wrapper.recipe === "object"
-                    ? wrapper.recipe : wrapper;
-                const compatible = recipe?.soft?.compatible_profiles || ["generic@1"];
-                const profileCompatible = compatible.includes(profileId);
-                const verdictLabel = REFERENCE_VERDICT_LABEL[verdict] || verdict;
-                const eligibility = globalScope ? profileCompatible
-                    : verdict === "winner" && profileCompatible;
-                const stateLabel = globalScope
-                    ? (hasSelection && verdict === "winner" ? " — applies now" : "")
-                    : ` — ${verdictLabel}`;
-                return [`item:${item.reference_item_id}`,
-                    `Lane ${Number(item.lane_index || 0) + 1}: ${names.join(" + ") || "Reference"}${stateLabel}${profileCompatible ? "" : " / incompatible prompt format"}`,
-                    eligibility];
-            });
-            const activeSetup = (scene?.minimax_h3_conditioning_setups || []).find(
-                (value) => value?.setup_id === scene?.active_minimax_h3_setup_id);
-            const setupPopulations = new Map();
-            for (const [key, population] of [
-                ["picture_lane_ids", "picture"], ["video_lane_ids", "video"],
-                ["audio_lane_ids", "audio"],
-            ]) {
-                for (const laneId of activeSetup?.[key] || []) {
-                    setupPopulations.set(String(laneId), population);
-                }
-            }
-            const makeUnitOption = (value, sources) => {
-                const eligibility = subjectSourceEligibility({
-                    sources, referenceItems, laneRecipes,
-                    verdicts: verdictResult.verdicts, profileId, setupPopulations,
-                    requiresSetup: usesDeclaredSources,
-                    scope: { globalScope, hasSelection },
-                });
-                return [value.semantic_unit_id,
-                    `Subject: ${value.name || value.semantic_unit_id}${eligibility.suffix}`,
-                    eligibility.eligible];
-            };
-            const unitOptions = ((semanticUnits || []).length
-                ? semanticUnits.map((value) =>
-                    makeUnitOption(value, value.sources || []))
-                : (references || []).map((value) => makeUnitOption({
-                        semantic_unit_id: `unit:${value.reference_id}`,
-                        name: value.name || value.reference_id,
-                    }, referenceItems.flatMap((item) => (item.members || []).filter((member) =>
-                        String(member?.entity_id || "") === String(value.reference_id || ""))))));
-            const physicalOptions = [];
-            referenceItems.forEach((item, index) => {
-                const verdict = verdictResult.verdicts.get(index) || "outside";
-                const wrapper = laneRecipes[Number(item.lane_index || 0)] || {};
-                const recipe = wrapper.recipe && typeof wrapper.recipe === "object"
-                    ? wrapper.recipe : wrapper;
-                const declaredPopulation = ({
-                    pictures: "picture", videos: "video", standalone_audios: "audio",
-                })[String(recipe?.soft?.physical_population || "")] || "";
-                const setupPopulation = setupPopulations.get(String(wrapper.lane_id || "")) || "";
-                const population = setupPopulation || declaredPopulation;
-                if (!population) return;
-                const compatible = recipe?.soft?.compatible_profiles || ["generic@1"];
-                const profileCompatible = compatible.includes(profileId);
-                const setupCompatible = !!setupPopulation
-                    && (!declaredPopulation || setupPopulation === declaredPopulation);
-                const eligible = profileCompatible && setupCompatible
-                    && (globalScope || verdict === "winner");
-                let stateSuffix = "";
-                if (!profileCompatible) stateSuffix = " - incompatible prompt format";
-                else if (!setupCompatible) stateSuffix = " - not in active setup";
-                else if (globalScope) {
-                    // The existing compact label already adds the applies-now badge.
-                    stateSuffix = "";
-                } else {
-                    stateSuffix = ` - ${REFERENCE_VERDICT_LABEL[verdict] || verdict}`;
-                }
-                for (const member of item.members || []) {
-                    const memberId = String(member?.member_id || "");
-                    if (!memberId) continue;
-                    const name = referenceNames.get(member.entity_id) || memberId;
-                    physicalOptions.push([`physical:${population}:${memberId}`,
-                        `${population[0].toUpperCase()}${population.slice(1)} source: ${name}${globalScope && hasSelection && verdict === "winner" ? " — applies now" : ""}`, true]);
-                    physicalOptions[physicalOptions.length - 1][1] += stateSuffix;
-                    physicalOptions[physicalOptions.length - 1][2] = eligible;
-                }
-            });
             const referenceOptions = [["", "Choose a Reference…", true],
-                ...(usesDeclaredSources ? [...unitOptions, ...physicalOptions] : itemOptions)];
+                ...referenceSources.options];
             const selectedPhysical = [
                 ["picture", attachment.source.picture_ids],
                 ["video", attachment.source.video_ids],
@@ -3002,7 +3571,17 @@ export function configurePromptAttachment(rawAttachment, {
         backdrop.appendChild(panel);
         document.body.appendChild(backdrop);
 
-        const finish = (value) => { backdrop.remove(); resolve(value); };
+        let releaseEscape = () => {};
+        const finish = (value) => {
+            releaseEscape();
+            backdrop.remove();
+            resolve(value);
+        };
+        // This dialog owned no Escape at all, so the key fell through to the
+        // Prompt tool behind it and closed THAT — the dialog stayed open over an
+        // editor that had just shut. Cancelling with Escape now matches the
+        // Cancel button and the backdrop click.
+        releaseEscape = ownModalEscape(() => finish(null));
         cancel.addEventListener("click", () => finish(null));
         backdrop.addEventListener("mousedown", (event) => {
             if (event.target === backdrop) finish(null);
@@ -3014,13 +3593,6 @@ export function configurePromptAttachment(rawAttachment, {
                 attachment.config.standalone = true;
             } else if (attachment.kind === "custom") {
                 attachment.config.text = controls.text.value;
-                if (controls.setupRole) {
-                    if (controls.setupRole.value) {
-                        attachment.config.setup_role = controls.setupRole.value;
-                    } else {
-                        delete attachment.config.setup_role;
-                    }
-                }
             } else if (["prompt_link", "prompt_link_scope"].includes(attachment.kind)) {
                 if (!controls.promptId.value) return;
                 attachment.source.prompt_id = controls.promptId.value;
@@ -3282,7 +3854,7 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
     onAdd = null, onActivate = null, onRemove = null, maxVisible = 6,
     allowedKinds = SCOPE_KINDS, attachmentLabelFor = null,
     reusableAttachments = [], onReuse = null, onUnlink = null,
-    onConvertPromptLinkCopy = null,
+    onConvertPromptLinkCopy = null, profile = null,
     allSceneAttachments = [], reuseContext = {} } = {}) {
     const row = document.createElement("div");
     row.style.cssText = "display:flex;gap:4px;align-items:center;flex-wrap:wrap;min-width:0;";
@@ -3390,8 +3962,12 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         chromeInputCss({ padding: "1px 3px", fontSize: "10px" })}`;
     setButtonDisabled(kindSelect, disabled);
     // Inline-only kinds are filtered here rather than at each caller, so every
-    // scope row in Timeline, Structured and Writing agrees.
-    for (const kind of allowedKinds.filter((value) => SCOPE_KINDS.includes(value))) {
+    // scope row in Timeline, Structured and Writing agrees. The format gate runs
+    // in the same place for the same reason: both authoring routes — this row
+    // and the caret menu — must offer exactly what the format declares.
+    const scopeKinds = promptContextGatedKinds(
+        allowedKinds.filter((value) => SCOPE_KINDS.includes(value)), profile);
+    for (const kind of scopeKinds) {
         const option = document.createElement("option");
         option.value = kind; option.textContent = LABELS[kind] || kind;
         kindSelect.appendChild(option);
@@ -3401,7 +3977,12 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
     add.textContent = "Attach to this section/scene";
     add.style.cssText = `font:10px system-ui;background:transparent;color:${CHIP_PALETTE.control};border:1px dashed ${CHIP_PALETTE.border};border-radius:999px;padding:1px 6px;cursor:pointer;`;
     setButtonDisabled(add, disabled);
-    add.addEventListener("click", () => onAdd?.(kindSelect.value || "custom"));
+    // Falling back to a hardcoded "custom" would attach a kind the format may
+    // not declare and this row may not even be offering.
+    add.addEventListener("click", () => {
+        const kind = kindSelect.value || scopeKinds[0] || "";
+        if (kind) onAdd?.(kind);
+    });
     row.append(kindSelect, add);
     const reusableKinds = new Set(
         allowedKinds.filter((value) => SCOPE_KINDS.includes(value)));

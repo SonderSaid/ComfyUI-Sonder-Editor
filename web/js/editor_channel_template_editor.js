@@ -494,12 +494,16 @@ export function mountChannelTemplateEditor(host, { template = null, mode = "edit
     render();
     document.body.appendChild(backdrop);
 
+    // `keydown` is the registry's contract. Registering `onKeyDown`/`isActive`
+    // instead is not a no-op error — it registers a consumer with no handler at
+    // all, so Escape silently fell through to whichever OVERLAY sits below this
+    // one and closed THAT surface instead. Nothing warns: dispatch simply skips
+    // a consumer that names no handler it knows.
     const unregisterKeys = registerKeyboardConsumer({
         id: host._keyboardConsumerId?.("channel-template-editor") || "channel-template-editor",
         priority: KEY_PRIORITY.OVERLAY,
-        isActive: () => backdrop.isConnected,
-        onKeyDown: (e) => {
-            if (e.key !== "Escape") return false;
+        keydown: (e) => {
+            if (e.key !== "Escape" || !backdrop.isConnected) return false;
             close();
             return true;
         },

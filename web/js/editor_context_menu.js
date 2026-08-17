@@ -84,7 +84,7 @@ export function openContextMenu({ x = 0, y = 0, items = [], closeOnScroll = fals
         element.dataset.sonderContextMenuDepth = String(depth);
         element.setAttribute("role", "menu");
         element.setAttribute("aria-label", depth ? "Context submenu" : "Context menu");
-        element.style.cssText = `${chromeMenuCss(160)}left:${panelX}px;top:${panelY}px;z-index:${10000 + depth};`;
+        element.style.cssText = `${chromeMenuCss(160)}left:${panelX}px;top:${panelY}px;z-index:${10000 + depth};max-width:min(440px,92vw);`;
         const panel = { element, rows: [], activeIndex: -1, parentEntry };
         stack[depth] = panel;
 
@@ -106,11 +106,33 @@ export function openContextMenu({ x = 0, y = 0, items = [], closeOnScroll = fals
             const label = document.createElement("span");
             label.textContent = String(item.label || "");
             row.appendChild(label);
-            if (item.submenu) {
-                const arrow = document.createElement("span");
-                arrow.textContent = "›";
-                arrow.setAttribute("aria-hidden", "true");
-                row.appendChild(arrow);
+            // A row may carry both a hint and a submenu arrow, so they share one
+            // trailing group rather than competing for the same flex end: the
+            // hint stays adjacent to the label it describes and the arrow keeps
+            // its position as the rightmost affordance in the column.
+            const hint = String(item.hint || "");
+            if (hint || item.submenu) {
+                const trailing = document.createElement("span");
+                trailing.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;";
+                if (hint) {
+                    const secondary = document.createElement("span");
+                    // Hints come from declared metadata, whose length this
+                    // renderer does not control, so the bound lives here rather
+                    // than in each caller. The full text stays in the tooltip.
+                    secondary.textContent = hint.length > 48
+                        ? `${hint.slice(0, 47)}…` : hint;
+                    if (hint.length > 48) secondary.title = hint;
+                    secondary.dataset.sonderContextMenuHint = "1";
+                    secondary.style.cssText = `min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:${COLORS.textDim};`;
+                    trailing.appendChild(secondary);
+                }
+                if (item.submenu) {
+                    const arrow = document.createElement("span");
+                    arrow.textContent = "›";
+                    arrow.setAttribute("aria-hidden", "true");
+                    trailing.appendChild(arrow);
+                }
+                row.appendChild(trailing);
             }
             row.addEventListener("focus", () => {
                 panel.activeIndex = panel.rows.indexOf(entry);
