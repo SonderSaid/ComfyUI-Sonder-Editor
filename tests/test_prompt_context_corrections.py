@@ -1647,7 +1647,11 @@ def test_vocal_event_editor_requires_a_subject_or_voice():
         encoding="utf-8")
     assert "bindingNotice" in chips
     assert "if (!subjectIds.length && !voiceId) {" in chips
-    assert "audio_relationship: controls.audioRelationship.value" in chips
+    # A stray grep for the Reference save block's `audio_relationship` line
+    # used to live here. It belonged to neither this test's subject nor a
+    # behavioural check, and the field list it pinned is now declaration-driven;
+    # test_reference_fieldset_renders_only_declared_fields_with_declared_copy
+    # covers that surface for real.
 
 
 def test_timeline_global_inline_picker_matches_structured_kinds():
@@ -1762,3 +1766,157 @@ def test_profile_picker_disables_incompatible_channel_templates():
     assert "catalogByKey" in panel
     assert "option.disabled = !compatible(value)" in panel
     assert "not available for this channel template" in panel
+
+
+def _fieldset_probe(profile_json, overrides_json="{}"):
+    """Render createReferenceOverrideFieldset and report what it built."""
+    return _run_chip_dom_script(f"""
+        const fieldset = mod.createReferenceOverrideFieldset({{
+            profile: {profile_json},
+            references: [], semanticUnits: [], setupManifest: {{}},
+            overrides: {overrides_json}, selected: "",
+        }});
+        const described = fieldset.fields.map((field) => {{
+            const row = fieldset.row(field);
+            // fieldRow builds <label><span title=help>LABEL</span>…</label>,
+            // with the visible help span appended last.
+            const spans = row.children.filter((c) => c.tagName === "SPAN");
+            return {{
+                field,
+                label: spans[0]?.textContent || "",
+                help: spans[0]?.title || "",
+                multiple: fieldset.controls.get(field)?.multiple === true,
+                tag: fieldset.controls.get(field)?.tagName || "",
+            }};
+        }});
+        console.log(JSON.stringify({{
+            fields: fieldset.fields,
+            described,
+            collected: fieldset.collect(),
+        }}));
+    """)
+
+
+_DECLARED_PROFILE = """{
+    profile_id: "probe", version: "1", name: "Probe Format",
+    capabilities: { reference: { derived: {
+        definitions: { order: 1, channel_key: "defs", placement: "section_prefix",
+            label: "Portrayal", help: "Declared definition guidance.", fields: {} },
+        retention: { order: 3, channel_key: "ret", placement: "section_prefix",
+            label: "Retention", help: "Declared retention guidance.", fields: {
+                visual_intent: { type: "enum", label: "Look handling",
+                    help: "Declared visual guidance.",
+                    values: [{ value: "preserve", label: "Keep" }] } } },
+    } } },
+}"""
+
+_DEFINITIONS_ONLY_PROFILE = """{
+    profile_id: "probe-min", version: "1", name: "Minimal Format",
+    capabilities: { reference: { derived: {
+        definitions: { order: 1, channel_key: "defs", placement: "section_prefix",
+            label: "Portrayal", help: "Only capability.", fields: {} },
+    } } },
+}"""
+
+
+def test_reference_fieldset_renders_only_declared_fields_with_declared_copy():
+    """Field presence, labels, and help come from the format, not the browser.
+
+    Replaces a source grep for one `overridableFieldRow(...)` call shape, which
+    passed whether or not the declaration was ever consulted.
+    """
+    result = _fieldset_probe(_DECLARED_PROFILE)
+    by_field = {row["field"]: row for row in result["described"]}
+
+    # Declared capabilities contribute their value fields; undeclared ones
+    # (summary, mentions, audio_relationship) contribute nothing at all.
+    assert set(result["fields"]) == {
+        "definition", "audio_definition", "retention_detail", "visual_intent"}
+    assert "summary" not in by_field
+    assert "task_types" not in by_field
+    assert "text" not in by_field
+    assert "audio_relationship" not in by_field
+
+    # A declared field wins on both label and help.
+    assert by_field["visual_intent"]["label"] == "Look handling"
+    assert by_field["visual_intent"]["help"] == "Declared visual guidance."
+    assert by_field["visual_intent"]["tag"] == "SELECT"
+
+    # A floor field with no field declaration keeps the renderer's own name but
+    # takes the owning capability's declared help.
+    assert by_field["definition"]["label"] == "Definition"
+    assert by_field["definition"]["help"] == "Declared definition guidance."
+    assert by_field["retention_detail"]["help"] == "Declared retention guidance."
+
+    # No provider vocabulary leaks from the browser into an unrelated format.
+    for row in result["described"]:
+        assert "MiniMax" not in row["help"]
+        assert "<Subject 1>" not in row["help"]
+
+
+def test_reference_fieldset_gates_enum_fields_on_a_declared_vocabulary():
+    """audio_intent is a floor field of `retention` but has no declared values.
+
+    Rendering it as free text would author values the compiler must reject.
+    """
+    result = _fieldset_probe(_DECLARED_PROFILE)
+    assert "visual_intent" in result["fields"]
+    assert "audio_intent" not in result["fields"]
+
+
+def test_reference_fieldset_collect_survives_undeclared_fields():
+    """The save reads the control map, so a gated-away field cannot throw.
+
+    A fixed field list here dereferenced controls the gate had never created.
+    """
+    result = _fieldset_probe(
+        _DEFINITIONS_ONLY_PROFILE,
+        '{"summary": "stored under a format that no longer declares it"}')
+    assert set(result["fields"]) == {"definition", "audio_definition"}
+    # An override for an undeclared field is neither rendered nor dropped by
+    # collect(): no control means no authored change, so the stored value is
+    # preserved rather than silently deleted on the next save.
+    assert result["collected"]["summary"] == (
+        "stored under a format that no longer declares it")
+
+
+def test_reference_fieldset_collapses_following_fields_but_never_an_override():
+    """Progressive disclosure by tier state, not by category.
+
+    Rendering every declared field as an equal editable row put ~35 controls in
+    front of an author whose chip usually deviates in none of them. Hiding an
+    actual override would be worse than showing everything, so a deviation
+    always stays visible.
+    """
+    result = _run_chip_dom_script(f"""
+        const fieldset = mod.createReferenceOverrideFieldset({{
+            profile: {_DECLARED_PROFILE},
+            references: [], semanticUnits: [], setupManifest: {{}},
+            overrides: {{ retention_detail: "authored here" }}, selected: "",
+        }});
+        const visible = () => fieldset.fields.filter(
+            (field) => fieldset.row(field).style.display !== "none");
+        const collapsed = visible();
+        const summaryWhenCollapsed = fieldset.summaryRow.children[0].textContent;
+        fieldset.setExpanded(true);
+        const openedUp = visible();
+        fieldset.setExpanded(false);
+        // Overriding a second field must pull it out of the collapsed group.
+        fieldset.controls.get("definition").value = "now authored";
+        const handlers = fieldset.controls.get("definition")._handlers.input || [];
+        handlers.forEach((handler) => handler());
+        console.log(JSON.stringify({{
+            collapsed, openedUp, afterOverriding: visible(),
+            summaryWhenCollapsed,
+            summaryAfter: fieldset.summaryRow.children[0].textContent,
+        }}));
+    """)
+    # Only the override shows while collapsed.
+    assert result["collapsed"] == ["retention_detail"]
+    # Expanding shows every declared field.
+    assert set(result["openedUp"]) == {
+        "definition", "audio_definition", "retention_detail", "visual_intent"}
+    # A newly authored field joins the visible set without expanding.
+    assert set(result["afterOverriding"]) == {"definition", "retention_detail"}
+    assert "3 fields following" in result["summaryWhenCollapsed"]
+    assert "2 fields following" in result["summaryAfter"]

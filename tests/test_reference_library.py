@@ -741,3 +741,101 @@ def test_reference_mutation_is_covered_by_origin_guard(monkeypatch):
     assert response.status == 403
     assert payload["code"] == "cross_origin_blocked"
     assert called == []
+
+
+def test_member_attachment_defaults_round_trip_and_refuse_uninheritable_keys(tmp_path):
+    """A physical member carries the same defaults bag an identity does.
+
+    Without it a physical Reference could only supply prompt text and the two
+    intents, so every other field had to be retyped on every chip.
+    """
+    project = _project(tmp_path)
+    routes._apply_reference_mutation_operations(project, [{
+        "type": "create_reference",
+        "fields": {"name": "Still", "kind": "character",
+                   "reference_class": "subject", "description": "",
+                   "visual_intent": "preserve",
+                   "audio_intent": "reference_characteristics"},
+    }])
+    reference_id = project.references[0].reference_id
+    routes._apply_reference_mutation_operations(project, [{
+        "type": "create_member", "reference_id": reference_id,
+        "fields": _member_fields(attachment_defaults={
+            "retention_detail": "She keeps her facial features.",
+            "task_types": ["reference_generation"],
+        }),
+    }])
+    member = project.references[0].members[0]
+    assert member.attachment_defaults == {
+        "retention_detail": "She keeps her facial features.",
+        "task_types": ["reference_generation"],
+    }
+
+    # Survives a real save/load cycle.
+    save_project(project)
+    reloaded = load_project(str(project.project_dir))
+    assert reloaded.references[0].members[0].attachment_defaults == (
+        member.attachment_defaults)
+
+    # An update carrying exact prior values replaces the bag.
+    routes._apply_reference_mutation_operations(project, [{
+        "type": "update_member", "reference_id": reference_id,
+        "member_id": member.member_id,
+        "fields": {"attachment_defaults": {"summary": "A quiet corridor."}},
+        "expected": {"attachment_defaults": {
+            "retention_detail": "She keeps her facial features.",
+            "task_types": ["reference_generation"],
+        }},
+    }])
+    assert project.references[0].members[0].attachment_defaults == {
+        "summary": "A quiet corridor."}
+
+    # A key the identity resolver would never iterate is refused at the route
+    # rather than stored and silently ignored forever.
+    with pytest.raises(routes.ProjectMutationRequestError) as invalid:
+        routes._apply_reference_mutation_operations(project, [{
+            "type": "update_member", "reference_id": reference_id,
+            "member_id": member.member_id,
+            "fields": {"attachment_defaults": {"invented_field": "x"}},
+            "expected": {"attachment_defaults": {"summary": "A quiet corridor."}},
+        }])
+    assert invalid.value.code == "invalid_reference_member"
+    assert project.references[0].members[0].attachment_defaults == {
+        "summary": "A quiet corridor."}
+
+
+def test_member_attachment_defaults_preserve_keys_from_another_format():
+    """Load must not filter to the currently resolved format's field set.
+
+    One project can hold members authored under several Prompt Formats, so
+    filtering here would delete authored defaults at rest on every load.
+    """
+    member = ReferenceMember.from_dict({
+        "member_id": "m1", "asset_id": "image-1",
+        "attachment_defaults": {"summary": "kept", "future_format_field": "kept"},
+    })
+    assert member.attachment_defaults == {
+        "summary": "kept", "future_format_field": "kept"}
+    assert member.to_dict()["attachment_defaults"] == member.attachment_defaults
+
+
+def test_member_intents_outside_the_vocabulary_are_preserved_not_blanked():
+    """Normalization preserves; the mutation route still refuses new ones.
+
+    Blanking on load destroyed authored data with no message and made the
+    route-side refusal unreachable for anything already stored.
+    """
+    member = ReferenceMember.from_dict({
+        "member_id": "m1", "asset_id": "image-1",
+        "visual_intent": "retired_alias", "audio_intent": "also_retired",
+    })
+    assert member.visual_intent == "retired_alias"
+    assert member.audio_intent == "also_retired"
+    assert member.to_dict()["visual_intent"] == "retired_alias"
+
+    # A canonical value still loads unchanged.
+    canonical = ReferenceMember.from_dict({
+        "member_id": "m2", "asset_id": "image-1",
+        "visual_intent": next(iter(prompt_context.VISUAL_INTENTS)),
+    })
+    assert canonical.visual_intent in prompt_context.VISUAL_INTENTS

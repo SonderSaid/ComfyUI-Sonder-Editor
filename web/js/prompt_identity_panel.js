@@ -3,7 +3,8 @@
 // module owns only the derived DOM/listeners and returns a cleanup callback.
 
 import { EDITOR_COLORS as COLORS, chromeInputCss } from "./editor_theme.js";
-import { normalizePromptAttachment } from "./prompt_context_chips.js";
+import { createReferenceOverrideFieldset,
+    normalizePromptAttachment } from "./prompt_context_chips.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
 import { createModalDraftGuard } from "./modal_draft_guard.js";
 import {
@@ -14,6 +15,7 @@ import {
     declaredFieldChoices,
     orderedReferenceDerived,
     referenceFieldDeclaration,
+    referenceRoleChoices,
 } from "./prompt_profile_declarations.js";
 
 const uid = () => globalThis.crypto?.randomUUID?.().replaceAll("-", "")
@@ -120,14 +122,42 @@ function buildPromptingRow(kind, cells) {
     return row;
 }
 
+export const PROMPT_HANDLE_RULE =
+    "Letters and digits only, starting with a letter. Up to 64 characters.";
+
+/** Sanitize a typed handle without reformatting what the author is writing. */
+export function sanitizePromptHandle(value) {
+    const cleaned = String(value || "").replace(/[^A-Za-z0-9]/g, "");
+    const rooted = /^[A-Za-z]/.test(cleaned) || !cleaned
+        ? cleaned : `Ref${cleaned}`;
+    return rooted.slice(0, 64);
+}
+
+/**
+ * A typeable handle suggestion.
+ *
+ * A handle is what an author TYPES while writing a prompt, so the suggestion
+ * has to be short enough to retype from memory. Camel-casing every token of a
+ * filename produced things like `ChatGPTImageAug112026120009PM` \u2014 technically
+ * valid and unusable at the exact moment it matters. Generated tails are
+ * dropped and the result is capped at three words.
+ */
 export function derivePromptHandleSuggestion(value, fallback = "Reference") {
     const words = String(value || "").normalize("NFKD")
         .replace(/[\u0300-\u036f]/g, "")
         .match(/[A-Za-z0-9]+/g) || [];
-    let handle = words.map((word) => word[0]?.toUpperCase() + word.slice(1)).join("");
+    // Drop camera/export debris: pure digits, and the date/time fragments that
+    // dominate generated filenames.
+    const meaningful = words.filter((word) => !/^\d+$/.test(word)
+        && !/^(?:19|20)\d{2}$/.test(word)
+        && !/^(?:AM|PM)$/i.test(word)
+        && !/^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\d*$/i
+            .test(word));
+    const chosen = (meaningful.length ? meaningful : words).slice(0, 3);
+    let handle = chosen.map((word) =>
+        word[0]?.toUpperCase() + word.slice(1)).join("");
     if (!handle) handle = String(fallback || "Reference").replace(/[^A-Za-z0-9]/g, "");
-    if (!/^[A-Za-z]/.test(handle)) handle = `Ref${handle}`;
-    return handle.slice(0, 64) || "Reference";
+    return sanitizePromptHandle(handle) || "Reference";
 }
 
 export function promptIdentityDependents(identityId, scenes = [], identity = null) {
@@ -381,15 +411,20 @@ export function promptReferenceAttachment(owner, profile = {}) {
         // Reset had nothing to clear. The compiler resolves a blank through
         // `_resolved_capability` and `_route_for`; only a real deviation is
         // ever stored.
+        // `enabled` is omitted for the same reason as the routing above: absent
+        // means inherit the Reference/identity default, and seeding `true` here
+        // would make every new chip read as an explicit override that pins the
+        // capability on however the Reference is later configured.
         capabilities: declarations.map(([capabilityId]) => ({
             capability_id: capabilityId, kind: capabilityId,
-            channel_key: "", placement: "",
-            enabled: true, config: {},
+            channel_key: "", placement: "", config: {},
         })),
     });
 }
 
-function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError }) {
+function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
+    profile = {}, references = [], semanticUnits = [], setupManifest = {},
+    disclosureMemory = null, confirmDismiss = null }) {
     const opener = document.activeElement;
     const backdrop = document.createElement("div");
     backdrop.dataset.promptAttachmentTarget = "1";
@@ -410,8 +445,34 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError }
         ]),
     ], "global");
     const hint = document.createElement("span");
-    hint.textContent = "The attachment follows current Reference/Identity defaults. Edit the chip only for sparse deviations.";
+    hint.textContent = "The attachment follows current Reference/Identity defaults. Override any of them here, or later from the chip.";
     hint.style.color = COLORS.textDim;
+
+    // Authoring moved here from the chip. The dialog used to ask only WHERE —
+    // the least interesting question — at the one moment the author had full
+    // context, then went silent while every remaining decision hid behind an
+    // unadvertised click on the chip it had just created.
+    const selection = owner?.type === "identity"
+        ? String(owner.identityId || "")
+        : `physical:${String(owner?.declaration?.key
+            || owner?.declaration?.ordinal_key || "picture")}:${
+            String(owner?.memberId || "")}`;
+    const fieldset = createReferenceOverrideFieldset({
+        profile, references, semanticUnits, setupManifest,
+        overrides: {}, selected: selection,
+        disclosureMemory, disclosureKey: "attach_overrides",
+    });
+    const fieldsetHost = document.createElement("div");
+    fieldsetHost.dataset.sonderAttachFieldset = "1";
+    fieldsetHost.style.cssText = "display:flex;flex-direction:column;gap:6px;max-height:46vh;overflow:auto;";
+    if (fieldset.fields.length) {
+        fieldsetHost.append(fieldset.summaryRow,
+            ...fieldset.fields.map((field) => fieldset.row(field)));
+    }
+    // A speaker binding is resolved against the compiler's window-scoped
+    // domain, not per section, so it is deliberately NOT offered here; the chip
+    // owns it. Live routing state is likewise unavailable until a compile has
+    // seen this attachment_id.
     const footer = document.createElement("div");
     footer.style.cssText = "display:flex;justify-content:flex-end;gap:6px;";
     const cancel = makeButton("Cancel");
@@ -423,15 +484,23 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError }
         opener?.focus?.();
         onClose?.();
     };
+    const draftGuard = createModalDraftGuard({
+        controls: () => [...fieldset.controls.values()],
+        confirm: confirmDismiss,
+        message: "Discard these attachment overrides? Your unsaved changes will be lost.",
+    });
+    // Cancel is explicit intent and is never guarded.
     cancel.addEventListener("click", close);
-    backdrop.addEventListener("click", (event) => { if (event.target === backdrop) close(); });
+    backdrop.addEventListener("click", (event) => {
+        if (event.target === backdrop && draftGuard.confirmDismiss()) close();
+    });
     attach.addEventListener("click", async () => {
         attach.disabled = true;
         const sectionMatch = String(target.value || "").match(/^section:(\d+)$/);
         try {
             await onAttach?.(owner, sectionMatch
                 ? { scope: "section", sectionIndex: Number(sectionMatch[1]) }
-                : { scope: "global" });
+                : { scope: "global" }, fieldset.collect());
             close();
         } catch (error) {
             attach.disabled = false;
@@ -439,7 +508,9 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError }
         }
     });
     footer.append(cancel, attach);
-    modal.append(title, target, hint, footer);
+    modal.append(title, target, hint, fieldsetHost, footer);
+    modal.style.maxHeight = "86vh";
+    modal.style.overflow = "auto";
     backdrop.appendChild(modal);
     document.body.appendChild(backdrop);
     unregisterKeys = registerKeyboardConsumer({
@@ -448,7 +519,10 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError }
         keydown: (event) => {
             if (event.isComposing === true || event.keyCode === 229) return false;
             if (event.key !== "Escape") return false;
-            close();
+            // Claim the key either way: returning false after a declined
+            // confirm passes Escape to the panel's own OVERLAY consumer, which
+            // closes the panel out from under this modal.
+            if (draftGuard.confirmDismiss()) close();
             return true;
         },
     });
@@ -457,6 +531,7 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError }
 
 function openIdentityEditor({ identity = null, seedSource = null, profile, references,
     semanticUnits, assets, disclosureMemory = null, placementPhases = [],
+    attachmentCount = 0,
     confirmDismiss = null, onSave, onDelete, onClose, onError }) {
     const opener = document.activeElement;
     const backdrop = document.createElement("div");
@@ -484,6 +559,24 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         || seedSource?.reference?.name || "";
     name.value = identity?.name || seededName;
     handle.value = identity?.handle || derivePromptHandleSuggestion(name.value, "Identity");
+    // Seeding once meant the description-only path — no physical source, so no
+    // name yet at open — kept the literal fallback "Identity" no matter what
+    // was typed. Track Name until the author touches the handle themselves.
+    let handleFollowsName = !identity?.handle;
+    handle.addEventListener("input", () => {
+        handleFollowsName = false;
+        const sanitized = sanitizePromptHandle(handle.value);
+        if (sanitized !== handle.value) {
+            const caret = Math.max(0, (handle.selectionStart ?? sanitized.length)
+                - (handle.value.length - sanitized.length));
+            handle.value = sanitized;
+            handle.setSelectionRange?.(caret, caret);
+        }
+    });
+    name.addEventListener("input", () => {
+        if (!handleFollowsName) return;
+        handle.value = derivePromptHandleSuggestion(name.value, "Identity");
+    });
     const definition = document.createElement("textarea");
     definition.rows = 3;
     definition.style.cssText = chromeInputCss();
@@ -514,6 +607,28 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     audioDefinitionDefault.rows = 2; audioDefinitionDefault.style.cssText = chromeInputCss();
     audioDefinitionDefault.placeholder = "Default audio definition (optional)";
     audioDefinitionDefault.value = attachmentDefaults.audio_definition || "";
+    // Which prompt parts this identity contributes at all. Sparse: an empty
+    // list is the ordinary "everything the format declares".
+    const storedDisabledCapabilities = new Set(
+        (identity?.disabled_capabilities || []).map(String));
+    const capabilityBoxes = new Map();
+    const capabilityParts = document.createElement("div");
+    capabilityParts.dataset.sonderIdentityCapabilityDefaults = "1";
+    capabilityParts.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;align-items:center;";
+    for (const [capabilityId, declaration] of orderedReferenceDerived(profile)) {
+        const item = document.createElement("label");
+        item.style.cssText = "display:flex;gap:4px;align-items:center;";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = !storedDisabledCapabilities.has(capabilityId);
+        box.setAttribute("aria-label",
+            `Contribute ${declaration?.label || capabilityId} by default`);
+        item.title = String(declaration?.help
+            || "New attachments follow this; a chip may still override it.");
+        capabilityBoxes.set(capabilityId, box);
+        item.append(box, String(declaration?.label || capabilityId));
+        capabilityParts.appendChild(item);
+    }
     const taskDeclaration = referenceFieldDeclaration(
         profile, "summary", "task_types");
     const taskTypesDefault = makeMultiSelect(
@@ -631,7 +746,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     const draftGuard = createModalDraftGuard({
         controls: () => [kind, handle, name, definition, voice,
             visual, audio, summaryDefault, retentionDefault,
-            audioDefinitionDefault, taskTypesDefault],
+            audioDefinitionDefault, taskTypesDefault, ...capabilityBoxes.values()],
         confirm: confirmDismiss,
         message: "Discard this prompt identity draft? Your unsaved changes will be lost.",
     });
@@ -685,7 +800,14 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
                 inherit_description: row.inherit.checked,
             })),
             voice: { member_id: voice.value || null },
-            intent_overrides: identity?.intent_overrides || {},
+            // Preserve ids this format does not declare: the identity may also
+            // be used under another format that owns them.
+            disabled_capabilities: [
+                ...[...storedDisabledCapabilities].filter(
+                    (id) => !capabilityBoxes.has(id)),
+                ...[...capabilityBoxes].filter(([, box]) => !box.checked)
+                    .map(([id]) => id),
+            ],
         };
         if (visual) next.visual_intent = visual.value;
         if (audio) next.audio_intent = audio.value;
@@ -713,7 +835,9 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     core.append(coreTitle,
         fieldRow("Kind", kind, { required: true }), kindDescription,
         fieldRow("Handle", handle, {
-            required: true, help: "User-language @handle used while authoring prompts.",
+            required: true,
+            help: `User-language @handle used while authoring prompts. ${
+                PROMPT_HANDLE_RULE}`,
         }),
         fieldRow("Name", name, { required: true }),
         fieldRow("Definition", definition, {
@@ -737,11 +861,21 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     });
     voiceGroup.body.append(fieldRow("Voice reference", voice));
 
+    // Name the rung and say who consumes it. This group and the chip's own
+    // fieldset are the same declared fields at two levels of one ladder, but
+    // only the chip end was labelled, so the pair read as two copies of one
+    // panel with no arrow between them.
     const advancedGroup = disclosureGroup({
-        title: "Advanced — attachment defaults",
-        description: "Defaults inherited by every new chip for this identity; chip overrides remain sparse.",
+        title: attachmentCount
+            ? `Defaults for all attachments (${attachmentCount} following)`
+            : "Defaults for all attachments",
+        description: "Every attachment of this identity starts from these; a chip stores only what it deviates on.",
         open: false, memory: disclosureMemory, key: "attachment_defaults",
     });
+    if (capabilityBoxes.size) advancedGroup.body.append(fieldRow(
+        "Contributes", capabilityParts, {
+            help: "Prompt parts new attachments inherit; a chip may still override one.",
+        }));
     if (visual) advancedGroup.body.append(fieldRow(
         visualDeclaration.label || "Visual default", visual, {
             help: declarationGuidance(visualDeclaration,
@@ -894,6 +1028,12 @@ export function mountPromptIdentityPanel(container, options = {}) {
         modalCleanup = openIdentityEditor({ identity, seedSource, profile,
             references, semanticUnits, assets, disclosureMemory,
             placementPhases: options.catalog?.placement_phases || [],
+            // How many attachments actually follow these defaults. The count is
+            // what turns an abstract "defaults" group into a statement about
+            // this project, and it is the arrow the chip end already draws.
+            attachmentCount: identity?.semantic_unit_id
+                ? promptIdentityDependents(identity.semantic_unit_id,
+                    options.scenes || [], identity).reference_chips : 0,
             onSave: (nextUnit) => saveIdentity(nextUnit, identity),
             onDelete: deleteIdentity,
             onClose: () => {
@@ -906,6 +1046,10 @@ export function mountPromptIdentityPanel(container, options = {}) {
         options.onModalStateChange?.(true);
         modalCleanup = openAttachmentTargetPicker({
             scene: options.scene, owner,
+            profile, references, semanticUnits,
+            setupManifest: candidate?.setup_manifest || {},
+            disclosureMemory,
+            confirmDismiss: options.confirm,
             onAttach: options.attachReference,
             onClose: () => {
                 modalCleanup = null;
@@ -939,8 +1083,21 @@ export function mountPromptIdentityPanel(container, options = {}) {
             const handle = document.createElement("input");
             handle.value = row.member?.handle || suggestion;
             handle.setAttribute("aria-label", "Physical Reference handle");
-            handle.title = row.member?.handle
-                ? "Durable handle" : "Suggested handle; it is stored when edited or first referenced";
+            handle.title = `${row.member?.handle
+                ? "Durable handle."
+                : "Suggested handle; it is stored when edited or first referenced."
+            } ${PROMPT_HANDLE_RULE}`;
+            // Sanitize while typing. The charset was previously learnable only
+            // by submitting and reading the server's refusal, even though the
+            // rule was already encoded one function away.
+            handle.addEventListener("input", () => {
+                const sanitized = sanitizePromptHandle(handle.value);
+                if (sanitized === handle.value) return;
+                const caret = Math.max(0, (handle.selectionStart ?? sanitized.length)
+                    - (handle.value.length - sanitized.length));
+                handle.value = sanitized;
+                handle.setSelectionRange?.(caret, caret);
+            });
             handle.style.cssText = `${chromeInputCss()}font-weight:600;color:${row.member?.handle ? COLORS.text : COLORS.textDim};`;
             const commitHandle = async () => {
                 if (!row.member || !row.reference
@@ -961,8 +1118,23 @@ export function mountPromptIdentityPanel(container, options = {}) {
             });
             const status = document.createElement("span");
             const identityCount = row.linkedIdentities.length;
-            status.textContent = `${row.role || "no role"} · ${row.resolvedLabel} · ${identityCount ? `${identityCount} identit${identityCount === 1 ? "y" : "ies"}` : "no identity"}`;
-            status.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`;
+            // Roles are declared as {value, label}; printing the raw value gave
+            // "first_frame" instead of "First frame" — and, when a format
+            // declares a role literally named `identity`, produced the
+            // self-contradicting "identity · <Picture 2> · no identity".
+            const roleLabel = referenceRoleChoices(profile, group.population)
+                .find((choice) => choice.value === String(row.role || ""))?.label
+                || String(row.role || "");
+            // The missing-identity state is an available ACTION, not a report:
+            // the row's only words used to read as status while the step that
+            // resolves them was an unlabeled glyph.
+            const identityState = identityCount
+                ? `${identityCount} identit${identityCount === 1 ? "y" : "ies"}`
+                : "no identity yet — use Create identity";
+            status.textContent = `${roleLabel || "no role"} · ${
+                row.resolvedLabel} · ${identityState}`;
+            status.style.cssText = `font:9px system-ui;color:${
+                identityCount ? COLORS.textDim : "#c8b48a"};`;
             const defaults = makeButton("Defaults", "Edit physical prompt text and preservation defaults");
             defaults.addEventListener("click", () => {
                 const existing = groupEl.querySelector(
@@ -982,12 +1154,49 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 const audio = makeSelect(intentValues(
                     profile, "audio_intent", { includeInherited: true }),
                 row.member.audio_intent || "");
+                // Which prompt parts this Reference contributes at all is a
+                // property of the Reference; WHERE each part lands stays
+                // per-attachment and remains in the chip's routing panel.
+                const storedDisabled = new Set(
+                    (row.member.disabled_capabilities || []).map(String));
+                const parts = document.createElement("div");
+                parts.dataset.sonderMemberCapabilityDefaults = "1";
+                parts.style.cssText = "grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;align-items:center;";
+                const partsLabel = document.createElement("span");
+                partsLabel.textContent = "Contributes";
+                partsLabel.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`;
+                parts.appendChild(partsLabel);
+                const partBoxes = new Map();
+                for (const [capabilityId, declaration] of
+                    orderedReferenceDerived(profile)) {
+                    const item = document.createElement("label");
+                    item.style.cssText = "display:flex;gap:3px;align-items:center;font:9px system-ui;";
+                    const box = document.createElement("input");
+                    box.type = "checkbox";
+                    box.checked = !storedDisabled.has(capabilityId);
+                    box.setAttribute("aria-label",
+                        `Contribute ${declaration?.label || capabilityId} by default`);
+                    item.title = String(declaration?.help
+                        || "New attachments follow this; a chip may still override it.");
+                    partBoxes.set(capabilityId, box);
+                    item.append(box, String(declaration?.label || capabilityId));
+                    parts.appendChild(item);
+                }
                 const save = makeButton("Save defaults", "Persist through the Reference mutation batch", "primary");
                 save.addEventListener("click", async () => {
+                    // Preserve ids this format does not declare: the member may
+                    // also be used under another format that owns them.
+                    const declaredIds = new Set(partBoxes.keys());
+                    const nextDisabled = [
+                        ...[...storedDisabled].filter((id) => !declaredIds.has(id)),
+                        ...[...partBoxes].filter(([, box]) => !box.checked)
+                            .map(([id]) => id),
+                    ];
                     const fields = {
                         prompt: prompt.value,
                         visual_intent: visual.value,
                         audio_intent: audio.value,
+                        disabled_capabilities: nextDisabled,
                     };
                     try {
                         await options.mutateReferences?.([{
@@ -997,18 +1206,21 @@ export function mountPromptIdentityPanel(container, options = {}) {
                                 prompt: String(row.member.prompt || ""),
                                 visual_intent: String(row.member.visual_intent || ""),
                                 audio_intent: String(row.member.audio_intent || ""),
+                                disabled_capabilities: [...storedDisabled],
                             },
                         }], "edit physical Reference prompt defaults");
                         rerender();
                     } catch (error) { options.onError?.(error); }
                 });
-                editor.append(prompt, visual, audio, save);
+                editor.append(prompt, visual, audio, save, parts);
                 rowEl.insertAdjacentElement("afterend", editor);
             });
-            const create = makeButton("+",
-                "One physical reference may feed several prompt identities", "primary",
-                "Create prompt identity from physical Reference");
-            create.style.cssText += "min-width:24px;padding:2px 6px;font-size:12px;";
+            // Labelled, not a bare glyph. This is the step that turns staged
+            // media into something a prompt can name, and it was the single
+            // least discoverable control in the tool.
+            const create = makeButton("Create identity",
+                "Turn this physical Reference into a named prompt identity. One Reference may feed several.",
+                "primary", "Create prompt identity from physical Reference");
             create.addEventListener("click", () => openEditor(null, row));
             const attach = makeButton("Attach...", "Attach this physical Reference to the scene or a section");
             attach.addEventListener("click", () => openAttach({

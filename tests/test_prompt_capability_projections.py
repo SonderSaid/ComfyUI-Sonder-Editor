@@ -1,6 +1,15 @@
 """Per-capability prompt projection contract and terminal-state coverage."""
 
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
 from server import prompt_context
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _attachment(text="value", *, attachment_id="a", group_id=None,
@@ -284,3 +293,112 @@ def test_minimax_reference_accounts_for_all_five_capabilities_and_resolved_route
     mention = next(row for row in rows if row["capability_id"] == "mentions")
     assert (mention["declared_placement"], mention["effective_phase"],
             mention["region"]) == ("inline", "inline", "before")
+
+
+def _enabled_probe(body):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for capability enabled coverage")
+    module_url = (ROOT / "web" / "js" / "prompt_context_chips.js").as_uri()
+    script = f"""
+        const mod = await import({json.dumps(module_url)});
+        {body}
+    """
+    return json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+
+
+def test_capability_enabled_is_stored_only_when_it_deviates():
+    """Sparse like the routing beside it: absent means inherit.
+
+    Writing `true` unconditionally made every record read as a deliberate
+    override, so a shared Reference default could never take effect.
+    """
+    result = _enabled_probe("""
+        const record = (enabled, inheritedEnabled) =>
+            mod.sparseCapabilityRecord({}, {
+                capabilityId: "summary", enabled, inheritedEnabled });
+        console.log(JSON.stringify({
+            onFollowingOn: record(true, true),
+            offFollowingOff: record(false, false),
+            offAgainstOn: record(false, true),
+            onAgainstOff: record(true, false),
+        }));
+    """)
+    assert "enabled" not in result["onFollowingOn"]
+    assert "enabled" not in result["offFollowingOff"]
+    assert result["offAgainstOn"]["enabled"] is False
+    assert result["onAgainstOff"]["enabled"] is True
+
+
+def test_inherited_capability_enabled_reads_the_reference_tiers():
+    result = _enabled_probe("""
+        const references = [{ reference_id: "ref", members: [
+            { member_id: "m", disabled_capabilities: ["summary"] }] }];
+        const semanticUnits = [
+            { semantic_unit_id: "lead", disabled_capabilities: ["mentions"] }];
+        const call = (capabilityId, selected) =>
+            mod.resolveInheritedCapabilityEnabled(capabilityId, {
+                selected, references, semanticUnits });
+        console.log(JSON.stringify({
+            memberOff: call("summary", "physical:picture:m"),
+            memberOn: call("mentions", "physical:picture:m"),
+            identityOff: call("mentions", "lead"),
+            identityOn: call("summary", "lead"),
+            unknownSelection: call("summary", "physical:picture:missing"),
+        }));
+    """)
+    assert result["memberOff"] is False
+    assert result["memberOn"] is True
+    assert result["identityOff"] is False
+    assert result["identityOn"] is True
+    assert result["unknownSelection"] is True
+
+
+def test_linked_propagation_never_carries_enabled_to_an_inheriting_target():
+    """Per-section suppression is local and must not ride a linked edit.
+
+    The previous shape restored the target's flag only when the target already
+    held a record for that capability — true while every attach seeded one, but
+    once records became sparse an inheriting target silently adopted the source
+    chip's suppression.
+    """
+    result = _enabled_probe("""
+        const configured = {
+            attachment_id: "src", emission_group_id: "grp", kind: "reference",
+            source: {}, config: {},
+            capabilities: [
+                { capability_id: "summary", kind: "summary", enabled: false },
+                { capability_id: "mentions", kind: "mentions", enabled: false },
+            ],
+        };
+        const inheriting = {
+            attachment_id: "dst", emission_group_id: "grp", kind: "reference",
+            source: {}, config: {},
+            capabilities: [{ capability_id: "summary", kind: "summary" }],
+        };
+        const stating = {
+            attachment_id: "dst2", emission_group_id: "grp", kind: "reference",
+            source: {}, config: {},
+            capabilities: [{ capability_id: "summary", kind: "summary",
+                             enabled: true }],
+        };
+        const pick = (result, id) => (result.capabilities || []).find(
+            (value) => value.capability_id === id);
+        const toInheriting = mod.propagateLinkedPromptAttachment(
+            configured, inheriting, "src");
+        const toStating = mod.propagateLinkedPromptAttachment(
+            configured, stating, "src");
+        console.log(JSON.stringify({
+            inheritingSummary: pick(toInheriting, "summary"),
+            inheritingMentions: pick(toInheriting, "mentions"),
+            statingSummary: pick(toStating, "summary"),
+        }));
+    """)
+    # The target was inheriting and stays inheriting.
+    assert "enabled" not in result["inheritingSummary"]
+    # A capability the target held no record for must not gain the source's flag.
+    assert "enabled" not in result["inheritingMentions"]
+    # A target that stated its own value keeps it.
+    assert result["statingSummary"]["enabled"] is True

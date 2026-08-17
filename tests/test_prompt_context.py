@@ -1062,3 +1062,147 @@ def test_custom_capability_formatter_is_bounded_and_text_alias_resolves():
                                                  "placement": "section_prefix",
                                                  "formatter": "prefix {text}"}}})
     assert compiled["prompt"] == "prefix hello"
+
+
+_MEMBER_TIER_PROFILE = {
+    "name": "Tier Format",
+    "physical_populations": [
+        {"key": "pictures", "ordinal_key": "pictures",
+         "source_key": "picture_ids", "token_kind": "picture",
+         "label": "Picture", "label_template": "<Picture {n}>"},
+    ],
+    "capabilities": {"reference": {
+        "defaults": {"retention_detail": "format detail"},
+        "derived": {"retention": {"order": 1, "channel_key": "ret",
+                                  "placement": "section_prefix", "fields": {}}},
+    }},
+}
+
+
+def _member_tier_context(members, units=None):
+    return {
+        "profile": _MEMBER_TIER_PROFILE,
+        "references": [{"reference_id": "ref", "name": "Korean Woman",
+                        "members": members}],
+        "semantic_units_by_id": {
+            str(unit["semantic_unit_id"]): unit for unit in (units or [])},
+    }
+
+
+def test_member_attachment_defaults_sit_between_format_and_identity():
+    """The physical member tier is what makes 'sparse deviations' true.
+
+    Without it a physical Reference inherited only prompt text and the two
+    intents, so every other field was a per-chip deviation.
+    """
+    members = [{"member_id": "pm", "handle": "CharacterSheet",
+                "attachment_defaults": {"retention_detail": "member detail"}}]
+    capability = {"capability_id": "retention", "kind": "retention"}
+
+    # Direct physical selection: member beats the format default.
+    physical = prompt_context.effective_reference_config(
+        {"source": {"picture_ids": ["pm"]}, "config": {}},
+        capability, _member_tier_context(members))
+    assert physical["retention_detail"] == "member detail"
+
+    # Via an identity that draws on the same member, with no identity default:
+    # the member still supplies it.
+    via_identity = prompt_context.effective_reference_config(
+        {"source": {"semantic_unit_ids": ["lead"]}, "config": {}},
+        capability, _member_tier_context(members, [
+            {"semantic_unit_id": "lead", "sources": [{"member_id": "pm"}]}]))
+    assert via_identity["retention_detail"] == "member detail"
+
+    # An identity default outranks the member it draws from.
+    identity_wins = prompt_context.effective_reference_config(
+        {"source": {"semantic_unit_ids": ["lead"]}, "config": {}},
+        capability, _member_tier_context(members, [
+            {"semantic_unit_id": "lead", "sources": [{"member_id": "pm"}],
+             "attachment_defaults": {"retention_detail": "identity detail"}}]))
+    assert identity_wins["retention_detail"] == "identity detail"
+
+    # A chip override still outranks everything below it.
+    chip_wins = prompt_context.effective_reference_config(
+        {"source": {"picture_ids": ["pm"]},
+         "config": {"overrides": {"retention_detail": "chip detail"}}},
+        capability, _member_tier_context(members))
+    assert chip_wins["retention_detail"] == "chip detail"
+
+
+def test_conflicting_member_defaults_fall_through_rather_than_first_wins():
+    """Two selected members disagreeing must not let one win by ordering."""
+    members = [
+        {"member_id": "a", "attachment_defaults": {"retention_detail": "left"}},
+        {"member_id": "b", "attachment_defaults": {"retention_detail": "right"}},
+    ]
+    config = prompt_context.effective_reference_config(
+        {"source": {"picture_ids": ["a", "b"]}, "config": {}},
+        {"capability_id": "retention", "kind": "retention"},
+        _member_tier_context(members))
+    assert config["retention_detail"] == "format detail"
+
+    # Agreement inherits normally.
+    agreed = [dict(member, attachment_defaults={"retention_detail": "same"})
+              for member in members]
+    config = prompt_context.effective_reference_config(
+        {"source": {"picture_ids": ["a", "b"]}, "config": {}},
+        {"capability_id": "retention", "kind": "retention"},
+        _member_tier_context(agreed))
+    assert config["retention_detail"] == "same"
+
+
+def test_member_defaults_absent_leaves_the_format_default_alone():
+    config = prompt_context.effective_reference_config(
+        {"source": {"picture_ids": ["pm"]}, "config": {}},
+        {"capability_id": "retention", "kind": "retention"},
+        _member_tier_context([{"member_id": "pm"}]))
+    assert config["retention_detail"] == "format detail"
+
+
+def test_capability_enabled_absence_is_preserved_and_resolves_per_reference():
+    """Absent means inherit, in storage and through the resolver.
+
+    Coercing absence to True at the deserialization boundary meant no resolver
+    downstream could ever see "inherit", so a shared default was inert.
+    """
+    sparse = prompt_context.normalize_capability(
+        {"capability_id": "summary", "kind": "summary"})
+    assert "enabled" not in sparse
+    for stored in (True, False):
+        explicit = prompt_context.normalize_capability(
+            {"capability_id": "summary", "kind": "summary", "enabled": stored})
+        assert explicit["enabled"] is stored
+
+    context = {
+        "profile": _MEMBER_TIER_PROFILE,
+        "references": [{"reference_id": "ref", "members": [
+            {"member_id": "pm", "disabled_capabilities": ["summary"]}]}],
+        "semantic_units_by_id": {"lead": {
+            "semantic_unit_id": "lead", "sources": [{"member_id": "pm"}],
+            "disabled_capabilities": []}},
+    }
+    capability = {"capability_id": "summary", "kind": "summary"}
+
+    # A physical selection follows its member.
+    assert prompt_context._inherited_capability_enabled(
+        {"source": {"picture_ids": ["pm"]}}, capability, context) is False
+    # An identity that says nothing outranks the member it draws from, so the
+    # part stays on: turning it off for the identity is a separate decision.
+    assert prompt_context._inherited_capability_enabled(
+        {"source": {"semantic_unit_ids": ["lead"]}}, capability, context) is True
+    # A capability the Reference says nothing about stays on.
+    assert prompt_context._inherited_capability_enabled(
+        {"source": {"picture_ids": ["pm"]}},
+        {"capability_id": "mentions", "kind": "mentions"}, context) is True
+
+
+def test_disabled_capabilities_preserve_ids_from_another_format():
+    """An id the active format does not declare must survive.
+
+    One Reference can be used under several formats; dropping an unrecognised
+    id would silently re-enable that part on the format that owns it.
+    """
+    assert prompt_context.normalize_disabled_capabilities(
+        ["summary", "future_format_part", "summary", "", 5]) == [
+            "summary", "future_format_part", "5"]
+    assert prompt_context.normalize_disabled_capabilities(None) == []

@@ -88,3 +88,38 @@ def test_missing_h3_shot_identity_is_advisory():
     })
     assert "missing_h3_shot_identity" in _codes(result, "warnings")
     assert "missing_h3_shot_identity" not in _codes(result, "errors")
+
+
+def test_unnamed_staged_reference_warns_on_the_member_not_the_channel():
+    """A staged member nothing in the prompt refers to.
+
+    Deliberately a separate code from `missing_h3_reference_field`, which is the
+    format-labelled variant of `empty_channel` and names an empty prompt
+    channel: retargeting that one would destroy a different diagnostic and
+    still not name the missing identity.
+    """
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[], window_start=0, window_end=10, fps=24,
+        template="minimax_h3_ref",
+        context={
+            "profile": "minimax_h3_ref@1",
+            "semantic_units": [{"semantic_unit_id": "named", "sources": [
+                {"entity_id": "e", "member_id": "described"}]}],
+            "setup_manifest": {"pictures": [
+                {"member_id": "described", "display_name": "Woman · Portrait",
+                 "member_prompt": "", "role": "identity", "slot_number": 1},
+                {"member_id": "prose_only", "display_name": "Street",
+                 "member_prompt": "a wet street at night", "role": "style",
+                 "slot_number": 2},
+                {"member_id": "orphan", "display_name": "Prop",
+                 "member_prompt": "", "role": "identity", "slot_number": 3},
+            ]},
+        })
+    unnamed = [value for value in compiled["warnings"]
+               if value["code"] == "unnamed_physical_reference"]
+    # Only the member with neither an identity nor prose is flagged.
+    assert [value["member_id"] for value in unnamed] == ["orphan"]
+    assert "Create identity" in unnamed[0]["message"]
+    # It is a warning, not a blocker: the pixels still reach the model.
+    assert not [value for value in compiled["errors"]
+                if value["code"] == "unnamed_physical_reference"]

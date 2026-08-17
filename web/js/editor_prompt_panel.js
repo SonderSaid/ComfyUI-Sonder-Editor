@@ -1922,7 +1922,7 @@ export function mountPromptManagementPanel(host) {
             return sourceKey && (attachment.source?.[sourceKey] || []).map(String)
                 .includes(String(owner?.memberId || ""));
         };
-        const attachReference = async (owner, target) => {
+        const attachReference = async (owner, target, overrides = null) => {
             const sectionIndex = Number(target?.sectionIndex);
             const section = target?.scope === "section"
                 ? scene.prompt_sections?.[sectionIndex] : null;
@@ -1963,6 +1963,13 @@ export function mountPromptManagementPanel(host) {
                 return true;
             }
             const attachment = promptReferenceAttachment(owner, identityProfile);
+            // Overrides authored in the Attach dialog ride the SAME scene batch
+            // as the attachment, so one Undo removes both — and, on the
+            // first-use path, the materialized handle with them.
+            if (overrides && typeof overrides === "object"
+                    && Object.keys(overrides).length) {
+                attachment.config = { ...attachment.config, overrides };
+            }
             const next = [...current, attachment];
             const operations = section ? [{
                 type: "update_prompt_section", index: sectionIndex,

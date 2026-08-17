@@ -1011,10 +1011,27 @@ def normalize_capability(raw, *, index=0) -> dict:
         "kind": str(raw.get("kind") or "text"),
         "channel_key": str(raw.get("channel_key") or ""),
         "placement": placement,
-        "enabled": raw.get("enabled") is not False,
         "config": copy.deepcopy(raw.get("config"))
                   if isinstance(raw.get("config"), dict) else {},
     }
+    # `enabled` is TRI-STATE and as sparse as the routing beside it: absent
+    # inherits the shared Reference/identity default, True/False is an authored
+    # chip deviation. Coercing absence to True here erased the distinction at
+    # the deserialization boundary, so no resolver downstream could ever see
+    # "inherit" and a shared default could never take effect.
+    #
+    # DELIBERATELY NOT MIGRATED. Projects written before this change carry an
+    # eagerly seeded `enabled: true` on every capability (249 such records in
+    # the test project, 22 of them a genuine `false`). Stripping `true` at load
+    # would be safe only for that pre-change data: from now on `true` is
+    # meaningful — it is how a chip stays on against a shared default that is
+    # off — and no value-level test can tell the two apart. The residue is
+    # bounded and self-healing: such a record simply keeps the part on, and
+    # `sparseCapabilityRecord` drops it as redundant the next time that chip is
+    # saved. Preferring that over a migration that could silently eat a
+    # deliberate override later.
+    if raw.get("enabled") is not None:
+        result["enabled"] = raw.get("enabled") is not False
     return result
 
 
@@ -1163,6 +1180,21 @@ def clone_for_split(channel_documents, attachments) -> tuple[dict, list]:
     return documents, clones
 
 
+def normalize_disabled_capabilities(raw) -> list:
+    """Ordered, de-duplicated capability ids a Reference tier turns off.
+
+    Preserves ids the active Prompt Format does not declare: a project can hold
+    one Reference used under several formats, and dropping an unrecognised id
+    would silently re-enable that part on the format that owns it.
+    """
+    result = []
+    for value in raw if isinstance(raw, list) else []:
+        capability_id = str(value or "").strip()
+        if capability_id and capability_id not in result:
+            result.append(capability_id)
+    return result
+
+
 def normalize_semantic_unit(raw) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     contributions = []
@@ -1201,8 +1233,10 @@ def normalize_semantic_unit(raw) -> dict:
                                if isinstance(raw.get("attachment_defaults"), dict)
                                else {},
         "voice": {"member_id": voice_member_id},
-        "intent_overrides": copy.deepcopy(raw.get("intent_overrides"))
-                            if isinstance(raw.get("intent_overrides"), dict) else {},
+        # Prompt parts this identity does not contribute by default. Sparse:
+        # an empty list is the ordinary "everything the format declares".
+        "disabled_capabilities": normalize_disabled_capabilities(
+            raw.get("disabled_capabilities")),
     }
     # Identity intent vocabulary belongs to the active Prompt Format. Keep the
     # authored value sparse and preserved—even when a future/other format owns
@@ -1966,6 +2000,125 @@ def _subject_definition(config, unit, context) -> tuple[str, str]:
     return "; ".join(prompts), ("member" if prompts else "")
 
 
+def _members_by_id(context) -> dict:
+    """Lazy member lookup, cached on the context.
+
+    Built on demand rather than beside `references_by_id`, which is assigned
+    part-way through compilation: this runs from the emission path and must not
+    depend on having been reached after that assignment.
+    """
+    cached = context.get("_members_by_id")
+    if isinstance(cached, dict):
+        return cached
+    result = {}
+    for reference in context.get("references") or []:
+        if not isinstance(reference, dict):
+            continue
+        for member in reference.get("members") or []:
+            member_id = str(member.get("member_id") or "") if isinstance(
+                member, dict) else ""
+            if member_id:
+                result[member_id] = member
+    context["_members_by_id"] = result
+    return result
+
+
+def _attachment_member_ids(attachment, context) -> list[str]:
+    """Physical members this attachment draws on, directly or via identities.
+
+    An identity contributes its own sources so a member default sits BELOW the
+    identity that draws from it, matching how `_subject_definition` already
+    falls back from identity prose to contributing member prose.
+    """
+    source = attachment.get("source") or {}
+    profile = context.get("profile") or {}
+    result = []
+    for declaration in physical_population_declarations(profile):
+        source_key = str(declaration.get("source_key") or "")
+        if not source_key:
+            continue
+        for source_id in source.get(source_key) or []:
+            value = str(source_id or "")
+            if value and value not in result:
+                result.append(value)
+    units = context.get("semantic_units_by_id") or {}
+    for unit_id in source.get("semantic_unit_ids") or []:
+        unit = units.get(str(unit_id)) or {}
+        for contribution in unit.get("sources") or []:
+            value = str((contribution or {}).get("member_id") or "")
+            if value and value not in result:
+                result.append(value)
+    return result
+
+
+def _inherited_capability_enabled(attachment, capability, context) -> bool:
+    """Shared default for a capability the chip does not state an opinion on.
+
+    Whether a Reference contributes a prompt part at all is a property of the
+    Reference, not of one section, so it is authored once on the member or the
+    identity and listed in `disabled_capabilities`. A chip that DOES state
+    `enabled` keeps its own value: that is per-section suppression and stays
+    local, exactly as before.
+
+    Identity beats member, matching the field precedence chain. A member is
+    consulted only when every selected member agrees, so two members disagreeing
+    fall through to enabled rather than one silently winning.
+    """
+    capability_id = str(capability.get("capability_id")
+                        or capability.get("kind") or "")
+    if not capability_id:
+        return True
+    units = context.get("semantic_units_by_id") or {}
+    selected_units = [units.get(str(unit_id)) for unit_id
+                      in (attachment.get("source") or {}).get(
+                          "semantic_unit_ids") or []]
+    selected_units = [unit for unit in selected_units if unit]
+    if selected_units:
+        opinions = [capability_id in (unit.get("disabled_capabilities") or [])
+                    for unit in selected_units]
+        if all(opinions):
+            return False
+        if not any(opinions):
+            return True
+        return True
+    members_by_id = _members_by_id(context)
+    selected_members = [members_by_id[member_id] for member_id
+                        in _attachment_member_ids(attachment, context)
+                        if member_id in members_by_id]
+    if selected_members:
+        opinions = [capability_id in (member.get("disabled_capabilities") or [])
+                    for member in selected_members]
+        if opinions and all(opinions):
+            return False
+    return True
+
+
+def _common_member_attachment_defaults(attachment, context) -> dict:
+    """Defaults shared by every physical member this attachment draws on.
+
+    Same all-selected-sources-agree rule as the identity tier below: a field
+    only inherits when every selected member states it and they agree, so two
+    members with conflicting defaults fall through rather than one silently
+    winning by ordering.
+    """
+    members_by_id = _members_by_id(context)
+    selected = [members_by_id[member_id] for member_id
+                in _attachment_member_ids(attachment, context)
+                if member_id in members_by_id]
+    if not selected:
+        return {}
+    defaults = [member.get("attachment_defaults")
+                if isinstance(member.get("attachment_defaults"), dict) else {}
+                for member in selected]
+    result = {}
+    for field in REFERENCE_OVERRIDE_FIELDS:
+        values = [value[field] for value in defaults if field in value]
+        if (values and len(values) == len(defaults)
+                and all(value == values[0] for value in values[1:])):
+            result[field] = copy.deepcopy(values[0])
+    return result
+
+
 def _common_identity_attachment_defaults(attachment, context) -> dict:
     units = context.get("semantic_units_by_id") or {}
     selected = [units.get(str(unit_id)) or {} for unit_id in
@@ -1988,9 +2141,15 @@ def _common_identity_attachment_defaults(attachment, context) -> dict:
 def effective_reference_config(attachment, capability, context) -> dict:
     """Resolve Reference config through its one sparse precedence chain.
 
-    Format defaults < common identity attachment defaults < non-inheritable
-    attachment config < chip overrides < capability config. Capability config
-    is sparse and intentionally wins for capability-owned fields.
+    Format defaults < common physical member attachment defaults < common
+    identity attachment defaults < non-inheritable attachment config < chip
+    overrides < capability config. Capability config is sparse and
+    intentionally wins for capability-owned fields.
+
+    The member tier is what makes "the attachment follows current
+    Reference/Identity defaults; edit the chip only for sparse deviations"
+    true for a physical Reference. Without it only prompt text and the two
+    intents inherited, so every other field was a per-chip deviation.
     """
     profile = context.get("profile") or {}
     declaration = (profile.get("capabilities") or {}).get("reference") or {}
@@ -2001,6 +2160,7 @@ def effective_reference_config(attachment, capability, context) -> dict:
     by_capability = declaration.get("capability_defaults")
     if isinstance(by_capability, dict) and isinstance(by_capability.get(kind), dict):
         config.update(copy.deepcopy(by_capability[kind]))
+    config.update(_common_member_attachment_defaults(attachment, context))
     config.update(_common_identity_attachment_defaults(attachment, context))
     attachment_config = (attachment.get("config")
                          if isinstance(attachment.get("config"), dict) else {})
@@ -2131,9 +2291,6 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                 if audio_definition:
                     lines.append((("audio_definition", str(audio_label)),
                                   f"{audio_label} is {audio_definition}{speaker_suffix}"))
-        physical_definitions = (config.get("physical_definitions")
-                                if isinstance(config.get(
-                                    "physical_definitions"), dict) else {})
         manifest = context.get("ordinal_manifest") or {}
         for declaration in physical_population_declarations(
                 context.get("profile") or {}):
@@ -2141,10 +2298,18 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
             population = str(declaration.get("ordinal_key") or "")
             for source_id in attachment["source"].get(source_key) or []:
                 number = (manifest.get(population) or {}).get(str(source_id))
-                definition = str(physical_definitions.get(str(source_id)) or (
+                definition = str((
                     config.get("audio_definition")
                     if str(declaration.get("token_kind") or "") == "audio"
                     else config.get("definition")) or "").strip()
+                # Authored Library prose is the definition of last resort, so a
+                # chip left blank FOLLOWS its member instead of emitting
+                # nothing. Mirrors `_subject_definition`'s member fallback one
+                # tier down, and keeps the chip editor's inherited preview and
+                # the compiled output telling the same story.
+                if not definition:
+                    definition = str((_members_by_id(context).get(
+                        str(source_id)) or {}).get("prompt") or "").strip()
                 label = declared_label(declaration, number)
                 if label and definition:
                     lines.append((("physical_definition", population, str(source_id)),
@@ -2436,6 +2601,11 @@ def _default_capability(attachment, profile):
 
 def _resolved_capability(attachment, capability, profile) -> dict:
     value = copy.deepcopy(capability)
+    # `enabled` is tri-state in storage but every renderer below reads it as a
+    # plain bool, several by bracket access. The compile resolves stored records
+    # against their shared default up front; anything still absent here was
+    # never stored at all — a synthesized default capability — and is enabled.
+    value.setdefault("enabled", True)
     if value.get("placement"):
         return value
     attachment_declaration = ((profile.get("capabilities") or {}).get(
@@ -2552,6 +2722,12 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         allowed_roles = {str(value.get("value") or "") for value in
                           role_catalogs.get(population, [])
                          if isinstance(value, dict)}
+        identity_source_members = {
+            str((source or {}).get("member_id") or "")
+            for unit in context.get("semantic_units") or []
+            if isinstance(unit, dict)
+            for source in unit.get("sources") or []
+        }
         for row in setup_manifest.get(manifest_key) or []:
             role = str(row.get("role") or "").strip()
             if role and (not allowed_roles or role not in allowed_roles):
@@ -2560,6 +2736,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     "member_id": str(row.get("member_id") or ""),
                     "message": (f"Reference role {role!r} is not supported by "
                                 f"{resolved_profile.get('name') or 'this prompt format'}; rebind it."),
+                })
+            # A staged member with neither a prompt identity nor authored prose
+            # reaches the model as pixels the text never names. Keyed on the
+            # MEMBER, deliberately not folded into `missing_h3_reference_field`:
+            # that one is the format-labelled variant of `empty_channel` and
+            # names an empty prompt channel, so retargeting it would destroy a
+            # different diagnostic and still not name the missing identity.
+            member_id = str(row.get("member_id") or row.get("video_member_id") or "")
+            if (member_id and member_id not in identity_source_members
+                    and not str(row.get("member_prompt") or "").strip()):
+                warnings.append({
+                    "code": "unnamed_physical_reference",
+                    "member_id": member_id,
+                    "message": (
+                        f"{row.get('display_name') or 'This staged Reference'} has no "
+                        "prompt identity and no Library prompt text, so nothing in "
+                        "the prompt refers to it. Use Create identity on its row, or "
+                        "give it prompt text under Defaults."),
                 })
     raw_sections = []
     global_attachment_values = normalize_attachments(global_attachments)
@@ -2684,6 +2878,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         for unit in (normalize_semantic_unit(value)
                      for value in context.get("semantic_units") or [])
     }
+
+    # Resolve the tri-state capability `enabled` ONCE, into the in-memory
+    # compile only. Storage stays sparse — absent means inherit the shared
+    # Reference/identity default — while every downstream reader keeps its plain
+    # `capability["enabled"]` boolean. Resolving per read site instead would
+    # thread this context through a dozen render helpers that have no business
+    # knowing about Reference defaults. Must run after `semantic_units_by_id`
+    # and before the first capability read.
+    for attachment in [*global_attachment_values, *scene_attachments]:
+        for capability in attachment.get("capabilities") or []:
+            if "enabled" not in capability:
+                capability["enabled"] = _inherited_capability_enabled(
+                    attachment, capability, context)
     profile_validator_ids = {
         str(value) for value in resolved_profile.get("validators") or []
         if isinstance(value, str)
@@ -3041,13 +3248,18 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                             f"Reference source {source_id!r} is not a winning physical setup slot in this window.",
                             attachment["attachment_id"])
                         continue
-                    definitions = (config.get("physical_definitions")
-                                   if isinstance(config.get(
-                                       "physical_definitions"), dict) else {})
-                    authored = str(definitions.get(str(source_id)) or (
+                    authored = str((
                         config.get("audio_definition")
                         if str(declaration.get("token_kind") or "") == "audio" else
                         config.get("definition")) or "").strip()
+                    # Decision: the member-prose fallback SUPPRESSES this
+                    # warning, because the warning means "this slot emits
+                    # nothing" and with prose it now emits. Leaving it armed
+                    # would make the diagnostic contradict the compiled output
+                    # it is describing.
+                    if not authored:
+                        authored = str((_members_by_id(context).get(
+                            str(source_id)) or {}).get("prompt") or "").strip()
                     if not authored:
                         reference_warning(
                             "missing_h3_physical_definition",
@@ -3152,6 +3364,13 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     context["reference_group_shots"] = dict(reference_group_shots)
     context["reference_unit_shots"] = dict(reference_unit_shots)
     emitted_groups = {}
+    # Same resolved text, different owner key. Definition/retention dedupe is
+    # per semantic unit OR physical slot, so one member's Library prose reaching
+    # a compile through both an identity chip and a physical chip produces two
+    # owners by construction and passes the dedupe in silence. Advisory, not
+    # blocking: emitting a subject and its source picture is legitimate, the
+    # author just cannot see the repetition from either chip.
+    emitted_group_text = {}
     unresolved_prompt_tokens = set()
 
     def resolve_attachment_tokens(value, attachment):
@@ -3257,6 +3476,19 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                         "conflicting text."),
                         })
                     continue
+                text_identity = (capability_kind, channel, line)
+                first_owner = emitted_group_text.get(text_identity)
+                if first_owner is not None and first_owner != owner:
+                    warnings.append({
+                        "code": "duplicate_reference_emission",
+                        "attachment_id": attachment["attachment_id"],
+                        "message": ("The same Reference text already emitted "
+                                    "for a different subject or slot in this "
+                                    "channel; blank one chip's field to stop it "
+                                    "repeating."),
+                    })
+                elif first_owner is None:
+                    emitted_group_text[text_identity] = owner
                 emitted_groups[line_identity] = line
                 kept.append(line)
             value = "\n".join(kept)

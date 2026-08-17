@@ -1944,7 +1944,6 @@ def test_prompt_template_dependency_collision_blocks_instead_of_overwriting(monk
         "semantic_unit_id": "unit-1", "name": "Existing", "order": 0,
         "sources": [], "visual_intent": "preserve",
         "audio_intent": "reference_characteristics", "definition": "",
-        "intent_overrides": {},
     }]
     saves = []
 

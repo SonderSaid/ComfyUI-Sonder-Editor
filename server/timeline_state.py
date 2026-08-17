@@ -1,3 +1,4 @@
+import copy
 import logging
 import math
 import uuid
@@ -493,6 +494,19 @@ def normalize_reference_tags(raw_tags) -> list[str]:
     return result
 
 
+def normalize_reference_attachment_defaults(raw) -> dict:
+    """Opaque passthrough bag of a member's prompt-attachment defaults.
+
+    Deliberately NOT key-filtered, matching `PromptSemanticUnit`'s bag one tier
+    up. WHICH fields exist is a Prompt Format declaration, and one project can
+    hold members authored under several formats — filtering to the currently
+    resolved format's field set would silently delete authored defaults at rest
+    every time the project loaded under a different one. Refusal for an unknown
+    key belongs to the mutation route, where the author can be told.
+    """
+    return copy.deepcopy(raw) if isinstance(raw, dict) else {}
+
+
 def normalize_reference_crop(raw_crop) -> dict | None:
     if raw_crop is None:
         return None
@@ -660,6 +674,19 @@ class ReferenceMember:
     # Reference entity default; staged item overrides remain the final level.
     visual_intent: str = ""
     audio_intent: str = ""
+    # Prompt-attachment defaults owned by this physical member — the same role
+    # `PromptSemanticUnit.attachment_defaults` plays for an identity, one tier
+    # lower. Without it a physical Reference could only supply prompt text and
+    # the two intents, so every other field had to be retyped on every chip and
+    # "edit the chip only for sparse deviations" was unreachable.
+    #
+    # Project-scoped: unlike identity defaults, these do NOT travel in browser
+    # prompt templates or prompt history, because member ids are project-owned.
+    attachment_defaults: dict = field(default_factory=dict)
+    # Prompt parts this member does not contribute by default. Whether a
+    # Reference offers a Summary at all is a property of the Reference; WHERE
+    # that Summary lands stays per-attachment.
+    disabled_capabilities: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     prompt: str = ""
     crop: dict | None = None
@@ -675,6 +702,8 @@ class ReferenceMember:
             "handle": self.handle,
             "visual_intent": self.visual_intent,
             "audio_intent": self.audio_intent,
+            "attachment_defaults": copy.deepcopy(self.attachment_defaults),
+            "disabled_capabilities": list(self.disabled_capabilities),
             "tags": list(self.tags),
             "prompt": self.prompt,
             "crop": dict(self.crop) if isinstance(self.crop, dict) else None,
@@ -695,13 +724,14 @@ class ReferenceMember:
             order = int(data.get("order", 0))
         except (TypeError, ValueError, OverflowError):
             order = 0
-        from . import prompt_context
+        # Preserve, do not coerce. Blanking an out-of-vocabulary intent here
+        # destroyed authored data at rest with no message, and made its own
+        # route-side refusal (`_validated_optional_visual_intent`) unreachable
+        # for anything already stored. The compiler reports the survivor as
+        # `unsupported_reference_intent`; the mutation route still refuses to
+        # write a new one.
         visual_intent = str(data.get("visual_intent") or "")
-        if visual_intent not in {"", *prompt_context.VISUAL_INTENTS}:
-            visual_intent = ""
         audio_intent = str(data.get("audio_intent") or "")
-        if audio_intent not in {"", *prompt_context.AUDIO_INTENTS}:
-            audio_intent = ""
         return cls(
             member_id=str(data.get("member_id", "") or ""),
             asset_id=str(data.get("asset_id", "") or ""),
@@ -709,6 +739,10 @@ class ReferenceMember:
             handle=str(data.get("handle", "") or "").strip(),
             visual_intent=visual_intent,
             audio_intent=audio_intent,
+            attachment_defaults=normalize_reference_attachment_defaults(
+                data.get("attachment_defaults")),
+            disabled_capabilities=prompt_context.normalize_disabled_capabilities(
+                data.get("disabled_capabilities")),
             tags=normalize_reference_tags(data.get("tags")),
             prompt=str(data.get("prompt", "") or ""),
             crop=normalize_reference_crop(data.get("crop")),

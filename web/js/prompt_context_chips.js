@@ -7,6 +7,7 @@ import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
     register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import { promptToken, promptTokenDeclarationsFromProfile } from "./prompt_tokens.js";
 import { openContextMenu } from "./editor_context_menu.js";
+import { createDisclosureMemory } from "./disclosure_memory.js";
 import {
     declaredFieldChoices,
     orderedReferenceDerived,
@@ -55,6 +56,31 @@ const REFERENCE_VALUE_LABELS = Object.freeze({
 const REFERENCE_VALUE_CAPABILITY = Object.freeze(Object.fromEntries(
     Object.entries(REFERENCE_CAPABILITY_VALUE_FIELDS).flatMap(([kind, fields]) =>
         fields.map((field) => [field, kind]))));
+// Presentation-only facts about the renderer floor above. They are renderer
+// knowledge of its own fixed field set, not provider vocabulary: a format
+// renames a field by DECLARING it in `derived[kind].fields`, which always wins.
+//
+// Expiry: both sets go when the field vocabulary itself becomes
+// declaration-derived and the floor is deleted — see the "Declaration-derived
+// Reference field vocabulary" execution-queue entry. Until then a floor field
+// needs a renderer-side shape, because there is nothing else to ask.
+const REFERENCE_MULTILINE_FIELDS = Object.freeze(new Set([
+    "definition", "audio_definition", "summary", "retention_detail",
+    "audio_relationship",
+]));
+// Floor fields that are enums rather than prose. They render ONLY when the
+// format declares their vocabulary — there is no renderer-side value list to
+// fall back on, and a free-text control for an enum would author values the
+// compiler must then reject. This preserves the existing `declaredSelect` gate.
+const REFERENCE_ENUM_FIELDS = Object.freeze(new Set([
+    "task_types", "visual_intent", "audio_intent",
+]));
+// Enum fields whose blank choice means "follow the tier below" rather than an
+// authored empty. Reset and explicit-empty stay distinct, so these cannot use
+// the bare declared choice list.
+const REFERENCE_INHERIT_CHOICE_FIELDS = Object.freeze(new Set([
+    "visual_intent", "audio_intent",
+]));
 
 function referenceCapabilityValueFields(profile, kind) {
     const declaration = referenceDerivedDeclarations(profile)?.[String(kind || "")] || {};
@@ -421,15 +447,29 @@ export function propagateLinkedPromptAttachment(configuredRaw, targetRaw,
             attachment_id: target.attachment_id,
             emission_group_id: target.emission_group_id };
     }
-    const targetEnabled = new Map((target.capabilities || []).map((value) => [
-        String(value?.capability_id || value?.kind || ""), value?.enabled !== false,
-    ]));
+    // Only the flags the target ACTUALLY STATED. Reading `enabled !== false`
+    // off every record could not tell "inheriting" from "explicitly on".
+    const targetEnabled = new Map();
+    for (const value of target.capabilities || []) {
+        const capabilityId = String(value?.capability_id || value?.kind || "");
+        if (capabilityId && Object.hasOwn(value || {}, "enabled")) {
+            targetEnabled.set(capabilityId, value.enabled !== false);
+        }
+    }
     const propagated = structuredClone(configured);
     propagated.capabilities = (propagated.capabilities || []).map((value) => {
         const capabilityId = String(value?.capability_id || value?.kind || "");
-        return targetEnabled.has(capabilityId)
-            ? { ...value, enabled: targetEnabled.get(capabilityId) }
-            : value;
+        const next = { ...value };
+        // Per-section suppression is LOCAL and never propagates. The previous
+        // shape restored the target's flag only when the target already held a
+        // record for that capability — true while every attach seeded one, but
+        // the moment records became sparse an inheriting target silently
+        // adopted the source chip's suppression.
+        delete next.enabled;
+        if (targetEnabled.has(capabilityId)) {
+            next.enabled = targetEnabled.get(capabilityId);
+        }
+        return next;
     });
     return { ...propagated,
         attachment_id: target.attachment_id,
@@ -451,7 +491,10 @@ export function setPromptAttachmentCapabilityEnabled(raw, projection, enabled) {
         attachment.capabilities.push({
             capability_id: capabilityId,
             kind: String(projection?.capability_kind || capabilityId),
-            placement: String(projection?.declared_placement || "section_prefix"),
+            // No `placement`: copying the declared value in here froze the
+            // format default as if the author had chosen it, so a later format
+            // change moved the routing panel while compiled output stayed put
+            // and Reset had nothing to clear. Blank inherits.
             enabled: Boolean(enabled),
         });
     }
@@ -471,6 +514,19 @@ function referenceMemberLookup(references) {
 
 function referenceSelectionMemberIds(selected, { scene = null, semanticUnits = [] } = {}) {
     const value = String(selected || "");
+    // A physical selection names its member outright. Falling through to the
+    // semantic-unit lookup below returned [] for every `physical:` value, which
+    // made `resolveReferenceSelectionInheritance` report "no inherited
+    // definition is available" while the member's prose sat in its own Defaults
+    // panel — and left the physical branch of that notice unreachable.
+    //
+    // Deliberately NOT gated on setup mode or window verdict, unlike the
+    // identity path below: the chip is already bound to this one member, the
+    // source picker already disables ineligible options, and this answers
+    // "where would this text come from", not "does it apply right now". Gating
+    // would reintroduce the same false claim whenever the window moved.
+    const physical = value.match(/^physical:[a-z][a-z0-9_]*:(.+)$/);
+    if (physical) return [physical[1]];
     const unit = (semanticUnits || []).find((row) =>
         String(row?.semantic_unit_id || "") === value);
     if (!unit) return [];
@@ -645,22 +701,49 @@ export function referencePromptDefaults(selected, {
             const member = (reference?.members || []).find((row) =>
                 String(row?.member_id || "") === memberId);
             if (!member) continue;
+            const memberSource = `Physical Reference default · @${
+                member.handle || member.member_id}`;
             const stagedSource = `Staged Reference default · @${
                 member.handle || member.member_id}`;
+            const entitySource = `Reference default · ${
+                reference.name || reference.reference_id || "Reference"}`;
             const values = { ...formatValues };
             const fieldSources = { ...formatFieldSources };
-            withSemanticFallback(values, fieldSources, "visual_intent",
-                commonStagedValue(rows, "visual_intent") || "preserve",
-                rows.length
-                    ? { label: stagedSource, tier: "shared" }
-                    : { label: rendererFallbackSource, tier: "format" });
-            withSemanticFallback(values, fieldSources, "audio_intent",
-                commonStagedValue(rows, "audio_intent") || "reference_characteristics",
-                rows.length
-                    ? { label: stagedSource, tier: "shared" }
-                    : { label: rendererFallbackSource, tier: "format" });
+            // The member's own defaults bag, mirroring the server's
+            // `_common_member_attachment_defaults` tier.
+            const memberDefaults = member.attachment_defaults
+                && typeof member.attachment_defaults === "object"
+                ? member.attachment_defaults : {};
+            for (const [field, fieldValue] of Object.entries(memberDefaults)) {
+                values[field] = structuredClone(fieldValue);
+                fieldSources[field] = { label: memberSource, tier: "shared" };
+            }
+            // Authored Library prose is the definition of last resort, so a
+            // blank chip FOLLOWS the member instead of emitting nothing.
+            withSemanticFallback(values, fieldSources, "definition",
+                String(member.prompt || "").trim(),
+                { label: memberSource, tier: "shared" });
+            // Intent resolution mirrors the server setup manifest exactly:
+            // staged item override, then member, then entity, then the
+            // renderer's literal. Reading only the staged value and falling
+            // straight to the literal ignored an authored entity default and
+            // attributed it to a renderer fallback that never ran.
+            for (const [field, literal] of [["visual_intent", "preserve"],
+                ["audio_intent", "reference_characteristics"]]) {
+                const staged = commonStagedValue(rows, field);
+                const resolved = staged || String(member[field] || "")
+                    || String(reference[field] || "") || literal;
+                let source = { label: rendererFallbackSource, tier: "format" };
+                if (staged) source = { label: stagedSource, tier: "shared" };
+                else if (String(member[field] || "")) {
+                    source = { label: memberSource, tier: "shared" };
+                } else if (String(reference[field] || "")) {
+                    source = { label: entitySource, tier: "shared" };
+                }
+                withSemanticFallback(values, fieldSources, field, resolved, source);
+            }
             return {
-                values, source: stagedSource, formatSource, fieldSources,
+                values, source: memberSource, formatSource, fieldSources,
             };
         }
     }
@@ -672,8 +755,37 @@ export function referencePromptDefaults(selected, {
             ? structuredClone(unit.attachment_defaults) : {};
         const sharedSource = `Shared identity default · @${
             unit.handle || unit.semantic_unit_id}`;
-        const values = { ...formatValues, ...sharedValues };
-        const fieldSources = { ...formatFieldSources,
+        // Contributing members sit BELOW the identity, matching the server's
+        // `_common_member_attachment_defaults` tier: a field inherits only when
+        // every contributing member states it and they agree, so conflicting
+        // members fall through rather than one winning by ordering.
+        const memberLookup = referenceMemberLookup(references);
+        const contributing = (unit.sources || [])
+            .map((source) => memberLookup.get(String(source?.member_id || "")))
+            .filter(Boolean);
+        const memberDefaultValues = {};
+        const memberDefaultSources = {};
+        if (contributing.length) {
+            const bags = contributing.map(({ member }) =>
+                (member?.attachment_defaults
+                    && typeof member.attachment_defaults === "object")
+                    ? member.attachment_defaults : {});
+            const first = contributing[0];
+            const memberSource = `Physical Reference default · @${
+                first.member?.handle || first.member?.member_id || "member"}`;
+            for (const field of REFERENCE_OVERRIDE_FIELDS) {
+                const stated = bags.filter((bag) => Object.hasOwn(bag, field));
+                if (stated.length !== bags.length || !stated.length) continue;
+                const [head, ...rest] = stated.map((bag) => bag[field]);
+                if (!rest.every((other) =>
+                    JSON.stringify(other) === JSON.stringify(head))) continue;
+                memberDefaultValues[field] = structuredClone(head);
+                memberDefaultSources[field] = {
+                    label: memberSource, tier: "shared" };
+            }
+        }
+        const values = { ...formatValues, ...memberDefaultValues, ...sharedValues };
+        const fieldSources = { ...formatFieldSources, ...memberDefaultSources,
             ...Object.fromEntries(Object.keys(sharedValues).map((field) => [
                 field, { label: sharedSource, tier: "shared" },
             ])) };
@@ -715,6 +827,33 @@ export function referencePromptDefaults(selected, {
     }
     return { values: formatValues, source: formatSource, formatSource,
         fieldSources: formatFieldSources };
+}
+
+/**
+ * Shared default for a capability a chip states no opinion on.
+ *
+ * Mirrors `_inherited_capability_enabled` on the server. Whether a Reference
+ * contributes a prompt part at all is a property of the Reference; WHERE that
+ * part lands stays per-attachment. Identity beats member, and members are
+ * consulted only when they all agree, so a disagreement falls through to
+ * enabled rather than one member winning by ordering.
+ */
+export function resolveInheritedCapabilityEnabled(capabilityId, {
+    selected = "", references = [], semanticUnits = [] } = {}) {
+    const wanted = String(capabilityId || "");
+    if (!wanted) return true;
+    const value = String(selected || "");
+    const unit = (semanticUnits || []).find((row) =>
+        String(row?.semantic_unit_id || "") === value);
+    if (unit) {
+        return !(unit.disabled_capabilities || []).map(String).includes(wanted);
+    }
+    const physical = value.match(/^physical:[a-z][a-z0-9_]*:(.+)$/);
+    if (!physical) return true;
+    const found = referenceMemberLookup(references).get(physical[1]);
+    if (!found) return true;
+    return !(found.member?.disabled_capabilities || [])
+        .map(String).includes(wanted);
 }
 
 export function referenceCapabilityInputProjection(capabilityKind, {
@@ -909,13 +1048,20 @@ export function attachmentLabel(attachment, preview = "", identityLabel = "", co
  *  save handler that no test can reach.
  */
 export function sparseCapabilityRecord(current = {}, {
-    capabilityId = "", enabled = true, channelKey = "", placement = "" } = {}) {
+    capabilityId = "", enabled = true, inheritedEnabled = true,
+    channelKey = "", placement = "" } = {}) {
     const capability = {
         ...current,
         capability_id: capabilityId,
         kind: current?.kind || capabilityId,
-        enabled: !!enabled,
     };
+    // `enabled` is as sparse as the routing below it: stored only when it
+    // DEVIATES from the shared Reference/identity default. Writing it
+    // unconditionally froze `true` into every record, which read as a
+    // deliberate override and made a shared default inert — the same failure
+    // the routing comment beside it describes.
+    if (!!enabled === !!inheritedEnabled) delete capability.enabled;
+    else capability.enabled = !!enabled;
     if (channelKey) capability.channel_key = channelKey;
     else delete capability.channel_key;
     if (placement) capability.placement = placement;
@@ -1162,6 +1308,15 @@ export function createPromptDocumentEditor({
             chip.title = `${label} — dynamic context; activate to configure`;
             chip.setAttribute("aria-label", `${label} context chip; activate to configure`);
             const chipLabel = contextChipLabel(label);
+            // A visible cue that a chip opens an editor. The chip already had
+            // `role="button"`, a tab stop, a pointer cursor and a title saying
+            // so, but at rest it looked like a static token, and clicking it
+            // was the ONLY way to reach the richest surface in the tool.
+            const editGlyph = document.createElement("span");
+            editGlyph.dataset.sonderChipEditAffordance = "1";
+            editGlyph.textContent = "✎";
+            editGlyph.setAttribute("aria-hidden", "true");
+            editGlyph.style.cssText = "flex:0 0 auto;opacity:.55;font-size:9px;";
             const remove = document.createElement("button");
             remove.type = "button";
             remove.contentEditable = "false";
@@ -1174,7 +1329,7 @@ export function createPromptDocumentEditor({
                 event.stopPropagation();
                 removeAttachment(attachment.attachment_id);
             });
-            chip.append(chipLabel, remove);
+            chip.append(chipLabel, editGlyph, remove);
             chip.addEventListener("click", (event) => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -1721,6 +1876,278 @@ function selectField(options, value = "") {
     return select;
 }
 
+/**
+ * One declaration-driven fieldset for Reference override authoring.
+ *
+ * Every surface that authors these values builds its rows here, so a format's
+ * declared labels, help, and field set cannot be re-declared per surface. Three
+ * gates decide whether a row exists at all:
+ *
+ *  1. the Prompt Format must declare the capability that owns the field, or the
+ *     author would fill in a control whose output can never be routed anywhere;
+ *  2. the field must be inheritable (`REFERENCE_OVERRIDE_FIELDS`), or it could
+ *     only ever be a chip override, never a shared default; and
+ *  3. an enum field must have a declared vocabulary, since the renderer has no
+ *     value list of its own to offer.
+ *
+ * The caller composes layout through `rows`, not through a prebuilt container:
+ * the chip editor interleaves non-overridable controls (source, speaker, token
+ * strip) between these rows, and emitting them as one block would move controls
+ * the author already knows the position of.
+ */
+export function createReferenceOverrideFieldset({
+    profile = {}, references = [], semanticUnits = [], setupManifest = {},
+    overrides = {}, selected = "", onOverrideChange = null,
+    disclosureMemory = null, disclosureKey = "reference_overrides",
+} = {}) {
+    const working = overrides && typeof overrides === "object"
+        ? structuredClone(overrides) : {};
+    const overriddenFields = new Set(Object.keys(working));
+    let currentSelection = String(selected || "");
+
+    const inheritedFor = (field) => referencePromptDefaults(currentSelection, {
+        references, semanticUnits, profile, setupManifest,
+        capabilityKind: REFERENCE_VALUE_CAPABILITY[field] || "",
+    });
+    const effectiveValue = (field, fallback = "") => {
+        if (overriddenFields.has(field)) return working[field];
+        const values = inheritedFor(field).values || {};
+        return Object.hasOwn(values, field) ? values[field] : fallback;
+    };
+    const setControlValue = (field, control, value) => {
+        if (control.multiple) {
+            const chosen = new Set((Array.isArray(value) ? value : [])
+                .map(String));
+            [...control.options].forEach((option) => {
+                option.selected = chosen.has(option.value);
+            });
+            return;
+        }
+        control.value = String(value ?? "");
+    };
+    const readControlValue = (field, control) => (control.multiple
+        ? [...(control.selectedOptions || [])]
+            .map((option) => option.value).filter(Boolean)
+        : control.value);
+
+    const buildControl = (field, declaration) => {
+        if (REFERENCE_ENUM_FIELDS.has(field)) {
+            if (!declaration) return null;
+            const inheritLabel = REFERENCE_INHERIT_CHOICE_FIELDS.has(field)
+                ? "Inherit staged/entity default" : "";
+            const selectedValue = effectiveValue(field,
+                declaration.type === "enum_multi" ? [] : "");
+            const choices = declaredFieldChoices(declaration)
+                .map((entry) => [entry.value, entry.label]);
+            const saved = new Set((Array.isArray(selectedValue)
+                ? selectedValue : [selectedValue]).map(String).filter(Boolean));
+            for (const value of saved) {
+                if (!choices.some(([known]) => known === value)) {
+                    choices.push([value, `Unsupported saved value: ${value}`]);
+                }
+            }
+            if (inheritLabel) choices.unshift(["", inheritLabel]);
+            const control = selectField(choices,
+                Array.isArray(selectedValue) ? "" : selectedValue);
+            if (declaration.type === "enum_multi") {
+                control.multiple = true;
+                control.size = Math.min(6, Math.max(2, choices.length));
+                setControlValue(field, control, selectedValue);
+            }
+            return control;
+        }
+        return textField(effectiveValue(field),
+            REFERENCE_MULTILINE_FIELDS.has(field));
+    };
+
+    const controls = new Map();
+    const rows = new Map();
+    const statuses = new Map();
+    const fields = [];
+
+    const refreshOverrideStatus = (field) => {
+        const status = statuses.get(field);
+        const control = controls.get(field);
+        if (!status || !control) return;
+        const isOverride = overriddenFields.has(field);
+        const inherited = inheritedFor(field);
+        const source = inherited.fieldSources?.[field]
+            || { label: inherited.formatSource, tier: "format" };
+        status.state.textContent = isOverride ? "Chip override" : source.label;
+        status.state.dataset.sonderAuthorityTier = isOverride ? "chip" : source.tier;
+        status.state.style.color = isOverride ? "#e9b77d"
+            : (source.tier === "shared" ? "#9fc8bc" : "#8792a5");
+        status.state.style.fontWeight = isOverride ? "600" : "400";
+        control.style.opacity = isOverride ? "1" : ".78";
+        status.reset.disabled = !isOverride;
+    };
+
+    for (const [kind, capabilityDeclaration] of orderedReferenceDerived(profile)) {
+        for (const field of referenceCapabilityValueFields(profile, kind)) {
+            if (!REFERENCE_OVERRIDE_FIELDS.includes(field)) continue;
+            if (controls.has(field)) continue;
+            const declaration = referenceFieldDeclaration(profile, kind, field);
+            const control = buildControl(field, declaration);
+            if (!control) continue;
+            controls.set(field, control);
+            fields.push(field);
+
+            // Declared field label wins, then the renderer's own name for its
+            // own floor field. The capability's label names the CAPABILITY and
+            // is reused in the routing block, so it is not a field name — but
+            // its `help` is declared guidance meant to sit beside a control,
+            // and is the only guidance a floor field has.
+            const label = String(declaration?.label
+                || REFERENCE_VALUE_LABELS[field] || field);
+            const help = String(declaration?.help
+                || capabilityDeclaration?.help || "");
+
+            const wrapper = document.createElement("div");
+            wrapper.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px;align-items:start;";
+            const reset = document.createElement("button");
+            reset.type = "button";
+            reset.textContent = "Reset";
+            reset.title = "Delete this chip override and follow the current default.";
+            reset.style.cssText = "padding:3px 6px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#b7c1cf;font:9px system-ui;cursor:pointer;";
+            const state = document.createElement("span");
+            state.style.cssText = "grid-column:1/-1;font:9px/1.25 system-ui;";
+            statuses.set(field, { state, reset });
+
+            const markOverride = () => {
+                overriddenFields.add(field);
+                refreshOverrideStatus(field);
+                applyDisclosure();
+                onOverrideChange?.(field);
+            };
+            control.addEventListener(control.multiple ? "change" : "input", markOverride);
+            if (control.tagName === "SELECT" && !control.multiple) {
+                control.addEventListener("change", markOverride);
+            }
+            reset.addEventListener("click", () => {
+                overriddenFields.delete(field);
+                delete working[field];
+                setControlValue(field, control, effectiveValue(field,
+                    control.multiple ? [] : ""));
+                refreshOverrideStatus(field);
+                applyDisclosure();
+                onOverrideChange?.(field);
+            });
+            wrapper.append(control, reset, state);
+            rows.set(field, fieldRow(label, wrapper, help, { visibleHelp: true }));
+            refreshOverrideStatus(field);
+        }
+    }
+
+    // Progressive disclosure by TIER STATE, not by category. Rendering every
+    // declared field as an equal editable row put ~35 controls in front of an
+    // author whose chip usually deviates in none of them, which is what made
+    // this the most intimidating surface in the tool. Fields that are following
+    // collapse to one line; an actual override always stays visible, because
+    // hiding a deviation is how an author loses track of one.
+    let expanded = disclosureMemory?.isOpen(disclosureKey, false) ?? false;
+    const summaryRow = document.createElement("div");
+    summaryRow.dataset.sonderInheritedSummary = "1";
+    summaryRow.style.cssText = "grid-column:1/-1;display:flex;gap:6px;align-items:baseline;justify-content:space-between;padding:4px 6px;border:1px dashed #3d4a5c;border-radius:5px;";
+    const summaryText = document.createElement("span");
+    summaryText.style.cssText = "font:9px/1.35 system-ui;color:#9fc8bc;min-width:0;";
+    const summaryToggle = document.createElement("button");
+    summaryToggle.type = "button";
+    summaryToggle.style.cssText = "flex:0 0 auto;padding:3px 7px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#b7c1cf;font:9px system-ui;cursor:pointer;";
+    summaryRow.append(summaryText, summaryToggle);
+
+    const inheritingFields = () => fields.filter(
+        (field) => !overriddenFields.has(field));
+    const applyDisclosure = () => {
+        const following = inheritingFields();
+        for (const [field, row] of rows) {
+            row.style.display = (expanded || overriddenFields.has(field))
+                ? "grid" : "none";
+        }
+        const sources = new Set(following.map((field) => {
+            const inherited = inheritedFor(field);
+            return String(inherited.fieldSources?.[field]?.label
+                || inherited.formatSource || "");
+        }).filter(Boolean));
+        const origin = sources.size === 1 ? [...sources][0]
+            : `${sources.size} sources`;
+        const overrideCount = fields.length - following.length;
+        summaryText.textContent = following.length
+            ? `${following.length} field${following.length === 1 ? "" : "s"} following ${origin}`
+            : "Every field on this attachment is overridden.";
+        if (overrideCount && following.length) {
+            summaryText.textContent += ` · ${overrideCount} overridden`;
+        }
+        summaryToggle.textContent = expanded ? "Hide following" : "Override…";
+        summaryToggle.title = expanded
+            ? "Collapse the fields that are following their default."
+            : "Show every declared field so one can be overridden.";
+        summaryRow.style.display = following.length ? "flex" : "none";
+    };
+    summaryToggle.addEventListener("click", () => {
+        expanded = !expanded;
+        disclosureMemory?.remember(disclosureKey, expanded);
+        applyDisclosure();
+    });
+    applyDisclosure();
+
+    return {
+        fields,
+        controls,
+        rows,
+        summaryRow,
+        has: (field) => controls.has(field),
+        row: (field) => rows.get(field) || null,
+        isExpanded: () => expanded,
+        setExpanded: (value) => { expanded = !!value; applyDisclosure(); },
+        /** Append this field's row to `list` when the format declares it. */
+        pushRow: (list, field) => {
+            const row = rows.get(field);
+            if (row) list.push(row);
+            return Boolean(row);
+        },
+        isOverridden: (field) => overriddenFields.has(field),
+        /** Current authored-or-inherited value, for live effective projections. */
+        draftValue: (field) => (controls.has(field)
+            ? readControlValue(field, controls.get(field))
+            : working[field]),
+        draftOverrides: () => {
+            const draft = { ...working };
+            for (const field of overriddenFields) {
+                if (controls.has(field)) {
+                    draft[field] = readControlValue(field, controls.get(field));
+                }
+            }
+            return draft;
+        },
+        refresh: (nextSelected = currentSelection) => {
+            currentSelection = String(nextSelected || "");
+            for (const [field, control] of controls) {
+                if (!overriddenFields.has(field)) {
+                    setControlValue(field, control, effectiveValue(field,
+                        control.multiple ? [] : ""));
+                }
+                refreshOverrideStatus(field);
+            }
+            applyDisclosure();
+        },
+        /**
+         * Sparse overrides for the save. Derived from the SAME control map the
+         * rows came from — reading a fixed field list here is what let a
+         * declaration-gated control be dereferenced when absent.
+         */
+        collect: () => {
+            for (const field of REFERENCE_OVERRIDE_FIELDS) {
+                if (overriddenFields.has(field) && controls.has(field)) {
+                    working[field] = readControlValue(field, controls.get(field));
+                } else if (!overriddenFields.has(field)) {
+                    delete working[field];
+                }
+            }
+            return working;
+        },
+    };
+}
+
 /** Bounded, deterministic attachment configuration. No provider prose is generated. */
 export function configurePromptAttachment(rawAttachment, {
     scene = null, references = [], semanticUnits = [], channelKey = "", profileId = "generic@1",
@@ -1989,25 +2416,20 @@ export function configurePromptAttachment(rawAttachment, {
                     controls.reference.options[index].disabled = value[2] === false;
                 }
             });
-            const overrides = attachment.config.overrides
-                && typeof attachment.config.overrides === "object"
-                ? structuredClone(attachment.config.overrides) : {};
-            const overriddenFields = new Set(Object.keys(overrides));
-            controls.referenceOverrides = overrides;
-            controls.referenceOverriddenFields = overriddenFields;
-            const inherited = (field = "", capabilityKind = "") =>
-                referencePromptDefaults(controls.reference.value, {
-                    references, semanticUnits, profile: resolvedProfile,
-                    setupManifest: candidate?.setup_manifest || {},
-                    capabilityKind: capabilityKind
-                        || REFERENCE_VALUE_CAPABILITY[field] || "",
-                });
-            const effectiveValue = (field, fallback = "") =>
-                overriddenFields.has(field)
-                    ? overrides[field]
-                    : (Object.hasOwn(inherited(field).values, field)
-                        ? inherited(field).values[field] : fallback);
-            controls.definition = textField(effectiveValue("definition"), true);
+            const referenceFieldset = createReferenceOverrideFieldset({
+                profile: resolvedProfile, references, semanticUnits,
+                setupManifest: candidate?.setup_manifest || {},
+                overrides: attachment.config.overrides,
+                selected: controls.reference.value,
+                onOverrideChange: () => refreshCapabilityEffectiveValues(),
+                // Browser-local presentation state, like every other disclosure
+                // in the editor. Nothing about it belongs to the project.
+                disclosureMemory: createDisclosureMemory(
+                    "sonder.prompt.chipFieldset.v1"),
+                disclosureKey: "reference_overrides",
+            });
+            controls.referenceFieldset = referenceFieldset;
+            const definitionControl = referenceFieldset.controls.get("definition") || null;
             const inheritanceNotice = document.createElement("div");
             inheritanceNotice.style.cssText =
                 "grid-column:2;font:10px/1.35 system-ui;color:#9fc8bc;margin-top:-4px;white-space:pre-wrap;";
@@ -2016,8 +2438,10 @@ export function configurePromptAttachment(rawAttachment, {
                     scene, references, semanticUnits,
                 });
                 const isPhysical = /^physical:/.test(controls.reference.value);
-                controls.definition.placeholder = inherited.value ||
-                    "Describe this Subject for prompt use…";
+                if (definitionControl) {
+                    definitionControl.placeholder = inherited.value
+                        || "Describe this Subject for prompt use…";
+                }
                 inheritanceNotice.textContent = inherited.value
                     ? (isPhysical
                         ? `Available from ${inherited.source}. Enter or edit Definition to author it for this chip.`
@@ -2025,7 +2449,6 @@ export function configurePromptAttachment(rawAttachment, {
                     : "No inherited definition is available. Add a Definition here or to the Subject/Library member.";
                 inheritanceNotice.style.color = inherited.value ? "#9fc8bc" : "#f2b8a0";
             };
-            controls.audioDefinition = textField(effectiveValue("audio_definition"), true);
             const managedSpeakers = new Set((managedSpeakerSubjectIds || []).map(String));
             const currentSpeaker = String(attachment.config.audio_speaker_subject_id || "");
             const speakerOptions = [["", "No target speaker binding", true],
@@ -2047,19 +2470,23 @@ export function configurePromptAttachment(rawAttachment, {
                     controls.audioSpeaker.options[index].disabled = value[2] === false;
                 }
             });
-            controls.summary = textField(effectiveValue("summary"), true);
+            const summaryControl = referenceFieldset.controls.get("summary") || null;
             const tokenStrip = document.createElement("div");
             tokenStrip.style.cssText = "grid-column:2;display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:-3px;";
             const insertSummaryToken = (value) => {
-                if (!value) return;
-                const start = Number.isInteger(controls.summary.selectionStart)
-                    ? controls.summary.selectionStart : controls.summary.value.length;
-                controls.summary.setRangeText(value, start, start, "end");
-                controls.summary.dispatchEvent(new Event("input", { bubbles: true }));
-                controls.summary.focus();
+                if (!value || !summaryControl) return;
+                const start = Number.isInteger(summaryControl.selectionStart)
+                    ? summaryControl.selectionStart : summaryControl.value.length;
+                summaryControl.setRangeText(value, start, start, "end");
+                summaryControl.dispatchEvent(new Event("input", { bubbles: true }));
+                summaryControl.focus();
             };
             const renderTokenStrip = () => {
                 tokenStrip.textContent = "";
+                // The strip inserts into Summary. Without that control there is
+                // nothing to insert into, so the format declares no Summary and
+                // the strip has no subject.
+                if (!summaryControl) return;
                 const selected = String(controls.reference.value || "");
                 const physical = selected.match(/^physical:(picture|video|audio):(.+)$/);
                 let kind = "subject";
@@ -2103,192 +2530,62 @@ export function configurePromptAttachment(rawAttachment, {
                 button.addEventListener("click", () => insertSummaryToken(authoredToken));
                 tokenStrip.appendChild(button);
             };
-            const declaredSelect = (capabilityKind, fieldName, emptyLabel = "") => {
-                const declaration = referenceFieldDeclaration(
-                    resolvedProfile, capabilityKind, fieldName);
-                if (!declaration) return null;
-                const selected = effectiveValue(fieldName,
-                    declaration.type === "enum_multi" ? [] : "");
-                const choices = declaredFieldChoices(declaration)
-                    .map((entry) => [entry.value, entry.label]);
-                const saved = new Set((Array.isArray(selected)
-                    ? selected : [selected]).map(String).filter(Boolean));
-                for (const value of saved) {
-                    if (!choices.some(([known]) => known === value)) {
-                        choices.push([value, `Unsupported saved value: ${value}`]);
-                    }
-                }
-                if (emptyLabel) choices.unshift(["", emptyLabel]);
-                const control = selectField(choices, Array.isArray(selected) ? "" : selected);
-                if (declaration.type === "enum_multi") {
-                    control.multiple = true;
-                    control.size = Math.min(6, Math.max(2, choices.length));
-                    [...control.options].forEach((option) => {
-                        option.selected = saved.has(option.value);
-                    });
-                }
-                return control;
-            };
-            controls.taskTypes = declaredSelect("summary", "task_types");
-            controls.mention = textField(effectiveValue("text"));
-            controls.retentionDetail = textField(
-                effectiveValue("retention_detail"), true);
-            controls.audioRelationship = textField(
-                effectiveValue("audio_relationship"), true);
-            controls.visualIntent = declaredSelect(
-                "retention", "visual_intent", "Inherit staged/entity default");
-            controls.audioIntent = declaredSelect(
-                "retention", "audio_intent", "Inherit staged/entity default");
             const referenceFieldRow = (label, control, help) =>
                 fieldRow(label, control, help, { visibleHelp: true });
-            const overrideControls = new Map([
-                ["definition", controls.definition],
-                ["audio_definition", controls.audioDefinition],
-                ["summary", controls.summary],
-                ["task_types", controls.taskTypes],
-                ["text", controls.mention],
-                ["retention_detail", controls.retentionDetail],
-                ["audio_relationship", controls.audioRelationship],
-                ["visual_intent", controls.visualIntent],
-                ["audio_intent", controls.audioIntent],
-            ].filter(([, control]) => control));
-            const overrideStatus = new Map();
             const refreshCapabilityEffectiveValues = () => {
                 for (const row of controls.capabilityRows?.values?.() || []) {
                     row.refreshEffective?.();
                 }
             };
-            const setControlValue = (field, control, value) => {
-                if (field === "task_types") {
-                    const selected = new Set(Array.isArray(value) ? value.map(String) : []);
-                    [...control.options].forEach((option) => {
-                        option.selected = selected.has(option.value);
-                    });
-                } else {
-                    control.value = String(value ?? "");
-                }
-            };
-            const refreshOverrideStatus = (field) => {
-                const status = overrideStatus.get(field);
-                const control = overrideControls.get(field);
-                if (!status || !control) return;
-                const { state, reset } = status;
-                const isOverride = overriddenFields.has(field);
-                const inheritedState = inherited(field);
-                const source = inheritedState.fieldSources?.[field]
-                    || { label: inheritedState.formatSource, tier: "format" };
-                state.textContent = isOverride ? "Chip override" : source.label;
-                state.dataset.sonderAuthorityTier = isOverride ? "chip" : source.tier;
-                state.style.color = isOverride ? "#e9b77d"
-                    : (source.tier === "shared" ? "#9fc8bc" : "#8792a5");
-                state.style.fontWeight = isOverride ? "600" : "400";
-                control.style.opacity = isOverride ? "1" : ".78";
-                reset.disabled = !isOverride;
-            };
-            const refreshInheritedFields = () => {
-                for (const [field, control] of overrideControls) {
-                    const defaults = inherited(field).values;
-                    if (!overriddenFields.has(field)) {
-                        setControlValue(field, control,
-                            Object.hasOwn(defaults, field) ? defaults[field] : "");
-                    }
-                    refreshOverrideStatus(field);
-                }
-            };
-            const overridableFieldRow = (label, field, help) => {
-                const control = overrideControls.get(field);
-                const wrapper = document.createElement("div");
-                wrapper.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px;align-items:start;";
-                const reset = document.createElement("button");
-                reset.type = "button";
-                reset.textContent = "Reset";
-                reset.title = "Delete this chip override and follow the current default.";
-                reset.style.cssText = "padding:3px 6px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#b7c1cf;font:9px system-ui;cursor:pointer;";
-                const state = document.createElement("span");
-                state.style.cssText = "grid-column:1/-1;font:9px/1.25 system-ui;";
-                overrideStatus.set(field, { state, reset });
-                const markOverride = () => {
-                    overriddenFields.add(field);
-                    refreshOverrideStatus(field);
-                    refreshCapabilityEffectiveValues();
-                };
-                control.addEventListener(field === "task_types" ? "change" : "input", markOverride);
-                if (control.tagName === "SELECT" && field !== "task_types") {
-                    control.addEventListener("change", markOverride);
-                }
-                reset.addEventListener("click", () => {
-                    overriddenFields.delete(field);
-                    delete overrides[field];
-                    const defaults = inherited(field).values;
-                    setControlValue(field, control,
-                        Object.hasOwn(defaults, field) ? defaults[field] : "");
-                    refreshOverrideStatus(field);
-                    refreshCapabilityEffectiveValues();
-                });
-                wrapper.append(control, reset, state);
-                const row = referenceFieldRow(label, wrapper, help);
-                refreshOverrideStatus(field);
-                return row;
-            };
-            const definitionRow = overridableFieldRow("Definition", "definition",
-                "Blank while overridden is deliberately blank; Reset follows the Identity or physical Reference default.");
+            const refreshInheritedFields = () =>
+                referenceFieldset.refresh(controls.reference.value);
             controls.reference.title = "Choose a semantic Subject or a physical source from the active conditioning setup.";
+            // Row ORDER is authored here, not by the fieldset, because the
+            // non-overridable controls below are interleaved between declared
+            // fields. Every `pushRow` is a no-op when the format does not
+            // declare that field's capability.
             const referenceRows = [referenceFieldRow("Reference", controls.reference,
-                "Choose a semantic Subject or a physical source from the active conditioning setup."),
-                definitionRow,
-                inheritanceNotice,
-                overridableFieldRow("Audio definition", "audio_definition",
-                    "Required when the Subject unit includes an Audio member."),
-                referenceFieldRow("Audio target speaker", controls.audioSpeaker,
-                    "Reuses the (Sx) assigned by that Subject's first managed Vocal Event; it never creates speaker order."),
-                overridableFieldRow("Summary", "summary",
-                    "Optional section summary text. Leave blank to use the provider's generated summary shape."),
-                tokenStrip];
-            const otherSummaryOwners = [
-                ...(scene?.global_attachments || []),
-                ...(scene?.prompt_sections || []).flatMap((value) => value?.attachments || []),
-            ].filter((value) => value?.kind === "reference"
-                && String(value?.attachment_id || "") !== String(attachment.attachment_id || "")
-                && String(value?.config?.overrides?.summary || "").trim());
-            if (String(effectiveValue("summary") || "").trim() && otherSummaryOwners.length) {
-                const summaryOwnerNotice = document.createElement("div");
-                summaryOwnerNotice.style.cssText = "grid-column:2;font:9px/1.35 system-ui;color:#e9b77d;margin-top:-4px;";
-                summaryOwnerNotice.textContent = "Only one MiniMax Summary owner can emit per compile. Another Reference chip also carries Summary text.";
-                referenceRows.push(summaryOwnerNotice);
+                "Choose a semantic Subject or a physical source from the active conditioning setup.")];
+            // Name the rung. Without it this fieldset and the identity editor's
+            // defaults group looked like two copies of one panel, with nothing
+            // saying which was which or which way inheritance ran.
+            const overridesHeading = document.createElement("div");
+            overridesHeading.textContent = "Overrides for this attachment";
+            overridesHeading.title = "Values authored here apply to this attachment only. Everything else follows the Reference or Identity default.";
+            overridesHeading.style.cssText = "grid-column:1/-1;font:600 10px system-ui;color:#c8d2e0;margin-top:2px;";
+            referenceRows.push(overridesHeading, referenceFieldset.summaryRow);
+            if (referenceFieldset.pushRow(referenceRows, "definition")) {
+                referenceRows.push(inheritanceNotice);
             }
-            if (controls.taskTypes) {
-                const taskDeclaration = referenceFieldDeclaration(
-                    resolvedProfile, "summary", "task_types") || {};
-                referenceRows.push(overridableFieldRow("Summary task types", "task_types",
-                    taskDeclaration.help || "Select values only to explicitly override the format default."));
+            referenceFieldset.pushRow(referenceRows, "audio_definition");
+            referenceRows.push(referenceFieldRow("Audio target speaker", controls.audioSpeaker,
+                "Reuses the (Sx) assigned by that Subject's first managed Vocal Event; it never creates speaker order."));
+            if (referenceFieldset.pushRow(referenceRows, "summary")) {
+                referenceRows.push(tokenStrip);
+                const otherSummaryOwners = [
+                    ...(scene?.global_attachments || []),
+                    ...(scene?.prompt_sections || []).flatMap((value) => value?.attachments || []),
+                ].filter((value) => value?.kind === "reference"
+                    && String(value?.attachment_id || "") !== String(attachment.attachment_id || "")
+                    && String(value?.config?.overrides?.summary || "").trim());
+                if (String(referenceFieldset.draftValue("summary") || "").trim()
+                        && otherSummaryOwners.length) {
+                    const summaryOwnerNotice = document.createElement("div");
+                    summaryOwnerNotice.style.cssText = "grid-column:2;font:9px/1.35 system-ui;color:#e9b77d;margin-top:-4px;";
+                    summaryOwnerNotice.textContent = "Only one Summary owner can emit per compile. Another Reference chip also carries Summary text.";
+                    referenceRows.push(summaryOwnerNotice);
+                }
             }
-            referenceRows.push(
-                overridableFieldRow("Inline mention output", "text",
-                    "Leave blank to emit late-bound labels such as <Subject 1>."),
-                overridableFieldRow("Preservation detail", "retention_detail",
-                    "Required in MiniMax H3 Full Reference; describe exactly what is retained or transferred."),
-                overridableFieldRow("Audio relationship", "audio_relationship",
-                    "Optional authored relationship between the referenced audio and target event."));
-            if (controls.visualIntent) {
-                const declaration = referenceFieldDeclaration(
-                    resolvedProfile, "retention", "visual_intent") || {};
-                referenceRows.push(overridableFieldRow(
-                    declaration.label || "Visual handling", "visual_intent",
-                    declaration.help || "Override the inherited visual handling."));
-            }
-            if (controls.audioIntent) {
-                const declaration = referenceFieldDeclaration(
-                    resolvedProfile, "retention", "audio_intent") || {};
-                referenceRows.push(overridableFieldRow(
-                    declaration.label || "Audio handling", "audio_intent",
-                    declaration.help || "Override the inherited audio handling."));
+            for (const field of ["task_types", "text", "retention_detail",
+                "audio_relationship", "visual_intent", "audio_intent"]) {
+                referenceFieldset.pushRow(referenceRows, field);
             }
             if (!profileResolved) {
                 // Opened before the format catalog landed, every declared field
                 // rendered NO ROW AT ALL and nothing said why — Summary task
                 // types and both retention intents simply vanished. The stored
-                // overrides are safe (a control that never rendered is excluded
-                // from `overrideControls`, so its key never enters the save),
+                // overrides are safe (the fieldset only collects fields it
+                // actually built, so an unrendered key never enters the save),
                 // but silence reads as "this format has no such fields".
                 //
                 // Expiry: removable once the prompt format catalog is served
@@ -2393,17 +2690,30 @@ export function configurePromptAttachment(rawAttachment, {
                     // No `placement` here: a capability with no stored record
                     // inherits the declaration, and seeding it would write the
                     // format default back as if the author had chosen it.
+                    // No `enabled` here either: an unstored capability inherits
+                    // the Reference/identity default, and seeding it would save
+                    // the inherited value back as a deliberate override.
                     const current = existing.get(capabilityId) || {
                         capability_id: capabilityId, kind: capabilityId,
-                        enabled: true,
                     };
+                    const inheritedEnabled = resolveInheritedCapabilityEnabled(
+                        capabilityId, {
+                            selected: controls.reference.value,
+                            references, semanticUnits,
+                        });
                     const row = document.createElement("div");
                     row.className = "sonder-prompt-routing-row";
                     const enabled = document.createElement("label");
                     enabled.className = "sonder-prompt-routing-label";
                     const checkbox = document.createElement("input");
                     checkbox.type = "checkbox";
-                    checkbox.checked = current.enabled !== false;
+                    checkbox.checked = Object.hasOwn(current, "enabled")
+                        ? current.enabled !== false : inheritedEnabled;
+                    if (!Object.hasOwn(current, "enabled")) {
+                        checkbox.title = inheritedEnabled
+                            ? "Following the Reference default (on)."
+                            : "Following the Reference default (off).";
+                    }
                     const capabilityName = document.createElement("span");
                     capabilityName.textContent = String(
                         capabilityDeclaration?.label || capabilityId);
@@ -2496,14 +2806,6 @@ export function configurePromptAttachment(rawAttachment, {
                     updatePlacementHelp();
                     const effective = document.createElement("div");
                     effective.className = "sonder-prompt-effective-values";
-                    const controlValue = (field) => {
-                        const control = overrideControls.get(field);
-                        if (!control) return overrides[field];
-                        return field === "task_types"
-                            ? [...(control.selectedOptions || [])]
-                                .map((option) => option.value)
-                            : control.value;
-                    };
                     const refreshEffective = () => {
                         effective.textContent = "";
                         const compiledLine = document.createElement("div");
@@ -2523,10 +2825,7 @@ export function configurePromptAttachment(rawAttachment, {
                         compiledSource.style.cssText = "white-space:nowrap;color:#9eb8d8;font-weight:600;";
                         compiledLine.append(compiledLabel, compiledValue, compiledSource);
                         effective.appendChild(compiledLine);
-                        const draftOverrides = { ...overrides };
-                        for (const field of overriddenFields) {
-                            draftOverrides[field] = controlValue(field);
-                        }
+                        const draftOverrides = referenceFieldset.draftOverrides();
                         const values = referenceCapabilityInputProjection(
                             capabilityId, {
                                 selected: controls.reference.value,
@@ -2572,6 +2871,7 @@ export function configurePromptAttachment(rawAttachment, {
                     capabilityHost.appendChild(row);
                     controls.capabilityRows.set(capabilityId, {
                         current, checkbox, channel, placement, refreshEffective,
+                        inheritedEnabled,
                     });
                     refreshEffective();
                 }
@@ -2671,35 +2971,16 @@ export function configurePromptAttachment(rawAttachment, {
                     delete attachment.source.reference_item_id;
                 }
                 attachment.config.audio_speaker_subject_id = controls.audioSpeaker.value;
-                const values = {
-                    definition: controls.definition.value,
-                    audio_definition: controls.audioDefinition.value,
-                    summary: controls.summary.value,
-                    text: controls.mention.value,
-                    retention_detail: controls.retentionDetail.value,
-                    audio_relationship: controls.audioRelationship.value,
-                };
-                if (controls.taskTypes) {
-                    values.task_types = [...controls.taskTypes.selectedOptions]
-                        .map((option) => option.value).filter(Boolean);
-                }
-                if (controls.visualIntent) {
-                    values.visual_intent = controls.visualIntent.value;
-                }
-                if (controls.audioIntent) {
-                    values.audio_intent = controls.audioIntent.value;
-                }
-                const savedOverrides = controls.referenceOverrides || {};
-                const savedFields = controls.referenceOverriddenFields || new Set();
-                for (const [field, value] of Object.entries(values)) {
-                    if (savedFields.has(field)) savedOverrides[field] = value;
-                    else delete savedOverrides[field];
-                }
-                attachment.config.overrides = savedOverrides;
+                // Collected from the SAME control map the rows were built from.
+                // A fixed field list here dereferenced controls that a
+                // declaration gate had legitimately never created, throwing
+                // inside this handler and losing the chip with no message.
+                attachment.config.overrides = controls.referenceFieldset.collect();
                 attachment.capabilities = [...(controls.capabilityRows?.entries() || [])]
                     .map(([capabilityId, row]) => sparseCapabilityRecord(row.current, {
                         capabilityId,
                         enabled: row.checkbox.checked,
+                        inheritedEnabled: row.inheritedEnabled,
                         channelKey: row.channel.value,
                         placement: row.placement.value,
                     }));

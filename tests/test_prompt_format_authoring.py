@@ -540,8 +540,10 @@ def test_chip_editor_round_trip_keeps_inherited_routing_blank():
         " {capabilityId: 'summary', enabled: true, channelKey: '', placement: 'inline'}),",
         "}));",
     ]))
+    # `enabled` matching the inherited default is dropped, exactly like the two
+    # routing axes: only a genuine deviation is stored.
     assert result["inherited"] == {
-        "capability_id": "summary", "kind": "summary", "enabled": True}
+        "capability_id": "summary", "kind": "summary"}
     assert result["deviating"]["channel_key"] == "sounds"
     assert result["deviating"]["placement"] == "channel_suffix"
     # Reset drops the stored key entirely rather than writing the default back.
@@ -624,11 +626,20 @@ def test_modal_dismissal_is_guarded_without_blocking_teardown():
     assert escape.rstrip().endswith("return true;"), (
         "Escape must claim the key even when the confirm is declined")
 
-    # The attachment target picker holds one <select> and stays unguarded — a
-    # dirty-confirm on a dropdown is noise, not protection.
+    # The attachment target picker now carries an authored override fieldset,
+    # not just one <select>, so it is guarded on the two accidental gestures
+    # like every other draft-holding modal. It was unguarded while it asked only
+    # "where", when a dirty-confirm on a dropdown would have been noise.
     picker = panel[panel.index("function openAttachmentTargetPicker("):
                    panel.index("function openIdentityEditor(")]
-    assert "draftGuard" not in picker
+    assert "createModalDraftGuard({" in picker
+    assert "event.target === backdrop && draftGuard.confirmDismiss()" in picker
+    assert 'cancel.addEventListener("click", close);' in picker
+    picker_escape = picker[picker.index("keydown: (event) => {"):]
+    picker_escape = picker_escape[:picker_escape.index("},")]
+    assert "if (draftGuard.confirmDismiss()) close();" in picker_escape
+    assert picker_escape.rstrip().endswith("return true;"), (
+        "Escape must claim the key even when the confirm is declined")
 
     # The format editor carries far more state and is guarded the same way.
     format_panel = (ROOT / "web/js/editor_prompt_panel.js").read_text(encoding="utf-8")

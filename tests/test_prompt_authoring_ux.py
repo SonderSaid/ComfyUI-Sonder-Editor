@@ -121,8 +121,13 @@ console.log(JSON.stringify(rows.map((row)=>({{
     assert all(row["cells"] == [
         "thumbnail", "name", "status", "attach", "edit", "action"]
         for row in rows)
+    # The physical row's action is LABELLED. It is the step that turns staged
+    # media into something a prompt can name, and a bare "+" made the single
+    # most important control in the tool the least discoverable one. The
+    # identity rows keep their glyphs: delete is destructive and conventional,
+    # and the create-identity row is already introduced by its own prose.
     assert [(row["action"], row["aria"]) for row in rows] == [
-        ("+", "Create prompt identity from physical Reference"),
+        ("Create identity", "Create prompt identity from physical Reference"),
         ("×", "Delete prompt identity"),
         ("+", "Create prompt identity"),
     ]
@@ -369,7 +374,11 @@ console.log(JSON.stringify({details,kindHelp,before,after,routing,taskLabels,sav
     assert result["details"] == [
         {"title": "Physical sources — optional", "open": False},
         {"title": "Voice — optional", "open": False},
-        {"title": "Advanced — attachment defaults", "open": False},
+        # Names the rung and, when the project has any, how many attachments
+        # follow it. "Advanced" said nothing about which direction inheritance
+        # ran, which is why this group and the chip's own fieldset read as two
+        # copies of one panel.
+        {"title": "Defaults for all attachments", "open": False},
         {"title": "Format defaults — derived output routing", "open": False},
     ]
     assert "visible person or character" in result["kindHelp"]
@@ -593,8 +602,20 @@ const physicalFallback=mod.referencePromptDefaults("physical:picture:member",{{
   references:[{{members:[{{member_id:"member",handle:"Portrait",
     prompt:"Library prose"}}]}}],profile:{{name:"Format A"}}
 }});
+const physicalEntity=mod.referencePromptDefaults("physical:picture:member",{{
+  references:[{{reference_id:"ref",name:"Korean Woman",
+    visual_intent:"transfer_attributes",members:[{{member_id:"member",
+    handle:"Portrait"}}]}}],profile:{{name:"Format A"}}
+}});
+const physicalBag=mod.referencePromptDefaults("physical:picture:member",{{
+  references:[{{reference_id:"ref",name:"Korean Woman",members:[{{
+    member_id:"member",handle:"Portrait",
+    attachment_defaults:{{retention_detail:"Keeps her jacket."}}}}]}}],
+  profile:{{name:"Format A"}},capabilityKind:"retention"
+}});
 console.log(JSON.stringify({{config: attachment.config, defaults,inherited,
-  authoredEmpty,taskEmpty,capabilityWins,stagedDefinition,physical,physicalFallback}}));
+  authoredEmpty,taskEmpty,capabilityWins,stagedDefinition,physical,physicalFallback,
+  physicalEntity,physicalBag}}));
 """
     result = json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script], capture_output=True,
@@ -642,13 +663,31 @@ console.log(JSON.stringify({{config: attachment.config, defaults,inherited,
         "visual_intent": {"label": "Staged Reference default · @Portrait", "tier": "shared"},
         "audio_intent": {"label": "Staged Reference default · @Portrait", "tier": "shared"},
     }
+    # Authored Library prose is the definition of last resort, so a blank chip
+    # FOLLOWS the member. This used to be absent entirely, which is why the chip
+    # claimed no inherited definition existed. It stays BELOW a format default
+    # (see `physical` above), matching the compiler's own fallback order.
     assert result["physicalFallback"]["values"] == {
+        "definition": "Library prose",
         "visual_intent": "preserve",
         "audio_intent": "reference_characteristics"}
     assert result["physicalFallback"]["fieldSources"] == {
+        "definition": {"label": "Physical Reference default · @Portrait",
+                       "tier": "shared"},
         "visual_intent": {"label": "Renderer fallback · Format A", "tier": "format"},
         "audio_intent": {"label": "Renderer fallback · Format A", "tier": "format"},
     }
+    # The Reference entity's authored intent is consulted before the renderer's
+    # literal, mirroring the server setup manifest's own staged/member/entity
+    # order. This tier existed in the data and in `minimax_h3.py` but the chip
+    # skipped it, attributing an authored value to a fallback that never ran.
+    assert result["physicalEntity"]["values"]["visual_intent"] == "transfer_attributes"
+    assert result["physicalEntity"]["fieldSources"]["visual_intent"] == {
+        "label": "Reference default · Korean Woman", "tier": "shared"}
+    # The member's own defaults bag outranks a format default.
+    assert result["physicalBag"]["values"]["retention_detail"] == "Keeps her jacket."
+    assert result["physicalBag"]["fieldSources"]["retention_detail"] == {
+        "label": "Physical Reference default · @Portrait", "tier": "shared"}
     source = _source("web/js/prompt_context_chips.js")
     assert 'state.textContent = isOverride ? "Chip override"' in source
     assert 'rendered.textContent = value.authored_empty' in source
@@ -690,15 +729,19 @@ console.log(JSON.stringify({{physical, identity}}));
     # a later format change moved the routing panel while compiled output stayed
     # put — and the frozen copy was indistinguishable from a real override.
     # Blank inherits, and only a genuine deviation is ever stored.
+    # `enabled` is omitted for the same reason as the routing beside it: absent
+    # inherits the Reference/identity default. Seeding `True` made every new
+    # chip read as an explicit override, pinning the capability on however the
+    # Reference was later configured.
     assert result["physical"]["capabilities"] == [
         {"capability_id": "definitions", "kind": "definitions",
-         "channel_key": "", "placement": "", "enabled": True, "config": {}},
+         "channel_key": "", "placement": "", "config": {}},
         {"capability_id": "mentions", "kind": "mentions",
-         "channel_key": "", "placement": "", "enabled": True, "config": {}},
+         "channel_key": "", "placement": "", "config": {}},
     ]
     assert result["identity"]["capabilities"] == [{
         "capability_id": "summary", "kind": "summary",
-        "channel_key": "", "placement": "", "enabled": True, "config": {},
+        "channel_key": "", "placement": "", "config": {},
     }]
     panel = _source("web/js/editor_prompt_panel.js")
     widget = _source("web/js/editor_widget.js")
@@ -1278,7 +1321,14 @@ def test_reference_chip_identity_inheritance_and_vocal_target_window_are_dynamic
             "value": "a poised woman in a blue coat",
             "source": "Library member Korean Woman · Portrait",
         },
-        "physicalInherited": {"value": "", "source": ""},
+        # A physical selection resolves its own member's prose. This used to be
+        # {"value": "", "source": ""} because the lookup only matched semantic
+        # unit ids, so the chip claimed no inherited definition existed while
+        # the member's Defaults panel plainly held one.
+        "physicalInherited": {
+            "value": "a poised woman in a blue coat",
+            "source": "Library member Korean Woman · Portrait",
+        },
         "label": "Korean Woman — <Subject 1> preview",
     }
 
@@ -1300,7 +1350,10 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
     assert "managedVocalEventSubjectIds" not in chips
     assert widget.count("managedSpeakerSubjectIds:") == 3
     assert panel.count("managedSpeakerSubjectIds:") == 7
-    assert 'overridableFieldRow("Summary task types", "task_types"' in chips
+    # The chip fieldset's field list, labels, and help now come from the format
+    # declaration, so there is no call shape to grep for. Behavioural coverage
+    # lives in test_prompt_context_corrections.py::
+    # test_reference_fieldset_renders_only_declared_fields_with_declared_copy.
     assert "const routeKey = String(current.kind || capabilityId);" in chips
     assert "referenceDerived?.[routeKey]?.channel_key" in chips
     assert "else delete capability.channel_key;" in chips
@@ -1415,3 +1468,208 @@ console.log(JSON.stringify({{
         "eligible": True, "appliesNow": True, "reason": "", "suffix": "",
     }
     assert result["split"] == {"before": ["prefix"], "after": ["suffix"]}
+
+
+def test_attach_dialog_authors_overrides_and_rides_the_same_batch():
+    """Configure before attaching, not attach-then-hunt-for-the-chip.
+
+    The dialog used to ask only WHERE — the least interesting question — at the
+    one moment the author had full context, then went silent while every
+    remaining decision hid behind an unadvertised click on the chip it had just
+    created.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for attach dialog coverage")
+    module_url = (ROOT / "web/js/prompt_identity_panel.js").as_uri()
+    script = f"""
+class N {{
+  constructor(tag) {{ this.tagName=String(tag).toUpperCase(); this.children=[];
+    this.childNodes=this.children; this.style={{cssText:"",setProperty(){{}}}};
+    this.dataset={{}}; this.attributes={{}}; this.options=[]; this.value="";
+    this.textContent=""; this.title=""; this.disabled=false; this.multiple=false;
+    this._handlers={{}}; }}
+  appendChild(c) {{ this.children.push(c); c.parentElement=this;
+    if (c.tagName === "OPTION") this.options.push(c); return c; }}
+  append(...cs) {{ cs.forEach((c) => c?.tagName && this.appendChild(c)); }}
+  addEventListener(t,h) {{ (this._handlers[t] ||= []).push(h); }}
+  removeEventListener() {{}}
+  setAttribute(k,v) {{ this.attributes[k]=String(v); }}
+  getAttribute(k) {{ return this.attributes[k] ?? null; }}
+  insertAdjacentElement(_pos, el) {{ this.parentElement?.appendChild(el); return el; }}
+  querySelector() {{ return null; }}
+  querySelectorAll() {{ return []; }}
+  get selectedOptions() {{ return this.options.filter((o) =>
+    o.selected === true || (!this.multiple && String(o.value) === String(this.value))); }}
+  focus() {{}}
+  remove() {{ const p=this.parentElement; if(!p) return;
+    p.children.splice(p.children.indexOf(this),1); }}
+}}
+globalThis.document={{createElement:(t)=>new N(t),
+  createTextNode:(t)=>({{nodeType:3,nodeValue:t}}),
+  body:new N("body"),activeElement:null}};
+globalThis.window={{addEventListener(){{}},removeEventListener(){{}}}};
+globalThis.CSS={{escape:(v)=>String(v)}};
+globalThis.Node={{TEXT_NODE:3}};
+const mod=await import({json.dumps(module_url)});
+const calls=[];
+const root=new N("div");
+mod.mountPromptIdentityPanel(root, {{
+  profile: {{
+    physical_populations:[{{key:"pictures",label:"Picture",
+      source_key:"picture_ids",label_template:"<Picture {{n}}>"}}],
+    identity_kinds:[{{key:"subject",label:"Subject"}}],
+    capabilities:{{reference:{{derived:{{
+      definitions:{{order:1,channel_key:"defs",placement:"section_prefix",
+        label:"Portrayal",help:"Declared guidance.",fields:{{}}}},
+    }}}}}},
+  }},
+  candidate: {{setup_manifest:{{pictures:[{{member_id:"member-1",
+    asset_id:"asset-1",role:"identity",slot_number:1}}]}}}},
+  references:[{{reference_id:"reference-1",name:"Woman",members:[
+    {{member_id:"member-1",name:"Portrait",asset_id:"asset-1",
+      handle:"CharacterSheet",prompt:"library prose"}}]}}],
+  semanticUnits:[],
+  scene:{{prompt_sections:[{{start_frame:0,end_frame:100}}]}},
+  attachReference: async (owner,target,overrides) => {{
+    calls.push({{ownerType:owner?.type,scope:target?.scope,overrides}}); return true; }},
+}});
+const find=(pred)=>{{ const out=[]; const walk=(n)=>{{ if(pred(n)) out.push(n);
+  n.children.forEach(walk); }}; walk(root); walk(document.body); return out; }};
+const rowAttach=find((n)=>n.tagName==="BUTTON"&&n.textContent==="Attach...")[0];
+rowAttach._handlers.click.forEach((h)=>h());
+const dialog=document.body.children.find((n)=>n.dataset?.promptAttachmentTarget);
+const fieldsetHost=find((n)=>n.dataset?.sonderAttachFieldset)[0];
+const textareas=find((n)=>["TEXTAREA","INPUT"].includes(n.tagName)
+  && n.parentElement && n.type!=="checkbox");
+const definition=textareas.find((n)=>n.tagName==="TEXTAREA");
+definition.value="authored at attach time";
+(definition._handlers.input||[]).forEach((h)=>h());
+const dialogAttach=find((n)=>n.tagName==="BUTTON"&&n.textContent==="Attach")[0];
+await dialogAttach._handlers.click[0]();
+console.log(JSON.stringify({{
+  dialogOpened: Boolean(dialog),
+  fieldsetPresent: Boolean(fieldsetHost),
+  guarded: typeof dialog?._handlers?.click?.[0] === "function",
+  calls,
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert result["dialogOpened"] is True
+    assert result["fieldsetPresent"] is True, (
+        "The Attach dialog must carry the declared override fieldset")
+    assert len(result["calls"]) == 1
+    call = result["calls"][0]
+    assert call["ownerType"] == "physical"
+    assert call["scope"] == "global"
+    # Authored in the dialog, forwarded to the same scene batch as the
+    # attachment so one Undo removes both.
+    assert call["overrides"] == {"definition": "authored at attach time"}
+
+
+def test_handle_suggestions_are_typeable_and_sanitize_live():
+    """A handle is what an author TYPES while writing a prompt.
+
+    Camel-casing every filename token produced `ChatGPTImageAug112026120009PM`
+    — technically valid and unusable at the exact moment it matters.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for handle coverage")
+    module_url = (ROOT / "web/js/prompt_identity_panel.js").as_uri()
+    script = (
+        f"const mod = await import({json.dumps(module_url)});\n"
+        "const derive = mod.derivePromptHandleSuggestion;\n"
+        "console.log(JSON.stringify({\n"
+        "  generatedFilename: derive('ChatGPT Image Aug 11 2026 12 00 09 PM'),\n"
+        "  ordinaryName: derive('Korean Woman'),\n"
+        "  longPhrase: derive('a poised woman in a long blue winter coat'),\n"
+        "  digitsOnly: derive('20260811120009'),\n"
+        "  empty: derive('', 'Identity'),\n"
+        "  sanitizeSpaces: mod.sanitizePromptHandle('Korean Woman 2'),\n"
+        "  sanitizeLeadingDigit: mod.sanitizePromptHandle('2Fast'),\n"
+        "  sanitizePunctuation: mod.sanitizePromptHandle('a-b_c!d'),\n"
+        "  rule: mod.PROMPT_HANDLE_RULE,\n"
+        "}));\n"
+    )
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    # Date/time/AM-PM debris is dropped and the result is capped at three words.
+    assert result["generatedFilename"] == "ChatGPTImage"
+    assert result["ordinaryName"] == "KoreanWoman"
+    assert result["longPhrase"] == "APoisedWoman"
+    # Nothing meaningful survives, so the fallback keeps it valid.
+    assert result["digitsOnly"] == "Ref20260811120009"
+    assert result["empty"] == "Identity"
+    # Live sanitization encodes the same rule the server refusal enforces.
+    assert result["sanitizeSpaces"] == "KoreanWoman2"
+    assert result["sanitizeLeadingDigit"] == "Ref2Fast"
+    assert result["sanitizePunctuation"] == "abcd"
+    assert "starting with a letter" in result["rule"]
+
+
+def test_physical_row_status_uses_declared_role_labels():
+    """Roles are declared as {value, label}; the row printed the raw value.
+
+    That gave "first_frame" instead of "First frame", and for a format whose
+    role vocabulary contains `identity` it produced the self-contradicting
+    "identity · <Picture 2> · no identity".
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for prompt row DOM coverage")
+    module_url = (ROOT / "web/js/prompt_identity_panel.js").as_uri()
+    script = f"""
+class N {{
+  constructor(tag) {{ this.tagName=String(tag).toUpperCase(); this.children=[];
+    this.style={{cssText:""}}; this.dataset={{}}; this.attributes={{}};
+    this.value=""; this.textContent=""; this.disabled=false; this._handlers={{}}; }}
+  appendChild(c) {{ this.children.push(c); c.parentElement=this; return c; }}
+  append(...cs) {{ cs.forEach((c) => c?.tagName && this.appendChild(c)); }}
+  addEventListener(t,h) {{ (this._handlers[t] ||= []).push(h); }}
+  setAttribute(k,v) {{ this.attributes[k]=String(v); }}
+  querySelector() {{ return null; }}
+}}
+globalThis.document={{createElement:(t)=>new N(t),body:new N("body"),activeElement:null}};
+globalThis.window={{addEventListener(){{}},removeEventListener(){{}}}};
+globalThis.CSS={{escape:(v)=>String(v)}};
+const mod=await import({json.dumps(module_url)});
+const root=new N("div");
+mod.mountPromptIdentityPanel(root, {{
+  profile: {{
+    physical_populations:[{{key:"pictures",label:"Picture",
+      source_key:"picture_ids",label_template:"<Picture {{n}}>"}}],
+    identity_kinds:[{{key:"subject",label:"Subject"}}],
+    role_catalogs:{{pictures:[
+      {{value:"first_frame",label:"First frame"}},
+      {{value:"identity",label:"Identity"}},
+    ]}},
+  }},
+  candidate: {{setup_manifest:{{pictures:[
+    {{member_id:"m1",asset_id:"a1",role:"first_frame",slot_number:1}},
+    {{member_id:"m2",asset_id:"a2",role:"identity",slot_number:2}},
+  ]}}}},
+  references:[{{reference_id:"r",name:"Woman",members:[
+    {{member_id:"m1",name:"One",asset_id:"a1"}},
+    {{member_id:"m2",name:"Two",asset_id:"a2"}}]}}],
+  semanticUnits:[],
+}});
+const rows=[];
+const walk=(n)=>{{ if(n.dataset?.promptingRow==="physical") rows.push(n); n.children.forEach(walk); }};
+walk(root);
+console.log(JSON.stringify(rows.map((row)=>
+  row.children.find((c)=>c.dataset.promptingCell==="status")?.textContent)));
+"""
+    statuses = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    assert statuses[0].startswith("First frame · ")
+    # The declared label reads "Identity" while the identity COUNT reads its own
+    # clause, so the two senses of the word no longer collide unreadably.
+    assert statuses[1].startswith("Identity · ")
+    # The missing-identity state names the action that resolves it.
+    assert all("no identity yet — use Create identity" in status
+               for status in statuses)

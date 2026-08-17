@@ -4277,7 +4277,8 @@ _REFERENCE_ENTITY_FIELDS = {
 }
 _REFERENCE_MEMBER_FIELDS = {
     "asset_id", "name", "handle", "tags", "prompt", "crop",
-    "visual_intent", "audio_intent",
+    "visual_intent", "audio_intent", "attachment_defaults",
+    "disabled_capabilities",
     "source_start_sec", "source_end_sec",
 }
 
@@ -4535,6 +4536,44 @@ def _validated_audio_intent(value) -> str:
     return intent
 
 
+def _validated_reference_attachment_defaults(value) -> dict:
+    """Refuse a member defaults bag the resolver could never inherit from.
+
+    Normalization stays tolerant so nothing is destroyed at rest; the refusal
+    lives here, where the author can be told which key was rejected. The
+    allowlist is the same one `_common_identity_attachment_defaults` iterates,
+    so a key outside it would be stored and then silently ignored forever.
+    """
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        _mutation_error("Member attachment defaults must be an object",
+                        400, "invalid_reference_member")
+    unknown = set(map(str, value)).difference(
+        prompt_context.REFERENCE_OVERRIDE_FIELDS)
+    if unknown:
+        _mutation_error(
+            f"Unsupported member attachment defaults: {', '.join(sorted(unknown))}",
+            400, "invalid_reference_member")
+    return copy.deepcopy(value)
+
+
+def _validated_disabled_capabilities(value) -> list:
+    """Capability ids this Reference tier turns off by default.
+
+    Ids are NOT checked against the resolved format's declarations: one
+    Reference may be used under several formats, and refusing an id the current
+    format does not declare would make the other format's setting unwritable.
+    """
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list) or any(
+            not isinstance(entry, str) for entry in value):
+        _mutation_error("Disabled capabilities must be a list of ids",
+                        400, "invalid_reference_member")
+    return prompt_context.normalize_disabled_capabilities(value)
+
+
 def _validated_optional_visual_intent(value) -> str:
     return "" if value in (None, "") else _validated_visual_intent(value)
 
@@ -4661,6 +4700,10 @@ def _member_from_fields(project: TimelineProject, fields: dict, *, member_id: st
             fields.get("visual_intent")),
         audio_intent=_validated_optional_audio_intent(
             fields.get("audio_intent")),
+        attachment_defaults=_validated_reference_attachment_defaults(
+            fields.get("attachment_defaults")),
+        disabled_capabilities=_validated_disabled_capabilities(
+            fields.get("disabled_capabilities")),
         tags=tags,
         prompt=str(fields.get("prompt", "") or ""),
         crop=crop,
@@ -4785,6 +4828,8 @@ def _apply_update_reference_member(project: TimelineProject, operation: dict) ->
     member.handle = replacement.handle
     member.visual_intent = replacement.visual_intent
     member.audio_intent = replacement.audio_intent
+    member.attachment_defaults = replacement.attachment_defaults
+    member.disabled_capabilities = replacement.disabled_capabilities
     member.tags = replacement.tags
     member.prompt = replacement.prompt
     member.crop = replacement.crop
