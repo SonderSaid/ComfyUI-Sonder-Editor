@@ -1432,7 +1432,7 @@ export function mountPromptManagementPanel(host) {
     const renderContextSettings = (bodyEl, scene) => {
         bodyEl.appendChild(sectionTitle("Prompt Context"));
         const card = document.createElement("div");
-        card.style.cssText = `display:flex;flex-direction:column;gap:7px;padding:8px;border:1px solid ${COLORS.promptBorder};border-radius:6px;background:#181d25;`;
+        card.style.cssText = `display:flex;flex-direction:column;gap:7px;padding:8px;border:1px solid ${COLORS.promptBorder};border-radius:6px;background:${COLORS.panelRaised};`;
         const profile = document.createElement("select");
         profile.style.cssText = chromeInputCss();
         const activeTemplate = host._channelTemplate();
@@ -1490,7 +1490,8 @@ export function mountPromptManagementPanel(host) {
         profileRow.append("Prompt format", profile); card.appendChild(profileRow);
         if (!catalogReady) {
             const state = document.createElement("div");
-            state.style.cssText = `font-size:10px;color:${host._referencesError ? "#e08b6a" : COLORS.textDim};`;
+            state.style.cssText = `font-size:10px;color:${
+                host._referencesError ? COLORS.dangerText : COLORS.textDim};`;
             state.textContent = host._referencesError
                 ? `Prompt format catalog failed to load: ${host._referencesError}`
                 : "Loading the authoritative prompt format catalog...";
@@ -1508,9 +1509,9 @@ export function mountPromptManagementPanel(host) {
             backdrop.style.cssText = "position:fixed;inset:0;z-index:12000;background:rgba(5,8,12,.72);display:flex;align-items:center;justify-content:center;padding:20px;";
             const editor = document.createElement("div");
             editor.dataset.profileEditor = "1";
-            editor.style.cssText = "width:min(720px,94vw);max-height:84vh;overflow:auto;padding:14px;border:1px solid #465266;border-radius:8px;background:#1a202a;box-shadow:0 18px 60px rgba(0,0,0,.55);display:grid;grid-template-columns:130px minmax(0,1fr);gap:7px;align-items:center;font:10px system-ui;color:#d8dee8;";
+            editor.style.cssText = `width:min(720px,94vw);max-height:84vh;overflow:auto;padding:14px;border:1px solid ${COLORS.border};border-radius:8px;background:${COLORS.panelRaised};box-shadow:0 18px 60px rgba(0,0,0,.55);display:grid;grid-template-columns:130px minmax(0,1fr);gap:7px;align-items:center;font:10px system-ui;color:${COLORS.text};`;
             const heading = document.createElement("strong");
-            heading.style.cssText = "grid-column:1/-1;font-size:13px;color:#eef2f8;";
+            heading.style.cssText = `grid-column:1/-1;font-size:13px;color:${COLORS.text};`;
             heading.textContent = fresh ? "New prompt format"
                 : editAsVersion ? "Edit as new version" : "Save as custom";
             editor.appendChild(heading);
@@ -1550,7 +1551,7 @@ export function mountPromptManagementPanel(host) {
 
             const writingAids = structuredClone(selected.writing_aids || []);
             const aidEditor = document.createElement("div");
-            aidEditor.style.cssText = "grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:7px;border:1px solid #343d4b;border-radius:5px;";
+            aidEditor.style.cssText = `grid-column:1/-1;display:flex;flex-direction:column;gap:4px;padding:7px;border:1px solid ${COLORS.border};border-radius:5px;`;
             const renderWritingAids = () => {
                 aidEditor.replaceChildren();
                 const title = document.createElement("strong");
@@ -1748,7 +1749,7 @@ export function mountPromptManagementPanel(host) {
             const menu = document.createElement("div");
             menu.dataset.promptFormatMenu = "1";
             menu.dataset.sonderPromptContextMenu = "1";
-            menu.style.cssText = "position:absolute;right:0;top:calc(100% + 4px);z-index:12010;min-width:190px;padding:5px;border:1px solid #465266;border-radius:6px;background:#1a202a;box-shadow:0 12px 30px rgba(0,0,0,.45);display:flex;flex-direction:column;gap:4px;";
+            menu.style.cssText = `position:absolute;right:0;top:calc(100% + 4px);z-index:12010;min-width:190px;padding:5px;border:1px solid ${COLORS.border};border-radius:6px;background:${COLORS.panelRaised};box-shadow:0 12px 30px rgba(0,0,0,.45);display:flex;flex-direction:column;gap:4px;`;
             const edit = makeBtn("Edit as new version…", "Save changes as another immutable version");
             const actions = promptFormatMenuActions(descriptor);
             setButtonDisabled(edit, !actions.edit);
@@ -1767,7 +1768,7 @@ export function mountPromptManagementPanel(host) {
             // in use, which is precisely when the server refuses it.
             const deleteHeading = document.createElement("div");
             deleteHeading.textContent = "Delete custom format";
-            deleteHeading.style.cssText = `margin-top:2px;padding:2px 2px 0;border-top:1px solid #2c3542;font:9px system-ui;color:${COLORS.textDim};`;
+            deleteHeading.style.cssText = `margin-top:2px;padding:2px 2px 0;border-top:1px solid ${COLORS.border};font:9px system-ui;color:${COLORS.textDim};`;
             menu.appendChild(deleteHeading);
             const targets = promptFormatDeleteTargets(host._promptContextCatalog?.profiles);
             if (!targets.length) {

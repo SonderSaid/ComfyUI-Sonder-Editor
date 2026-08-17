@@ -3,6 +3,8 @@
 // provider ordinals, timestamps, or generated text into authored documents.
 
 import { REFERENCE_VERDICT_LABEL, resolveReferenceVerdicts } from "./reference_resolution.js";
+import { EDITOR_COLORS as COLORS, chromeInputCss, setButtonDisabled,
+    setButtonVariant } from "./editor_theme.js";
 import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
     register as registerKeyboardConsumer } from "./keyboard_ownership.js";
 import { promptToken, promptTokenDeclarationsFromProfile } from "./prompt_tokens.js";
@@ -14,6 +16,27 @@ import {
     referenceDerivedDeclarations,
     referenceFieldDeclaration,
 } from "./prompt_profile_declarations.js";
+
+/**
+ * Context-chip role identity: the violet that marks an authored chip as a chip
+ * wherever it appears, in prose and in the panels that edit it.
+ *
+ * These stay literal rather than becoming `editor_theme.js` tokens. The theme's
+ * `lanePrompt` is the TIMELINE lane accent, which a durable rule keeps separate
+ * from role identity, and no token covers "an inline authored object". Whether
+ * this role earns a token is a question for the editor-wide normalization, not
+ * for a pass scoped to the Prompt tool — but a single named constant is what
+ * lets that pass find every use at once, instead of twelve scattered literals.
+ */
+const CHIP_PALETTE = Object.freeze({
+    border: "#6f62a8",
+    background: "#29243b",
+    text: "#ded6ff",
+    /** Glyph controls carried INSIDE a chip: suppress, unlink, remove. */
+    control: "#c9bfff",
+    /** The "LINKED" group marker beside a chip label. */
+    linked: "#b8a9ef",
+});
 
 export const PROMPT_DOCUMENT_SCHEMA = "prompt_document_v1";
 export const PROMPT_CONTEXT_FORMAT = "prompt_context_v1";
@@ -56,6 +79,25 @@ const REFERENCE_VALUE_LABELS = Object.freeze({
 const REFERENCE_VALUE_CAPABILITY = Object.freeze(Object.fromEntries(
     Object.entries(REFERENCE_CAPABILITY_VALUE_FIELDS).flatMap(([kind, fields]) =>
         fields.map((field) => [field, kind]))));
+/**
+ * Where a resolved value came from, ranked by the documented precedence chain:
+ * format defaults < Reference entity < physical member < staged item override <
+ * common identity defaults < chip. `tier` collapses all of these into three
+ * colour states, so it cannot say which of two "shared" sources is the more
+ * specific one — that is what rank is for, and it is why a summary listing
+ * several sources can name the most specific instead of counting them.
+ */
+export const REFERENCE_AUTHORITY_RANK = Object.freeze({
+    format: 1, entity: 2, member: 3, staged: 4, identity: 5, chip: 6,
+});
+/** Build a `fieldSources` record; `kind` is a key of REFERENCE_AUTHORITY_RANK. */
+function authoritySource(label, kind) {
+    return Object.freeze({
+        label,
+        tier: kind === "format" ? "format" : (kind === "chip" ? "chip" : "shared"),
+        rank: REFERENCE_AUTHORITY_RANK[kind] || REFERENCE_AUTHORITY_RANK.format,
+    });
+}
 // Presentation-only facts about the renderer floor above. They are renderer
 // knowledge of its own fixed field set, not provider vocabulary: a format
 // renames a field by DECLARING it in `derived[kind].fields`, which always wins.
@@ -673,7 +715,7 @@ export function referencePromptDefaults(selected, {
             ? structuredClone(referenceDeclaration.capability_defaults[capabilityKind]) : {}),
     };
     const formatFieldSources = Object.fromEntries(Object.keys(formatValues).map((field) => [
-        field, { label: formatSource, tier: "format" },
+        field, authoritySource(formatSource, "format"),
     ]));
     const stagedRowsFor = (memberIds) => {
         const wanted = new Set((memberIds || []).map(String).filter(Boolean));
@@ -716,13 +758,13 @@ export function referencePromptDefaults(selected, {
                 ? member.attachment_defaults : {};
             for (const [field, fieldValue] of Object.entries(memberDefaults)) {
                 values[field] = structuredClone(fieldValue);
-                fieldSources[field] = { label: memberSource, tier: "shared" };
+                fieldSources[field] = authoritySource(memberSource, "member");
             }
             // Authored Library prose is the definition of last resort, so a
             // blank chip FOLLOWS the member instead of emitting nothing.
             withSemanticFallback(values, fieldSources, "definition",
                 String(member.prompt || "").trim(),
-                { label: memberSource, tier: "shared" });
+                authoritySource(memberSource, "member"));
             // Intent resolution mirrors the server setup manifest exactly:
             // staged item override, then member, then entity, then the
             // renderer's literal. Reading only the staged value and falling
@@ -733,12 +775,12 @@ export function referencePromptDefaults(selected, {
                 const staged = commonStagedValue(rows, field);
                 const resolved = staged || String(member[field] || "")
                     || String(reference[field] || "") || literal;
-                let source = { label: rendererFallbackSource, tier: "format" };
-                if (staged) source = { label: stagedSource, tier: "shared" };
+                let source = authoritySource(rendererFallbackSource, "format");
+                if (staged) source = authoritySource(stagedSource, "staged");
                 else if (String(member[field] || "")) {
-                    source = { label: memberSource, tier: "shared" };
+                    source = authoritySource(memberSource, "member");
                 } else if (String(reference[field] || "")) {
-                    source = { label: entitySource, tier: "shared" };
+                    source = authoritySource(entitySource, "entity");
                 }
                 withSemanticFallback(values, fieldSources, field, resolved, source);
             }
@@ -780,21 +822,20 @@ export function referencePromptDefaults(selected, {
                 if (!rest.every((other) =>
                     JSON.stringify(other) === JSON.stringify(head))) continue;
                 memberDefaultValues[field] = structuredClone(head);
-                memberDefaultSources[field] = {
-                    label: memberSource, tier: "shared" };
+                memberDefaultSources[field] = authoritySource(memberSource, "member");
             }
         }
         const values = { ...formatValues, ...memberDefaultValues, ...sharedValues };
         const fieldSources = { ...formatFieldSources, ...memberDefaultSources,
             ...Object.fromEntries(Object.keys(sharedValues).map((field) => [
-                field, { label: sharedSource, tier: "shared" },
+                field, authoritySource(sharedSource, "identity"),
             ])) };
         const stagedRows = stagedRowsFor((unit.sources || []).map((source) =>
             source?.member_id));
         const stagedSource = `Staged Reference default · @${
             unit.handle || unit.semantic_unit_id}`;
         withSemanticFallback(values, fieldSources, "definition", unit.definition || "",
-            { label: sharedSource, tier: "shared" });
+            authoritySource(sharedSource, "identity"));
         const sourceMemberIds = new Set((unit.sources || []).map((source) =>
             String(source?.member_id || "")).filter(Boolean));
         const stagedPrompts = [...new Set((setupManifest?.presentation || [])
@@ -802,23 +843,23 @@ export function referencePromptDefaults(selected, {
                 row?.member_id || row?.video_member_id || "")))
             .map((row) => String(row?.member_prompt || "").trim()).filter(Boolean))];
         withSemanticFallback(values, fieldSources, "definition", stagedPrompts.join("; "),
-            { label: stagedSource, tier: "shared" });
+            authoritySource(stagedSource, "staged"));
         withSemanticFallback(values, fieldSources, "visual_intent",
             commonStagedValue(stagedRows, "visual_intent")
                 || unit.visual_intent || "preserve",
             commonStagedValue(stagedRows, "visual_intent")
-                ? { label: stagedSource, tier: "shared" }
+                ? authoritySource(stagedSource, "staged")
                 : (unit.visual_intent
-                    ? { label: sharedSource, tier: "shared" }
-                    : { label: rendererFallbackSource, tier: "format" }));
+                    ? authoritySource(sharedSource, "identity")
+                    : authoritySource(rendererFallbackSource, "format")));
         withSemanticFallback(values, fieldSources, "audio_intent",
             commonStagedValue(stagedRows, "audio_intent")
                 || unit.audio_intent || "reference_characteristics",
             commonStagedValue(stagedRows, "audio_intent")
-                ? { label: stagedSource, tier: "shared" }
+                ? authoritySource(stagedSource, "staged")
                 : (unit.audio_intent
-                    ? { label: sharedSource, tier: "shared" }
-                    : { label: rendererFallbackSource, tier: "format" }));
+                    ? authoritySource(sharedSource, "identity")
+                    : authoritySource(rendererFallbackSource, "format")));
         return {
             values,
             source: sharedSource, formatSource,
@@ -869,9 +910,9 @@ export function referenceCapabilityInputProjection(capabilityKind, {
         const capabilityOwns = Object.hasOwn(capabilityConfig || {}, field);
         const chipOwns = Object.hasOwn(overrides || {}, field);
         const source = capabilityOwns || chipOwns
-            ? { label: "Chip override", tier: "chip" }
+            ? authoritySource("Chip override", "chip")
             : (inherited.fieldSources?.[field]
-                || { label: inherited.formatSource, tier: "format" });
+                || authoritySource(inherited.formatSource, "format"));
         const value = capabilityOwns ? capabilityConfig[field]
             : (chipOwns ? overrides[field] : inherited.values?.[field]);
         const storedEmpty = (capabilityOwns || chipOwns)
@@ -1093,9 +1134,31 @@ function contextChipLabel(label) {
 function chipCss() {
     return `display:inline-flex;align-items:center;gap:3px;box-sizing:border-box;min-width:0;
         max-width:min(180px,calc(100% - 4px));padding:1px 6px;
-        margin:0 2px;border:1px solid #6f62a8;border-radius:999px;background:#29243b;
-        color:#ded6ff;font:10px/17px system-ui,sans-serif;vertical-align:baseline;cursor:pointer;
+        margin:0 2px;border:1px solid ${CHIP_PALETTE.border};border-radius:999px;
+        background:${CHIP_PALETTE.background};
+        color:${CHIP_PALETTE.text};font:10px/17px system-ui,sans-serif;vertical-align:baseline;cursor:pointer;
         user-select:none;white-space:normal;overflow:hidden;`;
+}
+
+/**
+ * The one button factory for this module. Four sites hand-rolled near-identical
+ * CSS before, which is how they drifted apart and why none of them had hover,
+ * active or disabled states — an inline-styled control carries no `:disabled`
+ * rule, so a bare `.disabled = true` reads as an enabled button that does
+ * nothing. `pill` is the rounded variant the routing and handle controls use.
+ */
+function chipButton(label, title = "", {
+    variant = "secondary", fontSize = "9px", padding = "3px 6px", pill = false,
+} = {}) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    if (title) button.title = title;
+    setButtonVariant(button, variant, {
+        padding, fontSize, lineHeight: "1.3",
+        radius: pill ? "999px" : "4px",
+    });
+    return button;
 }
 
 function editorCss(compact) {
@@ -1103,7 +1166,7 @@ function editorCss(compact) {
         flex:0 0 auto;
         min-height:${compact ? "30px" : "48px"};max-height:${compact ? "100px" : "none"};
         overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:5px 7px;
-        border:1px solid #3b4656;border-radius:4px;background:#131820;color:#d8dee8;
+        border:1px solid ${COLORS.border};border-radius:4px;background:${COLORS.panel};color:${COLORS.text};
         font:11px/1.4 system-ui,sans-serif;outline:none;`;
 }
 
@@ -1835,7 +1898,7 @@ export function installPromptContextMenu({ editor, allowedKinds = AUTHORING_KIND
 
 function fieldRow(label, control, help = "", { visibleHelp = false } = {}) {
     const row = document.createElement("label");
-    row.style.cssText = "display:grid;grid-template-columns:130px minmax(0,1fr);gap:8px;align-items:start;font:11px system-ui;color:#d8dee8;";
+    row.style.cssText = `display:grid;grid-template-columns:130px minmax(0,1fr);gap:8px;align-items:start;font:11px system-ui;color:${COLORS.text};`;
     const title = document.createElement("span");
     title.textContent = label;
     control.setAttribute?.("aria-label", label);
@@ -1848,7 +1911,7 @@ function fieldRow(label, control, help = "", { visibleHelp = false } = {}) {
     if (help && visibleHelp) {
         const description = document.createElement("span");
         description.textContent = help;
-        description.style.cssText = "grid-column:2;font:9px/1.35 system-ui;color:#8f9bad;margin-top:-4px;";
+        description.style.cssText = `grid-column:2;font:9px/1.35 system-ui;color:${COLORS.textDim};margin-top:-4px;`;
         row.appendChild(description);
     }
     return row;
@@ -1857,14 +1920,16 @@ function fieldRow(label, control, help = "", { visibleHelp = false } = {}) {
 function textField(value = "", multiline = false) {
     const control = document.createElement(multiline ? "textarea" : "input");
     control.value = String(value ?? "");
-    control.style.cssText = "box-sizing:border-box;width:100%;min-width:0;padding:5px 7px;border:1px solid #3b4656;border-radius:4px;background:#131820;color:#d8dee8;font:11px system-ui;";
+    control.style.cssText = `box-sizing:border-box;width:100%;${
+        chromeInputCss({ padding: "5px 7px" })}`;
     if (multiline) control.rows = 3;
     return control;
 }
 
 function selectField(options, value = "") {
     const select = document.createElement("select");
-    select.style.cssText = "box-sizing:border-box;width:100%;padding:5px 7px;border:1px solid #3b4656;border-radius:4px;background:#131820;color:#d8dee8;font:11px system-ui;";
+    select.style.cssText = `box-sizing:border-box;width:100%;cursor:pointer;${
+        chromeInputCss({ padding: "5px 7px" })}`;
     for (const optionValue of options) {
         const option = document.createElement("option");
         const pair = Array.isArray(optionValue) ? optionValue : [optionValue, optionValue];
@@ -1972,14 +2037,33 @@ export function createReferenceOverrideFieldset({
         const isOverride = overriddenFields.has(field);
         const inherited = inheritedFor(field);
         const source = inherited.fieldSources?.[field]
-            || { label: inherited.formatSource, tier: "format" };
+            || authoritySource(inherited.formatSource, "format");
         status.state.textContent = isOverride ? "Chip override" : source.label;
         status.state.dataset.sonderAuthorityTier = isOverride ? "chip" : source.tier;
-        status.state.style.color = isOverride ? "#e9b77d"
-            : (source.tier === "shared" ? "#9fc8bc" : "#8792a5");
+        // Authority reads as a greyscale ramp plus weight, never as hue. Accent
+        // belongs to interaction and warm/orange belongs to status, so neither
+        // is available to say "this field deviates" — and a hue that means
+        // neither of those two things is exactly how a permanent warm row tint
+        // came to read as a permanent error.
+        //
+        // TWO steps, not three. A third grey for the format tier measured 1.89:1
+        // against its neighbour and 2.81:1 against the panel — indistinguishable
+        // and barely readable at 9px. Which default a field follows is carried
+        // precisely by the label text ("Physical Reference default · @Anna"), so
+        // colour only answers what the label cannot: is this mine, or inherited?
+        // `tier` stays three-valued on the dataset for anything reading the DOM.
+        //
+        // The inherited step is `textSecondary`, not `textDim`. This label sits
+        // under EVERY field, so it carries much of the panel's structure, and at
+        // fg2 it measured 4.77:1 — half the 9.34:1 the hand-rolled colour it
+        // replaced had. Separation from the override step is then only 1.56:1,
+        // which is fine: the weight jump does that work, and the two states say
+        // different words. Legibility of the label matters more than contrast
+        // against a state it cannot be confused with.
+        status.state.style.color = isOverride ? COLORS.text : COLORS.textSecondary;
         status.state.style.fontWeight = isOverride ? "600" : "400";
         control.style.opacity = isOverride ? "1" : ".78";
-        status.reset.disabled = !isOverride;
+        setButtonDisabled(status.reset, !isOverride);
     };
 
     for (const [kind, capabilityDeclaration] of orderedReferenceDerived(profile)) {
@@ -2008,7 +2092,8 @@ export function createReferenceOverrideFieldset({
             reset.type = "button";
             reset.textContent = "Reset";
             reset.title = "Delete this chip override and follow the current default.";
-            reset.style.cssText = "padding:3px 6px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#b7c1cf;font:9px system-ui;cursor:pointer;";
+            setButtonVariant(reset, "secondary",
+                { padding: "3px 6px", fontSize: "9px", lineHeight: "1.3" });
             const state = document.createElement("span");
             state.style.cssText = "grid-column:1/-1;font:9px/1.25 system-ui;";
             statuses.set(field, { state, reset });
@@ -2047,12 +2132,13 @@ export function createReferenceOverrideFieldset({
     let expanded = disclosureMemory?.isOpen(disclosureKey, false) ?? false;
     const summaryRow = document.createElement("div");
     summaryRow.dataset.sonderInheritedSummary = "1";
-    summaryRow.style.cssText = "grid-column:1/-1;display:flex;gap:6px;align-items:baseline;justify-content:space-between;padding:4px 6px;border:1px dashed #3d4a5c;border-radius:5px;";
+    summaryRow.style.cssText = `grid-column:1/-1;display:flex;gap:6px;align-items:baseline;justify-content:space-between;padding:4px 6px;border:1px dashed ${COLORS.border};border-radius:5px;`;
     const summaryText = document.createElement("span");
-    summaryText.style.cssText = "font:9px/1.35 system-ui;color:#9fc8bc;min-width:0;";
-    const summaryToggle = document.createElement("button");
-    summaryToggle.type = "button";
-    summaryToggle.style.cssText = "flex:0 0 auto;padding:3px 7px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#b7c1cf;font:9px system-ui;cursor:pointer;";
+    // Same ramp as the per-field status: this line describes fields that are
+    // following, which is the inherited rung.
+    summaryText.style.cssText = `font:9px/1.35 system-ui;color:${COLORS.textSecondary};min-width:0;`;
+    const summaryToggle = chipButton("", "", { padding: "3px 7px" });
+    summaryToggle.style.flex = "0 0 auto";
     summaryRow.append(summaryText, summaryToggle);
 
     const inheritingFields = () => fields.filter(
@@ -2063,13 +2149,25 @@ export function createReferenceOverrideFieldset({
             row.style.display = (expanded || overriddenFields.has(field))
                 ? "grid" : "none";
         }
-        const sources = new Set(following.map((field) => {
+        // Name the MOST SPECIFIC source in play, not a count. Mixed tiers are
+        // the normal case for a physical member — format defaults for most
+        // fields, a member default for one — and "3 sources" told the author
+        // nothing about which of them was theirs. Ranking is why `rank` exists:
+        // `tier` collapses member, staged, entity and identity into one value.
+        const sources = new Map();
+        for (const field of following) {
             const inherited = inheritedFor(field);
-            return String(inherited.fieldSources?.[field]?.label
-                || inherited.formatSource || "");
-        }).filter(Boolean));
-        const origin = sources.size === 1 ? [...sources][0]
-            : `${sources.size} sources`;
+            const source = inherited.fieldSources?.[field]
+                || authoritySource(inherited.formatSource, "format");
+            const label = String(source.label || "");
+            if (!label) continue;
+            const rank = Number(source.rank) || REFERENCE_AUTHORITY_RANK.format;
+            if (rank > (sources.get(label) ?? -1)) sources.set(label, rank);
+        }
+        const ranked = [...sources].sort((left, right) => right[1] - left[1]);
+        const origin = ranked.length
+            ? `${ranked[0][0]}${ranked.length > 1 ? ` +${ranked.length - 1} more` : ""}`
+            : "its defaults";
         const overrideCount = fields.length - following.length;
         summaryText.textContent = following.length
             ? `${following.length} field${following.length === 1 ? "" : "s"} following ${origin}`
@@ -2171,13 +2269,13 @@ export function configurePromptAttachment(rawAttachment, {
         backdrop.dataset.sonderPromptContextModal = "1";
         backdrop.style.cssText = "position:fixed;inset:0;z-index:12000;background:rgba(5,8,12,.72);display:flex;align-items:center;justify-content:center;padding:20px;";
         const panel = document.createElement("div");
-        panel.style.cssText = "width:min(620px,92vw);max-height:82vh;overflow:auto;padding:14px;border:1px solid #465266;border-radius:8px;background:#1a202a;box-shadow:0 18px 60px rgba(0,0,0,.55);display:flex;flex-direction:column;gap:10px;";
+        panel.style.cssText = `width:min(620px,92vw);max-height:82vh;overflow:auto;padding:14px;border:1px solid ${COLORS.border};border-radius:8px;background:${COLORS.panelRaised};box-shadow:0 18px 60px rgba(0,0,0,.55);display:flex;flex-direction:column;gap:10px;`;
         const heading = document.createElement("div");
         heading.textContent = `${LABELS[attachment.kind] || "Context"} attachment`;
-        heading.style.cssText = "font:600 13px system-ui;color:#eef2f8;";
+        heading.style.cssText = `font:600 13px system-ui;color:${COLORS.text};`;
         const hint = document.createElement("div");
         hint.textContent = `Stored as semantic intent; ${profileId} resolves provider text at preview/enqueue.`;
-        hint.style.cssText = "font:10px system-ui;color:#9da9ba;";
+        hint.style.cssText = `font:10px system-ui;color:${COLORS.textDim};`;
         panel.append(heading, hint);
         const controls = {};
 
@@ -2194,7 +2292,7 @@ export function configurePromptAttachment(rawAttachment, {
             const resolved = Object.values(previewByChannel).find((value) =>
                 String(value || "").trim());
             const timeNotice = document.createElement("div");
-            timeNotice.style.cssText = "font:11px/1.45 system-ui;color:#c8d2e0;padding:7px 9px;border:1px solid #39475b;border-radius:5px;background:#141a22;";
+            timeNotice.style.cssText = `font:11px/1.45 system-ui;color:${COLORS.text};padding:7px 9px;border:1px solid ${COLORS.border};border-radius:5px;background:${COLORS.panel};`;
             timeNotice.textContent = resolved
                 ? `Resolved section time: ${resolved}`
                 : "Standalone Time resolves from this section's start/cut position at preview and execution time.";
@@ -2273,7 +2371,7 @@ export function configurePromptAttachment(rawAttachment, {
             controls.bindingNotice.textContent =
                 "Choose at least one Subject, or enter a stable Voice ID.";
             controls.bindingNotice.style.cssText =
-                "grid-column:1/-1;font:10px system-ui;color:#f2b8a0;display:none;";
+                `grid-column:1/-1;font:10px system-ui;color:${COLORS.dangerText};display:none;`;
             panel.append(fieldRow("Event", controls.eventType),
                 fieldRow("Language", controls.language),
                 fieldRow("Speaker / on-screen subject", controls.subjectPhrase,
@@ -2432,7 +2530,7 @@ export function configurePromptAttachment(rawAttachment, {
             const definitionControl = referenceFieldset.controls.get("definition") || null;
             const inheritanceNotice = document.createElement("div");
             inheritanceNotice.style.cssText =
-                "grid-column:2;font:10px/1.35 system-ui;color:#9fc8bc;margin-top:-4px;white-space:pre-wrap;";
+                `grid-column:2;font:10px/1.35 system-ui;color:${COLORS.textDim};margin-top:-4px;white-space:pre-wrap;`;
             const updateInheritance = () => {
                 const inherited = resolveReferenceSelectionInheritance(controls.reference.value, {
                     scene, references, semanticUnits,
@@ -2447,7 +2545,8 @@ export function configurePromptAttachment(rawAttachment, {
                         ? `Available from ${inherited.source}. Enter or edit Definition to author it for this chip.`
                         : `Inherited from ${inherited.source}. Leave Definition blank to keep following it.`)
                     : "No inherited definition is available. Add a Definition here or to the Subject/Library member.";
-                inheritanceNotice.style.color = inherited.value ? "#9fc8bc" : "#f2b8a0";
+                inheritanceNotice.style.color = inherited.value
+                    ? COLORS.textSecondary : COLORS.dangerText;
             };
             const managedSpeakers = new Set((managedSpeakerSubjectIds || []).map(String));
             const currentSpeaker = String(attachment.config.audio_speaker_subject_id || "");
@@ -2508,13 +2607,12 @@ export function configurePromptAttachment(rawAttachment, {
                 if (!declaration || !authoredToken || selected.startsWith("item:")) {
                     const empty = document.createElement("span");
                     empty.textContent = "Choose a Subject or physical setup source to insert a late-bound token.";
-                    empty.style.cssText = "font:9px/1.3 system-ui;color:#8792a5;";
+                    empty.style.cssText = `font:9px/1.3 system-ui;color:${COLORS.textDim};`;
                     tokenStrip.appendChild(empty);
                     return;
                 }
                 const ordinal = Number(ordinalManifest?.[declaration.manifestKey]?.[sourceId] || 0);
-                const button = document.createElement("button");
-                button.type = "button";
+                const button = chipButton("", "", { pill: true });
                 const resolvedLabel = ordinal > 0
                     ? String(declaration.labelTemplate || "").replace("{n}", String(ordinal))
                     : "not in the current preview";
@@ -2524,8 +2622,7 @@ export function configurePromptAttachment(rawAttachment, {
                 button.title = storedHandle
                     ? `Insert ${authoredToken}. The stable id is stored; provider ordinals resolve only during compilation.`
                     : "A suggested handle is presentation-only until the versioned Reference write succeeds.";
-                button.disabled = !storedHandle;
-                button.style.cssText = "padding:3px 6px;border:1px solid #4c5d73;border-radius:999px;background:#1b2531;color:#bdd8ee;font:9px/1.2 system-ui;cursor:pointer;";
+                setButtonDisabled(button, !storedHandle);
                 button.addEventListener("mousedown", (event) => event.preventDefault());
                 button.addEventListener("click", () => insertSummaryToken(authoredToken));
                 tokenStrip.appendChild(button);
@@ -2552,7 +2649,7 @@ export function configurePromptAttachment(rawAttachment, {
             const overridesHeading = document.createElement("div");
             overridesHeading.textContent = "Overrides for this attachment";
             overridesHeading.title = "Values authored here apply to this attachment only. Everything else follows the Reference or Identity default.";
-            overridesHeading.style.cssText = "grid-column:1/-1;font:600 10px system-ui;color:#c8d2e0;margin-top:2px;";
+            overridesHeading.style.cssText = `grid-column:1/-1;font:600 10px system-ui;color:${COLORS.text};margin-top:2px;`;
             referenceRows.push(overridesHeading, referenceFieldset.summaryRow);
             if (referenceFieldset.pushRow(referenceRows, "definition")) {
                 referenceRows.push(inheritanceNotice);
@@ -2571,7 +2668,10 @@ export function configurePromptAttachment(rawAttachment, {
                 if (String(referenceFieldset.draftValue("summary") || "").trim()
                         && otherSummaryOwners.length) {
                     const summaryOwnerNotice = document.createElement("div");
-                    summaryOwnerNotice.style.cssText = "grid-column:2;font:9px/1.35 system-ui;color:#e9b77d;margin-top:-4px;";
+                    // Warm is legitimate HERE and nowhere else on this surface:
+                    // a conflicting Summary owner is a transient compile state,
+                    // which is exactly what status colour is for.
+                    summaryOwnerNotice.style.cssText = `grid-column:2;font:9px/1.35 system-ui;color:${COLORS.warningText};margin-top:-4px;`;
                     summaryOwnerNotice.textContent = "Only one Summary owner can emit per compile. Another Reference chip also carries Summary text.";
                     referenceRows.push(summaryOwnerNotice);
                 }
@@ -2593,7 +2693,7 @@ export function configurePromptAttachment(rawAttachment, {
                 // ahead of it.
                 const notice = document.createElement("div");
                 notice.dataset.sonderPromptDeclaredFieldsState = "unresolved";
-                notice.style.cssText = "grid-column:2;font:9px/1.35 system-ui;color:#e9b77d;";
+                notice.style.cssText = `grid-column:2;font:9px/1.35 system-ui;color:${COLORS.warningText};`;
                 notice.textContent = "Format-declared fields are still loading, so any task types and handling choices this format declares are not shown yet. Close and reopen this chip once the prompt format catalog arrives; your saved values are untouched.";
                 referenceRows.push(notice);
             }
@@ -2724,7 +2824,7 @@ export function configurePromptAttachment(rawAttachment, {
                         enabled.title = Object.hasOwn(referenceDerived, capabilityId)
                             ? "This saved prompt part is not exposed by the selected recipe; disable it or rebind its source."
                             : "This saved prompt part is not declared by the active Prompt Format; disable it or switch formats.";
-                        enabled.style.color = "#f0b6a8";
+                        enabled.style.color = COLORS.dangerText;
                     }
                     const routeKey = String(current.kind || capabilityId);
                     const resolvedDefaultChannel = String(
@@ -2789,7 +2889,7 @@ export function configurePromptAttachment(rawAttachment, {
                     state.textContent = `→ ${projection?.channel_key || resolvedDefaultChannel || "unresolved"} · ${phase} · ${projectionState}`;
                     state.title = projection?.state_reason || "Compile once to see this capability's live state.";
                     state.className = "sonder-prompt-routing-state";
-                    state.style.cssText = "min-width:0;padding:2px 6px;border:1px solid #3d4d61;border-radius:999px;color:#a9bfd2;background:#151d27;font:9px/1.3 system-ui;";
+                    state.style.cssText = `min-width:0;padding:2px 6px;border:1px solid ${COLORS.border};border-radius:999px;color:${COLORS.text};background:${COLORS.panel};font:9px/1.3 system-ui;`;
                     const routingControls = document.createElement("div");
                     routingControls.className = "sonder-prompt-routing-controls";
                     channel.style.cssText += "min-width:0;";
@@ -2797,7 +2897,7 @@ export function configurePromptAttachment(rawAttachment, {
                     routingControls.append(channel, placement, state);
                     const help = document.createElement("div");
                     help.className = "sonder-prompt-routing-help";
-                    help.style.cssText = "min-width:0;font:9px/1.35 system-ui;color:#8f9bad;";
+                    help.style.cssText = `min-width:0;font:9px/1.35 system-ui;color:${COLORS.textDim};`;
                     const updatePlacementHelp = () => {
                         help.textContent = placementHelpFor(placement.value);
                         placement.title = help.textContent;
@@ -2812,17 +2912,17 @@ export function configurePromptAttachment(rawAttachment, {
                         compiledLine.style.cssText = "display:grid;grid-template-columns:minmax(100px,.55fr) minmax(0,1fr) auto;gap:5px;align-items:baseline;font:9px/1.3 system-ui;";
                         const compiledLabel = document.createElement("span");
                         compiledLabel.textContent = "Last compiled output";
-                        compiledLabel.style.color = "#8792a5";
+                        compiledLabel.style.color = COLORS.textDim;
                         const compiledValue = document.createElement("span");
                         compiledValue.textContent = projection
                             ? (String(projection.text || "") || `(${projection.state || "empty"})`)
                             : "Compile to resolve";
                         compiledValue.title = String(projection?.text || "");
-                        compiledValue.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd3df;";
+                        compiledValue.style.cssText = `min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${COLORS.text};`;
                         const compiledSource = document.createElement("span");
                         compiledSource.textContent = "Compiler projection";
                         compiledSource.dataset.sonderAuthorityTier = "compiler";
-                        compiledSource.style.cssText = "white-space:nowrap;color:#9eb8d8;font-weight:600;";
+                        compiledSource.style.cssText = `white-space:nowrap;color:${COLORS.textDim};font-weight:600;`;
                         compiledLine.append(compiledLabel, compiledValue, compiledSource);
                         effective.appendChild(compiledLine);
                         const draftOverrides = referenceFieldset.draftOverrides();
@@ -2837,7 +2937,7 @@ export function configurePromptAttachment(rawAttachment, {
                         if (!values.length) {
                             const note = document.createElement("span");
                             note.textContent = "No authored input fields for this prompt part.";
-                            note.style.cssText = "font:9px/1.3 system-ui;color:#8792a5;";
+                            note.style.cssText = `font:9px/1.3 system-ui;color:${COLORS.textDim};`;
                             effective.appendChild(note);
                             return;
                         }
@@ -2846,7 +2946,7 @@ export function configurePromptAttachment(rawAttachment, {
                             line.style.cssText = "display:grid;grid-template-columns:minmax(100px,.55fr) minmax(0,1fr) auto;gap:5px;align-items:baseline;font:9px/1.3 system-ui;";
                             const label = document.createElement("span");
                             label.textContent = `Input · ${value.label}`;
-                            label.style.color = "#8792a5";
+                            label.style.color = COLORS.textDim;
                             const rendered = document.createElement("span");
                             const renderedValue = Array.isArray(value.value)
                                 ? value.value.join(" + ") : String(value.value || "");
@@ -2855,13 +2955,13 @@ export function configurePromptAttachment(rawAttachment, {
                                 : `${renderedValue || "(empty)"}${value.stored_empty
                                     ? " · stored empty" : ""}`;
                             rendered.title = renderedValue;
-                            rendered.style.cssText = "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#cbd3df;";
+                            rendered.style.cssText = `min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${COLORS.text};`;
                             const source = document.createElement("span");
                             source.textContent = value.source;
                             source.dataset.sonderAuthorityTier = value.tier;
+                            // Same two-step ramp as the field status above.
                             source.style.cssText = `white-space:nowrap;color:${
-                                value.tier === "chip" ? "#e9b77d"
-                                    : (value.tier === "shared" ? "#9fc8bc" : "#8792a5")
+                                value.tier === "chip" ? COLORS.text : COLORS.textSecondary
                             };font-weight:${value.tier === "chip" ? "600" : "400"};`;
                             line.append(label, rendered, source);
                             effective.appendChild(line);
@@ -2890,15 +2990,13 @@ export function configurePromptAttachment(rawAttachment, {
 
         const actions = document.createElement("div");
         actions.style.cssText = "display:flex;justify-content:flex-end;gap:6px;margin-top:4px;";
-        const cancel = document.createElement("button");
-        cancel.textContent = "Cancel";
-        const save = document.createElement("button");
-        save.textContent = "Attach";
-        for (const button of [cancel, save]) {
-            button.type = "button";
-            button.style.cssText = "padding:5px 10px;border:1px solid #526079;border-radius:4px;background:#242c38;color:#e4e9f1;font:11px system-ui;cursor:pointer;";
-        }
-        save.style.background = "#51447d";
+        const cancel = chipButton("Cancel", "",
+            { padding: "5px 10px", fontSize: "11px" });
+        // Accent carries the committing action, which is what accent is for.
+        // The violet this used to paint on was chip role identity borrowed as
+        // emphasis, and it made Attach read as another chip rather than a verb.
+        const save = chipButton("Attach", "",
+            { variant: "accentSoft", padding: "5px 10px", fontSize: "11px" });
         actions.append(cancel, save);
         panel.appendChild(actions);
         backdrop.appendChild(panel);
@@ -3002,7 +3100,7 @@ export function splitCapabilityProjectionsByRegion(rows = []) {
 export function createPromptProjectionBox(editor, beforeHost, afterHost) {
     const wrapper = document.createElement("div");
     wrapper.dataset.sonderPromptProjectionBox = "1";
-    wrapper.style.cssText = "display:flex;flex-direction:column;min-width:0;border:1px solid #3b4656;border-radius:5px;background:#131820;overflow:hidden;";
+    wrapper.style.cssText = `display:flex;flex-direction:column;min-width:0;border:1px solid ${COLORS.border};border-radius:5px;background:${COLORS.panel};overflow:hidden;`;
     for (const host of [beforeHost, afterHost]) host.style.flex = "0 0 auto";
     editor.style.border = "0";
     editor.style.borderRadius = "0";
@@ -3063,7 +3161,9 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
                 : `${resolved} · ${channelKey}`;
             projection.setAttribute("aria-label",
                 `${sourceLabel} to ${channelKey}, ${phaseLabel}, ${stateLabel}. ${resolved}`);
-            projection.style.cssText = "min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 7px;border:1px solid #415267;border-radius:999px;background:#17212b;color:#aec8dc;font:9px/1.3 system-ui;cursor:pointer;text-align:left;";
+            // Accent text: a projection pill is a button that edits the record
+            // it names, so it is interaction, not metadata.
+            projection.style.cssText = `min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 7px;border:1px solid ${COLORS.border};border-radius:999px;background:${COLORS.panelRaised};color:${COLORS.accentHi};font:9px/1.3 system-ui;cursor:pointer;text-align:left;`;
             projection.title = [
                 candidate?._stale
                     ? "Preview is updating; showing the latest scene-matched compile." : "",
@@ -3108,7 +3208,7 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
                     ? ` Also enabled on ${linkedIds.size} linked chips - suppress there too, or Unlink first.`
                     : "";
                 suppress.title = `Remove this contribution from ${channelKey}.${linkedWarning}`;
-                suppress.style.cssText = "min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:#c9bfff;font:12px/16px system-ui;cursor:pointer;padding:0 2px;";
+                suppress.style.cssText = `min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:${CHIP_PALETTE.control};font:12px/16px system-ui;cursor:pointer;padding:0 2px;`;
                 suppress.addEventListener("mousedown", (event) => event.preventDefault());
                 suppress.addEventListener("click", () => {
                     onSetCapabilityEnabled(attachment, projectionRow, false);
@@ -3154,7 +3254,7 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
             projection.dataset.attachmentId = attachment.attachment_id;
             projection.dataset.sonderPromptProjection = "1";
             projection.textContent = `${LABELS[attachment.kind] || attachment.kind}: ${identity || "Context"}${text ? "" : " · no output"}`;
-            projection.style.cssText = "max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 7px;border:1px solid #415267;border-radius:999px;background:#17212b;color:#aec8dc;font:9px/1.3 system-ui;cursor:pointer;";
+            projection.style.cssText = `max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 7px;border:1px solid ${COLORS.border};border-radius:999px;background:${COLORS.panelRaised};color:${COLORS.accentHi};font:9px/1.3 system-ui;cursor:pointer;`;
             projection.title = [
                 candidate?._stale ? "Preview is updating; showing the latest scene-matched compile." : "",
                 identity ? `Source: ${identity}` : "Source: Context attachment",
@@ -3198,9 +3298,11 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         holder.style.cssText = "display:flex;align-items:center;gap:3px;flex-wrap:wrap;min-width:0;max-width:100%;";
         const chip = document.createElement("button");
         chip.type = "button";
-        chip.disabled = disabled;
         chip.dataset.attachmentId = attachment.attachment_id;
         chip.style.cssText = chipCss();
+        // After the style, never before: assigning cssText would wipe the
+        // dimming, and the flag alone leaves a control that looks live.
+        setButtonDisabled(chip, disabled);
         const label = attachmentLabel(attachment,
             previews?.[attachment.attachment_id] || "",
             attachmentLabelFor?.(attachment) || "");
@@ -3213,8 +3315,8 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         if (inlineOnly) {
             // A legacy scope row stays visible and reachable so it can be
             // rebound or removed; the compiler refuses the job meanwhile.
-            chip.style.borderColor = "#b4603f";
-            chip.style.color = "#f2c3ad";
+            chip.style.borderColor = COLORS.dangerBorder;
+            chip.style.color = COLORS.dangerText;
         }
         chip.addEventListener("click", () => onActivate?.(attachment));
         chip.addEventListener("keydown", (event) => {
@@ -3226,19 +3328,19 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         if (attachment.kind === "prompt_link_scope" && onRemove) {
             const unlinkScope = document.createElement("button");
             unlinkScope.type = "button";
-            unlinkScope.disabled = disabled;
             unlinkScope.textContent = "Unlink";
             unlinkScope.title = "Remove the live section dependency without copying its text.";
-            unlinkScope.style.cssText = "padding:2px 5px;border:1px solid #455166;border-radius:4px;background:#1a212b;color:#c9bfff;font:8px system-ui;cursor:pointer;";
+            unlinkScope.style.cssText = `padding:2px 5px;border:1px solid ${COLORS.border};border-radius:4px;background:${COLORS.panelRaised};color:${CHIP_PALETTE.control};font:8px system-ui;cursor:pointer;`;
+            setButtonDisabled(unlinkScope, disabled);
             unlinkScope.addEventListener("click", () => onRemove(attachment));
             holder.appendChild(unlinkScope);
             if (onConvertPromptLinkCopy) {
                 const copy = document.createElement("button");
                 copy.type = "button";
-                copy.disabled = disabled;
                 copy.textContent = "Convert to copy";
                 copy.title = "Copy the source's current authored channel text here, then remove the live link.";
                 copy.style.cssText = unlinkScope.style.cssText;
+                setButtonDisabled(copy, disabled);
                 copy.addEventListener("click", () => onConvertPromptLinkCopy(attachment));
                 holder.appendChild(copy);
             }
@@ -3248,15 +3350,15 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
             linked.dataset.sonderLinkedAttachment = "1";
             linked.textContent = "linked";
             linked.title = "Edits to this configured chip propagate to every linked section.";
-            linked.style.cssText = "margin-left:3px;font:8px system-ui;color:#b8a9ef;text-transform:uppercase;letter-spacing:.04em;";
+            linked.style.cssText = `margin-left:3px;font:8px system-ui;color:${CHIP_PALETTE.linked};text-transform:uppercase;letter-spacing:.04em;`;
             holder.appendChild(linked);
             if (onUnlink) {
                 const unlink = document.createElement("button");
                 unlink.type = "button";
-                unlink.disabled = disabled;
                 unlink.textContent = "Unlink";
                 unlink.title = "Give only this chip an independent emission group.";
-                unlink.style.cssText = "flex:0 0 auto;min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:#c9bfff;font:9px/16px system-ui;cursor:pointer;padding:0 3px;outline-offset:1px;";
+                unlink.style.cssText = `flex:0 0 auto;min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:${CHIP_PALETTE.control};font:9px/16px system-ui;cursor:pointer;padding:0 3px;outline-offset:1px;`;
+                setButtonDisabled(unlink, disabled);
                 unlink.addEventListener("click", () =>
                     onUnlink(unlinkPromptAttachment(attachment), attachment));
                 holder.appendChild(unlink);
@@ -3264,11 +3366,12 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         }
         if (onRemove) {
             const remove = document.createElement("button");
-            remove.type = "button"; remove.disabled = disabled;
+            remove.type = "button";
             remove.textContent = "×";
             remove.title = `Remove ${label} Context chip`;
             remove.setAttribute("aria-label", remove.title);
-            remove.style.cssText = "flex:0 0 auto;min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:#c9bfff;font:12px/16px system-ui;cursor:pointer;padding:0 3px;outline-offset:1px;";
+            remove.style.cssText = `flex:0 0 auto;min-width:16px;min-height:16px;border:0;border-radius:3px;background:transparent;color:${CHIP_PALETTE.control};font:12px/16px system-ui;cursor:pointer;padding:0 3px;outline-offset:1px;`;
+            setButtonDisabled(remove, disabled);
             remove.addEventListener("click", () => onRemove(attachment));
             holder.appendChild(remove);
         }
@@ -3278,13 +3381,14 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         const count = document.createElement("span");
         count.textContent = `+${values.length - maxVisible}`;
         count.title = `${values.length - maxVisible} more Context chips`;
-        count.style.cssText = "font:10px system-ui;color:#aeb7c5;";
+        count.style.cssText = `font:10px system-ui;color:${COLORS.textDim};`;
         row.appendChild(count);
     }
     const kindSelect = document.createElement("select");
-    kindSelect.disabled = disabled;
     kindSelect.setAttribute("aria-label", "Scope Context chip type");
-    kindSelect.style.cssText = "font:10px system-ui;background:#171c24;color:#ccd3df;border:1px solid #3b4656;border-radius:4px;padding:1px 3px;";
+    kindSelect.style.cssText = `cursor:pointer;${
+        chromeInputCss({ padding: "1px 3px", fontSize: "10px" })}`;
+    setButtonDisabled(kindSelect, disabled);
     // Inline-only kinds are filtered here rather than at each caller, so every
     // scope row in Timeline, Structured and Writing agrees.
     for (const kind of allowedKinds.filter((value) => SCOPE_KINDS.includes(value))) {
@@ -3294,9 +3398,9 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
     }
     const add = document.createElement("button");
     add.type = "button";
-    add.disabled = disabled;
     add.textContent = "Attach to this section/scene";
-    add.style.cssText = "font:10px system-ui;background:transparent;color:#c9bfff;border:1px dashed #6f62a8;border-radius:999px;padding:1px 6px;cursor:pointer;";
+    add.style.cssText = `font:10px system-ui;background:transparent;color:${CHIP_PALETTE.control};border:1px dashed ${CHIP_PALETTE.border};border-radius:999px;padding:1px 6px;cursor:pointer;`;
+    setButtonDisabled(add, disabled);
     add.addEventListener("click", () => onAdd?.(kindSelect.value || "custom"));
     row.append(kindSelect, add);
     const reusableKinds = new Set(
@@ -3308,9 +3412,9 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
     const reusableGroups = dedupeReusableAttachments(reusable, reuseContext);
     if (onReuse && reusableGroups.length) {
         const reuseSelect = document.createElement("select");
-        reuseSelect.disabled = disabled;
         reuseSelect.setAttribute("aria-label", "Reuse an existing Context chip");
         reuseSelect.style.cssText = kindSelect.style.cssText;
+        setButtonDisabled(reuseSelect, disabled);
         const labels = reusableGroups.map((entry) => attachmentReuseLabel(
             entry.attachment, { ...reuseContext, attachmentLabelFor }));
         const labelCounts = new Map();
@@ -3330,9 +3434,9 @@ export function createScopeChipRow({ attachments = [], previews = {}, disabled =
         }
         const reuse = document.createElement("button");
         reuse.type = "button";
-        reuse.disabled = disabled;
         reuse.textContent = "Reuse an existing chip";
         reuse.style.cssText = add.style.cssText;
+        setButtonDisabled(reuse, disabled);
         reuse.addEventListener("click", () => {
             const source = reusableGroups.find((value) =>
                 value.attachment.attachment_id === reuseSelect.value)?.attachment;

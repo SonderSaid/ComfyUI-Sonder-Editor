@@ -119,7 +119,10 @@ def test_unnamed_staged_reference_warns_on_the_member_not_the_channel():
                if value["code"] == "unnamed_physical_reference"]
     # Only the member with neither an identity nor prose is flagged.
     assert [value["member_id"] for value in unnamed] == ["orphan"]
-    assert "Create identity" in unnamed[0]["message"]
+    # The advisory names the control the author must actually find. A rename on
+    # the row without this leaves the server pointing at a button that no longer
+    # exists, which is worse than no instruction at all.
+    assert "+ Identity" in unnamed[0]["message"]
     # It is a warning, not a blocker: the pixels still reach the model.
     assert not [value for value in compiled["errors"]
                 if value["code"] == "unnamed_physical_reference"]

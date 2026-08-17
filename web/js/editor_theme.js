@@ -151,6 +151,14 @@ export const EDITOR_COLORS = Object.freeze({
     sceneBtnHover: THEME.bg3,
     sceneBtnActive: THEME.bg4,
     text: THEME.fg0,
+    // The rung between body text and dim. `THEME` has always defined four
+    // foreground steps and this map exposed only three, skipping fg1 — so a
+    // surface needing "clearly readable, but subordinate to the value beside
+    // it" had to drop two steps to fg2 or invent its own colour. The Prompt
+    // tool invented `#9fc8bc` for exactly this, and it measured 9.34:1 against
+    // the panel — within a rounding error of fg1's 9.36:1. It was this rung
+    // wearing a hue.
+    textSecondary: THEME.fg1,
     textDim: THEME.fg2,
     textMuted: THEME.fg3,
     border: THEME.line2,
@@ -228,6 +236,19 @@ const BUTTON_VARIANTS = Object.freeze({
         text: THEME.bg0,
         activeText: THEME.fg0,
         fontWeight: TYPE.fwBold,
+    },
+    // Emphasis without the weight of a filled `primary`: an accent-tinted
+    // ground for the one action a dense row wants the eye to find first. Built
+    // entirely from existing accent tokens, and accent on a button is squarely
+    // interaction, which is the only thing accent is for.
+    accentSoft: {
+        background: THEME.accentBg,
+        hoverBackground: THEME.accentLo,
+        activeBackground: THEME.accent,
+        border: THEME.accent,
+        text: THEME.fg0,
+        activeText: THEME.fg0,
+        fontWeight: TYPE.fwMed,
     },
     warning: {
         background: EDITOR_COLORS.warningSoft,

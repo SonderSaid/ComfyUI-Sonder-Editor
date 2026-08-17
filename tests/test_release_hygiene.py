@@ -143,3 +143,46 @@ def test_source_text_has_no_raw_nul_bytes():
                 f" ({raw.count(chr(0).encode())} total) — write \\u0000 instead"
             )
     assert not findings, "raw NUL bytes in source text:\n" + "\n".join(findings)
+
+
+# The Prompt tool's four colour-bearing modules. Scoped deliberately: the
+# editor-wide normalization is its own execution-queue entry and 298 more raw
+# values, so widening this list is a decision, not a maintenance chore.
+_TOKENIZED_PROMPT_MODULES = (
+    "web/js/prompt_context_chips.js",
+    "web/js/prompt_identity_panel.js",
+    "web/js/editor_prompt_panel.js",
+    "web/js/prompt_format_editor.js",
+)
+# Context-chip role identity has no theme token and deliberately stays literal;
+# it lives in one named constant so this guard can name its exception once.
+_CHIP_PALETTE_ALLOWLIST = frozenset({
+    "#6f62a8", "#29243b", "#ded6ff", "#c9bfff", "#b8a9ef",
+})
+_RAW_HEX = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+
+
+def test_prompt_tool_colour_comes_from_theme_tokens():
+    """A LINT, not coverage — it proves nothing about how the surface looks.
+
+    What it does prove is that no new raw colour enters these four files, which
+    is the invariant that decayed last time: with no token to reach for, a row
+    tint was authored as `#c8b48a`, one shade off `statusPending`, for a state
+    that is not a status at all. That broke the "pending/orange is status-only"
+    rule invisibly, and no behavioural test could have seen it.
+
+    A genuinely new role extends `editor_theme.js`; a genuine one-off joins the
+    allowlist above with a comment saying why it is not a token.
+    """
+    findings = []
+    for relative in _TOKENIZED_PROMPT_MODULES:
+        path = ROOT / relative
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for match in _RAW_HEX.finditer(line):
+                if match.group(0) in _CHIP_PALETTE_ALLOWLIST:
+                    continue
+                findings.append(f"{relative}:{number}: raw colour {match.group(0)}")
+    assert not findings, (
+        "raw colour in the Prompt tool; use editor_theme.js tokens:\n"
+        + "\n".join(findings)
+    )

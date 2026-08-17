@@ -252,7 +252,7 @@ export function mountPromptFormatDeclarationEditor({ definition, template,
         const details = document.createElement("details");
         details.dataset.promptFormatGroup = key;
         details.open = memory.isOpen(key, open);
-        details.style.cssText = `border:1px solid ${COLORS.promptBorder};border-radius:5px;padding:6px 8px;background:#161b23;`;
+        details.style.cssText = `border:1px solid ${COLORS.promptBorder};border-radius:5px;padding:6px 8px;background:${COLORS.panelRaised};`;
         const summary = document.createElement("summary");
         summary.textContent = title;
         summary.style.cssText = `cursor:pointer;font-size:11px;font-weight:600;color:${COLORS.text};`;

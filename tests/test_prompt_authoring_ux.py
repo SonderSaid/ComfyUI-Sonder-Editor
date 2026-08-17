@@ -110,6 +110,7 @@ console.log(JSON.stringify(rows.map((row)=>({{
   cells:row.children.map((child)=>child.dataset.promptingCell || ""),
   action:row.children.at(-1)?.textContent,
   aria:row.children.at(-1)?.attributes?.["aria-label"] || "",
+  css:row.style.cssText,
 }}))));
 """
     rows = json.loads(subprocess.run(
@@ -127,10 +128,17 @@ console.log(JSON.stringify(rows.map((row)=>({{
     # identity rows keep their glyphs: delete is destructive and conventional,
     # and the create-identity row is already introduced by its own prose.
     assert [(row["action"], row["aria"]) for row in rows] == [
-        ("Create identity", "Create prompt identity from physical Reference"),
+        ("+ Identity", "Create prompt identity from physical Reference"),
         ("×", "Delete prompt identity"),
         ("+", "Create prompt identity"),
     ]
+    # The action column must be able to grow. A fixed width sized for the glyph
+    # rows is what wrapped the labelled button onto two lines while every
+    # assertion here still passed. This checks only that the column CAN grow —
+    # whether the label actually fits at the real panel width is a question no
+    # fake DOM can answer, and it belongs to the visual pass.
+    assert all("minmax(28px,auto)" in row["css"] for row in rows)
+    assert not any(row["css"].endswith("28px;") for row in rows)
 
 
 def test_identity_editor_preserves_unknown_format_owned_values_visibly():
@@ -627,10 +635,15 @@ console.log(JSON.stringify({{config: attachment.config, defaults,inherited,
         "definition": "Person", "visual_intent": "partial",
         "audio_intent": "copy_partial"}
     assert result["defaults"]["source"] == "Shared identity default · @Lead"
+    # Every source carries a `rank` on the documented precedence chain as well as
+    # a `tier`. `tier` has only three values and collapses entity, member, staged
+    # and identity into one of them, so it cannot say which of two inherited
+    # sources is the more specific — which is what a collapsed summary needs in
+    # order to NAME the source in play instead of counting them.
     assert result["defaults"]["fieldSources"]["summary"] == {
-        "label": "Shared identity default · @Lead", "tier": "shared"}
+        "label": "Shared identity default · @Lead", "tier": "shared", "rank": 5}
     assert result["defaults"]["fieldSources"]["task_types"] == {
-        "label": "Prompt Format default · Format A", "tier": "format"}
+        "label": "Prompt Format default · Format A", "tier": "format", "rank": 1}
     assert result["inherited"][:2] == [
         {"field": "summary", "label": "Summary", "value": "identity summary",
          "source": "Shared identity default · @Lead", "tier": "shared",
@@ -659,9 +672,12 @@ console.log(JSON.stringify({{config: attachment.config, defaults,inherited,
         "definition": "Format definition", "visual_intent": "partial",
         "audio_intent": "copy_partial"}
     assert result["physical"]["fieldSources"] == {
-        "definition": {"label": "Prompt Format default · Format A", "tier": "format"},
-        "visual_intent": {"label": "Staged Reference default · @Portrait", "tier": "shared"},
-        "audio_intent": {"label": "Staged Reference default · @Portrait", "tier": "shared"},
+        "definition": {"label": "Prompt Format default · Format A",
+                       "tier": "format", "rank": 1},
+        "visual_intent": {"label": "Staged Reference default · @Portrait",
+                          "tier": "shared", "rank": 4},
+        "audio_intent": {"label": "Staged Reference default · @Portrait",
+                         "tier": "shared", "rank": 4},
     }
     # Authored Library prose is the definition of last resort, so a blank chip
     # FOLLOWS the member. This used to be absent entirely, which is why the chip
@@ -673,9 +689,11 @@ console.log(JSON.stringify({{config: attachment.config, defaults,inherited,
         "audio_intent": "reference_characteristics"}
     assert result["physicalFallback"]["fieldSources"] == {
         "definition": {"label": "Physical Reference default · @Portrait",
-                       "tier": "shared"},
-        "visual_intent": {"label": "Renderer fallback · Format A", "tier": "format"},
-        "audio_intent": {"label": "Renderer fallback · Format A", "tier": "format"},
+                       "tier": "shared", "rank": 3},
+        "visual_intent": {"label": "Renderer fallback · Format A",
+                          "tier": "format", "rank": 1},
+        "audio_intent": {"label": "Renderer fallback · Format A",
+                         "tier": "format", "rank": 1},
     }
     # The Reference entity's authored intent is consulted before the renderer's
     # literal, mirroring the server setup manifest's own staged/member/entity
@@ -683,11 +701,19 @@ console.log(JSON.stringify({{config: attachment.config, defaults,inherited,
     # skipped it, attributing an authored value to a fallback that never ran.
     assert result["physicalEntity"]["values"]["visual_intent"] == "transfer_attributes"
     assert result["physicalEntity"]["fieldSources"]["visual_intent"] == {
-        "label": "Reference default · Korean Woman", "tier": "shared"}
+        "label": "Reference default · Korean Woman", "tier": "shared", "rank": 2}
     # The member's own defaults bag outranks a format default.
     assert result["physicalBag"]["values"]["retention_detail"] == "Keeps her jacket."
     assert result["physicalBag"]["fieldSources"]["retention_detail"] == {
-        "label": "Physical Reference default · @Portrait", "tier": "shared"}
+        "label": "Physical Reference default · @Portrait",
+        "tier": "shared", "rank": 3}
+    # Rank orders the chain the durable rule documents, and the entity tier sits
+    # BELOW the member tier — a distinction `tier` cannot express, since it calls
+    # both "shared".
+    assert (result["physicalEntity"]["fieldSources"]["visual_intent"]["rank"]
+            < result["physicalBag"]["fieldSources"]["retention_detail"]["rank"]
+            < result["physical"]["fieldSources"]["visual_intent"]["rank"]
+            < result["defaults"]["fieldSources"]["summary"]["rank"])
     source = _source("web/js/prompt_context_chips.js")
     assert 'state.textContent = isOverride ? "Chip override"' in source
     assert 'rendered.textContent = value.authored_empty' in source
@@ -1666,10 +1692,12 @@ console.log(JSON.stringify(rows.map((row)=>
     statuses = json.loads(subprocess.run(
         [node, "--input-type=module", "-e", script], capture_output=True,
         text=True, encoding="utf-8", check=True).stdout)
-    assert statuses[0].startswith("First frame · ")
-    # The declared label reads "Identity" while the identity COUNT reads its own
-    # clause, so the two senses of the word no longer collide unreadably.
-    assert statuses[1].startswith("Identity · ")
-    # The missing-identity state names the action that resolves it.
-    assert all("no identity yet — use Create identity" in status
-               for status in statuses)
+    # `Role:` is spelled out so the middle segment — the provider's resolved
+    # slot label — can never be read as the role, and so a declared role
+    # literally NAMED `identity` cannot collide with the identity count.
+    assert statuses[0].startswith("Role: First frame · ")
+    assert statuses[1].startswith("Role: Identity · ")
+    # The count always says "prompt identity", which is the other sense of the
+    # word. No action hint: the button beside it is labelled "+ Identity".
+    assert all(status.endswith(" · No prompt identity") for status in statuses)
+    assert not any("Create identity" in status for status in statuses)

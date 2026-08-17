@@ -1920,3 +1920,46 @@ def test_reference_fieldset_collapses_following_fields_but_never_an_override():
     assert set(result["afterOverriding"]) == {"definition", "retention_detail"}
     assert "3 fields following" in result["summaryWhenCollapsed"]
     assert "2 fields following" in result["summaryAfter"]
+
+
+def test_collapsed_summary_names_the_most_specific_source_not_a_count():
+    """Mixed tiers are the normal case, so a count is the normal output.
+
+    A physical member typically states one or two defaults while the rest fall to
+    the format, which made the summary read `N fields following 3 sources` almost
+    always — technically true and useless, because it never named the tier the
+    author actually authored. Ranking the chain lets it name the most specific
+    source in play; `tier` alone cannot, since it calls member, staged, entity
+    and identity all "shared".
+    """
+    profile = _DECLARED_PROFILE.replace(
+        "capabilities: { reference: { derived: {",
+        'capabilities: { reference: { defaults: { retention_detail: "from format" },'
+        " derived: {")
+    result = _run_chip_dom_script(f"""
+        const references = [{{ reference_id: "ref", name: "Korean Woman",
+            members: [{{ member_id: "m1", handle: "Portrait",
+                attachment_defaults: {{ definition: "from the member" }} }}] }}];
+        const mixed = mod.createReferenceOverrideFieldset({{
+            profile: {profile}, references, semanticUnits: [], setupManifest: {{}},
+            overrides: {{}}, selected: "physical:picture:m1",
+        }});
+        // Nothing selected and no declared defaults: every field falls to the
+        // one format source, so there is nothing to disambiguate.
+        const single = mod.createReferenceOverrideFieldset({{
+            profile: {_DECLARED_PROFILE},
+            references: [], semanticUnits: [], setupManifest: {{}},
+            overrides: {{}}, selected: "",
+        }});
+        console.log(JSON.stringify({{
+            mixed: mixed.summaryRow.children[0].textContent,
+            single: single.summaryRow.children[0].textContent,
+        }}));
+    """)
+    # The member tier outranks both format tiers present, so it is named.
+    assert result["mixed"].startswith("4 fields following Physical Reference default · @Portrait")
+    # The others are counted, not listed — the point is to name one, not all.
+    assert "+2 more" in result["mixed"]
+    assert "sources" not in result["mixed"]
+    # With a single source there is nothing to disambiguate and no suffix.
+    assert result["single"] == "4 fields following Prompt Format default · Probe Format"

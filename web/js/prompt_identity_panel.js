@@ -2,7 +2,8 @@
 // The Prompt panel host owns state, networking, and durable commits. This
 // module owns only the derived DOM/listeners and returns a cleanup callback.
 
-import { EDITOR_COLORS as COLORS, chromeInputCss } from "./editor_theme.js";
+import { EDITOR_COLORS as COLORS, chromeInputCss, setButtonDisabled,
+    setButtonVariant } from "./editor_theme.js";
 import { createReferenceOverrideFieldset,
     normalizePromptAttachment } from "./prompt_context_chips.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
@@ -21,10 +22,15 @@ import {
 const uid = () => globalThis.crypto?.randomUUID?.().replaceAll("-", "")
     || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
 
+// The action column is `minmax(28px,auto)`, not a fixed 28px: identity rows put
+// a one-glyph button there and physical rows put a labelled one. A fixed width
+// sized for the glyph is what wrapped "Create identity" onto two lines while
+// every automated check passed. Glyph rows still resolve to 28px, because those
+// buttons carry `min-width:24px`.
 const PROMPTING_GRID_COLUMNS = Object.freeze([
-    "36px", "minmax(130px,.9fr)", "minmax(150px,1fr)", "auto", "auto", "28px",
+    "36px", "minmax(130px,.9fr)", "minmax(150px,1fr)", "auto", "auto", "minmax(28px,auto)",
 ]);
-const PROMPTING_ROW_CSS = `display:grid;grid-template-columns:${PROMPTING_GRID_COLUMNS.join(" ")};gap:6px;align-items:center;padding:5px 6px;border:1px solid #343d4b;border-radius:5px;`;
+const PROMPTING_ROW_CSS = `display:grid;grid-template-columns:${PROMPTING_GRID_COLUMNS.join(" ")};gap:6px;align-items:center;padding:5px 6px;border:1px solid ${COLORS.border};border-radius:5px;`;
 const PROMPTING_CELL_NAMES = Object.freeze([
     "thumbnail", "name", "status", "attach", "edit", "action",
 ]);
@@ -192,12 +198,13 @@ function makeButton(label, title = "", variant = "", ariaLabel = "") {
     button.type = "button";
     button.textContent = label;
     button.title = title;
-    const colors = variant === "danger"
-        ? "border-color:#74464b;color:#efb4b7;"
-        : variant === "primary"
-            ? "border-color:#52759b;color:#d7e9fb;background:#25384c;"
-            : "border-color:#3d4858;color:#cbd3df;";
-    button.style.cssText = `padding:3px 7px;border:1px solid;border-radius:4px;background:#1b212b;font:10px/1.3 system-ui;cursor:pointer;${colors}`;
+    // Geometry is passed through so the rows keep their exact density; palette,
+    // hover/active states and disabled handling come from the theme rather than
+    // being re-invented here. `primary` maps to the soft accent ground, not the
+    // filled one — a row with three buttons cannot carry a solid fill.
+    setButtonVariant(button, variant === "primary" ? "accentSoft"
+        : (variant || "secondary"),
+    { padding: "3px 7px", fontSize: "10px", lineHeight: "1.3" });
     if (ariaLabel) button.setAttribute("aria-label", ariaLabel);
     return button;
 }
@@ -224,7 +231,7 @@ function makeSelect(values, selected = "") {
 
 function sectionHeading(title, description) {
     const wrapper = document.createElement("div");
-    wrapper.style.cssText = "display:flex;flex-direction:column;gap:2px;padding-top:7px;border-top:1px solid #343d4b;";
+    wrapper.style.cssText = `display:flex;flex-direction:column;gap:2px;padding-top:7px;border-top:1px solid ${COLORS.border};`;
     const heading = document.createElement("strong");
     heading.textContent = title;
     heading.style.cssText = `font:600 11px/1.3 system-ui;color:${COLORS.text};`;
@@ -299,7 +306,7 @@ function disclosureGroup({ title, description = "", open = false,
     memory = null, key = "" } = {}) {
     const details = document.createElement("details");
     details.open = memory?.isOpen(key, open) ?? open;
-    details.style.cssText = "border:1px solid #343d4b;border-radius:6px;padding:0 8px;";
+    details.style.cssText = `border:1px solid ${COLORS.border};border-radius:6px;padding:0 8px;`;
     const summary = document.createElement("summary");
     summary.textContent = title;
     summary.style.cssText = "padding:7px 0;cursor:pointer;font-weight:600;";
@@ -430,7 +437,7 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
     backdrop.dataset.promptAttachmentTarget = "1";
     backdrop.style.cssText = "position:fixed;inset:0;z-index:12010;background:rgba(5,8,12,.72);display:flex;align-items:center;justify-content:center;padding:20px;";
     const modal = document.createElement("div");
-    modal.style.cssText = "width:min(480px,92vw);padding:14px;border:1px solid #465266;border-radius:8px;background:#1a202a;display:flex;flex-direction:column;gap:8px;color:#d8dee8;font:10px system-ui;";
+    modal.style.cssText = `width:min(480px,92vw);padding:14px;border:1px solid ${COLORS.border};border-radius:8px;background:${COLORS.panelRaised};display:flex;flex-direction:column;gap:8px;color:${COLORS.text};font:10px system-ui;`;
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
     const title = document.createElement("strong");
@@ -495,7 +502,7 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
         if (event.target === backdrop && draftGuard.confirmDismiss()) close();
     });
     attach.addEventListener("click", async () => {
-        attach.disabled = true;
+        setButtonDisabled(attach, true);
         const sectionMatch = String(target.value || "").match(/^section:(\d+)$/);
         try {
             await onAttach?.(owner, sectionMatch
@@ -503,7 +510,7 @@ function openAttachmentTargetPicker({ scene, owner, onAttach, onClose, onError,
                 : { scope: "global" }, fieldset.collect());
             close();
         } catch (error) {
-            attach.disabled = false;
+            setButtonDisabled(attach, false);
             onError?.(error);
         }
     });
@@ -538,7 +545,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     backdrop.dataset.promptIdentityEditor = "1";
     backdrop.style.cssText = "position:fixed;inset:0;z-index:12010;background:rgba(5,8,12,.72);display:flex;align-items:center;justify-content:center;padding:20px;";
     const modal = document.createElement("div");
-    modal.style.cssText = "width:min(720px,94vw);max-height:86vh;overflow:auto;padding:14px;border:1px solid #465266;border-radius:8px;background:#1a202a;display:flex;flex-direction:column;gap:8px;color:#d8dee8;font:10px system-ui;";
+    modal.style.cssText = `width:min(720px,94vw);max-height:86vh;overflow:auto;padding:14px;border:1px solid ${COLORS.border};border-radius:8px;background:${COLORS.panelRaised};display:flex;flex-direction:column;gap:8px;color:${COLORS.text};font:10px system-ui;`;
     modal.setAttribute("role", "dialog");
     modal.setAttribute("aria-modal", "true");
     const title = document.createElement("strong");
@@ -647,7 +654,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     }
     const sourceRows = [];
     const sources = document.createElement("div");
-    sources.style.cssText = "display:flex;flex-direction:column;gap:4px;max-height:220px;overflow:auto;padding:6px;border:1px solid #343d4b;border-radius:5px;";
+    sources.style.cssText = `display:flex;flex-direction:column;gap:4px;max-height:220px;overflow:auto;padding:6px;border:1px solid ${COLORS.border};border-radius:5px;`;
     const sourceSearch = document.createElement("input");
     sourceSearch.type = "search";
     sourceSearch.placeholder = "Search physical References…";
@@ -690,7 +697,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         enabled.type = "checkbox"; enabled.checked = true;
         const label = document.createElement("span");
         label.textContent = `Missing physical source · ${current.entity_id || "?"}:${current.member_id || "?"}`;
-        label.style.color = "#efb6a5";
+        label.style.color = COLORS.dangerText;
         const contribution = makeSelect([["", "Unattributed"],
             ...contributionValues(profile)], current.contribution || "");
         const inheritLabel = document.createElement("label");
@@ -726,7 +733,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     identity?.voice?.member_id || "");
     const requiredNotice = document.createElement("div");
     requiredNotice.dataset.sonderIdentityRequired = "1";
-    requiredNotice.style.cssText = "display:none;padding:6px 8px;border:1px solid #74464b;border-radius:5px;color:#efb4b7;";
+    requiredNotice.style.cssText = `display:none;padding:6px 8px;border:1px solid ${COLORS.dangerBorder};border-radius:5px;color:${COLORS.dangerText};background:${COLORS.dangerSoft};`;
     const footer = document.createElement("div");
     footer.style.cssText = "display:flex;justify-content:flex-end;gap:6px;";
     const cancel = makeButton("Cancel");
@@ -819,7 +826,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
     footer.append(cancel); if (remove) footer.append(remove); footer.append(save);
     const core = document.createElement("div");
     core.dataset.sonderIdentityGroup = "core";
-    core.style.cssText = "display:flex;flex-direction:column;gap:7px;border:1px solid #343d4b;border-radius:6px;padding:8px;";
+    core.style.cssText = `display:flex;flex-direction:column;gap:7px;border:1px solid ${COLORS.border};border-radius:6px;padding:8px;`;
     const coreTitle = document.createElement("strong");
     coreTitle.textContent = "Core identity";
     const kindDescription = document.createElement("span");
@@ -918,7 +925,7 @@ function openIdentityEditor({ identity = null, seedSource = null, profile, refer
         warning.dataset.sonderPreservedIdentityDefaults = "1";
         warning.textContent = `Saved defaults not used by this Prompt Format are preserved: ${
             preservedDefaults.join(", ")}.`;
-        warning.style.cssText = "font:9px/1.35 system-ui;color:#efb6a5;";
+        warning.style.cssText = `font:9px/1.35 system-ui;color:${COLORS.dangerText};`;
         advancedGroup.body.appendChild(warning);
     }
 
@@ -1069,7 +1076,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
         for (const row of group.rows) {
             let rowEl;
             const thumbnail = document.createElement("div");
-            thumbnail.style.cssText = "width:34px;height:28px;border:1px solid #344050;border-radius:3px;background:#0c1117;overflow:hidden;display:flex;align-items:center;justify-content:center;color:#758293;font:8px system-ui;";
+            thumbnail.style.cssText = `width:34px;height:28px;border:1px solid ${COLORS.border};border-radius:3px;background:${COLORS.bg};overflow:hidden;display:flex;align-items:center;justify-content:center;color:${COLORS.textDim};font:8px system-ui;`;
             const previewUrl = options.assetPreviewUrl?.(row.asset);
             if (previewUrl) {
                 const image = document.createElement("img");
@@ -1125,16 +1132,23 @@ export function mountPromptIdentityPanel(container, options = {}) {
             const roleLabel = referenceRoleChoices(profile, group.population)
                 .find((choice) => choice.value === String(row.role || ""))?.label
                 || String(row.role || "");
-            // The missing-identity state is an available ACTION, not a report:
-            // the row's only words used to read as status while the step that
-            // resolves them was an unlabeled glyph.
+            // Three positionally stable segments. `Role:` is always spelled out
+            // so the middle segment — the provider's resolved slot label — can
+            // never be misread as the role, and the identity clause always says
+            // "prompt identity" so it cannot be confused with a declared role
+            // that happens to be NAMED identity. No action hint: the button
+            // beside it says "+ Identity".
             const identityState = identityCount
-                ? `${identityCount} identit${identityCount === 1 ? "y" : "ies"}`
-                : "no identity yet — use Create identity";
-            status.textContent = `${roleLabel || "no role"} · ${
+                ? `${identityCount} prompt identit${identityCount === 1 ? "y" : "ies"}`
+                : "No prompt identity";
+            status.textContent = `Role: ${roleLabel || "unset"} · ${
                 row.resolvedLabel} · ${identityState}`;
-            status.style.cssText = `font:9px system-ui;color:${
-                identityCount ? COLORS.textDim : "#c8b48a"};`;
+            // Never tinted. A warm status on every row lacking an identity reads
+            // as broken forever for a Style Reference that legitimately has
+            // none, and the predicate was wrong besides — the real signal is the
+            // `unnamed_physical_reference` advisory, which correctly requires no
+            // identity AND no prose.
+            status.style.cssText = `font:9px system-ui;color:${COLORS.textDim};`;
             const defaults = makeButton("Defaults", "Edit physical prompt text and preservation defaults");
             defaults.addEventListener("click", () => {
                 const existing = groupEl.querySelector(
@@ -1143,7 +1157,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
                 if (!row.member || !row.reference) return;
                 const editor = document.createElement("div");
                 editor.dataset.physicalDefaults = row.memberId;
-                editor.style.cssText = "display:grid;grid-template-columns:minmax(160px,1fr) auto auto auto;gap:5px;padding:6px;border:1px solid #3e4a5a;border-radius:5px;background:#161c24;";
+                editor.style.cssText = `display:grid;grid-template-columns:minmax(160px,1fr) auto auto auto;gap:5px;padding:6px;border:1px solid ${COLORS.border};border-radius:5px;background:${COLORS.panelRaised};`;
                 const prompt = document.createElement("textarea");
                 prompt.rows = 2; prompt.value = row.member.prompt || "";
                 prompt.placeholder = "Physical Reference prompt description";
@@ -1217,8 +1231,10 @@ export function mountPromptIdentityPanel(container, options = {}) {
             });
             // Labelled, not a bare glyph. This is the step that turns staged
             // media into something a prompt can name, and it was the single
-            // least discoverable control in the tool.
-            const create = makeButton("Create identity",
+            // least discoverable control in the tool. The `+` prefix makes it
+            // read as an action; the aria-label carries the full sentence,
+            // because two words are thin for a screen reader.
+            const create = makeButton("+ Identity",
                 "Turn this physical Reference into a named prompt identity. One Reference may feed several.",
                 "primary", "Create prompt identity from physical Reference");
             create.addEventListener("click", () => openEditor(null, row));
@@ -1247,7 +1263,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
         for (const diagnostic of group.unresolved) {
             const unresolved = document.createElement("div");
             unresolved.textContent = `${diagnostic.code}: ${diagnostic.message || "Unresolved setup row"}`;
-            unresolved.style.cssText = "padding:4px 6px;border:1px solid #734d42;border-radius:4px;color:#efb6a5;font:9px system-ui;";
+            unresolved.style.cssText = `padding:4px 6px;border:1px solid ${COLORS.dangerBorder};border-radius:4px;background:${COLORS.dangerSoft};color:${COLORS.dangerText};font:9px system-ui;`;
             groupEl.appendChild(unresolved);
         }
         if (!group.rows.length && !group.unresolved.length) {
@@ -1267,7 +1283,7 @@ export function mountPromptIdentityPanel(container, options = {}) {
     const identityCreationDisabled = !(profile?.identity_kinds || []).length;
     for (const unit of semanticUnits) {
         const thumbnail = document.createElement("div");
-        thumbnail.style.cssText = "width:34px;height:28px;border:1px solid #344050;border-radius:3px;background:#18202a;display:flex;align-items:center;justify-content:center;color:#8fa0b5;font:8px system-ui;";
+        thumbnail.style.cssText = `width:34px;height:28px;border:1px solid ${COLORS.border};border-radius:3px;background:${COLORS.panelRaised};display:flex;align-items:center;justify-content:center;color:${COLORS.textDim};font:8px system-ui;`;
         const kindDeclaration = (profile?.identity_kinds || []).find((value) =>
             String(value?.key || "") === String(unit.kind || "subject"));
         thumbnail.textContent = String(kindDeclaration?.label || unit.kind || "Identity")
@@ -1282,7 +1298,8 @@ export function mountPromptIdentityPanel(container, options = {}) {
             ? `${kindDeclaration.label || unit.kind} · ${(unit.sources || []).length} physical`
             : `${unit.kind || "unknown"} · unsupported by this format`;
         status.textContent = `${kindStatus} · ${speakerIndex >= 0 ? `speaking S${speakerIndex + 1}` : "not speaking"}`;
-        status.style.cssText = `font:9px system-ui;color:${kindDeclaration ? COLORS.textDim : "#efb6a5"};`;
+        status.style.cssText = `font:9px system-ui;color:${
+            kindDeclaration ? COLORS.textDim : COLORS.dangerText};`;
         const edit = makeButton("Edit", "Edit identity, sources, contributions, and voice");
         edit.addEventListener("click", () => openEditor(unit));
         const attach = makeButton("Attach...", "Attach this prompt identity to the scene or a section");
@@ -1308,7 +1325,13 @@ export function mountPromptIdentityPanel(container, options = {}) {
     const createIdentity = makeButton("+", "Create with or without physical references", "primary",
         "Create prompt identity");
     createIdentity.style.cssText += "min-width:24px;padding:2px 6px;font-size:12px;";
-    createIdentity.disabled = identityCreationDisabled;
+    // Through the helper, not the bare flag: an inline-styled button carries no
+    // `:disabled` rule, so `.disabled = true` alone left a control that looked
+    // fully enabled and silently did nothing.
+    setButtonDisabled(createIdentity, identityCreationDisabled);
+    if (identityCreationDisabled) {
+        createIdentity.title = "This prompt format declares no identity kinds, so there is nothing to create.";
+    }
     createIdentity.addEventListener("click", () => openEditor());
     const createRow = buildPromptingRow("identity-create", [
         document.createElement("span"), createHint, document.createElement("span"),

@@ -2752,7 +2752,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                     "message": (
                         f"{row.get('display_name') or 'This staged Reference'} has no "
                         "prompt identity and no Library prompt text, so nothing in "
-                        "the prompt refers to it. Use Create identity on its row, or "
+                        "the prompt refers to it. Use + Identity on its row, or "
                         "give it prompt text under Defaults."),
                 })
     raw_sections = []
