@@ -196,6 +196,77 @@ def test_deleted_token_source_blocks_and_literal_provider_label_is_untouched():
     assert "@subject(unit:deleted), not <Subject 1>" in compiled["prompt"]
 
 
+def _shot(attachment_id):
+    return prompt_context.normalize_attachment({
+        "attachment_id": attachment_id, "kind": "shot", "config": {},
+    })
+
+
+def _shot_section(prompt_id, start, end, attachments, text="body"):
+    return {
+        "prompt_id": prompt_id, "start_frame": start, "end_frame": end,
+        "channels": {"visual": text, "summary": text,
+                     "subject_definitions": text},
+        "attachments": attachments,
+    }
+
+
+def test_shot_token_resolves_against_the_marker_counter():
+    """PR-20. `[Shot N]` is compiler-owned numbering with no authored spelling,
+    so a definition naming its shot had to hard-code a number that went stale as
+    soon as a Shot was added earlier. The citation must track the same counter
+    that renders the marker."""
+    summary = _reference_attachment(
+        "summary", {"summary": "The frame opens @shot(shot-b)"})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={},
+        sections=[
+            _shot_section("first", 0, 12, [_shot("shot-a")]),
+            _shot_section("second", 12, 24, [_shot("shot-b"), summary]),
+        ],
+        window_start=0, window_end=24, fps=24, template="minimax_h3_ref",
+        context=_reference_context())
+    assert not [value for value in compiled["errors"]
+                if value["code"] == "unresolved_prompt_token"]
+    assert "The frame opens [Shot 2]" in compiled["prompt"]
+    # The authored text keeps the stable id — an ordinal must never persist.
+    assert summary["config"]["overrides"]["summary"] == "The frame opens @shot(shot-b)"
+
+
+def test_shot_token_renumbers_when_an_earlier_shot_appears():
+    """The staleness PR-20 describes: the same authored citation must compile to
+    a different ordinal once a shot opens ahead of it, with no edit to the prose."""
+    summary = _reference_attachment(
+        "summary", {"summary": "Matches @shot(shot-b)"})
+    later = _shot_section("second", 12, 24, [_shot("shot-b"), summary])
+    without_earlier = prompt_context.compile_prompt_context(
+        global_channels={}, sections=[later], window_start=0, window_end=24,
+        fps=24, template="minimax_h3_ref", context=_reference_context())
+    with_earlier = prompt_context.compile_prompt_context(
+        global_channels={},
+        sections=[_shot_section("first", 0, 12, [_shot("shot-a")]), later],
+        window_start=0, window_end=24, fps=24, template="minimax_h3_ref",
+        context=_reference_context())
+    assert "Matches [Shot 1]" in without_earlier["prompt"]
+    assert "Matches [Shot 2]" in with_earlier["prompt"]
+
+
+def test_shot_token_for_a_shot_outside_the_window_blocks():
+    """A shot with no ordinal in the selected window is a dangling binding, not
+    a silent zero — the same contract every other prompt token follows."""
+    summary = _reference_attachment(
+        "summary", {"summary": "Matches @shot(shot-missing)"})
+    compiled = prompt_context.compile_prompt_context(
+        global_channels={},
+        sections=[_shot_section("only", 0, 24, [_shot("shot-a"), summary])],
+        window_start=0, window_end=24, fps=24, template="minimax_h3_ref",
+        context=_reference_context())
+    diagnostic = next(value for value in compiled["errors"]
+                      if value["code"] == "unresolved_prompt_token")
+    assert diagnostic["prompt_token_id"] == "shot-missing"
+    assert "@shot(shot-missing)" in compiled["prompt"]
+
+
 def test_attachment_limit_is_measured_after_token_resolution():
     attachment = prompt_context.normalize_attachment({
         "kind": "custom",

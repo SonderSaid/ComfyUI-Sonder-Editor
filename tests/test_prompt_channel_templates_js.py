@@ -47,6 +47,7 @@ def _python_catalog():
             "label_separator": template["label_separator"],
             "labels": template["labels"],
             "shot_marker_channel": template["shot_marker_channel"],
+            "default_draft_channel": template["default_draft_channel"],
             "global_merge": template["global_merge"],
             "global_channels_enabled": template["global_channels_enabled"],
             "name": template["name"],
@@ -67,6 +68,7 @@ def test_preset_catalog_matches_between_python_and_javascript():
         " label_separator: t.label_separator,"
         " labels: t.labels,"
         " shot_marker_channel: t.shot_marker_channel,"
+        " default_draft_channel: t.default_draft_channel,"
         " global_merge: t.global_merge,"
         " global_channels_enabled: t.global_channels_enabled,"
         " name: t.name}]))"
@@ -208,6 +210,13 @@ _CUSTOM_TEMPLATE_CASES = [
     {"id": "custom:d", "channels": [{"key": "k", "label": "K"}],
      "field_separator": "\n\n", "label_separator": ":\n",
      "shot_marker_channel": "k"},
+    # A dangling draft pointer must blank identically on both sides, and a real
+    # one must survive identically.
+    {"id": "custom:e", "channels": [{"key": "k", "label": "K"}],
+     "default_draft_channel": "missing"},
+    {"id": "custom:f", "channels": [{"key": "one", "label": "One"},
+                                    {"key": "two", "label": "Two"}],
+     "default_draft_channel": "two"},
     None,
     "not a template",
 ]
@@ -221,6 +230,8 @@ def test_custom_template_normalization_matches_between_python_and_javascript():
             "keys": list(pct.template_channel_keys(template)),
             "labels": template["labels"],
             "shot_marker_channel": template["shot_marker_channel"],
+            "default_draft_channel": template["default_draft_channel"],
+            "resolved_draft_channel": pct.default_draft_channel(template),
             "global_merge": template["global_merge"],
             "field_separator": template["field_separator"],
             "label_separator": template["label_separator"],
@@ -232,7 +243,10 @@ def test_custom_template_normalization_matches_between_python_and_javascript():
         f"{json.dumps(_CUSTOM_TEMPLATE_CASES)}.map((raw) => {{"
         " const t = mod.normalizeChannelTemplate(raw);"
         " return {id: t.id, keys: mod.templateChannelKeys(t), labels: t.labels,"
-        " shot_marker_channel: t.shot_marker_channel, global_merge: t.global_merge,"
+        " shot_marker_channel: t.shot_marker_channel,"
+        " default_draft_channel: t.default_draft_channel,"
+        " resolved_draft_channel: mod.defaultDraftChannel(t),"
+        " global_merge: t.global_merge,"
         " field_separator: t.field_separator, label_separator: t.label_separator,"
         " builtin: t.builtin};"
         "})"
@@ -241,6 +255,15 @@ def test_custom_template_normalization_matches_between_python_and_javascript():
     # Anti-vacuity: the fixtures must exercise both the fallback and a real fork.
     assert any(entry["builtin"] for entry in expected)
     assert any(not entry["builtin"] for entry in expected)
+    # And both draft-pointer outcomes: undeclared resolving to channel 1, and a
+    # declared pointer that is NOT channel 1. Without the second, both sides
+    # could agree on the fallback and never compare a declaration at all.
+    assert any(not entry["default_draft_channel"]
+               and entry["resolved_draft_channel"] == entry["keys"][0]
+               for entry in expected if entry["keys"])
+    assert any(entry["default_draft_channel"]
+               and entry["resolved_draft_channel"] != entry["keys"][0]
+               for entry in expected if entry["keys"])
 
 
 _NORMALIZER_CASES = [

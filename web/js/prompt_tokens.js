@@ -7,6 +7,14 @@ export const PROMPT_TOKEN_KINDS = Object.freeze({
     audio: Object.freeze({ manifestKey: "audios", labelTemplate: "<Audio {n}>", physical: true }),
 });
 
+// Deliberate mirrors of `prompt_context.SHOT_ORDINAL_KEY` and
+// `prompt_payload.SHOT_LABEL_TEMPLATE`, held in parity by
+// tests/test_prompt_tokens.py. Shot is compiler-owned ordering rather than an
+// identity or a physical population, so it enters the grammar from its own
+// capability declaration on both sides.
+const SHOT_ORDINAL_KEY = "shots";
+const SHOT_LABEL_TEMPLATE = "[Shot {n}]";
+
 const TOKEN_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const TOKEN_PATTERN = /@([a-z][a-z0-9_]{0,63})\(([A-Za-z0-9][A-Za-z0-9._:-]*)\)/g;
 
@@ -32,6 +40,14 @@ export function promptTokenDeclarationsFromProfile(profile = {}) {
         const labelTemplate = String(declaration?.label_template || "");
         if (!kind || !manifestKey || !labelTemplate) continue;
         result[kind] = { manifestKey, labelTemplate, physical: true };
+    }
+    const shotKind = String(profile?.capabilities?.shot?.token_kind || "").toLowerCase();
+    if (shotKind) {
+        result[shotKind] = {
+            manifestKey: SHOT_ORDINAL_KEY,
+            labelTemplate: SHOT_LABEL_TEMPLATE,
+            physical: false,
+        };
     }
     return result;
 }

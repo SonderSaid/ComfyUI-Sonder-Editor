@@ -730,33 +730,69 @@ function normalizeBuiltinOverrides(raw) {
 const WRITING_DRAFT_MAP_CAP = 40;
 const WRITING_DRAFT_TEXT_CAP = 20000;
 
+// One draft record. `withStash` is false for the stash itself, so a stash can
+// never carry its own stash and nest without bound.
+function normalizeWritingDraftRecord(value, { withStash = true } = {}) {
+    const record = {
+        ts: Number(value.ts) || 0,
+        draft: String(value.draft ?? "").slice(0, WRITING_DRAFT_TEXT_CAP),
+        // Writing is a reversible projection over PromptDocument nodes.
+        // Keeping only the plain-text mirror drops attachment anchors and
+        // makes a browser reload destructive, so retain the bounded local
+        // projection state exactly as authored.
+        document: value.document && typeof value.document === "object"
+            && !Array.isArray(value.document) ? structuredClone(value.document) : null,
+        attachments: cloneRecordArray(value.attachments),
+        blockMeta: cloneRecordArray(value.blockMeta),
+        baseModifiedAt: String(value.baseModifiedAt || ""),
+        allocations: Array.isArray(value.allocations)
+            ? value.allocations.map((a) => ({
+                length: Math.max(0, parseInt(a?.length, 10) || 0),
+                dirty: !!a?.dirty,
+            }))
+            : [],
+    };
+    // Which channel this draft's unheadered text parses into, stamped when the
+    // draft was built. Absent for every draft written before templates could
+    // declare one, and that absence is load-bearing: it is what keeps such a
+    // draft parsing into channel 1 instead of silently relocating its text on
+    // the first Apply after an update. Expiry: this can go once no draft
+    // predating `default_draft_channel` can still be in a browser store — in
+    // practice, once drafts move to durable project state and are migrated.
+    if (value.defaultDraftChannel) {
+        record.defaultDraftChannel = String(value.defaultDraftChannel);
+    }
+    // Absent unless one exists, so a record without a stash keeps the exact
+    // shape it had before stashing was added.
+    if (withStash && value.stash && typeof value.stash === "object"
+            && !Array.isArray(value.stash)) {
+        record.stash = normalizeWritingDraftRecord(value.stash, { withStash: false });
+    }
+    return record;
+}
+
+function writingDraftHasContent(value) {
+    return !!(String(value?.draft || "").trim() || value?.document);
+}
+
 function normalizeWritingDrafts(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
     const entries = [];
     for (const [key, value] of Object.entries(raw)) {
         if (!value || typeof value !== "object") continue;
-        entries.push([key, {
-            ts: Number(value.ts) || 0,
-            draft: String(value.draft ?? "").slice(0, WRITING_DRAFT_TEXT_CAP),
-            // Writing is a reversible projection over PromptDocument nodes.
-            // Keeping only the plain-text mirror drops attachment anchors and
-            // makes a browser reload destructive, so retain the bounded local
-            // projection state exactly as authored.
-            document: value.document && typeof value.document === "object"
-                && !Array.isArray(value.document) ? structuredClone(value.document) : null,
-            attachments: cloneRecordArray(value.attachments),
-            blockMeta: cloneRecordArray(value.blockMeta),
-            baseModifiedAt: String(value.baseModifiedAt || ""),
-            allocations: Array.isArray(value.allocations)
-                ? value.allocations.map((a) => ({
-                    length: Math.max(0, parseInt(a?.length, 10) || 0),
-                    dirty: !!a?.dirty,
-                }))
-                : [],
-        }]);
+        entries.push([key, normalizeWritingDraftRecord(value)]);
     }
-    entries.sort((a, b) => a[1].ts - b[1].ts);
-    return Object.fromEntries(entries.slice(-WRITING_DRAFT_MAP_CAP));
+    // Applying a draft CLEARS it to an empty record carrying a fresh `ts`, and
+    // the load path already treats an empty record and an absent one
+    // identically. Retaining them let worthless records win LRU slots from
+    // drafts still holding unapplied authoring, so drop them here and let the
+    // cap count real content only. Expiry: this filter is load-bearing for as
+    // long as the draft store is browser-local; it can go if drafts ever move
+    // to durable project state, where nothing is evicted.
+    const withContent = entries.filter(([, value]) =>
+        writingDraftHasContent(value) || writingDraftHasContent(value.stash));
+    withContent.sort((a, b) => a[1].ts - b[1].ts);
+    return Object.fromEntries(withContent.slice(-WRITING_DRAFT_MAP_CAP));
 }
 
 function normalizePromptsSettings(stored, defaults) {

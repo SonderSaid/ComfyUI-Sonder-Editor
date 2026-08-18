@@ -342,12 +342,23 @@ export function splitWritingPromptDocument(documentValue, { keepEmpty = false } 
         || block.nodes.some((node) => node.type === "attachment"));
 }
 
-/** Parse anchored `key:` header lines without flattening inline chips. */
-export function splitPromptDocumentChannels(documentValue, channelKeys) {
+/**
+ * Parse anchored `key:` header lines without flattening inline chips.
+ *
+ * `defaultKey` is where text ABOVE the first header lands. Omitted or unknown
+ * means the first channel, which is the behavior every caller had before the
+ * parameter existed — deliberately, because the template-retargeting collapse
+ * (`retargetChannelDocuments`, and its `split_document_channels` mirror in
+ * `server/prompt_context.py`) must keep folding into channel 1 byte for byte.
+ * Only the Writing draft passes a key, resolved from its template's
+ * `default_draft_channel`.
+ */
+export function splitPromptDocumentChannels(documentValue, channelKeys,
+    { defaultKey = "" } = {}) {
     const keys = Array.isArray(channelKeys) && channelKeys.length ? channelKeys : ["visual"];
     const keySet = new Set(keys);
     const output = Object.fromEntries(keys.map((key) => [key, []]));
-    let currentKey = keys[0];
+    let currentKey = keySet.has(defaultKey) ? defaultKey : keys[0];
     const appendText = (text) => {
         if (!text) return;
         const current = output[currentKey];
@@ -2179,23 +2190,98 @@ function writingAidMenuItem(editor, selection, aid, onInserted) {
 }
 
 /**
- * The capability kind a handle attach seeds, or "" when none is declared.
+ * `@KWoman.speaker` → `{handle: "KWoman", qualifier: "speaker"}`.
  *
- * A handle is a MENTION — `@KWoman is leaning then @Doggo appears` resolves
- * each to this format's canonical token in flowing prose. Seeding nothing let
- * the compiler fall back to the lowest-`order` declared capability, which under
- * MiniMax H3 Full Reference is `definitions`, so a handle emitted a definition
- * line into the subject-definitions channel instead of a token in the sentence.
+ * The dotted suffix is the CAPABILITY QUALIFIER: the explicit way to say which
+ * declared capability a handle seeds when the channel's own answer is not the
+ * one wanted. Splitting on the first dot is unambiguous because a handle cannot
+ * contain one (`PROMPT_HANDLE_RE` in `server/prompt_context.py` is
+ * `[A-Za-z][A-Za-z0-9_]{0,63}`), so everything after it is the qualifier.
  *
- * Declaration-driven, so this asks the resolved format rather than assuming the
- * kind exists: `generic@1` declares only `derived_prompt`, and the empty answer
- * there is correct — it seeds no capability, which IS the format-default path.
+ * Pure text → parts. Whether the qualifier names a real capability is
+ * `handleAttachCapabilityKind`'s question, not this one's.
+ */
+export function parseHandleMention(text) {
+    const raw = String(text || "").trim().replace(/^@/, "");
+    const dot = raw.indexOf(".");
+    if (dot < 0) return { handle: raw, qualifier: "" };
+    return { handle: raw.slice(0, dot), qualifier: raw.slice(dot + 1) };
+}
+
+/**
+ * The capability kind a handle attach seeds, or "" for the format default.
+ *
+ * A handle is an ATTACHMENT rendered as text, and which declared capability it
+ * seeds decides where its output goes. Three authorities, most specific first:
+ *
+ * 1. **The dotted qualifier** — explicit, and only honoured when the format
+ *    actually declares that kind. An undeclared qualifier falls through rather
+ *    than seeding a kind nothing can compile.
+ * 2. **The channel being written in** — the capability declaring this
+ *    `channel_key`, lowest `order` winning a tie (`summary` beats
+ *    `audio_relationship`, which share `summary` under H3 Full Reference).
+ *    Attaching while writing in `subject_definitions` used to seed `mentions`,
+ *    whose declared route is `detailed_description`, so the chip emitted into a
+ *    channel other than the one it was placed in.
+ * 3. **`mentions`** — the prose default, for a channel no capability claims.
+ *
+ * Declaration-driven throughout: `generic@1` declares only `derived_prompt`, so
+ * a `visual` attach resolves to it by channel and every other channel answers
+ * "" and takes the format default.
  */
 const MENTION_CAPABILITY_KIND = "mentions";
-function handleMentionCapabilityKind(profile) {
-    return orderedReferenceDerived(profile)
-        .some(([kind]) => kind === MENTION_CAPABILITY_KIND)
-        ? MENTION_CAPABILITY_KIND : "";
+export function handleAttachCapabilityKind(profile,
+    { channelKey = "", qualifier = "" } = {}) {
+    const declared = orderedReferenceDerived(profile);
+    const kinds = new Set(declared.map(([kind]) => kind));
+    if (qualifier && kinds.has(qualifier)) return qualifier;
+    const key = String(channelKey || "");
+    if (key) {
+        // `declared` is already ordered by (order, kind), so the first match IS
+        // the lowest-order claimant.
+        const claimed = declared.find(([, declaration]) =>
+            String(declaration?.channel_key || "") === key);
+        if (claimed) return claimed[0];
+    }
+    return kinds.has(MENTION_CAPABILITY_KIND) ? MENTION_CAPABILITY_KIND : "";
+}
+
+/**
+ * The `capabilities` array a handle attach stores — usually empty.
+ *
+ * Records stay SPARSE: the compiler already falls back to the lowest-`order`
+ * declared capability (`_default_capability`), so storing that same kind writes
+ * an authored deviation where the author deviated from nothing. Only a kind
+ * that differs from the format default is worth a record. `capability_id` and
+ * `kind` only — no `channel_key`/`placement`, which would freeze this chip's
+ * routing at attach time, and no `enabled`, which would resolve the tri-state
+ * out of inheriting its Reference or identity default.
+ */
+export function handleAttachCapabilityRecord(profile, options = {}) {
+    const kind = handleAttachCapabilityKind(profile, options);
+    if (!kind) return [];
+    // Deliberately NOT `orderedReferenceDerived(profile)[0]`. That helper reads
+    // a missing `order` as 0, putting such a capability FIRST, while the server's
+    // `_default_capability` reads it as MAX_CAPABILITIES and puts it LAST. For
+    // display ordering the difference is cosmetic; here it decides whether a
+    // record is written at all, and guessing wrong means the chip silently
+    // compiles as a capability the author never chose. So mirror the server's
+    // rule exactly — `(order ?? last, kind)` — and omit a record only when the
+    // two genuinely agree. Storing one is always semantically correct; it is
+    // only less sparse, which is the safe direction to err in.
+    const MAX_ORDER = Number.MAX_SAFE_INTEGER;
+    let defaultKind = "";
+    let best = null;
+    for (const [candidate, declaration] of orderedReferenceDerived(profile)) {
+        const order = Number.isFinite(Number(declaration?.order))
+            ? Number(declaration.order) : MAX_ORDER;
+        if (best === null || order < best
+                || (order === best && candidate < defaultKind)) {
+            best = order; defaultKind = candidate;
+        }
+    }
+    if (kind === defaultKind) return [];
+    return [{ capability_id: kind, kind }];
 }
 
 /**
@@ -2212,7 +2298,7 @@ function handleMentionCapabilityKind(profile) {
  * "why is it greyed out".
  */
 function referenceAttachItem(editor, bookmark, referenceContext, onCreate,
-    onInserted) {
+    onInserted, channelKey = "") {
     const openDialog = async () => {
         const attachment = normalizePromptAttachment({ kind: "reference" });
         const configured = onCreate ? await onCreate(attachment) : attachment;
@@ -2227,20 +2313,18 @@ function referenceAttachItem(editor, bookmark, referenceContext, onCreate,
     }
     const { options, usesDeclaredSources, unitOptions, physicalOptions } =
         promptReferenceSourceOptions(referenceContext);
-    const mentionKind = handleMentionCapabilityKind(referenceContext.resolvedProfile);
+    // Inferred from the channel this menu was opened in. No dotted qualifier is
+    // reachable from a menu row — a typed `@handle.capability` is what supplies
+    // one — so this is the channel-inferred half of the same resolution.
+    const seededCapabilities = handleAttachCapabilityRecord(
+        referenceContext.resolvedProfile, { channelKey });
     const attach = (value) => async () => {
         const attachment = applyPromptReferenceSource(
             normalizePromptAttachment({ kind: "reference" }), value);
-        // The seeded record is SPARSE — `capability_id` and `kind` only. Writing
-        // the declared `channel_key`/`placement` beside them would freeze this
-        // chip's routing at attach time, and an absent `enabled` keeps the
-        // tri-state inheriting the shared Reference/identity default. No
-        // overrides either, so the chip follows its Reference or identity
+        // No overrides either, so the chip follows its Reference or identity
         // defaults instead of freezing a copy of them.
-        if (mentionKind) {
-            attachment.capabilities = [
-                { capability_id: mentionKind, kind: mentionKind },
-            ];
+        if (seededCapabilities.length) {
+            attachment.capabilities = structuredClone(seededCapabilities);
         }
         if (!restorePromptInsertion(editor, bookmark)) return;
         editor?.insertAttachment?.(attachment);
@@ -2283,7 +2367,7 @@ export function createPromptContextMenuItems({ editor, bookmark = null,
         label: "Insert at cursor",
         submenu: kinds.map((kind) => kind === "reference"
             ? referenceAttachItem(editor, bookmark, referenceContext, onCreate,
-                onInserted)
+                onInserted, channelKey)
             : {
                 label: LABELS[kind] || kind,
                 kind,

@@ -41,7 +41,11 @@ import {
     sectionInheritsGlobal,
     splitChannelHeaders,
 } from "./prompt_composition.js";
-import { globalChannelKeys, templateChannelKeys } from "./prompt_channel_templates.js";
+import {
+    defaultDraftChannel,
+    globalChannelKeys,
+    templateChannelKeys,
+} from "./prompt_channel_templates.js";
 import {
     configurePromptAttachment,
     createAttachmentChannelProjections,
@@ -523,7 +527,60 @@ export function mountPromptManagementPanel(host) {
     const writingState = {
         key: "", draft: "", document: null, attachments: [],
         allocations: [], blockMeta: [], baseModifiedAt: "",
+        // Pre-Reset snapshot. Reset is the ONLY escape offered when Apply is
+        // staleness-blocked, so without this the one control a stuck author can
+        // reach is also the one that destroys their unapplied work.
+        stash: null,
+        // Which channel this draft's unheadered text parses into, STAMPED when
+        // the draft is built rather than resolved from the template at Apply
+        // time. A draft authored before the template declared a draft channel
+        // (or before the declaration existed at all) carries no stamp, and the
+        // empty value keeps it parsing into channel 1 exactly as it did when
+        // its author wrote it. Resolving live instead would silently relocate
+        // that text the first time they pressed Apply after an update.
+        defaultDraftChannel: "",
     };
+    const writingDraftSnapshot = () => ({
+        ts: Date.now(),
+        draft: writingState.draft,
+        document: structuredClone(writingState.document),
+        attachments: structuredClone(writingState.attachments),
+        baseModifiedAt: writingState.baseModifiedAt,
+        blockMeta: structuredClone(writingState.blockMeta),
+        allocations: writingState.allocations.map((a) => ({ length: a.length, dirty: !!a.dirty })),
+        defaultDraftChannel: writingState.defaultDraftChannel,
+    });
+    const writingDraftHasText = (value) =>
+        !!(String(value?.draft || "").trim() || value?.document);
+    // Where this draft's unheadered text actually goes. One accessor for the
+    // hint and both split call sites, so what the panel promises and what Apply
+    // does cannot disagree. A stamp naming a channel the template no longer
+    // carries falls back the same way an undeclared one does.
+    const writingDefaultChannelKey = () => {
+        const keys = templateChannelKeys(host._channelTemplate());
+        return keys.includes(writingState.defaultDraftChannel)
+            ? writingState.defaultDraftChannel : (keys[0] || "");
+    };
+    // Shape-only block metadata. The load path additionally falls back to the
+    // live sections for `muted` / `global_channel_exceptions` when a record
+    // predates them; a stash was written by this session and needs no such
+    // archaeology, so restoring must not silently re-derive from sections that
+    // may have moved on since the snapshot was taken.
+    const normalizeWritingBlockMeta = (raw) => (Array.isArray(raw) ? raw : []).map((value) => ({
+        block_id: String(value?.block_id || "")
+            || (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`),
+        source_prompt_id: String(value?.source_prompt_id || ""),
+        merged_source_prompt_ids: Array.isArray(value?.merged_source_prompt_ids)
+            ? value.merged_source_prompt_ids.map(String).filter(Boolean)
+            : [String(value?.source_prompt_id || "")].filter(Boolean),
+        node_ids: Array.isArray(value?.node_ids)
+            ? value.node_ids.map(String).filter(Boolean) : [],
+        muted: value?.muted === true,
+        global_channel_exceptions: [...new Set(
+            (Array.isArray(value?.global_channel_exceptions)
+                ? value.global_channel_exceptions : []).map(String))],
+        attachments: normalizePromptAttachments(value?.attachments),
+    }));
     const documentNodeIds = (documentValue) => normalizePromptDocument(documentValue).nodes
         .map((node) => String(node.node_id || "")).filter(Boolean);
     const scopedAttachmentIdentity = (attachment) => {
@@ -594,6 +651,7 @@ export function mountPromptManagementPanel(host) {
             };
         });
         writingState.baseModifiedAt = getProjectVersion(host._projectDirName?.() || "");
+        writingState.defaultDraftChannel = defaultDraftChannel(template);
     };
     const loadWritingState = () => {
         const key = writingDraftKey();
@@ -634,7 +692,12 @@ export function mountPromptManagementPanel(host) {
                 attachments: normalizePromptAttachments(value?.attachments),
             }));
             writingState.baseModifiedAt = String(saved.baseModifiedAt || "");
+            // No stamp means a pre-declaration draft: keep channel 1.
+            writingState.defaultDraftChannel = String(saved.defaultDraftChannel || "");
+            writingState.stash = saved.stash && writingDraftHasText(saved.stash)
+                ? structuredClone(saved.stash) : null;
         } else {
+            writingState.stash = null;
             reconstructDraftFromSections();
         }
     };
@@ -643,23 +706,32 @@ export function mountPromptManagementPanel(host) {
         if (writingState.draft.length > WRITING_DRAFT_TEXT_CAP) {
             notifyWarning("Writing draft exceeds the 20k browser-draft guidance.", { source: "prompt-writing-draft-cap" });
         }
-        const map = { ...(host._settings?.prompts?.writingDraftByProjectScene || {}) };
-        map[writingState.key] = {
-            ts: Date.now(),
-            draft: writingState.draft,
-            document: structuredClone(writingState.document),
-            attachments: structuredClone(writingState.attachments),
-            baseModifiedAt: writingState.baseModifiedAt,
-            blockMeta: structuredClone(writingState.blockMeta),
-            allocations: writingState.allocations.map((a) => ({ length: a.length, dirty: !!a.dirty })),
-        };
-        host._updateSettings({ prompts: { writingDraftByProjectScene: map } });
+        // Write ONE key. `mergeIntoSettings` deep-merges plain objects, so a
+        // single-key patch lands beside the other drafts instead of replacing
+        // the map — spreading `host._settings` here reverted every draft that
+        // changed after that snapshot was taken, which is a cross-window loss
+        // now that the draft holds authored prose rather than a projection.
+        // Cleared records cannot accumulate, because normalization drops them.
+        host._updateSettings({ prompts: { writingDraftByProjectScene: {
+            [writingState.key]: {
+                ...writingDraftSnapshot(),
+                stash: writingState.stash ? structuredClone(writingState.stash) : null,
+            },
+        } } });
     };
     const clearWritingState = () => {
-        const map = { ...(host._settings?.prompts?.writingDraftByProjectScene || {}) };
-        map[writingState.key] = { ts: Date.now(), draft: "", document: null,
-            attachments: [], allocations: [], blockMeta: [], baseModifiedAt: "" };
-        host._updateSettings({ prompts: { writingDraftByProjectScene: map } });
+        // Single-key patch for the same reason as `saveWritingState`. Every
+        // field is written, so the deep merge leaves nothing stale behind, and
+        // normalization then drops the emptied record entirely.
+        // The stash goes too: Apply means the work landed, so a snapshot from
+        // before some earlier Reset is stale and would offer to restore text
+        // the author already superseded.
+        host._updateSettings({ prompts: { writingDraftByProjectScene: {
+            [writingState.key]: { ts: Date.now(), draft: "", document: null,
+                attachments: [], allocations: [], blockMeta: [], baseModifiedAt: "",
+                stash: null, defaultDraftChannel: "" },
+        } } });
+        writingState.stash = null;
         writingState.key = ""; // force reload (reconstruct) on next render
     };
     const reconcileWritingBlockMeta = (blockDocuments) => {
@@ -943,7 +1015,7 @@ export function mountPromptManagementPanel(host) {
         bodyEl.appendChild(sectionTitle("Writing Mode — narrative draft"));
         const hint = document.createElement("div");
         hint.style.cssText = `font-size:10px; color:${COLORS.textDim};`;
-        hint.textContent = `Write freely; a line containing only ${WRITING_BREAK} splits sections, and a line like "${templateChannelKeys(host._channelTemplate())[0]}:" starts that channel. Unlabelled text goes to the first channel. Apply replaces the lane's sections (undoable).`;
+        hint.textContent = `Write freely; a line containing only ${WRITING_BREAK} splits sections, and a line like "${templateChannelKeys(host._channelTemplate())[0]}:" starts that channel. Unlabelled text goes to ${writingDefaultChannelKey() || "the first channel"}. Apply replaces the lane's sections (undoable).`;
         bodyEl.appendChild(hint);
 
         const writingBlockDocuments = () => reconcileWritingBlockMeta(
@@ -958,7 +1030,9 @@ export function mountPromptManagementPanel(host) {
             const promptSections = blockDocuments.map((blockDocument, index) => {
                 const length = Math.max(
                     minLen, writingState.allocations[index]?.length ?? minLen);
-                const channelDocs = splitPromptDocumentChannels(blockDocument, channelKeys);
+                const channelDocs = splitPromptDocumentChannels(
+                    blockDocument, channelKeys,
+                    { defaultKey: writingDefaultChannelKey() });
                 const anchorIds = new Set(Object.values(channelDocs)
                     .flatMap((documentValue) => documentValue.nodes)
                     .filter((node) => node.type === "attachment")
@@ -1157,14 +1231,41 @@ export function mountPromptManagementPanel(host) {
             updateStrip();
         });
         const equalizeBtn = makeBtn("Equalize", "Reset all lengths to an equal split of the scene");
-        const resetBtn = makeBtn("Reset from sections", "Rebuild the draft + lengths from the lane's current sections");
+        const resetBtn = makeBtn("Reset from sections",
+            "Rebuild the draft + lengths from the lane's current sections. The draft you have now is kept and can be restored.");
         resetBtn.addEventListener("click", () => {
+            // Snapshot BEFORE reconstructing. Reset is the only escape offered
+            // when Apply is staleness-blocked, so it must not also be the thing
+            // that destroys the draft the author cannot apply yet.
+            const previous = writingDraftSnapshot();
             reconstructDraftFromSections();
+            writingState.stash = writingDraftHasText(previous) ? previous : null;
+            saveWritingState();
+            render();
+        });
+        const restoreBtn = writingState.stash
+            ? makeBtn("Restore draft", "Bring back the draft that the last Reset replaced")
+            : null;
+        restoreBtn?.addEventListener("click", () => {
+            const stash = writingState.stash;
+            if (!stash) return;
+            writingState.document = normalizePromptDocument(
+                stash.document, String(stash.draft || ""));
+            writingState.draft = promptDocumentText(writingState.document);
+            writingState.attachments = normalizePromptAttachments(stash.attachments);
+            writingState.allocations = (stash.allocations || []).map((a) => ({
+                length: Math.max(0, parseInt(a?.length, 10) || 0),
+                dirty: !!a?.dirty,
+            }));
+            writingState.blockMeta = normalizeWritingBlockMeta(stash.blockMeta);
+            writingState.baseModifiedAt = String(stash.baseModifiedAt || "");
+            writingState.stash = null;
             saveWritingState();
             render();
         });
         const applyBtn = makeBtn(applyBlocked ? "Apply (locked)" : "Apply", "Replace the lane's sections with the draft blocks (undoable)", "primary");
-        toolRow.append(splitBtn, equalizeBtn, resetBtn, applyBtn);
+        toolRow.append(splitBtn, equalizeBtn, resetBtn,
+            ...(restoreBtn ? [restoreBtn] : []), applyBtn);
         bodyEl.appendChild(toolRow);
 
         const readout = document.createElement("div");
@@ -1406,7 +1507,9 @@ export function mountPromptManagementPanel(host) {
             let cursor = 0;
             const sections = blocks.map((blockDocument, i) => {
                 const length = Math.max(minLen, writingState.allocations[i]?.length ?? minLen);
-                const channelDocs = splitPromptDocumentChannels(blockDocument, channelKeys);
+                const channelDocs = splitPromptDocumentChannels(
+                    blockDocument, channelKeys,
+                    { defaultKey: writingDefaultChannelKey() });
                 const channels = Object.fromEntries(channelKeys.map((key) => [
                     key, promptDocumentText(channelDocs[key]).trim(),
                 ]));

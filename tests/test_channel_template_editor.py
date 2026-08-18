@@ -103,6 +103,33 @@ def test_editing_a_custom_template_keeps_its_id():
     assert saved["id"] == "custom:my-set"
 
 
+def test_a_draft_can_author_and_clear_its_default_draft_channel():
+    draft = _draft(
+        channels=[{"key": "defs", "label": "defs", "description": ""},
+                  {"key": "body", "label": "body", "description": ""}],
+        shot_marker_channel="body", default_draft_channel="body")
+    saved = _node_json(f"mod.templateFromDraft({json.dumps(draft)}, {{fork: true}})")
+    assert saved["default_draft_channel"] == "body"
+    assert pct.default_draft_channel(pct.get_channel_template(saved)) == "body"
+    # "First field" is the blank choice, and it must survive as blank rather
+    # than being written back as the first key — a stored copy would be
+    # indistinguishable from a deliberate choice if the channels were reordered.
+    cleared = _node_json(
+        f"mod.templateFromDraft({json.dumps(_draft(**{**draft, 'default_draft_channel': ''}))},"
+        " {fork: true})")
+    assert cleared["default_draft_channel"] == ""
+
+
+def test_deleting_the_channel_a_draft_pointer_names_blanks_the_pointer():
+    # Same tolerance as `shot_marker_channel`: the pointer is dropped rather
+    # than saved dangling, and the resolver then answers with the first field.
+    draft = _draft(channels=[{"key": "defs", "label": "defs", "description": ""}],
+                   shot_marker_channel="defs", default_draft_channel="body")
+    saved = _node_json(f"mod.templateFromDraft({json.dumps(draft)}, {{fork: true}})")
+    assert saved["default_draft_channel"] == ""
+    assert pct.default_draft_channel(pct.get_channel_template(saved)) == "defs"
+
+
 def test_two_copies_from_one_builtin_mint_distinct_ids_at_creation():
     first = _node_json(
         f"mod.templateFromDraft({json.dumps(_VALID_DRAFT)}, "

@@ -69,6 +69,7 @@ function draftFrom(template) {
         labels: [LABELS_ALWAYS, LABELS_NEVER].includes(template.labels)
             ? template.labels : LABELS_NEVER,
         shot_marker_channel: template.shot_marker_channel ?? "",
+        default_draft_channel: template.default_draft_channel ?? "",
         global_merge: template.global_merge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: template.global_channels_enabled !== false,
         default_context_profile: String(template.default_context_profile || "generic@1"),
@@ -146,6 +147,7 @@ function blankDraft() {
         label_separator: " ",
         labels: LABELS_NEVER,
         shot_marker_channel: "",
+        default_draft_channel: "",
         global_merge: GLOBAL_MERGE_LEADING,
         global_channels_enabled: false,
         default_context_profile: "generic@1",
@@ -410,6 +412,12 @@ export function mountChannelTemplateEditor(host, { template = null, mode = "edit
                 [{ value: "", label: "No shot markers" },
                  ...draft.channels.filter((c) => c.key).map((c) => ({ value: c.key, label: c.key }))],
                 draft.shot_marker_channel, (v) => { draft.shot_marker_channel = v; }),
+            mk("Unlabelled writing goes to", "Where Writing-mode text above the first"
+                + " field header lands. The first field unless you name another —"
+                + " point this at the body field when the first one is not it.",
+                [{ value: "", label: "First field" },
+                 ...draft.channels.filter((c) => c.key).map((c) => ({ value: c.key, label: c.key }))],
+                draft.default_draft_channel, (v) => { draft.default_draft_channel = v; }),
             mk("Between fields", "What separates one field from the next.",
                 FIELD_SEPARATORS, draft.field_separator, (v) => { draft.field_separator = v; }),
             mk("After a header", "What separates a field name from its text.",

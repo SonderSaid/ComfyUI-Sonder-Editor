@@ -76,6 +76,43 @@ a fresh `[Unreleased]` block.
   with upstream `MiniMaxH3AddGuide`, without a Sonder-specific replacement.
 
 ### Fixed
+- In Writing mode, text written above the first field header no longer becomes a
+  subject definition under MiniMax H3 (full reference). It now goes to the
+  body field — `detailed_description` — because that template leads with
+  `subject_definitions`, so "the first field" was the wrong place for narrative
+  prose. The panel names the field it will use, and a channel template can point
+  this anywhere; drafts written before this change keep landing where they always
+  did, so nothing already unapplied moves.
+- Mentioning a Reference from the right-click menu now attaches the part that
+  belongs to the field you are writing in. Picking a handle always attached a
+  scene mention, whose output goes to the body field, so a Reference inserted
+  while writing definitions or retention emitted into a different field than the
+  one it was placed in.
+- An unapplied Writing draft could be discarded without warning. Applying a
+  draft left behind an emptied record stamped with the current time, and those
+  records competed for the same forty slots as real ones — so enough applied
+  scenes would silently evict the one draft still holding unwritten work. The
+  emptied records are now dropped instead of hoarding a slot.
+- Prompt text can now cite a shot by name instead of by number. Writing
+  `@shot` and picking a Shot marker compiles to `[Shot 1]`, `[Shot 2]` and so
+  on, and the number follows the marker — adding a shot earlier in the scene
+  renumbers the citation instead of leaving it pointing at the wrong shot.
+  Citing a shot outside the render window is refused with the shot named,
+  rather than compiling as if it were there.
+- MiniMax H3 reference definitions and retention lines now get one line each
+  when they come from separate Reference chips, instead of being run together
+  into a single paragraph. Three Subjects described on three chips compiled as
+  one long line; MiniMax's own guide asks for a line per reference label. Prompts
+  using more than one Reference chip in these channels will compile differently
+  — and closer to the format — than they did before.
+- **Reset from sections** in Writing mode no longer throws your draft away. It
+  keeps a copy first and offers **Restore draft**, so the one control available
+  when Apply is locked is no longer the one that destroys unapplied work. The
+  copy survives a browser reload and is dropped once you Apply.
+- Writing drafts no longer overwrite each other between editor windows. Saving
+  or applying a draft rewrote the whole set of drafts from whatever snapshot
+  that window last read, reverting any draft another window had changed since;
+  each draft is now written on its own.
 - Escape now closes the dialog you are actually in. Pressing it over the
   Reference attachment dialog, the writing-aid panel, the prompt format editor
   or the format actions menu closed the Prompt tool behind them instead, leaving

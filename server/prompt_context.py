@@ -76,6 +76,16 @@ REFERENCE_RENDERER_KIND_LABELS = (
 REFERENCE_RENDERER_KINDS = frozenset(
     kind for kind, _label in REFERENCE_RENDERER_KIND_LABELS)
 SEPARATOR_NAMES = ("attachment", "line")
+# A declared separator is a JOINER, never authored content: a custom format may
+# choose how its emissions sit against each other, but must not be able to
+# inject prose between them. Whitespace only, and a closed set of it.
+DECLARED_CAPABILITY_SEPARATORS = frozenset({" ", "\n", "\n\n"})
+# Shot ordinals ride the same ordinal manifest as identity and physical
+# populations so `@shot(id)` resolves through the one token resolver. Keyed by
+# the opening Shot attachment's id, and window-relative like every other
+# ordinal — a shot outside the selected window has no number and its citation
+# is a blocking dangling binding, not a silent zero.
+SHOT_ORDINAL_KEY = "shots"
 # Every attachment stores `provider_id` and `provider_version`; the declarative
 # profile registry below is the authority for which pairs this build/project can
 # interpret. Legacy records normalize to generic@1 and stay valid, and disabled
@@ -540,12 +550,18 @@ def _reference_declaration_errors(value, *, template, add):
                 field)
         unknown = set(declaration).difference({
             "order", "channel_key", "placement", "label", "description",
-            "example", "help", "fields",
+            "example", "help", "fields", "separator",
         })
         if unknown:
             add("incomplete_capability_declaration",
                 f"Unsupported derived capability fields: {', '.join(sorted(unknown))}.",
                 field)
+        separator = declaration.get("separator")
+        if (separator is not None
+                and separator not in DECLARED_CAPABILITY_SEPARATORS):
+            add("incomplete_capability_declaration",
+                "Derived capability separator must be one of the declared "
+                "whitespace joiners.", field)
         order = declaration.get("order")
         if (not isinstance(order, int) or isinstance(order, bool)
                 or not 0 <= order <= MAX_CAPABILITIES or order in seen_orders):
@@ -858,6 +874,20 @@ def prompt_token_declarations(profile) -> dict:
                 "physical": True,
                 "population": str(declaration.get("key") or ""),
             }
+    # Shot is neither an identity nor a physical population — it is compiler-owned
+    # ordering over the selected window — so it enters the grammar from its own
+    # capability declaration. The format decides WHETHER `@shot` exists; the
+    # spelling comes from `prompt_payload.SHOT_LABEL_TEMPLATE`, the same constant
+    # that renders the marker being cited, so the two cannot drift (PR-20).
+    shot_declaration = ((profile or {}).get("capabilities") or {}).get("shot")
+    shot_token_kind = str((shot_declaration or {}).get("token_kind") or "") \
+        if isinstance(shot_declaration, dict) else ""
+    if shot_token_kind:
+        result[shot_token_kind] = {
+            "manifest_key": SHOT_ORDINAL_KEY,
+            "label_template": prompt_payload.SHOT_LABEL_TEMPLATE,
+            "physical": False,
+        }
     return result
 
 
@@ -1516,7 +1546,7 @@ BUILTIN_PROFILES = {
         "minimax_h3_base", "MiniMax H3 Base", "minimax_h3_base",
         capabilities={
             "shot": {"channel_key": "integrated_multimodal_description",
-                     "placement": "section_prefix"},
+                     "placement": "section_prefix", "token_kind": "shot"},
             "timestamp": {"channel_key": "integrated_multimodal_description",
                           "placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
@@ -1532,7 +1562,7 @@ BUILTIN_PROFILES = {
         "minimax_h3_ref", "MiniMax H3 Full Reference", "minimax_h3_ref",
         capabilities={
             "shot": {"channel_key": "detailed_description",
-                     "placement": "section_prefix"},
+                     "placement": "section_prefix", "token_kind": "shot"},
             "timestamp": {"channel_key": "detailed_description",
                           "placement": "section_prefix"},
             "prompt_link": {"placement": "inline"},
@@ -1542,6 +1572,8 @@ BUILTIN_PROFILES = {
                     "definitions": {
                         "order": 1, "channel_key": "subject_definitions",
                         "placement": "section_prefix", "label": "Definition",
+                        # ref guide §2 "Give each item its own line".
+                        "separator": "\n",
                         "description": "Defines semantic identities from authored prose and attributed References.",
                         "example": "<Subject 1> is a middle-aged man with a robust build.",
                         "help": "Use identity prose for description-only subjects or inherit it from selected physical References.",
@@ -1567,6 +1599,8 @@ BUILTIN_PROFILES = {
                     "retention": {
                         "order": 3, "channel_key": "retention_analysis",
                         "placement": "section_prefix", "label": "Retention",
+                        # ref guide §4 "Use one line for each reference label".
+                        "separator": "\n",
                         "description": "Describes which visual and audio characteristics should be retained.",
                         "example": "<Subject 1> is fully preserved.",
                         "help": "Defaults may be refined on an identity and overridden on an attachment.",
@@ -2001,6 +2035,44 @@ def _attachment_map(attachments):
 def _join_emissions(parts, separator=" ") -> str:
     return separator.join(str(value or "").strip() for value in parts
                           if str(value or "").strip()).strip()
+
+
+def declared_capability_separator(capability, profile, default=" ") -> str:
+    """The separator that PRECEDES this capability's emission.
+
+    Declared, never inferred from the text. MiniMax `definitions` and
+    `retention` emit one line per reference label and the ref guide requires
+    that shape in both §2 and §4, so those declarations carry `"\\n"`; two chips
+    naming different Subjects therefore keep a line each instead of being
+    space-joined into one run (PR-15). Everything else falls back to the
+    profile separator, which is what inline prose wants — a mention inside a
+    sentence must not start a new line.
+
+    Expiry: this reads a per-capability override on top of the profile-wide
+    `separators.attachment`. It can collapse back into the profile value only if
+    every declared capability in every format wants the same joiner, which the
+    guide's own line rules make unlikely.
+    """
+    kind = str(capability.get("kind") or capability.get("capability_id") or "")
+    declaration = _reference_derived_view(profile).get(kind)
+    separator = (declaration or {}).get("separator") \
+        if isinstance(declaration, dict) else None
+    return separator if isinstance(separator, str) and separator else default
+
+
+def _join_declared_emissions(parts, default=" ") -> str:
+    """Join `(text, separator)` pairs, each separator preceding its own part.
+
+    The first surviving part never emits a separator, so a leading line-joined
+    capability does not open the channel with a blank line.
+    """
+    result = ""
+    for text, separator in parts:
+        value = str(text or "").strip()
+        if not value:
+            continue
+        result = value if not result else f"{result}{separator or default}{value}"
+    return result.strip()
 
 
 def _speaker_bindings(events):
@@ -3520,12 +3592,20 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     # remains self-contained when rendered alone.
     reference_group_shots = defaultdict(list)
     reference_unit_shots = defaultdict(list)
+    # `@shot(id)` resolves against the SAME counter that numbers the markers and
+    # feeds `(appears in [Shot N])`, keyed by the Shot attachment that opens the
+    # shot. A section may carry more than one Shot attachment; each of them cites
+    # the single shot that section opens.
+    shot_ordinals = {}
     shot_number = 0
     for section in selected_sections:
         section_attachments = normalize_attachments(section.get("attachments"))
-        if any(value["enabled"] and value["kind"] == "shot"
-               for value in section_attachments):
+        opening_shots = [value for value in section_attachments
+                         if value["enabled"] and value["kind"] == "shot"]
+        if opening_shots:
             shot_number += 1
+            for value in opening_shots:
+                shot_ordinals[str(value["attachment_id"])] = shot_number
         if shot_number:
             for value in section_attachments:
                 if value["enabled"] and value["kind"] == "reference":
@@ -3547,6 +3627,8 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                         range(1, shot_number + 1))
     context["reference_group_shots"] = dict(reference_group_shots)
     context["reference_unit_shots"] = dict(reference_unit_shots)
+    if isinstance(context.get("ordinal_manifest"), dict):
+        context["ordinal_manifest"][SHOT_ORDINAL_KEY] = shot_ordinals
     emitted_groups = {}
     # Same resolved text, different owner key. Definition/retention dedupe is
     # per semantic unit OR physical slot, so one member's Library prose reaching
@@ -4132,21 +4214,28 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                    "message":
                                    f"Attachment route {key!r} is not in the active template."})
                 continue
-            prefixes = list(scope_link_prefixes.get(key) or [])
+            attachment_separator = resolved_profile.get("separators", {}).get(
+                "attachment", " ")
+            prefixes = [(value, attachment_separator)
+                        for value in scope_link_prefixes.get(key) or []]
             suffixes = []
             for phase in PLACEMENT_PHASES[:PLACEMENT_PHASES.index("inline") + 1]:
-                prefixes.extend(render(
-                    a, c, origin=section.get("prompt_id", ""), channel=key,
-                    projection=projection)
+                prefixes.extend(
+                    (render(a, c, origin=section.get("prompt_id", ""), channel=key,
+                            projection=projection),
+                     declared_capability_separator(c, resolved_profile,
+                                                   attachment_separator))
                     for a, c, projection in phases.get(phase, []))
             for phase in PLACEMENT_PHASES[PLACEMENT_PHASES.index("inline") + 1:]:
-                suffixes.extend(render(
-                    a, c, origin=section.get("prompt_id", ""), channel=key,
-                    projection=projection)
+                suffixes.extend(
+                    (render(a, c, origin=section.get("prompt_id", ""), channel=key,
+                            projection=projection),
+                     declared_capability_separator(c, resolved_profile,
+                                                   attachment_separator))
                     for a, c, projection in phases.get(phase, []))
-            mirrors[key] = _join_emissions(prefixes + [mirrors[key]] + suffixes,
-                                           resolved_profile.get("separators", {}).get(
-                                               "attachment", " "))
+            mirrors[key] = _join_declared_emissions(
+                prefixes + [(mirrors[key], attachment_separator)] + suffixes,
+                attachment_separator)
         prompt_id = str(section.get("prompt_id") or "")
         for key, value in mirrors.items():
             if str(value or "").strip():
@@ -4247,18 +4336,24 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
                                "message":
                                f"Attachment route {route!r} is not in the active template."})
             continue
+        global_attachment_separator = resolved_profile.get("separators", {}).get(
+            "attachment", " ")
         prefixes, suffixes = [], []
         for phase in PLACEMENT_PHASES[:PLACEMENT_PHASES.index("inline") + 1]:
-            prefixes.extend(render(
-                a, c, origin="global", channel=route, projection=projection)
+            prefixes.extend(
+                (render(a, c, origin="global", channel=route, projection=projection),
+                 declared_capability_separator(c, resolved_profile,
+                                               global_attachment_separator))
                 for a, c, projection in phases.get(phase, []))
         for phase in PLACEMENT_PHASES[PLACEMENT_PHASES.index("inline") + 1:]:
-            suffixes.extend(render(
-                a, c, origin="global", channel=route, projection=projection)
+            suffixes.extend(
+                (render(a, c, origin="global", channel=route, projection=projection),
+                 declared_capability_separator(c, resolved_profile,
+                                               global_attachment_separator))
                 for a, c, projection in phases.get(phase, []))
-        global_mirror[route] = _join_emissions(
-            prefixes + [global_mirror[route]] + suffixes,
-            resolved_profile.get("separators", {}).get("attachment", " "))
+        global_mirror[route] = _join_declared_emissions(
+            prefixes + [(global_mirror[route], global_attachment_separator)] + suffixes,
+            global_attachment_separator)
 
     final_prompt = prompt_payload.compose_range_prompt(
         prompt_payload.compose_section_text(global_mirror, labels_on=False),

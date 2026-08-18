@@ -39,6 +39,80 @@ def test_shot_marker_channel_names_a_real_channel():
             assert marker in pct.template_channel_keys(template), template_id
 
 
+def test_default_draft_channel_names_a_real_channel():
+    for template_id, template in pct.PROMPT_CHANNEL_TEMPLATE_PRESETS.items():
+        declared = template["default_draft_channel"]
+        if declared:
+            assert declared in pct.template_channel_keys(template), template_id
+
+
+def test_empty_default_draft_channel_means_undeclared_not_nowhere():
+    # Unlike `shot_marker_channel`, which may legitimately point nowhere,
+    # unheadered draft text has to land SOMEWHERE. `""` therefore resolves to
+    # the first channel — the behavior every template shipped with.
+    assert pct.PROMPT_CHANNEL_TEMPLATE_PRESETS["sonder"]["default_draft_channel"] == ""
+    assert pct.default_draft_channel("sonder") == "visual"
+    assert pct.default_draft_channel("standard") == "visual"
+
+
+def test_declared_default_draft_channel_overrides_the_first_channel():
+    # The whole point: H3 Full Reference leads with `subject_definitions`, so
+    # the first-channel fallback turned narrative prose into subject
+    # definitions. Base needs no move — its first channel IS the body.
+    assert pct.template_channel_keys("minimax_h3_ref")[0] == "subject_definitions"
+    assert pct.default_draft_channel("minimax_h3_ref") == "detailed_description"
+    assert pct.default_draft_channel("minimax_h3_base") == (
+        "integrated_multimodal_description")
+
+
+def test_default_draft_channel_naming_a_missing_channel_resolves_as_undeclared():
+    # A dangling pointer must not strand text. Tolerant normalization blanks it,
+    # and the resolver falls back rather than returning a key nothing reads.
+    template = pct.normalize_channel_template({
+        "id": "custom:mine",
+        "channels": [{"key": "a", "label": "A"}, {"key": "b", "label": "B"}],
+        "default_draft_channel": "gone",
+    })
+    assert template["default_draft_channel"] == ""
+    assert pct.default_draft_channel(template) == "a"
+    # Strict validation refuses instead of silently adopting the fallback.
+    assert pct.strict_normalize_channel_template({
+        "id": "custom:mine",
+        "channels": [{"key": "a", "label": "A"}],
+        "default_draft_channel": "gone",
+    }) is None
+
+
+def test_default_draft_channel_survives_the_project_and_job_projections():
+    fork = pct.normalize_channel_template({
+        "id": "custom:mine", "name": "Mine",
+        "channels": [{"key": "a", "label": "A"}, {"key": "b", "label": "B"}],
+        "default_draft_channel": "b",
+    })
+    assert fork["default_draft_channel"] == "b"
+    assert pct.project_template_value(fork)["default_draft_channel"] == "b"
+    assert pct.template_freeze_value(fork)["default_draft_channel"] == "b"
+    # A round trip through the projections must not quietly relocate the pointer.
+    assert pct.default_draft_channel(
+        pct.get_channel_template(pct.template_freeze_value(fork))) == "b"
+
+
+def test_global_view_blanks_a_draft_channel_it_narrowed_away():
+    # With per-channel globals off the view keeps only channel 1, so a pointer
+    # at channel 4 would dangle. Blanking is safe because the resolver then
+    # answers with the view's own first channel.
+    narrowed = pct.global_template_view(pct.normalize_channel_template({
+        **pct.template_freeze_value("minimax_h3_ref"),
+        "id": "custom:narrow",
+        "global_channels_enabled": False,
+    }))
+    assert pct.template_channel_keys(narrowed) == ("subject_definitions",)
+    assert narrowed["default_draft_channel"] == ""
+    assert pct.default_draft_channel(narrowed) == "subject_definitions"
+    # The unnarrowed template is untouched by the view.
+    assert pct.default_draft_channel("minimax_h3_ref") == "detailed_description"
+
+
 def test_label_policy_resolution():
     minimax = pct.get_channel_template("minimax_h3_ref")
     assert pct.template_labels_on(minimax, False) is True

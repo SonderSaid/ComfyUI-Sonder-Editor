@@ -15,6 +15,12 @@ from . import prompt_channel_templates as channel_templates
 
 CHANNEL_ORDER = ("visual", "speech", "sounds")
 DEFAULT_SECTION_DELIMITER = "."
+# The shot marker spelling, in ONE place. `@shot` citations in authored Context
+# fields resolve through this same template, so a marker and a citation of that
+# marker can never disagree. Emitted for any template naming a
+# `shot_marker_channel`, not only MiniMax, which is why it is a shared constant
+# rather than a per-format declaration.
+SHOT_LABEL_TEMPLATE = "[Shot {n}]"
 CHANNEL_LABELS = {
     "visual": "[VISUAL]:",
     "speech": "[SPEECH]:",
@@ -428,7 +434,7 @@ def resolve_shot_markers(segments, fps) -> list[str]:
         marker = ""
         if bool(segment.get("_opens_shot")):
             shot_number += 1
-            marker = f"[Shot {shot_number}]"
+            marker = SHOT_LABEL_TEMPLATE.format(n=shot_number)
         if bool(segment.get("_shot_timestamp")):
             timecode = channel_templates.format_shot_timecode(
                 segment.get("start", 0), fps)
@@ -577,7 +583,7 @@ def compose_range_prompt(global_text, sections, window_start, window_end,
                 marker = ""
                 if bool(segment.get("_opens_shot")):
                     shot_number += 1
-                    marker = f"[Shot {shot_number}]"
+                    marker = SHOT_LABEL_TEMPLATE.format(n=shot_number)
                 if bool(segment.get("_shot_timestamp")):
                     timecode = channel_templates.format_shot_timecode(
                         segment.get("start", 0), fps)

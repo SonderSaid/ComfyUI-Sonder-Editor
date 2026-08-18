@@ -991,20 +991,27 @@ def test_h5_speaker_order_follows_the_target_video_not_the_audio_staging(compile
 # Cross-cutting: every reference label the guide defines stays on its own line.
 # --------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PR-15: `minimax_h3_ref@1` inherits the default `\" \"` attachment "
-    "separator, so definition and retention lines contributed by different "
-    "chips are space-joined onto one line. ref 2 and ref 4 both require one "
-    "line per reference label."))
 @pytest.mark.parametrize("scene,channel", [
     ("one_asset_many_subjects", "subject_definitions"),
     ("physical_pictures", "retention_analysis"),
 ])
 def test_each_reference_label_owns_its_own_line(compiled, scene, channel):
+    """ref 2 "Give each item its own line"; ref 4 "one line for each label".
+
+    Counts labels in RECORD-OPENING position, not every label on the line. A
+    definition legitimately cites its sources — `<Subject 1> is the room from
+    <Picture 1>` is the guide's own shape — so a naive count of labels per line
+    reports correct output as broken. The three opening shapes are `<L> is …`
+    (definition), `<L> (…): …` (retention with a qualifier) and `<L>: …`
+    (retention without one); PR-15's space-join put two of those on one line.
+    """
     value = _channel(compiled, scene, channel)
-    for line in value.splitlines():
-        assert len(re.findall(r"<(?:Subject|Picture|Video|Audio) \d+>",
-                              line)) <= 1, line
+    lines = [line for line in value.splitlines() if line.strip()]
+    assert lines, value
+    for line in lines:
+        openings = re.findall(
+            r"<(?:Subject|Picture|Video|Audio) \d+>(?= is | \(|:)", line)
+        assert len(openings) == 1, line
 
 
 def test_no_scene_fixture_produces_a_blocking_diagnostic(compiled):

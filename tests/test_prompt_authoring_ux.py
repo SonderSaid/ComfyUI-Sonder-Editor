@@ -1775,3 +1775,204 @@ console.log(JSON.stringify({
     # An undeclared placeholder yields an empty vocabulary, which the New-aid
     # row now refuses by name instead of saving an unsavable format.
     assert result["emptyStaysEmpty"]["motion"]["values"] == []
+
+
+# --- handle capability qualifier and the draft channel (writing-parity Phase 3) --
+
+_H3_REF_PROFILE = {"capabilities": {"reference": {"derived": {
+    "definitions": {"order": 1, "channel_key": "subject_definitions",
+                    "placement": "section_prefix", "label": "Definition"},
+    "summary": {"order": 2, "channel_key": "summary",
+                "placement": "section_prefix", "label": "Summary"},
+    "retention": {"order": 3, "channel_key": "retention_analysis",
+                  "placement": "section_prefix", "label": "Retention"},
+    "mentions": {"order": 4, "channel_key": "detailed_description",
+                 "placement": "inline", "label": "Scene mention"},
+    "audio_relationship": {"order": 5, "channel_key": "summary",
+                           "placement": "section_prefix", "label": "Audio"},
+}}}}
+_GENERIC_PROFILE = {"capabilities": {"reference": {"derived": {
+    "derived_prompt": {"order": 1, "channel_key": "visual",
+                       "placement": "inline", "label": "Reference prompt"},
+}}}}
+
+
+def _run_chips_script(body):
+    module_url = (ROOT / "web/js/prompt_context_chips.js").as_uri()
+    return _run_node(
+        f"const mod = await import({json.dumps(module_url)});\n"
+        f"const h3 = {json.dumps(_H3_REF_PROFILE)};\n"
+        f"const generic = {json.dumps(_GENERIC_PROFILE)};\n"
+        f"{body}\n")
+
+
+def test_handle_mention_splits_its_capability_qualifier_at_the_first_dot():
+    result = _run_chips_script("""
+console.log(JSON.stringify({
+  bare: mod.parseHandleMention("@KWoman"),
+  dotted: mod.parseHandleMention("@KWoman.speaker"),
+  noSigil: mod.parseHandleMention("KWoman.speaker"),
+  // A handle cannot contain a dot (PROMPT_HANDLE_RE), so everything after the
+  // first one is qualifier — never a second handle segment.
+  extraDots: mod.parseHandleMention("@KWoman.a.b"),
+  empty: mod.parseHandleMention(""),
+}));
+""")
+    assert result["bare"] == {"handle": "KWoman", "qualifier": ""}
+    assert result["dotted"] == {"handle": "KWoman", "qualifier": "speaker"}
+    assert result["noSigil"] == {"handle": "KWoman", "qualifier": "speaker"}
+    assert result["extraDots"] == {"handle": "KWoman", "qualifier": "a.b"}
+    assert result["empty"] == {"handle": "", "qualifier": ""}
+
+
+def test_handle_capability_is_inferred_from_its_channel_with_a_dotted_override():
+    result = _run_chips_script("""
+const kind = (profile, channelKey, qualifier) =>
+  mod.handleAttachCapabilityKind(profile, { channelKey, qualifier });
+console.log(JSON.stringify({
+  definitions: kind(h3, "subject_definitions", ""),
+  retention: kind(h3, "retention_analysis", ""),
+  body: kind(h3, "detailed_description", ""),
+  tie: kind(h3, "summary", ""),
+  unclaimed: kind(h3, "overall_soundscape", ""),
+  noChannel: kind(h3, "", ""),
+  override: kind(h3, "subject_definitions", "mentions"),
+  undeclaredOverride: kind(h3, "subject_definitions", "not_a_capability"),
+  genericVisual: kind(generic, "visual", ""),
+  genericOther: kind(generic, "speech", ""),
+}));
+""")
+    # Placing a chip while writing in a channel seeds the capability that
+    # channel routes to, so the chip emits where it was placed. Attaching in
+    # `subject_definitions` used to seed `mentions`, whose declared route is
+    # `detailed_description` — the chip emitted into a different channel.
+    assert result["definitions"] == "definitions"
+    assert result["retention"] == "retention"
+    assert result["body"] == "mentions"
+    # Two capabilities declare `summary`; the lower `order` wins the tie.
+    assert result["tie"] == "summary"
+    # A channel no capability claims falls back to the prose default, as does
+    # one box projecting every channel — the Writing draft has no single channel.
+    assert result["unclaimed"] == "mentions"
+    assert result["noChannel"] == "mentions"
+    # The dotted qualifier is the explicit override; an undeclared one falls
+    # through rather than seeding a kind nothing can compile.
+    assert result["override"] == "mentions"
+    assert result["undeclaredOverride"] == "definitions"
+    assert result["genericVisual"] == "derived_prompt"
+    # `generic@1` declares no `mentions`, and "" is the correct answer: it means
+    # seed nothing and take the format default.
+    assert result["genericOther"] == ""
+
+
+def test_handle_attach_stores_a_capability_only_when_it_deviates_from_the_default():
+    result = _run_chips_script("""
+const record = (profile, channelKey, qualifier) =>
+  mod.handleAttachCapabilityRecord(profile, { channelKey, qualifier });
+console.log(JSON.stringify({
+  deviating: record(h3, "detailed_description", ""),
+  matchesDefault: record(h3, "subject_definitions", ""),
+  genericVisual: record(generic, "visual", ""),
+  genericOther: record(generic, "speech", ""),
+}));
+""")
+    # Sparse like the routing beside it: the compiler already falls back to the
+    # lowest-`order` capability, so storing that same kind writes an authored
+    # deviation where the author deviated from nothing. `capability_id`/`kind`
+    # only — a stored `channel_key`/`placement` would freeze this chip's routing
+    # at attach time, and a stored `enabled` would resolve the tri-state out of
+    # inheriting its Reference or identity default.
+    assert result["deviating"] == [
+        {"capability_id": "mentions", "kind": "mentions"}]
+    assert result["matchesDefault"] == []
+    assert result["genericVisual"] == []
+    assert result["genericOther"] == []
+
+
+def test_handle_attach_default_matches_the_servers_undeclared_order_rule():
+    from server import prompt_context
+
+    # A capability with no `order` is LAST to the server
+    # (`_default_capability` reads it as MAX_CAPABILITIES) and FIRST to the
+    # browser's display ordering (`orderedReferenceDerived` reads it as 0).
+    # Sparsity has to follow the server, or a chip omits a record the compiler
+    # then resolves to a capability the author never chose.
+    profile = {"capabilities": {"reference": {"derived": {
+        "ordered": {"order": 2, "channel_key": "body", "placement": "inline",
+                    "label": "Ordered"},
+        "unordered": {"channel_key": "aside", "placement": "inline",
+                      "label": "Unordered"},
+    }}}}
+    server_default = prompt_context._default_capability(
+        {"kind": "reference"}, profile)["kind"]
+    assert server_default == "ordered"
+    result = _run_node(
+        f"const mod = await import("
+        f"{json.dumps((ROOT / 'web/js/prompt_context_chips.js').as_uri())});\n"
+        f"const p = {json.dumps(profile)};\n"
+        "const record = (channelKey) =>"
+        " mod.handleAttachCapabilityRecord(p, { channelKey });\n"
+        "console.log(JSON.stringify({"
+        " displayFirst: mod.handleAttachCapabilityKind(p, {}),"
+        " serverDefault: record('body'),"
+        " deviating: record('aside') }));\n")
+    # The server's default kind gets no record; the other one does — the reverse
+    # of what the display ordering alone would have produced.
+    assert result["serverDefault"] == []
+    assert result["deviating"] == [
+        {"capability_id": "unordered", "kind": "unordered"}]
+
+
+def test_unheadered_draft_text_lands_in_the_declared_default_draft_channel():
+    result = _run_chips_script("""
+const keys = ["subject_definitions", "summary", "detailed_description"];
+const doc = { nodes: [{ type: "text", node_id: "t1",
+  text: "A woman crosses the market.\\nsummary: [reference generation]" }] };
+const text = (split, key) => mod.promptDocumentText(split[key]);
+const declared = mod.splitPromptDocumentChannels(doc, keys,
+  { defaultKey: "detailed_description" });
+const undeclared = mod.splitPromptDocumentChannels(doc, keys);
+const unknown = mod.splitPromptDocumentChannels(doc, keys,
+  { defaultKey: "not_a_channel" });
+console.log(JSON.stringify({
+  declared: keys.map((k) => [k, text(declared, k)]),
+  undeclared: keys.map((k) => [k, text(undeclared, k)]),
+  unknown: keys.map((k) => [k, text(unknown, k)]),
+}));
+""")
+    # The leading unheadered line follows the declared channel; a later `key:`
+    # header still wins for its own text.
+    assert result["declared"] == [
+        ["subject_definitions", ""],
+        ["summary", "[reference generation]"],
+        ["detailed_description", "A woman crosses the market."],
+    ]
+    # Omitted and unresolvable both keep channel 1 — the behavior every caller
+    # had before the parameter existed. The template-retargeting collapse relies
+    # on that default staying byte-identical.
+    assert result["undeclared"] == [
+        ["subject_definitions", "A woman crosses the market."],
+        ["summary", "[reference generation]"],
+        ["detailed_description", ""],
+    ]
+    assert result["unknown"] == result["undeclared"]
+
+
+def test_writing_draft_stamps_its_draft_channel_rather_than_resolving_at_apply():
+    panel = _source("web/js/editor_prompt_panel.js")
+    settings = _source("web/js/editor_settings.js")
+    # The stamp is written when the draft is BUILT and read back verbatim. A
+    # draft authored before its template declared a draft channel carries no
+    # stamp, and that absence is what keeps its unheadered text in channel 1
+    # instead of silently relocating on the first Apply after an update.
+    assert "writingState.defaultDraftChannel = defaultDraftChannel(template)" in panel
+    assert ('writingState.defaultDraftChannel = String(saved.defaultDraftChannel || "")'
+            in panel)
+    assert "defaultDraftChannel: writingState.defaultDraftChannel" in panel
+    # One accessor feeds the hint and BOTH split call sites, so what the panel
+    # promises and what Apply does cannot disagree.
+    assert panel.count("defaultKey: writingDefaultChannelKey()") == 2
+    assert "Unlabelled text goes to ${writingDefaultChannelKey()" in panel
+    # Persisted only when set, exactly like `stash`, so an older record keeps
+    # the shape it was written with.
+    assert "if (value.defaultDraftChannel) {" in settings

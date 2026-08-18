@@ -84,6 +84,7 @@ function template(id, name, description, channels, options = {}) {
         label_separator: options.labelSeparator ?? " ",
         labels: options.labels ?? LABELS_PROJECT,
         shot_marker_channel: options.shotMarkerChannel ?? "",
+        default_draft_channel: options.defaultDraftChannel ?? "",
         global_merge: options.globalMerge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: options.globalChannelsOn !== false,
         default_context_profile: options.defaultContextProfile ?? "generic@1",
@@ -109,6 +110,7 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         {
             fieldSeparator: "\n\n", labelSeparator: ": ", labels: LABELS_ALWAYS,
             shotMarkerChannel: "integrated_multimodal_description",
+            defaultDraftChannel: "integrated_multimodal_description",
             globalMerge: GLOBAL_MERGE_PER_CHANNEL,
             defaultContextProfile: "minimax_h3_base@1",
         }),
@@ -119,6 +121,8 @@ export const PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         {
             fieldSeparator: "\n\n", labelSeparator: ":\n", labels: LABELS_ALWAYS,
             shotMarkerChannel: "detailed_description",
+            // NOT channel 1 — see the server module for why.
+            defaultDraftChannel: "detailed_description",
             globalMerge: GLOBAL_MERGE_PER_CHANNEL,
             defaultContextProfile: "minimax_h3_ref@1",
         }),
@@ -190,6 +194,8 @@ export function strictNormalizeChannelTemplate(raw) {
         if (shotMarkerChannel) return null;
         shotMarkerChannel = "";
     }
+    const draftChannel = String(raw.default_draft_channel ?? "");
+    if (draftChannel && !seen.has(draftChannel)) return null;
 
     return {
         id: String(raw.id ?? "custom"),
@@ -200,6 +206,7 @@ export function strictNormalizeChannelTemplate(raw) {
         label_separator: raw.label_separator === undefined ? " " : String(raw.label_separator),
         labels,
         shot_marker_channel: shotMarkerChannel,
+        default_draft_channel: draftChannel,
         global_merge: globalMerge,
         // Absent means on: a hand-edited or pre-flag template keeps the
         // per-channel global it was authored with.
@@ -230,12 +237,15 @@ export function normalizeChannelTemplate(raw) {
     }
     let shotMarkerChannel = String(raw.shot_marker_channel ?? "");
     if (!seen.has(shotMarkerChannel)) shotMarkerChannel = "";
+    let draftChannel = String(raw.default_draft_channel ?? "");
+    if (!seen.has(draftChannel)) draftChannel = "";
     return strictNormalizeChannelTemplate({
         ...raw,
         channels,
         labels,
         global_merge: globalMerge,
         shot_marker_channel: shotMarkerChannel,
+        default_draft_channel: draftChannel,
     })
         || cloneTemplate(PROMPT_CHANNEL_TEMPLATE_PRESETS[DEFAULT_CHANNEL_TEMPLATE_ID]);
 }
@@ -250,6 +260,7 @@ function templateDict(resolved) {
         label_separator: resolved.label_separator ?? " ",
         labels: resolved.labels ?? LABELS_PROJECT,
         shot_marker_channel: resolved.shot_marker_channel ?? "",
+        default_draft_channel: resolved.default_draft_channel ?? "",
         global_merge: resolved.global_merge ?? GLOBAL_MERGE_LEADING,
         global_channels_enabled: globalChannelsEnabled(resolved),
         default_context_profile: resolved.default_context_profile ?? "generic@1",
@@ -287,6 +298,28 @@ export function templateChannelKeys(templateOrId) {
         ? templateOrId
         : getChannelTemplate(templateOrId);
     return (resolved.channels || []).map((entry) => entry.key);
+}
+
+/**
+ * The channel unheadered Writing-draft text belongs to. Mirror of
+ * `prompt_channel_templates.default_draft_channel`.
+ *
+ * `""` means UNDECLARED, not "no channel" — unheadered text has to land
+ * somewhere, so it resolves to the first channel, which is what every template
+ * shipped with. Only a template naming a channel moves it, and a name the
+ * template no longer carries is treated as undeclared.
+ *
+ * This is the ONE place `""` is interpreted on this side; no call site may
+ * re-derive it.
+ */
+export function defaultDraftChannel(templateOrId) {
+    const keys = templateChannelKeys(templateOrId);
+    if (!keys.length) return "";
+    const resolved = (templateOrId && typeof templateOrId === "object" && templateOrId.channels)
+        ? templateOrId
+        : getChannelTemplate(templateOrId);
+    const declared = String(resolved.default_draft_channel ?? "");
+    return keys.includes(declared) ? declared : keys[0];
 }
 
 export function channelTemplateKeySetsEqual(left, right, catalog = null) {

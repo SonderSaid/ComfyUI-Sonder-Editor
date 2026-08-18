@@ -83,6 +83,33 @@ def global_channel_keys(template) -> tuple:
     return keys if global_channels_enabled(resolved) else keys[:1]
 
 
+def default_draft_channel(template) -> str:
+    """The channel unheadered draft text belongs to under this template.
+
+    A Writing draft is one flat box carrying every channel behind `key:`
+    headers, so text above the first header has no channel of its own. It used
+    to land in channel 1 by default, which is right for `standard` and `sonder`
+    and wrong for MiniMax H3 Full Reference, where channel 1 is
+    `subject_definitions` and narrative prose became subject definitions.
+
+    `""` means UNDECLARED, not "no channel" — unlike `shot_marker_channel`,
+    which legitimately points nowhere. Unheadered text must always land
+    somewhere, so the empty value resolves to the first channel: that is the
+    behavior every template shipped with, and it stays the answer for a template
+    whose author never thought about this. Only a template that names a channel
+    moves it. An unresolvable name is treated as undeclared for the same reason
+    the marker pointer is blanked — a dangling key must not strand text.
+
+    This is the ONE place `""` is interpreted; no call site may re-derive it.
+    """
+    resolved = template if isinstance(template, dict) else get_channel_template(template)
+    keys = template_channel_keys(resolved)
+    if not keys:
+        return ""
+    declared = str(resolved.get("default_draft_channel") or "")
+    return declared if declared in keys else keys[0]
+
+
 def _channel(key, label, description):
     return {"key": key, "label": label, "description": description}
 
@@ -146,8 +173,8 @@ _MINIMAX_REF_CHANNELS = (
 
 def _template(template_id, name, description, channels, *, field_separator=" ",
               label_separator=" ", labels=LABELS_PROJECT, shot_marker_channel="",
-              global_merge=GLOBAL_MERGE_LEADING, global_channels_on=True,
-              default_context_profile="generic@1"):
+              default_draft_channel="", global_merge=GLOBAL_MERGE_LEADING,
+              global_channels_on=True, default_context_profile="generic@1"):
     return {
         "id": template_id,
         "name": name,
@@ -157,6 +184,7 @@ def _template(template_id, name, description, channels, *, field_separator=" ",
         "label_separator": label_separator,
         "labels": labels,
         "shot_marker_channel": shot_marker_channel,
+        "default_draft_channel": default_draft_channel,
         "global_merge": global_merge,
         "global_channels_enabled": global_channels_on,
         "default_context_profile": default_context_profile,
@@ -189,6 +217,7 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         _MINIMAX_BASE_CHANNELS,
         field_separator="\n\n", label_separator=": ", labels=LABELS_ALWAYS,
         shot_marker_channel="integrated_multimodal_description",
+        default_draft_channel="integrated_multimodal_description",
         global_merge=GLOBAL_MERGE_PER_CHANNEL,
         default_context_profile="minimax_h3_base@1",
     ),
@@ -199,6 +228,10 @@ PROMPT_CHANNEL_TEMPLATE_PRESETS = {
         _MINIMAX_REF_CHANNELS,
         field_separator="\n\n", label_separator=":\n", labels=LABELS_ALWAYS,
         shot_marker_channel="detailed_description",
+        # NOT channel 1. `subject_definitions` leads this template, so the
+        # first-channel fallback sent every unheadered line of a narrative
+        # draft into the definitions field — the bug this pointer exists to fix.
+        default_draft_channel="detailed_description",
         global_merge=GLOBAL_MERGE_PER_CHANNEL,
         default_context_profile="minimax_h3_ref@1",
     ),
@@ -259,6 +292,9 @@ def strict_normalize_channel_template(raw):
     if shot_marker_channel not in seen:
         if shot_marker_channel:
             return None
+    draft_channel = str(raw.get("default_draft_channel") or "")
+    if draft_channel and draft_channel not in seen:
+        return None
     return {
         "id": str(raw.get("id") or "custom"),
         "name": str(raw.get("name") or "Custom"),
@@ -268,6 +304,7 @@ def strict_normalize_channel_template(raw):
         "label_separator": str(raw.get("label_separator", " ")),
         "labels": labels,
         "shot_marker_channel": shot_marker_channel,
+        "default_draft_channel": draft_channel,
         "global_merge": global_merge,
         "global_channels_enabled": raw.get("global_channels_enabled", True) is not False,
         "default_context_profile": str(raw.get("default_context_profile") or "generic@1"),
@@ -302,12 +339,16 @@ def normalize_channel_template(raw) -> dict:
     marker = str(raw.get("shot_marker_channel") or "")
     if marker not in seen:
         marker = ""
+    draft_channel = str(raw.get("default_draft_channel") or "")
+    if draft_channel not in seen:
+        draft_channel = ""
     normalized = strict_normalize_channel_template({
         **raw,
         "channels": channels,
         "labels": labels,
         "global_merge": global_merge,
         "shot_marker_channel": marker,
+        "default_draft_channel": draft_channel,
     })
     if normalized is not None:
         return normalized
@@ -353,6 +394,7 @@ def _template_dict(resolved) -> dict:
         "label_separator": resolved.get("label_separator", " "),
         "labels": resolved.get("labels", LABELS_PROJECT),
         "shot_marker_channel": resolved.get("shot_marker_channel", ""),
+        "default_draft_channel": resolved.get("default_draft_channel", ""),
         "global_merge": resolved.get("global_merge", GLOBAL_MERGE_LEADING),
         "global_channels_enabled": global_channels_enabled(resolved),
         "default_context_profile": resolved.get("default_context_profile", "generic@1"),
@@ -395,6 +437,11 @@ def global_template_view(template) -> dict:
     view["channels"] = channels
     if resolved.get("shot_marker_channel") not in keys:
         view["shot_marker_channel"] = ""
+    # Same reason: the narrowed view must not point at a channel it dropped.
+    # Blanking is safe here because `default_draft_channel()` falls back to the
+    # view's own first channel rather than to nothing.
+    if resolved.get("default_draft_channel") not in keys:
+        view["default_draft_channel"] = ""
     return view
 
 

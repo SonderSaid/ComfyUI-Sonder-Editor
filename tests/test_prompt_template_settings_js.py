@@ -351,6 +351,60 @@ def test_writing_projection_state_survives_settings_normalization():
     assert restored == draft
 
 
+def test_cleared_writing_drafts_never_evict_unapplied_authoring():
+    """Applying clears a draft to an empty record with a *fresh* timestamp.
+
+    Those records are behaviourally identical to an absent one on load, so
+    letting them hold LRU slots would silently discard the one draft that still
+    holds unapplied text — the exact loss the browser-local store must not
+    cause now that Writing prose is a record rather than a projection.
+    """
+    drafts = {"unapplied::scene": {"ts": 1, "draft": "still authoring this"}}
+    for index in range(60):
+        drafts[f"cleared::{index}"] = {"ts": 100 + index, "draft": "",
+                                       "document": None}
+    restored = _normalize_settings({"prompts": {
+        "writingDraftByProjectScene": drafts,
+    }})["prompts"]["writingDraftByProjectScene"]
+    assert "unapplied::scene" in restored
+    assert restored["unapplied::scene"]["draft"] == "still authoring this"
+    assert not [key for key in restored if key.startswith("cleared::")]
+
+
+def test_reset_stash_survives_normalization_and_never_nests():
+    """Reset is the only escape from a staleness-blocked Apply, so the snapshot
+    it takes has to outlive a browser reload — and must not accumulate a chain
+    of stashes-within-stashes across repeated Resets."""
+    stashed = {
+        "ts": 7, "draft": "the draft Reset replaced",
+        "document": {"nodes": [{"type": "text", "node_id": "t", "text": "hi"}]},
+        "stash": {"ts": 1, "draft": "an older stash that must be dropped"},
+    }
+    restored = _normalize_settings({"prompts": {
+        "writingDraftByProjectScene": {"project::scene": {
+            "ts": 8, "draft": "rebuilt from sections", "stash": stashed,
+        }},
+    }})["prompts"]["writingDraftByProjectScene"]["project::scene"]
+    assert restored["stash"]["draft"] == "the draft Reset replaced"
+    assert restored["stash"]["document"]["nodes"][0]["text"] == "hi"
+    assert "stash" not in restored["stash"]
+
+
+def test_a_stash_alone_keeps_its_record_alive():
+    """A record can hold recoverable work in its stash while its own draft is
+    empty. Treating that as an empty record would evict the very snapshot the
+    non-destructive Reset exists to preserve."""
+    drafts = {"stashed::scene": {"ts": 1, "draft": "",
+                                 "stash": {"ts": 1, "draft": "recoverable"}}}
+    for index in range(60):
+        drafts[f"cleared::{index}"] = {"ts": 100 + index, "draft": ""}
+    restored = _normalize_settings({"prompts": {
+        "writingDraftByProjectScene": drafts,
+    }})["prompts"]["writingDraftByProjectScene"]
+    assert restored["stashed::scene"]["stash"]["draft"] == "recoverable"
+    assert not [key for key in restored if key.startswith("cleared::")]
+
+
 def test_channel_template_catalog_keeps_builtins_read_only_and_customs_owned():
     templates = _all_channel_templates({
         "promptChannelTemplates": {"customTemplates": [{
