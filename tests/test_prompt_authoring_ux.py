@@ -2346,3 +2346,53 @@ def test_the_two_document_normalizers_agree_on_carriage_returns():
         "mod.normalizePromptDocument({ nodes: [{ type: \"text\", node_id: \"t\","
         " text: \"a\" + CR + LF + \"b\" + CR + \"c\" }] })) }));" + chr(10))["t"]
     assert server_text == browser_text == "a" + lf + "b" + lf + "c"
+
+
+def test_mention_ranking_preserves_the_source_a_row_needs_to_attach():
+    """Ranking must not narrow the row to `{handle, label}`.
+
+    Accepting a mention builds a Reference attachment from the row's `value`
+    — the semantic unit id, or `physical:<population>:<member_id>`. When the
+    ranker returned only the handle and the label, that id was silently lost
+    and the accept produced a chip whose source was empty, referencing
+    nothing. `eligible` matters for the same reason: an ineligible row is
+    listed to explain itself but must not be attachable.
+    """
+    result = _run_chips_script('const opts = [\n  { handle: "KWoman", label: "Subject: KoreanWoman", value: "unit-1", eligible: true },\n  { handle: "Street", label: "Picture source: Locations", value: "physical:pictures:m-9", eligible: false },\n];\nconsole.log(JSON.stringify({\n  ranked: mod.handleMentionCandidates("", opts),\n  filtered: mod.handleMentionCandidates("Str", opts),\n}));\n')
+    assert [r["handle"] for r in result["ranked"]] == ["KWoman", "Street"]
+    assert result["ranked"][0]["value"] == "unit-1"
+    assert result["ranked"][1]["value"] == "physical:pictures:m-9"
+    assert result["ranked"][1]["eligible"] is False
+    # Filtering must carry the same fields through.
+    assert result["filtered"][0]["value"] == "physical:pictures:m-9"
+
+
+def test_mention_candidates_join_handles_onto_attachable_sources():
+    """`promptReferenceSourceOptions` rows carry no handle; this is the join.
+
+    Its values are `physical:<pop>:<member_id>` or a semantic unit id, while
+    handles live on the member and the unit. A source with no handle has no
+    spelling to complete, so it is dropped rather than shown — a typeahead
+    cannot offer something untypeable.
+    """
+    result = _run_chips_script("""
+const options = {
+  unitOptions: [["unit-1", "Subject: KoreanWoman", true]],
+  physicalOptions: [
+    ["physical:pictures:m-9", "Picture source: Locations", true],
+    ["physical:pictures:m-nohandle", "Picture source: Unnamed", true],
+  ],
+};
+const references = [{ members: [
+  { member_id: "m-9", handle: "Street" },
+  { member_id: "m-nohandle", handle: "" },
+]}];
+const semanticUnits = [{ semantic_unit_id: "unit-1", handle: "KWoman" }];
+console.log(JSON.stringify(mod.promptMentionCandidates(
+  { options, references, semanticUnits })));
+""")
+    assert [r["handle"] for r in result] == ["KWoman", "Street"]
+    assert result[0]["value"] == "unit-1"
+    assert result[1]["value"] == "physical:pictures:m-9"
+    # The handleless member is offered by the caret menu but not by a typeahead.
+    assert all("nohandle" not in r["value"] for r in result)

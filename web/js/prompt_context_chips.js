@@ -1655,9 +1655,26 @@ export function createPromptDocumentEditor({
         event.stopPropagation();
     });
 
-    const insertAttachment = (rawAttachment, capabilityId = "") => {
+    /** Insert a chip, optionally replacing a run of text in `value` coordinates.
+     *
+     *  `replaceTextRange` exists for the mention menu: it has to remove the
+     *  `@KWo` the author typed and put the chip in its place. Without it the
+     *  literal query survives beside the chip — the very thing that made a
+     *  typed mention compile as prose. Splicing the text out first is not an
+     *  option either: that re-renders, drops the selection, and the chip then
+     *  lands at the end of the document.
+     */
+    const insertAttachment = (rawAttachment, capabilityId = "", { replaceTextRange = null } = {}) => {
         if (disabled) return null;
         pushHistory();
+        let replaced = null;
+        if (replaceTextRange && Number.isFinite(replaceTextRange.start)
+                && Number.isFinite(replaceTextRange.end)
+                && replaceTextRange.end > replaceTextRange.start) {
+            const from = modelPositionForTextOffset(replaceTextRange.start);
+            const to = modelPositionForTextOffset(replaceTextRange.end);
+            if (from && to) replaced = deleteModelSpan(from, to);
+        }
         const attachment = normalizePromptAttachment(rawAttachment);
         attachments = [...attachments.filter((value) => value.attachment_id !== attachment.attachment_id), attachment];
         const node = { type: "attachment", node_id: uid(), attachment_id: attachment.attachment_id };
@@ -1669,7 +1686,9 @@ export function createPromptDocumentEditor({
         // on the editor element — the shape `focusFirst()` produces — so a
         // caret-menu attach after a programmatic focus placed the chip at the
         // bottom of the document instead of where the author was.
-        const target = modelPositionFor(selectionBookmark()?.start);
+        const target = replaced
+            ? { index: replaced.index, offset: replaced.offset }
+            : modelPositionFor(selectionBookmark()?.start);
         let index = target ? target.index : model.nodes.length;
         if (target && model.nodes[target.index]?.type === "text") {
             const current = model.nodes[target.index];
@@ -1787,6 +1806,29 @@ export function createPromptDocumentEditor({
             ? Math.max(0, Math.min(node.text.length, Number(boundary.offset) || 0))
             : (Number(boundary.offset) > 0 ? 1 : 0);
         return { index, offset };
+    };
+
+    /** Model position for an offset into `value`.
+     *
+     *  Callers that work in text coordinates — the mention menu, which tracks a
+     *  query as offsets into `promptDocumentText` — need this to address the
+     *  model. Attachment nodes contribute no text, so they consume none of the
+     *  offset, keeping this in step with `promptDocumentText` by construction.
+     */
+    const modelPositionForTextOffset = (offset) => {
+        const target = Math.max(0, Number(offset) || 0);
+        let seen = 0;
+        for (let index = 0; index < model.nodes.length; index += 1) {
+            const node = model.nodes[index];
+            if (node.type !== "text") continue;
+            if (target <= seen + node.text.length) {
+                return { index, offset: target - seen };
+            }
+            seen += node.text.length;
+        }
+        const last = model.nodes.length - 1;
+        return last >= 0 && model.nodes[last].type === "text"
+            ? { index: last, offset: model.nodes[last].text.length } : null;
     };
 
     /** Delete everything between two model positions and report the join point.
@@ -2394,6 +2436,51 @@ export function parseHandleMention(text) {
 }
 
 /**
+ * Mention rows for a typeahead: an attachable source that HAS a spelling.
+ *
+ * `promptReferenceSourceOptions` is the authority on what may be attached and
+ * why, but its rows carry no handle — values are `physical:<pop>:<member_id>`
+ * or a semantic unit id, and a handle lives on the member or the unit. This is
+ * that join, written explicitly rather than hidden behind "just reuse it".
+ *
+ * A source with no handle is DROPPED, not shown greyed: a typeahead completes
+ * a spelling, and a source without one has nothing to type. Ineligible sources
+ * are kept with their reason so the menu explains rather than omits, matching
+ * the caret menu — but they cannot be accepted.
+ */
+export function promptMentionCandidates({ options = null, references = [],
+    semanticUnits = [] } = {}) {
+    const handleByMember = new Map();
+    for (const reference of references || []) {
+        for (const member of reference?.members || []) {
+            const id = String(member?.member_id || "");
+            const handle = String(member?.handle || "");
+            if (id && handle) handleByMember.set(id, handle);
+        }
+    }
+    const handleByUnit = new Map();
+    for (const unit of semanticUnits || []) {
+        const id = String(unit?.semantic_unit_id || "");
+        const handle = String(unit?.handle || "");
+        if (id && handle) handleByUnit.set(id, handle);
+    }
+    const rows = [];
+    const seen = new Set();
+    for (const [value, label, eligible] of [
+        ...(options?.unitOptions || []), ...(options?.physicalOptions || [])]) {
+        const raw = String(value || "");
+        const handle = raw.startsWith("physical:")
+            ? handleByMember.get(raw.split(":").slice(2).join(":")) || ""
+            : handleByUnit.get(raw) || "";
+        if (!handle || seen.has(handle)) continue;
+        seen.add(handle);
+        rows.push({ handle, label: String(label || handle),
+            value: raw, eligible: eligible !== false });
+    }
+    return rows;
+}
+
+/**
  * The `@mention` under the caret, or null when there is none in progress.
  *
  * Bounded by the same grammar the handle itself uses, so a sigil in ordinary
@@ -2443,15 +2530,20 @@ export function handleMentionCandidates(query, options = []) {
         const position = hay.indexOf(needle);
         if (needle && position < 0) return;
         scored.push({
-            value,
-            label: typeof option === "string" ? value : String(option?.label || value),
+            // The WHOLE row is carried through. Returning only `{handle,label}`
+            // silently dropped `value` — the source id an accept needs to build
+            // the attachment — so a completed mention produced a chip whose
+            // source was empty and which therefore referenced nothing at all.
+            row: typeof option === "string"
+                ? { handle: value, label: value }
+                : { ...option, handle: value, label: String(option?.label || value) },
             rank: needle ? (position === 0 ? 0 : 1) : 0,
             index,
         });
     });
     return scored
         .sort((a, b) => a.rank - b.rank || a.index - b.index)
-        .map(({ value, label }) => ({ handle: value, label }));
+        .map(({ row }) => row);
 }
 
 /**

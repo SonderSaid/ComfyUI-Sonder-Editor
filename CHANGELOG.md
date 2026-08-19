@@ -77,9 +77,10 @@ a fresh `[Unreleased]` block.
 
 ### Added
 - Writing mode now completes `@` mentions. Typing `@` and the start of a
-  handle offers this project's References; arrow keys move through them and
-  Enter completes the name. It writes the mention text only — attaching a
-  Reference is still the caret menu's job.
+  handle offers this project's References — both prompt identities and
+  physical sources — and Enter attaches the one you pick, so it compiles to
+  the format's own label rather than staying as typed text. Which part of the
+  Reference it contributes follows the field you are writing in.
 
 ### Fixed
 - Applying a Writing draft is no longer refused because the project changed. Any save anywhere in the project — moving a clip, importing an asset, editing another scene — used to mark every open draft stale, and the only offered recovery rebuilt the draft from the lane instead of applying what you wrote, so authored text had no way in at all. Apply now replaces the lane with your draft, as it says it does, and reports when it changes the number of sections.

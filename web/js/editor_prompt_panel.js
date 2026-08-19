@@ -65,6 +65,11 @@ import {
     splitPromptDocumentChannels,
     writingMentionQuery,
     handleMentionCandidates,
+    promptMentionCandidates,
+    promptReferenceSourceOptions,
+    applyPromptReferenceSource,
+    normalizePromptAttachment,
+    handleAttachCapabilityRecord,
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
 } from "./prompt_context_chips.js";
@@ -208,15 +213,21 @@ export function writingSplitText(activeChannel, defaultChannel) {
 
 /** Typeahead for `@handle` while writing prose.
  *
- *  Completes the TEXT of a mention only. It deliberately does not attach a
- *  chip: an autocomplete that mutated the attachment registry on every
- *  keystroke would make an undo step per character, and the caret menu remains
- *  the one place an attachment is created. The mention this leaves behind is
- *  resolved by the same handle path the caret menu uses.
+ *  Accepting ATTACHES a Reference. It used to insert text, on the reasoning
+ *  that attaching per keystroke would make an undo step per character — which
+ *  confused a keystroke with an accept. The text version was worse than
+ *  incomplete: the compiler's grammar is `@kind(source_id)`, so a bare
+ *  `@KWoman` in prose compiles literally and never becomes `<Subject 1>`. Only
+ *  an attachment resolves.
+ *
+ *  `sources()` is called once per menu OPEN, not per keystroke: the only
+ *  builder of the shape it needs also reconciles block metadata and can clone
+ *  attachments, so calling it per input event would be both expensive and
+ *  side-effectful on the draft.
  *
  *  Returns a cleanup function, matching the module-host contract.
  */
-export function installWritingMentionMenu(area, { handles, onAccepted } = {}) {
+export function installWritingMentionMenu(area, { sources, channelAt, onAccepted } = {}) {
     const menu = document.createElement("div");
     menu.dataset.sonderPromptContextMenu = "1";
     menu.setAttribute("role", "listbox");
@@ -256,34 +267,37 @@ export function installWritingMentionMenu(area, { handles, onAccepted } = {}) {
     const accept = (index) => {
         const chosen = rows[index];
         if (!chosen || !query) return close();
-        // A mention is a contiguous run of handle-shaped characters, so an
-        // anchor always terminates it: the whole query lies inside ONE text
-        // node. Editing just that node keeps every anchor and every other
-        // node's id untouched, which a whole-document rewrite would not.
-        const documentValue = area.promptDocument;
-        let seen = 0;
-        const nodes = documentValue.nodes.map((node) => {
-            if (node.type !== "text") return node;
-            const start = seen;
-            seen += node.text.length;
-            if (query.start < start || query.end > seen) return node;
-            const from = query.start - start;
-            const to = query.end - start;
-            return { ...node, text: `${node.text.slice(0, from)}@${chosen.handle} `
-                + node.text.slice(to) };
+        // An ineligible source is listed so the menu can explain itself, but it
+        // cannot be attached — accepting one would create a chip the compiler
+        // will refuse.
+        if (chosen.eligible === false) return;
+        // The channel the caret is writing in decides which declared capability
+        // the chip seeds. Without it every mention would seed `mentions`, whose
+        // route is the body field, so a mention typed under `subject_definitions`
+        // would emit somewhere else entirely — the defect the caret menu already
+        // had fixed.
+        const attached = onAccepted?.({
+            handle: chosen.handle,
+            value: chosen.value,
+            channelKey: channelAt?.(query.start) || "",
+            // In `value` coordinates, so the editor can delete the typed query
+            // and put the chip in its place. Leaving the text behind is what
+            // made a mention compile literally.
+            replaceTextRange: { start: query.start, end: query.end },
         });
-        // Through the editor's own history so Ctrl+Z steps back over the
-        // completion rather than past it to before the mention was typed.
-        area.pushPromptHistory?.();
-        area.promptState = { document: { schema: documentValue.schema, nodes },
-            attachments: area.promptAttachments };
         close();
-        onAccepted?.();
+        return attached;
     };
+    let sourceRows = [];
     const refresh = () => {
+        const previous = query;
         query = writingMentionQuery(area.value, area.promptTextOffset ?? -1);
         if (!query || query.completingQualifier) return close();
-        rows = handleMentionCandidates(query.handle, handles?.() || []);
+        // Once per OPEN. `sources()` reconciles block metadata and can clone
+        // attachments, so running it per keystroke would mutate the draft on
+        // every character typed.
+        if (!previous) sourceRows = sources?.() || [];
+        rows = handleMentionCandidates(query.handle, sourceRows);
         if (!rows.length) return close();
         menu.replaceChildren(...rows.map((row, index) => {
             const item = document.createElement("div");
@@ -1445,19 +1459,41 @@ export function mountPromptManagementPanel(host) {
         // with listeners bound to a detached editor.
         disposeMentionMenu?.();
         disposeMentionMenu = installWritingMentionMenu(draftArea, {
-            // A PROPERTY, not a method: `host._promptSemanticUnits` is the
-            // array itself, and it is reassigned as the project loads, so it
-            // is read fresh on each keystroke rather than captured here.
-            handles: () => (Array.isArray(host._promptSemanticUnits)
-                ? host._promptSemanticUnits : [])
-                .map((unit) => ({ handle: String(unit?.handle || ""),
-                    label: String(unit?.name || unit?.handle || "") }))
-                .filter((row) => row.handle),
-            onAccepted: () => {
+            // Built once per menu open. `promptReferenceSourceOptions` is the
+            // authority on what may be attached and why; the handle join is
+            // explicit because its rows carry no handle of their own.
+            sources: () => promptMentionCandidates({
+                options: promptReferenceSourceOptions({
+                    scene: { ...(scene || {}),
+                        _context_reference_frame_threshold:
+                            host._referenceFrameThreshold || 0 },
+                    references: host._references || [],
+                    semanticUnits: host._promptSemanticUnits || [],
+                    profileId: scene?.prompt_context_profile_id
+                        || host._channelTemplate().default_context_profile || "generic@1",
+                    scope: "global",
+                    resolvedProfile: host._resolvedPromptContextProfile?.(),
+                }),
+                references: host._references || [],
+                semanticUnits: host._promptSemanticUnits || [],
+            }),
+            // Writing Source is one box over every channel, so the caret is the
+            // only thing that says which channel a mention belongs to.
+            channelAt: (offset) => writingChannelAtCaret(
+                draftArea.value, offset, templateChannelKeys(host._channelTemplate())),
+            onAccepted: ({ value, channelKey, replaceTextRange }) => {
+                const profile = host._resolvedPromptContextProfile?.();
+                const attachment = applyPromptReferenceSource(
+                    normalizePromptAttachment({ kind: "reference" }), value);
+                const seeded = handleAttachCapabilityRecord(profile, { channelKey });
+                if (seeded.length) attachment.capabilities = structuredClone(seeded);
+                draftArea.insertAttachment(attachment, "", { replaceTextRange });
                 writingState.draft = draftArea.value;
                 writingState.document = draftArea.promptDocument;
+                // The registry changes now, which the text-only accept never did.
                 writingState.attachments = draftArea.promptAttachments;
                 saveWritingState();
+                return attachment;
             },
         });
         installPromptContextMenu({
