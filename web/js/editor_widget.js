@@ -11232,7 +11232,6 @@ export class EditorWidget {
                               sections, extendDurationTo = 0, source_fps: sourceFps = 0,
                               source_channel_template: sourceChannelTemplate = null,
                               source_channel_template_id: sourceChannelTemplateId = null,
-                              base_modified_at: baseModifiedAt = "",
                               prompt_context_profile_id: promptContextProfileId = null,
                               prompt_context_profile_config: promptContextProfileConfig = null,
                               minimax_h3_conditioning_setups: minimaxSetups = null,
@@ -11243,10 +11242,6 @@ export class EditorWidget {
         if (this._isPromptTrackLocked() || this._isGlobalPromptTrackLocked()) {
             notifyWarning("Prompt track is locked.", { source: "prompt-apply-refused" });
             return;
-        }
-        const currentVersion = getProjectVersion(this._projectDirName());
-        if (baseModifiedAt && currentVersion && baseModifiedAt !== currentVersion) {
-            throw new Error("Writing draft is stale. Reset or reconstruct it from the current scene before applying.");
         }
         // New entries carry the whole authored definition. Legacy entries carry
         // only an id, which must resolve through the browser-local catalog so a
@@ -11406,7 +11401,14 @@ export class EditorWidget {
                 label: "apply prompt setup",
                 coalesce: false,
                 retryOnConflict: false,
-                expectedModifiedAt: baseModifiedAt,
+                // Deliberately NOT the draft's base version. The queue is FIFO
+                // and every completed mutation bumps `modified_at`, so a version
+                // captured when the draft was built — or even at click time — is
+                // stale by construction whenever anything is queued ahead of it,
+                // manufacturing a 409 rather than preventing one. Omitting it
+                // lets `withProjectVersionHeader` stamp the freshest known
+                // version at send time, which is the real "current". The write
+                // stays version-gated server-side either way.
             });
             if (Array.isArray(result?.payload?.prompt_context_profiles)) {
                 this._promptContextProfiles = result.payload.prompt_context_profiles;
@@ -11414,10 +11416,19 @@ export class EditorWidget {
             if (Array.isArray(result?.payload?.prompt_semantic_units)) {
                 this._promptSemanticUnits = result.payload.prompt_semantic_units;
             }
+            return true;
         } catch (e) {
             this._discardLastUndo(undoLabel);
             notifyWarning(e?.message || "Apply prompt setup was refused.", { source: "prompt-apply-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "apply_prompt_error" });
+            // Reports the outcome instead of rethrowing: two other callers
+            // simply `await` this and re-render, and turning their click
+            // handlers into unhandled rejections would be a regression. The
+            // caller that owns unapplied work — the Writing draft — must gate
+            // its "applied, now discard the draft" path on this, because the
+            // mutation can be refused ASYNCHRONOUSLY (409 conflict, attachment
+            // cap) long after any synchronous validation has passed.
+            return false;
         }
     }
 

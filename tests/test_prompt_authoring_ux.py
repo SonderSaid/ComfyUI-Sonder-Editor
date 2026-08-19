@@ -2254,3 +2254,95 @@ def test_split_disclosure_composition_uses_the_block_not_the_draft():
     assert result["splittingSecondBlock"] == []
     # Both fields in ONE block: splitting the body field does strand summary.
     assert result["sameBlockBothChannels"] == ["summary"]
+
+
+def test_apply_is_never_gated_on_a_stale_draft():
+    """All THREE enforcement points, because removing one leaves the others.
+
+    A test that only asserted the button was enabled would pass while
+    `_applyPromptSetup` still threw, and while the mutation still carried a
+    version stamped when the draft was built. `modified_at` is a single
+    whole-project timestamp bumped by ~50 save sites, so gating on it put
+    every draft on a countdown and left authored work with no path in.
+    """
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+
+    # 1. The button no longer has a staleness term.
+    assert "applyBtn.disabled = applyBlocked || !blocks.length;" in panel
+    assert "Draft is stale" not in panel
+
+    # 2. The second, independent throw is gone.
+    assert "Writing draft is stale" not in widget
+
+    # 3. The mutation no longer pins a version captured when the draft was
+    #    built; the fetch layer stamps the freshest one at send time.
+    apply_call = widget[widget.index("label: \"apply prompt setup\""):]
+    apply_call = apply_call[:apply_call.index("});")]
+    assert "expectedModifiedAt" not in apply_call, apply_call
+
+
+def test_apply_clears_the_draft_only_when_the_write_landed():
+    """The failure the staleness gate was hiding.
+
+    `_applyPromptSetup` catches its own async refusal and does not rethrow, so
+    the panel could only ever catch a SYNCHRONOUS one. Without an explicit
+    outcome check, a 409 or an over-cap attachment set resolved normally, the
+    draft and its Restore stash were wiped, and the author was told the apply
+    succeeded. Removing the gate makes that the primary failure mode.
+    """
+    panel = _source("web/js/editor_prompt_panel.js")
+    widget = _source("web/js/editor_widget.js")
+
+    # The outcome is reported rather than thrown, because two other callers
+    # simply await this and re-render.
+    assert "return true;" in widget[widget.index("async _applyPromptSetup"):]
+    apply_fn = widget[widget.index("async _applyPromptSetup"):]
+    apply_fn = apply_fn[:apply_fn.index("Browser-local prompt template library")]
+    assert "return false;" in apply_fn
+
+    # The panel gates the destructive half on that outcome.
+    gated = panel[panel.index("let applied = false;"):]
+    gated = gated[:gated.index("clearWritingState(")]
+    assert "if (!applied) return;" in gated, gated
+
+    # And Apply now leaves the applied draft restorable rather than dropping
+    # the stash with it — it is the only irreversible act on this surface.
+    assert "clearWritingState({ keepAsStash: writingDraftSnapshot() });" in panel
+
+
+def test_carriage_returns_never_reach_a_document_or_its_channels():
+    """CRLF text must parse its headers exactly as LF text does.
+
+    Splitting on the newline leaves a trailing CR on every line, and in
+    JavaScript regex `.` excludes CR — so the channel header pattern could
+    not match, every header stayed literal text, and all content fell into
+    one channel. Python's `.` DOES match CR, so the server parsed the same
+    input correctly while keeping a stray CR in the stored text: the two
+    splitters disagreed on identical input.
+
+    Normalizing at the document normalizer rather than the paste handler is
+    what heals drafts that already contain CRs.
+    """
+    result = _run_chips_script('const CR = String.fromCharCode(13), LF = String.fromCharCode(10);\nconst keys = ["subject_definitions","summary","retention_analysis","detailed_description","overall_soundscape","non_diegetic_music"];\nconst lf = "detailed_description:" + LF + "body" + LF + "overall_soundscape:" + LF + "ambient";\nconst crlf = lf.split(LF).join(CR + LF);\nconst doc = (t) => ({ schema: "prompt_document_v1", nodes: [{ type: "text", node_id: "t0", text: t }] });\nconst split = (t) => Object.fromEntries(Object.entries(\n  mod.splitPromptDocumentChannels(doc(t), keys, { defaultKey: "detailed_description" }))\n  .map(([k, v]) => [k, mod.promptDocumentText(v)]).filter(([, v]) => v));\nconsole.log(JSON.stringify({\n  normalized: mod.promptDocumentText(mod.normalizePromptDocument(doc(crlf))),\n  fromLF: split(lf),\n  fromCRLF: split(crlf),\n}));\n')
+    cr = chr(13)
+    assert cr not in result["normalized"]
+    # Identical input, identical routing — that is the whole point.
+    assert result["fromCRLF"] == result["fromLF"]
+    assert result["fromCRLF"]["overall_soundscape"] == "ambient"
+    assert "detailed_description:" not in result["fromCRLF"]["detailed_description"]
+
+
+def test_the_two_document_normalizers_agree_on_carriage_returns():
+    """Parity pair: the browser and server normalizers must strip identically."""
+    from server import prompt_context as pc
+    cr, lf = chr(13), chr(10)
+    raw = "a" + cr + lf + "b" + cr + "c"
+    server_text = pc.prompt_document_text(pc.normalize_prompt_document(
+        {"nodes": [{"type": "text", "node_id": "t", "text": raw}]}))
+    browser_text = _run_chips_script(
+        "const CR = String.fromCharCode(13), LF = String.fromCharCode(10);" + chr(10)
+        + "console.log(JSON.stringify({ t: mod.promptDocumentText("
+        "mod.normalizePromptDocument({ nodes: [{ type: \"text\", node_id: \"t\","
+        " text: \"a\" + CR + LF + \"b\" + CR + \"c\" }] })) }));" + chr(10))["t"]
+    assert server_text == browser_text == "a" + lf + "b" + lf + "c"

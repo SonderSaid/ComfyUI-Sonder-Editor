@@ -184,7 +184,15 @@ export function normalizePromptDocument(raw, fallbackText = "") {
         while (seen.has(nodeId)) nodeId = uid();
         seen.add(nodeId);
         if (value.type === "text") {
-            nodes.push({ type: "text", node_id: nodeId, text: String(value.text ?? "") });
+            // Line endings are normalized HERE, not at the paste handler, because
+            // this is the choke point every document passes through: the
+            // `promptState` and `value` setters, the saved-draft load and every
+            // server echo. Normalizing only on paste would leave already-stored
+            // drafts broken. A stray CR is not cosmetic: the channel header
+            // pattern cannot match a line ending in one, so `channel:` headers
+            // stay literal text and all content falls into a single channel.
+            nodes.push({ type: "text", node_id: nodeId,
+                text: String(value.text ?? "").replace(/\r\n?/g, "\n") });
         } else {
             const attachmentId = String(value.attachment_id || "").trim();
             if (!attachmentId) continue;

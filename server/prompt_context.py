@@ -940,8 +940,13 @@ def normalize_prompt_document(raw=None, fallback_text="") -> dict:
             node_id = _new_id()
         seen.add(node_id)
         if kind == "text":
+            # Parity with `normalizePromptDocument`. Python's `.` DOES match a
+            # CR, so the header pattern here matched while the browser's did
+            # not — the two splitters disagreed on identical input, and this
+            # side kept the CR inside the captured channel text. Strip on both.
             nodes.append({"type": "text", "node_id": node_id,
-                          "text": str(entry.get("text") or "")})
+                          "text": str(entry.get("text") or "").replace(
+                              "\r\n", "\n").replace("\r", "\n")})
         else:
             attachment_id = str(entry.get("attachment_id") or "").strip()
             if not attachment_id:

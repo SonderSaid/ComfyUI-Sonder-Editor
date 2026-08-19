@@ -82,6 +82,10 @@ a fresh `[Unreleased]` block.
   Reference is still the caret menu's job.
 
 ### Fixed
+- Applying a Writing draft is no longer refused because the project changed. Any save anywhere in the project — moving a clip, importing an asset, editing another scene — used to mark every open draft stale, and the only offered recovery rebuilt the draft from the lane instead of applying what you wrote, so authored text had no way in at all. Apply now replaces the lane with your draft, as it says it does, and reports when it changes the number of sections.
+- A Writing draft is no longer discarded when Apply is refused. The refusal could arrive after the editor had already cleared the draft and reported success, taking the draft, its chips and the restore copy with it. Applying now also keeps a restorable copy of what it applied.
+- Undo no longer wipes the scene-wide prompt. Restoring any scene edit fed back a text-only mirror that is empty under MiniMax H3, clearing every global field with it. Undo now restores the global fields themselves.
+- Text pasted from Windows apps now keeps its field headers. Carriage returns stopped `detailed_description:` and the rest from being recognized, so headers were left as literal text and everything landed in one field. Existing drafts carrying them are repaired on load.
 - Reference handles now read as part of the sentence in Writing mode instead of
   as bordered tokens. They still behave as single units for the caret, and
   their edit and remove controls appear on hover or keyboard focus.

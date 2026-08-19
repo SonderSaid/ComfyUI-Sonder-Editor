@@ -18,6 +18,7 @@ from server import prompt_payload as pp
 import server.routes as routes
 from server import prompt_context
 from server import minimax_h3
+from server.timeline_state import Scene
 from server.timeline_state import LaneConfig, PromptSection, Scene, TimelineProject
 
 
@@ -395,3 +396,58 @@ def test_set_global_prompt_is_still_destructive_so_the_flat_path_stays_correct()
     assert scene.global_channels["visual"] == "only this"
     assert scene.global_channels["speech"] == ""
     assert scene.global_channels["sounds"] == ""
+
+
+def _restore_body_into(scene, body):
+    """The scene-global half of `PUT /scenes/{id}/restore`, as the route runs it."""
+    if "global_channel_docs" in body or "global_channels" in body:
+        scene.global_channels = pp.normalize_channels(body.get("global_channels"))
+        scene.global_channel_docs = prompt_context.normalize_channel_documents(
+            body.get("global_channel_docs"), scene.global_channels,
+            scene.global_channels.keys())
+    elif "prompt" in body:
+        scene.set_global_prompt(body["prompt"])
+    if "global_attachments" in body:
+        scene.global_attachments = prompt_context.normalize_attachments(
+            body["global_attachments"])
+    return scene
+
+
+def test_undo_restores_global_channels_instead_of_blanking_them():
+    """Undo must not wipe the scene-global prompt on a non-legacy template.
+
+    The restore route used to feed `body["prompt"]` to `set_global_prompt`,
+    which is destructive by contract — channel 1 takes the text and every
+    other channel is cleared. That mirror covers only the legacy three
+    channels, so under MiniMax it is EMPTY, and undoing any scene edit blanked
+    the whole global bag. The channel state was already on the wire; the route
+    ignored it.
+    """
+    keys = ["subject_definitions", "summary", "detailed_description",
+            "overall_soundscape"]
+    scene = Scene(scene_id="s1")
+    scene.global_channels = pp.normalize_channels(
+        {"subject_definitions": "ANNA is a woman",
+         "detailed_description": "A wide shot", "overall_soundscape": "wind"},
+        keys=keys)
+    scene.global_channel_docs = prompt_context.normalize_channel_documents(
+        None, scene.global_channels, scene.global_channels.keys())
+    expected = {k: v for k, v in scene.global_channels.items() if v}
+
+    snapshot = scene.to_dict()
+    # The mirror really is empty here — that is what made the old path lossy.
+    assert snapshot["prompt"] == ""
+
+    restored = _restore_body_into(Scene(scene_id="s1"), snapshot)
+    assert {k: v for k, v in restored.global_channels.items() if v} == expected
+
+
+def test_a_snapshot_with_no_channel_state_still_uses_the_legacy_mirror():
+    """The fallback stays for a pre-channels snapshot, and only for that.
+
+    Undo history is session-only, so no stored data carries the old shape —
+    but a body without channel keys must still restore something rather than
+    silently leaving the global prompt untouched.
+    """
+    restored = _restore_body_into(Scene(scene_id="s1"), {"prompt": "legacy text"})
+    assert restored.prompt == "legacy text"

@@ -10167,8 +10167,27 @@ if routes is not None:
         # Restore all mutable scene fields from the snapshot
         scene.name = body.get("name", scene.name)
         scene.duration_frames = body.get("duration_frames", scene.duration_frames)
-        if "prompt" in body:
+        # The scene-global prompt restores from its CHANNELS, never from the
+        # flat `prompt` mirror. `set_global_prompt` is destructive by contract —
+        # the text lands in channel 1 and every other channel is cleared — and
+        # the mirror it would be fed covers only the legacy three channels, so
+        # it reads empty under any other template. Undoing an edit on a MiniMax
+        # scene therefore used to blank the whole global bag. The client posts
+        # the entire `to_dict()` snapshot, so the channel state is already on
+        # the wire; the route simply ignored it.
+        if "global_channel_docs" in body or "global_channels" in body:
+            scene.global_channels = prompt_payload.normalize_channels(
+                body.get("global_channels"))
+            scene.global_channel_docs = prompt_context.normalize_channel_documents(
+                body.get("global_channel_docs"), scene.global_channels,
+                scene.global_channels.keys())
+        elif "prompt" in body:
+            # Only a snapshot with no channel state at all falls back to the
+            # lossy mirror, which is the pre-channels shape.
             scene.set_global_prompt(body["prompt"])
+        if "global_attachments" in body:
+            scene.global_attachments = prompt_context.normalize_attachments(
+                body["global_attachments"])
 
         if "prompt_sections" in body:
             scene.prompt_sections = [

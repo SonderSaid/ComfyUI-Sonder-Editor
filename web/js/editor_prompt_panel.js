@@ -957,19 +957,22 @@ export function mountPromptManagementPanel(host) {
             },
         } } });
     };
-    const clearWritingState = () => {
+    const clearWritingState = ({ keepAsStash = null } = {}) => {
+        const applied = keepAsStash ? structuredClone(keepAsStash) : null;
         // Single-key patch for the same reason as `saveWritingState`. Every
         // field is written, so the deep merge leaves nothing stale behind, and
         // normalization then drops the emptied record entirely.
-        // The stash goes too: Apply means the work landed, so a snapshot from
-        // before some earlier Reset is stale and would offer to restore text
-        // the author already superseded.
+        // The stash becomes the draft that was just applied. Apply is the only
+        // irreversible act on this surface — it is what empties the draft — so
+        // it should leave a way back rather than dropping the previous stash
+        // and offering none. A snapshot from before some earlier Reset would
+        // be stale, so it is replaced, not kept.
         host._updateSettings({ prompts: { writingDraftByProjectScene: {
             [writingState.key]: { ts: Date.now(), draft: "", document: null,
                 attachments: [], allocations: [], blockMeta: [], baseModifiedAt: "",
-                stash: null, defaultDraftChannel: "" },
+                stash: applied, defaultDraftChannel: "" },
         } } });
-        writingState.stash = null;
+        writingState.stash = applied;
         writingState.key = ""; // force reload (reconstruct) on next render
     };
     const reconcileWritingBlockMeta = (blockDocuments) => {
@@ -1521,6 +1524,12 @@ export function mountPromptManagementPanel(host) {
         const resetBtn = makeBtn("Reset from sections",
             "Rebuild the draft + lengths from the lane's current sections. The draft you have now is kept and can be restored.");
         resetBtn.addEventListener("click", () => {
+            // Names the stake rather than asking generically: this one IS
+            // recoverable, and a confirmation that does not say so trains the
+            // author to dismiss it unread.
+            if (writingDraftHasText(writingDraftSnapshot())
+                && !window.confirm("Rebuild the draft from the lane's sections?"
+                    + " Your current draft is kept and can be restored.")) return;
             // Snapshot BEFORE reconstructing. Reset is the only escape offered
             // when Apply is staleness-blocked, so it must not also be the thing
             // that destroys the draft the author cannot apply yet.
@@ -1585,17 +1594,21 @@ export function mountPromptManagementPanel(host) {
                 ? `Sections: ${blocks.length} — total ${total}f of ${totalFrames}f (${Math.max(0, totalFrames - total)}f remaining; min ${minLen}f per section)`
                 : "No sections yet — the whole draft is one block until you add --- lines.";
             if (willExtend) readout.textContent += ` — Apply will extend the scene to ${requiredTotal}f.`;
-            const currentVersion = getProjectVersion(host._projectDirName?.() || "");
-            const stale = !!(writingState.baseModifiedAt && currentVersion
-                && writingState.baseModifiedAt !== currentVersion);
-            if (stale) readout.textContent += " — Draft is stale; reset from sections before Apply.";
+            // No staleness gate. `modified_at` is a single WHOLE-PROJECT stamp
+            // bumped on every save, and there are ~50 save sites — moving a
+            // clip, importing an asset, editing another scene. A draft was
+            // therefore on a countdown from the moment it was created, and the
+            // only offered escape (Reset) applies the rebuilt draft rather than
+            // the authored one, so authored work had no path in at all.
+            // Apply states intent plainly: make the lane match this draft.
+            // Replacing whatever the lane holds now is the feature.
             readout.style.color = COLORS.textDim;
             // Over-budget no longer blocks — Apply extends the scene instead
             // (which also satisfies the per-section minimum). Only a locked
             // lane or an empty draft can block.
             if (applyBlocked) applyBtn.textContent = "Apply (locked)";
             else applyBtn.textContent = willExtend ? `Apply & Extend Scene to ${requiredTotal}f` : "Apply";
-            applyBtn.disabled = applyBlocked || stale || !blocks.length;
+            applyBtn.disabled = applyBlocked || !blocks.length;
         };
 
         const updateStrip = () => {
@@ -1860,8 +1873,10 @@ export function mountPromptManagementPanel(host) {
             // 2..n). Apply would silently erase the whole global bag. Carry the
             // channels themselves, tagged with the template they were authored
             // under so no retarget is attempted.
+            const previousCount = (host.activeScene?.prompt_sections || []).length;
+            let applied = false;
             try {
-                await host._applyPromptSetup({
+                applied = await host._applyPromptSetup({
                     global: host.activeScene?.prompt || "",
                     global_channels: { ...(host.activeScene?.global_channels || {}) },
                     global_channel_docs: structuredClone(host.activeScene?.global_channel_docs || {}),
@@ -1870,18 +1885,28 @@ export function mountPromptManagementPanel(host) {
                     source_channel_template: host._channelTemplate(),
                     sections,
                     extendDurationTo,
-                    base_modified_at: writingState.baseModifiedAt,
                 });
             } catch (error) {
                 notifyWarning(error?.message || "Writing draft Apply was refused.",
                     { source: "prompt-writing-stale" });
                 return;
             }
-            clearWritingState();
+            // The catch above only ever sees a SYNCHRONOUS refusal. An async
+            // one — a 409 conflict, an over-cap attachment set — resolves
+            // normally, so without this the draft, its chips, its block
+            // metadata and the Restore stash were all discarded and the author
+            // was told "Applied N section(s)" while nothing had landed.
+            if (!applied) return;
+            clearWritingState({ keepAsStash: writingDraftSnapshot() });
+            // Disclosure, not a gate. Replacing the lane is exactly what Apply
+            // was asked to do, so it is reported, never confirmed.
+            const reshaped = previousCount && previousCount !== sections.length
+                ? `Replaced ${previousCount} section(s) with ${sections.length}.`
+                : `Applied ${sections.length} section(s) from the draft.`;
             notifySuccess(
                 extendDurationTo
-                    ? `Applied ${sections.length} section(s) and extended the scene to ${extendDurationTo}f.`
-                    : `Applied ${sections.length} section(s) from the draft.`,
+                    ? `${reshaped} Scene extended to ${extendDurationTo}f.`
+                    : reshaped,
                 { source: "prompt-writing-apply" });
             render();
         });
