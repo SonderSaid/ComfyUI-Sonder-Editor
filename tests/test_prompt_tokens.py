@@ -331,3 +331,46 @@ def test_token_in_authored_prose_stays_literal_and_is_advisory():
                     if value["code"] == "authored_prompt_token_literal")
     assert advisory["origin"] == "section"
     assert advisory["channel_key"] == "visual"
+
+
+def test_declared_token_grammar_matches_between_python_and_javascript():
+    """The two sides must agree on kind CASE and on what makes a declaration usable.
+
+    They did not: the browser lowercased `token_kind` and skipped a
+    declaration missing its manifest key or label template; Python did
+    neither. A format declaring `"Picture"` registered as `picture` in one and
+    `Picture` in the other, and one missing its label template registered a
+    token on the server that could never render. Breaking either half of the
+    guard must fail here.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for prompt token grammar parity")
+    profile = {
+        "physical_populations": [
+            # Mixed case, and a complete declaration.
+            {"key": "pictures", "token_kind": "Picture",
+             "ordinal_key": "pictures", "label_template": "<Picture {n}>"},
+            # Missing its label template: unusable, must be skipped by BOTH.
+            {"key": "videos", "token_kind": "video", "ordinal_key": "videos"},
+            # Missing its manifest key: likewise.
+            {"key": "audios", "token_kind": "audio",
+             "label_template": "<Audio {n}>"},
+        ],
+        "identity_kinds": [],
+        "capabilities": {},
+    }
+    module_url = (ROOT / "web" / "js" / "prompt_tokens.js").as_uri()
+    script = (
+        f"const mod = await import({json.dumps(module_url)});" + chr(10)
+        + f"const profile = {json.dumps(profile)};" + chr(10)
+        + "console.log(JSON.stringify(Object.keys("
+        "mod.promptTokenDeclarationsFromProfile(profile)).sort()));" + chr(10)
+    )
+    js_kinds = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", check=True).stdout)
+    py_kinds = sorted(prompt_context.prompt_token_declarations(profile))
+    assert js_kinds == py_kinds
+    # And the agreed answer is the lowercased, complete one only.
+    assert py_kinds == ["picture"]

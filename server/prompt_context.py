@@ -867,10 +867,17 @@ def prompt_token_declarations(profile) -> dict:
             }
     for declaration in physical_population_declarations(profile):
         token_kind = str(declaration.get("token_kind") or "")
-        if token_kind:
-            result[token_kind] = {
-                "manifest_key": str(declaration.get("ordinal_key") or ""),
-                "label_template": str(declaration.get("label_template") or ""),
+        # Parity with `web/js/prompt_tokens.js`: the kind is lowercased and a
+        # declaration missing either half of its grammar is skipped. A format
+        # declaring `"Shot"` used to register as `shot` in the browser and
+        # `Shot` here, and one missing its label template registered a token
+        # that could never render.
+        manifest_key = str(declaration.get("ordinal_key") or "")
+        label_template = str(declaration.get("label_template") or "")
+        if token_kind and manifest_key and label_template:
+            result[token_kind.lower()] = {
+                "manifest_key": manifest_key,
+                "label_template": label_template,
                 "physical": True,
                 "population": str(declaration.get("key") or ""),
             }
@@ -944,6 +951,15 @@ def normalize_prompt_document(raw=None, fallback_text="") -> dict:
             capability_id = str(entry.get("capability_id") or "").strip()
             if capability_id:
                 node["capability_id"] = capability_id
+            # Which of the capability's lines this anchor opens. One chip can
+            # emit several (a Subject definition per unit, a physical
+            # definition per slot), so `attachment_id` alone cannot say which
+            # record the following prose belongs to. Absent on every document
+            # written before materialization, which is why the reader falls
+            # back to the capability's first line rather than dropping it.
+            record_key = str(entry.get("record_key") or "").strip()
+            if record_key:
+                node["record_key"] = record_key
             nodes.append(node)
     if not nodes:
         return text_document(fallback_text)
@@ -2459,7 +2475,275 @@ def _render_reference_capability(attachment, capability, context):
     return ""
 
 
+# Segment kinds a materialized line decomposes into. `text` is the authored
+# prose body — the only part Writing mode may hold as stored text, because it is
+# the only part that does not vary with staging. Every other kind is DERIVED and
+# must stay a live node: labels renumber, source lists change arity, shot
+# citations follow a render-window-dependent counter, markers follow staged
+# intent, and speaker tokens follow document order. Freezing any of them into
+# stored prose violates the ordinal invariant.
+SEGMENT_TEXT = "text"
+SEGMENT_LABEL = "label"
+SEGMENT_SOURCES = "sources"
+SEGMENT_SHOTS = "shots"
+SEGMENT_MARKER = "marker"
+SEGMENT_SPEAKER = "speaker"
+DERIVED_SEGMENT_KINDS = frozenset({
+    SEGMENT_LABEL, SEGMENT_SOURCES, SEGMENT_SHOTS, SEGMENT_MARKER,
+    SEGMENT_SPEAKER,
+})
+
+
+def _segment(kind, text, **fields) -> dict:
+    """One run of a rendered line, tagged with whether it is authored.
+
+    `text` is always the exact substring this segment contributes, so
+    `"".join(segment["text"] for segment in segments)` reproduces the assembled
+    line byte for byte. That identity is what the round-trip gate rests on:
+    the assemblers below build segments and join them, rather than building a
+    string and re-parsing it, so a materialized document cannot drift from the
+    string the compiler would otherwise have emitted.
+    """
+    return {"kind": kind, "text": str(text or ""), **fields}
+
+
+def segments_text(segments) -> str:
+    """The rendered line a segment list stands for."""
+    return "".join(str(segment.get("text") or "") for segment in segments or [])
+
+
+def reference_capability_segments(attachment, capability, context) -> list[tuple]:
+    """`reference_capability_lines`, before the segments are joined.
+
+    Same owner keys and same order; each line carries its segment list instead
+    of its rendered string. This is the materializer's input.
+    """
+    return _reference_capability_parts(attachment, capability, context)
+
+
+def record_key(owner) -> str:
+    """Stable string form of a line's owner tuple, for the anchor node."""
+    if isinstance(owner, (list, tuple)):
+        return ":".join(str(part) for part in owner)
+    return str(owner or "")
+
+
+def detached_record_keys(attachment) -> set:
+    """Records whose prose the author has taken ownership of.
+
+    Detachment is an EXPLICIT flag, never inferred from node identity: text
+    nodes keep their id when typed into, and bare text nodes are re-issued a
+    fresh one, so identity can neither prove nor disprove an edit (audit
+    finding 2). Stored per record rather than per attachment because one chip
+    can own several lines and the author may edit only one.
+    """
+    raw = (attachment.get("config") or {}).get("detached_records")
+    return {str(value) for value in raw or [] if str(value or "")}
+
+
+def materialize(attachment, capability, context) -> dict:
+    """Document fragment holding this capability's lines as authored prose.
+
+    Each line becomes an ANCHOR (one attachment node, at the label position,
+    tagged with the record it opens) followed by the line's text runs. Derived
+    elements are deliberately NOT written: labels renumber, source lists change
+    arity, shot citations follow the render window, markers follow staged
+    intent, and speaker tokens follow document order. They are recomputed on
+    every read by `materialized_lines`, so a materialized document cannot
+    freeze a fact that staging owns.
+
+    Scaffolding (` is `, `: `, ` - `) materializes as text alongside the prose:
+    the point of the inversion is that the author owns the whole sentence, and
+    an uneditable connective would make Writing a projection again in
+    miniature.
+    """
+    nodes = []
+    for owner, segments in _reference_capability_parts(
+            attachment, capability, context):
+        if nodes:
+            nodes.append({"type": "text", "node_id": _new_id(), "text": "\n"})
+        anchor = {"type": "attachment", "node_id": _new_id(),
+                  "attachment_id": str(attachment.get("attachment_id") or ""),
+                  "record_key": record_key(owner)}
+        capability_id = str(capability.get("capability_id")
+                            or capability.get("kind") or "")
+        if capability_id:
+            anchor["capability_id"] = capability_id
+        nodes.append(anchor)
+        # One text node per maximal run of non-derived segments, so the holes
+        # the reader fills line up one-for-one with the text nodes it finds.
+        for run in _segment_text_runs(segments):
+            nodes.append({"type": "text", "node_id": _new_id(), "text": run})
+    if not nodes:
+        return text_document("")
+    return {"schema": DOCUMENT_SCHEMA, "nodes": nodes}
+
+
+def _segment_text_runs(segments) -> list:
+    """Maximal runs of storable segments, in order."""
+    runs = []
+    current = []
+    for segment in segments or []:
+        if str(segment.get("kind") or "") in DERIVED_SEGMENT_KINDS:
+            if current:
+                runs.append("".join(current))
+                current = []
+            continue
+        current.append(str(segment.get("text") or ""))
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
+def materialized_lines(document, attachment, capability, context) -> list[tuple]:
+    """Inverse of `materialize`: stored prose re-joined with live derived parts.
+
+    The template is recomputed from the assemblers rather than read back from
+    the document, so every derived element is current by construction; the
+    document contributes only the text runs. A record whose anchor is present
+    but whose prose was deleted contributes nothing for that hole rather than
+    falling back to the chip config, which would resurrect prose the author
+    removed.
+    """
+    parts = {record_key(owner): segments for owner, segments
+             in _reference_capability_parts(attachment, capability, context)}
+    order = [record_key(owner) for owner, _ in
+             _reference_capability_parts(attachment, capability, context)]
+    attachment_id = str(attachment.get("attachment_id") or "")
+    nodes = normalize_prompt_document(document)["nodes"]
+    lines = []
+    index = 0
+    while index < len(nodes):
+        node = nodes[index]
+        index += 1
+        if node.get("type") != "attachment":
+            continue
+        if str(node.get("attachment_id") or "") != attachment_id:
+            continue
+        key = str(node.get("record_key") or "")
+        if not key:
+            # Pre-materialization document: the anchor names no record, so it
+            # can only mean the capability's first line.
+            key = order[0] if order else ""
+        segments = parts.get(key)
+        if segments is None:
+            continue
+        runs = []
+        while index < len(nodes) and nodes[index].get("type") == "text":
+            text = str(nodes[index].get("text") or "")
+            index += 1
+            if "\n" in text:
+                # A newline ends the record's extent, matching the one-line-
+                # per-label rule; the remainder belongs to whatever follows.
+                head = text.split("\n", 1)[0]
+                if head:
+                    runs.append(head)
+                break
+            runs.append(text)
+        lines.append((key, _join_segments_with_runs(segments, runs)))
+    return lines
+
+
+def mark_record_detached(attachment, key, detached=True) -> dict:
+    """Set or clear the Detached flag for one record, in place.
+
+    The flag is written when the author edits materialized prose. It is never
+    inferred: a text node keeps its id when typed into, so node identity can
+    neither prove nor disprove an edit.
+    """
+    config = attachment.setdefault("config", {})
+    keys = [str(value) for value in config.get("detached_records") or []
+            if str(value or "")]
+    key = str(key or "")
+    if detached and key and key not in keys:
+        keys.append(key)
+    if not detached:
+        keys = [value for value in keys if value != key]
+    if keys:
+        config["detached_records"] = keys
+    else:
+        config.pop("detached_records", None)
+    return attachment
+
+
+def rematerialize(document, attachment, capability, context) -> dict:
+    """Refresh Bound records from their seeds; leave Detached prose untouched.
+
+    This is where the flag earns its keep. A Bound record still follows its
+    chip config, identity definition and member prompts, so a changed default
+    reaches it. A Detached one is the author's text now, and re-seeding it
+    would silently overwrite writing the author owns.
+
+    Records the document does not carry are appended, so enabling a capability
+    later still produces its line.
+    """
+    detached = detached_record_keys(attachment)
+    fresh = materialize(attachment, capability, context)
+    if not detached:
+        return fresh
+    attachment_id = str(attachment.get("attachment_id") or "")
+    kept = _records_by_key(document, attachment_id)
+    nodes = []
+    for node in fresh["nodes"]:
+        if node.get("type") == "attachment":
+            key = str(node.get("record_key") or "")
+            preserved = kept.get(key) if key in detached else None
+            if preserved is not None:
+                nodes.extend(copy.deepcopy(preserved))
+                continue
+        nodes.append(node)
+        continue
+    return {"schema": DOCUMENT_SCHEMA, "nodes": nodes} if nodes \
+        else text_document("")
+
+
+def _records_by_key(document, attachment_id) -> dict:
+    """Anchor node plus its following text runs, per record key."""
+    nodes = normalize_prompt_document(document)["nodes"]
+    result = {}
+    index = 0
+    while index < len(nodes):
+        node = nodes[index]
+        index += 1
+        if node.get("type") != "attachment":
+            continue
+        if str(node.get("attachment_id") or "") != attachment_id:
+            continue
+        run = [node]
+        while index < len(nodes) and nodes[index].get("type") == "text":
+            text = str(nodes[index].get("text") or "")
+            if "\n" in text:
+                break
+            run.append(nodes[index])
+            index += 1
+        result[str(node.get("record_key") or "")] = run
+    return result
+
+
+def _join_segments_with_runs(segments, runs) -> str:
+    """Walk the template, emitting derived parts live and filling holes in order."""
+    result = []
+    pending = list(runs)
+    in_hole = False
+    for segment in segments or []:
+        if str(segment.get("kind") or "") in DERIVED_SEGMENT_KINDS:
+            result.append(str(segment.get("text") or ""))
+            in_hole = False
+            continue
+        if not in_hole:
+            in_hole = True
+            result.append(pending.pop(0) if pending else "")
+    return "".join(result)
+
+
 def reference_capability_lines(attachment, capability, context) -> list[tuple]:
+    """Owner-tagged rendered lines. Thin join over the segment builder, so the
+    string path and the materialized path can never disagree."""
+    return [(owner, segments_text(segments)) for owner, segments
+            in _reference_capability_parts(attachment, capability, context)]
+
+
+def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
     """Owner-tagged definition/retention lines for per-semantic-unit dedupe.
 
     Two chips may legitimately select overlapping Subjects ([A, B] and [A]).
@@ -2512,15 +2796,25 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                     joined_labels = ", ".join(visual_labels[:-1]) + f", and {visual_labels[-1]}"
                 source = f" from {joined_labels}"
             if identity_label and definition:
-                lines.append((("subject_definition", str(unit_id)),
-                              f"{identity_label} is "
-                              f"{_definition_before_source(definition, source)}{source}"))
+                body = _definition_before_source(definition, source)
+                lines.append((("subject_definition", str(unit_id)), [
+                    _segment(SEGMENT_LABEL, identity_label,
+                             unit_id=str(unit_id), identity_kind=identity_kind),
+                    _segment(SEGMENT_TEXT, " is "),
+                    _segment(SEGMENT_TEXT, body, authored=True),
+                    # Variable arity: one source reads " from <Picture 1>", two
+                    # gain an Oxford join. The count follows staging, so the
+                    # whole suffix stays derived even though the prose before
+                    # it is authored.
+                    _segment(SEGMENT_SOURCES, source, labels=list(visual_labels)),
+                ]))
             elif assetless and definition:
                 speaker_number = (context.get("speaker_order") or {}).get(
                     str(unit_id))
                 if not speaker_number:
                     lines.append((("identity_definition", str(unit_id)),
-                                  definition))
+                                  [_segment(SEGMENT_TEXT, definition,
+                                            authored=True)]))
             audio_definition = str(config.get("audio_definition") or "").strip()
             speaker_subject_id = str(config.get("audio_speaker_subject_id") or "")
             speaker_suffix = ""
@@ -2545,8 +2839,15 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                                 if any(str(value).startswith(prefix)
                                        for prefix in audio_prefixes)):
                 if audio_definition:
-                    lines.append((("audio_definition", str(audio_label)),
-                                  f"{audio_label} is {audio_definition}{speaker_suffix}"))
+                    lines.append((("audio_definition", str(audio_label)), [
+                        _segment(SEGMENT_LABEL, audio_label),
+                        _segment(SEGMENT_TEXT, " is "),
+                        _segment(SEGMENT_TEXT, audio_definition, authored=True),
+                        # Carries BOTH a renumbering label and a document-order
+                        # speaker token, so it is derived twice over.
+                        _segment(SEGMENT_SPEAKER, speaker_suffix,
+                                 subject_id=speaker_subject_id),
+                    ]))
         manifest = context.get("ordinal_manifest") or {}
         for declaration in physical_population_declarations(
                 context.get("profile") or {}):
@@ -2568,8 +2869,12 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
                         str(source_id)) or {}).get("prompt") or "").strip()
                 label = declared_label(declaration, number)
                 if label and definition:
-                    lines.append((("physical_definition", population, str(source_id)),
-                                  f"{label} is {definition}"))
+                    lines.append((("physical_definition", population, str(source_id)), [
+                        _segment(SEGMENT_LABEL, label,
+                                 population=population, source_id=str(source_id)),
+                        _segment(SEGMENT_TEXT, " is "),
+                        _segment(SEGMENT_TEXT, definition, authored=True),
+                    ]))
         return lines
     if kind == "retention":
         lines = []
@@ -2658,8 +2963,21 @@ def reference_capability_lines(attachment, capability, context) -> list[tuple]:
             owner = (("retention_subject", str(unit_id))
                      if identity_declaration is not None
                      else ("retention_physical", str(label)))
-            lines.append((owner, f"{label}{appearance}: {marker}"
-                          + (f" - {detail}" if detail else "")))
+            segments = [
+                _segment(SEGMENT_LABEL, label, unit_id=str(unit_id)),
+                # Render-window dependent: the same Reference cites different
+                # shots under a different window, and an earlier shot renumbers
+                # every citation after it. Never storable as text.
+                _segment(SEGMENT_SHOTS, appearance, shots=list(appearances or [])),
+                _segment(SEGMENT_TEXT, ": "),
+                _segment(SEGMENT_MARKER, marker,
+                         visual_intent=resolved_visual,
+                         audio_intent=resolved_audio, is_audio=is_audio),
+            ]
+            if detail:
+                segments.append(_segment(SEGMENT_TEXT, " - "))
+                segments.append(_segment(SEGMENT_TEXT, detail, authored=True))
+            lines.append((owner, segments))
         return lines
     return []
 
@@ -3628,7 +3946,18 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
     context["reference_group_shots"] = dict(reference_group_shots)
     context["reference_unit_shots"] = dict(reference_unit_shots)
     if isinstance(context.get("ordinal_manifest"), dict):
-        context["ordinal_manifest"][SHOT_ORDINAL_KEY] = shot_ordinals
+        # `shots` is compiler-owned. A custom format declaring a physical
+        # population with that same `ordinal_key` would have its ordinals
+        # silently overwritten here. Detect the DECLARATION rather than the
+        # key's presence: the key is also present on any re-entry with a reused
+        # context, and refusing to write there would break `@shot` outright.
+        claimed = any(str(declaration.get("ordinal_key") or "") == SHOT_ORDINAL_KEY
+                      for declaration in physical_population_declarations(
+                          context.get("profile") or {}))
+        if claimed:
+            context.setdefault("_reserved_key_conflicts", []).append(SHOT_ORDINAL_KEY)
+        else:
+            context["ordinal_manifest"][SHOT_ORDINAL_KEY] = shot_ordinals
     emitted_groups = {}
     # Same resolved text, different owner key. Definition/retention dedupe is
     # per semantic unit OR physical slot, so one member's Library prose reaching

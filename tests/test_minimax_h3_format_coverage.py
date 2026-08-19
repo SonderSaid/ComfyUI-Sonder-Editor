@@ -20,6 +20,7 @@ relationship Sonder currently emits differently. They fail loudly the day the
 gap is closed, which is the signal to promote them to ordinary rows.
 """
 
+import copy
 import re
 
 import pytest
@@ -1018,3 +1019,378 @@ def test_no_scene_fixture_produces_a_blocking_diagnostic(compiled):
     """Every in-scope combination must compile without an integrity error."""
     for name, result in compiled.items():
         assert [value["code"] for value in result["errors"]] == [], name
+
+
+# --------------------------------------------------------------------------
+# Materialization boundary (Writing-Mode Parity, Phase 4)
+# --------------------------------------------------------------------------
+
+def test_authored_prose_never_absorbs_a_derived_element(monkeypatch):
+    """The materialization boundary, checked against every scene fixture.
+
+    Only `authored` segments may ever be stored as Writing-mode text. So an
+    authored segment must not contain an entity label, a shot citation or a
+    retention marker: those renumber with staging and the render window, and
+    freezing one into stored prose is the ordinal-invariant violation this
+    whole phase exists to avoid. A future edit that folds a derived element
+    back into the prose body fails here rather than in a user's project.
+    """
+    captured = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        result = original(attachment, capability, context)
+        captured.extend(segments for _owner, segments in result)
+        return result
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    assert captured, "no reference lines were assembled"
+
+    markers = set(prompt_context.VISUAL_INTENTS.values()) | set(
+        prompt_context.AUDIO_INTENTS.values())
+    for segments in captured:
+        for segment in segments:
+            if not segment.get("authored"):
+                continue
+            text = segment["text"]
+            assert not re.search(r"<[A-Za-z ]+\d+>", text), text
+            assert "[Shot " not in text, text
+            assert text.strip() not in markers, text
+
+
+def test_every_line_is_exactly_its_segments(monkeypatch):
+    """`segments_text` reproduces the assembled line byte for byte.
+
+    This is the round-trip gate at the assembler seam: the compiler's string
+    path is a join over the same segments the materializer consumes, so a
+    materialized document cannot drift from what the compiler would have
+    emitted. Guards against a future branch that builds a string directly and
+    leaves the segment list behind. Inputs are captured during a real compile
+    and replayed afterwards, so the two public entry points are compared
+    without either one re-entering the capture.
+    """
+    calls = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        calls.append((attachment, capability, context))
+        return original(attachment, capability, context)
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    monkeypatch.undo()
+    assert calls, "no reference lines were assembled"
+
+    compared = 0
+    for attachment, capability, context in calls:
+        parts = prompt_context.reference_capability_segments(
+            attachment, capability, context)
+        rendered = prompt_context.reference_capability_lines(
+            attachment, capability, context)
+        assert [owner for owner, _ in parts] == [owner for owner, _ in rendered]
+        for (_owner, segments), (_key, line) in zip(parts, rendered):
+            assert prompt_context.segments_text(segments) == line
+            assert all(segment.get("kind") for segment in segments), segments
+            compared += 1
+    assert compared, "no lines were compared"
+
+
+def test_round_trip_gate_materialize_then_compile_is_unchanged(monkeypatch):
+    """The Phase-4 gate: materializing a line must not change what it compiles to.
+
+    For every reference line every scene fixture produces, materialize it into
+    document nodes and read it back. The result must equal the line the
+    compiler emits today, byte for byte. This is the check that the authored
+    prose stored in the document plus the derived parts recomputed on read
+    reconstruct exactly the assembled sentence.
+    """
+    calls = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        calls.append((attachment, capability, context))
+        return original(attachment, capability, context)
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    monkeypatch.undo()
+    assert calls, "no reference lines were assembled"
+
+    checked = 0
+    for attachment, capability, context in calls:
+        expected = prompt_context.reference_capability_lines(
+            attachment, capability, context)
+        if not expected:
+            continue
+        document = prompt_context.materialize(attachment, capability, context)
+        actual = prompt_context.materialized_lines(
+            document, attachment, capability, context)
+        assert [prompt_context.record_key(owner) for owner, _ in expected] == [
+            key for key, _ in actual]
+        for (_owner, line), (_key, rebuilt) in zip(expected, actual):
+            assert rebuilt == line
+            checked += 1
+    assert checked, "no lines were round-tripped"
+
+
+def test_materialized_document_stores_no_derived_element(monkeypatch):
+    """What lands in the document is prose only.
+
+    The stored text must not contain a label, a shot citation or a marker —
+    those are recomputed on read. If any leaked into a text node the document
+    would freeze a fact staging owns, which is the failure the whole phase is
+    built to prevent.
+    """
+    calls = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        calls.append((attachment, capability, context))
+        return original(attachment, capability, context)
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    monkeypatch.undo()
+
+    # Labels and shot citations are checked by pattern because both have a
+    # shape ordinary prose cannot accidentally take. Markers are NOT checked by
+    # substring: `reference` is an audio marker value and also a normal English
+    # word, and real prose says "the whole-video temporal-structure reference".
+    # Marker leakage is pinned instead by
+    # `test_authored_prose_never_absorbs_a_derived_element`, which compares a
+    # whole stripped segment rather than searching inside one.
+    inspected = 0
+    for attachment, capability, context in calls:
+        lines = prompt_context.reference_capability_lines(
+            attachment, capability, context)
+        if not lines:
+            continue
+        document = prompt_context.materialize(attachment, capability, context)
+        stored = prompt_context.prompt_document_text(document)
+        assert not re.search(r"<[A-Za-z ]+\d+>", stored), stored
+        assert "[Shot " not in stored, stored
+        inspected += 1
+    assert inspected, "no lines were materialized"
+
+
+def test_a_deleted_prose_hole_does_not_resurrect_the_chip_config(monkeypatch):
+    """An emptied hole contributes nothing rather than falling back to config.
+
+    Re-seeding from `config` would restore prose the author deliberately
+    deleted, which is the one behavior a detached record must never have.
+    The derived parts must still be there — deleting prose removes the
+    sentence, not the label it hangs off.
+    """
+    calls = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        calls.append((attachment, capability, context))
+        return original(attachment, capability, context)
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    monkeypatch.undo()
+
+    checked = 0
+    for attachment, capability, context in calls:
+        document = prompt_context.materialize(attachment, capability, context)
+        prose = [node for node in document["nodes"]
+                 if node["type"] == "text" and node["text"] != chr(10)]
+        if not prose:
+            continue
+        emptied = {"schema": document["schema"],
+                   "nodes": [node for node in document["nodes"]
+                             if node not in prose]}
+        for _key, rebuilt in prompt_context.materialized_lines(
+                emptied, attachment, capability, context):
+            for run in (node["text"] for node in prose):
+                assert run.strip() not in rebuilt or not run.strip(), rebuilt
+        checked += 1
+    assert checked, "no materialized prose to strip"
+
+
+def test_detached_prose_survives_a_reseed_and_bound_prose_follows_it(monkeypatch):
+    """The Bound/Detached split, which is the whole point of the flag.
+
+    A Bound record still follows its chip config, so a changed default
+    reaches it. A Detached record is the author's text and must not be
+    overwritten by re-seeding.
+    """
+    calls = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        calls.append((attachment, capability, context))
+        return original(attachment, capability, context)
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    monkeypatch.undo()
+
+    checked = 0
+    for attachment, capability, context in calls:
+        document = prompt_context.materialize(attachment, capability, context)
+        keys = [node["record_key"] for node in document["nodes"]
+                if node["type"] == "attachment"]
+        if not keys:
+            continue
+        # The author rewrites the first record and detaches it.
+        edited = copy.deepcopy(document)
+        replaced = False
+        for node in edited["nodes"]:
+            if node["type"] == "text" and node["text"] != chr(10):
+                node["text"] = " is MINE"
+                replaced = True
+                break
+        if not replaced:
+            continue
+        target = copy.deepcopy(attachment)
+        prompt_context.mark_record_detached(target, keys[0])
+        assert prompt_context.detached_record_keys(target) == {keys[0]}
+
+        reseeded = prompt_context.rematerialize(
+            edited, target, capability, context)
+        assert "MINE" in prompt_context.prompt_document_text(reseeded)
+
+        # Clearing the flag lets the seed win again.
+        prompt_context.mark_record_detached(target, keys[0], detached=False)
+        assert prompt_context.detached_record_keys(target) == set()
+        bound = prompt_context.rematerialize(
+            edited, target, capability, context)
+        assert "MINE" not in prompt_context.prompt_document_text(bound)
+        assert (prompt_context.prompt_document_text(bound)
+                == prompt_context.prompt_document_text(document))
+        checked += 1
+    assert checked, "no records were exercised"
+
+
+def test_a_detached_record_still_renumbers_its_derived_parts(monkeypatch):
+    """Detachment owns the prose, never the label.
+
+    Detaching must not freeze the ordinal: the label, shot citation and marker
+    stay live for a detached record exactly as for a bound one. Otherwise
+    editing one word would silently pin a Subject number.
+    """
+    calls = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        calls.append((attachment, capability, context))
+        return original(attachment, capability, context)
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    monkeypatch.undo()
+
+    checked = 0
+    for attachment, capability, context in calls:
+        document = prompt_context.materialize(attachment, capability, context)
+        keys = [node["record_key"] for node in document["nodes"]
+                if node["type"] == "attachment"]
+        if not keys:
+            continue
+        target = copy.deepcopy(attachment)
+        prompt_context.mark_record_detached(target, keys[0])
+        rebuilt = prompt_context.materialized_lines(
+            document, target, capability, context)
+        expected = prompt_context.reference_capability_lines(
+            target, capability, context)
+        assert [line for _k, line in rebuilt] == [line for _o, line in expected]
+        checked += 1
+    assert checked, "no records were exercised"
+
+
+# --------------------------------------------------------------------------
+# Compatibility mirrors (Writing-Mode Parity, Phase 5)
+# --------------------------------------------------------------------------
+
+def _materialized_samples(monkeypatch):
+    """Every reference line the fixtures produce, as a materialized document."""
+    calls = []
+    original = prompt_context._reference_capability_parts
+
+    def _capture(attachment, capability, context):
+        calls.append((attachment, capability, context))
+        return original(attachment, capability, context)
+
+    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
+    for build in SCENES.values():
+        build()
+    monkeypatch.undo()
+    samples = []
+    for attachment, capability, context in calls:
+        document = prompt_context.materialize(attachment, capability, context)
+        if any(node["type"] == "attachment" for node in document["nodes"]):
+            samples.append((document, attachment, capability, context))
+    assert samples, "no materialized documents"
+    return samples
+
+
+H3_KEYS = ["subject_definitions", "summary", "retention_analysis",
+           "detailed_description", "overall_soundscape", "non_diegetic_music"]
+LEGACY_KEYS = ["visual", "speech", "sounds"]
+
+
+def test_the_channels_mirror_carries_prose_but_never_an_ordinal(monkeypatch):
+    """`channels` is PERSISTED in project.json, so it must stay unrendered.
+
+    Materialized prose newly reaches the mirror — it used to sit in
+    `config.definition`, which the mirror never saw. That is the intended
+    growth. What must NOT reach it is any derived element: rendering the line
+    into the mirror would persist `<Subject 1>` and `[Shot 1]` into the
+    project file, which is the ordinal invariant this phase is built around.
+    """
+    for document, _attachment, _capability, _context in _materialized_samples(
+            monkeypatch):
+        mirror = prompt_context.channel_document_mirrors(
+            {"detailed_description": document})["detailed_description"]
+        assert not re.search(r"<[A-Za-z ]+\d+>", mirror), mirror
+        assert "[Shot " not in mirror, mirror
+
+
+def test_materialized_records_survive_a_template_retarget(monkeypatch):
+    """Switching channel template must not strip an anchor or its record key.
+
+    The collapse is deliberately lossy for TEXT, but it is document-aware:
+    losing anchors here would orphan every materialized record, silently
+    turning Bound prose into Free text on an ordinary template switch.
+    """
+    for document, _attachment, _capability, _context in _materialized_samples(
+            monkeypatch):
+        before = [(node.get("attachment_id"), node.get("record_key"))
+                  for node in document["nodes"]
+                  if node["type"] == "attachment"]
+        documents = {key: prompt_context.text_document("") for key in H3_KEYS}
+        documents["subject_definitions"] = document
+        narrowed = prompt_context.retarget_channel_documents(
+            documents, H3_KEYS, LEGACY_KEYS)
+        widened = prompt_context.retarget_channel_documents(
+            narrowed, LEGACY_KEYS, H3_KEYS)
+        after = [(node.get("attachment_id"), node.get("record_key"))
+                 for value in widened.values()
+                 for node in prompt_context.normalize_prompt_document(
+                     value)["nodes"]
+                 if node["type"] == "attachment"]
+        assert after == before
+
+
+def test_a_materialized_document_refuses_a_flat_text_overwrite(monkeypatch):
+    """A materialized record must not be silently replaced by plain text.
+
+    `replace_document_text` already refuses when a document holds anchors;
+    this pins that the protection covers materialized documents too, since
+    they are exactly the documents whose anchors carry authored prose.
+    """
+    for document, _attachment, _capability, _context in _materialized_samples(
+            monkeypatch):
+        with pytest.raises(ValueError):
+            prompt_context.replace_document_text(document, "flattened")

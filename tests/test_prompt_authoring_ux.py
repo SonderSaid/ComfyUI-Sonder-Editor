@@ -1976,3 +1976,281 @@ def test_writing_draft_stamps_its_draft_channel_rather_than_resolving_at_apply()
     # Persisted only when set, exactly like `stash`, so an older record keeps
     # the shape it was written with.
     assert "if (value.defaultDraftChannel) {" in settings
+
+
+def test_document_anchor_fields_survive_the_browser_normalizer():
+    """Parity with `normalize_prompt_document`: same fields kept, same drops.
+
+    A field the server keeps and the browser drops makes an echoed document
+    hash differently from the server copy, which spuriously 409s identity
+    validation; for `record_key` it also collapses every materialized record
+    onto the capability first line.
+    """
+    result = _run_chips_script("""
+const doc = { schema: "prompt_document@1", nodes: [
+  { type: "attachment", node_id: "n1", attachment_id: "a1",
+    capability_id: "definitions", record_key: "subject_definition:u1" },
+  { type: "text", node_id: "n2", text: " is a woman" },
+  { type: "attachment", node_id: "n3", attachment_id: "a2" },
+]};
+console.log(JSON.stringify({ nodes: mod.normalizePromptDocument(doc).nodes }));
+""")
+    nodes = result["nodes"]
+    assert nodes[0]["capability_id"] == "definitions"
+    assert nodes[0]["record_key"] == "subject_definition:u1"
+    # An anchor that carries neither must not invent them.
+    assert "capability_id" not in nodes[2]
+    assert "record_key" not in nodes[2]
+
+    from server import prompt_context
+    server_nodes = prompt_context.normalize_prompt_document({"nodes": [
+        {"type": "attachment", "node_id": "n1", "attachment_id": "a1",
+         "capability_id": "definitions", "record_key": "subject_definition:u1"},
+        {"type": "text", "node_id": "n2", "text": " is a woman"},
+        {"type": "attachment", "node_id": "n3", "attachment_id": "a2"},
+    ]})["nodes"]
+    assert server_nodes == nodes
+
+
+def test_anchor_fields_survive_a_project_save_and_load():
+    """The persistence half of the anchor contract.
+
+    `capability_id` says which part of a Reference a chip emits and
+    `record_key` says which materialized line an anchor opens. Both are
+    useless if a project save drops them, and the loss would be silent — the
+    chip would simply start compiling as the format default. Round-trips
+    through real JSON so a serializer that stringifies unknown keys cannot
+    pass by accident.
+    """
+    from server.timeline_state import Scene, PromptSection
+    document = {"schema": "prompt_document_v1", "nodes": [
+        {"type": "attachment", "node_id": "n1", "attachment_id": "a1",
+         "capability_id": "definitions",
+         "record_key": "subject_definition:u1"},
+        {"type": "text", "node_id": "n2", "text": " is a woman"},
+    ]}
+    section = PromptSection(
+        start_frame=0, end_frame=10,
+        channel_docs={"detailed_description": document},
+        attachments=[{"attachment_id": "a1", "kind": "reference"}])
+    scene = Scene(scene_id="s1", prompt_sections=[section])
+
+    reloaded = Scene.from_dict(json.loads(json.dumps(scene.to_dict())))
+    anchor = reloaded.prompt_sections[0].channel_docs[
+        "detailed_description"]["nodes"][0]
+    assert anchor["capability_id"] == "definitions"
+    assert anchor["record_key"] == "subject_definition:u1"
+
+
+def _run_panel_script(body):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for prompt panel coverage")
+    module_url = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    return _run_node(
+        f"const mod = await import({json.dumps(module_url)});" + chr(10)
+        + body + chr(10))
+
+
+H3_CHANNELS = ["subject_definitions", "summary", "retention_analysis",
+               "detailed_description", "overall_soundscape", "non_diegetic_music"]
+
+
+def test_split_carries_the_field_the_caret_is_writing_in():
+    """A split under a heading must not move the tail to another field.
+
+    `---` starts a new block and a new block opens at its DEFAULT channel, so
+    a bare break inserted while writing under `detailed_description` silently
+    relocated everything after it into the default field.
+    """
+    result = _run_panel_script("const keys = "
+        + json.dumps(H3_CHANNELS) + ";" + chr(10) + """
+const draft = "subject_definitions:" + String.fromCharCode(10)
+  + "a woman" + String.fromCharCode(10)
+  + "detailed_description:" + String.fromCharCode(10)
+  + "she walks in";
+const at = (offset) => mod.writingChannelAtCaret(draft, offset, keys);
+const brk = String.fromCharCode(10) + "---" + String.fromCharCode(10);
+console.log(JSON.stringify({
+  inFirst: at(draft.indexOf("a woman") + 3),
+  inBody: at(draft.length),
+  beforeAnyHeader: at(0),
+  // After a break the channel resets, matching how the draft is re-read.
+  afterBreak: mod.writingChannelAtCaret(
+    "detailed_description:" + String.fromCharCode(10) + "x" + brk + "y",
+    999, keys),
+  carriesWhenDifferent: mod.writingSplitText("detailed_description", "subject_definitions"),
+  silentWhenSame: mod.writingSplitText("detailed_description", "detailed_description"),
+  silentWhenUnheaded: mod.writingSplitText("", "detailed_description"),
+}));
+""")
+    assert result["inFirst"] == "subject_definitions"
+    assert result["inBody"] == "detailed_description"
+    assert result["beforeAnyHeader"] == ""
+    assert result["afterBreak"] == ""
+    # The heading is re-emitted only when the tail would otherwise move.
+    nl = chr(10)
+    assert result["carriesWhenDifferent"] == f"{nl}---{nl}detailed_description:{nl}"
+    assert result["silentWhenSame"] == f"{nl}---{nl}"
+    assert result["silentWhenUnheaded"] == f"{nl}---{nl}"
+
+
+def test_a_handle_renders_without_pill_chrome():
+    """Writing mode shows a sentence, so a handle must not be a capsule.
+
+    Only the chrome goes: the element stays atomic and keyboard-reachable.
+    """
+    result = _run_chips_script("""
+console.log(JSON.stringify({
+  handle: mod.isHandleLabel("@KWoman"),
+  qualified: mod.isHandleLabel("@KWoman.speaker"),
+  described: mod.isHandleLabel("Reference — Korean Woman"),
+  bareSigil: mod.isHandleLabel("@"),
+  empty: mod.isHandleLabel(""),
+}));
+""")
+    assert result["handle"] is True
+    assert result["qualified"] is True
+    assert result["described"] is False
+    # A lone sigil is not a handle; it is someone mid-keystroke.
+    assert result["bareSigil"] is False
+    assert result["empty"] is False
+
+
+def test_text_insertion_never_routes_through_exec_command():
+    """Regression guard: `execCommand("insertText")` drops newlines here.
+
+    That is not cosmetic — it is why "Split here" inserted an inline `---`
+    that `splitWritingDraft` never recognized, so the button silently did
+    nothing. The defect was invisible to every existing test because the
+    string passed in was correct; only the DOM path mangled it. This pins the
+    path rather than the string, since a future edit reaching for
+    `execCommand` again would reintroduce exactly this failure.
+
+    Source-level by necessity: the failure needs a real contenteditable and a
+    live Selection, which the Node harness cannot provide. Behavior was
+    verified in the running editor on 2026-08-18.
+    """
+    chips = _source("web/js/prompt_context_chips.js")
+    panel = _source("web/js/editor_prompt_panel.js")
+
+    insert = chips[chips.index("editor.insertText = "):]
+    insert = insert[:insert.index("editor.removeAttachment")]
+    # The CALL form, not the word: both files legitimately name execCommand
+    # in comments explaining why they no longer use it.
+    assert "execCommand(" not in insert and "execCommand?.(" not in insert, insert
+    assert "model.nodes" in insert
+
+    split = panel[panel.index(chr(39) + chr(39) + chr(39)) if False else
+                  panel.index("makeBtn(" + chr(34) + "Split here" + chr(34)):]
+    split = split[:split.index("Equalize")]
+    assert "insertText(" in split, split
+    assert "execCommand(" not in split and "execCommand?.(" not in split, split
+
+
+def test_the_section_break_is_multi_line_so_the_splitter_can_see_it():
+    """`splitWritingDraft` only breaks on a line whose trim equals `---`.
+
+    So whatever the split inserts must put the marker alone on its own line,
+    in every branch — including the one that carries a heading after it.
+    """
+    result = _run_panel_script('const t = (a, d) => mod.writingSplitText(a, d);\nconsole.log(JSON.stringify({\n  carried: mod.splitWritingDraft("a" + t("retention_analysis", "detailed_description") + "b"),\n  bare: mod.splitWritingDraft("a" + t("summary", "summary") + "b"),\n}));\n')
+    assert len(result["carried"]) == 2
+    assert result["carried"][1].startswith("retention_analysis:")
+    assert len(result["bare"]) == 2
+    assert result["bare"][1] == "b"
+
+
+def test_at_autocomplete_only_opens_on_a_real_mention():
+    """A sigil in prose must not open a menu.
+
+    The query is bounded by the same grammar the handle uses, so an email
+    address or an `@` that has already been followed by a space is text, not
+    an in-progress mention.
+    """
+    result = _run_chips_script('const q = (t, o) => mod.writingMentionQuery(t, o);\nconst opts = ["KWoman", "KWomanTwo", "Bagger", "Locations"];\nconsole.log(JSON.stringify({\n  midWord: q("she meets @KWo", 14),\n  justSigil: q("she meets @", 11),\n  qualifier: q("@KWoman.spea", 12),\n  notAMention: q("mail me at bob@example", 22),\n  noSigil: q("plain prose", 11),\n  afterSpace: q("@KWoman walks in", 16),\n  afterPeriod: q("outside.@K", 10),\n  afterQuote: q(String.fromCharCode(34) + "@K", 3),\n  afterDash: q("cut-@K", 6),\n  prefixFirst: mod.handleMentionCandidates("KWo", opts).map(c => c.handle),\n  interiorAllowed: mod.handleMentionCandidates("oman", opts).map(c => c.handle),\n  emptyKeepsHostOrder: mod.handleMentionCandidates("", opts).map(c => c.handle),\n  noMatch: mod.handleMentionCandidates("zzz", opts),\n}));\n')
+    assert result["midWord"]["handle"] == "KWo"
+    assert result["midWord"]["completingQualifier"] is False
+    # A bare sigil is a real mention with an empty query: it offers everything.
+    assert result["justSigil"]["handle"] == ""
+    # Past the dot the menu should offer capability kinds, not handles.
+    assert result["qualifier"]["handle"] == "KWoman"
+    assert result["qualifier"]["qualifier"] == "spea"
+    assert result["qualifier"]["completingQualifier"] is True
+    assert result["notAMention"] is None
+    # Prose reaches `@` after punctuation far more often than after a bare
+    # space. An opener allowlist refused all of these, which is what made the
+    # menu look broken in the real panel while passing in a clean fixture.
+    assert result["afterPeriod"]["handle"] == "K"
+    assert result["afterQuote"]["handle"] == "K"
+    assert result["afterDash"]["handle"] == "K"
+    assert result["noSigil"] is None
+    # The mention ended at the space; the caret is in ordinary prose again.
+    assert result["afterSpace"] is None
+
+    assert result["prefixFirst"] == ["KWoman", "KWomanTwo"]
+    assert result["interiorAllowed"] == ["KWoman", "KWomanTwo"]
+    # No query offers everything, in the order the host supplied.
+    assert result["emptyKeepsHostOrder"] == ["KWoman", "KWomanTwo", "Bagger", "Locations"]
+    assert result["noMatch"] == []
+
+
+def test_a_split_discloses_the_channels_it_would_strand():
+    """A split continues one channel; the rest stay with the block above.
+
+    Silence there is the failure mode — a new section that quietly drops its
+    summary and soundscape compiles to something the author never wrote. Only
+    channels that actually hold text count, and the channel being continued is
+    never among them.
+    """
+    result = _run_panel_script('const keys = ["subject_definitions","summary","retention_analysis","detailed_description","overall_soundscape","non_diegetic_music"];\nconst L = (t, a) => mod.writingSplitLinkage(t, a, keys);\nconst nl = String.fromCharCode(10);\nconst populated = "summary:" + nl + "a fashion video" + nl + "detailed_description:" + nl + "she walks in";\nconst onlyActive = "detailed_description:" + nl + "she walks in";\nconst blankOther = "summary:" + nl + nl + "detailed_description:" + nl + "she walks";\nconsole.log(JSON.stringify({\n  stranded: L(populated, "detailed_description"),\n  none: L(onlyActive, "detailed_description"),\n  blankIsNotPopulated: L(blankOther, "detailed_description"),\n  headerInlineText: L("summary: a line" + nl + "detailed_description:" + nl + "x", "detailed_description"),\n  activeItselfNeverListed: L(populated, "summary"),\n}));\n')
+    assert result["stranded"] == ["summary"]
+    assert result["none"] == []
+    # A header with no body strands nothing; there is nothing to inherit.
+    assert result["blankIsNotPopulated"] == []
+    # Text on the header line itself counts as content.
+    assert result["headerInlineText"] == ["summary"]
+    # Continuing `summary` strands the body field instead, never itself.
+    assert result["activeItselfNeverListed"] == ["detailed_description"]
+
+
+def test_split_disclosure_measures_only_the_block_it_splits():
+    """The notice must not name channels from a different section.
+
+    `writingSplitLinkage` was handed the entire draft, so splitting a block
+    whose own other channels were empty still announced channels populated
+    somewhere else entirely. A false positive on the only signal the author
+    gets is worse than silence.
+
+    `splitWritingDraft` cannot supply the block: it trims each one and filters
+    empties, which destroys the offsets needed to find the caret.
+    `writingBlockHeadAt` keeps them and returns the head of the impending
+    split — the tail travels with the author and is never stranded.
+    """
+    result = _run_panel_script('const keys = ["subject_definitions","summary","retention_analysis","detailed_description","overall_soundscape","non_diegetic_music"];\nconst nl = String.fromCharCode(10);\nconst head = (t, o) => mod.writingBlockHeadAt(t, o);\nconst draft = "detailed_description:" + nl + "she walks in" + nl + "---" + nl + "summary:" + nl + "a fashion video";\nconst caretInSecondBlock = draft.length;\nconst caretInFirstBlock = draft.indexOf("walks") + 3;\nconsole.log(JSON.stringify({\n  secondBlockHead: head(draft, caretInSecondBlock),\n  firstBlockHead: head(draft, caretInFirstBlock),\n  noBreakYet: head("summary:" + nl + "text", 14),\n  // The whole-draft bug: measuring everything reported summary as stranded\n  // while splitting the FIRST block, where summary is not even present.\n  strandedFromHead: mod.writingSplitLinkage(\n    head(draft, caretInFirstBlock), "detailed_description", keys),\n  strandedFromWholeDraft: mod.writingSplitLinkage(\n    draft, "detailed_description", keys),\n}));\n')
+    nl = chr(10)
+    assert result["secondBlockHead"] == "summary:" + nl + "a fashion video"
+    assert result["firstBlockHead"] == "detailed_description:" + nl + "she wal"
+    assert result["noBreakYet"] == "summary:" + nl + "text"
+    # Splitting the first block strands nothing — summary lives past the break.
+    assert result["strandedFromHead"] == []
+    # The defect this fixes: the whole draft reports it anyway.
+    assert result["strandedFromWholeDraft"] == ["summary"]
+
+
+def test_split_disclosure_composition_uses_the_block_not_the_draft():
+    """Covers the whole decision, not its parts.
+
+    An earlier version of this coverage tested `writingBlockHeadAt` and
+    `writingSplitLinkage` separately and passed with the call site still
+    handing over the entire draft — the defect was in the composition, which
+    no test could reach while it lived inline in a click handler. Breaking
+    the composition must fail here.
+    """
+    result = _run_panel_script('const keys = ["subject_definitions","summary","retention_analysis","detailed_description","overall_soundscape","non_diegetic_music"];\nconst nl = String.fromCharCode(10);\nconst draft = "detailed_description:" + nl + "she walks in" + nl + "---" + nl + "summary:" + nl + "a fashion video";\nconsole.log(JSON.stringify({\n  splittingFirstBlock: mod.writingSplitDisclosure(draft, draft.indexOf("walks") + 3, keys),\n  splittingSecondBlock: mod.writingSplitDisclosure(draft, draft.length, keys),\n  sameBlockBothChannels: mod.writingSplitDisclosure(\n    "summary:" + nl + "a video" + nl + "detailed_description:" + nl + "she walks",\n    ("summary:" + nl + "a video" + nl + "detailed_description:" + nl + "she walks").length,\n    keys),\n}));\n')
+    # `summary` is past the break, so splitting the first block strands nothing.
+    assert result["splittingFirstBlock"] == []
+    # Splitting the second strands nothing either — its own block has one field.
+    assert result["splittingSecondBlock"] == []
+    # Both fields in ONE block: splitting the body field does strand summary.
+    assert result["sameBlockBothChannels"] == ["summary"]

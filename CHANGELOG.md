@@ -75,7 +75,20 @@ a fresh `[Unreleased]` block.
   replacement design; Base physical keyframes use the existing Guides Bridge
   with upstream `MiniMaxH3AddGuide`, without a Sonder-specific replacement.
 
+### Added
+- Writing mode now completes `@` mentions. Typing `@` and the start of a
+  handle offers this project's References; arrow keys move through them and
+  Enter completes the name. It writes the mention text only — attaching a
+  Reference is still the caret menu's job.
+
 ### Fixed
+- Reference handles now read as part of the sentence in Writing mode instead of
+  as bordered tokens. They still behave as single units for the caret, and
+  their edit and remove controls appear on hover or keyboard focus.
+- **Split here** now keeps you in the field you were writing in. Splitting
+  mid-paragraph under a heading used to send everything after the break to the
+  default field; the new section now carries that heading. It also tells you
+  when other fields in the section you are leaving will not come with it.
 - In Writing mode, text written above the first field header no longer becomes a
   subject definition under MiniMax H3 (full reference). It now goes to the
   body field — `detailed_description` — because that template leads with
@@ -93,12 +106,12 @@ a fresh `[Unreleased]` block.
   records competed for the same forty slots as real ones — so enough applied
   scenes would silently evict the one draft still holding unwritten work. The
   emptied records are now dropped instead of hoarding a slot.
-- Prompt text can now cite a shot by name instead of by number. Writing
-  `@shot` and picking a Shot marker compiles to `[Shot 1]`, `[Shot 2]` and so
+- Prompt text can now cite a shot instead of hard-coding its number. Writing
+  `@shot(...)` against a Shot marker compiles to `[Shot 1]`, `[Shot 2]` and so
   on, and the number follows the marker — adding a shot earlier in the scene
   renumbers the citation instead of leaving it pointing at the wrong shot.
-  Citing a shot outside the render window is refused with the shot named,
-  rather than compiling as if it were there.
+  Citing a shot outside the render window is refused rather than compiling as
+  if it were there.
 - MiniMax H3 reference definitions and retention lines now get one line each
   when they come from separate Reference chips, instead of being run together
   into a single paragraph. Three Subjects described on three chips compiled as

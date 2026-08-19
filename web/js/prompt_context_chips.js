@@ -190,6 +190,12 @@ export function normalizePromptDocument(raw, fallbackText = "") {
             if (!attachmentId) continue;
             const node = { type: "attachment", node_id: nodeId, attachment_id: attachmentId };
             if (value.capability_id) node.capability_id = String(value.capability_id);
+            // Mirrors `normalize_prompt_document`. Dropping it here would make
+            // an echoed document hash differently from the server's copy and
+            // spuriously 409 identity validation, and would orphan every
+            // materialized record by collapsing it onto the capability's
+            // first line. Parity is pinned by a test.
+            if (value.record_key) node.record_key = String(value.record_key);
             nodes.push(node);
         }
     }
@@ -1143,6 +1149,30 @@ function contextChipLabel(label) {
     return chipLabel;
 }
 
+/** A handle reads as prose, not as a token.
+ *
+ *  Same node, same atomicity, no pill: Writing mode's premise is that the
+ *  author sees a sentence, and a bordered capsule mid-clause defeats that. The
+ *  element stays `contentEditable=false` with `role="button"` and a tab stop,
+ *  so caret movement and keyboard reach are unchanged — only the chrome goes.
+ */
+function handleCss() {
+    // Deliberately the SAME token as a chip's label, not a new colour: a
+    // handle is chip text without the capsule, so it is the existing role
+    // rendered differently rather than a role of its own. `font:inherit` is
+    // what does the prose work — the chip's 10px sans is what made it read as
+    // a token, more than the border did.
+    return `display:inline;box-sizing:border-box;padding:0;margin:0;border:0;
+        background:transparent;color:${CHIP_PALETTE.text};
+        font:inherit;vertical-align:baseline;cursor:pointer;user-select:none;
+        white-space:normal;`;
+}
+
+/** Whether a rendered label is a handle mention rather than a described chip. */
+export function isHandleLabel(label) {
+    return /^@\S/.test(String(label || ""));
+}
+
 function chipCss() {
     return `display:inline-flex;align-items:center;gap:3px;box-sizing:border-box;min-width:0;
         max-width:min(180px,calc(100% - 4px));padding:1px 6px;
@@ -1374,10 +1404,15 @@ export function createPromptDocumentEditor({
             chip.dataset.nodeId = node.node_id;
             chip.dataset.nodeType = "attachment";
             chip.dataset.attachmentId = attachment.attachment_id;
-            chip.style.cssText = chipCss();
+            // The DOM is the round-trip carrier: whatever is not written here
+            // is gone the next time `readDom` rebuilds the model from it.
+            if (node.capability_id) chip.dataset.capabilityId = String(node.capability_id);
+            if (node.record_key) chip.dataset.recordKey = String(node.record_key);
             const label = attachmentLabel(attachment,
                 previews?.[attachment.attachment_id] || "",
                 attachmentLabelFor?.(attachment) || "", attachmentContext);
+            const handle = isHandleLabel(label);
+            chip.style.cssText = handle ? handleCss() : chipCss();
             chip.setAttribute("role", "button");
             chip.tabIndex = 0;
             chip.title = `${label} — dynamic context; activate to configure`;
@@ -1405,6 +1440,26 @@ export function createPromptDocumentEditor({
                 removeAttachment(attachment.attachment_id);
             });
             chip.append(chipLabel, editGlyph, remove);
+            if (handle) {
+                // Inline styles carry no `:hover` rule, so the reveal is wired
+                // by hand. The affordances stay in the DOM and keep their
+                // accessible names — only their paint is deferred, so a
+                // screen reader and the keyboard path are unaffected.
+                const affordances = [editGlyph, remove];
+                const reveal = (shown) => {
+                    for (const element of affordances) {
+                        element.style.opacity = shown ? "" : "0";
+                        element.style.pointerEvents = shown ? "" : "none";
+                    }
+                };
+                reveal(false);
+                chip.addEventListener("mouseenter", () => reveal(true));
+                chip.addEventListener("mouseleave", () => {
+                    if (!chip.contains(document.activeElement)) reveal(false);
+                });
+                chip.addEventListener("focusin", () => reveal(true));
+                chip.addEventListener("focusout", () => reveal(false));
+            }
             chip.addEventListener("click", (event) => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -1439,8 +1494,11 @@ export function createPromptDocumentEditor({
             }
             if (!(child instanceof HTMLElement)) continue;
             if (child.dataset.nodeType === "attachment") {
-                next.push({ type: "attachment", node_id: child.dataset.nodeId || uid(),
-                    attachment_id: child.dataset.attachmentId });
+                const node = { type: "attachment", node_id: child.dataset.nodeId || uid(),
+                    attachment_id: child.dataset.attachmentId };
+                if (child.dataset.capabilityId) node.capability_id = child.dataset.capabilityId;
+                if (child.dataset.recordKey) node.record_key = child.dataset.recordKey;
+                next.push(node);
             } else {
                 next.push({ type: "text", node_id: child.dataset.nodeId || uid(),
                     text: String(child.innerText || child.textContent || "").replaceAll("\u200b", "") });
@@ -1472,9 +1530,12 @@ export function createPromptDocumentEditor({
     editor.addEventListener("paste", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        pushHistory();
+        // Through `insertText`, not `execCommand`: the same newline loss that
+        // made "Split here" inert flattens a pasted draft. `insertText` pushes
+        // its own history entry, so pasting stays ONE undo step, and it prunes
+        // a chip record whose anchor the paste overwrote.
         const plain = event.clipboardData?.getData("text/plain") || "";
-        document.execCommand?.("insertText", false, plain);
+        editor.insertText(plain, { replaceSelection: true });
     });
     const ownedKeyHandlers = [];
     const handleOwnedKeydown = (event) => {
@@ -1594,36 +1655,29 @@ export function createPromptDocumentEditor({
         const node = { type: "attachment", node_id: uid(), attachment_id: attachment.attachment_id };
         if (capabilityId) node.capability_id = capabilityId;
 
-        // Translate the active caret to a model insertion boundary. When the
-        // browser selection is inside a text node, split that stable text node.
-        const range = selectionPoint(editor);
-        let index = model.nodes.length;
-        if (range) {
-            const hostNode = (range.startContainer.nodeType === Node.TEXT_NODE
-                ? range.startContainer.parentElement : range.startContainer);
-            const direct = hostNode === editor ? null : hostNode?.closest?.("[data-node-id]");
-            if (direct && editor.contains(direct)) {
-                index = model.nodes.findIndex((value) => value.node_id === direct.dataset.nodeId);
-                if (index < 0) index = model.nodes.length;
-                else if (direct.dataset.nodeType === "text") {
-                    const current = model.nodes[index];
-                    const offset = range.startContainer.nodeType === Node.TEXT_NODE
-                        ? Math.min(current.text.length, range.startOffset) : current.text.length;
-                    const replacement = [];
-                    if (current.text.slice(0, offset)) replacement.push({ ...current, text: current.text.slice(0, offset) });
-                    replacement.push(node);
-                    if (current.text.slice(offset)) replacement.push({ type: "text", node_id: uid(), text: current.text.slice(offset) });
-                    model.nodes.splice(index, 1, ...replacement);
-                    render();
-                    const chip = editor.querySelector(`[data-node-id="${node.node_id}"]`);
-                    if (chip) setCaretAfter(chip);
-                    emit("attachment");
-                    return attachment;
-                } else {
-                    index += 1;
-                }
-            }
+        // Translate the active caret to a model insertion boundary through the
+        // SAME resolver `insertText` uses. The hand-rolled copy this replaces
+        // fell through to "append at the end" whenever the caret was anchored
+        // on the editor element — the shape `focusFirst()` produces — so a
+        // caret-menu attach after a programmatic focus placed the chip at the
+        // bottom of the document instead of where the author was.
+        const target = modelPositionFor(selectionBookmark()?.start);
+        let index = target ? target.index : model.nodes.length;
+        if (target && model.nodes[target.index]?.type === "text") {
+            const current = model.nodes[target.index];
+            const offset = target.offset;
+            const replacement = [];
+            if (current.text.slice(0, offset)) replacement.push({ ...current, text: current.text.slice(0, offset) });
+            replacement.push(node);
+            if (current.text.slice(offset)) replacement.push({ type: "text", node_id: uid(), text: current.text.slice(offset) });
+            model.nodes.splice(target.index, 1, ...replacement);
+            render();
+            const chip = editor.querySelector(`[data-node-id="${node.node_id}"]`);
+            if (chip) setCaretAfter(chip);
+            emit("attachment");
+            return attachment;
         }
+        if (target && target.offset > 0) index += 1;
         model.nodes.splice(index, 0, node);
         render();
         const chip = editor.querySelector(`[data-node-id="${node.node_id}"]`);
@@ -1669,6 +1723,28 @@ export function createPromptDocumentEditor({
                 return bookmark?.start ? structuredClone(bookmark.start) : null;
             },
         },
+        // The caret as an offset into `value`, which `promptSelection` cannot
+        // give because its offset is relative to one node. Attachment nodes
+        // contribute no text, so they add nothing here either — keeping this
+        // in step with `promptDocumentText` by construction. Null when the
+        // caret is not in this editor.
+        promptTextOffset: {
+            get: () => {
+                const bookmark = selectionBookmark();
+                const start = bookmark?.start;
+                if (!start) return null;
+                let total = 0;
+                for (const node of model.nodes) {
+                    if (node.node_id === start.node_id) {
+                        return total + (node.type === "text"
+                            ? Math.max(0, Math.min(node.text.length, start.offset | 0))
+                            : 0);
+                    }
+                    if (node.type === "text") total += node.text.length;
+                }
+                return null;
+            },
+        },
         disabled: {
             get: () => editor.contentEditable === "false",
             set: (value) => {
@@ -1681,22 +1757,120 @@ export function createPromptDocumentEditor({
     editor.capturePromptSelection = () => selectionBookmark();
     editor.restorePromptSelection = (bookmark) => restoreSelection(bookmark);
     editor.isPromptComposing = () => composing;
-    editor.insertText = (rawText) => {
+    // Deliberately NOT `execCommand("insertText")`. That path silently drops
+    // newlines in this contenteditable, so multi-line insertions arrived
+    // flattened — which is how "Split here" came to insert an inline `---`
+    // that `splitWritingDraft` never recognized, making the button inert.
+    // Writing the model directly also keeps insertion in the one
+    // representation `readDom` can round-trip.
+    /** Model position for a selection boundary produced by `selectionBoundary`.
+     *
+     *  `selectionBoundary` already resolves the hard cases — a caret anchored
+     *  on the editor element itself resolves through the next/previous sibling
+     *  rather than falling through to "append at the end", which is the bug
+     *  three hand-rolled copies of this logic each carried.
+     */
+    const modelPositionFor = (boundary) => {
+        if (!boundary?.node_id) return null;
+        const index = model.nodes.findIndex((node) => node.node_id === boundary.node_id);
+        if (index < 0) return null;
+        const node = model.nodes[index];
+        const offset = node.type === "text"
+            ? Math.max(0, Math.min(node.text.length, Number(boundary.offset) || 0))
+            : (Number(boundary.offset) > 0 ? 1 : 0);
+        return { index, offset };
+    };
+
+    /** Delete everything between two model positions and report the join point.
+     *
+     *  An attachment inside the span goes with it, and its record is pruned —
+     *  the same reconciliation `readDom` performs for the Backspace path
+     *  (`range.deleteContents()` then `readDom()`). Leaving the record behind
+     *  would strand it with no inline anchor, which compiles as a blocking
+     *  `unanchored_inline_attachment` for inline-only kinds.
+     */
+    const deleteModelSpan = (from, to) => {
+        const head = model.nodes[from.index];
+        const tail = model.nodes[to.index];
+        const removedIds = [];
+        for (let i = from.index; i <= to.index && i < model.nodes.length; i += 1) {
+            const node = model.nodes[i];
+            if (node.type !== "attachment") continue;
+            const wholly = i > from.index && i < to.index;
+            if (wholly || (i === from.index && from.offset === 0)
+                    || (i === to.index && to.offset > 0)) {
+                removedIds.push(node.attachment_id);
+            }
+        }
+        const headText = head?.type === "text" ? head.text.slice(0, from.offset) : "";
+        const tailText = tail?.type === "text" ? tail.text.slice(to.offset) : "";
+        const merged = { type: "text", node_id: head?.type === "text" ? head.node_id : uid(),
+            text: headText + tailText };
+        model.nodes.splice(from.index, to.index - from.index + 1, merged);
+        if (removedIds.length) {
+            const stillAnchored = new Set(model.nodes
+                .filter((node) => node.type === "attachment")
+                .map((node) => node.attachment_id));
+            attachments = attachments.filter((value) =>
+                stillAnchored.has(value.attachment_id)
+                || !removedIds.includes(value.attachment_id));
+        }
+        return { index: from.index, offset: headText.length,
+            removedAttachment: removedIds.length > 0 };
+    };
+
+    // Deliberately NOT `execCommand("insertText")`. That path silently drops
+    // newlines in this contenteditable, so multi-line insertions arrived
+    // flattened — which is how "Split here" came to insert an inline `---`
+    // that `splitWritingDraft` never recognized, making the button inert.
+    // Writing the model directly also keeps insertion in the one
+    // representation `readDom` can round-trip.
+    //
+    // `replaceSelection` restores what `execCommand` used to do for free, but
+    // only where the caller actually wants it. A writing aid that weaves the
+    // selection into its output (`{text}`) wants a wrap; one that does not
+    // would otherwise DELETE the author's paragraph and put an unrelated token
+    // in its place, so the caller decides rather than this function guessing.
+    editor.insertText = (rawText, { replaceSelection = false } = {}) => {
         if (disabled) return;
         const value = String(rawText ?? "");
         if (!value) return;
-        pushHistory();
         editor.focus();
-        if (typeof document.execCommand === "function") {
-            document.execCommand("insertText", false, value);
-            readDom();
-            return;
+        const bookmark = selectionBookmark();
+        const from = modelPositionFor(bookmark?.start);
+        const to = modelPositionFor(bookmark?.end);
+        pushHistory();
+        let target = from;
+        let removedAttachment = false;
+        if (replaceSelection && from && to
+                && (to.index > from.index || to.offset > from.offset)) {
+            const result = deleteModelSpan(from, to);
+            target = { index: result.index, offset: result.offset };
+            removedAttachment = result.removedAttachment;
         }
-        const tail = model.nodes.at(-1);
-        if (tail?.type === "text") tail.text += value;
-        else model.nodes.push({ type: "text", node_id: uid(), text: value });
-        render(); emit();
+        let caret = null;
+        if (target && model.nodes[target.index]?.type === "text") {
+            // Grow the existing text node rather than splitting it, so the id
+            // the caret is bookmarked against survives the re-render.
+            const current = model.nodes[target.index];
+            current.text = current.text.slice(0, target.offset) + value
+                + current.text.slice(target.offset);
+            caret = { node_id: current.node_id, offset: target.offset + value.length };
+        } else {
+            const index = target ? target.index + (target.offset > 0 ? 1 : 0)
+                : model.nodes.length;
+            const node = { type: "text", node_id: uid(), text: value };
+            model.nodes.splice(index, 0, node);
+            caret = { node_id: node.node_id, offset: value.length };
+        }
+        model = normalizePromptDocument(model);
+        render();
+        restoreSelection({ start: caret, end: caret });
+        emit(removedAttachment ? "attachment" : "document");
     };
+    // Lets a host that mutates the document through `promptState` still
+    // enrol the change in this editor's undo stack.
+    editor.pushPromptHistory = () => pushHistory();
     editor.removeAttachment = removeAttachment;
     editor.replaceAttachment = (raw) => {
         pushHistory();
@@ -2018,14 +2192,17 @@ function ownModalEscape(onEscape) {
 /**
  * Restore the caret, insert the built text, and report it.
  *
- * `insertText` routes through `execCommand`, which replaces whatever the
- * restored range covers — that is what turns a selection plus `{text}` into a
- * wrap rather than an insertion in front of the words.
+ * The selection is replaced ONLY when the aid weaves it into its output via
+ * `{text}` — that is what turns a selection plus `{text}` into a wrap rather
+ * than an insertion in front of the words. An aid that ignores `{text}`
+ * (scene transition, cutoff, camera motion, the framing aids) must leave the
+ * author's prose alone; replacing it there would delete a paragraph and put an
+ * unrelated token in its place.
  */
 async function commitWritingAid(editor, bookmark, aid, values, textValue, onInserted) {
     const value = buildWritingAidText(aid, values, textValue);
     if (!restorePromptInsertion(editor, bookmark)) return;
-    editor?.insertText?.(value);
+    editor?.insertText?.(value, { replaceSelection: writingAidUsesText(aid) });
     await onInserted?.({ type: "writing_aid", text: value });
 }
 
@@ -2206,6 +2383,67 @@ export function parseHandleMention(text) {
     const dot = raw.indexOf(".");
     if (dot < 0) return { handle: raw, qualifier: "" };
     return { handle: raw.slice(0, dot), qualifier: raw.slice(dot + 1) };
+}
+
+/**
+ * The `@mention` under the caret, or null when there is none in progress.
+ *
+ * Bounded by the same grammar the handle itself uses, so a sigil in ordinary
+ * prose cannot open a menu: the run after `@` must be handle-shaped, and an
+ * `@` with a space or another sigil before the caret is just text. The dotted
+ * qualifier is reported separately, so completing `@KWoman.spea` offers
+ * capability kinds rather than handles.
+ */
+export function writingMentionQuery(text, offset) {
+    const value = String(text ?? "");
+    const caret = Math.max(0, Math.min(value.length, offset | 0));
+    const before = value.slice(0, caret);
+    const at = before.lastIndexOf("@");
+    if (at < 0) return null;
+    // A mention starts at a boundary. The test is whether the `@` follows a
+    // WORD character — that is what makes `bob@example` an address. Anything
+    // else may precede it: prose reaches `@` after a full stop, a quote, a
+    // dash or an opening bracket far more often than after a bare space, and
+    // an allowlist of openers silently refused most real sentences.
+    if (at > 0 && /[A-Za-z0-9_]/.test(before[at - 1])) return null;
+    const run = before.slice(at + 1);
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}(\.[A-Za-z0-9_]{0,63})?$|^$/.test(run)) return null;
+    const dot = run.indexOf(".");
+    return {
+        start: at,
+        end: caret,
+        handle: dot < 0 ? run : run.slice(0, dot),
+        qualifier: dot < 0 ? "" : run.slice(dot + 1),
+        completingQualifier: dot >= 0,
+    };
+}
+
+/**
+ * Candidates for an in-progress mention, best first.
+ *
+ * Prefix matches rank above interior ones so typing the start of a name does
+ * what it looks like it does, and ties fall back to the order the host gave —
+ * never alphabetical, which would silently reorder a host's own ranking.
+ */
+export function handleMentionCandidates(query, options = []) {
+    const needle = String(query || "").toLowerCase();
+    const scored = [];
+    (options || []).forEach((option, index) => {
+        const value = String(typeof option === "string" ? option : option?.handle || "");
+        if (!value) return;
+        const hay = value.toLowerCase();
+        const position = hay.indexOf(needle);
+        if (needle && position < 0) return;
+        scored.push({
+            value,
+            label: typeof option === "string" ? value : String(option?.label || value),
+            rank: needle ? (position === 0 ? 0 : 1) : 0,
+            index,
+        });
+    });
+    return scored
+        .sort((a, b) => a.rank - b.rank || a.index - b.index)
+        .map(({ value, label }) => ({ handle: value, label }));
 }
 
 /**

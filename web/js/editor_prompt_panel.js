@@ -63,11 +63,13 @@ import {
     sceneWithDraftGlobal,
     sceneWithDraftSection,
     splitPromptDocumentChannels,
+    writingMentionQuery,
+    handleMentionCandidates,
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
 } from "./prompt_context_chips.js";
 import { getProjectVersion } from "./api_client.js";
-import { notifySuccess, notifyWarning } from "./editor_notifications.js";
+import { notifyInfo, notifySuccess, notifyWarning } from "./editor_notifications.js";
 import { resolvedPromptProfile } from "./prompt_profile_declarations.js";
 import { mountPromptFormatDeclarationEditor } from "./prompt_format_editor.js";
 import { createModalDraftGuard } from "./modal_draft_guard.js";
@@ -102,6 +104,242 @@ export function splitWritingDraft(draft) {
     }
     blocks.push(current.join("\n").trim());
     return blocks.filter(Boolean);
+}
+
+/** The channel the caret is writing in: the last `key:` header at or above it.
+ *
+ *  Returns "" when no header precedes the caret, which means the block's
+ *  default channel — the caller resolves that, because only it knows the
+ *  template's `default_draft_channel` stamp.
+ */
+export function writingChannelAtCaret(text, offset, channelKeys) {
+    const keys = new Set((channelKeys || []).map((value) => String(value)));
+    const before = String(text ?? "").slice(0, Math.max(0, offset | 0));
+    let active = "";
+    for (const line of before.split("\n")) {
+        const match = /^([A-Za-z0-9_]+):/.exec(line);
+        if (match && keys.has(match[1])) active = match[1];
+        // A section break resets to the block default, exactly as
+        // `splitWritingDraft` + `splitPromptDocumentChannels` will read it back.
+        else if (line.trim() === WRITING_BREAK) active = "";
+    }
+    return active;
+}
+
+/** The text from the caret's block start up to the caret.
+ *
+ *  `splitWritingDraft` cannot answer this: it `.trim()`s each block and
+ *  `.filter(Boolean)`s the list, destroying the offsets needed to locate the
+ *  caret. This keeps them, and returns the HEAD of the impending split — what
+ *  stays behind — because the tail travels with the author and its channels
+ *  are not stranded.
+ */
+export function writingBlockHeadAt(text, offset) {
+    const value = String(text ?? "");
+    const caret = Math.max(0, Math.min(value.length, offset | 0));
+    const before = value.slice(0, caret);
+    const lines = before.split("\n");
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+        if (lines[i].trim() === WRITING_BREAK) return lines.slice(i + 1).join("\n");
+    }
+    return before;
+}
+
+/** The channels a split at `caret` would strand — the whole decision.
+ *
+ *  Exported as one function so the composition (head-of-block, then linkage)
+ *  is covered by a test rather than living inline in a click handler where
+ *  only a source-string assertion could reach it. Passing the whole draft
+ *  instead of the head is the defect this shape prevents.
+ */
+export function writingSplitDisclosure(draftText, caret, channelKeys) {
+    const keys = channelKeys || [];
+    const active = writingChannelAtCaret(draftText, caret, keys);
+    return writingSplitLinkage(writingBlockHeadAt(draftText, caret), active, keys);
+}
+
+/** Which channels a split would strand, and therefore warrant a scope link.
+ *
+ *  A split continues ONE channel — the one the caret is in. Every other
+ *  channel that already has text belongs to the block being left behind, so
+ *  the new block starts empty in those channels and quietly loses them. When
+ *  none are populated there is nothing to inherit and the split stays silent;
+ *  when some are, the author is told, because a section that silently drops
+ *  its summary and soundscape compiles to something they never wrote.
+ *
+ *  Pure: decides WHICH channels are at stake. Binding the actual
+ *  `prompt_link_scope` needs a `prompt_id`, and sections do not exist until
+ *  Apply, so the binding cannot happen here.
+ */
+export function writingSplitLinkage(blockText, activeChannel, channelKeys) {
+    const keys = (channelKeys || []).map((value) => String(value));
+    const active = String(activeChannel || "");
+    const populated = [];
+    let current = "";
+    for (const line of String(blockText ?? "").split("\n")) {
+        const match = /^([A-Za-z0-9_]+):(.*)$/.exec(line);
+        if (match && keys.includes(match[1])) {
+            current = match[1];
+            if (match[2].trim() && current !== active && !populated.includes(current)) {
+                populated.push(current);
+            }
+            continue;
+        }
+        if (line.trim() === WRITING_BREAK) { current = ""; continue; }
+        if (!line.trim() || !current || current === active) continue;
+        if (!populated.includes(current)) populated.push(current);
+    }
+    return populated;
+}
+
+/** The text a "Split here" inserts so the tail keeps writing where it was.
+ *
+ *  A bare `---` starts a new block, and a new block begins at its default
+ *  channel — so splitting mid-paragraph under a non-default heading silently
+ *  moved the tail into a different field. The heading is re-emitted unless the
+ *  tail would land in that channel anyway, so the common case stays clean.
+ */
+export function writingSplitText(activeChannel, defaultChannel) {
+    const active = String(activeChannel || "");
+    const fallback = String(defaultChannel || "");
+    const carry = active && active !== fallback ? `${active}:\n` : "";
+    return `\n${WRITING_BREAK}\n${carry}`;
+}
+
+/** Typeahead for `@handle` while writing prose.
+ *
+ *  Completes the TEXT of a mention only. It deliberately does not attach a
+ *  chip: an autocomplete that mutated the attachment registry on every
+ *  keystroke would make an undo step per character, and the caret menu remains
+ *  the one place an attachment is created. The mention this leaves behind is
+ *  resolved by the same handle path the caret menu uses.
+ *
+ *  Returns a cleanup function, matching the module-host contract.
+ */
+export function installWritingMentionMenu(area, { handles, onAccepted } = {}) {
+    const menu = document.createElement("div");
+    menu.dataset.sonderPromptContextMenu = "1";
+    menu.setAttribute("role", "listbox");
+    // The Writing draft lives inside the panel overlay (z-index 10000), and
+    // dialogs above it use 12000 — a menu at 40 on `document.body` renders
+    // BEHIND all of it, which is indistinguishable from not opening at all.
+    // 12010 is the established "menu above panel chrome" tier. `fixed`, not
+    // `absolute`, because the anchor it is positioned from is itself fixed.
+    menu.style.cssText = `position:fixed;z-index:12010;display:none;min-width:150px;
+        max-height:180px;overflow:auto;border:1px solid ${COLORS.border};border-radius:6px;
+        background:${COLORS.panelRaised};box-shadow:0 6px 18px rgba(0,0,0,.45);padding:2px;`;
+    // The panel re-renders freely and builds a fresh draft area each time. Its
+    // callers cannot be relied on to run the returned cleanup, and a leaked
+    // menu is not merely garbage — it keeps a listener bound to a DETACHED
+    // editor, so a stale instance can still answer keys. Sweep any menu whose
+    // owner is gone before adding this one.
+    for (const stale of document.querySelectorAll("[data-sonder-writing-mention='1']")) {
+        if (!stale.__sonderOwner || !stale.__sonderOwner.isConnected) {
+            stale.__sonderDispose?.();
+            stale.remove();
+        }
+    }
+    menu.dataset.sonderWritingMention = "1";
+    menu.__sonderOwner = area;
+    document.body.appendChild(menu);
+    let rows = [];
+    let active = 0;
+    let query = null;
+
+    const close = () => { menu.style.display = "none"; rows = []; query = null; };
+    const paint = () => {
+        [...menu.children].forEach((row, index) => {
+            row.style.background = index === active ? COLORS.panelMuted : "transparent";
+            row.setAttribute("aria-selected", index === active ? "true" : "false");
+        });
+    };
+    const accept = (index) => {
+        const chosen = rows[index];
+        if (!chosen || !query) return close();
+        // A mention is a contiguous run of handle-shaped characters, so an
+        // anchor always terminates it: the whole query lies inside ONE text
+        // node. Editing just that node keeps every anchor and every other
+        // node's id untouched, which a whole-document rewrite would not.
+        const documentValue = area.promptDocument;
+        let seen = 0;
+        const nodes = documentValue.nodes.map((node) => {
+            if (node.type !== "text") return node;
+            const start = seen;
+            seen += node.text.length;
+            if (query.start < start || query.end > seen) return node;
+            const from = query.start - start;
+            const to = query.end - start;
+            return { ...node, text: `${node.text.slice(0, from)}@${chosen.handle} `
+                + node.text.slice(to) };
+        });
+        // Through the editor's own history so Ctrl+Z steps back over the
+        // completion rather than past it to before the mention was typed.
+        area.pushPromptHistory?.();
+        area.promptState = { document: { schema: documentValue.schema, nodes },
+            attachments: area.promptAttachments };
+        close();
+        onAccepted?.();
+    };
+    const refresh = () => {
+        query = writingMentionQuery(area.value, area.promptTextOffset ?? -1);
+        if (!query || query.completingQualifier) return close();
+        rows = handleMentionCandidates(query.handle, handles?.() || []);
+        if (!rows.length) return close();
+        menu.replaceChildren(...rows.map((row, index) => {
+            const item = document.createElement("div");
+            item.setAttribute("role", "option");
+            item.style.cssText = `padding:3px 7px;border-radius:4px;cursor:pointer;
+                color:${COLORS.text};font:11px system-ui,sans-serif;white-space:nowrap;`;
+            item.textContent = row.label === row.handle
+                ? `@${row.handle}` : `@${row.handle} — ${row.label}`;
+            item.addEventListener("mousedown", (event) => {
+                event.preventDefault();
+                accept(index);
+            });
+            return item;
+        }));
+        active = 0;
+        // Viewport coordinates, to match `position:fixed`. Flipped above the
+        // caret line when the menu would fall off the bottom of the window.
+        const box = area.getBoundingClientRect();
+        const height = Math.min(180, rows.length * 22 + 8);
+        const below = box.bottom + 2;
+        menu.style.left = `${Math.max(4, box.left)}px`;
+        menu.style.top = below + height > globalThis.innerHeight
+            ? `${Math.max(4, box.top - height - 2)}px` : `${below}px`;
+        menu.style.display = "block";
+        paint();
+    };
+
+    const onInput = () => refresh();
+    const onKeyDown = (event) => {
+        if (menu.style.display === "none") return false;
+        if (area.isPromptComposing?.() || event.isComposing || event.keyCode === 229) return false;
+        if (event.key === "Escape") { close(); return true; }
+        if (["ArrowDown", "ArrowUp"].includes(event.key)) {
+            active = (active + (event.key === "ArrowDown" ? 1 : rows.length - 1)) % rows.length;
+            paint();
+            return true;
+        }
+        if (["Enter", "Tab"].includes(event.key)) { accept(active); return true; }
+        return false;
+    };
+    area.addEventListener("input", onInput);
+    // NOT a raw keydown listener: `keyboard_ownership` owns these keys at
+    // capture on document and calls `stopImmediatePropagation`, so a listener
+    // on the element never runs. `addOwnedKeyHandler` is the editor's seam
+    // into that layer, and returning true marks the key consumed.
+    const removeOwned = area.addOwnedKeyHandler?.(onKeyDown) ?? (() => {});
+    area.addEventListener("blur", close);
+    const dispose = () => {
+        area.removeEventListener("input", onInput);
+        removeOwned();
+        area.removeEventListener("blur", close);
+        menu.__sonderDispose = null;
+        menu.remove();
+    };
+    menu.__sonderDispose = dispose;
+    return dispose;
 }
 
 /** Min-first proportional allocator (audit F2 — min to every block FIRST so
@@ -1106,6 +1344,7 @@ export function mountPromptManagementPanel(host) {
 
         let draftTimer = null;
         let draftArea = null;
+        let disposeMentionMenu = null;
         const draftAttachmentContext = (nodeId = "") => {
             const blockDocuments = reconcileWritingBlockMeta(
                 splitWritingPromptDocument(writingState.document, {
@@ -1197,6 +1436,27 @@ export function mountPromptManagementPanel(host) {
             saveWritingState();
         });
         draftArea.addEventListener("keydown", (e) => e.stopPropagation());
+        // Keep the disposer. The panel rebuilds its draft area on every render
+        // and the installer's own sweep only runs when a NEW menu is installed,
+        // so leaving Writing mode without this strands a menu in `document.body`
+        // with listeners bound to a detached editor.
+        disposeMentionMenu?.();
+        disposeMentionMenu = installWritingMentionMenu(draftArea, {
+            // A PROPERTY, not a method: `host._promptSemanticUnits` is the
+            // array itself, and it is reassigned as the project loads, so it
+            // is read fresh on each keystroke rather than captured here.
+            handles: () => (Array.isArray(host._promptSemanticUnits)
+                ? host._promptSemanticUnits : [])
+                .map((unit) => ({ handle: String(unit?.handle || ""),
+                    label: String(unit?.name || unit?.handle || "") }))
+                .filter((row) => row.handle),
+            onAccepted: () => {
+                writingState.draft = draftArea.value;
+                writingState.document = draftArea.promptDocument;
+                writingState.attachments = draftArea.promptAttachments;
+                saveWritingState();
+            },
+        });
         installPromptContextMenu({
             editor: draftArea,
             onInserted: () => {
@@ -1221,10 +1481,37 @@ export function mountPromptManagementPanel(host) {
 
         const toolRow = document.createElement("div");
         toolRow.style.cssText = "display:flex; gap:6px; align-items:center; flex-wrap:wrap;";
-        const splitBtn = makeBtn("Split here", "Insert a --- section break at the cursor");
+        const splitBtn = makeBtn("Split here",
+            "Insert a --- section break at the cursor, keeping the field you are writing in");
+        // Same guard the neighbouring "Add N/A" carries: without it the click
+        // blurs the draft (firing the blur commit) before `focus()` reacquires
+        // it, leaving the caret the channel resolver reads up to the browser.
+        splitBtn.addEventListener("mousedown", (event) => event.preventDefault());
         splitBtn.addEventListener("click", () => {
             draftArea.focus();
-            document.execCommand?.("insertText", false, `\n${WRITING_BREAK}\n`);
+            const keys = templateChannelKeys(host._channelTemplate());
+            const caret = draftArea.promptTextOffset ?? draftArea.value.length;
+            const active = writingChannelAtCaret(draftArea.value, caret, keys);
+            // Computed BEFORE the insert, from the head of the split only.
+            // Measuring the whole draft reported channels populated in other
+            // sections, so the notice fired for text that was never at risk.
+            const stranded = writingSplitDisclosure(draftArea.value, caret, keys);
+            // `editor.insertText`, not `execCommand`: the break is multi-line
+            // and execCommand drops newlines here, which left an inert inline
+            // `---` that produced no section break at all.
+            draftArea.insertText(writingSplitText(active, writingDefaultChannelKey()));
+            // Disclosure, not a silent fix: the split continues only the
+            // channel the caret is in, so any other channel with text stays
+            // with the block being left behind. The author is told which,
+            // because a new section that quietly drops its summary compiles to
+            // something nobody wrote. The scope link itself cannot be bound
+            // here — it needs a `prompt_id`, and sections exist only after Apply.
+            if (stranded.length) {
+                notifyInfo(`Split continues ${active || "the default field"} only. `
+                    + `${stranded.join(", ")} stay${stranded.length === 1 ? "s" : ""} `
+                    + "with the section above; link the new section to inherit "
+                    + "them.", { source: "writing-split-linkage" });
+            }
             writingState.document = draftArea.promptDocument;
             writingState.draft = draftArea.value;
             saveWritingState();
@@ -1259,6 +1546,12 @@ export function mountPromptManagementPanel(host) {
             }));
             writingState.blockMeta = normalizeWritingBlockMeta(stash.blockMeta);
             writingState.baseModifiedAt = String(stash.baseModifiedAt || "");
+            // The stamp travels with the draft. Without it a restored
+            // pre-declaration draft picks up the CURRENT default and its
+            // leading unheadered text silently relocates on the next Apply —
+            // the exact relocation the stamp exists to prevent, reintroduced
+            // by the one control offered when Apply is staleness-blocked.
+            writingState.defaultDraftChannel = String(stash.defaultDraftChannel || "");
             writingState.stash = null;
             saveWritingState();
             render();
