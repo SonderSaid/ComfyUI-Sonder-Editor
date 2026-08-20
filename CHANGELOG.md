@@ -76,6 +76,8 @@ a fresh `[Unreleased]` block.
   with upstream `MiniMaxH3AddGuide`, without a Sonder-specific replacement.
 
 ### Added
+- A Reference contribution can now be converted to prose you own. The sentence lands in the channel it came from as ordinary text, with real `@handle` mentions where an entity was named, and the chip stops emitting that part. It is offered only where every part has a live spelling: a contribution citing `[Shot 2]`, a speaker number, or a Reference with no handle declines and says what stopped it, rather than freezing a number that staging can still change. In practice that makes it a Subject-definition action under MiniMax H3 today.
+- Writing mode now shows what each attached Reference actually contributes, as prose, under the channel it is staged in — so you can read the sentence your References will produce beside the sentence you are writing, without leaving the draft. That includes channels you have not written in yet, which is where most of a Reference's output usually goes; each one offers to add its heading so you can type there. A capability that routes to a channel but resolves to nothing says so rather than disappearing.
 - Writing mode now completes `@` mentions. Typing `@` and the start of a
   handle offers this project's References — both prompt identities and
   physical sources — and Enter attaches the one you pick, so it compiles to
@@ -83,13 +85,16 @@ a fresh `[Unreleased]` block.
   Reference it contributes follows the field you are writing in.
 
 ### Fixed
+- Writing mode no longer opens blank on a scene that has prompt sections, and Reset from sections no longer asks permission to discard a draft that is not there. An emptied draft was being treated as real work, which also meant a blank panel plus one Apply could clear every section in the scene.
+- Shot and Time markers in Writing mode now show what they contribute — `[Shot 1] At 00:00.000,` — instead of an internal note about the section composer, and are named as Shots rather than as References. Chips attached to a section were mislabelled the same way.
+- Splitting a section no longer stacks both halves' Reference contributions under the second one.
+- The Writing draft's compiled preview now shows the same sections Apply will write. Preview and Apply each built that projection separately, and after merging two sections the preview could still show a Prompt Link pointing at the section that was absorbed.
+- A Reference mention typed into a sentence now reads as part of that sentence rather than as a bordered token. It stayed on its own line and broke the paragraph around it, and it repeated the chip's description after the handle — so prose showed `@KWoman — <Subject 1> is the korean woman…` where it should read `@KWoman`. It still behaves as a single unit for the caret, its description still appears on hover, and its edit and remove controls appear on keyboard focus.
+- Applying a Writing draft no longer adds a blank line between every section each time. Repeated Applies had accumulated more than a dozen, and Reset from sections now also clears padding a project already built up.
 - Applying a Writing draft is no longer refused because the project changed. Any save anywhere in the project — moving a clip, importing an asset, editing another scene — used to mark every open draft stale, and the only offered recovery rebuilt the draft from the lane instead of applying what you wrote, so authored text had no way in at all. Apply now replaces the lane with your draft, as it says it does, and reports when it changes the number of sections.
 - A Writing draft is no longer discarded when Apply is refused. The refusal could arrive after the editor had already cleared the draft and reported success, taking the draft, its chips and the restore copy with it. Applying now also keeps a restorable copy of what it applied.
 - Undo no longer wipes the scene-wide prompt. Restoring any scene edit fed back a text-only mirror that is empty under MiniMax H3, clearing every global field with it. Undo now restores the global fields themselves.
 - Text pasted from Windows apps now keeps its field headers. Carriage returns stopped `detailed_description:` and the rest from being recognized, so headers were left as literal text and everything landed in one field. Existing drafts carrying them are repaired on load.
-- Reference handles now read as part of the sentence in Writing mode instead of
-  as bordered tokens. They still behave as single units for the caret, and
-  their edit and remove controls appear on hover or keyboard focus.
 - **Split here** now keeps you in the field you were writing in. Splitting
   mid-paragraph under a heading used to send everything after the break to the
   default field; the new section now carries that heading. It also tells you

@@ -10870,6 +10870,73 @@ export class EditorWidget {
     /** Debounced, non-mutating preview over the exact structured candidate the
      *  user is editing. Enqueue invokes the same backend compiler again and
      *  freezes that result; hover merely reads this versioned cache. */
+    /**
+     * What "Convert to prose" would write for one staged capability.
+     *
+     * Rides the existing compile endpoint rather than a route of its own: the
+     * plan needs the fully resolved setup context, and a second endpoint that
+     * rebuilt it could disagree with the contribution the author is looking at.
+     * Never cached — the answer depends on staging, which the author may have
+     * changed since the last compile.
+     */
+    async _promptConvertPlan(attachmentId, capabilityId, scenePatch = null) {
+        const dirName = this._projectDirName?.();
+        const sceneId = this.activeSceneId;
+        if (!dirName || !sceneId) return null;
+        const candidate = { ...structuredClone(this.activeScene),
+            ...structuredClone(scenePatch || {}) };
+        const range = this._selectionContextRange?.();
+        const windowStart = Math.max(0, Math.round(range?.contextStart ?? 0));
+        const windowEnd = Math.max(windowStart + 1, Math.round(
+            range?.contextEnd ?? candidate.duration_frames ?? this.totalFrames ?? 1));
+        const response = await fetch(api.apiURL(
+            `/sonder-editor/project/${encodeURIComponent(dirName)}/scenes/${encodeURIComponent(sceneId)}/prompt-context/compile`
+        ), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                ...this._promptCompileRequestBody({
+                    dirName, candidate, windowStart, windowEnd, labelsOn: true }),
+                convert_plan_for: { attachment_id: attachmentId,
+                    capability_id: capabilityId },
+            }),
+        });
+        if (!response.ok) return null;
+        const payload = await response.json();
+        return payload?.convert_plan || null;
+    }
+
+    /**
+     * The compile request body, built once for every caller.
+     *
+     * Preview and the Convert plan each assembled this separately, and the
+     * Convert copy carried 7 of the 13 fields. That divergence did not cause
+     * the empty-plan defect — the hand-built server context did — but two
+     * copies of a request body that must describe the SAME candidate is how a
+     * surface ends up answering about a scene the author is not looking at.
+     * `labels_on` is stated explicitly here rather than left to a default,
+     * because the two callers disagreed about it silently.
+     */
+    _promptCompileRequestBody({ dirName, candidate, windowStart, windowEnd,
+        selection = null, labelsOn = false } = {}) {
+        return {
+            base_modified_at: getProjectVersion(dirName),
+            scene: candidate,
+            channel_template: templateFreezeValue(this._channelTemplate()),
+            window_start: windowStart,
+            window_end: windowEnd,
+            selection_start: selection ? selection.selectionStart : windowStart,
+            selection_end: selection ? selection.selectionEnd : windowEnd,
+            pre_context_frames: this._contextFrameValue("pre_context_frames"),
+            post_context_frames: this._contextFrameValue("post_context_frames"),
+            mask_pre_offset: this._contextFrameValue("mask_pre_offset"),
+            mask_post_offset: this._contextFrameValue("mask_post_offset"),
+            frame_constraint: this._getActiveFrameConstraint(),
+            fps: this._effectiveFps || 24,
+            labels_on: labelsOn,
+        };
+    }
+
     _previewPromptContextCandidate(scenePatch = {}, delay = 180) {
         const dirName = this._projectDirName();
         const sceneId = this.activeSceneId;
@@ -10903,21 +10970,10 @@ export class EditorWidget {
                 ), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        base_modified_at: getProjectVersion(dirName),
-                        scene: candidate,
-                        channel_template: templateFreezeValue(this._channelTemplate()),
-                        window_start: windowStart,
-                        window_end: windowEnd,
-                        selection_start: candidateSelection.selectionStart,
-                        selection_end: candidateSelection.selectionEnd,
-                        pre_context_frames: this._contextFrameValue("pre_context_frames"),
-                        post_context_frames: this._contextFrameValue("post_context_frames"),
-                        mask_pre_offset: this._contextFrameValue("mask_pre_offset"),
-                        mask_post_offset: this._contextFrameValue("mask_post_offset"),
-                        frame_constraint: this._getActiveFrameConstraint(),
-                        fps: this._effectiveFps || 24,
-                    }),
+                    body: JSON.stringify(this._promptCompileRequestBody({
+                        dirName, candidate, windowStart, windowEnd,
+                        selection: candidateSelection,
+                    })),
                 });
                 const payload = await response.json().catch(() => null);
                 if (token !== this._promptContextPreviewToken || !payload) return;

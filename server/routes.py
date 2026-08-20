@@ -8314,7 +8314,10 @@ if routes is not None:
             window_start=window_start, window_end=window_end, fps=fps,
             labels_on=body.get("labels_on", False) is True,
             delimiter=delimiter, prompt_threshold=prompt_threshold,
-            reference_threshold=reference_threshold)
+            reference_threshold=reference_threshold,
+            convert_plan_for=(body.get("convert_plan_for")
+                              if isinstance(body.get("convert_plan_for"), dict)
+                              else None))
         compiled["execution_window"] = execution_window
         compiled["candidate_base_modified_at"] = actual
         return web.json_response(compiled)

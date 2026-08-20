@@ -11,6 +11,7 @@ def resolve_scene_prompt_context(project, scene, template, window_start,
     """Build the setup/ordinal context shared by every live compile entry point."""
     result = {"setup_manifest": {}, "ordinal_manifest": {},
               "unit_picture_ordinals": {}, "unit_source_labels": {},
+              "unit_source_members": {},
               "generic_references": {}, "errors": [], "warnings": []}
     template = (template if isinstance(template, dict)
                 else prompt_channel_templates.get_channel_template(template))
@@ -78,8 +79,18 @@ def compile_live_scene_prompt_context(project, scene, *, template,
                                       window_start, window_end, fps,
                                       labels_on=False, delimiter=".",
                                       prompt_threshold=0.0,
-                                      reference_threshold=0.0) -> dict:
-    """Compile one live scene with the same complete context used by preview."""
+                                      reference_threshold=0.0,
+                                      convert_plan_for=None) -> dict:
+    """Compile one live scene with the same complete context used by preview.
+
+    `convert_plan_for` is `{"attachment_id", "capability_id"}` and asks, in the
+    same request, what "Convert to prose" would write for that one capability.
+    It is answered INSIDE the compile, where the enriched context lives. An
+    earlier version rebuilt that context by hand out here and silently produced
+    empty plans: the keys the assemblers actually read (`profile`,
+    `semantic_units_by_id`, `speaker_order`, `references_by_id`) are injected
+    during compilation and cannot be enumerated from outside.
+    """
     template = (template if isinstance(template, dict)
                 else prompt_channel_templates.get_channel_template(template))
     setup_result = {"errors": [], "warnings": []}
@@ -107,12 +118,14 @@ def compile_live_scene_prompt_context(project, scene, *, template,
                 "ordinal_manifest": setup_result.get("ordinal_manifest", {}),
                 "unit_picture_ordinals": setup_result.get("unit_picture_ordinals", {}),
                 "unit_source_labels": setup_result.get("unit_source_labels", {}),
+                "unit_source_members": setup_result.get("unit_source_members", {}),
                 "semantic_units": project.prompt_semantic_units,
                 "references": [value.to_dict() for value in project.references],
                 "generic_references": setup_result.get("generic_references", {}),
             },
             labels_on=labels_on, delimiter=delimiter,
-            boundary_threshold_pct=prompt_threshold)
+            boundary_threshold_pct=prompt_threshold,
+            convert_plan_for=convert_plan_for)
     except prompt_context.ProfileResolutionError as exc:
         compiled = prompt_context.profile_error_result(
             exc, window_start=window_start, window_end=window_end, fps=fps)

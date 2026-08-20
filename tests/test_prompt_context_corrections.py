@@ -584,30 +584,78 @@ class N {
   constructor(tag){ this.tagName=String(tag).toUpperCase(); this.children=[];
     this.childNodes=this.children; this.style={cssText:"",setProperty(){}};
     this.dataset={}; this.attributes={}; this.options=[]; this.value="";
-    this.textContent=""; this.title=""; this.disabled=false; this.multiple=false;
+    this._text=""; this.title=""; this.disabled=false; this.multiple=false;
     this._handlers={}; }
+  // textContent is MODELLED, not stored: setting it replaces the children,
+  // reading it concatenates them. A stored string would make a test that
+  // strips a nested element pass without the strip ever running.
+  get textContent(){ return this._text
+    + this.children.map((c) => c.textContent ?? "").join(""); }
+  set textContent(v){ this.children.length = 0; this._text = String(v ?? ""); }
   appendChild(c){ this.children.push(c); c.parentElement=this;
     if (c.tagName === "OPTION") this.options.push(c); return c; }
+  insertBefore(c, ref){
+    const at = ref ? this.children.indexOf(ref) : -1;
+    if (at < 0) return this.appendChild(c);
+    this.children.splice(at, 0, c); c.parentElement=this; return c; }
   append(...cs){ for (const c of cs) if (c && c.tagName) this.appendChild(c); }
   addEventListener(t,h){ (this._handlers[t] ||= []).push(h); }
   removeEventListener(){}
   setAttribute(k,v){ this.attributes[k]=String(v); }
   getAttribute(k){ return this.attributes[k] ?? null; }
+  cloneNode(deep){
+    const copy = new N(this.tagName);
+    copy._text = this._text;
+    copy.dataset = { ...this.dataset };
+    copy.attributes = { ...this.attributes };
+    if (deep) for (const c of this.children) copy.appendChild(c.cloneNode(true));
+    return copy; }
+  get nextSibling(){
+    const kids = this.parentElement?.children || [];
+    return kids[kids.indexOf(this) + 1] || null; }
+  get previousElementSibling(){
+    const kids = this.parentElement?.children || [];
+    return kids[kids.indexOf(this) - 1] || null; }
+  get nextElementSibling(){ return this.nextSibling; }
   querySelector(s){ return this.querySelectorAll(s)[0] || null; }
   querySelectorAll(sel){
-    const want = String(sel).toUpperCase();
+    const raw = String(sel).trim();
+    // Parsed without a regex on purpose: this string passes through a Python
+    // triple-quote and a shell before node sees it, and a bracket class does
+    // not survive that reliably.
+    const isAttr = raw.startsWith('[') && raw.endsWith(']');
+    const inner = isAttr ? raw.slice(1, -1) : '';
+    const eq = inner.indexOf('=');
+    const rawName = eq < 0 ? inner : inner.slice(0, eq);
+    const rawValue = eq < 0 ? undefined : inner.slice(eq + 1).split('"').join('');
+    const key = isAttr ? rawName.replace('data-', '').split('-').map((part, i) =>
+      i ? part.charAt(0).toUpperCase() + part.slice(1) : part).join('') : '';
+    const want = raw.toUpperCase();
     const out = [];
     const walk = (n) => { for (const c of n.children) {
-      if (c.tagName === want) out.push(c); walk(c); } };
+      const hit = isAttr
+        ? (c.dataset[key] !== undefined
+           && (rawValue === undefined || String(c.dataset[key]) === rawValue))
+        : c.tagName === want;
+      if (hit) out.push(c); walk(c); } };
     walk(this); return out; }
+  // Walk the parent chain too, so a TEXT NODE inside a span counts as
+  // contained. Without this `selectionPoint` rejects every caret and no
+  // test could place one.
   contains(n){ if (n === this) return true;
+    let p = n && n.parentElement;
+    while (p) { if (p === this) return true; p = p.parentElement; }
     return this.children.some((c) => c.contains && c.contains(n)); }
   get selectedOptions(){ return this.options.filter((o) =>
     o.selected === true || (!this.multiple
       && String(o.value) === String(this.value))); }
   closest(){ return null; }
   focus(){}
-  remove(){}
+  remove(){ const kids = this.parentElement?.children;
+    if (!kids) return;
+    const at = kids.indexOf(this);
+    if (at >= 0) kids.splice(at, 1);
+    this.parentElement = null; }
 }
 globalThis.document = {
   createElement: (t) => new N(t),
@@ -616,6 +664,9 @@ globalThis.document = {
 };
 globalThis.window = { addEventListener(){}, removeEventListener(){} };
 globalThis.Node = { TEXT_NODE: 3 };
+// Without this every `instanceof HTMLElement` guard throws, which silently
+// put `readDom` out of reach of every test using this stub.
+globalThis.HTMLElement = N;
 globalThis.getSelection = () => null;
 """
 
@@ -2540,3 +2591,686 @@ def test_an_unresolvable_caret_appends_instead_of_inserting_at_position_zero():
     # against a stale offset, split authored prose mid-word. It must land at the
     # end, which can never cut existing text in half.
     assert result["calls"] == ["focusEnd", "insert:<cutoff>"]
+
+
+def test_a_handle_renders_inline_and_drops_the_chip_preview():
+    """A handle must read as one word inside its paragraph.
+
+    Two defects in one element. `contextChipLabel` was `display:-webkit-box` —
+    block-level — so a handle mid-clause forced a line break either side of it
+    and split the paragraph it belonged to. And it carried the chip preview, so
+    the sentence read `@KWoman - <Subject 1> is the korean woman...` where a
+    mention should read `@KWoman`. Both were invisible to every style probe and
+    only showed when a handle was read inside real prose, which is why this
+    asserts the composition: what the handle DISPLAYS, how it lays out, and that
+    the descriptive form still reaches the title.
+    """
+    result = _run_chip_dom_script("""
+        const preview = "<Subject 1> is the korean woman with long black hair";
+        const chipFor = (identity) => {
+            const attachment = { attachment_id: "ref", kind: "reference",
+                source: {}, config: {} };
+            const editor = mod.createPromptDocumentEditor({
+                document: { nodes: [
+                    { type: "text", node_id: "before", text: "she has an " },
+                    { type: "attachment", node_id: "anchor", attachment_id: "ref" },
+                    { type: "text", node_id: "after", text: " editorial style." },
+                ] },
+                attachments: [attachment],
+                previews: { ref: preview },
+                attachmentLabelFor: () => identity,
+            });
+            const chip = editor.children.find((value) =>
+                value.dataset.attachmentId === "ref");
+            const findLabel = (node) => node.dataset?.sonderContextChipLabel === "1"
+                ? node : (node.children || []).map(findLabel).find(Boolean);
+            return { chip, label: findLabel(chip) };
+        };
+        const handle = chipFor("@KWoman");
+        const pill = chipFor("Woman");
+        const glyphWidthOwners = (node) => (node.children || []).flatMap((child) =>
+            child.dataset?.sonderChipEditAffordance === "1"
+                ? [node.style.cssText] : glyphWidthOwners(child));
+        console.log(JSON.stringify({
+            handleText: handle.label.textContent,
+            handleLabelCss: handle.label.style.cssText,
+            handleChipCss: handle.chip.style.cssText,
+            handleTitle: handle.chip.title,
+            pillText: pill.label.textContent,
+            pillLabelCss: pill.label.style.cssText,
+            handleGlyphHost: glyphWidthOwners(handle.chip),
+            pillGlyphHost: glyphWidthOwners(pill.chip),
+            handleRevealEvents: Object.keys(handle.chip._handlers || {})
+                .filter((name) => name.startsWith("mouse") || name.startsWith("focus")),
+            pillRevealEvents: Object.keys(pill.chip._handlers || {})
+                .filter((name) => name.startsWith("mouse") || name.startsWith("focus")),
+        }));
+    """)
+    # The handle displays its identity ALONE. The preview is chip chrome: a pill
+    # has room to describe itself, a sentence does not.
+    assert result["handleText"] == "@KWoman"
+    assert "<Subject 1>" not in result["handleText"]
+    # ...while the descriptive form still reaches the title, where describing
+    # the chip is the whole point.
+    assert "<Subject 1> is the korean woman" in result["handleTitle"]
+    # Inline, and specifically NOT the block-level box that broke the paragraph.
+    assert "display:inline;" in result["handleLabelCss"]
+    assert "-webkit-box" not in result["handleLabelCss"]
+    # The pill is untouched — it shares the element and must keep its clamp.
+    assert result["pillText"].startswith("Woman")
+    assert "<Subject 1>" in result["pillText"]
+    assert "-webkit-line-clamp:2" in result["pillLabelCss"]
+    # The edit/remove glyphs hide with `opacity:0`, which keeps layout, so on a
+    # handle they left a blank gap after every mention. On a handle they are
+    # taken out of flow; on a pill they stay in the capsule's flex row.
+    assert result["handleGlyphHost"] and all(
+        "position:absolute" in css for css in result["handleGlyphHost"])
+    assert result["pillGlyphHost"] and not any(
+        "position:absolute" in css for css in result["pillGlyphHost"])
+    # Out of flow, those controls sit ON TOP of the words after the mention.
+    # Revealing them on hover therefore put a live Remove button over prose the
+    # author was about to click into — measured 14-18px past the handle in the
+    # real browser, exactly where a caret click lands. A handle reveals on FOCUS
+    # only, so a mouse moving toward the next word never arms a delete.
+    assert result["handleRevealEvents"] == ["focusin", "focusout"]
+    # The pill needs no reveal at all: its controls sit inside the capsule, in
+    # flow, always visible. Asserted so that "hide the pill's controls too"
+    # cannot be adopted quietly as a symmetry that was never there.
+    assert result["pillRevealEvents"] == []
+
+
+def test_the_writing_section_separator_round_trips_without_growing():
+    """Apply must not add a blank line to every section each time it runs.
+
+    `joinWritingSectionDocuments` writes the break as "\n---\n", but by the
+    time `splitWritingPromptDocument` reads the "---" line the preceding line
+    has already contributed its own "\n" suffix, so the separator's LEADING
+    newline lands in the block being closed and is re-emitted with a fresh
+    separator next time. Stored channels were measured holding 13 and 14.
+
+    This drives the real pair over five cycles rather than checking either half:
+    the growth is a disagreement BETWEEN them, so testing them apart cannot see
+    it. An odd measured count is also why the channel joiner was ruled out —
+    its `\n\n` is trimmed whole, and can only move a count by two.
+    """
+    result = _run_chip_dom_script(r"""
+        const keys = ["summary", "detailed_description"];
+        const doc = (text) => ({ nodes: [{ type: "text", node_id: "n", text }] });
+        let sections = [
+            { channel_docs: { summary: doc("alpha"),
+                // An AUTHORED blank line before the break. An over-eager trim
+                // would eat this, which is the opposite failure.
+                detailed_description: doc("says one\n") } },
+            { channel_docs: { summary: doc("beta"),
+                detailed_description: doc("says two") } },
+            { channel_docs: { summary: doc("gamma"),
+                detailed_description: doc("says three") } },
+        ];
+        const cycles = [];
+        for (let pass = 0; pass < 5; pass += 1) {
+            const joined = mod.joinWritingSectionDocuments(sections, keys);
+            const blocks = mod.splitWritingPromptDocument(joined, { keepEmpty: true });
+            sections = blocks.map((block) => ({
+                channel_docs: mod.splitPromptDocumentChannels(block, keys) }));
+            cycles.push(sections.map((section) => keys.map((key) =>
+                mod.promptDocumentText(section.channel_docs[key]))));
+        }
+        console.log(JSON.stringify({ first: cycles[0], last: cycles.at(-1),
+            stable: cycles.every((pass) =>
+                JSON.stringify(pass) === JSON.stringify(cycles[0])) }));
+    """)
+    # Idempotent from the FIRST cycle, not merely converging later.
+    assert result["stable"], result["cycles"] if "cycles" in result else result
+    assert result["first"] == result["last"]
+    # The authored blank line survives every pass...
+    assert result["last"][0][1] == "says one\n"
+    # ...and no section acquired one it did not have. The last block never grew
+    # even before the fix, so it is the control, not the evidence.
+    assert result["last"][1][1] == "says two"
+    assert result["last"][2][1] == "says three"
+    assert all(text in ("alpha", "beta", "gamma")
+               for text in [row[0] for row in result["last"]])
+
+
+def test_reset_heals_separator_padding_a_project_already_accumulated():
+    """Stopping the growth leaves the damage already on disk.
+
+    The separator fix removes only the newline it just added, so a channel
+    holding thirteen keeps thirteen forever. `healSeparatorPadding` is the
+    one-time repair, applied where the draft is rebuilt from sections and the
+    Reset stash makes it recoverable. It keeps ONE trailing newline, because a
+    single authored blank line is indistinguishable from one unit of damage.
+    """
+    result = _run_chip_dom_script(r"""
+        const text = (value) => mod.promptDocumentText(
+            mod.healSeparatorPadding(value));
+        const doc = (value) => ({ nodes: [{ type: "text", node_id: "n", text: value }] });
+        const shape = (value) => mod.healSeparatorPadding(value).nodes
+            .map((node) => node.type === "text"
+                ? "[" + node.text.replaceAll("\n", "NL") + "]"
+                : "<" + node.attachment_id + ">").join("|");
+        console.log(JSON.stringify({
+            damaged: text(doc("says two\n\n\n\n\n\n\n")),
+            authored: text(doc("says one\n")),
+            clean: text(doc("says one")),
+            // Padding split across nodes is the shape the joiner actually
+            // produces, so the walk must cross a node boundary.
+            split: text({ nodes: [
+                { type: "text", node_id: "a", text: "says two\n" },
+                { type: "text", node_id: "b", text: "\n\n\n" } ] }),
+            // A trailing anchor ends the run: a chip is not padding, and
+            // walking past it would strip prose that precedes it.
+            anchorKinds: shape({ nodes: [
+                { type: "text", node_id: "a", text: "sees " },
+                { type: "attachment", node_id: "b", attachment_id: "chip" } ] }),
+            // Padding AFTER an anchor. The kept newline has to land at the end
+            // of the document; appending it to the last TEXT node puts it on
+            // the wrong side of the chip and pushes the mention onto its own
+            // line, which is the defect inline handles exist to prevent.
+            afterAnchor: shape({ nodes: [
+                { type: "text", node_id: "a", text: "she looks like " },
+                { type: "attachment", node_id: "b", attachment_id: "chip" },
+                { type: "text", node_id: "c", text: "\n\n\n\n" } ] }),
+            // The empty text node between two adjacent chips is the caret slot
+            // the renderer materializes. Dropping empties document-wide instead
+            // of only in the run just walked removes the author's ability to
+            // type between them.
+            caretSlot: shape({ nodes: [
+                { type: "attachment", node_id: "a", attachment_id: "one" },
+                { type: "text", node_id: "b", text: "" },
+                { type: "attachment", node_id: "c", attachment_id: "two" },
+                { type: "text", node_id: "d", text: "tail\n\n\n" } ] }),
+        }));
+    """)
+    assert result["damaged"] == "says two\n"
+    assert result["split"] == "says two\n"
+    # Untouched where there is nothing to heal — the heal must not be a trim.
+    assert result["authored"] == "says one\n"
+    assert result["clean"] == "says one"
+    assert result["anchorKinds"] == "[sees ]|<chip>"
+    assert result["afterAnchor"] == "[she looks like ]|<chip>|[NL]"
+    assert result["caretSlot"] == "<one>|[]|<two>|[tailNL]"
+
+
+def test_a_decoration_never_enters_the_document_and_never_eats_a_keystroke():
+    """The four ways host chrome inside a contenteditable can destroy authoring.
+
+    Decorations are read-only prose the host paints BETWEEN model nodes. They
+    are not document content, and `readDom` rebuilds the model from the DOM on
+    every keystroke, so each of these is a silent-corruption path rather than a
+    cosmetic one:
+
+    1. `readDom`'s else-branch turns any unrecognised direct child into a text
+       node from its `textContent` — a whole rendered contribution injected into
+       the author's prose.
+    2. It walks DIRECT children only, so a decoration nested inside a text span
+       is absorbed into that span's text instead.
+    3. Backspace/Delete reach a neighbouring chip by DOM adjacency, and a
+       decoration between them makes the chip undeletable from the keyboard.
+    4. A caret beside a decoration must still resolve to a model node; a null
+       bookmark makes `render()` drop the caret, which the bug tracker records
+       producing text inserted at position 0, inside chip spans.
+    """
+    result = _run_chip_dom_script("""
+        const attachment = { attachment_id: "ref", kind: "reference",
+            source: {}, config: {} };
+        const decoration = () => {
+            const box = document.createElement("div");
+            box.textContent = "<Subject 1> is the korean woman";
+            return box;
+        };
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "text", node_id: "t1", text: "she wears " },
+                { type: "attachment", node_id: "a1", attachment_id: "ref" },
+                { type: "text", node_id: "t2", text: " in the shot." },
+            ] },
+            attachments: [attachment],
+            attachmentLabelFor: () => "@KWoman",
+            decorations: () => [{ afterIndex: 0, element: decoration() }],
+        });
+        const painted = editor.children.filter((child) =>
+            child.dataset.sonderDecoration === "1");
+
+        // 1. A top-level decoration must be invisible to the model rebuild.
+        editor._handlers.input?.[0]?.();
+        const afterTopLevel = mod.promptDocumentText(editor.promptDocument);
+
+        // 2. Nest one INSIDE a text span, which editing can do, and rebuild.
+        const span = editor.children.find((child) => child.dataset.nodeId === "t2");
+        const nested = decoration();
+        nested.dataset.sonderDecoration = "1";
+        span.appendChild(nested);
+        editor._handlers.input?.[0]?.();
+        const afterNested = mod.promptDocumentText(editor.promptDocument);
+
+        console.log(JSON.stringify({
+            paintedCount: painted.length,
+            paintedIsAtomic: painted[0]?.contentEditable,
+            paintedTabIndex: painted[0]?.tabIndex,
+            paintedRefusesPointer: !!painted[0]?._handlers?.mousedown?.length,
+            afterTopLevel,
+            afterNested,
+            // 3. Adjacency: the chip must still be reachable across a decoration.
+            decorationSitsBetween: editor.children
+                .map((c) => c.dataset.sonderDecoration === "1" ? "D"
+                    : (c.dataset.nodeType === "attachment" ? "C" : "T")).join(""),
+        }));
+    """)
+    # Painted, atomic, unfocusable, and refusing the click that would put a
+    # caret inside it.
+    assert result["paintedCount"] == 1
+    assert result["paintedIsAtomic"] == "false"
+    assert result["paintedTabIndex"] == -1
+    assert result["paintedRefusesPointer"] is True
+    # 1 + 2: the document is exactly the author's prose, both times. The chip
+    # contributes no text, so this is the whole document.
+    assert result["afterTopLevel"] == "she wears  in the shot."
+    assert result["afterNested"] == "she wears  in the shot."
+    assert "<Subject 1>" not in result["afterTopLevel"]
+    assert "<Subject 1>" not in result["afterNested"]
+    # 3: the decoration really is interposed between a text span and the chip,
+    # which is the arrangement that broke Backspace.
+    assert result["decorationSitsBetween"] == "TDCT"
+
+
+def test_decorations_refresh_without_rebuilding_the_draft():
+    """A landed candidate must not rebuild the editor under the caret.
+
+    The compiled candidate arrives on a debounce while the author is still
+    typing. Repainting through the panel's `render()` would recreate the draft
+    element, destroying the caret and this editor's closure-local undo history
+    — the trap the durable rules already document. `refreshDecorations` touches
+    only `[data-sonder-decoration]`.
+    """
+    result = _run_chip_dom_script("""
+        let generation = 0;
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "text", node_id: "t1", text: "alpha" },
+                { type: "text", node_id: "t2", text: "beta" },
+            ] },
+            decorations: () => {
+                generation += 1;
+                const box = document.createElement("div");
+                box.textContent = "generation " + generation;
+                return [{ afterIndex: 1, element: box }];
+            },
+        });
+        const identity = () => editor.children
+            .filter((child) => child.dataset.nodeId)
+            .map((child) => child.dataset.nodeId + ":" + child.textContent);
+        const before = identity();
+        const beforeText = editor.children.find((c) =>
+            c.dataset.sonderDecoration === "1")?.textContent;
+        editor.refreshDecorations();
+        const after = identity();
+        const afterText = editor.children.find((c) =>
+            c.dataset.sonderDecoration === "1")?.textContent;
+        console.log(JSON.stringify({
+            before, after, beforeText, afterText,
+            decorationCount: editor.children
+                .filter((c) => c.dataset.sonderDecoration === "1").length,
+            order: editor.children.map((c) =>
+                c.dataset.sonderDecoration === "1" ? "D" : c.dataset.nodeId).join(","),
+        }));
+    """)
+    # The model spans are the SAME elements with the same ids and text: nothing
+    # was rebuilt, so a caret inside them would have survived.
+    assert result["before"] == result["after"]
+    # The decoration itself did re-render, which is the point.
+    assert result["beforeText"] == "generation 1"
+    assert result["afterText"] == "generation 2"
+    # Exactly one — a refresh that appended instead of replacing would stack
+    # a new copy on every debounced keystroke.
+    assert result["decorationCount"] == 1
+    # And it is re-inserted at its region, not swept to the end of the draft.
+    assert result["order"] == "t1,t2,D"
+
+
+def test_channel_regions_are_reported_per_block():
+    """Decorations need the last node of each channel IN EACH BLOCK.
+
+    `splitPromptDocumentChannels` cannot answer this — it mints a fresh id for
+    every text node it emits — and a single index per channel would pile every
+    block's contributions onto the last block, which is the failure this shape
+    exists to prevent.
+    """
+    result = _run_chip_dom_script("""
+        const t = (id, text) => ({ type: "text", node_id: id, text });
+        const doc = { nodes: [
+            t("h1", "summary:" + String.fromCharCode(10)), t("b1", "alpha"),
+            t("br", String.fromCharCode(10) + "---" + String.fromCharCode(10)),
+            t("h2", "summary:" + String.fromCharCode(10)), t("b2", "beta"),
+            t("h3", "detailed_description:" + String.fromCharCode(10)), t("b3", "says two"),
+        ] };
+        console.log(JSON.stringify({ regions: mod.channelRegionsByNode(
+            doc, ["summary", "detailed_description"],
+            { defaultKey: "detailed_description" }) }));
+    """)
+    assert result["regions"] == [
+        {"block": 0, "channelKey": "summary", "afterIndex": 1},
+        {"block": 1, "channelKey": "summary", "afterIndex": 4},
+        {"block": 1, "channelKey": "detailed_description", "afterIndex": 6},
+    ]
+
+
+def test_a_decoration_does_not_make_a_chip_undeletable():
+    """Guard 3, exercised through Backspace rather than through DOM shape.
+
+    Backspace at the start of a text run deletes the chip before it, found by
+    `previousElementSibling`. A decoration painted between them is not a
+    neighbour in the model but IS one in the DOM, so without `adjacentModelElement`
+    stepping over it the chip becomes undeletable from the keyboard and the
+    browser default runs instead — silently eating a character somewhere else.
+
+    Asserting the DOM arrangement instead of the keystroke is what let this go
+    untested the first time: the arrangement is what `render()` produced, not
+    what the guard does with it.
+    """
+    result = _run_chip_dom_script("""
+        const attachment = { attachment_id: "ref", kind: "reference",
+            source: {}, config: {} };
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "attachment", node_id: "a1", attachment_id: "ref" },
+                { type: "text", node_id: "t1", text: "follows." },
+            ] },
+            attachments: [attachment],
+            attachmentLabelFor: () => "@KWoman",
+            decorations: () => {
+                const box = document.createElement("div");
+                box.textContent = "contribution";
+                return [{ afterIndex: 0, element: box }];
+            },
+        });
+        const order = editor.children.map((c) => c.dataset.sonderDecoration === "1"
+            ? "D" : (c.dataset.nodeType === "attachment" ? "C" : "T")).join("");
+        const span = editor.children.find((c) => c.dataset.nodeId === "t1");
+        // A caret at the very start of the text run, which is the position from
+        // which Backspace is supposed to reach the chip.
+        globalThis.getSelection = () => ({
+            rangeCount: 1,
+            getRangeAt: () => ({ startContainer: span, startOffset: 0,
+                collapsed: true, endContainer: span, endOffset: 0 }),
+            removeAllRanges() {}, addRange() {},
+        });
+        let defaultPrevented = false;
+        editor._handlers.keydown[0]({
+            key: "Backspace", target: span,
+            preventDefault() { defaultPrevented = true; },
+            stopPropagation() {}, stopImmediatePropagation() {},
+        });
+        console.log(JSON.stringify({
+            order,
+            defaultPrevented,
+            anchorsAfter: mod.normalizePromptDocument(editor.promptDocument).nodes
+                .filter((n) => n.type === "attachment").map((n) => n.attachment_id),
+        }));
+    """)
+    # The decoration really is interposed between the chip and the text.
+    assert result["order"] == "CDT"
+    # The editor claimed the keystroke rather than letting the browser default
+    # run, and the chip is gone from the document.
+    assert result["defaultPrevented"] is True
+    assert result["anchorsAfter"] == []
+
+
+def test_a_caret_beside_a_decoration_still_resolves_to_a_model_node():
+    """Guard 4, the one with a recorded prior incident.
+
+    `selectionBoundary` needs a `[data-node-id]` neighbour. A caret resting
+    against a decoration has a decoration on one side, and if the walk does not
+    step over it the bookmark comes back null — which makes `render()` drop the
+    caret. The bug tracker records what that produced last time: text inserted
+    at position 0, landing inside chip spans.
+
+    Both directions are covered because the walk is directional: a decoration
+    before the caret and one after it fail independently.
+    """
+    result = _run_chip_dom_script("""
+        const build = (afterIndex) => {
+            const editor = mod.createPromptDocumentEditor({
+                document: { nodes: [
+                    { type: "text", node_id: "t1", text: "alpha" },
+                    { type: "text", node_id: "t2", text: "beta" },
+                ] },
+                decorations: () => {
+                    const box = document.createElement("div");
+                    box.textContent = "contribution";
+                    return [{ afterIndex, element: box }];
+                },
+            });
+            return editor;
+        };
+        const probe = (editor, childOffset) => {
+            globalThis.getSelection = () => ({
+                rangeCount: 1,
+                getRangeAt: () => ({ startContainer: editor, startOffset: childOffset,
+                    collapsed: true, endContainer: editor, endOffset: childOffset }),
+                removeAllRanges() {}, addRange() {},
+            });
+            return editor.capturePromptSelection();
+        };
+        // Decoration after node 0 -> children are [t1, D, t2]. A caret at child
+        // offset 1 has the decoration immediately AFTER it.
+        const editor = build(0);
+        const shape = editor.children.map((c) =>
+            c.dataset.sonderDecoration === "1" ? "D" : c.dataset.nodeId).join(",");
+        // A caret at the very END of a draft that ENDS in a decoration is the
+        // isolating case: scanning forward runs off the end, so the backward
+        // scan is the only chance, and it lands on the decoration. Probing
+        // anywhere with a model node on one side is rescued by the other
+        // direction and proves nothing about the guard.
+        const trailing = build(1);
+        const trailingShape = trailing.children.map((c) =>
+            c.dataset.sonderDecoration === "1" ? "D" : c.dataset.nodeId).join(",");
+        console.log(JSON.stringify({
+            shape,
+            trailingShape,
+            forward: probe(editor, 1),
+            atEndAfterDecoration: probe(trailing, trailing.children.length),
+        }));
+    """)
+    assert result["shape"] == "t1,D,t2"
+    assert result["trailingShape"] == "t1,t2,D"
+    # Neither position may come back null, and each must name a REAL model node.
+    assert result["forward"] is not None
+    assert result["forward"]["start"]["node_id"] in ("t1", "t2")
+    assert result["atEndAfterDecoration"] is not None
+    assert result["atEndAfterDecoration"]["start"]["node_id"] == "t2"
+
+
+def test_refresh_places_decorations_exactly_where_render_does():
+    """The two paint paths must agree, or a block moves when a compile lands.
+
+    `render()` walks model nodes; `refreshDecorations` walks DOM children. Those
+    lists diverge whenever a model node emits no element, and two blocks sharing
+    one index reverse if each is inserted against the same anchor. Either way
+    the author sees a contribution jump on a keystroke that changed nothing.
+    """
+    result = _run_chip_dom_script("""
+        const label = (editor) => editor.children.map((c) =>
+            c.dataset.sonderDecoration === "1" ? "[" + c.textContent + "]"
+                : c.dataset.nodeId).join(",");
+        // Two blocks sharing one index — the hand-edited-draft case the region
+        // walk explicitly warns about.
+        const make = () => {
+            const box = (text) => { const d = document.createElement("div");
+                d.textContent = text; return d; };
+            return [{ afterIndex: 0, element: box("first") },
+                    { afterIndex: 0, element: box("second") }];
+        };
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "text", node_id: "t1", text: "alpha" },
+                { type: "text", node_id: "t2", text: "beta" },
+            ] },
+            decorations: make,
+        });
+        const rendered = label(editor);
+        editor.refreshDecorations();
+        const refreshed = label(editor);
+        console.log(JSON.stringify({ rendered, refreshed }));
+    """)
+    assert result["rendered"] == "t1,[first],[second],t2"
+    # The reversal this catches was reproducible: inserting both against the
+    # same anchor puts the second one first.
+    assert result["refreshed"] == result["rendered"]
+
+
+def test_a_channel_contribution_resolves_its_text_label_and_placement():
+    """One answer for two surfaces, pinned on the three ways the copy got it wrong.
+
+    Writing mode re-derived these facts from a narrower source than the pill
+    strip did, and produced three visible defects in one block:
+
+    1. Marker text. A Shot has NO `attachment_channel_previews` entry — its text
+       is only on the projection row — so reading previews printed the row's
+       `state_reason` ("composed by the prompt section composer") where the
+       author should have seen `[Shot 1] At 00:00.000,`.
+    2. Labels. Anything without a Reference identity fell back to the literal
+       "Reference", so a Shot announced itself as a Reference.
+    3. Inline. It decided placement from the published route table, but a
+       DISABLED inline capability publishes no route at all, so it read as
+       "show it" and appeared under a heading it can never render in.
+       `rendered_at_anchor` is the authority.
+    """
+    result = _run_chip_dom_script("""
+        const attachments = [
+            { attachment_id: "shot-1", kind: "shot", source: {}, config: {} },
+            { attachment_id: "ref-1", kind: "reference", source: {}, config: {} },
+            { attachment_id: "inline-1", kind: "reference", source: {}, config: {} },
+        ];
+        const candidate = {
+            // Deliberately EMPTY: a marker contributes nothing here, and reading
+            // this map is what produced the excuse instead of the marker.
+            attachment_channel_previews: {},
+            attachment_capability_projections: [
+                { attachment_id: "shot-1", capability_id: "shot",
+                  channel_key: "detailed_description", state: "marker",
+                  text: "[Shot 1] At 00:00.000,",
+                  state_reason: "This marker is composed by the prompt section composer.",
+                  rendered_at_anchor: false, effective_phase: "section_prefix" },
+                { attachment_id: "ref-1", capability_id: "definitions",
+                  channel_key: "detailed_description", state: "emitted",
+                  text: "<Subject 1> is the korean woman",
+                  rendered_at_anchor: false, effective_phase: "section_prefix" },
+                { attachment_id: "inline-1", capability_id: "mentions",
+                  channel_key: "detailed_description", state: "emitted",
+                  text: "<Subject 1>", rendered_at_anchor: true,
+                  effective_phase: "inline" },
+            ],
+        };
+        const rows = mod.channelContributionRows({
+            channelKey: "detailed_description", attachments, candidate,
+            attachmentLabelFor: (a) => a.attachment_id === "ref-1" ? "@KWoman" : "",
+        });
+        console.log(JSON.stringify(rows.map((r) => ({
+            id: r.attachmentId, label: r.label, text: r.text,
+            resolved: r.resolved, emitting: r.emitting, atAnchor: r.atAnchor,
+        }))));
+    """)
+    byId = {row["id"]: row for row in result}
+    # 1. The marker's own text, not its reason.
+    assert byId["shot-1"]["resolved"] == "[Shot 1] At 00:00.000,"
+    assert "composer" not in byId["shot-1"]["resolved"]
+    assert byId["shot-1"]["emitting"] is True
+    # 2. A Shot is labelled a Shot. A Reference with an identity keeps it.
+    assert byId["shot-1"]["label"] != "Reference"
+    assert byId["ref-1"]["label"] == "@KWoman"
+    # 3. Inline is reported so the caller can drop it, and it is decided by
+    # `rendered_at_anchor` rather than by any route table.
+    assert byId["inline-1"]["atAnchor"] is True
+    assert byId["ref-1"]["atAnchor"] is False
+
+
+def test_a_contribution_that_resolves_to_nothing_still_reports_itself():
+    """Silence must be stated, not implied by absence.
+
+    A capability that routes to a channel and produces no text is a different
+    fact from a Reference that does not apply there at all. Omitting it reads as
+    the second when it is the first.
+    """
+    result = _run_chip_dom_script("""
+        const rows = mod.channelContributionRows({
+            channelKey: "summary",
+            attachments: [{ attachment_id: "ref-1", kind: "reference", source: {}, config: {} }],
+            candidate: { attachment_capability_projections: [
+                { attachment_id: "ref-1", capability_id: "summary",
+                  channel_key: "summary", state: "empty", text: "",
+                  state_reason: "This capability is disabled and contributes no text.",
+                  rendered_at_anchor: false }] },
+            attachmentLabelFor: () => "@KWoman",
+        });
+        console.log(JSON.stringify(rows.map((r) => ({
+            emitting: r.emitting, text: r.text, resolved: r.resolved }))));
+    """)
+    assert len(result) == 1
+    assert result[0]["emitting"] is False
+    assert result[0]["text"] == ""
+    assert "disabled" in result[0]["resolved"]
+
+
+def test_a_break_inside_a_text_node_collapses_two_blocks_onto_one_anchor():
+    """Why Split must write the `---` as its own node.
+
+    Decoration placement is node-granular. When the break lives INSIDE a text
+    node, the blocks either side of it report the same index, and both blocks'
+    contributions render stacked under the second one — measured in a real
+    project as `{block:1, afterIndex:6}` and `{block:2, afterIndex:6}`. When the
+    break is its own node, each block anchors separately.
+
+    `joinWritingSectionDocuments` already emits the separator standalone, so
+    reconstruction was always fine; only authoring produced the merged shape,
+    because `insertText` grows the surrounding node by design to keep the
+    caret's bookmarked id alive.
+
+    This pins the READER's behaviour over both document shapes. Driving the
+    editor's caret to produce them is not expressible in this DOM stub — that
+    half is a manual row.
+    """
+    result = _run_chip_dom_script(r"""
+        const NL = String.fromCharCode(10);
+        const keys = ["detailed_description"];
+        const shape = (nodes) => mod.channelRegionsByNode({ nodes }, keys,
+            { defaultKey: "detailed_description" }).map((r) => r.block + ":" + r.afterIndex);
+        console.log(JSON.stringify({
+            // The break merged into the surrounding prose, as growing produced.
+            merged: shape([
+                { type: "text", node_id: "a", text: "alpha" + NL + "---" + NL + "beta" },
+            ]),
+            // The break standing alone, as the reconstruction has always done.
+            standalone: shape([
+                { type: "text", node_id: "a", text: "alpha" },
+                { type: "text", node_id: "b", text: NL + "---" + NL },
+                { type: "text", node_id: "c", text: "beta" },
+            ]),
+        }));
+    """)
+    merged, standalone = result["merged"], result["standalone"]
+    # Two blocks either way...
+    assert len(merged) == 2 and len(standalone) == 2, result
+    # ...but merged puts both on the SAME node, which is the stacking defect.
+    assert merged[0].split(":")[1] == merged[1].split(":")[1], merged
+    # Standalone gives each its own anchor.
+    assert standalone[0].split(":")[1] != standalone[1].split(":")[1], standalone
+
+
+def test_split_here_writes_the_break_as_its_own_node():
+    """The writer half of the rule above.
+
+    Source-level because the caret path is not drivable here: what matters is
+    that Split asks for `asOwnNode`, since the default — growing the node — is
+    exactly what produced the merged shape.
+    """
+    root = Path(__file__).resolve().parents[1]
+    panel = (root / "web" / "js" / "editor_prompt_panel.js").read_text(
+        encoding="utf-8")
+    chips = (root / "web" / "js" / "prompt_context_chips.js").read_text(
+        encoding="utf-8")
+    assert "{ asOwnNode: true }" in panel
+    assert "asOwnNode = false" in chips
+    # Growing must remain the DEFAULT: ordinary typing depends on it to keep the
+    # id the caret is bookmarked against alive across the re-render.
+    assert "asOwnNode && target && model.nodes[target.index]?.type" in chips

@@ -382,6 +382,7 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
         # base/reference branch rather than resolving under a guessed mode.
         return {"setup_manifest": manifest, "ordinal_manifest": ordinals,
                 "unit_picture_ordinals": {}, "unit_source_labels": {},
+                "unit_source_members": {},
                 "errors": invalid, "warnings": warnings}
     if value["mode"] == "base":
         required_first = value["task_mode"] in {"I2VA", "FL2VA"}
@@ -579,6 +580,13 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
     units.sort(key=lambda row: row[:3])
     unit_picture_ordinals = {}
     unit_source_labels = {}
+    # Index-aligned with `unit_source_labels`: the member each rendered source
+    # label stands for. `unit_source_labels` holds STRINGS, which is fine for
+    # compiling but useless to anything that has to turn a source back into a
+    # live `@handle` — the member id is in this loop and was thrown away.
+    # Additive on purpose: `prompt_tokens._unit_label_ordinal` still parses the
+    # rendered strings and no fixture has to supply this.
+    unit_source_members = {}
     for subject_number, (_first, _order, unit_id, unit) in enumerate(units, 1):
         if not unit_id:
             continue
@@ -592,9 +600,11 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
             if row.get("member_id") in member_ids
         ]
         labels = []
+        members = []
         for row in manifest["presentation"]:
-            if str(row.get("member_id") or row.get(
-                    "video_member_id") or "") not in member_ids:
+            member_id = str(row.get("member_id") or row.get(
+                "video_member_id") or "")
+            if member_id not in member_ids:
                 continue
             declaration = populations_by_key.get(str(row.get("population") or ""))
             if declaration is None:
@@ -602,10 +612,17 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
             ordinal_field = f"{declaration['token_kind']}_ordinal"
             label = prompt_context.declared_label(
                 declaration, row.get(ordinal_field))
-            if label not in labels:
-                labels.append(label)
+            # The dedupe is on the LABEL, and one label can be reached by more
+            # than one member, so the two lists must move together or every
+            # index after the first duplicate points at the wrong member.
+            if label in labels:
+                continue
+            labels.append(label)
+            members.append(member_id)
         unit_source_labels[unit_id] = labels
+        unit_source_members[unit_id] = members
     return {"setup_manifest": manifest, "ordinal_manifest": ordinals,
             "unit_picture_ordinals": unit_picture_ordinals,
             "unit_source_labels": unit_source_labels,
+            "unit_source_members": unit_source_members,
             "errors": errors, "warnings": warnings}

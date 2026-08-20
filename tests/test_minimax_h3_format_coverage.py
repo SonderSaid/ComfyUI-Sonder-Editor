@@ -20,7 +20,6 @@ relationship Sonder currently emits differently. They fail loudly the day the
 gap is closed, which is the signal to promote them to ordinary rows.
 """
 
-import copy
 import re
 
 import pytest
@@ -118,6 +117,7 @@ def _compile(resolved, units, sections):
             "ordinal_manifest": resolved["ordinal_manifest"],
             "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
             "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
             "semantic_units": list(units),
         }, labels_on=True)
 
@@ -1098,223 +1098,16 @@ def test_every_line_is_exactly_its_segments(monkeypatch):
     assert compared, "no lines were compared"
 
 
-def test_round_trip_gate_materialize_then_compile_is_unchanged(monkeypatch):
-    """The Phase-4 gate: materializing a line must not change what it compiles to.
+def _anchored_samples(monkeypatch):
+    """Every Reference chip the fixtures stage, as an authored channel document.
 
-    For every reference line every scene fixture produces, materialize it into
-    document nodes and read it back. The result must equal the line the
-    compiler emits today, byte for byte. This is the check that the authored
-    prose stored in the document plus the derived parts recomputed on read
-    reconstruct exactly the assembled sentence.
+    Chips are the record and a channel document holds the author's prose plus an
+    inline anchor per staged chip. These contracts were previously exercised
+    through materialized documents, whose shape was a superset of this one, so
+    the FIXTURE moved and the assertions did not: what they pin — anchors
+    surviving a template retarget, the persisted mirror staying free of
+    ordinals, and a flat overwrite being refused — is unchanged by the pivot.
     """
-    calls = []
-    original = prompt_context._reference_capability_parts
-
-    def _capture(attachment, capability, context):
-        calls.append((attachment, capability, context))
-        return original(attachment, capability, context)
-
-    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
-    for build in SCENES.values():
-        build()
-    monkeypatch.undo()
-    assert calls, "no reference lines were assembled"
-
-    checked = 0
-    for attachment, capability, context in calls:
-        expected = prompt_context.reference_capability_lines(
-            attachment, capability, context)
-        if not expected:
-            continue
-        document = prompt_context.materialize(attachment, capability, context)
-        actual = prompt_context.materialized_lines(
-            document, attachment, capability, context)
-        assert [prompt_context.record_key(owner) for owner, _ in expected] == [
-            key for key, _ in actual]
-        for (_owner, line), (_key, rebuilt) in zip(expected, actual):
-            assert rebuilt == line
-            checked += 1
-    assert checked, "no lines were round-tripped"
-
-
-def test_materialized_document_stores_no_derived_element(monkeypatch):
-    """What lands in the document is prose only.
-
-    The stored text must not contain a label, a shot citation or a marker —
-    those are recomputed on read. If any leaked into a text node the document
-    would freeze a fact staging owns, which is the failure the whole phase is
-    built to prevent.
-    """
-    calls = []
-    original = prompt_context._reference_capability_parts
-
-    def _capture(attachment, capability, context):
-        calls.append((attachment, capability, context))
-        return original(attachment, capability, context)
-
-    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
-    for build in SCENES.values():
-        build()
-    monkeypatch.undo()
-
-    # Labels and shot citations are checked by pattern because both have a
-    # shape ordinary prose cannot accidentally take. Markers are NOT checked by
-    # substring: `reference` is an audio marker value and also a normal English
-    # word, and real prose says "the whole-video temporal-structure reference".
-    # Marker leakage is pinned instead by
-    # `test_authored_prose_never_absorbs_a_derived_element`, which compares a
-    # whole stripped segment rather than searching inside one.
-    inspected = 0
-    for attachment, capability, context in calls:
-        lines = prompt_context.reference_capability_lines(
-            attachment, capability, context)
-        if not lines:
-            continue
-        document = prompt_context.materialize(attachment, capability, context)
-        stored = prompt_context.prompt_document_text(document)
-        assert not re.search(r"<[A-Za-z ]+\d+>", stored), stored
-        assert "[Shot " not in stored, stored
-        inspected += 1
-    assert inspected, "no lines were materialized"
-
-
-def test_a_deleted_prose_hole_does_not_resurrect_the_chip_config(monkeypatch):
-    """An emptied hole contributes nothing rather than falling back to config.
-
-    Re-seeding from `config` would restore prose the author deliberately
-    deleted, which is the one behavior a detached record must never have.
-    The derived parts must still be there — deleting prose removes the
-    sentence, not the label it hangs off.
-    """
-    calls = []
-    original = prompt_context._reference_capability_parts
-
-    def _capture(attachment, capability, context):
-        calls.append((attachment, capability, context))
-        return original(attachment, capability, context)
-
-    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
-    for build in SCENES.values():
-        build()
-    monkeypatch.undo()
-
-    checked = 0
-    for attachment, capability, context in calls:
-        document = prompt_context.materialize(attachment, capability, context)
-        prose = [node for node in document["nodes"]
-                 if node["type"] == "text" and node["text"] != chr(10)]
-        if not prose:
-            continue
-        emptied = {"schema": document["schema"],
-                   "nodes": [node for node in document["nodes"]
-                             if node not in prose]}
-        for _key, rebuilt in prompt_context.materialized_lines(
-                emptied, attachment, capability, context):
-            for run in (node["text"] for node in prose):
-                assert run.strip() not in rebuilt or not run.strip(), rebuilt
-        checked += 1
-    assert checked, "no materialized prose to strip"
-
-
-def test_detached_prose_survives_a_reseed_and_bound_prose_follows_it(monkeypatch):
-    """The Bound/Detached split, which is the whole point of the flag.
-
-    A Bound record still follows its chip config, so a changed default
-    reaches it. A Detached record is the author's text and must not be
-    overwritten by re-seeding.
-    """
-    calls = []
-    original = prompt_context._reference_capability_parts
-
-    def _capture(attachment, capability, context):
-        calls.append((attachment, capability, context))
-        return original(attachment, capability, context)
-
-    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
-    for build in SCENES.values():
-        build()
-    monkeypatch.undo()
-
-    checked = 0
-    for attachment, capability, context in calls:
-        document = prompt_context.materialize(attachment, capability, context)
-        keys = [node["record_key"] for node in document["nodes"]
-                if node["type"] == "attachment"]
-        if not keys:
-            continue
-        # The author rewrites the first record and detaches it.
-        edited = copy.deepcopy(document)
-        replaced = False
-        for node in edited["nodes"]:
-            if node["type"] == "text" and node["text"] != chr(10):
-                node["text"] = " is MINE"
-                replaced = True
-                break
-        if not replaced:
-            continue
-        target = copy.deepcopy(attachment)
-        prompt_context.mark_record_detached(target, keys[0])
-        assert prompt_context.detached_record_keys(target) == {keys[0]}
-
-        reseeded = prompt_context.rematerialize(
-            edited, target, capability, context)
-        assert "MINE" in prompt_context.prompt_document_text(reseeded)
-
-        # Clearing the flag lets the seed win again.
-        prompt_context.mark_record_detached(target, keys[0], detached=False)
-        assert prompt_context.detached_record_keys(target) == set()
-        bound = prompt_context.rematerialize(
-            edited, target, capability, context)
-        assert "MINE" not in prompt_context.prompt_document_text(bound)
-        assert (prompt_context.prompt_document_text(bound)
-                == prompt_context.prompt_document_text(document))
-        checked += 1
-    assert checked, "no records were exercised"
-
-
-def test_a_detached_record_still_renumbers_its_derived_parts(monkeypatch):
-    """Detachment owns the prose, never the label.
-
-    Detaching must not freeze the ordinal: the label, shot citation and marker
-    stay live for a detached record exactly as for a bound one. Otherwise
-    editing one word would silently pin a Subject number.
-    """
-    calls = []
-    original = prompt_context._reference_capability_parts
-
-    def _capture(attachment, capability, context):
-        calls.append((attachment, capability, context))
-        return original(attachment, capability, context)
-
-    monkeypatch.setattr(prompt_context, "_reference_capability_parts", _capture)
-    for build in SCENES.values():
-        build()
-    monkeypatch.undo()
-
-    checked = 0
-    for attachment, capability, context in calls:
-        document = prompt_context.materialize(attachment, capability, context)
-        keys = [node["record_key"] for node in document["nodes"]
-                if node["type"] == "attachment"]
-        if not keys:
-            continue
-        target = copy.deepcopy(attachment)
-        prompt_context.mark_record_detached(target, keys[0])
-        rebuilt = prompt_context.materialized_lines(
-            document, target, capability, context)
-        expected = prompt_context.reference_capability_lines(
-            target, capability, context)
-        assert [line for _k, line in rebuilt] == [line for _o, line in expected]
-        checked += 1
-    assert checked, "no records were exercised"
-
-
-# --------------------------------------------------------------------------
-# Compatibility mirrors (Writing-Mode Parity, Phase 5)
-# --------------------------------------------------------------------------
-
-def _materialized_samples(monkeypatch):
-    """Every reference line the fixtures produce, as a materialized document."""
     calls = []
     original = prompt_context._reference_capability_parts
 
@@ -1328,10 +1121,26 @@ def _materialized_samples(monkeypatch):
     monkeypatch.undo()
     samples = []
     for attachment, capability, context in calls:
-        document = prompt_context.materialize(attachment, capability, context)
-        if any(node["type"] == "attachment" for node in document["nodes"]):
-            samples.append((document, attachment, capability, context))
-    assert samples, "no materialized documents"
+        lines = prompt_context.reference_capability_lines(
+            attachment, capability, context)
+        rendered = chr(10).join(text for _owner, text in lines)
+        if not rendered.strip():
+            continue
+        # Two anchors separated by a newline-bearing text node, because that is
+        # the shape a channel collapse is most likely to mishandle and the one
+        # the old fixture produced by accident rather than by design.
+        document = prompt_context.normalize_prompt_document({"nodes": [
+            {"type": "text", "node_id": "lead", "text": "She wears "},
+            {"type": "attachment", "node_id": "anchor",
+             "attachment_id": attachment["attachment_id"]},
+            {"type": "text", "node_id": "mid", "text": " in the opening shot."
+             + chr(10) + "Later, "},
+            {"type": "attachment", "node_id": "anchor2",
+             "attachment_id": attachment["attachment_id"]},
+            {"type": "text", "node_id": "tail", "text": " returns."},
+        ]})
+        samples.append((document, rendered, attachment, capability, context))
+    assert samples, "no anchored documents"
     return samples
 
 
@@ -1343,39 +1152,54 @@ LEGACY_KEYS = ["visual", "speech", "sounds"]
 def test_the_channels_mirror_carries_prose_but_never_an_ordinal(monkeypatch):
     """`channels` is PERSISTED in project.json, so it must stay unrendered.
 
-    Materialized prose newly reaches the mirror — it used to sit in
-    `config.definition`, which the mirror never saw. That is the intended
-    growth. What must NOT reach it is any derived element: rendering the line
-    into the mirror would persist `<Subject 1>` and `[Shot 1]` into the
-    project file, which is the ordinal invariant this phase is built around.
+    The mirror is `prompt_document_text` over the channel documents, so it can
+    only ever hold what the author typed. The failure it guards against is the
+    mirror learning to RENDER its anchors: every one of these documents holds a
+    chip whose compiled line carries an ordinal, so if the mirror ever composed
+    instead of transcribing, `<Subject 1>` and `[Shot 1]` would land on disk.
+
+    Convert to prose is the other half of the ordinal-at-rest guard and has its
+    own test; this one pins that the mirror never invents an ordinal the document
+    does not contain.
     """
-    for document, _attachment, _capability, _context in _materialized_samples(
+    ordinal = re.compile(r"<[A-Za-z ]+\d+>")
+    leakable = 0
+    for document, rendered, _attachment, _capability, _context in _anchored_samples(
             monkeypatch):
         mirror = prompt_context.channel_document_mirrors(
             {"detailed_description": document})["detailed_description"]
-        assert not re.search(r"<[A-Za-z ]+\d+>", mirror), mirror
+        # The author's prose is there...
+        assert "She wears " in mirror and "opening shot" in mirror, mirror
+        # ...and nothing the compiler derives is.
+        assert not ordinal.search(mirror), mirror
         assert "[Shot " not in mirror, mirror
+        if ordinal.search(rendered) or "[Shot " in rendered:
+            leakable += 1
+    # Without this the suite could pass on documents whose lines never carried
+    # an ordinal at all, which would prove nothing about the invariant.
+    assert leakable, "no sample could have leaked an ordinal"
 
 
-def test_materialized_records_survive_a_template_retarget(monkeypatch):
-    """Switching channel template must not strip an anchor or its record key.
+def test_anchors_survive_a_template_retarget(monkeypatch):
+    """Switching channel template must not strip an inline anchor.
 
     The collapse is deliberately lossy for TEXT, but it is document-aware:
-    losing anchors here would orphan every materialized record, silently
-    turning Bound prose into Free text on an ordinary template switch.
+    losing anchors here would silently drop the author's staged chips on an
+    ordinary template switch, leaving prose that refers to a Reference the
+    prompt no longer conditions on.
     """
-    for document, _attachment, _capability, _context in _materialized_samples(
+    for document, _rendered, _attachment, _capability, _context in _anchored_samples(
             monkeypatch):
-        before = [(node.get("attachment_id"), node.get("record_key"))
-                  for node in document["nodes"]
+        before = [node.get("attachment_id") for node in document["nodes"]
                   if node["type"] == "attachment"]
+        assert before
         documents = {key: prompt_context.text_document("") for key in H3_KEYS}
         documents["subject_definitions"] = document
         narrowed = prompt_context.retarget_channel_documents(
             documents, H3_KEYS, LEGACY_KEYS)
         widened = prompt_context.retarget_channel_documents(
             narrowed, LEGACY_KEYS, H3_KEYS)
-        after = [(node.get("attachment_id"), node.get("record_key"))
+        after = [node.get("attachment_id")
                  for value in widened.values()
                  for node in prompt_context.normalize_prompt_document(
                      value)["nodes"]
@@ -1383,14 +1207,276 @@ def test_materialized_records_survive_a_template_retarget(monkeypatch):
         assert after == before
 
 
-def test_a_materialized_document_refuses_a_flat_text_overwrite(monkeypatch):
-    """A materialized record must not be silently replaced by plain text.
+def test_an_anchored_document_refuses_a_flat_text_overwrite(monkeypatch):
+    """A document holding chips must not be silently replaced by plain text.
 
-    `replace_document_text` already refuses when a document holds anchors;
-    this pins that the protection covers materialized documents too, since
-    they are exactly the documents whose anchors carry authored prose.
+    `replace_document_text` refuses when a document holds anchors; flattening
+    one would delete the author's staged References while appearing to be an
+    ordinary text edit.
     """
-    for document, _attachment, _capability, _context in _materialized_samples(
+    for document, _rendered, _attachment, _capability, _context in _anchored_samples(
             monkeypatch):
         with pytest.raises(ValueError):
             prompt_context.replace_document_text(document, "flattened")
+
+
+def test_convert_to_prose_never_writes_an_ordinal_to_disk(monkeypatch):
+    """The guard that decides whether Convert is safe to ship at all.
+
+    `PromptSection.channels` is derived from the channel documents and persisted
+    to `project.json`, so every literal Convert emits reaches disk. An ordinal
+    there would make the file assert a number staging can still change — the
+    invariant the whole design is built around.
+
+    This walks every Reference capability the H3 fixtures produce, converts it,
+    and asserts of the TEXT parts that no `<Label N>` and no `[Shot N]` survives.
+    Anything that would have to be frozen as a number is refused instead, and
+    the refusal count is asserted non-zero so a build that quietly converted
+    everything could not pass by having nothing to refuse.
+    """
+    ordinal = re.compile(r"<[A-Za-z ]+\d+>")
+    converted = 0
+    refused = 0
+    froze_a_marker = 0
+    for _document, _rendered, attachment, capability, context in _anchored_samples(
+            monkeypatch):
+        plan = prompt_context.convert_capability_plan(
+            attachment, capability, context)
+        if plan["refused"]:
+            refused += 1
+            # A refusal emits nothing AND reports no freeze. Reporting a freeze
+            # that never happened would make a caller warn the author about a
+            # change the tool did not make.
+            assert not plan["lines"], "a refusal must emit nothing"
+            assert not plan["frozen"], "a refusal must report no freeze"
+            continue
+        converted += 1
+        for line in plan["lines"]:
+            for part in line["parts"]:
+                if part["kind"] != "text":
+                    continue
+                assert not ordinal.search(part["text"]), part
+                assert "[Shot " not in part["text"], part
+                assert "(S" not in part["text"], part
+        if plan["frozen"]:
+            froze_a_marker += 1
+    # Both arms have to be exercised or this proves nothing.
+    assert converted, "nothing converted"
+    assert refused, "nothing refused"
+    # WORTH KNOWING, and asserted so it cannot change silently: under the
+    # shipped H3 format nothing reaches the marker-freeze branch, because every
+    # retention line carries either a shot citation or a physical label, and
+    # both block. Convert is therefore a DEFINITIONS-only action in practice.
+    # The freeze rule exists for formats whose retention cites neither; if a
+    # fixture ever starts freezing a marker this flips and the disclosure path
+    # needs its own coverage before it ships.
+    assert froze_a_marker == 0
+
+
+def test_convert_keeps_the_entity_and_its_sources_live(monkeypatch):
+    """A converted definition must still renumber.
+
+    `label` and `sources` are the two derived kinds with a live spelling, so
+    they leave as handle references carrying stable ids rather than as the text
+    `<Subject 1>` / `from <Picture 1>`. Emitting ids is also what keeps handle
+    resolution in one place instead of duplicating it server-side.
+    """
+    seen_handle = 0
+    seen_sources = 0
+    empty_sources = 0
+    for _document, _rendered, attachment, capability, context in _anchored_samples(
+            monkeypatch):
+        plan = prompt_context.convert_capability_plan(
+            attachment, capability, context)
+        if plan["refused"]:
+            continue
+        for line in plan["lines"]:
+            for part in line["parts"]:
+                if part["kind"] == "handle":
+                    # A handle with no id would resolve to nothing and the
+                    # conversion would silently drop the entity.
+                    assert part["source"] == "unit"
+                    assert part["id"], part
+                    seen_handle += 1
+                if part["kind"] == "sources":
+                    seen_sources += 1
+                    # `all([])` is TRUE, so asserting only this let an EMPTY
+                    # sources part through — and the browser join then wrote
+                    # " from  and @undefined" into the author's prompt. Count
+                    # the empty ones instead of assuming they cannot happen.
+                    if not part["member_ids"]:
+                        empty_sources += 1
+                        # The precondition the browser's zero-length branch
+                        # rests on: a sources part with no members also renders
+                        # to nothing, so skipping it can never drop text the
+                        # author would have seen. Joining it instead is what
+                        # produced " from  and @undefined".
+                        assert not part["rendered"].strip(), part
+                        continue
+                    # Index-parallel with the labels it stands for, and every
+                    # member named rather than a rendered string.
+                    assert all(part["member_ids"]), part
+    assert seen_handle, "no definition carried an entity handle"
+    assert seen_sources, "no definition carried its sources"
+    # An empty sources part is REACHABLE outside these fixtures — a Subject with
+    # no visual source — and the assertion above pins what makes skipping it
+    # safe. The checklist never stages a voice-only Subject, so the count here
+    # is not asserted; the browser guard carries a manual row instead.
+
+
+def test_convert_refuses_a_line_whose_numbers_have_no_spelling(monkeypatch):
+    """Refusal is the feature, not a gap.
+
+    A retention line cites `[Shot 2]` and a speech line carries `(S1)`. Both are
+    ordinals; neither has a handle spelling reachable from the segment. The only
+    way to convert them is to freeze the number, which is precisely what may not
+    reach `project.json` — so Convert declines and says which parts stopped it.
+    """
+    reasons = []
+    for _document, _rendered, attachment, capability, context in _anchored_samples(
+            monkeypatch):
+        plan = prompt_context.convert_capability_plan(
+            attachment, capability, context)
+        if plan["refused"]:
+            reasons.append(plan["refused"])
+    assert reasons, "no fixture produced a refusal"
+    # The message must NAME what blocked it — a bare "cannot convert" leaves the
+    # author with no way to tell whether it is their doing.
+    assert any("shots" in reason or "speaker" in reason for reason in reasons), reasons
+    assert all("freeze a number" in reason for reason in reasons), reasons
+    # A PHYSICAL definition blocks for its own reason: its owner is keyed by
+    # the rendered label, so there is no id to hand a handle.
+    assert any("no stable id" in reason for reason in reasons), reasons
+
+
+def test_the_source_member_sidecar_stays_aligned_with_its_labels():
+    """`unit_source_labels` dedupes on the LABEL, so the pair can drift.
+
+    One rendered label can be reached by more than one member. If only the label
+    list skips the duplicate, every index after it names the wrong member, and a
+    converted source resolves to a Reference the author never staged. The two
+    lists are built together for exactly this reason.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a"),
+        ReferenceMember(member_id="mq", asset_id="img_b")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"},
+                               {"entity_id": "e", "member_id": "mq",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
+              "sources": [{"entity_id": "e", "member_id": "mp"},
+                          {"entity_id": "e", "member_id": "mq"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes,
+                        units=units)
+    labels = resolved["unit_source_labels"]["u"]
+    members = resolved["unit_source_members"]["u"]
+    assert labels, "fixture produced no source labels"
+    # One entry per label, in the same order, naming a real member.
+    assert len(members) == len(labels)
+    assert all(member for member in members)
+    assert set(members) <= {"mp", "mq"}
+
+
+def test_convert_plan_through_the_real_compile_keeps_the_entity_and_sources():
+    """Convert, through the wiring rather than the pure function.
+
+    The pure `convert_capability_plan` was already covered — and it passed the
+    whole time the feature was broken. The defect lived in the WIRING: the plan
+    was built from a context assembled by hand, and `_reference_capability_parts`
+    reads `semantic_units_by_id` and `profile`, which `compile_prompt_context`
+    injects during compilation. A hand-built context has neither, so
+    `declared_label` returned "", the definition branch was never taken, and
+    every Convert returned an empty plan that the browser treated as success:
+    the capability was disabled and no prose was written.
+
+    Asserting merely "non-empty" would NOT have caught it either. With a chip
+    definition override the broken path still produced one text part, having
+    silently dropped the entity handle and the source list — a live-to-static
+    degradation on a one-way action. So this asserts the SHAPE: handle, prose,
+    sources.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a",
+                        prompt="the young woman with long dark hair")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
+              "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    chip = _reference_chip("chip-1", {"semantic_unit_ids": ["u"]},
+                           {"definition": "a woman in a red coat"},
+                           capabilities=("definitions",))
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    sections = [PromptSection(0, WINDOW_END,
+                              channels={"detailed_description": "She looks up."},
+                              attachments=[chip])]
+
+    compiled = prompt_context.compile_prompt_context(
+        sections=sections, window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": resolved["setup_manifest"],
+            "ordinal_manifest": resolved["ordinal_manifest"],
+            "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
+            "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
+            "semantic_units": units,
+        }, labels_on=True,
+        convert_plan_for={"attachment_id": "chip-1", "capability_id": "definitions"})
+
+    plan = compiled["convert_plan"]
+    assert not plan["refused"], plan
+    assert plan["lines"], "the wiring produced no lines; this is the shipped defect"
+    parts = plan["lines"][0]["parts"]
+    kinds = [part["kind"] for part in parts]
+    # The entity leaves as a HANDLE keyed by a stable id, not as `<Subject 1>`.
+    assert "handle" in kinds, parts
+    handle = next(part for part in parts if part["kind"] == "handle")
+    assert handle["source"] == "unit" and handle["id"] == "u", handle
+    # The author's prose is carried through...
+    assert any(part["kind"] == "text" and "red coat" in part["text"]
+               for part in parts), parts
+    # ...and the sources come with it, naming members rather than labels. The
+    # broken path produced the prose alone, which is why "non-empty" is not
+    # a sufficient assertion here.
+    assert "sources" in kinds, parts
+    sources = next(part for part in parts if part["kind"] == "sources")
+    assert sources["member_ids"] == ["mp"], sources
+
+
+def test_convert_plan_refuses_a_capability_that_is_not_staged():
+    """A Convert request naming something absent must decline, not crash.
+
+    The lookup deliberately searches the compiled state rather than trusting the
+    request, so a stale panel cannot convert a capability the author can no
+    longer see.
+    """
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channels={"detailed_description": "She looks up."})],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        convert_plan_for={"attachment_id": "nope", "capability_id": "definitions"})
+    plan = compiled["convert_plan"]
+    assert plan["refused"]
+    assert not plan["lines"] and not plan["frozen"]
+
+
+def test_a_compile_without_a_convert_request_carries_no_plan():
+    """The field appears only when asked for; every other compile is unchanged."""
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channels={"detailed_description": "She looks up."})],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1")
+    assert "convert_plan" not in compiled

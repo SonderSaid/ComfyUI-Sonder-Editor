@@ -197,13 +197,10 @@ export function normalizePromptDocument(raw, fallbackText = "") {
             const attachmentId = String(value.attachment_id || "").trim();
             if (!attachmentId) continue;
             const node = { type: "attachment", node_id: nodeId, attachment_id: attachmentId };
-            if (value.capability_id) node.capability_id = String(value.capability_id);
             // Mirrors `normalize_prompt_document`. Dropping it here would make
             // an echoed document hash differently from the server's copy and
-            // spuriously 409 identity validation, and would orphan every
-            // materialized record by collapsing it onto the capability's
-            // first line. Parity is pinned by a test.
-            if (value.record_key) node.record_key = String(value.record_key);
+            // spuriously 409 identity validation. Parity is pinned by a test.
+            if (value.capability_id) node.capability_id = String(value.capability_id);
             nodes.push(node);
         }
     }
@@ -323,6 +320,21 @@ export function joinWritingSectionDocuments(sections, channelKeys) {
 /** Split only separator LINES; attachment nodes remain in their exact block. */
 export function splitWritingPromptDocument(documentValue, { keepEmpty = false } = {}) {
     const blocks = [[]];
+    // `joinWritingSectionDocuments` writes the separator as "\n---\n", but the
+    // line preceding it has already appended its own "\n" suffix below by the
+    // time the "---" line is read, so the separator's LEADING newline lands in
+    // the block being closed. Left there it is re-emitted alongside a fresh
+    // separator on the next join, growing every block but the last by one
+    // newline per Apply. Mirrors `trimStructuralSeparator`, which does the same
+    // job for channel headers — and like it, removes exactly what the joiner
+    // contributed so an authored blank line before a break survives.
+    const trimClosingSeparator = () => {
+        const current = blocks.at(-1);
+        const previous = current.at(-1);
+        if (previous?.type !== "text" || !previous.text.endsWith("\n")) return;
+        previous.text = previous.text.slice(0, -1);
+        if (!previous.text) current.pop();
+    };
     for (const node of normalizePromptDocument(documentValue).nodes) {
         if (node.type === "attachment") {
             blocks.at(-1).push(structuredClone(node));
@@ -332,6 +344,7 @@ export function splitWritingPromptDocument(documentValue, { keepEmpty = false } 
         let reusedSourceId = false;
         lines.forEach((line, index) => {
             if (line.trim() === "---") {
+                trimClosingSeparator();
                 blocks.push([]);
                 return;
             }
@@ -354,6 +367,64 @@ export function splitWritingPromptDocument(documentValue, { keepEmpty = false } 
     return keepEmpty ? normalized : normalized.filter((block) =>
         promptDocumentText(block).trim()
         || block.nodes.some((node) => node.type === "attachment"));
+}
+
+/**
+ * Collapse separator padding a channel document accumulated before the
+ * `"\n---\n"` asymmetry in `splitWritingPromptDocument` was fixed.
+ *
+ * That defect added one trailing newline per Apply to every block but the last,
+ * and the fix only stops the growth — a channel already holding thirteen keeps
+ * thirteen. This is the one-time heal, applied where the draft is being rebuilt
+ * from sections anyway and the Reset stash makes it recoverable.
+ *
+ * ONE trailing newline is preserved, because a single authored blank line
+ * before the next channel heading is indistinguishable from one unit of damage
+ * and is the reading a user is more likely to have meant. Everything beyond it
+ * accumulated mechanically.
+ *
+ * It is deliberately applied to every channel rather than only the last
+ * populated one of a non-final block, which is the only place the defect could
+ * reach: the draft is rebuilt from whatever the project holds, and narrowing it
+ * would mean re-deriving which channel was last at the time the damage was
+ * written, which nothing records.
+ *
+ * EXPIRY: this repairs data written before the separator fix. It can be deleted
+ * once no project in circulation predates that fix — in practice, after the
+ * next release that carries it plus one round of opening every project the
+ * maintainer still uses. Until then removing it silently leaves damaged
+ * projects damaged, since the fix only stops the growth.
+ */
+export function healSeparatorPadding(documentValue) {
+    const nodes = normalizePromptDocument(documentValue).nodes.map(
+        (node) => ({ ...node }));
+    let removed = 0;
+    let runStart = nodes.length;
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+        const node = nodes[index];
+        if (node.type !== "text") break;
+        const trimmed = node.text.replace(/\n+$/, "");
+        removed += node.text.length - trimmed.length;
+        node.text = trimmed;
+        runStart = index;
+        // A node still holding prose ends the trailing run; one that was all
+        // newlines does not, so the walk continues through it.
+        if (trimmed) break;
+    }
+    if (removed <= 1) return normalizePromptDocument(documentValue);
+    // Drop ONLY the nodes this walk emptied. An empty text node elsewhere is
+    // the caret slot `render()` materializes between two adjacent chips, and
+    // removing it removes the author's ability to type between them.
+    const kept = nodes.filter((node, index) =>
+        index < runStart || node.type !== "text" || node.text);
+    // The preserved newline belongs at the END of the document. Appending it to
+    // the last TEXT node instead puts it on the wrong side of a trailing
+    // anchor, which pushes a mention onto its own line — the exact defect the
+    // inline handle rendering exists to prevent, reintroduced by the repair.
+    const last = kept.at(-1);
+    if (last?.type === "text") last.text += "\n";
+    else kept.push({ type: "text", node_id: uid(), text: "\n" });
+    return normalizePromptDocument({ nodes: kept });
 }
 
 /**
@@ -416,6 +487,88 @@ export function splitPromptDocumentChannels(documentValue, channelKeys,
     }
     return Object.fromEntries(keys.map((key) => [key,
         normalizePromptDocument({ nodes: output[key] })]));
+}
+
+/**
+ * The model node span each `---`-separated block occupies.
+ *
+ * `channelRegionsByNode` can only report a channel that APPEARS in the draft,
+ * and `joinChannelDocuments` writes a heading only for a populated channel — so
+ * a channel a chip feeds but the author has never typed in has no region, and
+ * therefore nowhere for its contribution to be shown. This gives that case an
+ * anchor: the end of the block it belongs to.
+ */
+export function writingBlockNodeRanges(documentValue) {
+    const nodes = normalizePromptDocument(documentValue).nodes;
+    const ranges = [{ block: 0, firstIndex: 0, lastIndex: -1 }];
+    nodes.forEach((node, index) => {
+        if (node.type === "text"
+            && String(node.text || "").split("\n").some((line) => line.trim() === "---")) {
+            // A break can share a node with the text on either side of it, so
+            // the node counts as the tail of the closing block AND the head of
+            // the next. Placement is node-granular; this is the same known
+            // limit `channelRegionsByNode` documents.
+            ranges.at(-1).lastIndex = index;
+            ranges.push({ block: ranges.length, firstIndex: index, lastIndex: index });
+            return;
+        }
+        ranges.at(-1).lastIndex = index;
+    });
+    return ranges;
+}
+
+/**
+ * Where each channel's text stops in each block, as MODEL NODE INDICES.
+ *
+ * `splitPromptDocumentChannels` cannot answer this: `appendText` mints a fresh
+ * `uid()` for every text node it emits and merges adjacent runs, so nothing in
+ * its output maps back to a position in the source document. This walks the
+ * same grammar — `key:` headings, and `---` starting a new block — and reports
+ * one region per (block, channel) pair with the index of the last node that
+ * contributed to it. That is what an inline decoration needs in order to sit
+ * after the right region instead of at the end of the draft.
+ *
+ * Block-aware deliberately: the same channel key appears once per block, so a
+ * single index per channel would pile every block's decorations onto the last
+ * one.
+ *
+ * Node granularity is exact for a reconstructed draft, because
+ * `joinChannelDocuments` emits each `key:` heading as its own text node. A
+ * hand-edited draft can end up with two channels inside one node, and then both
+ * report that node. Decorations therefore name their channel rather than
+ * relying on position alone.
+ */
+export function channelRegionsByNode(documentValue, channelKeys, { defaultKey = "" } = {}) {
+    const keys = Array.isArray(channelKeys) && channelKeys.length ? channelKeys : [];
+    const keySet = new Set(keys);
+    const fallback = keySet.has(defaultKey) ? defaultKey : keys[0] || "";
+    const regions = [];
+    let block = 0;
+    let current = fallback;
+    const seen = new Map();
+    const mark = (index) => {
+        if (!current) return;
+        const key = `${block}::${current}`;
+        const existing = seen.get(key);
+        if (existing) { existing.afterIndex = index; return; }
+        const region = { block, channelKey: current, afterIndex: index };
+        seen.set(key, region);
+        regions.push(region);
+    };
+    normalizePromptDocument(documentValue).nodes.forEach((node, index) => {
+        if (node.type === "attachment") { mark(index); return; }
+        for (const line of String(node.text || "").split("\n")) {
+            if (line.trim() === "---") { block += 1; current = fallback; continue; }
+            const match = line.match(/^([A-Za-z0-9_]+):[ \t]?(.*)$/);
+            if (match && keySet.has(match[1])) {
+                current = match[1];
+                mark(index);
+                continue;
+            }
+            if (line) mark(index);
+        }
+    });
+    return regions;
 }
 
 /** Retarget channel documents without flattening inline attachment anchors. */
@@ -1147,13 +1300,20 @@ function placementDisplayLabel(value, { renderedAtAnchor = false,
         || placement.replaceAll("_", " ").replace(/^./, (char) => char.toUpperCase());
 }
 
-function contextChipLabel(label) {
+function contextChipLabel(label, { inline = false } = {}) {
     const chipLabel = document.createElement("span");
     chipLabel.dataset.sonderContextChipLabel = "1";
     chipLabel.textContent = label;
-    chipLabel.style.cssText = "display:-webkit-box;min-width:0;overflow:hidden;"
-        + "overflow-wrap:anywhere;white-space:normal;line-height:14px;"
-        + "-webkit-box-orient:vertical;-webkit-line-clamp:2;";
+    // A pill clamps to two lines inside a fixed-width capsule. A handle must
+    // not: `-webkit-box` is BLOCK-level, and a block child inside an inline
+    // parent forces a line break either side of it, so a handle mid-sentence
+    // broke the paragraph it sat in. The clamp has nothing to clamp anyway —
+    // a handle renders its identity alone, without the chip preview.
+    chipLabel.style.cssText = inline
+        ? "display:inline;min-width:0;overflow-wrap:anywhere;white-space:normal;"
+        : "display:-webkit-box;min-width:0;overflow:hidden;"
+            + "overflow-wrap:anywhere;white-space:normal;line-height:14px;"
+            + "-webkit-box-orient:vertical;-webkit-line-clamp:2;";
     return chipLabel;
 }
 
@@ -1267,6 +1427,11 @@ export function createPromptDocumentEditor({
     onActivateAttachment = null,
     getHostSnapshot = null,
     onRestoreHostSnapshot = null,
+    // `(model) => [{ afterIndex, element }]`, re-run on every render.
+    // Decorations are NOT document content: they are read-only prose the
+    // host paints between model nodes, and `readDom` is built to look
+    // straight through them. See `renderDecorations` below.
+    decorations = null,
 } = {}) {
     let model = normalizePromptDocument(initialDocument, text);
     let attachments = normalizePromptAttachments(initialAttachments);
@@ -1309,11 +1474,26 @@ export function createPromptDocumentEditor({
         }
         if (container !== editor) return null;
         const childOffset = Math.max(0, Math.min(editor.childNodes.length, Number(offset) || 0));
-        const next = editor.childNodes[childOffset];
+        // Step over decorations in BOTH directions. A caret beside one has to
+        // resolve to a real model node: a null bookmark makes `render()` drop
+        // the caret, and the bug tracker records what that produced last time
+        // — text inserted at position 0, landing inside chip spans.
+        const modelSibling = (from, step) => {
+            for (let index = from; index >= 0 && index < editor.childNodes.length;
+                index += step) {
+                const candidate = editor.childNodes[index];
+                if (!(candidate instanceof HTMLElement)) continue;
+                if (candidate.dataset.sonderDecoration === "1") continue;
+                if (candidate.dataset.nodeId) return candidate;
+                return null;
+            }
+            return null;
+        };
+        const next = modelSibling(childOffset, 1);
         if (next instanceof HTMLElement && next.dataset.nodeId) {
             return { node_id: next.dataset.nodeId, offset: 0 };
         }
-        const previous = editor.childNodes[childOffset - 1];
+        const previous = modelSibling(childOffset - 1, -1);
         if (previous instanceof HTMLElement && previous.dataset.nodeId) {
             const logicalLength = previous.dataset.nodeType === "text"
                 ? String(previous.textContent || "").replaceAll("\u200b", "").length : 1;
@@ -1334,6 +1514,8 @@ export function createPromptDocumentEditor({
             .find((value) => value.dataset.nodeId === boundary.node_id);
         if (!direct) return null;
         if (direct.dataset.nodeType !== "text") {
+            // Index within the LIVE child list, which now includes decorations,
+            // so this stays correct without needing to discount them.
             const index = [...editor.childNodes].indexOf(direct);
             return index < 0 ? null : { container: editor,
                 offset: index + (Number(boundary.offset) > 0 ? 1 : 0) };
@@ -1389,43 +1571,112 @@ export function createPromptDocumentEditor({
         future = [];
     };
 
+    // Decorations are the host's read-only prose, painted BETWEEN model nodes
+    // and never part of the document. Everything about them is defensive:
+    // `readDom` skips them, the text-span read strips them out of any span they
+    // end up inside, chip adjacency steps over them, and they refuse focus and
+    // selection so nothing an author types can land in one and be silently
+    // eaten on the next render.
+    let paintedDecorations = new Set();
+    const decorationFor = () => {
+        if (typeof decorations !== "function") return [];
+        try {
+            return decorations(structuredClone(model)) || [];
+        } catch (_error) {
+            // A host that throws while describing decorations must not take the
+            // editor down with it: prose the author is typing outranks chrome.
+            return [];
+        }
+    };
+    const decorateElement = (element) => {
+        element.dataset.sonderDecoration = "1";
+        element.contentEditable = "false";
+        element.tabIndex = -1;
+        // `user-select:none` is what stops a selection dragged across the draft
+        // from swallowing decoration text into a copy or a delete.
+        element.style.userSelect = "none";
+        element.style.webkitUserSelect = "none";
+        // A caret could otherwise be placed inside by clicking, and anything
+        // typed there would be invisible to `readDom` and erased by the next
+        // render — a silent loss of the author's words. Refusing the mousedown
+        // leaves the click on the prose behind it.
+        if (element.dataset.sonderDecorationArmed !== "1") {
+            element.dataset.sonderDecorationArmed = "1";
+            element.addEventListener("mousedown", (event) => event.preventDefault());
+        }
+    };
+    let decorationPlan = [];
+    let lastPaintedIndex = -1;
+    const paintDecorations = (nodeIndex, { trailing = false } = {}) => {
+        for (const entry of decorationPlan) {
+            const target = Number(entry?.afterIndex);
+            const isTrailing = !Number.isFinite(target) || target >= model.nodes.length;
+            if (trailing ? !isTrailing : (isTrailing || target !== nodeIndex)) continue;
+            if (paintedDecorations.has(entry)) continue;
+            paintedDecorations.add(entry);
+            const element = entry?.element;
+            if (!(element instanceof HTMLElement)) continue;
+            decorateElement(element);
+            editor.appendChild(element);
+            lastPaintedIndex = nodeIndex;
+        }
+    };
+
     const render = (bookmark = selectionBookmark()) => {
         const ownedFocus = document.activeElement === editor || editor.contains(document.activeElement);
         rendering = true;
         editor.textContent = "";
+        decorationPlan = decorationFor();
+        paintedDecorations = new Set();
         const byId = attachmentById();
-        for (const node of model.nodes) {
+        model.nodes.forEach((node, nodeIndex) => {
             if (node.type === "text") {
                 const span = document.createElement("span");
                 span.dataset.nodeId = node.node_id;
                 span.dataset.nodeType = "text";
+                // The model index is stamped so `refreshDecorations` can place a
+                // block exactly where `render()` would. Deriving it from the
+                // child list instead drifts the moment a model node emits no
+                // element — an attachment whose record is gone, or a bare text
+                // node the browser leaves behind at an editor boundary.
+                span.dataset.modelIndex = String(nodeIndex);
                 // A zero-width character keeps an empty stable text node
                 // addressable without entering the normalized projection.
                 span.textContent = node.text || "\u200b";
                 editor.appendChild(span);
-                continue;
+                paintDecorations(nodeIndex);
+                return;
             }
             const attachment = byId.get(node.attachment_id);
-            if (!attachment) continue;
+            if (!attachment) { paintDecorations(nodeIndex); return; }
             const chip = document.createElement("span");
             chip.contentEditable = "false";
             chip.dataset.nodeId = node.node_id;
             chip.dataset.nodeType = "attachment";
+            chip.dataset.modelIndex = String(nodeIndex);
             chip.dataset.attachmentId = attachment.attachment_id;
             // The DOM is the round-trip carrier: whatever is not written here
             // is gone the next time `readDom` rebuilds the model from it.
             if (node.capability_id) chip.dataset.capabilityId = String(node.capability_id);
-            if (node.record_key) chip.dataset.recordKey = String(node.record_key);
+            // The identity WITHOUT the preview decides both the handle test and
+            // what a handle renders. The preview is chip chrome — a pill has
+            // room to describe itself, prose does not, and `@KWoman — <Subject
+            // 1> is the korean woman…` mid-clause is not a mention. The full
+            // label still carries the preview into the title and aria name,
+            // where describing the chip is the point.
+            const identityLabel = attachmentLabel(attachment, "",
+                attachmentLabelFor?.(attachment) || "", attachmentContext);
             const label = attachmentLabel(attachment,
                 previews?.[attachment.attachment_id] || "",
                 attachmentLabelFor?.(attachment) || "", attachmentContext);
-            const handle = isHandleLabel(label);
+            const handle = isHandleLabel(identityLabel);
             chip.style.cssText = handle ? handleCss() : chipCss();
             chip.setAttribute("role", "button");
             chip.tabIndex = 0;
             chip.title = `${label} — dynamic context; activate to configure`;
             chip.setAttribute("aria-label", `${label} context chip; activate to configure`);
-            const chipLabel = contextChipLabel(label);
+            const chipLabel = contextChipLabel(handle ? identityLabel : label,
+                { inline: handle });
             // A visible cue that a chip opens an editor. The chip already had
             // `role="button"`, a tab stop, a pointer cursor and a title saying
             // so, but at rest it looked like a static token, and clicking it
@@ -1447,12 +1698,35 @@ export function createPromptDocumentEditor({
                 event.stopPropagation();
                 removeAttachment(attachment.attachment_id);
             });
-            chip.append(chipLabel, editGlyph, remove);
             if (handle) {
+                // `opacity:0` hides paint but keeps layout, so the glyphs left
+                // roughly two blank characters after every handle mid-sentence.
+                // Taking them out of flow removes that gap while keeping them
+                // in the DOM, in the accessibility tree and focusable — which
+                // `display:none` and `visibility:hidden` would not.
+                const affordanceHost = document.createElement("span");
+                affordanceHost.contentEditable = "false";
+                affordanceHost.style.cssText = "position:absolute;top:0;left:100%;"
+                    + "display:inline-flex;align-items:center;gap:2px;"
+                    + "white-space:nowrap;z-index:1;";
+                affordanceHost.append(editGlyph, remove);
+                chip.style.cssText += "position:relative;";
+                chip.append(chipLabel, affordanceHost);
                 // Inline styles carry no `:hover` rule, so the reveal is wired
                 // by hand. The affordances stay in the DOM and keep their
                 // accessible names — only their paint is deferred, so a
                 // screen reader and the keyboard path are unaffected.
+                //
+                // FOCUS ONLY, deliberately not hover. Out of flow they sit ON
+                // TOP of the words after the mention, so revealing them on
+                // hover put a live Remove button over prose the author was
+                // about to click into — measured at 14-18px past the handle,
+                // where a caret click lands. A mouse user reaches the same
+                // controls by activating the chip, which opens its editor; a
+                // keyboard user tabbing here is deliberately in the control and
+                // is not about to click the sentence behind it. Reflowing the
+                // sentence on hover instead was rejected: the text moving out
+                // from under the pointer re-fires hover and flickers.
                 const affordances = [editGlyph, remove];
                 const reveal = (shown) => {
                     for (const element of affordances) {
@@ -1461,12 +1735,10 @@ export function createPromptDocumentEditor({
                     }
                 };
                 reveal(false);
-                chip.addEventListener("mouseenter", () => reveal(true));
-                chip.addEventListener("mouseleave", () => {
-                    if (!chip.contains(document.activeElement)) reveal(false);
-                });
                 chip.addEventListener("focusin", () => reveal(true));
                 chip.addEventListener("focusout", () => reveal(false));
+            } else {
+                chip.append(chipLabel, editGlyph, remove);
             }
             chip.addEventListener("click", (event) => {
                 event.preventDefault();
@@ -1480,7 +1752,9 @@ export function createPromptDocumentEditor({
                 onActivateAttachment?.(attachment, node);
             });
             editor.appendChild(chip);
-        }
+            paintDecorations(nodeIndex);
+        });
+        paintDecorations(model.nodes.length - 1, { trailing: true });
         rendering = false;
         if (ownedFocus && bookmark) {
             editor.focus({ preventScroll: true });
@@ -1488,6 +1762,34 @@ export function createPromptDocumentEditor({
         }
     };
 
+    // The top-level skip is not enough on its own: `readDom` walks DIRECT
+    // children, and a decoration that ends up nested inside a text span —
+    // which editing can do — would be read as part of that span's text.
+    // Backspace/Delete reach a neighbouring chip by DOM adjacency, and a
+    // decoration painted between them is not a neighbour in the model. Left
+    // unhandled it makes the chip undeletable from the keyboard and lets the
+    // browser default run instead.
+    const adjacentModelElement = (element, direction) => {
+        let cursor = direction === "previous"
+            ? element.previousElementSibling : element.nextElementSibling;
+        while (cursor?.dataset?.sonderDecoration === "1") {
+            cursor = direction === "previous"
+                ? cursor.previousElementSibling : cursor.nextElementSibling;
+        }
+        return cursor?.dataset?.nodeType === "attachment" ? cursor : null;
+    };
+    const textWithoutDecorations = (element) => {
+        if (!element.querySelector?.("[data-sonder-decoration]")) {
+            return String(element.innerText || element.textContent || "")
+                .replaceAll("\u200b", "");
+        }
+        const clone = element.cloneNode(true);
+        for (const stray of clone.querySelectorAll("[data-sonder-decoration]")) {
+            stray.remove();
+        }
+        return String(clone.innerText || clone.textContent || "")
+            .replaceAll("\u200b", "");
+    };
     const readDom = () => {
         if (rendering || composing) return;
         const previouslyAnchored = new Set(model.nodes
@@ -1501,15 +1803,18 @@ export function createPromptDocumentEditor({
                 continue;
             }
             if (!(child instanceof HTMLElement)) continue;
+            // Host chrome, not document content. Without this the else-branch
+            // below would absorb a whole rendered contribution into the
+            // author's prose as text on the very next keystroke.
+            if (child.dataset.sonderDecoration === "1") continue;
             if (child.dataset.nodeType === "attachment") {
                 const node = { type: "attachment", node_id: child.dataset.nodeId || uid(),
                     attachment_id: child.dataset.attachmentId };
                 if (child.dataset.capabilityId) node.capability_id = child.dataset.capabilityId;
-                if (child.dataset.recordKey) node.record_key = child.dataset.recordKey;
                 next.push(node);
             } else {
                 next.push({ type: "text", node_id: child.dataset.nodeId || uid(),
-                    text: String(child.innerText || child.textContent || "").replaceAll("\u200b", "") });
+                    text: textWithoutDecorations(child) });
             }
         }
         model = normalizePromptDocument({ nodes: next });
@@ -1616,11 +1921,9 @@ export function createPromptDocumentEditor({
                 if (host?.dataset?.nodeType === "text") {
                     const length = String(host.textContent || "").replaceAll("\u200b", "").length;
                     if (event.key === "Backspace" && range.startOffset === 0) {
-                        chip = host.previousElementSibling?.dataset?.nodeType === "attachment"
-                            ? host.previousElementSibling : null;
+                        chip = adjacentModelElement(host, "previous");
                     } else if (event.key === "Delete" && range.startOffset >= length) {
-                        chip = host.nextElementSibling?.dataset?.nodeType === "attachment"
-                            ? host.nextElementSibling : null;
+                        chip = adjacentModelElement(host, "next");
                     }
                 }
             }
@@ -1881,7 +2184,22 @@ export function createPromptDocumentEditor({
     // selection into its output (`{text}`) wants a wrap; one that does not
     // would otherwise DELETE the author's paragraph and put an unrelated token
     // in its place, so the caller decides rather than this function guessing.
-    editor.insertText = (rawText, { replaceSelection = false } = {}) => {
+    /**
+     * `asOwnNode` splits the text node instead of growing it.
+     *
+     * Growing is right for ordinary typing — it keeps the id the caret is
+     * bookmarked against alive across the re-render. It is wrong for a section
+     * break: `channelRegionsByNode` places decorations at node granularity, so
+     * a `---` living inside a text node makes the blocks either side of it
+     * report the SAME index, and both blocks' contributions stack under the
+     * second. `joinWritingSectionDocuments` already emits the separator as its
+     * own node, so this makes authoring match reconstruction.
+     *
+     * Safe because `normalizePromptDocument` does not merge adjacent text nodes
+     * and `readDom` preserves each span's id. The caret is bookmarked to the
+     * TAIL node explicitly, so it lands after the break rather than before it.
+     */
+    editor.insertText = (rawText, { replaceSelection = false, asOwnNode = false } = {}) => {
         if (disabled) return;
         const value = String(rawText ?? "");
         if (!value) return;
@@ -1899,7 +2217,18 @@ export function createPromptDocumentEditor({
             removedAttachment = result.removedAttachment;
         }
         let caret = null;
-        if (target && model.nodes[target.index]?.type === "text") {
+        if (asOwnNode && target && model.nodes[target.index]?.type === "text") {
+            const current = model.nodes[target.index];
+            const head = current.text.slice(0, target.offset);
+            const tail = current.text.slice(target.offset);
+            const inserted = { type: "text", node_id: uid(), text: value };
+            const tailNode = { type: "text", node_id: uid(), text: tail };
+            current.text = head;
+            // Head keeps its id so anything bookmarked against it survives; the
+            // break and the tail are new nodes, which is the whole point.
+            model.nodes.splice(target.index + 1, 0, inserted, tailNode);
+            caret = { node_id: tailNode.node_id, offset: 0 };
+        } else if (target && model.nodes[target.index]?.type === "text") {
             // Grow the existing text node rather than splitting it, so the id
             // the caret is bookmarked against survives the re-render.
             const current = model.nodes[target.index];
@@ -1977,6 +2306,63 @@ export function createPromptDocumentEditor({
         range.collapse(false);
         selection.removeAllRanges();
         selection.addRange(range);
+    };
+    /**
+     * Repaint decorations only, leaving the document spans and the caret alone.
+     *
+     * The whole point of a separate entry: the compiled candidate lands on a
+     * debounce while the author is still typing, and routing that through the
+     * panel's `render()` would rebuild the draft element under the cursor —
+     * destroying the caret and this editor's closure-local undo history. Model
+     * children are untouched here; only `[data-sonder-decoration]` is removed
+     * and re-inserted at its region.
+     */
+    editor.refreshDecorations = () => {
+        if (rendering || composing) return;
+        for (const stale of [...editor.querySelectorAll("[data-sonder-decoration]")]) {
+            stale.remove();
+        }
+        decorationPlan = decorationFor();
+        paintedDecorations = new Set();
+        const stamped = [...editor.childNodes].filter((child) =>
+            child instanceof HTMLElement && child.dataset.modelIndex !== undefined);
+        // Same placement rule `render()` uses: a decoration follows the LAST
+        // element at or before its model index. Indexing the child list
+        // directly drifts whenever a model node emitted no element, and
+        // inserting every block against the same anchor reverses two blocks
+        // that share one index.
+        // Two regions can share one index (a hand-edited draft can put two
+        // channels in one node), so the anchor ADVANCES to whatever was last
+        // inserted for that index — otherwise each block is inserted against the
+        // same element and the pair comes out reversed.
+        const cursors = new Map();
+        const anchorFor = (target) => {
+            if (cursors.has(target)) return cursors.get(target);
+            let found = null;
+            for (const child of stamped) {
+                if (Number(child.dataset.modelIndex) > target) break;
+                found = child;
+            }
+            return found;
+        };
+        for (const entry of decorationPlan) {
+            const element = entry?.element;
+            if (!(element instanceof HTMLElement)) continue;
+            const target = Number(entry?.afterIndex);
+            // `render()` never paints a negative or out-of-range index inline;
+            // it falls to the trailing pass. Match that rather than inventing a
+            // second rule here.
+            const trailing = !Number.isFinite(target) || target < 0
+                || target >= model.nodes.length;
+            paintedDecorations.add(entry);
+            decorateElement(element);
+            const after = trailing ? null : anchorFor(target);
+            if (after?.nextSibling) editor.insertBefore(element, after.nextSibling);
+            else if (after) editor.appendChild(element);
+            else if (!trailing && stamped.length) editor.insertBefore(element, stamped[0]);
+            else editor.appendChild(element);
+            if (!trailing) cursors.set(target, element);
+        }
     };
     render();
     return editor;
@@ -4103,6 +4489,65 @@ export function createPromptProjectionBox(editor, beforeHost, afterHost) {
     return wrapper;
 }
 
+/**
+ * What each staged chip contributes to one channel — the answer, not a rendering.
+ *
+ * Two surfaces need this and had two implementations. The pill strip beside a
+ * channel box got it right; Writing mode's inline prose got it wrong three
+ * ways, because it re-derived the same facts from a narrower source:
+ *
+ * - It read text from `attachment_channel_previews`, and a Shot marker has NO
+ *   entry there — its text lives only on the projection row — so a marker
+ *   printed its `state_reason` ("composed by the prompt section composer")
+ *   instead of `[Shot 1] At 00:00.000,`.
+ * - It labelled anything without a Reference identity "Reference", which is
+ *   every Shot AND every section-scoped chip.
+ * - It decided "inline" from published routes, but a DISABLED inline capability
+ *   publishes no route at all, so it read as "show it".
+ *
+ * `rendered_at_anchor` is the authority on inline, per the projection rule in
+ * the durable rules — not the presence of an anchor, and not the route table.
+ *
+ * `attachments` must carry EVERY pool the caller knows about. Writing has two
+ * (the editor's registry and each block's own `attachments`), and passing only
+ * the registry is what made section-scoped chips anonymous.
+ */
+export function channelContributionRows({ channelKey = "", attachments = [],
+    candidate = null, attachmentLabelFor = null } = {}) {
+    const byId = new Map(normalizePromptAttachments(attachments)
+        .map((value) => [value.attachment_id, value]));
+    const rows = (candidate?.attachment_capability_projections || [])
+        .filter((value) => value?.channel_key === channelKey
+            && byId.has(value?.attachment_id));
+    if (!rows.length) return [];
+    const regions = splitCapabilityProjectionsByRegion(rows);
+    const out = [];
+    for (const row of [...regions.before, ...regions.after]) {
+        const attachment = byId.get(row.attachment_id);
+        if (!attachment) continue;
+        const state = String(row.state || "empty");
+        // A marker is emitting: its text is the marker itself.
+        const emitting = state === "emitted" || state === "marker";
+        const text = String(row.text || "").trim();
+        const reason = String(row.state_reason || "No output");
+        out.push({
+            row,
+            attachment,
+            attachmentId: attachment.attachment_id,
+            capabilityId: String(row.capability_id || ""),
+            label: attachmentLabelFor?.(attachment) || LABELS[attachment.kind]
+                || attachment.kind || "Context",
+            state,
+            emitting,
+            text,
+            reason,
+            resolved: emitting ? (text || reason) : reason,
+            atAnchor: row.rendered_at_anchor === true,
+        });
+    }
+    return out;
+}
+
 export function createAttachmentChannelProjections({ channelKey = "", attachments = [],
     candidate = null, attachmentLabelFor = null, onActivate = null,
     onSetCapabilityEnabled = null, onLinkedSuppressionWarning = null } = {}) {
@@ -4120,18 +4565,15 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
     const normalized = normalizePromptAttachments(attachments);
     const attachmentById = new Map(normalized.map((value) =>
         [value.attachment_id, value]));
-    const capabilityRows = (candidate?.attachment_capability_projections || [])
-        .filter((value) => value?.channel_key === channelKey
-            && attachmentById.has(value?.attachment_id));
-    if (capabilityRows.length) {
-        const regions = splitCapabilityProjectionsByRegion(capabilityRows);
-        for (const projectionRow of [...regions.before, ...regions.after]) {
-            if (projectionRow.rendered_at_anchor === true) continue;
-            const attachment = attachmentById.get(projectionRow.attachment_id);
-            if (!attachment) continue;
-            const text = String(projectionRow.text || "").trim();
-            const identity = attachmentLabelFor?.(attachment) || "";
-            const state = String(projectionRow.state || "empty");
+    const contributions = channelContributionRows({
+        channelKey, attachments, candidate, attachmentLabelFor });
+    if (contributions.length) {
+        for (const contribution of contributions) {
+            if (contribution.atAnchor) continue;
+            const projectionRow = contribution.row;
+            const attachment = contribution.attachment;
+            const text = contribution.text;
+            const state = contribution.state;
             const stateLabel = state === "linked_elsewhere" ? "linked" : state;
             const phaseLabel = placementDisplayLabel(
                 projectionRow.effective_phase || "section_prefix", {
@@ -4145,11 +4587,10 @@ export function createAttachmentChannelProjections({ channelKey = "", attachment
             projection.dataset.attachmentId = attachment.attachment_id;
             projection.dataset.capabilityId = String(projectionRow.capability_id || "");
             projection.dataset.sonderPromptProjection = "1";
-            const sourceLabel = identity || LABELS[attachment.kind]
-                || attachment.kind || "Context";
-            const reason = String(projectionRow.state_reason || "No output");
-            const isEmitting = state === "emitted" || state === "marker";
-            const resolved = isEmitting ? (text || reason) : reason;
+            const sourceLabel = contribution.label;
+            const reason = contribution.reason;
+            const isEmitting = contribution.emitting;
+            const resolved = contribution.resolved;
             projection.textContent = isEmitting
                 ? `${resolved} · ${channelKey} · ${stateLabel}`
                 : `${resolved} · ${channelKey}`;

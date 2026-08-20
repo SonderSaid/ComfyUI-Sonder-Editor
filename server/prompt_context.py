@@ -956,15 +956,6 @@ def normalize_prompt_document(raw=None, fallback_text="") -> dict:
             capability_id = str(entry.get("capability_id") or "").strip()
             if capability_id:
                 node["capability_id"] = capability_id
-            # Which of the capability's lines this anchor opens. One chip can
-            # emit several (a Subject definition per unit, a physical
-            # definition per slot), so `attachment_id` alone cannot say which
-            # record the following prose belongs to. Absent on every document
-            # written before materialization, which is why the reader falls
-            # back to the capability's first line rather than dropping it.
-            record_key = str(entry.get("record_key") or "").strip()
-            if record_key:
-                node["record_key"] = record_key
             nodes.append(node)
     if not nodes:
         return text_document(fallback_text)
@@ -2480,13 +2471,16 @@ def _render_reference_capability(attachment, capability, context):
     return ""
 
 
-# Segment kinds a materialized line decomposes into. `text` is the authored
-# prose body — the only part Writing mode may hold as stored text, because it is
-# the only part that does not vary with staging. Every other kind is DERIVED and
-# must stay a live node: labels renumber, source lists change arity, shot
-# citations follow a render-window-dependent counter, markers follow staged
-# intent, and speaker tokens follow document order. Freezing any of them into
-# stored prose violates the ordinal invariant.
+# Segment kinds a rendered Reference line decomposes into. `text` is authored
+# prose; every other kind is DERIVED — labels renumber, source lists change
+# arity, shot citations follow a render-window-dependent counter, markers follow
+# staged intent, and speaker tokens follow document order. Freezing any of them
+# into stored prose violates the ordinal invariant.
+#
+# EXPIRY: `DERIVED_SEGMENT_KINDS` currently has no reader — its two consumers
+# went with the materializer. It is held for the prose-read renderer and Convert
+# to prose, which need exactly this authored/derived split. Delete it if both are
+# abandoned; do not delete it merely because nothing imports it today.
 SEGMENT_TEXT = "text"
 SEGMENT_LABEL = "label"
 SEGMENT_SOURCES = "sources"
@@ -2504,10 +2498,9 @@ def _segment(kind, text, **fields) -> dict:
 
     `text` is always the exact substring this segment contributes, so
     `"".join(segment["text"] for segment in segments)` reproduces the assembled
-    line byte for byte. That identity is what the round-trip gate rests on:
-    the assemblers below build segments and join them, rather than building a
-    string and re-parsing it, so a materialized document cannot drift from the
-    string the compiler would otherwise have emitted.
+    line byte for byte. That identity is what lets a renderer walk the segments
+    instead of re-parsing the line: the assemblers build segments and join them,
+    rather than building a string and picking it apart again.
     """
     return {"kind": kind, "text": str(text or ""), **fields}
 
@@ -2521,224 +2514,115 @@ def reference_capability_segments(attachment, capability, context) -> list[tuple
     """`reference_capability_lines`, before the segments are joined.
 
     Same owner keys and same order; each line carries its segment list instead
-    of its rendered string. This is the materializer's input.
+    of its rendered string.
+
+    EXPIRY: no production caller yet — this is the seam the prose-read renderer
+    and Convert to prose consume, since they need to know which runs the author
+    owns and which the compiler derives. Delete it if both are abandoned.
     """
     return _reference_capability_parts(attachment, capability, context)
 
 
-def record_key(owner) -> str:
-    """Stable string form of a line's owner tuple, for the anchor node."""
+def convert_capability_plan(attachment, capability, context) -> dict:
+    """What "Convert to prose" would write, or why it refuses.
+
+    Convert is the author's one-way escape hatch: it turns a chip's rendered
+    contribution into prose they own outright. The rule it has to satisfy is
+    NOT "prose is better" — it is that no ordinal may become stored text.
+    `PromptSection.channels` is derived from the channel documents
+    (`channel_document_mirrors`) and persisted to `project.json`, so anything
+    Convert writes into a document reaches disk; freezing `<Subject 1>` or
+    `[Shot 2]` there would make the file say something staging no longer agrees
+    with, which is the ordinal invariant.
+
+    So each derived segment kind must either have a LIVE spelling or block the
+    conversion:
+
+    * `label`   -> a handle for the semantic unit. Renumbers as before.
+    * `sources` -> a handle per contributing member (needs `unit_source_members`).
+    * `marker`  -> frozen as text. `fully_preserved` is an enum drawn from staged
+                   intent, not an ordinal, so freezing it loses tracking but
+                   writes nothing positional to disk. Disclosed, never silent.
+    * `shots`   -> REFUSED. The segment carries rendered numbers, not shot ids
+                   (`appearances` is a list of ordinals), so `@shot(id)` cannot
+                   be built from here and the only alternative is freezing
+                   `[Shot 2]`, which the invariant forbids. Lifting this needs a
+                   `unit_shot_ids` sidecar beside `unit_source_members`.
+    * `speaker` -> REFUSED. `(S1)` is an ordinal and has no handle spelling at
+                   all.
+
+    Returns ids rather than handles: the browser owns handle resolution and
+    attachment minting, and duplicating that here would be a second authority
+    over the same fact.
+    """
+    plan = {"lines": [], "refused": "", "frozen": []}
+    blockers = set()
+    for owner, segments in reference_capability_segments(
+            attachment, capability, context):
+        parts = []
+        for segment in segments:
+            kind = str(segment.get("kind") or "")
+            text = str(segment.get("text") or "")
+            if kind == SEGMENT_TEXT:
+                if text:
+                    parts.append({"kind": "text", "text": text})
+            elif kind == SEGMENT_LABEL:
+                unit_id = str(segment.get("unit_id") or "")
+                if not unit_id:
+                    # A PHYSICAL definition's label has no semantic unit behind
+                    # it — the owner is keyed by the rendered `<Picture 1>`
+                    # itself, which is the ordinal-as-identity problem recorded
+                    # in the withdrawn materializer plan. With no id there is no
+                    # handle to emit and the only alternative is freezing the
+                    # ordinal, so the line blocks like any other.
+                    blockers.add("an entity with no stable id")
+                    continue
+                parts.append({"kind": "handle", "source": "unit",
+                              "id": unit_id, "rendered": text})
+            elif kind == SEGMENT_SOURCES:
+                parts.append({"kind": "sources", "rendered": text,
+                              "member_ids": [str(value) for value
+                                             in segment.get("member_ids") or []]})
+            elif kind == SEGMENT_MARKER:
+                if text:
+                    parts.append({"kind": "text", "text": text, "frozen": True})
+                    plan["frozen"].append(text.strip())
+            elif kind in DERIVED_SEGMENT_KINDS:
+                # An EMPTY derived segment contributes nothing to the rendered
+                # line, so there is no number to freeze and nothing to block.
+                # Retention always carries a `shots` segment, empty when the
+                # Reference is staged in no shot; treating its mere presence as
+                # a blocker refused every retention line and left the marker
+                # freeze rule with no case that reached it.
+                if text.strip():
+                    blockers.add(kind)
+        if parts:
+            plan["lines"].append({"owner": record_owner_key(owner), "parts": parts})
+    if blockers:
+        named = ", ".join(sorted(blockers))
+        plan["refused"] = (
+            f"This contribution cites {named}, which follow staging and the "
+            "render window and have no handle spelling. Converting would "
+            "freeze a number that staging can still change.")
+        # A refusal emits NOTHING. Leaving `frozen` populated would report a
+        # freeze that never happened, and a caller disclosing it would warn the
+        # author about a change it did not make.
+        plan["lines"] = []
+        plan["frozen"] = []
+    return plan
+
+
+def record_owner_key(owner) -> str:
+    """Readable owner tuple, for reporting only.
+
+    Deliberately NOT an identity: the retention/audio owners embed a rendered
+    label, which is why per-LINE conversion is not offered and Convert operates
+    on a whole capability. See the withdrawn materializer plan for the full
+    argument.
+    """
     if isinstance(owner, (list, tuple)):
         return ":".join(str(part) for part in owner)
     return str(owner or "")
-
-
-def detached_record_keys(attachment) -> set:
-    """Records whose prose the author has taken ownership of.
-
-    Detachment is an EXPLICIT flag, never inferred from node identity: text
-    nodes keep their id when typed into, and bare text nodes are re-issued a
-    fresh one, so identity can neither prove nor disprove an edit (audit
-    finding 2). Stored per record rather than per attachment because one chip
-    can own several lines and the author may edit only one.
-    """
-    raw = (attachment.get("config") or {}).get("detached_records")
-    return {str(value) for value in raw or [] if str(value or "")}
-
-
-def materialize(attachment, capability, context) -> dict:
-    """Document fragment holding this capability's lines as authored prose.
-
-    Each line becomes an ANCHOR (one attachment node, at the label position,
-    tagged with the record it opens) followed by the line's text runs. Derived
-    elements are deliberately NOT written: labels renumber, source lists change
-    arity, shot citations follow the render window, markers follow staged
-    intent, and speaker tokens follow document order. They are recomputed on
-    every read by `materialized_lines`, so a materialized document cannot
-    freeze a fact that staging owns.
-
-    Scaffolding (` is `, `: `, ` - `) materializes as text alongside the prose:
-    the point of the inversion is that the author owns the whole sentence, and
-    an uneditable connective would make Writing a projection again in
-    miniature.
-    """
-    nodes = []
-    for owner, segments in _reference_capability_parts(
-            attachment, capability, context):
-        if nodes:
-            nodes.append({"type": "text", "node_id": _new_id(), "text": "\n"})
-        anchor = {"type": "attachment", "node_id": _new_id(),
-                  "attachment_id": str(attachment.get("attachment_id") or ""),
-                  "record_key": record_key(owner)}
-        capability_id = str(capability.get("capability_id")
-                            or capability.get("kind") or "")
-        if capability_id:
-            anchor["capability_id"] = capability_id
-        nodes.append(anchor)
-        # One text node per maximal run of non-derived segments, so the holes
-        # the reader fills line up one-for-one with the text nodes it finds.
-        for run in _segment_text_runs(segments):
-            nodes.append({"type": "text", "node_id": _new_id(), "text": run})
-    if not nodes:
-        return text_document("")
-    return {"schema": DOCUMENT_SCHEMA, "nodes": nodes}
-
-
-def _segment_text_runs(segments) -> list:
-    """Maximal runs of storable segments, in order."""
-    runs = []
-    current = []
-    for segment in segments or []:
-        if str(segment.get("kind") or "") in DERIVED_SEGMENT_KINDS:
-            if current:
-                runs.append("".join(current))
-                current = []
-            continue
-        current.append(str(segment.get("text") or ""))
-    if current:
-        runs.append("".join(current))
-    return runs
-
-
-def materialized_lines(document, attachment, capability, context) -> list[tuple]:
-    """Inverse of `materialize`: stored prose re-joined with live derived parts.
-
-    The template is recomputed from the assemblers rather than read back from
-    the document, so every derived element is current by construction; the
-    document contributes only the text runs. A record whose anchor is present
-    but whose prose was deleted contributes nothing for that hole rather than
-    falling back to the chip config, which would resurrect prose the author
-    removed.
-    """
-    parts = {record_key(owner): segments for owner, segments
-             in _reference_capability_parts(attachment, capability, context)}
-    order = [record_key(owner) for owner, _ in
-             _reference_capability_parts(attachment, capability, context)]
-    attachment_id = str(attachment.get("attachment_id") or "")
-    nodes = normalize_prompt_document(document)["nodes"]
-    lines = []
-    index = 0
-    while index < len(nodes):
-        node = nodes[index]
-        index += 1
-        if node.get("type") != "attachment":
-            continue
-        if str(node.get("attachment_id") or "") != attachment_id:
-            continue
-        key = str(node.get("record_key") or "")
-        if not key:
-            # Pre-materialization document: the anchor names no record, so it
-            # can only mean the capability's first line.
-            key = order[0] if order else ""
-        segments = parts.get(key)
-        if segments is None:
-            continue
-        runs = []
-        while index < len(nodes) and nodes[index].get("type") == "text":
-            text = str(nodes[index].get("text") or "")
-            index += 1
-            if "\n" in text:
-                # A newline ends the record's extent, matching the one-line-
-                # per-label rule; the remainder belongs to whatever follows.
-                head = text.split("\n", 1)[0]
-                if head:
-                    runs.append(head)
-                break
-            runs.append(text)
-        lines.append((key, _join_segments_with_runs(segments, runs)))
-    return lines
-
-
-def mark_record_detached(attachment, key, detached=True) -> dict:
-    """Set or clear the Detached flag for one record, in place.
-
-    The flag is written when the author edits materialized prose. It is never
-    inferred: a text node keeps its id when typed into, so node identity can
-    neither prove nor disprove an edit.
-    """
-    config = attachment.setdefault("config", {})
-    keys = [str(value) for value in config.get("detached_records") or []
-            if str(value or "")]
-    key = str(key or "")
-    if detached and key and key not in keys:
-        keys.append(key)
-    if not detached:
-        keys = [value for value in keys if value != key]
-    if keys:
-        config["detached_records"] = keys
-    else:
-        config.pop("detached_records", None)
-    return attachment
-
-
-def rematerialize(document, attachment, capability, context) -> dict:
-    """Refresh Bound records from their seeds; leave Detached prose untouched.
-
-    This is where the flag earns its keep. A Bound record still follows its
-    chip config, identity definition and member prompts, so a changed default
-    reaches it. A Detached one is the author's text now, and re-seeding it
-    would silently overwrite writing the author owns.
-
-    Records the document does not carry are appended, so enabling a capability
-    later still produces its line.
-    """
-    detached = detached_record_keys(attachment)
-    fresh = materialize(attachment, capability, context)
-    if not detached:
-        return fresh
-    attachment_id = str(attachment.get("attachment_id") or "")
-    kept = _records_by_key(document, attachment_id)
-    nodes = []
-    for node in fresh["nodes"]:
-        if node.get("type") == "attachment":
-            key = str(node.get("record_key") or "")
-            preserved = kept.get(key) if key in detached else None
-            if preserved is not None:
-                nodes.extend(copy.deepcopy(preserved))
-                continue
-        nodes.append(node)
-        continue
-    return {"schema": DOCUMENT_SCHEMA, "nodes": nodes} if nodes \
-        else text_document("")
-
-
-def _records_by_key(document, attachment_id) -> dict:
-    """Anchor node plus its following text runs, per record key."""
-    nodes = normalize_prompt_document(document)["nodes"]
-    result = {}
-    index = 0
-    while index < len(nodes):
-        node = nodes[index]
-        index += 1
-        if node.get("type") != "attachment":
-            continue
-        if str(node.get("attachment_id") or "") != attachment_id:
-            continue
-        run = [node]
-        while index < len(nodes) and nodes[index].get("type") == "text":
-            text = str(nodes[index].get("text") or "")
-            if "\n" in text:
-                break
-            run.append(nodes[index])
-            index += 1
-        result[str(node.get("record_key") or "")] = run
-    return result
-
-
-def _join_segments_with_runs(segments, runs) -> str:
-    """Walk the template, emitting derived parts live and filling holes in order."""
-    result = []
-    pending = list(runs)
-    in_hole = False
-    for segment in segments or []:
-        if str(segment.get("kind") or "") in DERIVED_SEGMENT_KINDS:
-            result.append(str(segment.get("text") or ""))
-            in_hole = False
-            continue
-        if not in_hole:
-            in_hole = True
-            result.append(pending.pop(0) if pending else "")
-    return "".join(result)
 
 
 def reference_capability_lines(attachment, capability, context) -> list[tuple]:
@@ -2787,13 +2671,21 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
                 identity_declaration, number,
                 "assetless_label_template" if assetless
                 else "referenced_label_template")
-            definition, _definition_source = _subject_definition(
+            definition, definition_source = _subject_definition(
                 config, unit, context)
             source = ""
             source_labels = context.get("unit_source_labels", {}).get(str(unit_id)) or []
-            visual_labels = [str(value) for value in source_labels
-                             if any(str(value).startswith(prefix)
-                                    for prefix in visual_prefixes)]
+            source_members = context.get("unit_source_members", {}).get(str(unit_id)) or []
+            # Filter both together so the member list stays aligned with the
+            # labels it describes; the two are index-parallel by construction
+            # and every filter has to preserve that or a source resolves to the
+            # wrong Reference.
+            visual_pairs = [(str(label), str(source_members[index])
+                             if index < len(source_members) else "")
+                            for index, label in enumerate(source_labels)
+                            if any(str(label).startswith(prefix)
+                                   for prefix in visual_prefixes)]
+            visual_labels = [label for label, _member in visual_pairs]
             if visual_labels:
                 if len(visual_labels) == 1:
                     joined_labels = visual_labels[0]
@@ -2806,12 +2698,25 @@ def _reference_capability_parts(attachment, capability, context) -> list[tuple]:
                     _segment(SEGMENT_LABEL, identity_label,
                              unit_id=str(unit_id), identity_kind=identity_kind),
                     _segment(SEGMENT_TEXT, " is "),
-                    _segment(SEGMENT_TEXT, body, authored=True),
+                    # `origin` names the tier the authored prose came from
+                    # (chip, identity, or the member's Library text), so a
+                    # surface rendering this line can tell the author
+                    # whether editing here creates an override or edits the
+                    # thing everything else inherits. Resolved here because
+                    # the fallback chain lives here; every caller used to
+                    # discard it.
+                    # EXPIRY: no consumer yet. It is here for the Writing
+                    # contribution blocks to say whether editing a line
+                    # overrides or edits the shared source. Drop it if that
+                    # attribution is abandoned.
+                    _segment(SEGMENT_TEXT, body, authored=True,
+                             origin=definition_source),
                     # Variable arity: one source reads " from <Picture 1>", two
                     # gain an Oxford join. The count follows staging, so the
                     # whole suffix stays derived even though the prose before
                     # it is authored.
-                    _segment(SEGMENT_SOURCES, source, labels=list(visual_labels)),
+                    _segment(SEGMENT_SOURCES, source, labels=list(visual_labels),
+                             member_ids=[member for _label, member in visual_pairs]),
                 ]))
             elif assetless and definition:
                 speaker_number = (context.get("speaker_order") or {}).get(
@@ -3310,13 +3215,42 @@ def profile_error_result(exc, *, window_start=0, window_end=1, fps=24.0) -> dict
     return result
 
 
+def _locate_capability(convert_plan_for, global_attachments, sections):
+    """The staged (attachment, capability) a Convert request names, or None.
+
+    Searches the compiled state itself rather than trusting the request, so a
+    Convert cannot name a capability the author cannot see staged.
+    """
+    if not isinstance(convert_plan_for, dict):
+        return None
+    attachment_id = str(convert_plan_for.get("attachment_id") or "")
+    capability_id = str(convert_plan_for.get("capability_id") or "")
+    if not attachment_id or not capability_id:
+        return None
+    pools = [global_attachments or []]
+    for section in sections or []:
+        pools.append(getattr(section, "attachments", None)
+                     or (section.get("attachments") if isinstance(section, dict) else None)
+                     or [])
+    for pool in pools:
+        for raw in pool:
+            attachment = normalize_attachment(raw)
+            if attachment.get("attachment_id") != attachment_id:
+                continue
+            for capability in attachment.get("capabilities") or []:
+                if str(capability.get("capability_id") or "") == capability_id:
+                    return attachment, capability
+    return None
+
+
 def compile_prompt_context(*, global_documents=None, global_channels=None,
                            global_attachments=None, sections=None,
                            window_start=0, window_end=1, fps=24.0,
                            template=None, profile=None, custom_profiles=None,
                            context=None, labels_on=True,
                            delimiter=prompt_payload.DEFAULT_SECTION_DELIMITER,
-                           boundary_threshold_pct=0.0) -> dict:
+                           boundary_threshold_pct=0.0,
+                           convert_plan_for=None) -> dict:
     """Compile candidate state to a frozen, provider-ready prompt.
 
     The function never mutates inputs.  It returns diagnostics instead of
@@ -4927,6 +4861,20 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         projection.pop("_anchor_node_id", None)
         projection.pop("_discovery", None)
         projection.pop("_scope_inline", None)
+    # Built HERE, from the context this compile enriched, and never from a
+    # dict assembled by a caller. `_reference_capability_parts` reads
+    # `semantic_units_by_id` and `profile`, both injected above; a caller that
+    # enumerated context keys by hand got neither and produced empty plans that
+    # looked like successful conversions. Enumeration is the bug, so this does
+    # not enumerate.
+    convert_plan = None
+    if convert_plan_for is not None:
+        located = _locate_capability(convert_plan_for, global_attachments, sections)
+        convert_plan = (convert_capability_plan(located[0], located[1], context)
+                        if located else
+                        {"lines": [], "frozen": [],
+                         "refused": "That capability is not staged in this scene."})
+
     result = {
         "format": FORMAT_VERSION,
         "prompt": final_prompt,
@@ -4936,6 +4884,7 @@ def compile_prompt_context(*, global_documents=None, global_channels=None,
         "window": {"start_frame": int(window_start), "end_frame": int(window_end),
                    "fps": float(fps)},
         "emissions": emissions,
+        **({"convert_plan": convert_plan} if convert_plan is not None else {}),
         "attachment_previews": {key: "\n".join(value)
                                 for key, value in previews.items()},
         "attachment_channel_previews": {

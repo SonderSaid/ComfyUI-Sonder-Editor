@@ -950,8 +950,13 @@ def test_prompt_panel_consumes_only_windowed_candidate_diagnostics():
     assert "refreshDiagnostics: renderDiagnostics" in panel
     assert "_candidate_scene_id: sceneId" in widget
     assert "const candidateSelection = resolvePromptCandidateSelection(" in widget
-    assert "selection_start: candidateSelection.selectionStart" in widget
-    assert "selection_end: candidateSelection.selectionEnd" in widget
+    # The windowed selection still reaches the compile, now through the one
+    # request body both the preview and the Convert plan share. Two copies of
+    # that body is how a surface ends up asking about a different candidate
+    # than the author is looking at.
+    assert "selection: candidateSelection," in widget
+    assert "selection_start: selection ? selection.selectionStart" in widget
+    assert "_promptCompileRequestBody({" in widget
     assert "this._promptPayloadCache = payload" not in widget
 
 
@@ -1369,7 +1374,11 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
         'if (["prompt_link", "prompt_link_scope"].includes(attachment?.kind))')]
     assert "attachment?.config?.label" not in reference_case
     assert widget.count("attachmentLabelFor,") == 3
-    assert panel.count("attachmentLabelFor,") == 8
+    # Ten: the Writing contribution resolver is a chip surface too, and it is
+    # called twice — once for channels the author has written in and once for
+    # the channels a chip feeds but they have not. Omitting identity there is
+    # how every Shot and every section-scoped chip came to read "Reference".
+    assert panel.count("attachmentLabelFor,") == 10
     assert "Shared identity default · @" in chips
     assert "Prompt Format default ·" in chips
     assert "no managed Vocal Event in this window" in chips
@@ -1969,9 +1978,13 @@ def test_writing_draft_stamps_its_draft_channel_rather_than_resolving_at_apply()
     assert ('writingState.defaultDraftChannel = String(saved.defaultDraftChannel || "")'
             in panel)
     assert "defaultDraftChannel: writingState.defaultDraftChannel" in panel
-    # One accessor feeds the hint and BOTH split call sites, so what the panel
-    # promises and what Apply does cannot disagree.
-    assert panel.count("defaultKey: writingDefaultChannelKey()") == 2
+    # One accessor feeds the hint and EVERY split call site, so what the panel
+    # promises, what the contribution decorations are placed against, and what
+    # Apply writes cannot disagree. Three call sites: the Apply projection, the
+    # compile-candidate patch, and the decoration region walk. A new splitter
+    # that resolves the channel itself instead of taking the stamp is the
+    # regression this counts.
+    assert panel.count("defaultKey: writingDefaultChannelKey()") == 3
     assert "Unlabelled text goes to ${writingDefaultChannelKey()" in panel
     # Persisted only when set, exactly like `stash`, so an older record keeps
     # the shape it was written with.
@@ -1983,8 +1996,10 @@ def test_document_anchor_fields_survive_the_browser_normalizer():
 
     A field the server keeps and the browser drops makes an echoed document
     hash differently from the server copy, which spuriously 409s identity
-    validation; for `record_key` it also collapses every materialized record
-    onto the capability first line.
+    validation. `record_key` used to travel this same carrier and was retired
+    with the materializer, so the parity that remains is `capability_id` — plus
+    the drop itself, asserted so a revival has to be deliberate on both sides
+    rather than leaking back in on one.
     """
     result = _run_chips_script("""
 const doc = { schema: "prompt_document@1", nodes: [
@@ -1997,10 +2012,9 @@ console.log(JSON.stringify({ nodes: mod.normalizePromptDocument(doc).nodes }));
 """)
     nodes = result["nodes"]
     assert nodes[0]["capability_id"] == "definitions"
-    assert nodes[0]["record_key"] == "subject_definition:u1"
-    # An anchor that carries neither must not invent them.
+    assert "record_key" not in nodes[0]
+    # An anchor that carries no capability must not invent one.
     assert "capability_id" not in nodes[2]
-    assert "record_key" not in nodes[2]
 
     from server import prompt_context
     server_nodes = prompt_context.normalize_prompt_document({"nodes": [
@@ -2009,24 +2023,23 @@ console.log(JSON.stringify({ nodes: mod.normalizePromptDocument(doc).nodes }));
         {"type": "text", "node_id": "n2", "text": " is a woman"},
         {"type": "attachment", "node_id": "n3", "attachment_id": "a2"},
     ]})["nodes"]
+    # The whole-node comparison is what makes this a parity test rather than two
+    # independent ones: it fails if either side keeps a field the other drops.
     assert server_nodes == nodes
 
 
 def test_anchor_fields_survive_a_project_save_and_load():
     """The persistence half of the anchor contract.
 
-    `capability_id` says which part of a Reference a chip emits and
-    `record_key` says which materialized line an anchor opens. Both are
-    useless if a project save drops them, and the loss would be silent — the
-    chip would simply start compiling as the format default. Round-trips
-    through real JSON so a serializer that stringifies unknown keys cannot
-    pass by accident.
+    `capability_id` says which part of a Reference a chip emits. It is useless
+    if a project save drops it, and the loss would be silent — the chip would
+    simply start compiling as the format default. Round-trips through real JSON
+    so a serializer that stringifies unknown keys cannot pass by accident.
     """
     from server.timeline_state import Scene, PromptSection
     document = {"schema": "prompt_document_v1", "nodes": [
         {"type": "attachment", "node_id": "n1", "attachment_id": "a1",
-         "capability_id": "definitions",
-         "record_key": "subject_definition:u1"},
+         "capability_id": "definitions"},
         {"type": "text", "node_id": "n2", "text": " is a woman"},
     ]}
     section = PromptSection(
@@ -2039,7 +2052,6 @@ def test_anchor_fields_survive_a_project_save_and_load():
     anchor = reloaded.prompt_sections[0].channel_docs[
         "detailed_description"]["nodes"][0]
     assert anchor["capability_id"] == "definitions"
-    assert anchor["record_key"] == "subject_definition:u1"
 
 
 def _run_panel_script(body):
@@ -2396,3 +2408,213 @@ console.log(JSON.stringify(mod.promptMentionCandidates(
     assert result[1]["value"] == "physical:pictures:m-9"
     # The handleless member is offered by the caret menu but not by a typeahead.
     assert all("nohandle" not in r["value"] for r in result)
+
+
+def test_reset_then_apply_reproduces_the_same_sections():
+    """The parity claim the Writing pivot rests on, over the real projection.
+
+    Chips are the record and Writing renders them; Structured edits them. That
+    is only "one record, two views" if a draft rebuilt from sections and applied
+    unchanged writes those sections back. The document functions round-trip on
+    their own, so a test over them alone stays green against a build that
+    relocates every section — the projection itself is what has to be pinned,
+    which is why it was extracted out of the Apply closure to be reachable.
+
+    Also pins the two documented NON-identities, so neither can regress into a
+    silent surprise: bounds recompact from 0, and reused chips coalesce.
+    """
+    result = _run_panel_script(r"""
+        const chips = await import(CHIPS_URL);
+        const keys = ["summary", "detailed_description"];
+        const chip = { attachment_id: "ref-1", kind: "reference",
+            source: { reference_item_id: "item" }, config: {} };
+        const sections = [
+            { prompt_id: "p1", start_frame: 0, end_frame: 60,
+              channels: { summary: "alpha", detailed_description: "says one" },
+              channel_docs: {
+                  summary: { nodes: [{ type: "text", node_id: "s1", text: "alpha" }] },
+                  detailed_description: { nodes: [
+                      { type: "text", node_id: "d1", text: "says one " },
+                      { type: "attachment", node_id: "a1", attachment_id: "ref-1" }] },
+              }, attachments: [chip], muted: false, global_channel_exceptions: [] },
+            { prompt_id: "p2", start_frame: 60, end_frame: 130,
+              channels: { summary: "beta", detailed_description: "says two" },
+              channel_docs: {
+                  summary: { nodes: [{ type: "text", node_id: "s2", text: "beta" }] },
+                  detailed_description: { nodes: [{ type: "text", node_id: "d2", text: "says two" }] },
+              }, attachments: [], muted: true, global_channel_exceptions: ["summary"] },
+        ];
+        // Exactly what `reconstructDraftFromSections` builds, then what Apply
+        // projects back — the whole Reset -> Apply path in miniature.
+        const roundTrip = (input) => {
+            const normalized = input.map((section) => ({ ...section,
+                channel_docs: Object.fromEntries(keys.map((key) => [key,
+                    chips.healSeparatorPadding(chips.normalizePromptDocument(
+                        section.channel_docs?.[key], section.channels?.[key] || ""))])) }));
+            const document = chips.joinWritingSectionDocuments(normalized, keys);
+            const blocks = chips.splitWritingPromptDocument(document,
+                { keepEmpty: input.length > 0 });
+            return mod.writingSectionsFromDraft({
+                blocks,
+                attachments: input.flatMap((section) => section.attachments || []),
+                blockMeta: input.map((section) => ({
+                    source_prompt_id: section.prompt_id,
+                    merged_source_prompt_ids: [section.prompt_id],
+                    muted: section.muted === true,
+                    global_channel_exceptions: section.global_channel_exceptions || [],
+                    attachments: (section.attachments || []).filter((value) =>
+                        !Object.values(section.channel_docs || {}).some((doc) =>
+                            (doc.nodes || []).some((node) =>
+                                node.attachment_id === value.attachment_id))),
+                })),
+                allocations: input.map((section) => ({
+                    length: section.end_frame - section.start_frame })),
+                channelKeys: keys, defaultKey: "detailed_description", minLen: 1,
+                newId: (index) => `fresh:${index}`,
+            }).sections;
+        };
+        const compare = (rows) => rows.map((section) => ({
+            prompt_id: section.prompt_id,
+            bounds: [section.start_frame, section.end_frame],
+            channels: section.channels,
+            muted: section.muted,
+            exceptions: section.global_channel_exceptions,
+            attachments: section.attachments.map((value) => value.attachment_id),
+            anchors: keys.flatMap((key) => (section.channel_docs[key].nodes || [])
+                .filter((node) => node.type === "attachment")
+                .map((node) => node.attachment_id)),
+        }));
+        const once = roundTrip(sections);
+        const twice = roundTrip(once);
+
+        // Documented non-identity 1: a lane with a gap recompacts from 0.
+        const gapped = roundTrip(sections.map((section, index) => index === 0
+            ? section : { ...section, start_frame: 90, end_frame: 160 }));
+
+        // Documented non-identity 2: `reusePromptAttachment` keeps the emission
+        // group and mints a new object id, and `scopedAttachmentIdentity` drops
+        // only the object id — so a reused chip is identity-equal to its source
+        // and the scope copy coalesces onto the anchored one. An INDEPENDENT
+        // chip does not, because `emission_group_id` defaults to its own id.
+        const reused = chips.reusePromptAttachment(chip);
+        const independent = { ...structuredClone(chip), attachment_id: "ref-3",
+            emission_group_id: "ref-3" };
+        const withReuse = structuredClone(sections);
+        withReuse[0].attachments = [chip, reused];
+        const withIndependent = structuredClone(sections);
+        withIndependent[0].attachments = [chip, independent];
+
+        // A MERGED block absorbs its neighbour's prompt id, so a Prompt Link
+        // pointing at the absorbed id has to follow the survivor or it dangles.
+        // Apply always rebound; the compile preview carried its own copy of
+        // this projection and did NOT, so preview could show a link Apply would
+        // repoint. One projection now serves both, and this is the case that
+        // tells them apart — without it the remap is an identity no-op in every
+        // fixture and the shared code path is executed but never discriminated.
+        const linked = structuredClone(sections);
+        linked[0].attachments = [{ attachment_id: "link-1", kind: "prompt_link",
+            source: { prompt_id: "p2" }, config: {} }];
+        const merged = mod.writingSectionsFromDraft({
+            blocks: [chips.joinWritingSectionDocuments([linked[0]], keys)],
+            attachments: linked[0].attachments,
+            blockMeta: [{ source_prompt_id: "p1",
+                merged_source_prompt_ids: ["p1", "p2"],
+                attachments: linked[0].attachments }],
+            allocations: [{ length: 130 }], channelKeys: keys,
+            defaultKey: "detailed_description", minLen: 1,
+            newId: (index) => `fresh:${index}`,
+        }).sections;
+
+        console.log(JSON.stringify({
+            first: compare(once), second: compare(twice),
+            mergedLinkTarget: merged[0].attachments
+                .find((v) => v.kind === "prompt_link")?.source?.prompt_id,
+            mergedPromptId: merged[0].prompt_id,
+            gappedBounds: gapped.map((s) => [s.start_frame, s.end_frame]),
+            reusedCount: roundTrip(withReuse)[0].attachments.length,
+            independentIds: roundTrip(withIndependent)[0].attachments
+                .map((v) => v.attachment_id).sort(),
+        }));
+    """.replace("CHIPS_URL", json.dumps(
+        (ROOT / "web/js/prompt_context_chips.js").as_uri())))
+
+    first, second = result["first"], result["second"]
+    # Identity, and identity that HOLDS — a projection that converged only on
+    # the second pass would still have rewritten the author's lane on the first.
+    assert first == second
+    assert [row["prompt_id"] for row in first] == ["p1", "p2"]
+    assert [row["bounds"] for row in first] == [[0, 60], [60, 130]]
+    assert [row["channels"]["summary"] for row in first] == ["alpha", "beta"]
+    assert [row["channels"]["detailed_description"] for row in first] == [
+        "says one", "says two"]
+    # The inline anchor survives as an anchor, and its record travels with it.
+    assert first[0]["anchors"] == ["ref-1"]
+    assert first[0]["attachments"] == ["ref-1"]
+    # Per-block flags are carried, not recomputed from the lane.
+    assert [row["muted"] for row in first] == [False, True]
+    assert [row["exceptions"] for row in first] == [[], ["summary"]]
+    # Recompaction from 0 is by construction: the draft owns lengths, not
+    # positions, so a gapped lane does NOT come back unchanged.
+    assert result["gappedBounds"] == [[0, 60], [60, 130]]
+    # A link into an absorbed block follows the survivor rather than dangling.
+    # This is the ONLY case that separates the shared projection from the
+    # preview copy it replaced, which skipped the rebinding.
+    assert result["mergedPromptId"] == "p1"
+    assert result["mergedLinkTarget"] == "p1"
+    # A reused chip coalesces onto its twin rather than emitting twice...
+    assert result["reusedCount"] == 1
+    # ...while an independent chip carrying the same config does NOT, because
+    # its emission group is its own. Coalescing those would silently delete a
+    # deliberate second attachment, so the pair has to be tested together.
+    assert result["independentIds"] == ["ref-1", "ref-3"]
+
+
+def test_an_empty_draft_is_not_mistaken_for_authored_work():
+    """The predicate that decides whether a Writing draft holds anything.
+
+    Its predecessor tested whether a document OBJECT existed rather than whether
+    it held anything, and an emptied draft stores a document of one empty text
+    node — truthy. Three consequences, all observed in a real project: Reset
+    asked permission to discard nothing, `loadWritingState` restored the
+    emptiness instead of rebuilding from sections so the panel opened blank, and
+    an empty stash sat behind a "Restore draft" button that restored nothing.
+
+    A blank panel plus one Apply writes ZERO sections, and Apply is deliberately
+    unconfirmed, so getting this wrong costs the whole prompt lane.
+
+    The opposite error is just as bad and is why this is not a text check: chips
+    live in three places, and a draft whose only content is a chip attached with
+    "Attach to this section/scene" has no text AND no entry in the editor's
+    attachment registry. Treating that as empty would discard exactly the work
+    this predicate exists to protect.
+    """
+    result = _run_panel_script(r"""
+        const doc = (nodes) => ({ nodes });
+        const empty = [{ type: "text", node_id: "a", text: "" }];
+        const cases = {
+            trulyEmpty: { draft: "", document: doc(empty) },
+            whitespaceOnly: { draft: "   ", document: doc([{ type: "text", node_id: "a", text: "   " }]) },
+            nothingAtAll: {},
+            prose: { draft: "hello", document: doc([{ type: "text", node_id: "a", text: "hello" }]) },
+            inlineChipOnly: { draft: "", document: doc([
+                { type: "attachment", node_id: "a", attachment_id: "ref" }]) },
+            registryChipOnly: { draft: "", document: doc(empty),
+                attachments: [{ attachment_id: "ref", kind: "reference" }] },
+            sectionScopedOnly: { draft: "", document: doc(empty),
+                blockMeta: [{ attachments: [{ attachment_id: "ref", kind: "reference" }] }] },
+        };
+        console.log(JSON.stringify(Object.fromEntries(
+            Object.entries(cases).map(([name, value]) =>
+                [name, mod.writingDraftHasContent(value)]))));
+    """)
+    # Nothing worth keeping.
+    assert result["trulyEmpty"] is False
+    assert result["whitespaceOnly"] is False
+    assert result["nothingAtAll"] is False
+    # Prose, obviously.
+    assert result["prose"] is True
+    # ...and a chip in each of the three places one can live. The last is the
+    # one a text-only predicate would throw away.
+    assert result["inlineChipOnly"] is True
+    assert result["registryChipOnly"] is True
+    assert result["sectionScopedOnly"] is True

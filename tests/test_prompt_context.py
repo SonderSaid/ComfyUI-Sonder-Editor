@@ -711,7 +711,11 @@ def test_prompt_editor_sources_preserve_writing_state_and_prune_deleted_chips():
     assert "range.intersectsNode(value)" in editor
     assert "if (!composing) pushHistory()" in editor
     assert "global_channel_exceptions" in panel
-    assert "muted: writingState.blockMeta" in panel
+    # The draft projection moved out of the Apply/preview closures into the
+    # exported `writingSectionsFromDraft`, which reads its block metadata
+    # positionally. Behaviour is covered properly by the projection tests;
+    # this row only pins that `muted` still travels with the block.
+    assert "muted: blockMeta[index]?.muted" in panel
     assert "physicalOptions" in editor
     assert "candidate?.setup_manifest" in identity_panel
     assert "Staging remains in Reference lanes" in identity_panel

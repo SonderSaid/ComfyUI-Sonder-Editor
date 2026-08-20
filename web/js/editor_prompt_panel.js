@@ -52,6 +52,10 @@ import {
     createPromptProjectionBox,
     createPromptDocumentEditor,
     createScopeChipRow,
+    channelContributionRows,
+    channelRegionsByNode,
+    writingBlockNodeRanges,
+    healSeparatorPadding,
     installPromptContextMenu,
     joinWritingSectionDocuments,
     normalizePromptAttachments,
@@ -690,6 +694,143 @@ function makeHeightGrip(host, scopeEl, heightKey, { min = 28, max = 800, label =
     return grip;
 }
 
+/**
+ * Does this draft hold anything the author would be sorry to lose?
+ *
+ * The predecessor tested `value?.document` — whether a document OBJECT
+ * exists, not whether it holds anything. An emptied draft stores a document
+ * of one empty text node, which is truthy, so an empty draft counted as
+ * content everywhere this is asked. That made Reset ask permission to
+ * discard nothing, made `loadWritingState` restore the emptiness instead of
+ * rebuilding from sections (so the panel opened blank), and kept an empty
+ * stash behind a "Restore draft" button that restored nothing. A blank
+ * panel plus one Apply writes zero sections, and Apply is deliberately
+ * unconfirmed — so this predicate can cost a whole lane.
+ *
+ * Chips count, and they live in THREE places: inline anchors in the
+ * document, the editor's attachment registry, and `blockMeta[].attachments`
+ * for anything attached with "Attach to this section/scene". A draft whose
+ * only content is a section-scoped chip has no text and no registry entry,
+ * so testing text alone would discard exactly the case this exists to save.
+ */
+export const writingDraftHasContent = (value) => {
+    if (String(value?.draft || "").trim()) return true;
+    const documentValue = normalizePromptDocument(value?.document);
+    if (promptDocumentText(documentValue).trim()) return true;
+    if (documentValue.nodes.some((node) => node.type === "attachment")) return true;
+    if (normalizePromptAttachments(value?.attachments).length) return true;
+    return (Array.isArray(value?.blockMeta) ? value.blockMeta : []).some(
+        (meta) => normalizePromptAttachments(meta?.attachments).length);
+};
+
+function scopedAttachmentIdentity(attachment) {
+    const semantic = structuredClone(attachment || {});
+    // Split clones deliberately receive distinct authored object ids but share
+    // an emission group. They coalesce only while every semantic field still
+    // agrees; an edited clone remains present so compilation can surface the
+    // conflicting emission instead of silently discarding either choice.
+    delete semantic.attachment_id;
+    return JSON.stringify(semantic);
+}
+
+export function coalesceScopedAttachments(values) {
+    const result = [];
+    const seen = new Set();
+    for (const attachment of normalizePromptAttachments(values)) {
+        const identity = scopedAttachmentIdentity(attachment);
+        if (seen.has(identity)) continue;
+        seen.add(identity); result.push(attachment);
+    }
+    return result;
+}
+
+/**
+ * The sections the Writing draft stands for, as a pure projection.
+ *
+ * Extracted so the Reset-then-Apply parity claim is testable at all. Everything
+ * the pivot rests on lives here — channel routing, anchor/scope attachment
+ * reconciliation, prompt-id continuity and the frame layout — and while it sat
+ * inside `mountPromptManagementPanel`'s closure the only reachable surface was
+ * the three document functions, which round-trip cleanly on their own. A test
+ * over those alone stays green against a build that relocates every section.
+ *
+ * ONE projection, two callers: Apply and the compile-candidate preview each
+ * carried their own near-identical copy, differing only in how a block with no
+ * source id is named. Preview showing sections Apply would not write is the
+ * exact disagreement this surface exists to prevent.
+ *
+ * `blocks` are already split and reconciled: `reconcileWritingBlockMeta`
+ * mutates draft state, so it stays with the caller and this takes its output.
+ *
+ * NOTE the frame layout is deliberately a recompaction from 0, not a copy of
+ * the previous bounds — the draft owns lengths, not positions. A lane holding a
+ * gap, or not starting at frame 0, does NOT survive a round trip, and that is
+ * by construction rather than by defect.
+ */
+export function writingSectionsFromDraft({
+    blocks = [], attachments = [], blockMeta = [], allocations = [],
+    channelKeys = [], defaultKey = "", minLen = 1, newId = () => "",
+} = {}) {
+    // Refuse rather than quietly lose the author's work. With no channel keys
+    // every channel comes back empty AND every inline anchor is dropped, which
+    // is a silent deletion of chips dressed up as an empty draft. Both callers
+    // pass `templateChannelKeys()`, which always yields at least one.
+    if (!channelKeys.length) {
+        throw new Error("writingSectionsFromDraft needs the template's channel keys");
+    }
+    const attachmentById = new Map(normalizePromptAttachments(attachments)
+        .map((attachment) => [attachment.attachment_id, attachment]));
+    let cursor = 0;
+    const sections = blocks.map((blockDocument, index) => {
+        const length = Math.max(minLen, allocations[index]?.length ?? minLen);
+        const channelDocs = splitPromptDocumentChannels(
+            blockDocument, channelKeys, { defaultKey });
+        const anchorIds = new Set(Object.values(channelDocs)
+            .flatMap((documentValue) => documentValue.nodes)
+            .filter((node) => node.type === "attachment")
+            .map((node) => node.attachment_id));
+        const section = {
+            prompt_id: blockMeta[index]?.source_prompt_id || newId(index),
+            start_frame: cursor,
+            end_frame: cursor + length,
+            channels: Object.fromEntries(channelKeys.map((key) => [
+                key, promptDocumentText(channelDocs[key]).trim(),
+            ])),
+            channel_docs: channelDocs,
+            attachments: coalesceScopedAttachments([
+                ...normalizePromptAttachments(blockMeta[index]?.attachments)
+                    .filter((value) => !anchorIds.has(value.attachment_id)),
+                ...[...anchorIds].map((id) => attachmentById.get(id)).filter(Boolean),
+            ]),
+            muted: blockMeta[index]?.muted === true,
+            global_channel_exceptions: [...new Set(
+                (blockMeta[index]?.global_channel_exceptions || []).map(String))],
+        };
+        cursor += length;
+        return section;
+    });
+    // A merged block absorbs its neighbours' prompt ids, so a link pointing at
+    // one of them must follow the survivor or it dangles. Preview previously
+    // skipped this and could therefore show links Apply would rebind.
+    const promptIdRemap = new Map();
+    sections.forEach((section, index) => {
+        for (const oldId of blockMeta[index]?.merged_source_prompt_ids || []) {
+            if (oldId) promptIdRemap.set(oldId, section.prompt_id);
+        }
+    });
+    for (const section of sections) {
+        section.attachments = section.attachments.map((attachment) => {
+            if (!["prompt_link", "prompt_link_scope"].includes(attachment.kind)) {
+                return attachment;
+            }
+            const rebound = promptIdRemap.get(String(attachment.source?.prompt_id || ""));
+            return rebound ? { ...attachment,
+                source: { ...attachment.source, prompt_id: rebound } } : attachment;
+        });
+    }
+    return { sections, totalFrames: cursor };
+}
+
 export function mountPromptManagementPanel(host) {
     const backdrop = document.createElement("div");
     backdrop.style.cssText = `
@@ -707,6 +848,11 @@ export function mountPromptManagementPanel(host) {
     let identityPanelCleanup = () => {};
     let renderNow = () => {};
     let lastIdentityCandidateSignature = null;
+    // Set while the Writing draft is mounted so a landed candidate can repaint
+    // its contributions WITHOUT going through the panel's `render()`, which
+    // rebuilds the draft element and takes the caret and the chip editor's
+    // undo history with it.
+    let refreshWritingDecorations = null;
     const identityRefreshGate = createModalRefreshGate(() => renderNow());
     const render = () => identityRefreshGate.request();
     // Esc/blur-commit guard (audit F1): the OVERLAY consumer fires on the
@@ -802,8 +948,6 @@ export function mountPromptManagementPanel(host) {
         allocations: writingState.allocations.map((a) => ({ length: a.length, dirty: !!a.dirty })),
         defaultDraftChannel: writingState.defaultDraftChannel,
     });
-    const writingDraftHasText = (value) =>
-        !!(String(value?.draft || "").trim() || value?.document);
     // Where this draft's unheadered text actually goes. One accessor for the
     // hint and both split call sites, so what the panel promises and what Apply
     // does cannot disagree. A stamp naming a channel the template no longer
@@ -835,25 +979,6 @@ export function mountPromptManagementPanel(host) {
     }));
     const documentNodeIds = (documentValue) => normalizePromptDocument(documentValue).nodes
         .map((node) => String(node.node_id || "")).filter(Boolean);
-    const scopedAttachmentIdentity = (attachment) => {
-        const semantic = structuredClone(attachment || {});
-        // Split clones deliberately receive distinct authored object ids but share
-        // an emission group. They coalesce only while every semantic field still
-        // agrees; an edited clone remains present so compilation can surface the
-        // conflicting emission instead of silently discarding either choice.
-        delete semantic.attachment_id;
-        return JSON.stringify(semantic);
-    };
-    const coalesceScopedAttachments = (values) => {
-        const result = [];
-        const seen = new Set();
-        for (const attachment of normalizePromptAttachments(values)) {
-            const identity = scopedAttachmentIdentity(attachment);
-            if (seen.has(identity)) continue;
-            seen.add(identity); result.push(attachment);
-        }
-        return result;
-    };
     const cloneSplitScopedAttachments = (values) => normalizePromptAttachments(values)
         .filter((value) => !["shot", "timestamp"].includes(value.kind))
         .map((value) => ({ ...structuredClone(value),
@@ -870,8 +995,12 @@ export function mountPromptManagementPanel(host) {
         const keys = templateChannelKeys(template);
         const normalizedSections = sections.map((section) => {
             const channels = normalizeChannels(section.channels, section.prompt, keys);
+            // Heal separator padding on the way in. Reset is the right place:
+            // the draft is being rebuilt from sections anyway, the stash makes
+            // it recoverable, and nothing durable changes until Apply.
             const channelDocs = Object.fromEntries(keys.map((key) => [
-                key, normalizePromptDocument(section.channel_docs?.[key], channels[key] || ""),
+                key, healSeparatorPadding(normalizePromptDocument(
+                    section.channel_docs?.[key], channels[key] || "")),
             ]));
             return { ...section, channel_docs: channelDocs };
         });
@@ -910,7 +1039,10 @@ export function mountPromptManagementPanel(host) {
         if (writingState.key === key) return;
         writingState.key = key;
         const saved = host._settings?.prompts?.writingDraftByProjectScene?.[key];
-        if (saved && (String(saved.draft || "").trim() || saved.document)) {
+        // The one predicate, not a copy of it. This site had its own inlined
+        // version of the same expression and is how an emptied draft came to be
+        // restored as though it were real work.
+        if (saved && writingDraftHasContent(saved)) {
             const currentSectionsById = new Map(
                 (host.activeScene?.prompt_sections || []).map((section) => [
                     String(section.prompt_id || ""), section,
@@ -946,7 +1078,7 @@ export function mountPromptManagementPanel(host) {
             writingState.baseModifiedAt = String(saved.baseModifiedAt || "");
             // No stamp means a pre-declaration draft: keep channel 1.
             writingState.defaultDraftChannel = String(saved.defaultDraftChannel || "");
-            writingState.stash = saved.stash && writingDraftHasText(saved.stash)
+            writingState.stash = saved.stash && writingDraftHasContent(saved.stash)
                 ? structuredClone(saved.stash) : null;
         } else {
             writingState.stash = null;
@@ -1278,44 +1410,17 @@ export function mountPromptManagementPanel(host) {
                 keepEmpty: writingState.blockMeta.length > 0,
             }));
         const buildWritingCandidatePatch = (blockDocuments) => {
-            const attachmentById = new Map(writingState.attachments
-                .map((attachment) => [attachment.attachment_id, attachment]));
-            const channelKeys = templateChannelKeys(host._channelTemplate());
-            let cursor = 0;
-            const promptSections = blockDocuments.map((blockDocument, index) => {
-                const length = Math.max(
-                    minLen, writingState.allocations[index]?.length ?? minLen);
-                const channelDocs = splitPromptDocumentChannels(
-                    blockDocument, channelKeys,
-                    { defaultKey: writingDefaultChannelKey() });
-                const anchorIds = new Set(Object.values(channelDocs)
-                    .flatMap((documentValue) => documentValue.nodes)
-                    .filter((node) => node.type === "attachment")
-                    .map((node) => node.attachment_id));
-                const attachments = coalesceScopedAttachments([
-                    ...normalizePromptAttachments(writingState.blockMeta[index]?.attachments)
-                        .filter((value) => !anchorIds.has(value.attachment_id)),
-                    ...[...anchorIds].map((id) => attachmentById.get(id)).filter(Boolean),
-                ]);
-                const value = {
-                    prompt_id: writingState.blockMeta[index]?.source_prompt_id
-                        || `preview:${index}`,
-                    start_frame: cursor,
-                    end_frame: cursor + length,
-                    channels: Object.fromEntries(channelKeys.map((key) => [
-                        key, promptDocumentText(channelDocs[key]).trim(),
-                    ])),
-                    channel_docs: channelDocs,
-                    attachments,
-                    muted: writingState.blockMeta[index]?.muted === true,
-                    global_channel_exceptions: [...new Set(
-                        (writingState.blockMeta[index]?.global_channel_exceptions || [])
-                            .map(String))],
-                };
-                cursor += length;
-                return value;
+            const { sections, totalFrames: cursor } = writingSectionsFromDraft({
+                blocks: blockDocuments,
+                attachments: writingState.attachments,
+                blockMeta: writingState.blockMeta,
+                allocations: writingState.allocations,
+                channelKeys: templateChannelKeys(host._channelTemplate()),
+                defaultKey: writingDefaultChannelKey(),
+                minLen,
+                newId: (index) => `preview:${index}`,
             });
-            return { prompt_sections: promptSections,
+            return { prompt_sections: sections,
                 duration_frames: Math.max(totalFrames, cursor) };
         };
         const previewWritingBlocks = (blockDocuments) => {
@@ -1361,6 +1466,7 @@ export function mountPromptManagementPanel(host) {
 
         let draftTimer = null;
         let draftArea = null;
+        refreshWritingDecorations = null;
         let disposeMentionMenu = null;
         const draftAttachmentContext = (nodeId = "") => {
             const blockDocuments = reconcileWritingBlockMeta(
@@ -1414,6 +1520,411 @@ export function mountPromptManagementPanel(host) {
                 candidate: currentCandidatePayload(),
             });
         };
+        // Turn one staged capability into prose the author owns. One-way and
+        // explicit: the chip stops emitting that capability and the sentence
+        // becomes ordinary text with live `@handle` anchors where an entity was
+        // named. Anything the server could not give a live spelling for blocks
+        // the whole conversion rather than being frozen as a number — see
+        // `convert_capability_plan`.
+        const convertContributionToProse = async (attachmentId, capabilityId,
+            channelKey, regionIndex) => {
+            const plan = await host._promptConvertPlan?.(
+                attachmentId, capabilityId, buildWritingCandidatePatch(
+                    writingBlockDocuments()));
+            if (!plan) {
+                notifyWarning("Could not work out what converting this would write.",
+                    { source: "prompt-convert" });
+                return false;
+            }
+            if (plan.refused) {
+                notifyWarning(plan.refused, { source: "prompt-convert" });
+                return false;
+            }
+            // Nothing to write is a REFUSAL, never a quiet success. The shipped
+            // version disabled the capability regardless, so the contribution
+            // left the prompt with nothing in its place. Checked here, before
+            // the confirm: a before/after comparison of the draft text cannot
+            // stand in for it, because the insertion below unconditionally
+            // writes a newline first and the text always changes.
+            if (!(plan.lines || []).some((line) => (line.parts || []).length)) {
+                notifyWarning("This contribution resolves to nothing right now, so"
+                    + " there is no prose to write. Nothing was changed.",
+                    { source: "prompt-convert" });
+                return false;
+            }
+            const units = host._promptSemanticUnits || [];
+            const handleForUnit = (unitId) => String((units.find((value) =>
+                String(value?.semantic_unit_id || "") === String(unitId)) || {})
+                .handle || "");
+            const members = (host._references || []).flatMap((entity) =>
+                (entity?.members || []).map((member) => ({
+                    member_id: String(member?.member_id || ""),
+                    handle: String(member?.handle || "") })));
+            const handleForMember = (memberId) => String((members.find((value) =>
+                value.member_id === String(memberId)) || {}).handle || "");
+
+            // A piece is either literal text or a REFERENCE the prose names.
+            // Building one string and inserting it would leave `@KWoman` as
+            // inert text: nothing re-parses a mention out of prose, so the
+            // provider would receive the literal handle and the Reference would
+            // stop being cited at all — worse output than the ordinal this
+            // action exists to avoid. Each named entity is inserted as a real
+            // attachment node, the same way accepting a mention does.
+            const pieces = [];
+            const missing = [];
+            // The same two calls the mention menu makes, in the same order.
+            // `promptReferenceSourceOptions` is the authority on what may be
+            // attached and why; its rows carry no handle, so
+            // `promptMentionCandidates` is the join. Reusing both means Convert
+            // can only attach what the author could have attached by hand, and
+            // there is no second opinion about eligibility.
+            const sourceOptions = promptMentionCandidates({
+                options: promptReferenceSourceOptions({
+                    scene: { ...(scene || {}),
+                        _context_reference_frame_threshold:
+                            host._referenceFrameThreshold || 0 },
+                    references: host._references || [],
+                    semanticUnits: host._promptSemanticUnits || [],
+                    profileId: scene?.prompt_context_profile_id
+                        || host._channelTemplate().default_context_profile || "generic@1",
+                    scope: "global",
+                    resolvedProfile: host._resolvedPromptContextProfile?.(),
+                }),
+                references: host._references || [],
+                semanticUnits: host._promptSemanticUnits || [],
+            }) || [];
+            const optionForHandle = (handle) => (sourceOptions.find((row) =>
+                String(row?.handle || "") === String(handle)
+                && row?.eligible !== false) || null);
+            const pushReference = (handle, rendered) => {
+                const option = optionForHandle(handle);
+                if (!option) { missing.push(rendered); return; }
+                pieces.push({ kind: "reference", option, handle });
+            };
+            for (const line of plan.lines || []) {
+                for (const part of line.parts || []) {
+                    if (part.kind === "text") {
+                        pieces.push({ kind: "text", text: part.text });
+                        continue;
+                    }
+                    if (part.kind === "handle") {
+                        const handle = handleForUnit(part.id);
+                        if (!handle) { missing.push(part.rendered); continue; }
+                        pushReference(handle, part.rendered);
+                        continue;
+                    }
+                    if (part.kind === "sources") {
+                        const names = (part.member_ids || []).map(handleForMember);
+                        // A Subject with no VISUAL source still gets a sources
+                        // segment, empty. Falling through emitted
+                        // " from  and @undefined" into the author's prompt, and
+                        // `some(v => !v)` cannot catch it because an empty list
+                        // satisfies every predicate.
+                        if (!names.length) continue;
+                        if (names.some((value) => !value)) {
+                            missing.push(part.rendered);
+                            continue;
+                        }
+                        pieces.push({ kind: "text", text: " from " });
+                        names.forEach((handle, index) => {
+                            if (index) {
+                                pieces.push({ kind: "text",
+                                    text: index === names.length - 1
+                                        ? (names.length > 2 ? ", and " : " and ") : ", " });
+                            }
+                            pushReference(handle, part.rendered);
+                        });
+                    }
+                }
+                pieces.push({ kind: "text", text: "\n" });
+            }
+            if (missing.length) {
+                // A named entity with no handle, or none this format can attach,
+                // has no live spelling in prose. Writing its rendered label
+                // instead is exactly the ordinal freeze this action avoids.
+                notifyWarning(`${[...new Set(missing)].join(", ")} cannot be`
+                    + " attached here, so this cannot become prose without freezing"
+                    + " its number. Give it a handle first.",
+                    { source: "prompt-convert" });
+                return false;
+            }
+            if (!pieces.some((piece) => piece.kind !== "text" || piece.text.trim())) {
+                // Every part was filtered out on the way to prose. Same rule:
+                // disable nothing.
+                notifyWarning("There is nothing to write for this contribution."
+                    + " Nothing was changed.", { source: "prompt-convert" });
+                return false;
+            }
+            const frozen = (plan.frozen || []).filter(Boolean);
+            const warning = frozen.length
+                ? `\n\n${frozen.join(", ")} will become plain text and stop following`
+                    + " staged intent."
+                : "";
+            if (!window.confirm(`Convert this ${channelKey} contribution to prose?`
+                + " The chip stops emitting it and you own the sentence."
+                + ` This cannot be undone from the prose.${warning}`)) return false;
+
+            // Land it in the channel it was converted FROM. `focusEnd()` put it
+            // after the whole draft — under the shipped H3 template that is the
+            // last section's last channel, so a subject definition reappeared as
+            // music prose. The region's last node is the anchor.
+            const model = normalizePromptDocument(writingState.document);
+            const anchorNode = model.nodes[regionIndex];
+            if (!anchorNode) {
+                notifyWarning("Could not find where this contribution belongs in"
+                    + " the draft.", { source: "prompt-convert" });
+                return false;
+            }
+            const placed = draftArea.restorePromptSelection({
+                start: { node_id: anchorNode.node_id,
+                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
+                end: { node_id: anchorNode.node_id,
+                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
+            });
+            if (!placed) {
+                notifyWarning("Could not place the caret in that channel, so"
+                    + " nothing was converted.", { source: "prompt-convert" });
+                return false;
+            }
+            // Sequential inserts chain: each leaves the caret after what it
+            // wrote, so text and attachments interleave in order.
+            draftArea.insertText("\n");
+            for (const piece of pieces) {
+                if (piece.kind === "text") {
+                    if (piece.text) draftArea.insertText(piece.text);
+                    continue;
+                }
+                const attachment = applyPromptReferenceSource(
+                    normalizePromptAttachment({ kind: "reference" }), piece.option.value);
+                const seeded = handleAttachCapabilityRecord(
+                    host._resolvedPromptContextProfile?.(), { channelKey });
+                if (seeded.length) attachment.capabilities = structuredClone(seeded);
+                draftArea.insertAttachment(attachment, "");
+            }
+            // Per-CAPABILITY, never per-line: a per-line suppression would need
+            // a stable per-record key, and the only one that ever existed
+            // embedded a rendered ordinal.
+            //
+            // The record has to be disabled in BOTH homes. An INLINE-anchored
+            // chip lives in the editor's registry; a chip attached to the
+            // section lives in `blockMeta[i].attachments`, and
+            // `writingSectionsFromDraft` reads the unanchored ones from there.
+            // Writing only the registry copy left a section-scoped chip still
+            // emitting, so Apply produced the contribution twice — once as the
+            // author's new prose and once from the chip.
+            const disable = (value) => setPromptAttachmentCapabilityEnabled(
+                value, { capability_id: capabilityId }, false);
+            const inRegistry = writingState.attachments.find((value) =>
+                value.attachment_id === attachmentId);
+            let touched = false;
+            if (inRegistry) {
+                draftArea.replaceAttachment(disable(inRegistry));
+                touched = true;
+            }
+            for (const meta of writingState.blockMeta || []) {
+                const scopedIndex = (meta.attachments || []).findIndex((value) =>
+                    value.attachment_id === attachmentId);
+                if (scopedIndex < 0) continue;
+                meta.attachments[scopedIndex] = disable(meta.attachments[scopedIndex]);
+                touched = true;
+            }
+            if (!touched) {
+                notifyWarning("That Reference is no longer staged here, so nothing"
+                    + " was converted.", { source: "prompt-convert" });
+                return false;
+            }
+            writingState.draft = draftArea.value;
+            writingState.document = draftArea.promptDocument;
+            writingState.attachments = draftArea.promptAttachments;
+            saveWritingState();
+            notifySuccess("Converted to prose.", { source: "prompt-convert" });
+            render();
+            return true;
+        };
+        // Each chip's RESOLVED contribution, rendered as read-only prose under
+        // the channel it is staged in. This is the whole point of the Writing
+        // view after the pivot: the author reads the sentence their chips will
+        // produce, in place, while the chips stay the record. Nothing here is
+        // document content — see `decorations` on the chips editor.
+        const writingDecorations = (model) => {
+            const payload = currentCandidatePayload();
+            if (!payload) return [];
+            const keys = templateChannelKeys(host._channelTemplate());
+            const regions = channelRegionsByNode(model, keys,
+                { defaultKey: writingDefaultChannelKey() });
+            // ALWAYS keepEmpty: `channelRegionsByNode` counts every `---`, so a
+            // filtered split would shift every index after a dropped empty
+            // block and hand a region the NEXT block's chips — a wrong reading
+            // rather than a missing one.
+            const blocks = splitWritingPromptDocument(model, { keepEmpty: true });
+            const out = [];
+            const seen = new Set();
+            for (const region of regions) {
+                const blockDocument = blocks[region.block];
+                if (!blockDocument) continue;
+                const anchored = new Set(normalizePromptDocument(blockDocument).nodes
+                    .filter((node) => node.type === "attachment")
+                    .map((node) => node.attachment_id));
+                // BOTH pools. A chip attached with "Attach to this section"
+                // never reaches the editor's registry, and looking it up there
+                // alone is what left every one of them labelled "Reference".
+                const pool = [
+                    ...normalizePromptAttachments(writingState.attachments)
+                        .filter((value) => anchored.has(value.attachment_id)),
+                    ...normalizePromptAttachments(
+                        writingState.blockMeta[region.block]?.attachments),
+                ];
+                const lines = channelContributionRows({
+                    channelKey: region.channelKey, attachments: pool,
+                    candidate: payload, attachmentLabelFor,
+                })
+                    // An inline capability compiles where its anchor sits, so it
+                    // is already in the sentence the author wrote. Printing it
+                    // again under the heading states one emission twice, in the
+                    // wrong place. `rendered_at_anchor` is the authority here,
+                    // not the route table — a DISABLED inline capability
+                    // publishes no route and read as "show it".
+                    .filter((contribution) => !contribution.atAnchor)
+                    .map((contribution) => ({
+                        label: contribution.label,
+                        // `resolved` is the marker's own text when it emits one
+                        // and the reason when it does not, so a Shot reads
+                        // `[Shot 1] At 00:00.000,` rather than its excuse.
+                        text: contribution.emitting ? contribution.resolved : "",
+                        reason: contribution.emitting ? "" : contribution.resolved,
+                        attachmentId: contribution.attachmentId,
+                        capabilityId: contribution.capabilityId,
+                    }));
+                if (!lines.length) continue;
+                seen.add(`${region.block}::${region.channelKey}`);
+                out.push({ afterIndex: region.afterIndex,
+                    element: writingDecorationElement(region.channelKey, lines,
+                        convertContributionToProse, region.afterIndex) });
+            }
+            // A channel a chip FEEDS but the author has never typed in has no
+            // heading in the draft, so it has no region and nothing above found
+            // it — which meant most of what a Reference actually produces was
+            // invisible here. Give those a home at the end of their block, in
+            // template order, with the heading drawn by the decoration itself.
+            //
+            // Deliberately NOT written into the document: this runs from the
+            // debounced compile, and `insertText` focuses the editor, pushes an
+            // undo entry and moves the caret. A heading the author deleted
+            // would also be restored on the next compile, a fight they cannot
+            // win. `Write here` materialises it on an explicit click instead.
+            const ranges = writingBlockNodeRanges(model);
+            for (const range of ranges) {
+                const blockDocument = blocks[range.block];
+                if (!blockDocument) continue;
+                const anchored = new Set(normalizePromptDocument(blockDocument).nodes
+                    .filter((node) => node.type === "attachment")
+                    .map((node) => node.attachment_id));
+                const pool = [
+                    ...normalizePromptAttachments(writingState.attachments)
+                        .filter((value) => anchored.has(value.attachment_id)),
+                    ...normalizePromptAttachments(
+                        writingState.blockMeta[range.block]?.attachments),
+                ];
+                if (!pool.length) continue;
+                for (const channelKey of keys) {
+                    if (seen.has(`${range.block}::${channelKey}`)) continue;
+                    const lines = channelContributionRows({
+                        channelKey, attachments: pool, candidate: payload,
+                        attachmentLabelFor,
+                    })
+                        .filter((contribution) => !contribution.atAnchor
+                            && contribution.emitting)
+                        .map((contribution) => ({
+                            label: contribution.label,
+                            text: contribution.resolved,
+                            attachmentId: contribution.attachmentId,
+                            capabilityId: contribution.capabilityId,
+                        }));
+                    if (!lines.length) continue;
+                    out.push({ afterIndex: range.lastIndex,
+                        element: writingDecorationElement(channelKey, lines,
+                            convertContributionToProse, range.lastIndex,
+                            { unwritten: true, block: range.block }) });
+                }
+            }
+            return out;
+        };
+        const writingDecorationElement = (channelKey, lines, onConvert, regionIndex,
+            unwritten = null) => {
+            const host_ = document.createElement("div");
+            host_.dataset.sonderWritingContribution = String(channelKey);
+            host_.style.cssText = `margin:4px 0 6px;padding:5px 8px;border-left:2px solid ${COLORS.promptBorder};`
+                + `background:${COLORS.panelMuted};border-radius:0 4px 4px 0;`;
+            const heading = document.createElement("div");
+            heading.textContent = unwritten
+                ? `${channelKey} — from your References · you have not written here`
+                : `${channelKey} — from your References`;
+            heading.style.cssText = `font-size:9px;letter-spacing:.04em;text-transform:uppercase;`
+                + `color:${COLORS.textDim};margin-bottom:2px;`;
+            host_.appendChild(heading);
+            for (const line of lines) {
+                const row = document.createElement("div");
+                row.style.cssText = `font:11px/1.5 system-ui;color:${line.text ? COLORS.text : COLORS.textDim};`
+                    + "white-space:pre-wrap;overflow-wrap:anywhere;";
+                row.textContent = line.text || `${line.label}: ${line.reason}`;
+                host_.appendChild(row);
+                if (!line.text || !line.capabilityId || applyBlocked) continue;
+                const convert = makeBtn("Convert to prose",
+                    "Write this contribution into the draft as text you own."
+                    + " The chip stops emitting it.", "subtle");
+                convert.style.cssText += ";margin-top:3px;font-size:10px;";
+                convert.addEventListener("click", () => {
+                    onConvert?.(line.attachmentId, line.capabilityId, channelKey,
+                        regionIndex);
+                });
+                host_.appendChild(convert);
+            }
+            if (unwritten) {
+                const write = makeBtn("Write here",
+                    `Add a ${channelKey} heading to the draft so you can type in`
+                    + " this channel.", "subtle");
+                write.style.cssText += ";margin-top:4px;font-size:10px;";
+                write.addEventListener("click", () => {
+                    materialiseChannelHeading(channelKey, unwritten.block);
+                });
+                host_.appendChild(write);
+            }
+            return host_;
+        };
+        /**
+         * Put a real `channel:` heading in the draft, on request.
+         *
+         * The only path that writes one. A compile callback must never do it:
+         * `insertText` focuses the editor, pushes history and moves the caret,
+         * and the candidate lands on a debounce while the author is typing.
+         */
+        const materialiseChannelHeading = (channelKey, blockIndex) => {
+            const ranges = writingBlockNodeRanges(writingState.document);
+            const range = ranges[blockIndex];
+            const model = normalizePromptDocument(writingState.document);
+            const anchorNode = range ? model.nodes[range.lastIndex] : null;
+            if (!anchorNode) {
+                notifyWarning("Could not find where that channel belongs in the"
+                    + " draft.", { source: "prompt-writing-channel" });
+                return;
+            }
+            const placed = draftArea.restorePromptSelection({
+                start: { node_id: anchorNode.node_id,
+                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
+                end: { node_id: anchorNode.node_id,
+                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
+            });
+            if (!placed) {
+                notifyWarning("Could not place the caret in that block.",
+                    { source: "prompt-writing-channel" });
+                return;
+            }
+            draftArea.insertText(`\n${channelKey}:\n`);
+            writingState.draft = draftArea.value;
+            writingState.document = draftArea.promptDocument;
+            saveWritingState();
+            render();
+        };
         draftArea = createPromptDocumentEditor({
             document: writingState.document,
             text: writingState.draft,
@@ -1423,6 +1934,7 @@ export function mountPromptManagementPanel(host) {
             attachmentContext: { scene, template: host._channelTemplate() },
             disabled: applyBlocked,
             ariaLabel: "Writing mode narrative draft",
+            decorations: writingDecorations,
             onChange: ({ document: nextDocument, attachments, text, reason }) => {
                 writingState.document = nextDocument;
                 writingState.attachments = attachments;
@@ -1441,6 +1953,7 @@ export function mountPromptManagementPanel(host) {
                 writingState.blockMeta = Array.isArray(value) ? value : [];
             },
         });
+        refreshWritingDecorations = () => draftArea?.refreshDecorations?.();
         draftArea.style.minHeight = "120px";
         applyBoxHeight(host, draftArea, "panelDraftBoxHeight", 160);
         registerPromptBoxGuard(draftArea, () => writingState.draft);
@@ -1538,7 +2051,13 @@ export function mountPromptManagementPanel(host) {
             // `editor.insertText`, not `execCommand`: the break is multi-line
             // and execCommand drops newlines here, which left an inert inline
             // `---` that produced no section break at all.
-            draftArea.insertText(writingSplitText(active, writingDefaultChannelKey()));
+            //
+            // `asOwnNode`: growing the surrounding text node put the `---`
+            // INSIDE it, and decoration placement is node-granular, so both
+            // blocks reported the same node and their contributions stacked
+            // under the second one.
+            draftArea.insertText(writingSplitText(active, writingDefaultChannelKey()),
+                { asOwnNode: true });
             // Disclosure, not a silent fix: the split continues only the
             // channel the caret is in, so any other channel with text stays
             // with the block being left behind. The author is told which,
@@ -1563,7 +2082,7 @@ export function mountPromptManagementPanel(host) {
             // Names the stake rather than asking generically: this one IS
             // recoverable, and a confirmation that does not say so trains the
             // author to dismiss it unread.
-            if (writingDraftHasText(writingDraftSnapshot())
+            if (writingDraftHasContent(writingDraftSnapshot())
                 && !window.confirm("Rebuild the draft from the lane's sections?"
                     + " Your current draft is kept and can be restored.")) return;
             // Snapshot BEFORE reconstructing. Reset is the only escape offered
@@ -1571,7 +2090,7 @@ export function mountPromptManagementPanel(host) {
             // that destroys the draft the author cannot apply yet.
             const previous = writingDraftSnapshot();
             reconstructDraftFromSections();
-            writingState.stash = writingDraftHasText(previous) ? previous : null;
+            writingState.stash = writingDraftHasContent(previous) ? previous : null;
             saveWritingState();
             render();
         });
@@ -1843,62 +2362,17 @@ export function mountPromptManagementPanel(host) {
                 splitWritingPromptDocument(writingState.document, {
                     keepEmpty: writingState.blockMeta.length > 0,
                 }));
-            const attachmentById = new Map(writingState.attachments
-                .map((attachment) => [attachment.attachment_id, attachment]));
-            const channelKeys = templateChannelKeys(host._channelTemplate());
-            let cursor = 0;
-            const sections = blocks.map((blockDocument, i) => {
-                const length = Math.max(minLen, writingState.allocations[i]?.length ?? minLen);
-                const channelDocs = splitPromptDocumentChannels(
-                    blockDocument, channelKeys,
-                    { defaultKey: writingDefaultChannelKey() });
-                const channels = Object.fromEntries(channelKeys.map((key) => [
-                    key, promptDocumentText(channelDocs[key]).trim(),
-                ]));
-                const anchorIds = new Set(Object.values(channelDocs)
-                    .flatMap((documentValue) => documentValue.nodes)
-                    .filter((node) => node.type === "attachment")
-                    .map((node) => node.attachment_id));
-                const scoped = normalizePromptAttachments(
-                    writingState.blockMeta[i]?.attachments)
-                    .filter((value) => !anchorIds.has(value.attachment_id));
-                const attachments = coalesceScopedAttachments([
-                    ...scoped,
-                    ...[...anchorIds].map((id) => attachmentById.get(id)).filter(Boolean),
-                ]);
-                const section = {
-                    prompt_id: writingState.blockMeta[i]?.source_prompt_id
-                        || (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${i}`),
-                    start_frame: cursor,
-                    end_frame: cursor + length,
-                    channels,
-                    channel_docs: channelDocs,
-                    attachments,
-                    muted: writingState.blockMeta[i]?.muted === true,
-                    global_channel_exceptions: [...new Set(
-                        (writingState.blockMeta[i]?.global_channel_exceptions || [])
-                            .map(String))],
-                };
-                cursor += length;
-                return section;
+            const { sections, totalFrames: cursor } = writingSectionsFromDraft({
+                blocks,
+                attachments: writingState.attachments,
+                blockMeta: writingState.blockMeta,
+                allocations: writingState.allocations,
+                channelKeys: templateChannelKeys(host._channelTemplate()),
+                defaultKey: writingDefaultChannelKey(),
+                minLen,
+                newId: (index) => globalThis.crypto?.randomUUID?.()
+                    || `${Date.now()}-${index}`,
             });
-            const promptIdRemap = new Map();
-            sections.forEach((section, index) => {
-                for (const oldId of writingState.blockMeta[index]?.merged_source_prompt_ids || []) {
-                    if (oldId) promptIdRemap.set(oldId, section.prompt_id);
-                }
-            });
-            for (const section of sections) {
-                section.attachments = section.attachments.map((attachment) => {
-                    if (!["prompt_link", "prompt_link_scope"].includes(attachment.kind)) {
-                        return attachment;
-                    }
-                    const sourceId = String(attachment.source?.prompt_id || "");
-                    const rebound = promptIdRemap.get(sourceId);
-                    return rebound ? { ...attachment,
-                        source: { ...attachment.source, prompt_id: rebound } } : attachment;
-                });
-            }
             const sceneDur = host.activeScene?.duration_frames || host.totalFrames || 0;
             const extendDurationTo = cursor > sceneDur ? cursor : 0;
             // The writing tool rewrites SECTIONS only, so the scene-global text
@@ -3530,6 +4004,10 @@ export function mountPromptManagementPanel(host) {
         // loss that gate exists to prevent.
         applyCandidate: (payload) => {
             if (!mounted) return false;
+            // Contributions follow the compiled output, which changes on every
+            // recompile — including the many that leave identity untouched and
+            // return false below. Repaint them first, and directly.
+            refreshWritingDecorations?.();
             const next = identityCandidateSignature(payload);
             if (next === lastIdentityCandidateSignature) return false;
             lastIdentityCandidateSignature = next;
