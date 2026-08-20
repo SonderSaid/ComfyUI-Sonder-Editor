@@ -405,12 +405,19 @@ class SonderMasksBridge:
         "Hard 0/1 noise mask for the VIDEO latent — one mask per latent frame "
         "(1 = generate, 0 = keep). Feed Set Latent Noise Mask on the video "
         "latent. Not interchangeable with audio_mask. All-zeros when the video "
-        "latent and VAE are not both wired, or when Edit Video is off.",
+        "latent and VAE are not both wired, or when Edit Video is off. "
+        "On LTX, a graph that also uses guides or a start image should drive "
+        "LTXVAudioVideoMask from the time outputs above instead of feeding this "
+        "mask to Set Latent Noise Mask — see docs/generating.md. A mask also "
+        "replaces rather than composes, so it overwrites any pin a start-image "
+        "or continuation node set upstream.",
         "Hard 0/1 noise mask for the AUDIO latent — a SINGLE mask image shaped "
         "to the audio latent's last two axes, not a batch (1 = generate, 0 = "
         "keep). Feed Set Latent Noise Mask on the audio latent. Not "
         "interchangeable with video_mask. All-zeros when the audio latent and "
-        "VAE are not both wired, or when Edit Audio is off.",
+        "VAE are not both wired, or when Edit Audio is off. Like the video "
+        "mask it replaces rather than composes, so it overwrites any noise "
+        "mask set upstream.",
     )
     FUNCTION = "execute"
     DESCRIPTION = (

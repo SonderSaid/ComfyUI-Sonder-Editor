@@ -12,7 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
-- The Masks Bridge can now compile the generation window straight into hard video and audio latent noise masks. Wire each half of a separated AV latent together with its VAE, and feed the two new mask outputs to **Set Latent Noise Mask** — no retyped frame rate, no seconds round-trip, and the context frames outside the window are kept exactly. Works on both LTX and MiniMax H3. Note that latent masks and LTX guide nodes cannot be combined yet — a graph using both will ignore its guides.
+- The Masks Bridge can now compile the generation window straight into hard video and audio latent noise masks. Wire each half of a separated AV latent together with its VAE, and feed the two new mask outputs to **Set Latent Noise Mask** — no retyped frame rate, no seconds round-trip, and the context frames outside the window are kept exactly. Geometry is read from the VAE, so it is correct on LTX, MiniMax H3 and Wan with no per-model setting. On LTX, a graph that also uses guides or a start image should drive kjnodes' `LTXVAudioVideoMask` from the four time outputs instead of feeding the masks to **Set Latent Noise Mask** — the generating guide has the wiring. Note also that a mask replaces rather than composes, so it overwrites any pin a start-image or continuation node set upstream.
 
 ### Changed
 - Writing aids now ask for their choices in the menu itself instead of a browser popup: an aid with nothing left to decide inserts straight away, one with a single choice opens a submenu, and one needing several opens a small panel. Select a line first and an aid wraps it — highlight a spoken line, pick Dialogue, and it comes back in the format's own syntax.

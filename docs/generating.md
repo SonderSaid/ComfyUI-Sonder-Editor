@@ -195,8 +195,10 @@ VAE Encode (editor frames + audio)
 ```
 
 Wire each latent, and the VAE that encoded it, back into the Masks Bridge — it
-needs **both** to build that channel's mask. This works unchanged on LTX and
-MiniMax H3.
+needs **both** to build that channel's mask. The pixel-to-latent geometry comes
+from the VAE itself, so it is correct on LTX, MiniMax H3 and Wan without any
+per-model setting. What is *not* universal is composition — see the last two
+notes below.
 
 Notes worth knowing:
 
@@ -211,16 +213,47 @@ Notes worth knowing:
 - Masking only one stream leaves the other fully regenerated, because **Concat
   AV Latent** fills an absent mask with all-ones. Mask both, or Freeze the one
   you want kept.
-- **Latent masks and LTX guides cannot currently be combined.** Neither order
-  works. Masking *before* `LTXVAddGuide` raises `IndexError: tuple index out of
-  range`, because ComfyUI's own `SetLatentNoiseMask` stores a 4D mask while the
-  LTX guide nodes expect the 5D form they build themselves. Masking *after* runs
-  without error but silently cancels the guides: `LTXVAddGuide` appends each
-  guide as extra latent frames and claims them in the noise mask with `1 -
-  strength`, and setting the mask afterwards replaces that whole tensor. Use one
-  or the other for now — a graph with both will produce a video that ignores its
-  guides. This is a ComfyUI interaction rather than a Sonder one, but a fix is
-  planned on the Sonder side.
+- **On LTX with guides or a start image, use `LTXVAudioVideoMask` (kjnodes)
+  instead of Set Latent Noise Mask.** Drive it from this node's four *time*
+  outputs rather than the MASK outputs, and place it **before** the guide chain:
+
+  ```
+  Separate AV Latent -> LTXVAudioVideoMask -> [guide chain] -> Concat AV Latent
+                          max_length: partial     <- NOT the default
+                          video_start/end_time, audio_start/end_time <- bridge FLOATs
+  ```
+
+  It writes the 5D noise mask that LTX's own nodes expect, so `LTXVAddGuide`
+  *extends* it rather than colliding with it, and the guides keep their claims.
+  Two things to get right: `max_length` defaults to `truncate`, which slices the
+  latent and destroys the guide tail — set it to `partial`; and place it before
+  the guide chain, because afterwards it either loses your context or silently
+  rewrites guide strengths.
+
+  The cost is that you retype `video_fps`, and the node is LTX-only — its 8
+  frames-per-latent and 25 audio-latents-per-second are hardcoded, so it is
+  wrong on Wan and on MiniMax H3. **Keep the MASK outputs and Set Latent Noise
+  Mask for H3 and Wan**, which have no such conflict.
+
+  What goes wrong if you use Set Latent Noise Mask anyway on LTX: those nodes
+  read the mask through one helper that expects the 5D form, while ComfyUI's
+  `SetLatentNoiseMask` stores 4D. Before `LTXVAddGuide` that raises
+  `IndexError: tuple index out of range`. Before `LTXVImgToVideoInplace` it is
+  **silent and total** — that node writes over the leading latent frames, but on
+  a 4D mask that axis has length one, so it overwrites the entire mask and
+  nothing generates at all. After the guide chain the guides are discarded when
+  your window reaches the end of the clip, or survive with a silently shifted
+  window when it does not. MiniMax H3 is exempt throughout, because its guide
+  node returns only conditioning.
+- **A mask replaces, it never composes.** Anything that already wrote a
+  `noise_mask` upstream loses it — including start-image and continuation nodes
+  such as `WanImageToVideo`, `WanAnimateToVideo`, the Cosmos image-to-video
+  pair, HunyuanVideo's *v2 (replace)* mode and SCAIL continuation, all of which
+  pin their reference frames that way. Those pins are silently destroyed.
+  Chaining through the Sonder timeline is unaffected, because it carries context
+  as encoded frames inside the window rather than as a producer-written pin.
+  Stock `SetLatentNoiseMask` behaves identically; this is not specific to the
+  Masks Bridge.
 - Masks are hard 0/1, so the boundary latent is fully regenerated and the seam
   is a hard cut at latent resolution — around a third of a second for LTX
   video, and much finer for audio.
