@@ -131,7 +131,7 @@ ComfyUI.
 | **Sonder Reference Image Bridge** | Decodes image-serving references according to the lane recipe. Slot recipes grow as `r01`–`r16`; assembled batches, sheets, and temporal sequences use `r01`. MiniMax H3 Video lanes also use this bridge and emit 24 fps IMAGE sequences on the `17n+5` frame grid. |
 | **Sonder Reference Audio Bridge** | Decodes up to 16 trimmed audio members as homogeneous `a01`–`a16` outputs. |
 | **Sonder Reference Prompt Bridge** | Exports `reference_prompt`, `reference_names`, and per-member `p01`–`p16` strings. |
-| **Sonder Masks Bridge** | Exposes the editor's generation-mask window as separate video/audio mask-time pairs, each gated by an Edit/Freeze toggle (a frozen channel emits a zero-width window, so nothing is generated for it). Feed a downstream temporal mask node. |
+| **Sonder Masks Bridge** | Exposes the editor's generation-mask window as separate video/audio mask-time pairs, each gated by an Edit/Freeze toggle (a frozen channel emits a zero-width window, so nothing is generated for it). Feed a downstream temporal mask node, or wire each latent together with its VAE and take the compiled hard 0/1 MASK outputs straight to **Set Latent Noise Mask**. |
 | **Sonder Prompt Relay Bridge** | Exports the render window's prompt lanes as ComfyUI-PromptRelay payload strings (no model patching). |
 
 ### Save & preview — `Sonder/IO`

@@ -180,6 +180,51 @@ come back through **Sonder Save Video** or **Sonder Save Bridge**, which
 register outputs as project assets. The full node list is in the
 [README](../README.md#nodes).
 
+### Masking an audio-video latent
+
+To regenerate only part of a clip while keeping the context frames, the Masks
+Bridge can build the noise masks itself. Encode the editor's frames and audio
+into an AV latent, split it, mask each half, and rejoin:
+
+```
+VAE Encode (editor frames + audio)
+  -> Concat AV Latent -> Separate AV Latent
+       video_latent -> Set Latent Noise Mask (mask <- bridge video_mask)
+       audio_latent -> Set Latent Noise Mask (mask <- bridge audio_mask)
+  -> Concat AV Latent -> sampler
+```
+
+Wire each latent, and the VAE that encoded it, back into the Masks Bridge — it
+needs **both** to build that channel's mask. This works unchanged on LTX and
+MiniMax H3.
+
+Notes worth knowing:
+
+- **Freeze** emits an all-zero mask, so that channel is kept from source. This
+  is how you regenerate audio over locked picture, or the reverse.
+- Wire only half a pair and that channel emits a keep-everything mask and logs
+  a warning. A latent that was not encoded from this render window is refused
+  outright rather than masked at the wrong scale.
+- The two mask outputs are **not** interchangeable. Video is a batch with one
+  entry per latent frame; audio is a single image whose time axis differs by
+  model. Swapping them resizes silently instead of erroring.
+- Masking only one stream leaves the other fully regenerated, because **Concat
+  AV Latent** fills an absent mask with all-ones. Mask both, or Freeze the one
+  you want kept.
+- **Latent masks and LTX guides cannot currently be combined.** Neither order
+  works. Masking *before* `LTXVAddGuide` raises `IndexError: tuple index out of
+  range`, because ComfyUI's own `SetLatentNoiseMask` stores a 4D mask while the
+  LTX guide nodes expect the 5D form they build themselves. Masking *after* runs
+  without error but silently cancels the guides: `LTXVAddGuide` appends each
+  guide as extra latent frames and claims them in the noise mask with `1 -
+  strength`, and setting the mask afterwards replaces that whole tensor. Use one
+  or the other for now — a graph with both will produce a video that ignores its
+  guides. This is a ComfyUI interaction rather than a Sonder one, but a fix is
+  planned on the Sonder side.
+- Masks are hard 0/1, so the boundary latent is fully regenerated and the seam
+  is a hard cut at latent resolution — around a third of a second for LTX
+  video, and much finer for audio.
+
 ## The render queue
 
 The queue panel docks at the bottom of the Assets sidebar.
