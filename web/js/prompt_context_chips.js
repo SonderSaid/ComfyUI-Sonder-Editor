@@ -501,21 +501,59 @@ export function splitPromptDocumentChannels(documentValue, channelKeys,
  */
 export function writingBlockNodeRanges(documentValue) {
     const nodes = normalizePromptDocument(documentValue).nodes;
-    const ranges = [{ block: 0, firstIndex: 0, lastIndex: -1 }];
+    const ranges = [{ block: 0, firstIndex: 0, lastIndex: -1,
+        tailIndex: -1, tailOffset: null }];
     nodes.forEach((node, index) => {
-        if (node.type === "text"
-            && String(node.text || "").split("\n").some((line) => line.trim() === "---")) {
+        const breakStart = node.type === "text"
+            ? writingBreakRunStart(node.text) : -1;
+        if (breakStart >= 0) {
             // A break can share a node with the text on either side of it, so
             // the node counts as the tail of the closing block AND the head of
-            // the next. Placement is node-granular; this is the same known
-            // limit `channelRegionsByNode` documents.
-            ranges.at(-1).lastIndex = index;
-            ranges.push({ block: ranges.length, firstIndex: index, lastIndex: index });
+            // the next. That is right for MEMBERSHIP and wrong as an INSERTION
+            // point: the caret placed at this node's end lands past the break,
+            // which put a fed channel's heading in the following block. So the
+            // closing block also carries a tail anchor — the last position that
+            // is still its own.
+            const closing = ranges.at(-1);
+            closing.lastIndex = index;
+            if (breakStart > 0) {
+                // Text of this block precedes the break inside this node, so the
+                // anchor is an OFFSET rather than a node boundary.
+                closing.tailIndex = index;
+                closing.tailOffset = breakStart;
+            } else {
+                // The node opens with the break, so nothing of this block lives
+                // in it; the previous node is the tail. `null` means "the end of
+                // that node", which is what every caller computed before.
+                closing.tailIndex = Math.max(0, index - 1);
+                closing.tailOffset = index === 0 ? 0 : null;
+            }
+            ranges.push({ block: ranges.length, firstIndex: index,
+                lastIndex: index, tailIndex: index, tailOffset: null });
             return;
         }
         ranges.at(-1).lastIndex = index;
+        ranges.at(-1).tailIndex = index;
+        ranges.at(-1).tailOffset = null;
     });
     return ranges;
+}
+
+/**
+ * Where a `---` line's run begins inside a text node, or -1 if it holds none.
+ *
+ * The run includes the newline that PRECEDES the marker, because that newline
+ * belongs to the separator rather than to the block being closed — the same
+ * rule `splitWritingPromptDocument` applies when it trims one back off.
+ */
+function writingBreakRunStart(text) {
+    const lines = String(text || "").split("\n");
+    let offset = 0;
+    for (const line of lines) {
+        if (line.trim() === "---") return offset > 0 ? offset - 1 : 0;
+        offset += line.length + 1;
+    }
+    return -1;
 }
 
 /**
@@ -1702,18 +1740,18 @@ export function createPromptDocumentEditor({
                 // accessible names — only their paint is deferred, so a
                 // screen reader and the keyboard path are unaffected.
                 //
-                // FOCUS ONLY, deliberately not hover. Out of flow they sit ON
-                // TOP of the words after the mention, so revealing them on
-                // hover put a live Remove button over prose the author was
-                // about to click into — measured at 14-18px past the handle,
-                // where a caret click lands. A mouse user reaches the same
-                // controls by activating the chip, which opens its editor; a
-                // keyboard user tabbing here is deliberately in the control and
-                // is not about to click the sentence behind it. Reflowing the
-                // sentence on hover instead was rejected: the text moving out
-                // from under the pointer re-fires hover and flickers.
+                // FOCUS ONLY, deliberately not hover. A mouse user reaches the
+                // same controls by activating the chip, which opens its editor;
+                // reflowing the sentence under a moving pointer re-fires hover
+                // and flickers, which is why hover was ruled out. Focus does not
+                // re-fire on layout, so the reveal can put them back IN FLOW —
+                // out of flow they sat on top of the words after the mention,
+                // measured 14-18px past the handle, exactly where a caret click
+                // lands. At rest they stay absolute so a hidden control still
+                // costs no width, which is what taking them out of flow was for.
                 const affordances = [editGlyph, remove];
                 const reveal = (shown) => {
+                    affordanceHost.style.position = shown ? "static" : "absolute";
                     for (const element of affordances) {
                         element.style.opacity = shown ? "" : "0";
                         element.style.pointerEvents = shown ? "" : "none";
@@ -2991,6 +3029,28 @@ export function handleAttachCapabilityRecord(profile, options = {}) {
     }
     if (kind === defaultKind) return [];
     return [{ capability_id: kind, kind }];
+}
+
+/**
+ * The derived capability this format renders where its anchor sits, or "".
+ *
+ * Declaration-driven: whichever kind declares `placement: "inline"` first, so
+ * H3 Full Reference answers `mentions` and `generic@1` answers `derived_prompt`
+ * without either name appearing here. A format declaring none has no way to
+ * spell a Reference inside a sentence, and callers must refuse rather than fall
+ * back — the fallback is a section-prefix capability that emits its own line
+ * and renders nothing at the caret.
+ *
+ * `orderedReferenceDerived`'s missing-`order`-as-0 reading is COSMETIC here,
+ * unlike in `handleAttachCapabilityRecord` above, where it decides whether a
+ * record is written at all: every candidate this sees is already a live inline
+ * capability, so a tie only picks a different correct answer.
+ */
+export function inlineReferenceCapabilityKind(profile) {
+    for (const [kind, declaration] of orderedReferenceDerived(profile)) {
+        if (String(declaration?.placement || "") === "inline") return kind;
+    }
+    return "";
 }
 
 /**

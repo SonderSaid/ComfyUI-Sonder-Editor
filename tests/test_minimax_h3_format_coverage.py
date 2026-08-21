@@ -1473,6 +1473,131 @@ def test_convert_plan_refuses_a_capability_that_is_not_staged():
     assert not plan["lines"] and not plan["frozen"]
 
 
+def test_a_converted_mention_renders_where_the_author_put_it():
+    """What Convert's minted chips must compile to, end to end.
+
+    Convert writes prose into the channel the contribution came from and
+    replaces each named entity with a real Reference chip. Those chips have to
+    render AT THEIR ANCHOR, inside that sentence. Two things are required and
+    the shipped build had neither, so the compiled prompt read
+    `" is the korean woman ... from "` with both handle positions empty:
+
+    1. the capability must be the one the format declares `inline` — a
+       section-prefix capability emits its own line and nothing at the caret; and
+    2. its route must EQUAL the channel it is anchored in. `_route_for` answers
+       with the capability's DECLARED channel, and `mentions` declares
+       `detailed_description`, so seeding the kind alone routes the token out of
+       `subject_definitions` into the prose channel — a different empty result
+       reached the same way.
+
+    Asserting only that `<Subject 1>` appears SOMEWHERE would pass on that
+    routed-away case, which is why this pins the sentence.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a",
+                        prompt="the young woman with long dark hair")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
+              "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    # Exactly what `convertContributionToProse` mints: the inline kind, pinned
+    # to the channel the author converted in.
+    chip = prompt_context.normalize_attachment({
+        "attachment_id": "minted", "kind": "reference",
+        "provider_id": "minimax_h3_ref", "provider_version": "1",
+        "source": {"semantic_unit_ids": ["u"]}, "config": {},
+        "capabilities": [{"capability_id": "mentions", "kind": "mentions",
+                          "channel_key": "subject_definitions",
+                          "placement": "inline"}],
+    })
+    document = {"nodes": [
+        {"type": "attachment", "attachment_id": "minted"},
+        {"type": "text", "text": " is the korean woman."},
+    ]}
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channel_docs={"subject_definitions": document},
+                                attachments=[chip])],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": resolved["setup_manifest"],
+            "ordinal_manifest": resolved["ordinal_manifest"],
+            "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
+            "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
+            "semantic_units": units,
+        }, labels_on=True)
+
+    definitions = compiled["channels"]["subject_definitions"]
+    # The token stands where the chip was anchored, inside the author's sentence.
+    assert "<Subject 1> is the korean woman." in definitions, definitions
+    # ...and not merely present somewhere while the sentence keeps its hole.
+    assert " is the korean woman." not in definitions.replace(
+        "<Subject 1> is the korean woman.", ""), definitions
+    # An inline capability emits ONLY at its anchor, so nothing was also added
+    # as a separate line above or below it.
+    assert definitions.strip() == "<Subject 1> is the korean woman.", definitions
+    # And the token did not leak into the channel `mentions` declares.
+    assert "<Subject 1>" not in compiled["channels"].get(
+        "detailed_description", ""), compiled["channels"]
+
+
+def test_a_converted_mention_that_only_seeds_its_kind_routes_away():
+    """The discrimination half of the guard above, kept as documentation.
+
+    Same chip with the `channel_key`/`placement` pins removed — the record the
+    first fix attempt would have written. `mentions` then routes to its declared
+    `detailed_description`, so `subject_definitions` keeps the hole and the
+    token surfaces in a channel the author never wrote in. Pinned so that
+    "sparse records are always better" cannot be re-adopted here.
+    """
+    entity = ReferenceEntity(reference_id="e", name="Woman", members=[
+        ReferenceMember(member_id="mp", asset_id="img_a",
+                        prompt="the young woman with long dark hair")])
+    recipes = [ReferenceLaneRecipe(lane_id="lp", media_kind="image",
+                                   recipe=PICTURE_RECIPE)]
+    items = [ReferenceItem(reference_item_id="ip", lane_index=0, start_frame=0,
+                           end_frame=WINDOW_END, members=[
+                               {"entity_id": "e", "member_id": "mp",
+                                "role": "identity", "visual_intent": "preserve"}])]
+    units = [{"semantic_unit_id": "u", "name": "Woman", "order": 0,
+              "sources": [{"entity_id": "e", "member_id": "mp"}]}]
+    resolved = _resolve(setup={"mode": "reference", "picture_lane_ids": ["lp"]},
+                        entities=[entity], items=items, recipes=recipes, units=units)
+    chip = prompt_context.normalize_attachment({
+        "attachment_id": "minted", "kind": "reference",
+        "provider_id": "minimax_h3_ref", "provider_version": "1",
+        "source": {"semantic_unit_ids": ["u"]}, "config": {},
+        "capabilities": [{"capability_id": "mentions", "kind": "mentions"}],
+    })
+    document = {"nodes": [
+        {"type": "attachment", "attachment_id": "minted"},
+        {"type": "text", "text": " is the korean woman."},
+    ]}
+    compiled = prompt_context.compile_prompt_context(
+        sections=[PromptSection(0, WINDOW_END,
+                                channel_docs={"subject_definitions": document},
+                                attachments=[chip])],
+        window_start=0, window_end=WINDOW_END, fps=24.0,
+        template="minimax_h3_ref", profile="minimax_h3_ref@1",
+        context={
+            "setup_manifest": resolved["setup_manifest"],
+            "ordinal_manifest": resolved["ordinal_manifest"],
+            "unit_picture_ordinals": resolved.get("unit_picture_ordinals", {}),
+            "unit_source_labels": resolved.get("unit_source_labels", {}),
+            "unit_source_members": resolved.get("unit_source_members", {}),
+            "semantic_units": units,
+        }, labels_on=True)
+    assert "<Subject 1>" not in compiled["channels"]["subject_definitions"]
+
+
 def test_a_compile_without_a_convert_request_carries_no_plan():
     """The field appears only when asked for; every other compile is unchanged."""
     compiled = prompt_context.compile_prompt_context(

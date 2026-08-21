@@ -74,6 +74,8 @@ import {
     applyPromptReferenceSource,
     normalizePromptAttachment,
     handleAttachCapabilityRecord,
+    inlineReferenceCapabilityKind,
+    sparseCapabilityRecord,
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
 } from "./prompt_context_chips.js";
@@ -1526,8 +1528,28 @@ export function mountPromptManagementPanel(host) {
         // named. Anything the server could not give a live spelling for blocks
         // the whole conversion rather than being frozen as a number — see
         // `convert_capability_plan`.
+        /**
+         * Put the caret at a draft anchor, given as `{ index, offset }`.
+         *
+         * `offset: null` means the end of that node, which is what both callers
+         * computed by hand. A non-null offset is what a `---` sharing a node
+         * with the text before it needs: the block's last position is INSIDE
+         * that node, and the node's end is already past the break.
+         */
+        const placeWritingCaret = ({ index, offset = null } = {}) => {
+            const node = normalizePromptDocument(writingState.document)
+                .nodes[index];
+            if (!node) return null;
+            const at = node.type === "text"
+                ? (offset === null ? node.text.length
+                    : Math.max(0, Math.min(node.text.length, offset)))
+                : 1;
+            const position = { node_id: node.node_id, offset: at };
+            return draftArea.restorePromptSelection({
+                start: position, end: position }) ? node : null;
+        };
         const convertContributionToProse = async (attachmentId, capabilityId,
-            channelKey, regionIndex) => {
+            channelKey, anchor) => {
             const plan = await host._promptConvertPlan?.(
                 attachmentId, capabilityId, buildWritingCandidatePatch(
                     writingBlockDocuments()));
@@ -1552,6 +1574,44 @@ export function mountPromptManagementPanel(host) {
                     { source: "prompt-convert" });
                 return false;
             }
+            // Resolved BEFORE the confirm, with the other refusals. A converted
+            // handle has to render where it sits, and only a capability the
+            // format declares `inline` does that; a format declaring none has
+            // no live spelling for a Reference inside a sentence, which is the
+            // same refusal `missing[]` makes below for an entity with no handle.
+            const inlineKind = inlineReferenceCapabilityKind(
+                host._resolvedPromptContextProfile?.());
+            if (!inlineKind) {
+                notifyWarning("This prompt format has no way to name a Reference"
+                    + " inside a sentence, so converting would freeze its number."
+                    + " Nothing was changed.", { source: "prompt-convert" });
+                return false;
+            }
+            // Every chip the emission group stages, because Convert silences the
+            // GROUP. Dedupe keys on `(emission_group_id, capability_id, kind,
+            // channel)`, so with the same Reference staged on three sections
+            // only one chip emits and the others read "equivalent output
+            // already emitted" — disabling just the clicked one promotes a
+            // sibling and the definition still reaches the prompt, now twice:
+            // once as the author's prose. The group already behaves as one
+            // record and the author converted the group's contribution.
+            //
+            // Matched on capability only, not on channel: a linked group is one
+            // chip cloned, so its capability set is identical, while a sibling
+            // whose record pins a different channel would slip through a
+            // channel filter and keep emitting.
+            const projections = currentCandidatePayload()
+                ?.attachment_capability_projections || [];
+            const clickedRow = projections.find((row) =>
+                String(row?.attachment_id || "") === attachmentId
+                && String(row?.capability_id || "") === capabilityId);
+            const emissionGroup = String(clickedRow?.emission_group_id || "");
+            const groupAttachmentIds = new Set([attachmentId,
+                ...(emissionGroup ? projections
+                    .filter((row) => String(row?.emission_group_id || "") === emissionGroup
+                        && String(row?.capability_id || "") === capabilityId)
+                    .map((row) => String(row?.attachment_id || ""))
+                    .filter(Boolean) : [])]);
             const units = host._promptSemanticUnits || [];
             const handleForUnit = (unitId) => String((units.find((value) =>
                 String(value?.semantic_unit_id || "") === String(unitId)) || {})
@@ -1660,28 +1720,22 @@ export function mountPromptManagementPanel(host) {
                 ? `\n\n${frozen.join(", ")} will become plain text and stop following`
                     + " staged intent."
                 : "";
+            // Silencing three chips must never be silent, so the count is in the
+            // question rather than in a toast afterwards.
+            const linked = groupAttachmentIds.size > 1
+                ? `\n\nThis Reference is linked across ${groupAttachmentIds.size}`
+                    + " sections; the contribution stops on all of them, or a"
+                    + " linked chip would emit it again beside your prose."
+                : "";
             if (!window.confirm(`Convert this ${channelKey} contribution to prose?`
                 + " The chip stops emitting it and you own the sentence."
-                + ` This cannot be undone from the prose.${warning}`)) return false;
+                + ` This cannot be undone from the prose.${linked}${warning}`)) return false;
 
             // Land it in the channel it was converted FROM. `focusEnd()` put it
             // after the whole draft — under the shipped H3 template that is the
             // last section's last channel, so a subject definition reappeared as
-            // music prose. The region's last node is the anchor.
-            const model = normalizePromptDocument(writingState.document);
-            const anchorNode = model.nodes[regionIndex];
-            if (!anchorNode) {
-                notifyWarning("Could not find where this contribution belongs in"
-                    + " the draft.", { source: "prompt-convert" });
-                return false;
-            }
-            const placed = draftArea.restorePromptSelection({
-                start: { node_id: anchorNode.node_id,
-                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
-                end: { node_id: anchorNode.node_id,
-                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
-            });
-            if (!placed) {
+            // music prose.
+            if (!placeWritingCaret(anchor)) {
                 notifyWarning("Could not place the caret in that channel, so"
                     + " nothing was converted.", { source: "prompt-convert" });
                 return false;
@@ -1696,9 +1750,19 @@ export function mountPromptManagementPanel(host) {
                 }
                 const attachment = applyPromptReferenceSource(
                     normalizePromptAttachment({ kind: "reference" }), piece.option.value);
-                const seeded = handleAttachCapabilityRecord(
-                    host._resolvedPromptContextProfile?.(), { channelKey });
-                if (seeded.length) attachment.capabilities = structuredClone(seeded);
+                // BOTH routing axes, deliberately, where a menu attach leaves
+                // them sparse. Seeding the inline kind alone is not enough:
+                // `_route_for` answers with the capability's DECLARED channel —
+                // `mentions` declares `detailed_description` — and the compiler
+                // renders at the anchor only when `route == channel_key`, so a
+                // mention converted into `subject_definitions` would route away
+                // and leave a hole where the handle sits. A menu attach INFERS
+                // routing and should keep following the format; Convert records
+                // that the author put this sentence in this channel, so freezing
+                // is the semantics rather than an oversight.
+                attachment.capabilities = [sparseCapabilityRecord({}, {
+                    capabilityId: inlineKind, enabled: true, inheritedEnabled: true,
+                    channelKey, placement: "inline" })];
                 draftArea.insertAttachment(attachment, "");
             }
             // Per-CAPABILITY, never per-line: a per-line suppression would need
@@ -1714,19 +1778,20 @@ export function mountPromptManagementPanel(host) {
             // author's new prose and once from the chip.
             const disable = (value) => setPromptAttachmentCapabilityEnabled(
                 value, { capability_id: capabilityId }, false);
-            const inRegistry = writingState.attachments.find((value) =>
-                value.attachment_id === attachmentId);
             let touched = false;
-            if (inRegistry) {
-                draftArea.replaceAttachment(disable(inRegistry));
+            // Snapshot: `replaceAttachment` writes through to the same registry
+            // this is walking.
+            for (const value of [...writingState.attachments]) {
+                if (!groupAttachmentIds.has(value.attachment_id)) continue;
+                draftArea.replaceAttachment(disable(value));
                 touched = true;
             }
             for (const meta of writingState.blockMeta || []) {
-                const scopedIndex = (meta.attachments || []).findIndex((value) =>
-                    value.attachment_id === attachmentId);
-                if (scopedIndex < 0) continue;
-                meta.attachments[scopedIndex] = disable(meta.attachments[scopedIndex]);
-                touched = true;
+                (meta.attachments || []).forEach((value, index) => {
+                    if (!groupAttachmentIds.has(value.attachment_id)) return;
+                    meta.attachments[index] = disable(value);
+                    touched = true;
+                });
             }
             if (!touched) {
                 notifyWarning("That Reference is no longer staged here, so nothing"
@@ -1785,6 +1850,13 @@ export function mountPromptManagementPanel(host) {
                     // not the route table — a DISABLED inline capability
                     // publishes no route and read as "show it".
                     .filter((contribution) => !contribution.atAnchor)
+                    // A capability the author turned OFF contributes nothing to
+                    // this channel, which is what this block reports. Listing it
+                    // as "disabled and contributes no text" made a successful
+                    // Convert read as a failure — the line it replaced was still
+                    // sitting there. The chip's own state stays visible in
+                    // Structured, where turning it back on happens.
+                    .filter((contribution) => contribution.state !== "disabled")
                     .map((contribution) => ({
                         label: contribution.label,
                         // `resolved` is the marker's own text when it emits one
@@ -1799,7 +1871,8 @@ export function mountPromptManagementPanel(host) {
                 seen.add(`${region.block}::${region.channelKey}`);
                 out.push({ afterIndex: region.afterIndex,
                     element: writingDecorationElement(region.channelKey, lines,
-                        convertContributionToProse, region.afterIndex) });
+                        convertContributionToProse,
+                        { index: region.afterIndex, offset: null }) });
             }
             // A channel a chip FEEDS but the author has never typed in has no
             // heading in the draft, so it has no region and nothing above found
@@ -1841,15 +1914,19 @@ export function mountPromptManagementPanel(host) {
                             capabilityId: contribution.capabilityId,
                         }));
                     if (!lines.length) continue;
-                    out.push({ afterIndex: range.lastIndex,
+                    // The TAIL, not `lastIndex`: a block closing with a `---`
+                    // inside its last node ends before that break, so painting
+                    // and inserting at `lastIndex` both land in the next block.
+                    out.push({ afterIndex: range.tailIndex,
                         element: writingDecorationElement(channelKey, lines,
-                            convertContributionToProse, range.lastIndex,
+                            convertContributionToProse,
+                            { index: range.tailIndex, offset: range.tailOffset },
                             { unwritten: true, block: range.block }) });
                 }
             }
             return out;
         };
-        const writingDecorationElement = (channelKey, lines, onConvert, regionIndex,
+        const writingDecorationElement = (channelKey, lines, onConvert, anchor,
             unwritten = null) => {
             const host_ = document.createElement("div");
             host_.dataset.sonderWritingContribution = String(channelKey);
@@ -1875,7 +1952,7 @@ export function mountPromptManagementPanel(host) {
                 convert.style.cssText += ";margin-top:3px;font-size:10px;";
                 convert.addEventListener("click", () => {
                     onConvert?.(line.attachmentId, line.capabilityId, channelKey,
-                        regionIndex);
+                        anchor);
                 });
                 host_.appendChild(convert);
             }
@@ -1899,22 +1976,12 @@ export function mountPromptManagementPanel(host) {
          * and the candidate lands on a debounce while the author is typing.
          */
         const materialiseChannelHeading = (channelKey, blockIndex) => {
-            const ranges = writingBlockNodeRanges(writingState.document);
-            const range = ranges[blockIndex];
-            const model = normalizePromptDocument(writingState.document);
-            const anchorNode = range ? model.nodes[range.lastIndex] : null;
-            if (!anchorNode) {
-                notifyWarning("Could not find where that channel belongs in the"
-                    + " draft.", { source: "prompt-writing-channel" });
-                return;
-            }
-            const placed = draftArea.restorePromptSelection({
-                start: { node_id: anchorNode.node_id,
-                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
-                end: { node_id: anchorNode.node_id,
-                    offset: anchorNode.type === "text" ? anchorNode.text.length : 1 },
-            });
-            if (!placed) {
+            const range = writingBlockNodeRanges(writingState.document)[blockIndex];
+            // The TAIL anchor, not `lastIndex`: a block whose closing `---`
+            // shares its last node ends before that break, and the node's end
+            // put the heading in the next block.
+            if (!range || !placeWritingCaret(
+                { index: range.tailIndex, offset: range.tailOffset })) {
                 notifyWarning("Could not place the caret in that block.",
                     { source: "prompt-writing-channel" });
                 return;

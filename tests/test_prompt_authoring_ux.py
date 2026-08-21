@@ -1928,6 +1928,72 @@ def test_handle_attach_default_matches_the_servers_undeclared_order_rule():
         {"capability_id": "unordered", "kind": "unordered"}]
 
 
+def test_the_inline_reference_capability_is_read_from_the_declaration():
+    """Which capability Convert mints, and why it cannot be a hardcoded name.
+
+    A converted handle has to render where it sits, which only a capability the
+    format declares `inline` does. That kind is per-format — `mentions` under
+    MiniMax H3 Full Reference, `derived_prompt` under generic — so it comes from
+    the declaration. A format declaring no inline capability answers "", and
+    Convert refuses rather than falling back: the fallback is a section-prefix
+    capability that emits its own line and nothing at the caret, which is the
+    shipped defect.
+    """
+    from server import prompt_context
+
+    builtin = prompt_context.BUILTIN_PROFILES
+    profiles = {
+        "h3": builtin["minimax_h3_ref@1"],
+        "generic": builtin["generic@1"],
+        # Declares Reference capabilities, none of them inline.
+        "prefix_only": {"capabilities": {"reference": {"derived": {
+            "definitions": {"order": 1, "channel_key": "body",
+                            "placement": "section_prefix"},
+        }}}},
+        # No Reference capabilities at all.
+        "bare": {"capabilities": {}},
+    }
+    result = _run_node(
+        f"const mod = await import("
+        f"{json.dumps((ROOT / 'web/js/prompt_context_chips.js').as_uri())});\n"
+        f"const p = {json.dumps(profiles)};\n"
+        "console.log(JSON.stringify(Object.fromEntries("
+        " Object.entries(p).map(([k, v]) =>"
+        " [k, mod.inlineReferenceCapabilityKind(v)]))));\n")
+    assert result == {"h3": "mentions", "generic": "derived_prompt",
+                      "prefix_only": "", "bare": ""}
+
+
+def test_convert_pins_both_routing_axes_on_the_chip_it_mints():
+    """Seeding the inline KIND alone leaves the sentence with a hole.
+
+    `_route_for` answers with a capability's DECLARED channel, and the compiler
+    renders at the anchor only when `route == channel_key`, so a `mentions` chip
+    converted into `subject_definitions` routes out to `detailed_description`.
+    Convert therefore writes `channel_key` and `placement` — the two axes a MENU
+    attach deliberately leaves sparse, because a menu attach infers routing
+    while Convert records where the author put the sentence.
+
+    Source-level: the compiled behaviour is pinned end to end in
+    `test_a_converted_mention_renders_where_the_author_put_it`, and what this
+    adds is that the browser is the thing writing that record.
+    """
+    panel = (ROOT / "web/js/editor_prompt_panel.js").read_text(encoding="utf-8")
+    convert = panel.split("const convertContributionToProse")[1].split(
+        "const writingDecorations")[0]
+    assert "inlineReferenceCapabilityKind(" in convert
+    assert "capabilityId: inlineKind" in convert
+    assert "channelKey, placement: \"inline\"" in convert
+    # The refusal is reachable and sits with the other pre-confirm guards, so a
+    # format with no inline capability never disables anything.
+    assert convert.index("if (!inlineKind)") < convert.index("window.confirm")
+    # The MENU attach keeps inferring from its channel; this must not become a
+    # symmetry. `onAccepted` is the `@` mention path.
+    accepted = panel.split("onAccepted: ({ value, channelKey")[1][:600]
+    assert "handleAttachCapabilityRecord(profile, { channelKey })" in accepted
+    assert "inlineReferenceCapabilityKind" not in accepted
+
+
 def test_unheadered_draft_text_lands_in_the_declared_default_draft_channel():
     result = _run_chips_script("""
 const keys = ["subject_definitions", "summary", "detailed_description"];

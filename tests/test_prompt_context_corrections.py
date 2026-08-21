@@ -2667,11 +2667,11 @@ def test_a_handle_renders_inline_and_drops_the_chip_preview():
         "position:absolute" in css for css in result["handleGlyphHost"])
     assert result["pillGlyphHost"] and not any(
         "position:absolute" in css for css in result["pillGlyphHost"])
-    # Out of flow, those controls sit ON TOP of the words after the mention.
-    # Revealing them on hover therefore put a live Remove button over prose the
-    # author was about to click into — measured 14-18px past the handle in the
-    # real browser, exactly where a caret click lands. A handle reveals on FOCUS
-    # only, so a mouse moving toward the next word never arms a delete.
+    # A handle reveals on FOCUS only, so a mouse moving toward the next word
+    # never arms a delete. Hover was ruled out for a second reason too: the
+    # reveal now puts these controls back IN FLOW (see
+    # `test_a_focused_mention_control_reflows_instead_of_covering_the_prose`),
+    # and text reflowing under a moving pointer re-fires hover and flickers.
     assert result["handleRevealEvents"] == ["focusin", "focusout"]
     # The pill needs no reveal at all: its controls sit inside the capsule, in
     # flow, always visible. Asserted so that "hide the pill's controls too"
@@ -3183,6 +3183,177 @@ def test_a_channel_contribution_resolves_its_text_label_and_placement():
     # `rendered_at_anchor` rather than by any route table.
     assert byId["inline-1"]["atAnchor"] is True
     assert byId["ref-1"]["atAnchor"] is False
+
+
+def test_a_block_anchors_insertions_before_its_closing_break():
+    """`lastIndex` answers membership; it cannot answer "where does this block end".
+
+    A `---` can share a text node with the heading that follows it, so the
+    closing block's last node is the break-bearing one. Placing the caret at
+    that node's END lands past the break, which put a fed channel's heading and
+    its contribution in the NEXT block. Measured in a real project: block 0's
+    last node was "\n---\n\nsubject_definitions:\n".
+
+    Both node shapes are pinned, because the fix has to be exact in each:
+    a break-LEADING node belongs entirely to the following block, so the tail is
+    the previous node; a break that follows text in the same node leaves the
+    tail as an OFFSET inside it.
+    """
+    result = _run_chip_dom_script("""
+        const NL = String.fromCharCode(10);
+        const shape = (nodes) => mod.writingBlockNodeRanges({ nodes })
+            .map((r) => [r.block, r.lastIndex, r.tailIndex, r.tailOffset]);
+        console.log(JSON.stringify({
+            // The measured shape: the break opens the node that also carries
+            // the next block's heading.
+            leading: shape([
+                { type: "text", node_id: "a", text: "subject_definitions:" },
+                { type: "text", node_id: "b", text: "A woman crosses." },
+                { type: "text", node_id: "c",
+                  text: NL + "---" + NL + NL + "subject_definitions:" + NL },
+                { type: "text", node_id: "d", text: "She looks up." },
+            ]),
+            // A hand-typed break merged after this block's own text.
+            trailing: shape([
+                { type: "text", node_id: "a", text: "alpha" + NL + "---" + NL + "beta" },
+            ]),
+            // No break at all: one block ending at the last node.
+            single: shape([
+                { type: "text", node_id: "a", text: "alpha" },
+                { type: "text", node_id: "b", text: "beta" },
+            ]),
+        }));
+    """)
+    leading, trailing, single = (result["leading"], result["trailing"],
+                                result["single"])
+    # Membership is unchanged: the break-bearing node still closes block 0.
+    assert [row[1] for row in leading] == [2, 3], leading
+    # ...but the INSERTION point steps back to the last node that is block 0's
+    # own. This is the whole defect: it used to be node 2.
+    assert leading[0][2] == 1 and leading[0][3] is None, leading
+    # The following block starts at the break-bearing node and runs to the end.
+    assert leading[1][2] == 3, leading
+    # A break merged after text keeps the same node and reports the offset just
+    # before the separator's leading newline, so "alpha" is not split.
+    assert trailing[0][2] == 0 and trailing[0][3] == 5, trailing
+    assert trailing[1][2] == 0, trailing
+    # Nothing changes for a draft with no break.
+    assert single == [[0, 1, 1, None]], single
+
+
+def test_a_disabled_capability_is_not_listed_as_a_contribution():
+    """What the author turned off is not something their References contribute.
+
+    `channelContributionRows` still REPORTS a disabled row — the pill strip needs
+    it, since re-enabling happens there — so the filter belongs to the Writing
+    decoration. Without it a converted contribution kept sitting under the
+    heading as "disabled and contributes no text", which reads as a Convert that
+    failed rather than one that worked.
+    """
+    result = _run_chip_dom_script("""
+        const rows = mod.channelContributionRows({
+            channelKey: "subject_definitions",
+            attachments: [{ attachment_id: "ref-1", kind: "reference",
+                            source: {}, config: {} }],
+            candidate: { attachment_capability_projections: [
+                { attachment_id: "ref-1", capability_id: "definitions",
+                  channel_key: "subject_definitions", state: "disabled",
+                  text: "", rendered_at_anchor: false,
+                  state_reason: "This capability is disabled and contributes no text.",
+                  effective_phase: "section_prefix" },
+            ] },
+        });
+        console.log(JSON.stringify(rows.map((r) => [r.state, r.emitting])));
+    """)
+    # The resolver keeps reporting it...
+    assert result == [["disabled", False]], result
+    # ...and the Writing decoration is the thing that drops it.
+    panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(
+        encoding="utf-8")
+    decorations = panel.split("const writingDecorations")[1].split(
+        "const writingDecorationElement")[0]
+    assert '.filter((contribution) => contribution.state !== "disabled")' in decorations
+
+
+def test_convert_disables_every_chip_in_the_emission_group():
+    """A per-chip disable promotes a linked sibling instead of silencing it.
+
+    Dedupe keys on `(emission_group_id, capability_id, kind, channel)`, so with
+    the same Reference staged on three sections only one chip emits and the
+    others read "equivalent output already emitted". Turning off the emitter
+    hands the emission to a sibling, and the definition still reaches the
+    prompt — now twice, once as the author's new prose.
+
+    The group is enumerated from the candidate the panel already holds, matched
+    on capability rather than channel: a linked group is one chip cloned, so a
+    sibling whose record pins a different channel must not slip through.
+    """
+    panel = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(
+        encoding="utf-8")
+    convert = panel.split("const convertContributionToProse")[1].split(
+        "const writingDecorations")[0]
+    assert "emission_group_id" in convert
+    assert "groupAttachmentIds" in convert
+    # Both homes, over the whole group. A section-scoped chip never reaches the
+    # editor registry, and `writingSectionsFromDraft` reads it from blockMeta.
+    registry, scoped = convert.split("for (const meta of writingState.blockMeta")
+    assert "groupAttachmentIds.has(value.attachment_id)" in registry
+    assert "groupAttachmentIds.has(value.attachment_id)" in scoped
+    # Silencing three chips is never silent: the count is in the question, not
+    # in a toast after the fact.
+    question = convert.split("window.confirm(")[1].split("return false;")[0]
+    assert "groupAttachmentIds.size" in convert.split("window.confirm(")[0]
+    assert "linked" in question
+
+
+def test_a_focused_mention_control_reflows_instead_of_covering_the_prose():
+    """Out of flow, a revealed control sits on top of the following words.
+
+    At rest the affordances must stay absolute: `opacity:0` alone keeps layout,
+    which left roughly two blank characters after every handle mid-sentence, and
+    taking them out of flow is what closed that gap. But revealing them out of
+    flow put a live Remove button over the prose — measured 14-18px past the
+    handle in the real browser, exactly where a caret click lands.
+
+    So the reveal moves them back INTO flow. Hover was ruled out because text
+    moving under the pointer re-fires hover and flickers; focus does not re-fire
+    on layout, which is what makes this safe here and not there.
+    """
+    result = _run_chip_dom_script("""
+        const attachment = { attachment_id: "ref", kind: "reference",
+            source: {}, config: {} };
+        const editor = mod.createPromptDocumentEditor({
+            document: { nodes: [
+                { type: "text", node_id: "before", text: "she has an " },
+                { type: "attachment", node_id: "anchor", attachment_id: "ref" },
+                { type: "text", node_id: "after", text: " editorial style." },
+            ] },
+            attachments: [attachment],
+            attachmentLabelFor: () => "@KWoman",
+        });
+        const chip = editor.children.find((v) => v.dataset.attachmentId === "ref");
+        const hostOf = (node) => (node.children || []).flatMap((child) =>
+            child.dataset?.sonderChipEditAffordance === "1"
+                ? [node] : hostOf(child));
+        const host = hostOf(chip)[0];
+        const glyph = (host.children || []).find((c) =>
+            c.dataset?.sonderChipEditAffordance === "1");
+        const snap = () => ({ position: host.style.position,
+                              opacity: glyph.style.opacity });
+        const rest = snap();
+        chip._handlers.focusin[0]();
+        const focused = snap();
+        chip._handlers.focusout[0]();
+        console.log(JSON.stringify({ rest, focused, back: snap() }));
+    """)
+    # At rest: out of flow and unpainted, so a hidden control costs no width.
+    assert result["rest"]["position"] == "absolute", result
+    assert result["rest"]["opacity"] == "0", result
+    # Focused: in flow, so the sentence moves aside rather than being covered.
+    assert result["focused"]["position"] == "static", result
+    assert result["focused"]["opacity"] != "0", result
+    # And blurring puts the gap back, or every visited handle would keep a hole.
+    assert result["back"] == result["rest"], result
 
 
 def test_a_contribution_that_resolves_to_nothing_still_reports_itself():
