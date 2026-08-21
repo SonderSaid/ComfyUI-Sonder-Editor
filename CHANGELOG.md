@@ -48,10 +48,15 @@ a fresh `[Unreleased]` block.
   and last-frame images straight from the Guides Bridge, so no prompt-side
   binding is involved. Unsupported raw Guide/unknown kinds remain visible for
   repair and block while enabled.
-- MiniMax H3 Full Reference scenes now add Picture, Video, and Audio lanes
-  independently instead of installing an all-three setup. Reference lane Members
-  and Advisories start collapsed, remember browser-local disclosure choices, and
-  use larger thumbnails that open the existing read-only media inspector.
+- A MiniMax H3 Full Reference lane now feeds the model as soon as you stage it.
+  Set a Reference lane to Pictures, Videos, or Audio and drop a Reference in —
+  there is no separate step that registers the lane, and a brand-new scene works
+  the same as one you copied. Lane order decides which is Picture 1. To leave a
+  lane out, hide it or mute the item. Existing projects gain any H3 lane they had
+  staged but never registered, which can renumber slots in a scene that has more
+  than one. Reference lane Members and Advisories start collapsed, remember
+  browser-local disclosure choices, and use larger thumbnails that open the
+  existing read-only media inspector.
 - MiniMax H3 Picture, Video, and standalone Audio populations now flow through
   the generic Reference Selector and media-typed bridges. Video remains a
   video-only authored population but is served as a 24 fps IMAGE sequence on

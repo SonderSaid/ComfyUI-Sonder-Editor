@@ -19,10 +19,9 @@ def _blank_scene():
         reference_lane_recipes=[ReferenceLaneRecipe(lane_id="blank")])
 
 
-def _ensure(scene, population="picture"):
-    return routes._ensure_minimax_h3_reference_population(
-        scene, {"type": "ensure_minimax_h3_reference_population",
-                "population": population})
+def _rename(scene, project, name="renamed"):
+    return routes._apply_scene_mutation_operation(
+        project, scene, {"type": "update_scene_fields", "fields": {"name": name}})
 
 
 def test_catalog_is_versioned_and_fork_seeds_exclude_server_owned_fields():
@@ -782,79 +781,12 @@ def test_retired_role_aliases_remain_visible_but_block_compilation(
         prompt_context.MINIMAX_H3_ROLE_CATALOGS[population]}
 
 
-def test_atomic_population_reuses_blank_lane_then_is_semantically_idempotent():
-    scene = _blank_scene()
-    first = _ensure(scene, "picture")
-    state = scene.to_dict()
-    second = _ensure(scene, "picture")
-    assert first["lane_index"] == 0 and first["materialized"] is True
-    assert second["lane_id"] == first["lane_id"]
-    assert second["changed"] is False
-    assert scene.to_dict() == state
+def test_stale_scene_mutation_precondition_rolls_back_before_the_operation():
+    """The version gate refuses before any scene operation runs.
 
-
-@pytest.mark.parametrize("population,setup_key,physical", [
-    ("picture", "picture_lane_ids", "pictures"),
-    ("video", "video_lane_ids", "videos"),
-    ("audio", "audio_lane_ids", "standalone_audios"),
-])
-def test_atomic_population_materializes_all_canonical_populations(
-        population, setup_key, physical):
-    scene = _blank_scene()
-    result = _ensure(scene, population)
-    setup = minimax_h3.active_setup(scene)
-    recipe = scene.reference_lane_recipes[result["lane_index"]]
-    assert setup["mode"] == "reference"
-    assert setup[setup_key] == [result["lane_id"]]
-    assert recipe.recipe["soft"]["physical_population"] == physical
-
-
-def test_atomic_population_never_rewrites_custom_or_configured_lane():
-    custom = ReferenceLaneRecipe(
-        lane_id="custom", media_kind="video", recipe_id="custom:owned",
-        recipe={"id": "custom:owned", "name": "Authored",
-                "hard": {"assembly": "batch"}, "soft": {}})
-    scene = Scene(
-        scene_id="scene", reference_lane_count=1,
-        reference_lane_configs=[LaneConfig(name="Keep", locked=True)],
-        reference_lane_recipes=[custom])
-    before_recipe = scene.reference_lane_recipes[0].to_dict()
-    before_config = scene.reference_lane_configs[0].to_dict()
-    result = _ensure(scene, "picture")
-    assert result["lane_index"] == 1
-    assert scene.reference_lane_recipes[0].to_dict() == before_recipe
-    assert scene.reference_lane_configs[0].to_dict() == before_config
-
-
-def test_exact_lane_owned_by_another_setup_is_not_reused():
-    preset = routes._h3_population_preset("pictures")
-    owned = routes._canonical_h3_lane_recipe("owned", preset)
-    first = minimax_h3.default_reference_setup(picture_lane_ids=["owned"])
-    first["setup_id"] = "first"
-    active = minimax_h3.default_reference_setup()
-    active["setup_id"] = "active"
-    scene = Scene(
-        scene_id="scene", reference_lane_count=1,
-        reference_lane_configs=[LaneConfig(name="Owned")],
-        reference_lane_recipes=[owned],
-        minimax_h3_conditioning_setups=[first, active],
-        active_minimax_h3_setup_id="active")
-    result = _ensure(scene, "picture")
-    assert result["lane_index"] == 1
-    assert minimax_h3.active_setup(scene)["picture_lane_ids"] == [result["lane_id"]]
-    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == ["owned"]
-
-
-def test_atomic_population_operation_rejects_embedded_scene_or_extra_fields():
-    with pytest.raises(routes.ProjectMutationRequestError) as exc:
-        routes._ensure_minimax_h3_reference_population(_blank_scene(), {
-            "type": "ensure_minimax_h3_reference_population",
-            "population": "picture", "scene_id": "not-body-owned",
-        })
-    assert exc.value.code == "invalid_h3_reference_population_operation"
-
-
-def test_stale_scene_mutation_precondition_rolls_back_before_h3_operation():
+    Previously carried by the deleted H3 population op; the contract is the
+    precondition, not the operation, so it rides an ordinary field write now.
+    """
     scene = _blank_scene()
     project = TimelineProject(project_id="project", scenes=[scene],
                               modified_at="current")
@@ -862,5 +794,5 @@ def test_stale_scene_mutation_precondition_rolls_back_before_h3_operation():
     request = SimpleNamespace(method="POST", headers={"If-Match": "stale"})
     with pytest.raises(ProjectVersionConflict):
         routes._validate_request_project_version(request, project)
-        _ensure(scene, "picture")
+        _rename(scene, project)
     assert scene.to_dict() == before

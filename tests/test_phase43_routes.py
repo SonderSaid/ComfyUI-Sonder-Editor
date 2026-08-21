@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
 import server.routes as routes
-from server import prompt_context
+from server import minimax_h3, prompt_context
 from server.timeline_state import (
     Asset,
     AudioTrack,
@@ -1014,7 +1014,13 @@ def test_scene_put_preserves_omitted_reference_lane_id_and_setup_binding(tmp_pat
         "stable"]
 
 
-def test_scene_put_count_only_shrink_prunes_removed_h3_setup_lane(tmp_path, monkeypatch):
+def test_scene_put_count_only_shrink_drops_removed_h3_population_lane(tmp_path, monkeypatch):
+    """Shrinking the lane count removes the lane, and its population with it.
+
+    There is no setup binding to prune: membership is derived from each
+    recipe's declared model input, so the removed lane simply stops being a
+    candidate.
+    """
     route_module = _load_route_module(monkeypatch)
     project_dir = tmp_path / "project"
     project_dir.mkdir()
@@ -1030,12 +1036,6 @@ def test_scene_put_count_only_shrink_prunes_removed_h3_setup_lane(tmp_path, monk
         reference_lane_count=2,
         reference_lane_configs=[LaneConfig(), LaneConfig()],
         reference_lane_recipes=recipes,
-        minimax_h3_conditioning_setups=[{
-            "schema": "minimax_h3_setup_v1", "setup_id": "setup",
-            "name": "Setup", "mode": "reference", "task_mode": "T2VA",
-            "picture_lane_ids": ["keep", "remove"],
-            "video_lane_ids": [], "audio_lane_ids": [],
-        }], active_minimax_h3_setup_id="setup",
     )
     project = TimelineProject(project_dir=str(project_dir), name="Project", scenes=[scene])
     monkeypatch.setattr(route_module, "_load_project_from_request", lambda request: project)
@@ -1052,8 +1052,8 @@ def test_scene_put_count_only_shrink_prunes_removed_h3_setup_lane(tmp_path, monk
     assert response.status == 200
     assert [value["lane_id"] for value in payload["reference_lane_recipes"]] == [
         "keep"]
-    assert payload["minimax_h3_conditioning_setups"][0]["picture_lane_ids"] == [
-        "keep"]
+    assert minimax_h3.population_lane_ids(
+        payload["reference_lane_recipes"], "pictures") == ["keep"]
 
 
 def test_scene_restore_rejects_duplicate_driver_clip_snapshot(tmp_path, monkeypatch):

@@ -494,6 +494,12 @@ def test_h3_base_setup_requires_declared_guides():
 
 
 def test_h3_setup_overflow_is_preserved_until_validation():
+    """Normalization still preserves an over-cap declaration rather than trimming.
+
+    Nothing reads these ids any more — Reference lane membership is derived
+    from each recipe's declared model input — but a stored record is preserved
+    as authored rather than rewritten at rest.
+    """
     setup = minimax_h3.normalize_setup({
         "mode": "reference",
         "picture_lane_ids": [f"lane-{index}" for index in range(10)],
@@ -502,8 +508,8 @@ def test_h3_setup_overflow_is_preserved_until_validation():
     result = minimax_h3.resolve_setup(
         setup=setup, reference_items=[], lane_recipes=[], lane_count=10,
         scene_duration=100, window_start=0, window_end=100)
-    assert any(value["code"] == "missing_setup_lane"
-               for value in result["errors"])
+    assert result["errors"] == []
+    assert result["setup_manifest"]["pictures"] == []
 
 
 def test_h3_reference_presentation_order_and_independent_audio_ordinals():
@@ -719,7 +725,9 @@ def test_prompt_editor_sources_preserve_writing_state_and_prune_deleted_chips():
     assert "physicalOptions" in editor
     assert "candidate?.setup_manifest" in identity_panel
     assert "Staging remains in Reference lanes" in identity_panel
-    assert 'type: "ensure_minimax_h3_reference_population"' not in panel
+    assert "ensure_minimax_h3_reference_population" not in panel
+    # Reference mode reads no setup record, so nothing offers to author one.
+    assert "minimax_h3_conditioning_setups" not in editor
     assert "pre_context_frames: this._contextFrameValue" in widget
     assert "frame_constraint: this._getActiveFrameConstraint()" in widget
 

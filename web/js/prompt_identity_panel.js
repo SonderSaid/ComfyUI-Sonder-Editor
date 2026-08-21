@@ -1252,7 +1252,6 @@ export function mountPromptIdentityPanel(container, options = {}) {
             rowEl.dataset.physicalMemberId = row.memberId;
             rowEl.title = [
                 `Resolved: ${row.resolvedLabel}`,
-                `Setup: ${candidate?.setup_manifest?.setup?.name || candidate?.setup_manifest?.setup?.setup_id || "active"}`,
                 `Window: ${candidate?.window_start ?? 0}-${candidate?.window_end ?? "scene"}`,
                 `Role: ${row.role || "none"}`,
                 `Status: ${row.diagnostics.map((value) => value.code).join(", ") || "ready"}`,

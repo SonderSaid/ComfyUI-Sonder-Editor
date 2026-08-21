@@ -18,18 +18,18 @@ MAX_PICTURES = 9
 MAX_VIDEOS = 3
 MAX_STANDALONE_AUDIO = 3
 
-SETUP_LANE_POPULATIONS = {
-    "picture_lane_ids": "pictures",
-    "video_lane_ids": "videos",
-    "audio_lane_ids": "standalone_audios",
-}
+PICTURES_POPULATION = "pictures"
+VIDEOS_POPULATION = "videos"
+STANDALONE_AUDIOS_POPULATION = "standalone_audios"
 
-# MiniMax H3 Base needs no authored setup, so compilation synthesizes one.  That
+# Neither H3 mode needs an authored setup, so compilation synthesizes one.  That
 # synthetic setup must be byte-identical on every compile: a fresh UUID would
 # change `setup_manifest`, and therefore the compiled content hash, on each
 # preview, and would disagree with the id the live Bridge selector resolves.
 IMPLICIT_BASE_SETUP_ID = "implicit_minimax_h3_base"
 IMPLICIT_BASE_SETUP_NAME = "MiniMax H3 Base"
+IMPLICIT_REFERENCE_SETUP_ID = "implicit_minimax_h3_reference"
+IMPLICIT_REFERENCE_SETUP_NAME = "MiniMax H3 Full Reference"
 
 
 def normalize_setup(raw) -> dict:
@@ -63,7 +63,11 @@ def normalize_setup(raw) -> dict:
     }
 
 
-def _lane_population(recipe_wrapper) -> str:
+def lane_population(recipe_wrapper) -> str:
+    """The physical population one lane recipe serves, or "" for a generic lane.
+
+    Mirrored in `web/js/reference_lane_identity.js` as `lanePopulation`.
+    """
     wrapper = as_plain_record(recipe_wrapper)
     recipe = (as_plain_record(wrapper.get("recipe"))
               if wrapper.get("recipe") is not None else wrapper)
@@ -79,102 +83,25 @@ def _lane_population(recipe_wrapper) -> str:
     }.get(recipe_id, "")
 
 
-def repoint_setup_lane_ids(setups, replacements) -> list[dict]:
-    """Re-point or prune setup lane ids in the same scene mutation.
+def population_lane_ids(lane_recipes, population) -> list[str]:
+    """Durable lane ids serving one physical population, in lane order.
 
-    ``replacements`` maps an old durable lane id to its replacement.  A blank
-    replacement removes the binding.  Unrelated setup data is preserved so
-    this helper can safely run before the setup is otherwise normalized.
+    Membership is the lane recipe's own declared model input.  There is no
+    setup registration: a lane that declares a population participates, a lane
+    that declares none is a generic Reference lane serving the graph through
+    the Selector/Bridge.  Lane order is what numbers the population's ordinals.
     """
-    replacements = {
-        str(old or ""): str(new or "")
-        for old, new in dict(replacements or {}).items()
-        if str(old or "")
-    }
-    if not replacements:
-        return [copy.deepcopy(value) for value in setups or []
-                if isinstance(value, dict)]
+    population = str(population or "")
+    if not population:
+        return []
     result = []
-    for raw_setup in setups or []:
-        if not isinstance(raw_setup, dict):
-            continue
-        setup = copy.deepcopy(raw_setup)
-        for key in SETUP_LANE_POPULATIONS:
-            values = []
-            for raw_lane_id in setup.get(key) or []:
-                lane_id = str(raw_lane_id or "")
-                lane_id = replacements.get(lane_id, lane_id)
-                if lane_id and lane_id not in values:
-                    values.append(lane_id)
-            setup[key] = values
-        result.append(setup)
-    return result
-
-
-def repair_setup_lane_bindings(setups, lane_recipes) -> tuple[list[dict], list[dict]]:
-    """Repair stale setup bindings from ordered lane population evidence.
-
-    A missing id is rebound only when the remaining lanes of that population
-    make the mapping unambiguous.  Otherwise the dead binding is dropped so a
-    stale project remains usable and the repair is reported to the load log.
-    """
-    candidates = {population: [] for population in SETUP_LANE_POPULATIONS.values()}
-    all_lane_ids = set()
-    for lane_index, raw_recipe in enumerate(lane_recipes or []):
+    for raw_recipe in lane_recipes or []:
         recipe = as_plain_record(raw_recipe)
         lane_id = str(recipe.get("lane_id") or "")
-        population = _lane_population(recipe)
-        if lane_id:
-            all_lane_ids.add(lane_id)
-        if lane_id and population in candidates:
-            candidates[population].append((lane_index, lane_id))
-
-    repaired = []
-    warnings = []
-    for raw_setup in setups or []:
-        if not isinstance(raw_setup, dict):
-            continue
-        setup = copy.deepcopy(raw_setup)
-        setup_id = str(setup.get("setup_id") or "")
-        if str(setup.get("mode") or "") != "reference":
-            repaired.append(setup)
-            continue
-        for key, population in SETUP_LANE_POPULATIONS.items():
-            source_ids = [str(value or "") for value in setup.get(key) or []
-                          if str(value or "")]
-            population_rows = candidates[population]
-            valid_ids = {lane_id for _index, lane_id in population_rows}
-            used = {lane_id for lane_id in source_ids if lane_id in valid_ids}
-            # An id that still exists on a different population is not a
-            # missing lane. Preserve it so resolve_setup reports the authored
-            # population mismatch instead of silently guessing another lane.
-            missing_positions = [index for index, lane_id in enumerate(source_ids)
-                                 if lane_id not in all_lane_ids]
-            available = [lane_id for _index, lane_id in population_rows
-                         if lane_id not in used]
-            replacements = {}
-            if missing_positions and len(missing_positions) == len(available):
-                replacements = dict(zip(missing_positions, available))
-
-            next_ids = []
-            for index, lane_id in enumerate(source_ids):
-                if lane_id in all_lane_ids:
-                    resolved = lane_id
-                else:
-                    resolved = replacements.get(index, "")
-                    warnings.append({
-                        "code": ("rebound_setup_lane" if resolved
-                                 else "dropped_setup_lane"),
-                        "setup_id": setup_id,
-                        "population": population,
-                        "old_lane_id": lane_id,
-                        "lane_id": resolved,
-                    })
-                if resolved and resolved not in next_ids:
-                    next_ids.append(resolved)
-            setup[key] = next_ids
-        repaired.append(setup)
-    return repaired, warnings
+        if (lane_id and lane_id not in result
+                and lane_population(recipe) == population):
+            result.append(lane_id)
+    return result
 
 
 def setup_validation_errors(setup) -> list[dict]:
@@ -202,16 +129,24 @@ def implicit_base_setup(task_mode="T2VA") -> dict:
     })
 
 
-def default_reference_setup(picture_lane_ids=(), video_lane_ids=(), audio_lane_ids=()) -> dict:
+def implicit_reference_setup() -> dict:
+    """The deterministic Full Reference setup.  There is no authored variant.
+
+    Reference mode reads nothing from a stored setup record: `task_mode` is
+    Base-only, the guide ids are never resolved, and lane membership now comes
+    from each lane recipe's declared model input.  Any `minimax_h3_conditioning
+    _setups` entry a project still carries is left untouched at rest and simply
+    never consulted here.
+    """
     return normalize_setup({
-        "name": "MiniMax H3 Reference Setup", "mode": "reference",
-        "picture_lane_ids": list(picture_lane_ids),
-        "video_lane_ids": list(video_lane_ids),
-        "audio_lane_ids": list(audio_lane_ids),
+        "setup_id": IMPLICIT_REFERENCE_SETUP_ID,
+        "name": IMPLICIT_REFERENCE_SETUP_NAME,
+        "mode": "reference",
     })
 
 
 def active_setup(scene_or_dict) -> dict | None:
+    """The scene's authored setup.  Base-only: Reference mode never calls this."""
     if isinstance(scene_or_dict, dict):
         setups = scene_or_dict.get("minimax_h3_conditioning_setups") or []
         active_id = str(scene_or_dict.get("active_minimax_h3_setup_id") or "")
@@ -408,32 +343,30 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
     _entities, member_lookup = _entity_lookup(references)
     assets_by_id = _asset_lookup(assets)
 
-    def collect(lane_ids, declaration):
+    def collect(declaration):
         population = str((declaration or {}).get("key") or "")
         cap = int((declaration or {}).get("cap") or 0)
         expected_types = set((declaration or {}).get("media_kinds") or [])
         rows = []
-        for lane_id in lane_ids:
-            lane_value = recipe_lookup.get(lane_id)
-            if lane_value is None:
-                errors.append({"code": "missing_setup_lane", "lane_id": lane_id,
-                               "message": "A conditioning setup lane no longer exists."})
-                continue
-            lane_index, recipe_wrapper = lane_value
+        # Lane ids come from the recipes themselves, so a missing lane and a
+        # population that disagrees with its own declaration are both
+        # unreachable here.  `lane_population` is the one derivation: reading
+        # `soft["physical_population"]` directly would diverge from it for a
+        # lane whose recipe body is bare and only carries `recipe_id`.
+        for lane_id in population_lane_ids(lane_recipes, population):
+            lane_index, recipe_wrapper = recipe_lookup[lane_id]
             recipe = (as_plain_record(recipe_wrapper.get("recipe"))
                       if recipe_wrapper.get("recipe") is not None
                       else recipe_wrapper)
             soft = as_plain_record(recipe.get("soft"))
             compatible_profiles = [str(entry) for entry in
                                    soft.get("compatible_profiles", [])]
-            physical_population = str(soft.get("physical_population") or "none")
+            # Reachable on a lane the user never opted into a setup, because a
+            # custom recipe may declare a population under a format that does
+            # not want it.  Refuse loudly rather than feed foreign slots.
             if compatible_profiles and active_profile_key not in compatible_profiles:
                 errors.append({"code": "setup_lane_profile_incompatible", "lane_id": lane_id,
                                "message": "A conditioning lane recipe is not compatible with MiniMax H3 Full Reference."})
-                continue
-            if physical_population != population:
-                errors.append({"code": "setup_lane_population_mismatch", "lane_id": lane_id,
-                               "message": f"This setup slot requires a {population} recipe declaration."})
                 continue
             winner = winners[lane_index] if lane_index < len(winners) else None
             lane_rows = _member_slots(winner, lane_id, population,
@@ -501,12 +434,12 @@ def resolve_setup(*, setup, guide_frames=None, reference_items=None,
                                  "message": f"This source is longer than the recipe's {maximum:g}s recommendation."})
         return rows
 
-    pictures_decl = populations_by_key.get(SETUP_LANE_POPULATIONS["picture_lane_ids"])
-    videos_decl = populations_by_key.get(SETUP_LANE_POPULATIONS["video_lane_ids"])
-    audio_decl = populations_by_key.get(SETUP_LANE_POPULATIONS["audio_lane_ids"])
-    pictures = collect(value["picture_lane_ids"], pictures_decl) if pictures_decl else []
-    videos = collect(value["video_lane_ids"], videos_decl) if videos_decl else []
-    standalone = collect(value["audio_lane_ids"], audio_decl) if audio_decl else []
+    pictures_decl = populations_by_key.get(PICTURES_POPULATION)
+    videos_decl = populations_by_key.get(VIDEOS_POPULATION)
+    audio_decl = populations_by_key.get(STANDALONE_AUDIOS_POPULATION)
+    pictures = collect(pictures_decl) if pictures_decl else []
+    videos = collect(videos_decl) if videos_decl else []
+    standalone = collect(audio_decl) if audio_decl else []
     manifest["pictures"] = pictures
     manifest["videos"] = videos
     manifest["standalone_audios"] = standalone

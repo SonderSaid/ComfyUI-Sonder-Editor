@@ -490,12 +490,23 @@ console.log(JSON.stringify({{
     }]
 
 
-def test_prompt_panel_keeps_h3_staging_outside_prompting_and_refuses_stale_retry():
+def test_h3_reference_populations_need_no_registration_step():
+    """Staging a Reference lane is the whole opt-in.
+
+    The Prompt panel once carried Picture/Video/Audio buttons that registered a
+    lane into a conditioning setup. They were deleted, which left Full
+    Reference uncompilable in any scene that had not inherited a setup record.
+    Membership is now derived from each lane recipe's declared model input, so
+    there is no registration call to re-add on either side.
+    """
     source = (ROOT / "web" / "js" / "editor_prompt_panel.js").read_text(encoding="utf-8")
+    routes = (ROOT / "server" / "routes.py").read_text(encoding="utf-8")
     assert "retryOnConflict: false" in source
     assert "const populationButtons = []" not in source
-    assert 'type: "ensure_minimax_h3_reference_population"' not in source
     assert "planH3ReferencePopulation" not in source
+    assert "ensure_minimax_h3_reference_population" not in source
+    assert "ensure_minimax_h3_reference_population" not in routes
+    assert "picture_lane_ids" not in routes
 
 
 # One fixture set, computed in Python and in node, compared. Not a golden file:

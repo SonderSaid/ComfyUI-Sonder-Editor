@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -291,25 +292,154 @@ def _h3_lane_recipe(lane_id, population="pictures"):
     )
 
 
-def _h3_reference_setup(**lane_ids):
-    return minimax_h3.normalize_setup({
-        "setup_id": "setup",
-        "mode": "reference",
-        "task_mode": "T2VA",
-        **lane_ids,
-    })
+def _h3_scene(recipes, items=(), configs=None, duration=24):
+    return Scene(
+        scene_id="scene", duration_frames=duration,
+        reference_lane_count=len(recipes),
+        reference_lane_configs=list(configs or [LaneConfig() for _ in recipes]),
+        reference_lane_recipes=list(recipes),
+        reference_items=list(items),
+    )
 
 
-def test_reference_lane_config_save_preserves_lane_id_and_setup_resolution():
+def _h3_resolve(scene, references=(), assets=()):
+    """Resolve exactly as live compilation does: no authored setup at all."""
+    return minimax_h3.resolve_setup(
+        setup=minimax_h3.implicit_reference_setup(),
+        reference_items=scene.reference_items,
+        lane_recipes=scene.reference_lane_recipes,
+        lane_configs=scene.reference_lane_configs,
+        lane_count=scene.reference_lane_count,
+        scene_duration=scene.duration_frames,
+        window_start=0, window_end=scene.duration_frames,
+        references=list(references), assets=list(assets),
+    )
+
+
+def _h3_picture(entity_id, member_id, prompt="a portrait"):
+    return (
+        ReferenceEntity(reference_id=entity_id, name=entity_id, members=[
+            ReferenceMember(member_id=member_id, asset_id=f"asset-{member_id}",
+                            prompt=prompt)]),
+        Asset(asset_id=f"asset-{member_id}", asset_type="image"),
+    )
+
+
+def _picture_item(item_id, lane_index, entity_id, member_id):
+    return ReferenceItem(
+        reference_item_id=item_id, lane_index=lane_index,
+        start_frame=0, end_frame=-1,
+        members=[{"entity_id": entity_id, "member_id": member_id}])
+
+
+def test_h3_population_membership_is_derived_without_any_setup_record():
+    """The reported defect: a staged H3 lane compiled to nothing in a new scene.
+
+    A scene that never inherited a `minimax_h3_conditioning_setups` record used
+    to fail with `missing_reference_setup` and an empty manifest, however
+    correctly its lane was staged.
+    """
+    entity, asset = _h3_picture("woman", "portrait")
+    scene = _h3_scene([_h3_lane_recipe("pictures")],
+                      [_picture_item("item", 0, "woman", "portrait")])
+    assert scene.minimax_h3_conditioning_setups == []
+
+    resolved = _h3_resolve(scene, [entity], [asset])
+
+    assert resolved["errors"] == []
+    assert [row["member_id"] for row in resolved["setup_manifest"]["pictures"]] == [
+        "portrait"]
+    assert resolved["setup_manifest"]["pictures"][0]["picture_ordinal"] == 1
+
+
+def test_h3_ordinals_follow_lane_order_across_two_populated_lanes():
+    first_entity, first_asset = _h3_picture("woman", "portrait")
+    second_entity, second_asset = _h3_picture("man", "headshot")
+    recipes = [_h3_lane_recipe("lane-a"), _h3_lane_recipe("lane-b")]
+    items = [_picture_item("b", 1, "man", "headshot"),
+             _picture_item("a", 0, "woman", "portrait")]
+
+    resolved = _h3_resolve(_h3_scene(recipes, items),
+                           [first_entity, second_entity],
+                           [first_asset, second_asset])
+
+    # Authored item order is irrelevant; lane order numbers the population.
+    assert [(row["member_id"], row["picture_ordinal"])
+            for row in resolved["setup_manifest"]["pictures"]] == [
+        ("portrait", 1), ("headshot", 2)]
+
+
+def test_h3_hidden_lane_and_muted_item_leave_the_manifest():
+    """Exclusion stays where it already lived, not in a registration list."""
+    entity, asset = _h3_picture("woman", "portrait")
+    other, other_asset = _h3_picture("man", "headshot")
+    recipes = [_h3_lane_recipe("lane-a"), _h3_lane_recipe("lane-b")]
+    muted = _picture_item("muted", 1, "man", "headshot")
+    muted.muted = True
+    items = [_picture_item("hidden", 0, "woman", "portrait"), muted]
+
+    # Both lanes declare `pictures`, so the same scene contributes two slots
+    # once nothing is hidden or muted. Asserting only emptiness below would
+    # pass just as well if derivation had stopped finding lanes at all.
+    visible = _h3_resolve(_h3_scene(recipes, [
+        _picture_item("hidden", 0, "woman", "portrait"),
+        _picture_item("muted", 1, "man", "headshot"),
+    ]), [entity, other], [asset, other_asset])
+    assert len(visible["setup_manifest"]["pictures"]) == 2
+
+    scene = _h3_scene(recipes, items,
+                      configs=[LaneConfig(hidden=True), LaneConfig()])
+    resolved = _h3_resolve(scene, [entity, other], [asset, other_asset])
+
+    assert resolved["setup_manifest"]["pictures"] == []
+
+
+def test_h3_lane_declaring_a_population_under_a_foreign_format_is_refused():
+    """A custom recipe may declare a population the active format rejects."""
+    foreign = ReferenceLaneRecipe(
+        lane_id="foreign", media_kind="image",
+        recipe={"soft": {"compatible_profiles": ["custom@1"],
+                         "physical_population": "pictures"}})
+    entity, asset = _h3_picture("woman", "portrait")
+    scene = _h3_scene([foreign], [_picture_item("item", 0, "woman", "portrait")])
+
+    resolved = _h3_resolve(scene, [entity], [asset])
+
+    assert [error["code"] for error in resolved["errors"]] == [
+        "setup_lane_profile_incompatible"]
+    assert resolved["setup_manifest"]["pictures"] == []
+
+
+def test_h3_picture_cap_is_reported_across_lanes_not_silently_truncated():
+    """Newly reachable: no registration limited a population to one lane."""
+    references, assets, items, recipes = [], [], [], []
+    for lane_index in range(2):
+        recipes.append(_h3_lane_recipe(f"lane-{lane_index}"))
+        for slot in range(5):
+            member_id = f"m{lane_index}{slot}"
+            entity, asset = _h3_picture(f"e{lane_index}{slot}", member_id)
+            references.append(entity)
+            assets.append(asset)
+        items.append(ReferenceItem(
+            reference_item_id=f"item-{lane_index}", lane_index=lane_index,
+            start_frame=0, end_frame=-1,
+            members=[{"entity_id": f"e{lane_index}{slot}",
+                      "member_id": f"m{lane_index}{slot}"} for slot in range(5)]))
+
+    resolved = _h3_resolve(_h3_scene(recipes, items), references, assets)
+
+    assert any(error["code"] == "pictures_slot_cap" for error in resolved["errors"])
+    assert len(resolved["setup_manifest"]["pictures"]) == 9
+
+
+def test_reference_lane_config_save_preserves_lane_id_and_population():
+    """`lane_id` is the sole key `_recipe_lookup` uses, so a save must keep it."""
     lane = _h3_lane_recipe("pictures")
     scene = Scene(
         scene_id="scene", duration_frames=24,
         reference_lane_count=1,
         reference_lane_configs=[LaneConfig()],
         reference_lane_recipes=[lane],
-        minimax_h3_conditioning_setups=[_h3_reference_setup(
-            picture_lane_ids=["pictures"])],
-        active_minimax_h3_setup_id="setup",
     )
 
     incoming = lane.to_dict()
@@ -321,118 +451,8 @@ def test_reference_lane_config_save_preserves_lane_id_and_setup_resolution():
     })
 
     assert scene.reference_lane_recipes[0].lane_id == "pictures"
-    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == ["pictures"]
-    resolved = minimax_h3.resolve_setup(
-        setup=scene.minimax_h3_conditioning_setups[0],
-        reference_items=scene.reference_items,
-        lane_recipes=scene.reference_lane_recipes,
-        lane_configs=scene.reference_lane_configs,
-        lane_count=scene.reference_lane_count,
-        scene_duration=scene.duration_frames,
-        window_start=0, window_end=scene.duration_frames,
-    )
-    assert not any(error["code"] == "missing_setup_lane"
-                   for error in resolved["errors"])
-
-
-def test_reference_lane_id_change_and_removal_reconcile_setup_in_same_mutation():
-    scene = Scene(
-        scene_id="scene", duration_frames=24,
-        reference_lane_count=2,
-        reference_lane_configs=[LaneConfig(), LaneConfig()],
-        reference_lane_recipes=[
-            _h3_lane_recipe("pictures-a"),
-            _h3_lane_recipe("pictures-b"),
-        ],
-        minimax_h3_conditioning_setups=[_h3_reference_setup(
-            picture_lane_ids=["pictures-a", "pictures-b"])],
-        active_minimax_h3_setup_id="setup",
-    )
-
-    routes._apply_lane_config(scene, {
-        "lane_type": "reference", "lane_index": 0,
-        "fields": {"reference_recipe": _h3_lane_recipe("pictures-new").to_dict()},
-    })
-    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
-        "pictures-new", "pictures-b"]
-
-    routes._set_scene_lane_count(scene, "reference", 1)
-    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
-        "pictures-new"]
-
-
-def test_reference_lane_removal_prunes_setup_binding_without_retargeting_shifted_lane():
-    scene = Scene(
-        scene_id="scene", duration_frames=24,
-        reference_lane_count=3,
-        reference_lane_configs=[LaneConfig(), LaneConfig(), LaneConfig()],
-        reference_lane_recipes=[
-            _h3_lane_recipe("pictures-a"),
-            _h3_lane_recipe("pictures-b"),
-            _h3_lane_recipe("pictures-c"),
-        ],
-        minimax_h3_conditioning_setups=[_h3_reference_setup(
-            picture_lane_ids=["pictures-a", "pictures-b", "pictures-c"])],
-        active_minimax_h3_setup_id="setup",
-    )
-
-    routes._remove_media_lane(scene, "reference", 1, "require_empty")
-    assert [recipe.lane_id for recipe in scene.reference_lane_recipes] == [
-        "pictures-a", "pictures-c"]
-    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
-        "pictures-a", "pictures-c"]
-
-
-def test_scene_load_repairs_unambiguous_stale_setup_lane_and_drops_ambiguous_one():
-    raw_recipe = _h3_lane_recipe("discarded").to_dict()
-    raw_recipe.pop("lane_id")
-    base = {
-        "scene_id": "scene", "duration_frames": 24,
-        "reference_lane_count": 1,
-        "reference_lane_configs": [{}],
-        "reference_lane_recipes": [raw_recipe],
-        "minimax_h3_conditioning_setups": [_h3_reference_setup(
-            picture_lane_ids=["dead-lane"])],
-        "active_minimax_h3_setup_id": "setup",
-    }
-    repaired = Scene.from_dict(base)
-    minted_lane_id = repaired.reference_lane_recipes[0].lane_id
-    assert minted_lane_id and minted_lane_id != "dead-lane"
-    assert repaired.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
-        minted_lane_id]
-
-    ambiguous = dict(base)
-    ambiguous["reference_lane_count"] = 2
-    ambiguous["reference_lane_configs"] = [{}, {}]
-    ambiguous["reference_lane_recipes"] = [dict(raw_recipe), dict(raw_recipe)]
-    loaded = Scene.from_dict(ambiguous)
-    assert loaded.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == []
-
-
-def test_scene_load_does_not_retarget_lane_that_still_exists_on_wrong_population():
-    scene = Scene.from_dict({
-        "scene_id": "scene", "duration_frames": 24,
-        "reference_lane_count": 2,
-        "reference_lane_configs": [{}, {}],
-        "reference_lane_recipes": [
-            _h3_lane_recipe("lane-p", "videos").to_dict(),
-            _h3_lane_recipe("lane-q", "pictures").to_dict(),
-        ],
-        "minimax_h3_conditioning_setups": [_h3_reference_setup(
-            picture_lane_ids=["lane-p"])],
-        "active_minimax_h3_setup_id": "setup",
-    })
-    assert scene.minimax_h3_conditioning_setups[0]["picture_lane_ids"] == [
-        "lane-p"]
-    resolved = minimax_h3.resolve_setup(
-        setup=scene.minimax_h3_conditioning_setups[0],
-        reference_items=[], lane_recipes=scene.reference_lane_recipes,
-        lane_configs=scene.reference_lane_configs,
-        lane_count=scene.reference_lane_count,
-        scene_duration=scene.duration_frames, window_start=0, window_end=24,
-    )
-    assert any(error["code"] == "setup_lane_population_mismatch"
-               for error in resolved["errors"])
+    assert minimax_h3.population_lane_ids(
+        scene.reference_lane_recipes, "pictures") == ["pictures"]
 
 
 def test_frontend_default_reference_recipe_mints_lane_identity():
@@ -922,12 +942,11 @@ def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monke
                           start_frame=60, end_frame=90,
                           members=[{"entity_id": "late", "member_id": "late-member"}]),
         ],
-        minimax_h3_conditioning_setups=[{
-            "setup_id": "setup", "mode": "reference",
-            "video_lane_ids": ["video-lane"],
-        }],
-        active_minimax_h3_setup_id="setup",
     )
+    # No setup record anywhere: the lane's declared model input is what makes
+    # these `Video N` slots, so the Bridge panel labels a brand-new scene the
+    # same as one that inherited a conditioning setup.
+    assert scene.minimax_h3_conditioning_setups == []
     project = TimelineProject(
         project_id="project-1", assets=assets, references=references,
         scenes=[scene])
@@ -983,3 +1002,103 @@ def test_bridge_references_uses_effective_window_and_h3_video_image_labels(monke
     assert (frozen["window_start"], frozen["window_end"]) == (0, 20)
     assert frozen["references"][0]["slot_labels"] == [
         "Video 1 · Early (subject)"]
+
+
+# `lane_population` is the single authority for which lanes serve a MiniMax H3
+# population, and the browser needs the same answer to decide what a chip may
+# attach to. The two halves are separate implementations, so this compares them
+# on the cases that actually differ: a bare recipe body carrying only
+# `recipe_id`, a declared population, and a generic lane.
+_LANE_POPULATION_CASES = [
+    {"lane_id": "declared", "recipe": {"soft": {"physical_population": "pictures"}}},
+    {"lane_id": "bare-picture", "recipe_id": "sonder:minimax_h3_picture"},
+    {"lane_id": "bare-video", "recipe_id": "sonder:minimax_h3_video"},
+    {"lane_id": "bare-audio", "recipe_id": "sonder:minimax_h3_audio"},
+    {"lane_id": "nested-id", "recipe": {"id": "sonder:minimax_h3_picture"}},
+    {"lane_id": "declared-wins", "recipe_id": "sonder:minimax_h3_video",
+     "recipe": {"soft": {"physical_population": "pictures"}}},
+    {"lane_id": "generic", "recipe": {"hard": {"assembly": "slots"}}},
+    {"lane_id": "wan", "recipe_id": "sonder:wan_vace", "recipe": {"soft": {}}},
+    {"lane_id": "empty"},
+]
+
+
+def test_lane_population_matches_between_python_and_the_browser():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for lane population parity")
+    expected = [minimax_h3.lane_population(case) for case in _LANE_POPULATION_CASES]
+    assert expected == ["pictures", "pictures", "videos", "standalone_audios",
+                        "pictures", "pictures", "", "", ""]
+    module_url = (ROOT / "web" / "js" / "reference_lane_identity.js").as_uri()
+    script = f"""
+const mod = await import({json.dumps(module_url)});
+const cases = {json.dumps(_LANE_POPULATION_CASES)};
+console.log(JSON.stringify(cases.map((value) => mod.lanePopulation(value))));
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True)
+    assert json.loads(result.stdout) == expected
+
+
+def test_physical_chip_values_keep_the_singular_token_the_parsers_expect():
+    """`lanePopulation` answers in plural; the chip value is parsed singular.
+
+    Three regexes in `prompt_context_chips.js` read
+    `physical:(picture|video|audio):<member_id>`. Feeding the manifest's plural
+    key straight into that value would leave every physical chip unbindable and
+    orphan stored selections, and a parity test on `lanePopulation` alone would
+    not notice.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for physical chip value coverage")
+    module_url = (ROOT / "web" / "js" / "prompt_context_chips.js").as_uri()
+    scene = {
+        "duration_frames": 20, "reference_lane_count": 3,
+        "reference_lane_configs": [{}, {}, {}],
+        "reference_lane_recipes": [
+            {"lane_id": "pic", "recipe": {"soft": {
+                "physical_population": "pictures",
+                "compatible_profiles": ["minimax_h3_ref@1"]}}},
+            {"lane_id": "vid", "recipe": {"soft": {
+                "physical_population": "videos",
+                "compatible_profiles": ["minimax_h3_ref@1"]}}},
+            {"lane_id": "aud", "recipe": {"soft": {
+                "physical_population": "standalone_audios",
+                "compatible_profiles": ["minimax_h3_ref@1"]}}},
+        ],
+        "reference_items": [
+            {"reference_item_id": "i0", "lane_index": 0, "start_frame": 0,
+             "end_frame": -1, "members": [{"entity_id": "e", "member_id": "m0"}]},
+            {"reference_item_id": "i1", "lane_index": 1, "start_frame": 0,
+             "end_frame": -1, "members": [{"entity_id": "e", "member_id": "m1"}]},
+            {"reference_item_id": "i2", "lane_index": 2, "start_frame": 0,
+             "end_frame": -1, "members": [{"entity_id": "e", "member_id": "m2"}]},
+        ],
+    }
+    script = f"""
+const mod = await import({json.dumps(module_url)});
+const result = mod.promptReferenceSourceOptions({{
+    scene: {json.dumps(scene)},
+    references: [{{reference_id: "e", name: "Entity"}}],
+    semanticUnits: [],
+    profileId: "minimax_h3_ref@1",
+    scope: "global",
+    resolvedProfile: {{physical_populations: [{{key: "pictures"}}]}},
+}});
+console.log(JSON.stringify({{
+    values: result.physicalOptions.map((row) => row[0]),
+    eligible: result.physicalOptions.map((row) => row[2]),
+}}));
+"""
+    result = json.loads(subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, encoding="utf-8", check=True).stdout)
+    assert result["values"] == [
+        "physical:picture:m0", "physical:video:m1", "physical:audio:m2"]
+    assert all(re.match(r"^physical:(picture|video|audio):(.+)$", value)
+               for value in result["values"])
+    # No setup record anywhere in the scene, yet every staged member attaches.
+    assert result["eligible"] == [True, True, True]

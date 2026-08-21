@@ -7,7 +7,7 @@ from datetime import datetime
 import os
 from typing import Any
 
-from . import minimax_h3, prompt_context, prompt_live_context, prompt_payload
+from . import prompt_context, prompt_live_context, prompt_payload
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs, pad_lane_recipes
 from .reference_resolution import REFERENCE_OUTPUT_NAMES
 
@@ -1771,22 +1771,9 @@ class Scene:
         ]
         pad_lane_configs(scene, LaneConfig)
         pad_lane_recipes(scene, ReferenceLaneRecipe)
-        (
-            scene.minimax_h3_conditioning_setups,
-            setup_repair_warnings,
-        ) = minimax_h3.repair_setup_lane_bindings(
-            scene.minimax_h3_conditioning_setups,
-            scene.reference_lane_recipes,
-        )
-        for warning in setup_repair_warnings:
-            logger.warning(
-                "MiniMax H3 setup lane repair: code=%s setup_id=%s population=%s old_lane_id=%s lane_id=%s",
-                warning.get("code", ""),
-                warning.get("setup_id", ""),
-                warning.get("population", ""),
-                warning.get("old_lane_id", ""),
-                warning.get("lane_id", ""),
-            )
+        # No setup-binding repair: Reference lane membership is derived from
+        # each recipe's declared model input, so there is nothing stale to
+        # rebind.  A Base setup record is loaded and preserved as authored.
         scene.guide_track_config = LaneConfig.from_dict(data.get("guide_track_config", {}))
         scene.prompt_track_config = LaneConfig.from_dict(data.get("prompt_track_config", {}))
         raw_global_config = data.get("global_prompt_track_config")

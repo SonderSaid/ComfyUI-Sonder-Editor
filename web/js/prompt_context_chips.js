@@ -3,6 +3,7 @@
 // provider ordinals, timestamps, or generated text into authored documents.
 
 import { REFERENCE_VERDICT_LABEL, resolveReferenceVerdicts } from "./reference_resolution.js";
+import { lanePopulation } from "./reference_lane_identity.js";
 import { EDITOR_COLORS as COLORS, chromeInputCss, setButtonDisabled,
     setButtonVariant } from "./editor_theme.js";
 import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
@@ -751,9 +752,6 @@ function referenceSelectionMemberIds(selected, { scene = null, semanticUnits = [
     const unit = (semanticUnits || []).find((row) =>
         String(row?.semantic_unit_id || "") === value);
     if (!unit) return [];
-    const setup = (scene?.minimax_h3_conditioning_setups || []).find((row) =>
-        String(row?.setup_id || "") === String(scene?.active_minimax_h3_setup_id || ""));
-    if (setup?.mode !== "reference") return [];
     const referenceItems = scene?.reference_items || [];
     const recipes = scene?.reference_lane_recipes || [];
     const consumerStart = Number(scene?._context_consumer_start);
@@ -772,14 +770,10 @@ function referenceSelectionMemberIds(selected, { scene = null, semanticUnits = [
     const sourceIds = new Set((unit.sources || []).map((row) =>
         String(row?.member_id || "")).filter(Boolean));
     const result = [];
-    for (const laneId of [
-        ...(setup.picture_lane_ids || []),
-        ...(setup.video_lane_ids || []),
-        ...(setup.audio_lane_ids || []),
-    ].map(String)) {
-        const laneIndex = recipes.findIndex((wrapper) =>
-            String(wrapper?.lane_id || "") === laneId);
-        if (laneIndex < 0) continue;
+    // Lane membership is the recipe's declared model input, in lane order —
+    // there is no setup registration to consult.
+    for (const [laneIndex, wrapper] of recipes.entries()) {
+        if (!lanePopulation(wrapper)) continue;
         referenceItems.forEach((item, itemIndex) => {
             if (Number(item?.lane_index || 0) !== laneIndex
                     || verdicts.get(itemIndex) !== "winner") return;
@@ -823,7 +817,7 @@ export function resolveReferenceSelectionInheritance(selected, {
 
 export function subjectSourceEligibility({ sources = [], referenceItems = [],
     laneRecipes = [], verdicts = new Map(), profileId = "generic@1",
-    setupPopulations = new Map(), requiresSetup = false, scope = {} } = {}) {
+    scope = {} } = {}) {
     const sourceIds = new Set((sources || []).map((source) =>
         String(source?.member_id || "")).filter(Boolean));
     if (!sourceIds.size) {
@@ -842,9 +836,6 @@ export function subjectSourceEligibility({ sources = [], referenceItems = [],
                 ? (verdicts.get(index) || "outside")
                 : (verdicts?.[index] || "outside"),
             profileCompatible: compatible.includes(profileId),
-            setupPopulation: setupPopulations instanceof Map
-                ? (setupPopulations.get(String(wrapper.lane_id || "")) || "")
-                : (setupPopulations?.[String(wrapper.lane_id || "")] || ""),
         });
     });
     if (!states.length) {
@@ -855,13 +846,7 @@ export function subjectSourceEligibility({ sources = [], referenceItems = [],
         return { eligible: false, appliesNow: false,
             reason: "incompatible prompt format", suffix: " - incompatible prompt format" };
     }
-    if (requiresSetup && !states.some((state) =>
-        state.profileCompatible && state.setupPopulation)) {
-        return { eligible: false, appliesNow: false,
-            reason: "not in active setup", suffix: " - not in active setup" };
-    }
-    const compatibleStates = states.filter((state) =>
-        state.profileCompatible && (!requiresSetup || !!state.setupPopulation));
+    const compatibleStates = states.filter((state) => state.profileCompatible);
     const appliesNow = compatibleStates.some((state) => state.verdict === "winner");
     const globalScope = Boolean(scope?.globalScope);
     const eligible = globalScope ? compatibleStates.length > 0 : appliesNow;
@@ -3633,22 +3618,10 @@ export function promptReferenceSourceOptions({ scene = null, references = [],
             `Lane ${Number(item.lane_index || 0) + 1}: ${names.join(" + ") || "Reference"}${stateLabel}${profileCompatible ? "" : " / incompatible prompt format"}`,
             eligibility];
     });
-    const activeSetup = (scene?.minimax_h3_conditioning_setups || []).find(
-        (value) => value?.setup_id === scene?.active_minimax_h3_setup_id);
-    const setupPopulations = new Map();
-    for (const [key, population] of [
-        ["picture_lane_ids", "picture"], ["video_lane_ids", "video"],
-        ["audio_lane_ids", "audio"],
-    ]) {
-        for (const laneId of activeSetup?.[key] || []) {
-            setupPopulations.set(String(laneId), population);
-        }
-    }
     const makeUnitOption = (value, sources) => {
         const eligibility = subjectSourceEligibility({
             sources, referenceItems, laneRecipes,
-            verdicts: verdictResult.verdicts, profileId, setupPopulations,
-            requiresSetup: usesDeclaredSources,
+            verdicts: verdictResult.verdicts, profileId,
             scope: { globalScope, hasSelection },
         });
         return [value.semantic_unit_id,
@@ -3669,21 +3642,19 @@ export function promptReferenceSourceOptions({ scene = null, references = [],
         const wrapper = laneRecipes[Number(item.lane_index || 0)] || {};
         const recipe = wrapper.recipe && typeof wrapper.recipe === "object"
             ? wrapper.recipe : wrapper;
-        const declaredPopulation = ({
+        // The lane's declared model input is the only membership authority.
+        // `lanePopulation` answers in the manifest's plural vocabulary; the chip
+        // value below is parsed by singular `physical:(picture|video|audio):`
+        // regexes, so the translation stays here.
+        const population = ({
             pictures: "picture", videos: "video", standalone_audios: "audio",
-        })[String(recipe?.soft?.physical_population || "")] || "";
-        const setupPopulation = setupPopulations.get(String(wrapper.lane_id || "")) || "";
-        const population = setupPopulation || declaredPopulation;
+        })[lanePopulation(wrapper)] || "";
         if (!population) return;
         const compatible = recipe?.soft?.compatible_profiles || ["generic@1"];
         const profileCompatible = compatible.includes(profileId);
-        const setupCompatible = !!setupPopulation
-            && (!declaredPopulation || setupPopulation === declaredPopulation);
-        const eligible = profileCompatible && setupCompatible
-            && (globalScope || verdict === "winner");
+        const eligible = profileCompatible && (globalScope || verdict === "winner");
         let stateSuffix = "";
         if (!profileCompatible) stateSuffix = " - incompatible prompt format";
-        else if (!setupCompatible) stateSuffix = " - not in active setup";
         else if (globalScope) {
             // The existing compact label already adds the applies-now badge.
             stateSuffix = "";

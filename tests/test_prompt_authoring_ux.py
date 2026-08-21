@@ -1301,12 +1301,8 @@ def test_reference_chip_identity_inheritance_and_vocal_target_window_are_dynamic
         "duration_frames": 20,
         "reference_lane_count": 1,
         "reference_lane_configs": [{}],
-        "reference_lane_recipes": [{"lane_id": "pictures"}],
-        "active_minimax_h3_setup_id": "setup",
-        "minimax_h3_conditioning_setups": [{
-            "setup_id": "setup", "mode": "reference",
-            "picture_lane_ids": ["pictures"],
-        }],
+        "reference_lane_recipes": [{"lane_id": "pictures", "recipe": {
+            "soft": {"physical_population": "pictures"}}}],
         "reference_items": [{"reference_item_id": "item", "members": [{
             "entity_id": "woman", "member_id": "portrait"}]}],
         "prompt_sections": [

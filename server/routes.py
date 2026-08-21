@@ -773,17 +773,9 @@ def _set_scene_lane_count(scene: Scene, lane_type: str, count: int) -> None:
         configs.pop()
     if descriptor.recipe_attr:
         recipes = getattr(scene, descriptor.recipe_attr)
-        removed_lane_ids = [
-            str(getattr(recipe, "lane_id", "") or "")
-            for recipe in recipes[count:]
-        ]
         while len(recipes) > count:
             recipes.pop()
         pad_lane_recipes(scene, ReferenceLaneRecipe)
-        scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
-            scene.minimax_h3_conditioning_setups,
-            {lane_id: "" for lane_id in removed_lane_ids if lane_id},
-        )
 
 
 def _lane_config(scene: Scene, lane_type: str, lane_index: int) -> LaneConfig:
@@ -1653,7 +1645,6 @@ def _replace_reference_lane_recipes(scene: Scene, raw_recipes) -> None:
     """Replace aligned recipes without losing or orphaning lane identity."""
     previous = list(scene.reference_lane_recipes)
     incoming = []
-    replacements = {}
     for index, raw_recipe in enumerate(
             raw_recipes if isinstance(raw_recipes, list) else []):
         raw_value = dict(raw_recipe) if isinstance(raw_recipe, dict) else {}
@@ -1661,19 +1652,8 @@ def _replace_reference_lane_recipes(scene: Scene, raw_recipes) -> None:
             if index < len(previous) else ""
         if not str(raw_value.get("lane_id") or "") and old_lane_id:
             raw_value["lane_id"] = old_lane_id
-        next_recipe = ReferenceLaneRecipe.from_dict(raw_value)
-        incoming.append(next_recipe)
-        if old_lane_id and old_lane_id != next_recipe.lane_id:
-            replacements[old_lane_id] = next_recipe.lane_id
-    for old_recipe in previous[len(incoming):]:
-        old_lane_id = str(getattr(old_recipe, "lane_id", "") or "")
-        if old_lane_id:
-            replacements[old_lane_id] = ""
+        incoming.append(ReferenceLaneRecipe.from_dict(raw_value))
     scene.reference_lane_recipes = incoming
-    scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
-        scene.minimax_h3_conditioning_setups,
-        replacements,
-    )
 
 
 def _apply_lane_config(scene: Scene, op: dict) -> dict:
@@ -1732,11 +1712,6 @@ def _apply_lane_config(scene: Scene, op: dict) -> dict:
                 "reference_media_kind_mismatch",
             )
         recipes[lane_index] = next_recipe
-        if previous_lane_id and previous_lane_id != next_recipe.lane_id:
-            scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
-                scene.minimax_h3_conditioning_setups,
-                {previous_lane_id: next_recipe.lane_id},
-            )
     return {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
 
 
@@ -1907,11 +1882,6 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
     _require_lane_unlocked(scene, lane_type, lane_index)
 
     lane_items = _media_lane_items(scene, lane_type, lane_index)
-    removed_lane_id = ""
-    if descriptor.recipe_attr:
-        recipes = getattr(scene, descriptor.recipe_attr)
-        if lane_index < len(recipes):
-            removed_lane_id = str(getattr(recipes[lane_index], "lane_id", "") or "")
 
     item_policy = str(item_policy or "require_empty")
     if lane_items and item_policy == "require_empty":
@@ -1961,11 +1931,6 @@ def _remove_media_lane(scene: Scene, lane_type: str, lane_index: int, item_polic
     next_count = current_count - 1
     setattr(scene, descriptor.count_attr, next_count)
     _trim_lane_configs(scene, descriptor, lane_index, next_count)
-    if removed_lane_id:
-        scene.minimax_h3_conditioning_setups = minimax_h3.repoint_setup_lane_ids(
-            scene.minimax_h3_conditioning_setups,
-            {removed_lane_id: ""},
-        )
     if descriptor.max_items_per_lane == 1:
         _validate_single_driver_per_lane(scene)
 
@@ -3127,157 +3092,10 @@ def _apply_swap_prompt_sections(scene: Scene, op: dict) -> tuple:
     return section_a, section_b
 
 
-_H3_POPULATION_FIELDS = {
-    "picture": ("pictures", "picture_lane_ids"),
-    "video": ("videos", "video_lane_ids"),
-    "audio": ("standalone_audios", "audio_lane_ids"),
-}
-
-
-def _h3_population_preset(physical_population: str) -> dict:
-    preset = next((value for value in ALL_REFERENCE_RECIPE_PRESETS
-                   if str((value.get("soft") or {}).get("physical_population") or "")
-                   == physical_population), None)
-    if preset is None:
-        _mutation_error("MiniMax H3 population preset is unavailable", 500,
-                        "missing_h3_reference_population")
-    return copy.deepcopy(preset)
-
-
-def _canonical_h3_lane_recipe(lane_id: str, preset: dict) -> ReferenceLaneRecipe:
-    return ReferenceLaneRecipe.from_dict({
-        "lane_id": lane_id,
-        "media_kind": preset.get("media_kind", "image"),
-        "recipe_id": preset.get("id", ""),
-        "recipe": preset,
-    })
-
-
-def _is_exact_h3_lane_recipe(recipe: ReferenceLaneRecipe, preset: dict) -> bool:
-    if not isinstance(recipe, ReferenceLaneRecipe):
-        return False
-    canonical = _canonical_h3_lane_recipe(recipe.lane_id, preset)
-    return recipe.to_dict() == canonical.to_dict()
-
-
-def _ensure_minimax_h3_reference_population(scene: Scene, op: dict) -> dict:
-    """Atomically ensure one canonical H3 population without touching peers."""
-    if set(op) != {"type", "population"}:
-        _mutation_error(
-            "ensure_minimax_h3_reference_population accepts only population",
-            400, "invalid_h3_reference_population_operation")
-    population = str(op.get("population") or "")
-    population_fields = _H3_POPULATION_FIELDS.get(population)
-    if population_fields is None:
-        _mutation_error("Unknown MiniMax H3 Reference population", 400,
-                        "invalid_h3_reference_population")
-    physical_population, setup_key = population_fields
-    preset = _h3_population_preset(physical_population)
-
-    _ensure_scene_lane_config_lengths(scene)
-    recipes = scene.reference_lane_recipes
-    configs = scene.reference_lane_configs
-    setups = [copy.deepcopy(value)
-              for value in scene.minimax_h3_conditioning_setups
-              if isinstance(value, dict)]
-    active_id = str(scene.active_minimax_h3_setup_id or "")
-    setup_index = next((index for index, value in enumerate(setups)
-                        if str(value.get("setup_id") or "") == active_id
-                        and str(value.get("mode") or "") == "reference"), None)
-    if setup_index is None:
-        setup_index = next((index for index, value in enumerate(setups)
-                            if str(value.get("mode") or "") == "reference"), None)
-    created_setup = setup_index is None
-    if created_setup:
-        setup = minimax_h3.default_reference_setup()
-        setups.append(setup)
-        setup_index = len(setups) - 1
-    else:
-        setup = minimax_h3.normalize_setup(setups[setup_index])
-
-    setup_id = str(setup.get("setup_id") or "")
-    target_lane_ids = [str(value or "") for value in setup.get(setup_key) or []
-                       if str(value or "")]
-    lane_index_by_id = {
-        str(recipe.lane_id or ""): index
-        for index, recipe in enumerate(recipes)
-        if str(recipe.lane_id or "")
-    }
-    exact_linked = next((
-        (lane_index_by_id[lane_id], lane_id)
-        for lane_id in target_lane_ids
-        if lane_id in lane_index_by_id
-        and _is_exact_h3_lane_recipe(recipes[lane_index_by_id[lane_id]], preset)
-    ), None)
-
-    # Any binding in any setup is ownership. Reusing it for another setup or
-    # population would silently couple their later authoring.
-    owned_lane_ids = {
-        str(lane_id or "")
-        for candidate in setups
-        for key in minimax_h3.SETUP_LANE_POPULATIONS
-        for lane_id in (candidate.get(key) or [])
-        if str(lane_id or "")
-    }
-    materialized = False
-    if exact_linked is not None:
-        lane_index, lane_id = exact_linked
-    else:
-        lane_index = next((index for index, recipe in enumerate(recipes)
-                           if str(recipe.lane_id or "") not in owned_lane_ids
-                           and _is_exact_h3_lane_recipe(recipe, preset)), None)
-        if lane_index is None:
-            blank_config = LaneConfig().to_dict()
-            occupied_indices = {
-                int(getattr(item, "lane_index", 0) or 0)
-                for item in scene.reference_items
-            }
-            lane_index = next((
-                index for index, recipe in enumerate(recipes)
-                if index not in occupied_indices
-                and str(recipe.lane_id or "") not in owned_lane_ids
-                and recipe.to_dict().get("media_kind") == "image"
-                and not str(recipe.recipe_id or "")
-                and not dict(recipe.recipe or {})
-                and index < len(configs)
-                and configs[index].to_dict() == blank_config
-            ), None)
-            if lane_index is None:
-                lane_index = int(scene.reference_lane_count)
-                _set_scene_lane_count(scene, "reference", lane_index + 1)
-                recipes = scene.reference_lane_recipes
-                configs = scene.reference_lane_configs
-            lane_id = str(recipes[lane_index].lane_id or "")
-            recipes[lane_index] = _canonical_h3_lane_recipe(lane_id, preset)
-            configs[lane_index].name = str(preset.get("name") or "")
-            materialized = True
-        lane_id = str(recipes[lane_index].lane_id or "")
-        setup[setup_key] = [*target_lane_ids, lane_id]
-
-    setup = minimax_h3.normalize_setup(setup)
-    setups[setup_index] = setup
-    was_active = active_id == setup_id
-    scene.minimax_h3_conditioning_setups = setups
-    scene.active_minimax_h3_setup_id = setup_id
-    return {
-        "type": "ensure_minimax_h3_reference_population",
-        "population": population,
-        "lane_index": lane_index,
-        "lane_id": lane_id,
-        "setup_id": setup_id,
-        "materialized": materialized,
-        "created_setup": created_setup,
-        "changed": bool(materialized or created_setup or exact_linked is None
-                        or not was_active),
-    }
-
-
 def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict) -> dict:
     if not isinstance(op, dict):
         _mutation_error("Mutation operation must be an object", 400)
     op_type = str(op.get("type", ""))
-    if op_type == "ensure_minimax_h3_reference_population":
-        return _ensure_minimax_h3_reference_population(scene, op)
     if op_type == "update_scene_fields":
         _apply_scene_fields(project, scene, op.get("fields", {}))
         return {"type": op_type}
@@ -4135,7 +3953,10 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
         # Profile selection, its configuration, and the active H3 setup all
         # change the model-facing prompt.  Leaving them out of the digest
         # collapsed two genuinely different runs — identical authored text
-        # under different task modes — into one history entry.
+        # under different task modes — into one history entry.  The frozen
+        # content hash covers what the setup record no longer can: in Full
+        # Reference the setup is now one constant implicit record, so two runs
+        # differing only in which lanes served slots would otherwise collide.
         digest = hashlib.sha256(json.dumps(
             {"global": global_text, "global_channels": global_channels,
              "global_channel_docs": global_channel_docs,
@@ -4147,6 +3968,8 @@ def _record_prompt_history(project: TimelineProject, jobs: list) -> None:
              "minimax_h3_conditioning_setups": ([active_setup] if active_setup
                                                 else []),
              "active_minimax_h3_setup_id": str(active_setup.get("setup_id") or ""),
+             "prompt_context_content_hash": str(
+                 params.get("prompt_context_content_hash") or ""),
              "source_channel_template": source_template_value}, sort_keys=True
         ).encode("utf-8")).hexdigest()[:16]
         timestamp = _dt.now().isoformat()
@@ -10582,10 +10405,14 @@ if routes is not None:
             window_start = max(0, selection_start - pre_context)
             window_end = min(duration, selection_end + post_context)
             setup_manifest = {}
-            setup = minimax_h3.active_setup(scene)
-            if setup is not None and setup.get("mode") == "reference":
+            # A lane declaring a physical population is what makes this an H3
+            # setup; there is no registration to look up. Resolved narrowly
+            # here rather than through `resolve_scene_prompt_context`, which
+            # would make these labels depend on the project's channel template
+            # and raise `ProfileResolutionError` at an endpoint with no handler.
+            if any(minimax_h3.lane_population(recipe) for recipe in recipes):
                 setup_result = minimax_h3.resolve_setup(
-                    setup=setup,
+                    setup=minimax_h3.implicit_reference_setup(),
                     guide_frames=scene.guide_frames,
                     reference_items=reference_items,
                     lane_recipes=recipes,

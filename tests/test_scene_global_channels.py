@@ -17,7 +17,6 @@ from server import prompt_channel_templates as pct
 from server import prompt_payload as pp
 import server.routes as routes
 from server import prompt_context
-from server import minimax_h3
 from server.timeline_state import Scene
 from server.timeline_state import LaneConfig, PromptSection, Scene, TimelineProject
 
@@ -168,9 +167,6 @@ def test_global_channel_merges_into_its_own_field():
     scene.prompt_sections = _sections()
     scene.set_global_channels(
         {"detailed_description": "The target video is cinematic"})
-    setup = minimax_h3.default_reference_setup()
-    scene.minimax_h3_conditioning_setups = [setup]
-    scene.active_minimax_h3_setup_id = setup["setup_id"]
     composed = scene.get_prompt_for_range(
         0, 120, delimiter=".", template=REF, fps=24.0)
     assert composed == (
@@ -286,9 +282,6 @@ def test_frozen_job_composes_from_its_frozen_global_channels():
     scene.prompt_sections = _sections()
     scene.set_global_channels(
         {"detailed_description": "The target video is cinematic"})
-    setup = minimax_h3.default_reference_setup()
-    scene.minimax_h3_conditioning_setups = [setup]
-    scene.active_minimax_h3_setup_id = setup["setup_id"]
     project.scenes = [scene]
     job = _job_with(project, REF)
     routes._compose_frozen_job_prompt(project, job)
